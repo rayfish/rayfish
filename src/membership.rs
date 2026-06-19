@@ -171,6 +171,7 @@ pub fn derive_ip(identity: &str) -> Ipv4Addr {
     Ipv4Addr::from(base | host_bits)
 }
 
+#[derive(Clone)]
 pub struct IrohIdentityProvider {
     endpoint_id: EndpointId,
     ip: Ipv4Addr,
