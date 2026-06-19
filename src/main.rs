@@ -14,6 +14,9 @@ use iroh::EndpointId;
 const SELF_IP_CREATE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
 const PEER_IP_CREATE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
 
+const BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
+const BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Parser)]
 #[command(name = "pitopi", about = "P2P mesh VPN powered by iroh")]
 struct Cli {
@@ -47,40 +50,117 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
 
+    let token = shutdown::token();
+    let stats = stats::Stats::new();
+    stats.spawn_logger(token.clone());
+
     match cli.command {
-        Command::Create => cmd_create().await,
-        Command::Join { node_id } => cmd_join(node_id).await,
+        Command::Create => cmd_create(token, stats).await,
+        Command::Join { node_id } => cmd_join(node_id, token, stats).await,
     }
 }
 
-async fn cmd_create() -> Result<()> {
+async fn cmd_create(
+    token: tokio_util::sync::CancellationToken,
+    stats: std::sync::Arc<stats::Stats>,
+) -> Result<()> {
     let key = identity::load_or_create()?;
     let ep = transport::create_endpoint(key).await?;
 
     tracing::info!("network created");
     tracing::info!(ip = %SELF_IP_CREATE, "your virtual IP");
     tracing::info!(node_id = %ep.id(), "share this node ID with your peer");
-    tracing::info!("waiting for a peer to join...");
-
-    let conn = transport::accept_connection(&ep).await?;
-    tracing::info!("peer connected, tunnel active");
 
     let tun = tun::TunDevice::create(SELF_IP_CREATE, PEER_IP_CREATE)
-        .context("failed to create TUN device (are you running as root?)")?;
+        .context("failed to create TUN device")?;
 
-    forward::run(tun, conn).await
+    let mut backoff = BACKOFF_INITIAL;
+
+    loop {
+        tracing::info!("waiting for a peer to join...");
+
+        let conn = tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            result = transport::accept_connection(&ep) => {
+                match result {
+                    Ok(conn) => {
+                        backoff = BACKOFF_INITIAL;
+                        conn
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to accept connection");
+                        backoff_sleep(&token, &mut backoff).await;
+                        continue;
+                    }
+                }
+            }
+        };
+
+        tracing::info!("peer connected, tunnel active");
+
+        if let Err(e) = forward::run(tun.share(), conn, token.clone(), stats.clone()).await {
+            if token.is_cancelled() {
+                return Ok(());
+            }
+            tracing::warn!(error = %e, "connection lost, reconnecting...");
+            backoff_sleep(&token, &mut backoff).await;
+        }
+    }
 }
 
-async fn cmd_join(node_id: EndpointId) -> Result<()> {
+async fn cmd_join(
+    node_id: EndpointId,
+    token: tokio_util::sync::CancellationToken,
+    stats: std::sync::Arc<stats::Stats>,
+) -> Result<()> {
     let key = identity::load_or_create()?;
     let ep = transport::create_endpoint(key).await?;
 
-    tracing::info!("connecting to network...");
-    let conn = transport::connect_to_peer(&ep, node_id).await?;
-    tracing::info!(ip = %PEER_IP_CREATE, "connected, tunnel active");
-
     let tun = tun::TunDevice::create(PEER_IP_CREATE, SELF_IP_CREATE)
-        .context("failed to create TUN device (are you running as root?)")?;
+        .context("failed to create TUN device")?;
 
-    forward::run(tun, conn).await
+    let mut backoff = BACKOFF_INITIAL;
+
+    loop {
+        tracing::info!("connecting to network...");
+
+        let conn = tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            result = transport::connect_to_peer(&ep, node_id) => {
+                match result {
+                    Ok(conn) => {
+                        backoff = BACKOFF_INITIAL;
+                        conn
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to connect");
+                        backoff_sleep(&token, &mut backoff).await;
+                        continue;
+                    }
+                }
+            }
+        };
+
+        tracing::info!(ip = %PEER_IP_CREATE, "connected, tunnel active");
+
+        if let Err(e) = forward::run(tun.share(), conn, token.clone(), stats.clone()).await {
+            if token.is_cancelled() {
+                return Ok(());
+            }
+            tracing::warn!(error = %e, "connection lost, reconnecting...");
+            backoff_sleep(&token, &mut backoff).await;
+        }
+    }
+}
+
+async fn backoff_sleep(
+    token: &tokio_util::sync::CancellationToken,
+    backoff: &mut std::time::Duration,
+) {
+    tracing::info!(secs = backoff.as_secs(), "retrying in");
+    tokio::select! {
+        _ = token.cancelled() => {}
+        _ = tokio::time::sleep(*backoff) => {}
+    }
+    *backoff = (*backoff * 2).min(BACKOFF_MAX);
 }

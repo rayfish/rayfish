@@ -35,7 +35,7 @@ pub async fn run(
 }
 
 async fn tun_read_loop(
-    mut tun: TunDevice,
+    tun: TunDevice,
     conn: Connection,
     mut incoming: mpsc::Receiver<Vec<u8>>,
     token: CancellationToken,

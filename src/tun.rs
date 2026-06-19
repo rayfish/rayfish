@@ -1,13 +1,15 @@
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tun::{AsyncDevice, Configuration};
 
 const TUN_MTU: u16 = 1200;
 
 pub struct TunDevice {
-    device: AsyncDevice,
+    device: Arc<Mutex<AsyncDevice>>,
 }
 
 impl TunDevice {
@@ -27,16 +29,26 @@ impl TunDevice {
 
         let device = tun::create_as_async(&config)?;
         tracing::info!(%addr, "TUN device created");
-        Ok(Self { device })
+        Ok(Self {
+            device: Arc::new(Mutex::new(device)),
+        })
     }
 
-    pub async fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let n = self.device.read(buf).await?;
+    pub fn share(&self) -> TunDevice {
+        TunDevice {
+            device: self.device.clone(),
+        }
+    }
+
+    pub async fn read_packet(&self, buf: &mut [u8]) -> Result<usize> {
+        let mut dev = self.device.lock().await;
+        let n = dev.read(buf).await?;
         Ok(n)
     }
 
-    pub async fn write_packet(&mut self, packet: &[u8]) -> Result<()> {
-        self.device.write_all(packet).await?;
+    pub async fn write_packet(&self, packet: &[u8]) -> Result<()> {
+        let mut dev = self.device.lock().await;
+        dev.write_all(packet).await?;
         Ok(())
     }
 }
