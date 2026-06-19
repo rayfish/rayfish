@@ -1,5 +1,6 @@
 mod forward;
 mod identity;
+mod shutdown;
 mod transport;
 mod tun;
 
