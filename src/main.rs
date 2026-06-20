@@ -530,6 +530,7 @@ async fn join_mesh_shared(
             group_mode: GroupMode::Restricted,
             my_ip: Some(my_ip),
             members: member_entries,
+            approved: vec![],
         },
     );
     config::save(&app_config)?;
@@ -754,6 +755,7 @@ fn save_network_config(
             group_mode: mode,
             my_ip,
             members: member_entries,
+            approved: vec![],
         },
     );
     config::save(app_config)

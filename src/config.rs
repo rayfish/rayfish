@@ -15,6 +15,13 @@ pub struct MemberEntry {
     pub is_coordinator: bool,
 }
 
+/// A pre-approved peer that hasn't connected yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedConfigEntry {
+    pub identity: String,
+    pub ip: Ipv4Addr,
+}
+
 /// A single saved network membership.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkConfig {
@@ -30,6 +37,9 @@ pub struct NetworkConfig {
     /// Known members in this network.
     #[serde(default)]
     pub members: Vec<MemberEntry>,
+    /// Pre-approved peers that haven't connected yet.
+    #[serde(default)]
+    pub approved: Vec<ApprovedConfigEntry>,
 }
 
 /// Top-level config stored at `~/.config/pitopi/networks.toml`.
@@ -107,6 +117,7 @@ mod tests {
                             is_coordinator: false,
                         },
                     ],
+                    approved: vec![],
                 },
                 NetworkConfig {
                     name: "work".to_string(),
@@ -114,6 +125,7 @@ mod tests {
                     group_mode: GroupMode::Restricted,
                     my_ip: None,
                     members: vec![],
+                    approved: vec![],
                 },
             ],
         };
@@ -153,6 +165,7 @@ coordinator_id = "abc"
             group_mode: GroupMode::Open,
             my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
             members: vec![],
+            approved: vec![],
         };
         upsert_network(&mut config, net.clone());
         assert_eq!(config.networks.len(), 1);
@@ -168,6 +181,7 @@ coordinator_id = "abc"
                 group_mode: GroupMode::Restricted,
                 my_ip: None,
                 members: vec![],
+                approved: vec![],
             }],
         };
         let updated = NetworkConfig {
@@ -176,6 +190,7 @@ coordinator_id = "abc"
             group_mode: GroupMode::Open,
             my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
             members: vec![],
+            approved: vec![],
         };
         upsert_network(&mut config, updated.clone());
         assert_eq!(config.networks.len(), 1);
@@ -193,6 +208,7 @@ coordinator_id = "abc"
                     group_mode: GroupMode::Restricted,
                     my_ip: None,
                     members: vec![],
+                    approved: vec![],
                 },
                 NetworkConfig {
                     name: "remove-me".to_string(),
@@ -200,6 +216,7 @@ coordinator_id = "abc"
                     group_mode: GroupMode::Restricted,
                     my_ip: None,
                     members: vec![],
+                    approved: vec![],
                 },
             ],
         };
@@ -212,5 +229,42 @@ coordinator_id = "abc"
     fn test_remove_nonexistent() {
         let mut config = AppConfig::default();
         assert!(!remove_network(&mut config, "nope"));
+    }
+
+    #[test]
+    fn test_serialize_with_approved() {
+        let config = AppConfig {
+            networks: vec![NetworkConfig {
+                name: "gaming".to_string(),
+                coordinator_id: "abc123".to_string(),
+                group_mode: GroupMode::Restricted,
+                my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
+                members: vec![MemberEntry {
+                    identity: "coord".to_string(),
+                    ip: Ipv4Addr::new(100, 64, 5, 3),
+                    is_coordinator: true,
+                }],
+                approved: vec![ApprovedConfigEntry {
+                    identity: "pending-peer".to_string(),
+                    ip: Ipv4Addr::new(100, 64, 12, 34),
+                }],
+            }],
+        };
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: AppConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config, parsed);
+        assert_eq!(parsed.networks[0].approved.len(), 1);
+        assert_eq!(parsed.networks[0].approved[0].identity, "pending-peer");
+    }
+
+    #[test]
+    fn test_deserialize_without_approved_field() {
+        let toml_str = r#"
+[[networks]]
+name = "test"
+coordinator_id = "abc"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.networks[0].approved.is_empty());
     }
 }
