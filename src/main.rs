@@ -771,9 +771,7 @@ async fn join_mesh_shared(
                                                     peers.add(ip, conn.clone(), peer_identity);
                                                     forward::spawn_peer_reader(conn, tun_tx.clone(), token.clone(), stats.clone());
                                                 } else {
-                                                    tracing::info!(peer_ip = %ip, "mesh peer connected");
-                                                    peers.add(ip, conn.clone(), peer_identity);
-                                                    forward::spawn_peer_reader(conn, tun_tx.clone(), token.clone(), stats.clone());
+                                                    tracing::warn!(peer = %peer_identity, "unknown peer, not approved — rejecting");
                                                 }
                                             }
                                             Ok(ControlMsg::ReconnectRequest { identity: peer_identity, ip }) => {
