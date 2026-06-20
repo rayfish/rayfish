@@ -168,17 +168,17 @@ impl DaemonState {
         // Load ACL from file if it exists.
         // Note: network is not yet registered, so resolve short IDs directly from net_state.members.
         let acl_path = self.acl_file_path(&name);
-        if acl_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&acl_path) {
-                let resolver = |short: &str| -> Option<EndpointId> {
-                    net_state.members.all().iter()
-                        .find(|m| m.identity.to_string().starts_with(short))
-                        .map(|m| m.identity)
-                };
-                if let Ok(data) = acl::parse_acl_file(&content, &resolver) {
-                    tracing::info!(network = %name, "loaded ACL from file on create");
-                    net_state.acl = data;
-                }
+        if acl_path.exists()
+            && let Ok(content) = std::fs::read_to_string(&acl_path)
+        {
+            let resolver = |short: &str| -> Option<EndpointId> {
+                net_state.members.all().iter()
+                    .find(|m| m.identity.to_string().starts_with(short))
+                    .map(|m| m.identity)
+            };
+            if let Ok(data) = acl::parse_acl_file(&content, &resolver) {
+                tracing::info!(network = %name, "loaded ACL from file on create");
+                net_state.acl = data;
             }
         }
 
@@ -1922,10 +1922,10 @@ async fn join_mesh_shared(
     };
 
     // Fetch ACL from DHT if coordinator provided an ACL DHT ID
-    if let Some(acl_id_str) = received_acl_dht_id {
-        if let Ok(acl_dht_id_parsed) = acl_id_str.parse::<EndpointId>()
-            && let Ok(pkarr_client) = dht::create_pkarr_client(ep)
-        {
+    if let Some(acl_id_str) = received_acl_dht_id
+        && let Ok(acl_dht_id_parsed) = acl_id_str.parse::<EndpointId>()
+        && let Ok(pkarr_client) = dht::create_pkarr_client(ep)
+    {
             match dht::resolve_acl_hash(&pkarr_client, acl_dht_id_parsed).await {
                 Ok(acl_hash) => {
                     match acl_hash.parse::<blake3::Hash>() {
@@ -1969,7 +1969,6 @@ async fn join_mesh_shared(
                 }
                 Err(e) => tracing::warn!(error = %e, "failed to resolve ACL hash from DHT on join"),
             }
-        }
     }
 
     // Control listener

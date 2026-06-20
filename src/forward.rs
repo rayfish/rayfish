@@ -126,6 +126,7 @@ pub async fn run_mesh(
 /// Spawns a task that reads QUIC datagrams from a single peer connection and
 /// forwards them to the TUN writer via `tun_tx`. On connection loss, sends a
 /// [`DisconnectEvent`] and exits.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_peer_reader(
     conn: Connection,
     peer_id: EndpointId,

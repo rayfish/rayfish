@@ -43,12 +43,6 @@ impl PeerTable {
             .insert(ip, PeerEntry { conn, endpoint_id, network: network.to_string() });
     }
 
-    /// Returns the QUIC connection for a peer's virtual IP, if present.
-    /// Called on every outgoing packet by `run_mesh`.
-    pub fn lookup(&self, ip: &Ipv4Addr) -> Option<Connection> {
-        self.inner.read().unwrap().get(ip).map(|e| e.conn.clone())
-    }
-
     /// Returns (Connection, EndpointId, network_name) for a peer's virtual IP.
     /// Used by `run_mesh` for ACL-aware routing.
     pub fn lookup_full(&self, ip: &Ipv4Addr) -> Option<(Connection, EndpointId, String)> {
@@ -114,13 +108,6 @@ impl PeerTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_peer_table_empty_lookup() {
-        let table = PeerTable::new();
-        let ip = Ipv4Addr::new(100, 64, 0, 2);
-        assert!(table.lookup(&ip).is_none());
-    }
 
     #[test]
     fn test_peer_table_empty_lookup_full() {
