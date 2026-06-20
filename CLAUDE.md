@@ -41,7 +41,7 @@ Only `daemon` (and its alias `up`) requires `sudo`. All other commands run unpri
 
 ```bash
 just cross                   # build for x86_64 Linux
-just deploy <ip>             # cross-build + rsync + install to server
+just deploy <ip>             # cross-build + install + create group + start daemon service
 ```
 
 ## Architecture

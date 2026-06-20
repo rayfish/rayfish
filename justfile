@@ -14,8 +14,8 @@ cross:
 deploy ip:
     cross -q build --release --target {{target}}
     rsync -az --progress target/{{target}}/release/{{binary}} {{user}}@{{ip}}:/tmp/
-    ssh {{user}}@{{ip}} "install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}}"
-    @echo "Deployed to {{ip}}"
+    ssh {{user}}@{{ip}} "getent group pitopi >/dev/null || groupadd pitopi && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && {{binary}} install-service && systemctl daemon-reload && systemctl enable pitopi && systemctl restart pitopi"
+    @echo "Deployed and installed daemon on {{ip}}"
 
 check:
     cargo -q check

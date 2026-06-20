@@ -250,34 +250,72 @@ pitopi join gaming/ybnj-raqe-c5s6-...
 
 The joiner connects to the coordinator, receives approval and a member list, and establishes direct connections to every other peer in the mesh.
 
-### Why sudo?
+### Checking status
 
-TUN devices are virtual network interfaces. Creating them requires root privileges on both Linux and macOS. Only `pitopi daemon` (and its alias `pitopi up`) requires root. All other commands (`create`, `join`, `leave`, `status`, `down`) are thin IPC clients that talk to the daemon and run unprivileged.
-
-### Other commands
-
-| Command | Description | Requires root |
-|---------|-------------|:---:|
-| `pitopi daemon` | Start the daemon | Yes |
-| `pitopi up` | Alias for daemon | Yes |
-| `pitopi create --name NAME [--mode open\|restricted]` | Create a network (via daemon) | No |
-| `pitopi join CODE [--name NAME]` | Join a network (via daemon) | No |
-| `pitopi leave NAME` | Leave a network (via daemon) | No |
-| `pitopi status` | Show live network status from daemon | No |
-| `pitopi down` | Shut down the daemon | No |
-| `pitopi list` | Show saved networks from config file | No |
-| `pitopi install-service` | Install systemd/launchd service | Yes |
-| `pitopi uninstall-service` | Remove system service | Yes |
-| `pitopi completions SHELL` | Generate shell completions | No |
-
-### Cross-compilation
-
-For deploying to Linux servers from a macOS development machine:
+Once you have networks running, query the daemon for live state:
 
 ```bash
-just cross          # build for x86_64 Linux
-just deploy <ip>    # cross-build + rsync + install to server
+pitopi status
+# > Endpoint: <your-endpoint-id>
+# >   gaming [coordinator]
+# >     IP: 100.64.23.142
+# >     Peers:
+# >       100.64.7.201 (<peer-endpoint-id>)
 ```
+
+### Leaving a network
+
+```bash
+pitopi leave gaming
+```
+
+This tears down all connections for that network, removes peers from the routing table, and deletes it from the saved config.
+
+### Shutting down
+
+```bash
+pitopi down    # signals the daemon to shut down gracefully
+```
+
+### Socket permissions
+
+The daemon runs as root and creates the IPC socket at `/var/run/pitopi/pitopi.sock`. By default, only root can connect. To allow unprivileged users to run commands, create a `pitopi` group and add users to it:
+
+```bash
+sudo groupadd pitopi
+sudo usermod -aG pitopi $USER
+# log out and back in, or: newgrp pitopi
+```
+
+The daemon automatically sets the socket to `root:pitopi` with mode `0660` if the group exists.
+
+### Why sudo?
+
+TUN devices are virtual network interfaces. Creating them requires root privileges on both Linux and macOS. Only `pitopi daemon` (and its alias `pitopi up`) requires root. All other commands are thin IPC clients that talk to the daemon and run unprivileged.
+
+### All commands
+
+| Command | Description | Needs daemon |
+|---------|-------------|:---:|
+| `sudo pitopi daemon` | Start the daemon (owns TUN + endpoint) | — |
+| `sudo pitopi up` | Alias for `daemon` | — |
+| `pitopi create --name NAME` | Create a network (you become coordinator) | Yes |
+| `pitopi join ROOM-CODE` | Join a network using a room code | Yes |
+| `pitopi leave NAME` | Leave a network and remove config | Yes |
+| `pitopi status` | Show active networks, peers, and IPs | Yes |
+| `pitopi down` | Shut down the daemon | Yes |
+| `pitopi list` | Show saved networks from config file | No |
+| `pitopi install-service` | Install systemd/launchd service | No |
+| `pitopi uninstall-service` | Remove system service | No |
+| `pitopi completions SHELL` | Generate shell completions | No |
+
+### Deploying to servers
+
+```bash
+just deploy <ip>    # cross-build + install + create pitopi group + start daemon service
+```
+
+This handles everything: builds for x86_64 Linux, installs the binary, creates the `pitopi` group, installs a systemd service, and starts the daemon. On subsequent deploys it restarts the service to pick up the new binary.
 
 ---
 

@@ -430,6 +430,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
     }
     let listener = UnixListener::bind(&socket_path)
         .context("failed to bind IPC socket")?;
+    set_socket_group_permissions(&socket_path);
     tracing::info!(path = %socket_path.display(), "IPC socket listening");
 
     loop {
@@ -456,6 +457,33 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
             }
         }
     }
+}
+
+fn set_socket_group_permissions(path: &std::path::Path) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    if cfg!(target_os = "macos") {
+        unsafe { libc::chmod(c_path.as_ptr(), 0o666) };
+        tracing::info!("socket mode 0666 (macOS — any user)");
+        return;
+    }
+
+    let group_name = CString::new("pitopi").unwrap();
+    let grp = unsafe { libc::getgrnam(group_name.as_ptr()) };
+    if grp.is_null() {
+        tracing::warn!("group 'pitopi' not found — socket only accessible by root");
+        return;
+    }
+    let gid = unsafe { (*grp).gr_gid };
+    unsafe { libc::chown(c_path.as_ptr(), 0, gid) };
+    unsafe { libc::chmod(c_path.as_ptr(), 0o660) };
+    tracing::info!("socket owned by root:pitopi (0660)");
 }
 
 async fn handle_ipc_client(mut stream: UnixStream, daemon: &DaemonState) -> Result<()> {
