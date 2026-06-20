@@ -21,6 +21,9 @@ pub async fn create_endpoint_with_alpns(
     let ep = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(alpns)
+        .clear_ip_transports()
+        .bind_addr("0.0.0.0:0")
+        .context("invalid bind address")?
         .bind()
         .await
         .context("failed to bind iroh endpoint")?;
