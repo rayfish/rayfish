@@ -618,6 +618,45 @@ async fn try_reconnect_to_known_peers(
         .iter()
         .find(|n| n.name == network_name)?;
 
+    // Best-effort: try DHT resolution first for a potentially fresher member list
+    if let Some(dht_id_str) = &net.membership_dht_id
+        && let Ok(dht_id) = dht_id_str.parse::<EndpointId>()
+    {
+        match dht::create_pkarr_client(ep) {
+            Ok(client) => {
+                match dht::resolve_membership(&client, dht_id).await {
+                    Ok((dht_members, _)) => {
+                        tracing::info!(count = dht_members.len(), "resolved membership from DHT");
+                        for member in &dht_members {
+                            if member.identity == identity.local_identity() {
+                                continue;
+                            }
+                            if token.is_cancelled() {
+                                return None;
+                            }
+                            match transport::connect_to_peer_with_alpn(ep, member.identity, alpn).await {
+                                Ok(conn) => {
+                                    tracing::info!(peer_ip = %member.ip, "connected to DHT-resolved peer for reconnection");
+                                    return Some(conn);
+                                }
+                                Err(e) => {
+                                    tracing::debug!(peer = %member.identity.fmt_short(), error = %e, "DHT-resolved peer unavailable");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "DHT membership resolution failed, falling back to local config");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create pkarr client for reconnection");
+            }
+        }
+    }
+
+    // Fall back to local config members
     for member in &net.members {
         if member.identity == identity.local_identity() {
             continue; // skip self
@@ -663,8 +702,8 @@ async fn join_mesh_shared(
         .context("accept control stream")?;
 
     let msg = control::recv_msg(&mut recv).await?;
-    let (members, approved) = match msg {
-        ControlMsg::Welcome { members, approved, .. } => {
+    let (members, approved, received_dht_id) = match msg {
+        ControlMsg::Welcome { members, approved, membership_dht_id } => {
             tracing::info!(network = %network_name, "welcomed to network");
             // Joiner-side collision check
             if let Some(existing) = members
@@ -677,7 +716,7 @@ async fn join_mesh_shared(
                     existing.identity
                 );
             }
-            (members, approved)
+            (members, approved, membership_dht_id)
         }
         ControlMsg::JoinApproved { your_ip, members } => {
             // Backward compat: old coordinators still send JoinApproved
@@ -689,11 +728,11 @@ async fn join_mesh_shared(
                     "coordinator assigned different IP than identity-derived"
                 );
             }
-            (members, vec![])
+            (members, vec![], None)
         }
-        ControlMsg::MemberSync { members, .. } => {
+        ControlMsg::MemberSync { members, membership_dht_id } => {
             tracing::info!(network = %network_name, "reconnected via peer");
-            (members, vec![])
+            (members, vec![], membership_dht_id)
         }
         ControlMsg::JoinDenied { reason } => {
             anyhow::bail!("join denied: {reason}");
@@ -703,7 +742,7 @@ async fn join_mesh_shared(
         }
     };
 
-    // Save membership to config
+    // Save membership to config, including membership_dht_id if received
     let member_entries: Vec<config::MemberEntry> = members
         .iter()
         .map(|m| config::MemberEntry {
@@ -720,6 +759,12 @@ async fn join_mesh_shared(
         })
         .collect();
     let mut app_config = config::load()?;
+    // Preserve an existing dht_id if we didn't get a new one
+    let dht_id_to_save = received_dht_id.clone().or_else(|| {
+        app_config.networks.iter()
+            .find(|n| n.name == network_name)
+            .and_then(|n| n.membership_dht_id.clone())
+    });
     config::upsert_network(
         &mut app_config,
         config::NetworkConfig {
@@ -729,7 +774,7 @@ async fn join_mesh_shared(
             my_ip: Some(my_ip),
             members: member_entries,
             approved: approved_config,
-            membership_dht_id: None,
+            membership_dht_id: dht_id_to_save,
         },
     );
     config::save(&app_config)?;
@@ -786,7 +831,9 @@ async fn join_mesh_shared(
         let initial_conn = initial_conn.clone();
         let token = token.clone();
         let live_state = live_state.clone();
+        let network_name_owned = network_name.to_string();
         async move {
+            let network_name = network_name_owned;
             loop {
                 tokio::select! {
                     _ = token.cancelled() => return,
@@ -801,9 +848,17 @@ async fn join_mesh_shared(
                                         let members = s.members.clone();
                                         let _ = s.approved.approve(entry, &members);
                                     }
-                                    Ok(ControlMsg::MemberSync { members, .. }) => {
+                                    Ok(ControlMsg::MemberSync { members, membership_dht_id }) => {
                                         tracing::info!(count = members.len(), "member list updated");
                                         live_state.write().unwrap().members = MemberList::from_members(members);
+                                        // Persist updated DHT ID if newly received
+                                        if membership_dht_id.is_some()
+                                            && let Ok(mut cfg) = config::load()
+                                            && let Some(net) = cfg.networks.iter_mut().find(|n| n.name == network_name)
+                                        {
+                                            net.membership_dht_id = membership_dht_id;
+                                            let _ = config::save(&cfg);
+                                        }
                                     }
                                     Ok(other) => {
                                         tracing::debug!(?other, "unhandled control message");
@@ -1140,6 +1195,7 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
             // We're a member — join using the shared TUN/peers
             let coordinator_id: EndpointId = net.coordinator_id;
             let name = net.name.clone();
+            let membership_dht_id = net.membership_dht_id.clone();
             let ep = ep.clone();
             let identity = identity.clone();
             let peers = peers.clone();
@@ -1148,6 +1204,55 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
             let stats = stats.clone();
             handles.push(tokio::spawn(async move {
                 tracing::info!(network = %name, "connecting...");
+
+                // Best-effort: try DHT resolution to get a fresh member list before connecting
+                if let Some(dht_id_str) = &membership_dht_id
+                    && let Ok(dht_id) = dht_id_str.parse::<EndpointId>()
+                {
+                    match dht::create_pkarr_client(&ep) {
+                        Ok(client) => {
+                            match dht::resolve_membership(&client, dht_id).await {
+                                Ok((dht_members, _)) => {
+                                    tracing::info!(
+                                        network = %name,
+                                        count = dht_members.len(),
+                                        "refreshed membership from DHT"
+                                    );
+                                    // Try connecting to DHT-resolved members directly
+                                    for member in &dht_members {
+                                        if member.identity == identity.local_identity() {
+                                            continue;
+                                        }
+                                        if token.is_cancelled() {
+                                            return;
+                                        }
+                                        match transport::connect_to_peer_with_alpn(&ep, member.identity, &alpn).await {
+                                            Ok(conn) => {
+                                                tracing::info!(network = %name, peer_ip = %member.ip, "connected via DHT-resolved peer");
+                                                if let Err(e) = join_mesh_shared(
+                                                    conn, &ep, &name, &identity, &alpn, peers, tun_tx, token, stats,
+                                                ).await {
+                                                    tracing::warn!(network = %name, error = %e, "join_mesh_shared failed (DHT path)");
+                                                }
+                                                return;
+                                            }
+                                            Err(e) => {
+                                                tracing::debug!(peer_ip = %member.ip, error = %e, "DHT-resolved peer unavailable");
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(network = %name, error = %e, "DHT resolution failed, falling back to coordinator");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(network = %name, error = %e, "failed to create pkarr client for cmd_up");
+                        }
+                    }
+                }
+
                 match transport::connect_to_peer_with_alpn(&ep, coordinator_id, &alpn).await {
                     Ok(conn) => {
                         tracing::info!(network = %name, "connected");
