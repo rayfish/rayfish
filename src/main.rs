@@ -326,9 +326,12 @@ async fn ipc_create(mode: GroupMode, name: Option<String>, hostname: Option<Stri
     ipc::send_msg(&mut stream, &ipc::IpcRequest::Create { mode, name, hostname }).await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Created { name, network_key, my_ip } => {
+        ipc::IpcResponse::Created { name, network_key, my_ip, my_ipv6 } => {
             println!("Network created: {}", name);
-            println!("  IP: {}", my_ip);
+            println!("  IPv4: {}", my_ip);
+            if let Some(v6) = my_ipv6 {
+                println!("  IPv6: {}", v6);
+            }
             println!("  Join code: {}", network_key);
             println!("  Share this join code to invite others");
         }
@@ -349,9 +352,12 @@ async fn ipc_join(network_key: &str, name: Option<&str>, hostname: Option<String
     }).await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Joined { name, my_ip } => {
+        ipc::IpcResponse::Joined { name, my_ip, my_ipv6 } => {
             println!("Joined network '{}'.", name);
-            println!("  IP: {}", my_ip);
+            println!("  IPv4: {}", my_ip);
+            if let Some(v6) = my_ipv6 {
+                println!("  IPv6: {}", v6);
+            }
         }
         ipc::IpcResponse::Error { message } => {
             eprintln!("Error: {}", message);

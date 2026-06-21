@@ -5,7 +5,7 @@
 //! - [`spawn_peer_reader`]: one per peer, reads incoming datagrams and forwards to TUN writer
 //! - [`spawn_tun_writer`]: single task, writes incoming packets to the TUN device
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -35,14 +35,14 @@ pub(crate) enum InboundDecision {
     DropAcl,
     /// Dropped by the local firewall.
     DropFirewall,
-    /// Dropped: too large or not a parseable IPv4 packet.
+    /// Dropped: too large or not a parseable IP packet.
     DropMalformed,
 }
 
 /// Pure evaluation of an inbound peer datagram against ACL, firewall, and basic
 /// packet validity. Extracted from [`spawn_peer_reader`] so it can be unit-tested.
 ///
-/// Non-IPv4 / truncated / oversized packets are rejected (`DropMalformed`) rather
+/// Non-IP / truncated / oversized packets are rejected (`DropMalformed`) rather
 /// than passed through — previously such packets bypassed the firewall entirely.
 pub(crate) fn evaluate_inbound(
     packet: &[u8],
@@ -99,6 +99,7 @@ impl SharedAcl {
 pub struct DisconnectEvent {
     pub endpoint_id: EndpointId,
     pub ip: Ipv4Addr,
+    pub ipv6: std::net::Ipv6Addr,
 }
 
 /// Main TUN read loop. Reads packets from the TUN device, extracts the destination IP,
@@ -123,7 +124,11 @@ pub async fn run_mesh(
                     tracing::debug!(len = n, first_byte = buf[0], "TUN read");
                     let pkt = &buf[..n];
                     if let Some(info) = firewall::parse_packet_info(pkt) {
-                        if let Some((conn, peer_endpoint_id, network)) = peers.lookup_full(&info.dst_ip) {
+                        let lookup = match info.dst_ip {
+                            IpAddr::V4(v4) => peers.lookup_v4(&v4),
+                            IpAddr::V6(v6) => peers.lookup_v6(&v6),
+                        };
+                        if let Some((conn, peer_endpoint_id, network)) = lookup {
                             let acl = shared_acl.get(&network);
                             if !acl.is_allowed(&local_id, &peer_endpoint_id) {
                                 tracing::debug!(dst = %info.dst_ip, "ACL denied outbound");
@@ -148,7 +153,7 @@ pub async fn run_mesh(
                             stats.record_drop(DropReason::NoPeer);
                         }
                     } else {
-                        tracing::debug!(len = n, "not IPv4, dropping");
+                        tracing::debug!(len = n, "not IP, dropping");
                     }
                 }
             }
@@ -164,6 +169,7 @@ pub fn spawn_peer_reader(
     conn: Connection,
     peer_id: EndpointId,
     peer_ip: Ipv4Addr,
+    peer_ipv6: std::net::Ipv6Addr,
     local_id: EndpointId,
     network: String,
     shared_acl: SharedAcl,
@@ -195,7 +201,7 @@ pub fn spawn_peer_reader(
                         }
                         Err(e) => {
                             tracing::warn!(peer = %peer_id.fmt_short(), ip = %peer_ip, error = %e, "peer connection lost");
-                            let _ = disconnect_tx.send(DisconnectEvent { endpoint_id: peer_id, ip: peer_ip }).await;
+                            let _ = disconnect_tx.send(DisconnectEvent { endpoint_id: peer_id, ip: peer_ip, ipv6: peer_ipv6 }).await;
                             return;
                         }
                     }
@@ -245,10 +251,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_packet_not_ipv4() {
-        let mut packet = vec![0u8; 20];
-        packet[0] = 0x60;
-        assert!(firewall::parse_packet_info(&packet).is_none());
+    fn test_parse_packet_ipv6() {
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x60; // IPv6
+        packet[6] = 6; // TCP next header
+        // dst at bytes 24-39
+        packet[24] = 0x02;
+        packet[25] = 0x01;
+        let info = firewall::parse_packet_info(&packet).unwrap();
+        assert!(info.dst_ip.is_ipv6());
     }
 
     fn make_tcp_packet(dst_port: u16) -> Vec<u8> {
@@ -280,19 +291,17 @@ mod tests {
     }
 
     #[test]
-    fn inbound_non_ipv4_dropped_as_malformed_not_bypassing_firewall() {
-        // Regression: previously a non-IPv4 packet bypassed the firewall and was
-        // written straight to the TUN device.
+    fn inbound_ipv6_evaluated_by_firewall() {
         let acl = AclData::empty();
-        // default-deny firewall — if the packet slipped through it would be a bug
         let fw = inbound_fw(Action::Deny, vec![]);
         let peer = iroh::SecretKey::generate().public();
         let me = iroh::SecretKey::generate().public();
         let mut pkt = vec![0u8; 40];
         pkt[0] = 0x60; // IPv6
+        pkt[6] = 6; // TCP
         assert!(matches!(
             evaluate_inbound(&pkt, &acl, &fw, &peer, &me),
-            InboundDecision::DropMalformed
+            InboundDecision::DropFirewall
         ));
     }
 

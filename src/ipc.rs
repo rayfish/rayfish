@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -90,10 +90,14 @@ pub enum IpcResponse {
         name: String,
         network_key: EndpointId,
         my_ip: Ipv4Addr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        my_ipv6: Option<Ipv6Addr>,
     },
     Joined {
         name: String,
         my_ip: Ipv4Addr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        my_ipv6: Option<Ipv6Addr>,
     },
     Status {
         endpoint_id: EndpointId,
@@ -121,6 +125,8 @@ pub struct NetworkStatus {
     pub role: NetworkRole,
     pub my_ip: Ipv4Addr,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub my_ipv6: Option<Ipv6Addr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub my_hostname: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_key: Option<String>,
@@ -138,6 +144,8 @@ pub enum NetworkRole {
 pub struct PeerStatus {
     pub endpoint_id: EndpointId,
     pub ip: Ipv4Addr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6: Option<Ipv6Addr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -233,11 +241,12 @@ mod tests {
             name: "test".to_string(),
             network_key: key,
             my_ip: Ipv4Addr::new(100, 64, 10, 5),
+            my_ipv6: None,
         };
         let json = serde_json::to_vec(&resp).unwrap();
         let decoded: IpcResponse = serde_json::from_slice(&json).unwrap();
         match decoded {
-            IpcResponse::Created { name, network_key, my_ip } => {
+            IpcResponse::Created { name, network_key, my_ip, .. } => {
                 assert_eq!(name, "test");
                 assert_eq!(network_key, key);
                 assert_eq!(my_ip, Ipv4Addr::new(100, 64, 10, 5));
@@ -290,12 +299,14 @@ mod tests {
                 name: "gaming".to_string(),
                 role: NetworkRole::Coordinator,
                 my_ip: Ipv4Addr::new(100, 64, 10, 5),
+                my_ipv6: None,
                 my_hostname: Some("alice".to_string()),
                 network_key: Some("abc123".to_string()),
                 member_count: 2,
                 peers: vec![PeerStatus {
                     endpoint_id: peer_id,
                     ip: Ipv4Addr::new(100, 64, 10, 6),
+                    ipv6: None,
                     hostname: None,
                     connection: None,
                 }],

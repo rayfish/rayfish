@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Result, bail};
 use iroh::EndpointId;
@@ -244,17 +244,31 @@ pub fn policy_for_mode(mode: GroupMode) -> Box<dyn MembershipPolicy> {
 /// depend directly on iroh types.
 pub trait IdentityProvider: Send + Sync {
     fn local_ip(&self) -> Ipv4Addr;
+    fn local_ipv6(&self) -> Ipv6Addr;
     fn local_identity(&self) -> EndpointId;
     fn derive_ip(&self, peer_identity: &EndpointId) -> Ipv4Addr;
+    fn derive_ipv6(&self, peer_identity: &EndpointId) -> Ipv6Addr;
 }
 
 /// Derives a deterministic virtual IP from an [`EndpointId`] using FNV-1a.
 /// Always produces an address in the 100.64.0.0/10 range, avoiding .0 and .1
 /// (network address and TUN gateway).
 pub fn derive_ip(identity: &EndpointId) -> Ipv4Addr {
-    let id_str = identity.to_string();
+    derive_ip_with_index(identity, 0)
+}
+
+/// Derives a virtual IPv4 with a collision index. Index 0 produces the same
+/// result as [`derive_ip`]. Higher indices rotate the address to resolve
+/// collisions in the 22-bit space. The index is local state — each node
+/// resolves collisions independently.
+pub fn derive_ip_with_index(identity: &EndpointId, index: u32) -> Ipv4Addr {
+    let input = if index == 0 {
+        identity.to_string()
+    } else {
+        format!("{identity}{index}")
+    };
     let mut hash: u32 = 2_166_136_261; // FNV-1a offset basis
-    for &b in id_str.as_bytes() {
+    for &b in input.as_bytes() {
         hash ^= b as u32;
         hash = hash.wrapping_mul(16_777_619); // FNV-1a prime
     }
@@ -270,17 +284,34 @@ pub fn derive_ip(identity: &EndpointId) -> Ipv4Addr {
     Ipv4Addr::from(base | host_bits)
 }
 
+/// Derives a stable IPv6 address from an [`EndpointId`] in the `200::/7` range.
+/// Uses blake3 to hash the identity, takes 15 bytes, and prepends `0x02`.
+/// The 120-bit address space makes collisions practically impossible.
+pub fn derive_ipv6(identity: &EndpointId) -> Ipv6Addr {
+    let hash = blake3::hash(identity.to_string().as_bytes());
+    let bytes = hash.as_bytes();
+    let octets: [u8; 16] = [
+        0x02, bytes[0], bytes[1], bytes[2],
+        bytes[3], bytes[4], bytes[5], bytes[6],
+        bytes[7], bytes[8], bytes[9], bytes[10],
+        bytes[11], bytes[12], bytes[13], bytes[14],
+    ];
+    Ipv6Addr::from(octets)
+}
+
 /// [`IdentityProvider`] backed by an iroh [`EndpointId`].
 #[derive(Clone)]
 pub struct IrohIdentityProvider {
     endpoint_id: EndpointId,
     ip: Ipv4Addr,
+    ipv6: Ipv6Addr,
 }
 
 impl IrohIdentityProvider {
     pub fn new(endpoint_id: EndpointId) -> Self {
         let ip = derive_ip(&endpoint_id);
-        Self { endpoint_id, ip }
+        let ipv6 = derive_ipv6(&endpoint_id);
+        Self { endpoint_id, ip, ipv6 }
     }
 }
 
@@ -289,12 +320,20 @@ impl IdentityProvider for IrohIdentityProvider {
         self.ip
     }
 
+    fn local_ipv6(&self) -> Ipv6Addr {
+        self.ipv6
+    }
+
     fn local_identity(&self) -> EndpointId {
         self.endpoint_id
     }
 
     fn derive_ip(&self, peer_identity: &EndpointId) -> Ipv4Addr {
         derive_ip(peer_identity)
+    }
+
+    fn derive_ipv6(&self, peer_identity: &EndpointId) -> Ipv6Addr {
+        derive_ipv6(peer_identity)
     }
 }
 
@@ -462,6 +501,46 @@ mod tests {
             assert_ne!(ip, reserved1);
             assert_ne!(ip, reserved2);
         }
+    }
+
+    #[test]
+    fn test_derive_ip_with_index_zero_matches_derive_ip() {
+        for i in 0..=255u8 {
+            let id = test_id(i);
+            assert_eq!(derive_ip(&id), derive_ip_with_index(&id, 0));
+        }
+    }
+
+    #[test]
+    fn test_derive_ip_with_index_rotates() {
+        let id = test_id(1);
+        let ip0 = derive_ip_with_index(&id, 0);
+        let ip1 = derive_ip_with_index(&id, 1);
+        let ip2 = derive_ip_with_index(&id, 2);
+        assert_ne!(ip0, ip1);
+        assert_ne!(ip1, ip2);
+    }
+
+    #[test]
+    fn test_derive_ipv6_deterministic() {
+        let id = test_id(1);
+        assert_eq!(derive_ipv6(&id), derive_ipv6(&id));
+    }
+
+    #[test]
+    fn test_derive_ipv6_in_200_range() {
+        for i in 0..=255u8 {
+            let ipv6 = derive_ipv6(&test_id(i));
+            let octets = ipv6.octets();
+            assert_eq!(octets[0], 0x02, "first byte must be 0x02 for 200::/7");
+        }
+    }
+
+    #[test]
+    fn test_derive_ipv6_different_identities_differ() {
+        let a = derive_ipv6(&test_id(1));
+        let b = derive_ipv6(&test_id(2));
+        assert_ne!(a, b);
     }
 
     #[test]

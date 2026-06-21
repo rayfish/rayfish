@@ -3,9 +3,9 @@
 //! The device is immediately split into [`TunReader`] and [`TunWriter`] halves
 //! so that reads and writes can happen concurrently without locking.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tun::{Configuration, DeviceReader, DeviceWriter};
 
@@ -65,13 +65,14 @@ pub fn check_cgnat_conflict() -> Result<()> {
     Ok(())
 }
 
-/// Creates a TUN device with the given virtual IP and /10 netmask (100.64.0.0/10),
-/// then splits it into independent read/write halves.
-pub fn create(addr: Ipv4Addr) -> Result<(TunReader, TunWriter)> {
+/// Creates a TUN device with the given virtual IPs and splits it into
+/// independent read/write halves. IPv4 gets a /10 netmask (100.64.0.0/10),
+/// IPv6 gets a /128 host address in the `200::/7` range.
+pub fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
     let gateway = Ipv4Addr::new(100, 64, 0, 1);
     let mut config = Configuration::default();
     config
-        .address(addr)
+        .address(v4)
         .destination(gateway)
         .netmask((255, 192, 0, 0)) // /10
         .mtu(TUN_MTU)
@@ -83,10 +84,36 @@ pub fn create(addr: Ipv4Addr) -> Result<(TunReader, TunWriter)> {
     });
 
     let device = tun::create_as_async(&config)?;
-    tracing::info!(%addr, "TUN device created");
+    let tun_name = device.as_ref().tun_name()
+        .unwrap_or_else(|_| "unknown".to_string());
+    tracing::info!(addr = %v4, ipv6 = %v6, tun = %tun_name, "TUN device created");
+
+    if let Err(e) = add_ipv6_address(&tun_name, v6) {
+        tracing::warn!(error = %e, "failed to add IPv6 address to TUN (IPv6 routing will not work)");
+    }
 
     let (writer, reader) = device.split()?;
-    Ok((TunReader { reader }, TunWriter { writer }))
+    Ok((TunReader { reader }, TunWriter { writer }, tun_name))
+}
+
+fn add_ipv6_address(tun_name: &str, addr: Ipv6Addr) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("ifconfig")
+            .args([tun_name, "inet6", &addr.to_string(), "prefixlen", "128"])
+            .status()
+            .context("run ifconfig")?;
+        anyhow::ensure!(status.success(), "ifconfig inet6 failed with {status}");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::process::Command::new("ip")
+            .args(["-6", "addr", "add", &format!("{addr}/128"), "dev", tun_name])
+            .status()
+            .context("run ip -6 addr add")?;
+        anyhow::ensure!(status.success(), "ip -6 addr add failed with {status}");
+    }
+    Ok(())
 }
 
 impl TunReader {

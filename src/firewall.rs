@@ -31,7 +31,7 @@
 //! Explicit rules always win (first-match). Established return traffic only
 //! bypasses the *default* action, never an explicit rule.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -120,9 +120,9 @@ const UDP_FLOW_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct Flow {
     proto: u8,
-    local_ip: Ipv4Addr,
+    local_ip: IpAddr,
     local_port: u16,
-    peer_ip: Ipv4Addr,
+    peer_ip: IpAddr,
     peer_port: u16,
 }
 
@@ -316,13 +316,13 @@ fn protocol_matches(filter: Protocol, ip_proto: u8) -> bool {
         Protocol::Any => true,
         Protocol::Tcp => ip_proto == 6,
         Protocol::Udp => ip_proto == 17,
-        Protocol::Icmp => ip_proto == 1,
+        Protocol::Icmp => ip_proto == 1 || ip_proto == 58, // ICMPv4 + ICMPv6
     }
 }
 
 pub struct PacketInfo {
-    pub src_ip: Ipv4Addr,
-    pub dst_ip: Ipv4Addr,
+    pub src_ip: IpAddr,
+    pub dst_ip: IpAddr,
     pub protocol: u8,
     pub src_port: u16,
     pub dst_port: u16,
@@ -333,10 +333,18 @@ pub struct PacketInfo {
 }
 
 pub fn parse_packet_info(packet: &[u8]) -> Option<PacketInfo> {
-    if packet.len() < 20 {
+    if packet.is_empty() {
         return None;
     }
-    if packet[0] >> 4 != 4 {
+    match packet[0] >> 4 {
+        4 => parse_ipv4(packet),
+        6 => parse_ipv6(packet),
+        _ => None,
+    }
+}
+
+fn parse_ipv4(packet: &[u8]) -> Option<PacketInfo> {
+    if packet.len() < 20 {
         return None;
     }
     let ihl = (packet[0] & 0x0F) as usize;
@@ -346,26 +354,51 @@ pub fn parse_packet_info(packet: &[u8]) -> Option<PacketInfo> {
     }
 
     let protocol = packet[9];
-    let src_ip = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
-    let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    let src_ip = IpAddr::V4(Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]));
+    let dst_ip = IpAddr::V4(Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]));
 
-    let (src_port, dst_port) = if (protocol == 6 || protocol == 17) && packet.len() >= header_len + 4 {
+    let (src_port, dst_port) = extract_ports(protocol, packet, header_len);
+    let tcp_flags = extract_tcp_flags(protocol, packet, header_len);
+
+    Some(PacketInfo { src_ip, dst_ip, protocol, src_port, dst_port, tcp_flags })
+}
+
+fn parse_ipv6(packet: &[u8]) -> Option<PacketInfo> {
+    if packet.len() < 40 {
+        return None;
+    }
+    let protocol = packet[6]; // Next Header
+    let mut src_octets = [0u8; 16];
+    let mut dst_octets = [0u8; 16];
+    src_octets.copy_from_slice(&packet[8..24]);
+    dst_octets.copy_from_slice(&packet[24..40]);
+    let src_ip = IpAddr::V6(Ipv6Addr::from(src_octets));
+    let dst_ip = IpAddr::V6(Ipv6Addr::from(dst_octets));
+
+    let header_len = 40; // fixed IPv6 header (extension headers not yet supported)
+    let (src_port, dst_port) = extract_ports(protocol, packet, header_len);
+    let tcp_flags = extract_tcp_flags(protocol, packet, header_len);
+
+    Some(PacketInfo { src_ip, dst_ip, protocol, src_port, dst_port, tcp_flags })
+}
+
+fn extract_ports(protocol: u8, packet: &[u8], header_len: usize) -> (u16, u16) {
+    if (protocol == 6 || protocol == 17) && packet.len() >= header_len + 4 {
         (
             u16::from_be_bytes([packet[header_len], packet[header_len + 1]]),
             u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]),
         )
     } else {
         (0, 0)
-    };
+    }
+}
 
-    // TCP flags live at byte 13 of the TCP header (byte 12 is data-offset/reserved).
-    let tcp_flags = if protocol == 6 && packet.len() >= header_len + 14 {
+fn extract_tcp_flags(protocol: u8, packet: &[u8], header_len: usize) -> u8 {
+    if protocol == 6 && packet.len() >= header_len + 14 {
         packet[header_len + 13]
     } else {
         0
-    };
-
-    Some(PacketInfo { src_ip, dst_ip, protocol, src_port, dst_port, tcp_flags })
+    }
 }
 
 pub fn firewall_path() -> Result<PathBuf> {
@@ -552,9 +585,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_not_ipv4() {
+    fn parse_ipv6_basic() {
         let mut pkt = vec![0u8; 40];
         pkt[0] = 0x60; // IPv6
+        pkt[6] = 17; // UDP next header
+        pkt[24] = 0x02; // dst starts with 0x02 (200::/7)
+        let info = parse_packet_info(&pkt).unwrap();
+        assert!(info.dst_ip.is_ipv6());
+        assert_eq!(info.protocol, 17);
+    }
+
+    #[test]
+    fn parse_not_ip() {
+        let pkt = vec![0x30; 40]; // version nibble 3
         assert!(parse_packet_info(&pkt).is_none());
     }
 

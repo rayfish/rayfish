@@ -29,7 +29,7 @@ use crate::ipc::{self, IpcRequest, IpcResponse, NetworkRole, NetworkStatus, Peer
 use crate::membership::{
     ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
     MemberList, MembershipPolicy, policy_for_mode, canonical_group_bytes,
-    group_blob_hash, verify_group_blob,
+    group_blob_hash, verify_group_blob, derive_ipv6,
 };
 use crate::network_name;
 use crate::peers::PeerTable;
@@ -273,7 +273,7 @@ impl DaemonState {
         {
             let mut table = self.hostname_table.write().await;
             let network_hosts = table.entry(name.clone()).or_default();
-            network_hosts.insert(my_hostname.clone(), my_ip);
+            network_hosts.insert(my_hostname.clone(), (my_ip, derive_ipv6(&self.identity.local_identity())));
         }
 
         let mut net_state = NetworkState {
@@ -409,6 +409,7 @@ impl DaemonState {
             name,
             network_key: net_public_key,
             my_ip,
+            my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
         })
     }
 
@@ -615,11 +616,11 @@ impl DaemonState {
         {
             let mut table = self.hostname_table.write().await;
             let network_hosts = table.entry(display_name.to_string()).or_default();
-            network_hosts.insert(my_hostname.clone(), my_ip);
+            network_hosts.insert(my_hostname.clone(), (my_ip, derive_ipv6(&self.identity.local_identity())));
             // Add any members with known hostnames
             for member in &data.members {
                 if let Some(ref h) = member.hostname {
-                    network_hosts.insert(h.clone(), member.ip);
+                    network_hosts.insert(h.clone(), (member.ip, derive_ipv6(&member.identity)));
                 }
             }
         }
@@ -629,6 +630,7 @@ impl DaemonState {
         Ok(IpcResponse::Joined {
             name: display_name.to_string(),
             my_ip,
+            my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
         })
     }
 
@@ -716,8 +718,8 @@ impl DaemonState {
                         let _ = control::send_msg(&mut s, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip, hostname: my_hostname.clone() }).await;
                     }
                     crate::spawn_path_logger(peer_conn.clone(), m.identity.fmt_short().to_string());
-                    self.peers.add(m.ip, peer_conn.clone(), m.identity, network_name);
-                    forward::spawn_peer_reader(peer_conn, m.identity, m.ip, self.endpoint.id(), network_name.to_string(), self.shared_acl.clone(), self.firewall.clone(), self.tun_tx.clone(), disconnect_tx.clone(), cancel.clone(), self.stats.clone());
+                    self.peers.add(m.ip, derive_ipv6(&m.identity), peer_conn.clone(), m.identity, network_name);
+                    forward::spawn_peer_reader(peer_conn, m.identity, m.ip, derive_ipv6(&m.identity), self.endpoint.id(), network_name.to_string(), self.shared_acl.clone(), self.firewall.clone(), self.tun_tx.clone(), disconnect_tx.clone(), cancel.clone(), self.stats.clone());
                 }
             }
 
@@ -748,6 +750,7 @@ impl DaemonState {
             return Ok(IpcResponse::Joined {
                 name: network_name.to_string(),
                 my_ip,
+                my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
             });
         }
 
@@ -933,13 +936,13 @@ impl DaemonState {
             let members_snapshot: Vec<_> = {
                 let s = state.read().unwrap();
                 s.members.all().into_iter().filter_map(|m| {
-                    m.hostname.as_ref().map(|h| (h.clone(), m.ip))
+                    m.hostname.as_ref().map(|h| (h.clone(), m.ip, derive_ipv6(&m.identity)))
                 }).collect()
             };
             let mut table = self.hostname_table.write().await;
             let network_hosts = table.entry(name.to_string()).or_default();
-            for (hostname, ip) in members_snapshot {
-                network_hosts.insert(hostname, ip);
+            for (hostname, ip, ipv6) in members_snapshot {
+                network_hosts.insert(hostname, (ip, ipv6));
             }
         }
 
@@ -961,6 +964,7 @@ impl DaemonState {
             name: name.to_string(),
             network_key: net_public_key,
             my_ip,
+            my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
         })
     }
 
@@ -1057,21 +1061,22 @@ impl DaemonState {
             let peers = peer_entries.into_iter().map(|(eid, ip, conn)| {
                 let hostname = hostname_snapshot.as_ref().and_then(|table| {
                     table.get(&h.name).and_then(|hosts| {
-                        hosts.iter().find(|(_, v)| **v == ip).map(|(k, _)| k.clone())
+                        hosts.iter().find(|(_, v)| v.0 == ip).map(|(k, _)| k.clone())
                     })
                 });
                 let connection = Self::gather_conn_info(&conn);
-                PeerStatus { endpoint_id: eid, ip, hostname, connection: Some(connection) }
+                PeerStatus { endpoint_id: eid, ip, ipv6: Some(derive_ipv6(&eid)), hostname, connection: Some(connection) }
             }).collect();
             let my_hostname = hostname_snapshot.as_ref().and_then(|table| {
                 table.get(&h.name).and_then(|hosts| {
-                    hosts.iter().find(|(_, v)| **v == h.my_ip).map(|(k, _)| k.clone())
+                    hosts.iter().find(|(_, v)| v.0 == h.my_ip).map(|(k, _)| k.clone())
                 })
             });
             NetworkStatus {
                 name: h.name.clone(),
                 role: h.role.clone(),
                 my_ip: h.my_ip,
+                my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
                 my_hostname,
                 network_key,
                 member_count,
@@ -1154,8 +1159,8 @@ impl DaemonState {
         // Update DNS table: remove old entry for our IP, insert new one
         if let Ok(mut table) = self.hostname_table.try_write() {
             let hosts = table.entry(network.to_string()).or_default();
-            hosts.retain(|_, ip| *ip != my_ip);
-            hosts.insert(new_hostname.clone(), my_ip);
+            hosts.retain(|_, addr| addr.0 != my_ip);
+            hosts.insert(new_hostname.clone(), (my_ip, derive_ipv6(&self.identity.local_identity())));
         }
 
         // Persist to config
@@ -1544,7 +1549,8 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     tun::check_cgnat_conflict()?;
 
     // Single TUN for all networks
-    let (tun_reader, tun_writer) = tun::create(my_ip).context("failed to create TUN device")?;
+    let my_ipv6 = derive_ipv6(&identity.local_identity());
+    let (tun_reader, tun_writer, _tun_name) = tun::create(my_ip, my_ipv6).context("failed to create TUN device")?;
     let peers = PeerTable::new();
     let shared_acl = forward::SharedAcl::new();
     let fw_config = firewall::load_firewall().unwrap_or_else(|e| {
@@ -1665,7 +1671,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
             let daemon_c = daemon.clone();
             tokio::spawn(async move {
                 match daemon_c.join_network_inner(&net_pubkey, Some(&name), persisted_hostname).await {
-                    Ok(IpcResponse::Joined { name, my_ip }) => {
+                    Ok(IpcResponse::Joined { name, my_ip, .. }) => {
                         tracing::info!(network = %name, ip = %my_ip, "restored member network");
                     }
                     Ok(IpcResponse::Error { message }) => {
@@ -1888,7 +1894,7 @@ fn spawn_group_poller(
                 if !new_member_ids.contains(old_id) {
                     let s = state.read().unwrap();
                     if let Some(member) = s.members.get(old_id) {
-                        peers.remove(&member.ip);
+                        peers.remove(&member.ip, &derive_ipv6(old_id));
                         tracing::info!(peer = %old_id.fmt_short(), "removed kicked peer");
                     }
                 }
@@ -1928,7 +1934,7 @@ fn spawn_peer_cleanup(
                     match event {
                         Some(ev) => {
                             tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, "removing dead peer");
-                            peers.remove(&ev.ip);
+                            peers.remove(&ev.ip, &ev.ipv6);
                         }
                         None => return,
                     }
@@ -2027,7 +2033,8 @@ async fn run_accept_loop(
             tracing::info!(ip = %peer_ip, "known member reconnecting");
             let members: Vec<Member> = state.read().unwrap().members.all().into_iter().cloned().collect();
             crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
-            peers.add(peer_ip, conn.clone(), remote_id, network_name);
+            let peer_ipv6 = derive_ipv6(&remote_id);
+            peers.add(peer_ip, peer_ipv6, conn.clone(), remote_id, network_name);
             let token_c = token.clone();
             let stats_c = stats.clone();
             let tun_tx_c = tun_tx.clone();
@@ -2042,7 +2049,7 @@ async fn run_accept_loop(
             tokio::spawn(async move {
                 send_member_sync(&conn, &members).await;
                 spawn_coordinator_hello_reader(conn.clone(), remote_id, peer_ip, &network_name_c, state_c, hostname_table_c).await;
-                forward::spawn_peer_reader(conn, remote_id, peer_ip, local_id, network_c, shared_acl_c, firewall_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
+                forward::spawn_peer_reader(conn, remote_id, peer_ip, peer_ipv6, local_id, network_c, shared_acl_c, firewall_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
             });
             continue;
         }
@@ -2074,7 +2081,8 @@ async fn run_accept_loop(
                 }).await;
             }
             broadcast_member_sync(&peers, &members, Some(peer_ip)).await;
-            peers.add(peer_ip, conn.clone(), remote_id, network_name);
+            let peer_ipv6 = derive_ipv6(&remote_id);
+            peers.add(peer_ip, peer_ipv6, conn.clone(), remote_id, network_name);
             let token_c = token.clone();
             let stats_c = stats.clone();
             let tun_tx_c = tun_tx.clone();
@@ -2091,7 +2099,7 @@ async fn run_accept_loop(
             tokio::spawn(async move {
                 spawn_coordinator_hello_reader(conn.clone(), remote_id, peer_ip, &network_name_c, state_c.clone(), hostname_table_c).await;
                 update_snapshot_and_publish(&state_c, &blob_store_c, &dht_notify_c).await;
-                forward::spawn_peer_reader(conn, remote_id, peer_ip, local_id, network_c, shared_acl_c, firewall_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
+                forward::spawn_peer_reader(conn, remote_id, peer_ip, peer_ipv6, local_id, network_c, shared_acl_c, firewall_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
             });
             continue;
         }
@@ -2170,7 +2178,8 @@ async fn run_accept_loop(
             }).await;
         }
         broadcast_member_sync(&peers, &members, Some(peer_ip)).await;
-        peers.add(peer_ip, conn.clone(), remote_id, network_name);
+        let peer_ipv6 = derive_ipv6(&remote_id);
+        peers.add(peer_ip, peer_ipv6, conn.clone(), remote_id, network_name);
         let token_c = token.clone();
         let stats_c = stats.clone();
         let tun_tx_c = tun_tx.clone();
@@ -2187,7 +2196,7 @@ async fn run_accept_loop(
         tokio::spawn(async move {
             spawn_coordinator_hello_reader(conn.clone(), remote_id, peer_ip, &network_name_c, state_c.clone(), hostname_table_c).await;
             update_snapshot_and_publish(&state_c, &blob_store_c, &dht_notify_c).await;
-            forward::spawn_peer_reader(conn, remote_id, peer_ip, local_id, network_c, shared_acl_c, firewall_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
+            forward::spawn_peer_reader(conn, remote_id, peer_ip, peer_ipv6, local_id, network_c, shared_acl_c, firewall_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
         });
     }
 }
@@ -2227,7 +2236,7 @@ async fn spawn_coordinator_hello_reader(
             {
                 let mut table = hostname_table.write().await;
                 let network_hosts = table.entry(network_name.to_string()).or_default();
-                network_hosts.insert(final_hostname, peer_ip);
+                network_hosts.insert(final_hostname, (peer_ip, derive_ipv6(&remote_id)));
             }
         }
         Ok(())
@@ -2336,9 +2345,10 @@ async fn join_mesh_shared(
     let remote_id = initial_conn.remote_id();
     let remote_ip = identity.derive_ip(&remote_id);
     crate::spawn_path_logger(initial_conn.clone(), remote_id.fmt_short().to_string());
-    peers.add(remote_ip, initial_conn.clone(), remote_id, network_name);
+    let remote_ipv6 = derive_ipv6(&remote_id);
+    peers.add(remote_ip, remote_ipv6, initial_conn.clone(), remote_id, network_name);
     forward::spawn_peer_reader(
-        initial_conn.clone(), remote_id, remote_ip,
+        initial_conn.clone(), remote_id, remote_ip, remote_ipv6,
         ep.id(), network_name.to_string(), shared_acl.clone(), firewall.clone(),
         tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone(),
     );
@@ -2352,8 +2362,9 @@ async fn join_mesh_shared(
             Ok(conn) => {
                 let (mut send, _recv) = conn.open_bi().await?;
                 control::send_msg(&mut send, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip, hostname: my_hostname.clone() }).await?;
-                peers.add(member.ip, conn.clone(), member.identity, network_name);
-                forward::spawn_peer_reader(conn, member.identity, member.ip, ep.id(), network_name.to_string(), shared_acl.clone(), firewall.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
+                let member_ipv6 = derive_ipv6(&member.identity);
+                peers.add(member.ip, member_ipv6, conn.clone(), member.identity, network_name);
+                forward::spawn_peer_reader(conn, member.identity, member.ip, member_ipv6, ep.id(), network_name.to_string(), shared_acl.clone(), firewall.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                 tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
             }
             Err(e) => {
@@ -2514,7 +2525,7 @@ async fn join_mesh_shared(
                             if let Some(ref h) = final_hostname {
                                 let mut table = hostname_table.write().await;
                                 let network_hosts = table.entry(network_name.clone()).or_default();
-                                network_hosts.insert(h.clone(), ip);
+                                network_hosts.insert(h.clone(), (ip, derive_ipv6(&peer_identity)));
                             }
                             if is_approved {
                                 let snap_bytes = {
@@ -2537,8 +2548,9 @@ async fn join_mesh_shared(
                                         members: members.clone(), approved: approved_list,
                                     }).await;
                                 }
-                                peers.add(ip, conn.clone(), peer_identity, &network_name);
-                                forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), firewall.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
+                                let peer_ipv6 = derive_ipv6(&peer_identity);
+                                peers.add(ip, peer_ipv6, conn.clone(), peer_identity, &network_name);
+                                forward::spawn_peer_reader(conn, peer_identity, ip, peer_ipv6, ep.id(), network_name.clone(), shared_acl.clone(), firewall.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                                 broadcast_member_sync(&peers, &members, Some(ip)).await;
                             } else if is_member {
                                 // Update hostname for existing member
@@ -2548,20 +2560,22 @@ async fn join_mesh_shared(
                                         m.hostname = final_hostname;
                                     }
                                 }
-                                peers.add(ip, conn.clone(), peer_identity, &network_name);
-                                forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), firewall.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
+                                let peer_ipv6 = derive_ipv6(&peer_identity);
+                                peers.add(ip, peer_ipv6, conn.clone(), peer_identity, &network_name);
+                                forward::spawn_peer_reader(conn, peer_identity, ip, peer_ipv6, ep.id(), network_name.clone(), shared_acl.clone(), firewall.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                             }
                         }
                         Ok(ControlMsg::ReconnectRequest { identity: peer_identity, ip }) => {
                             if peer_identity != transport_id { continue; }
                             let is_known = live_state.read().unwrap().members.is_member(&peer_identity);
                             if is_known {
-                                peers.add(ip, conn.clone(), peer_identity, &network_name);
+                                let peer_ipv6 = derive_ipv6(&peer_identity);
+                                peers.add(ip, peer_ipv6, conn.clone(), peer_identity, &network_name);
                                 let current_members: Vec<Member> = live_state.read().unwrap().members.all().into_iter().cloned().collect();
                                 if let Ok((mut send, _)) = conn.open_bi().await {
                                     let _ = control::send_msg(&mut send, &ControlMsg::MemberSync { members: current_members }).await;
                                 }
-                                forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), firewall.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
+                                forward::spawn_peer_reader(conn, peer_identity, ip, peer_ipv6, ep.id(), network_name.clone(), shared_acl.clone(), firewall.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                             }
                         }
                         _ => {}
@@ -2602,8 +2616,9 @@ fn spawn_reconnect_loop(
             };
             let peer_id = event.endpoint_id;
             let peer_ip = event.ip;
+            let peer_ipv6 = event.ipv6;
             tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "peer disconnected, will reconnect");
-            peers.remove(&peer_ip);
+            peers.remove(&peer_ip, &peer_ipv6);
 
             let ep = ep.clone();
             let alpn = alpn.clone();
@@ -2639,8 +2654,8 @@ fn spawn_reconnect_loop(
                                 continue;
                             }
                             tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "reconnected to peer");
-                            peers.add(peer_ip, conn.clone(), peer_id, &network_name);
-                            forward::spawn_peer_reader(conn, peer_id, peer_ip, my_identity, network_name, shared_acl, firewall, tun_tx, disconnect_tx, token, stats);
+                            peers.add(peer_ip, peer_ipv6, conn.clone(), peer_id, &network_name);
+                            forward::spawn_peer_reader(conn, peer_id, peer_ip, peer_ipv6, my_identity, network_name, shared_acl, firewall, tun_tx, disconnect_tx, token, stats);
                             return;
                         }
                         Err(e) => { tracing::debug!(error = %e, "reconnect attempt failed"); }
