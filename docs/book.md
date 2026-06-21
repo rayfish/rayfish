@@ -558,10 +558,10 @@ The endpoint is created with:
 Each pitopi network gets its own ALPN (Application-Layer Protocol Negotiation) string:
 
 ```
-pitopi/net/<network-name>
+pitopi/net/<pubkey-prefix>
 ```
 
-For example, `pitopi/net/gaming` or `pitopi/net/work`. When a connection arrives, pitopi checks the ALPN to determine which network it belongs to and routes it accordingly.
+The ALPN uses the first 16 hex characters of the network's public key. For example, `pitopi/net/aa8bc368fec8c227`. When a connection arrives, pitopi checks the ALPN to determine which network it belongs to and routes it accordingly. Since the ALPN is derived from the public key (which all peers share via the join code), it matches regardless of local aliases.
 
 This allows a single iroh endpoint to participate in multiple networks without interference. Connection attempts for one network are invisible to another.
 
@@ -1402,7 +1402,7 @@ When a user runs `pitopi create` (optionally with `--mode open`), the CLI sends 
 
 4. **Generate per-network keypair.** Create a random `SecretKey` — this is the network's signing key. Its public key becomes the join code.
 
-5. **Update ALPNs.** Call `endpoint.set_alpns()` to add `pitopi/net/<name>` to the shared endpoint.
+5. **Update ALPNs.** Call `endpoint.set_alpns()` to add `pitopi/net/<pubkey-prefix>` to the shared endpoint.
 
 6. **Initialize membership.** Create a `MemberList` with self as the only member (marked `is_coordinator: true`). Create the membership policy based on the mode.
 
@@ -1582,7 +1582,7 @@ The daemon accepts one connection at a time, reads a request, processes it, and 
 
 ### Dynamic ALPN management
 
-The key enabler for runtime network management is `Endpoint::set_alpns()`. When a network is created or joined, its ALPN (`pitopi/net/<name>`) is added to the endpoint. When a network is left, the ALPN is removed. The shared accept loop dispatches incoming connections to the correct network handler based on the ALPN.
+The key enabler for runtime network management is `Endpoint::set_alpns()`. When a network is created or joined, its ALPN (`pitopi/net/<pubkey-prefix>`) is added to the endpoint. When a network is left, the ALPN is removed. The shared accept loop dispatches incoming connections to the correct network handler based on the ALPN.
 
 ### Network teardown (`leave`)
 

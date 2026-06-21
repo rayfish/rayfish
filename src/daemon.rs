@@ -36,6 +36,31 @@ use crate::tun;
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+struct ConnRouter {
+    routes: std::sync::RwLock<HashMap<Vec<u8>, mpsc::Sender<Connection>>>,
+}
+
+impl ConnRouter {
+    fn new() -> Self {
+        Self { routes: std::sync::RwLock::new(HashMap::new()) }
+    }
+
+    fn register(&self, alpn: Vec<u8>) -> mpsc::Receiver<Connection> {
+        let (tx, rx) = mpsc::channel(32);
+        self.routes.write().unwrap().insert(alpn, tx);
+        rx
+    }
+
+    #[allow(dead_code)]
+    fn unregister(&self, alpn: &[u8]) {
+        self.routes.write().unwrap().remove(alpn);
+    }
+
+    fn route(&self, alpn: &[u8]) -> Option<mpsc::Sender<Connection>> {
+        self.routes.read().unwrap().get(alpn).cloned()
+    }
+}
+
 #[derive(Clone)]
 struct GroupSnapshot {
     hash: String,
@@ -62,6 +87,7 @@ impl NetworkState {
 #[allow(dead_code)]
 pub struct NetworkHandle {
     name: String,
+    network_key: String,
     role: NetworkRole,
     my_ip: Ipv4Addr,
     state: Arc<std::sync::RwLock<NetworkState>>,
@@ -80,16 +106,19 @@ pub struct DaemonState {
     blob_store: FsStore,
     blobs_proto: BlobsProtocol,
     shared_acl: forward::SharedAcl,
+    conn_router: Arc<ConnRouter>,
 }
 
 impl DaemonState {
     fn refresh_alpns(&self) {
         let networks = self.networks.read().unwrap();
         let mut alpns: Vec<Vec<u8>> = networks
-            .keys()
-            .map(|n| transport::network_alpn(n))
+            .values()
+            .map(|h| transport::network_alpn(&h.network_key))
             .collect();
         alpns.push(iroh_blobs::protocol::ALPN.to_vec());
+        let alpn_strs: Vec<String> = alpns.iter().map(|a| String::from_utf8_lossy(a).to_string()).collect();
+        tracing::info!(alpns = ?alpn_strs, "refreshing ALPNs");
         self.endpoint.set_alpns(alpns);
     }
 
@@ -237,9 +266,12 @@ impl DaemonState {
         tasks.push(spawn_peer_cleanup(disconnect_rx, self.peers.clone(), cancel.clone()));
 
         // Accept loop for this network
+        let network_key = net_public_key.to_string();
+        let conn_rx = self.conn_router.register(transport::network_alpn(&network_key));
         let accept_handle = spawn_coordinator_accept(
             self.endpoint.clone(),
             name.clone(),
+            conn_rx,
             self.identity.clone(),
             policy,
             state.clone(),
@@ -250,7 +282,6 @@ impl DaemonState {
             self.stats.clone(),
             Some(dht_notify),
             self.blob_store.clone(),
-            self.blobs_proto.clone(),
             self.shared_acl.clone(),
         );
         tasks.push(accept_handle);
@@ -258,6 +289,7 @@ impl DaemonState {
         // Update ALPNs
         let handle = NetworkHandle {
             name: name.clone(),
+            network_key: network_key.clone(),
             role: NetworkRole::Coordinator,
             my_ip,
             state,
@@ -287,13 +319,12 @@ impl DaemonState {
     async fn join_network_inner(&self, network_key: &str, alias: Option<&str>) -> Result<IpcResponse> {
         let net_pubkey: EndpointId = network_key.parse()
             .context("invalid network key")?;
-        let name = alias.unwrap_or(network_key);
 
-        {
+        if let Some(a) = alias {
             let networks = self.networks.read().unwrap();
-            if networks.contains_key(name) {
+            if networks.contains_key(a) {
                 return Ok(IpcResponse::Error {
-                    message: format!("already in network '{name}'"),
+                    message: format!("already in network '{a}'"),
                 });
             }
         }
@@ -332,10 +363,24 @@ impl DaemonState {
 
         let data = group_blob.context("could not fetch group blob from any peer")?;
 
-        let alpn = transport::network_alpn(name);
+        let alpn = transport::network_alpn(network_key);
         let my_ip = self.identity.local_ip();
+        // Local alias for display/config (defaults to truncated key)
+        let default_name = &network_key[..network_key.len().min(8)];
+        let display_name = alias.unwrap_or(default_name);
+
+        // Check for duplicate after resolving the display name
+        {
+            let networks = self.networks.read().unwrap();
+            if networks.contains_key(display_name) {
+                return Ok(IpcResponse::Error {
+                    message: format!("already in network '{display_name}'"),
+                });
+            }
+        }
 
         // Connect to the first reachable peer
+        tracing::info!(alpn = %String::from_utf8_lossy(&alpn), peers = peer_ids.len(), "connecting to seed peers");
         let mut initial_conn = None;
         for peer_id in &peer_ids {
             if *peer_id == self.endpoint.id() { continue; }
@@ -345,7 +390,7 @@ impl DaemonState {
                     break;
                 }
                 Err(e) => {
-                    tracing::warn!(peer = %peer_id.fmt_short(), error = %e, "failed to connect to seed peer");
+                    tracing::warn!(peer = %peer_id.fmt_short(), error = ?e, "failed to connect to seed peer");
                 }
             }
         }
@@ -376,7 +421,7 @@ impl DaemonState {
             disconnect_rx,
             self.endpoint.clone(),
             alpn.clone(),
-            name.to_string(),
+            display_name.to_string(),
             self.identity.local_identity(),
             my_ip,
             self.peers.clone(),
@@ -388,12 +433,13 @@ impl DaemonState {
         )];
 
         // Apply ACL from group blob
-        self.shared_acl.set(name, data.acl.clone());
+        self.shared_acl.set(display_name, data.acl.clone());
 
+        let conn_rx = self.conn_router.register(alpn.clone());
         let state = join_mesh_shared(
             conn,
             &self.endpoint,
-            name,
+            display_name,
             &self.identity,
             &alpn,
             self.peers.clone(),
@@ -402,9 +448,9 @@ impl DaemonState {
             cancel.clone(),
             self.stats.clone(),
             self.blob_store.clone(),
-            self.blobs_proto.clone(),
             self.shared_acl.clone(),
             net_pubkey,
+            conn_rx,
         ).await?;
 
         // Set the network public key and ACL on the state
@@ -419,9 +465,9 @@ impl DaemonState {
             let _ = self.blob_store.blobs().add_slice(&bytes).await;
         }
 
-        // Save config with network public key
+        // Save config with network public key (use display_name for config)
         if let Ok(mut app_config) = config::load() {
-            if let Some(net) = app_config.networks.iter_mut().find(|n| n.name == name) {
+            if let Some(net) = app_config.networks.iter_mut().find(|n| n.name == display_name) {
                 net.network_public_key = Some(net_pubkey.to_string());
             }
             let _ = config::save(&app_config);
@@ -437,27 +483,28 @@ impl DaemonState {
                 self.endpoint.clone(),
                 self.blob_store.clone(),
                 self.peers.clone(),
-                name.to_string(),
+                display_name.to_string(),
                 self.shared_acl.clone(),
                 cancel.clone(),
             ));
         }
 
         let handle = NetworkHandle {
-            name: name.to_string(),
+            name: display_name.to_string(),
+            network_key: network_key.to_string(),
             role: NetworkRole::Member,
             my_ip,
             state,
             cancel,
             tasks,
         };
-        self.networks.write().unwrap().insert(name.to_string(), handle);
+        self.networks.write().unwrap().insert(display_name.to_string(), handle);
         self.refresh_alpns();
 
-        tracing::info!(network = %name, ip = %my_ip, "joined network");
+        tracing::info!(network = %display_name, key = %network_key, ip = %my_ip, "joined network");
 
         Ok(IpcResponse::Joined {
-            name: name.to_string(),
+            name: display_name.to_string(),
             my_ip,
         })
     }
@@ -565,6 +612,7 @@ impl DaemonState {
 
             let handle = NetworkHandle {
                 name: network_name.to_string(),
+                network_key: net_pubkey.to_string(),
                 role: NetworkRole::Member,
                 my_ip,
                 state: live_state,
@@ -733,9 +781,11 @@ impl DaemonState {
             self.shared_acl.set(name, s.acl.clone());
         }
 
+        let conn_rx = self.conn_router.register(transport::network_alpn(&net_public_key.to_string()));
         let accept_handle = spawn_coordinator_accept(
             self.endpoint.clone(),
             name.to_string(),
+            conn_rx,
             self.identity.clone(),
             policy,
             state.clone(),
@@ -746,13 +796,13 @@ impl DaemonState {
             self.stats.clone(),
             Some(dht_notify),
             self.blob_store.clone(),
-            self.blobs_proto.clone(),
             self.shared_acl.clone(),
         );
         tasks.push(accept_handle);
 
         let handle = NetworkHandle {
             name: name.to_string(),
+            network_key: net_public_key.to_string(),
             role: NetworkRole::Coordinator,
             my_ip,
             state,
@@ -1128,7 +1178,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
     let mut alpns: Vec<Vec<u8>> = app_config
         .networks
         .iter()
-        .map(|net| transport::network_alpn(&net.name))
+        .filter_map(|net| net.network_public_key.as_ref().map(|k| transport::network_alpn(k)))
         .collect();
 
     alpns.push(iroh_blobs::protocol::ALPN.to_vec());
@@ -1161,6 +1211,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
         stats.clone(),
     ));
 
+    let conn_router = Arc::new(ConnRouter::new());
     let daemon = Arc::new(DaemonState {
         endpoint: ep,
         identity,
@@ -1172,13 +1223,75 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
         blob_store,
         blobs_proto,
         shared_acl,
+        conn_router: conn_router.clone(),
     });
+
+    // Single global accept loop — routes connections by ALPN to per-network handlers
+    {
+        let ep = daemon.endpoint.clone();
+        let blobs_proto = daemon.blobs_proto.clone();
+        let router = conn_router.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => return,
+                    incoming = ep.accept() => {
+                        let Some(incoming) = incoming else { return };
+                        let router = router.clone();
+                        let blobs_proto = blobs_proto.clone();
+                        tokio::spawn(async move {
+                            let conn = match incoming.await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::debug!(error = ?e, "incoming handshake failed");
+                                    return;
+                                }
+                            };
+                            let alpn = conn.alpn().to_vec();
+                            if alpn == iroh_blobs::protocol::ALPN {
+                                let _ = blobs_proto.accept(conn).await;
+                                return;
+                            }
+                            if let Some(tx) = router.route(&alpn) {
+                                let _ = tx.send(conn).await;
+                            } else {
+                                tracing::warn!(
+                                    alpn = %String::from_utf8_lossy(&alpn),
+                                    "no handler for ALPN"
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+        });
+    }
 
     tracing::info!(ip = %my_ip, id = %daemon.endpoint.id().fmt_short(), "daemon started");
 
     // Restore saved networks
     for net in &app_config.networks {
-        if net.my_ip.is_some() {
+        if net.network_secret_key.is_some() {
+            // We have the secret key — restore as coordinator
+            let name = net.name.clone();
+            let mode = net.group_mode;
+            let daemon_c = daemon.clone();
+            tokio::spawn(async move {
+                match daemon_c.restore_coordinator_network(&name, mode).await {
+                    Ok(IpcResponse::Created { name, .. }) => {
+                        tracing::info!(network = %name, "restored coordinator network");
+                    }
+                    Ok(IpcResponse::Error { message }) => {
+                        tracing::warn!(network = %name, error = %message, "failed to restore network");
+                    }
+                    Err(e) => {
+                        tracing::warn!(network = %name, error = %e, "failed to restore network");
+                    }
+                    _ => {}
+                }
+            });
+        } else {
             // We're a member — rejoin via DHT lookup
             let name = net.name.clone();
             let net_pubkey = match &net.network_public_key {
@@ -1193,25 +1306,6 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
                 match daemon_c.join_network_inner(&net_pubkey, Some(&name)).await {
                     Ok(IpcResponse::Joined { name, my_ip }) => {
                         tracing::info!(network = %name, ip = %my_ip, "restored member network");
-                    }
-                    Ok(IpcResponse::Error { message }) => {
-                        tracing::warn!(network = %name, error = %message, "failed to restore network");
-                    }
-                    Err(e) => {
-                        tracing::warn!(network = %name, error = %e, "failed to restore network");
-                    }
-                    _ => {}
-                }
-            });
-        } else {
-            // We're the coordinator — restore with existing name
-            let name = net.name.clone();
-            let mode = net.group_mode;
-            let daemon_c = daemon.clone();
-            tokio::spawn(async move {
-                match daemon_c.restore_coordinator_network(&name, mode).await {
-                    Ok(IpcResponse::Created { name, .. }) => {
-                        tracing::info!(network = %name, "restored coordinator network");
                     }
                     Ok(IpcResponse::Error { message }) => {
                         tracing::warn!(network = %name, error = %message, "failed to restore network");
@@ -1489,6 +1583,7 @@ fn spawn_peer_cleanup(
 fn spawn_coordinator_accept(
     ep: Endpoint,
     network_name: String,
+    conn_rx: mpsc::Receiver<Connection>,
     identity: IrohIdentityProvider,
     policy: Box<dyn MembershipPolicy>,
     state: Arc<std::sync::RwLock<NetworkState>>,
@@ -1499,14 +1594,13 @@ fn spawn_coordinator_accept(
     stats: Arc<Stats>,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
     blob_store: FsStore,
-    blobs_proto: BlobsProtocol,
     shared_acl: forward::SharedAcl,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = run_accept_loop(
             &ep,
-            &transport::network_alpn(&network_name),
             &network_name,
+            conn_rx,
             &identity,
             &*policy,
             state,
@@ -1517,7 +1611,6 @@ fn spawn_coordinator_accept(
             stats,
             dht_notify,
             blob_store,
-            blobs_proto,
             shared_acl,
         ).await {
             tracing::warn!(network = %network_name, error = %e, "accept loop stopped");
@@ -1528,8 +1621,8 @@ fn spawn_coordinator_accept(
 #[allow(clippy::too_many_arguments)]
 async fn run_accept_loop(
     ep: &Endpoint,
-    alpn: &[u8],
     network_name: &str,
+    mut conn_rx: mpsc::Receiver<Connection>,
     identity: &IrohIdentityProvider,
     policy: &dyn MembershipPolicy,
     state: Arc<std::sync::RwLock<NetworkState>>,
@@ -1540,7 +1633,6 @@ async fn run_accept_loop(
     stats: Arc<Stats>,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
     blob_store: FsStore,
-    blobs_proto: BlobsProtocol,
     shared_acl: forward::SharedAcl,
 ) -> Result<()> {
     let self_member = {
@@ -1553,23 +1645,10 @@ async fn run_accept_loop(
 
         let conn = tokio::select! {
             _ = token.cancelled() => return Ok(()),
-            result = transport::accept_connection_with_alpn(ep) => {
-                match result {
-                    Ok((conn, conn_alpn)) => {
-                        if conn_alpn == iroh_blobs::protocol::ALPN {
-                            let proto = blobs_proto.clone();
-                            tokio::spawn(async move { let _ = proto.accept(conn).await; });
-                            continue;
-                        }
-                        if conn_alpn != alpn {
-                            continue;
-                        }
-                        conn
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to accept connection");
-                        continue;
-                    }
+            msg = conn_rx.recv() => {
+                match msg {
+                    Some(conn) => conn,
+                    None => return Ok(()),
                 }
             }
         };
@@ -1740,9 +1819,9 @@ async fn join_mesh_shared(
     token: CancellationToken,
     stats: Arc<Stats>,
     blob_store: FsStore,
-    blobs_proto: BlobsProtocol,
     shared_acl: forward::SharedAcl,
     net_pubkey: EndpointId,
+    conn_rx: mpsc::Receiver<Connection>,
 ) -> Result<Arc<std::sync::RwLock<NetworkState>>> {
     let my_identity = identity.local_identity();
     let my_ip = identity.local_ip();
@@ -1932,78 +2011,73 @@ async fn join_mesh_shared(
         let stats = stats.clone();
         let tun_tx = tun_tx.clone();
         let disconnect_tx = disconnect_tx.clone();
-        let expected_alpn = alpn.to_vec();
         let live_state = live_state.clone();
         let network_name = network_name.to_string();
         let blob_store = blob_store.clone();
-        let blobs_proto = blobs_proto.clone();
         let shared_acl = shared_acl.clone();
+        let mut conn_rx = conn_rx;
         async move {
             loop {
-                tokio::select! {
+                let conn = tokio::select! {
                     _ = token.cancelled() => return,
-                    result = transport::accept_connection_with_alpn(&ep) => {
-                        if let Ok((conn, conn_alpn)) = result {
-                            if conn_alpn == iroh_blobs::protocol::ALPN {
-                                let proto = blobs_proto.clone();
-                                tokio::spawn(async move { let _ = proto.accept(conn).await; });
-                                continue;
-                            }
-                            if conn_alpn != expected_alpn { continue; }
-                            if let Ok((_send, mut recv)) = conn.accept_bi().await {
-                                let transport_id = conn.remote_id();
-                                match control::recv_msg(&mut recv).await {
-                                    Ok(ControlMsg::MeshHello { identity: peer_identity, ip }) => {
-                                        if peer_identity != transport_id { continue; }
-                                        let (is_member, is_approved) = {
-                                            let s = live_state.read().unwrap();
-                                            (s.members.is_member(&peer_identity), s.approved.is_approved(&peer_identity))
-                                        };
-                                        if is_approved {
-                                            let snap_bytes = {
-                                                let mut s = live_state.write().unwrap();
-                                                s.approved.remove(&peer_identity);
-                                                let _ = s.members.add(Member { identity: peer_identity, ip, is_coordinator: false });
-                                                s.refresh_snapshot();
-                                                s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
-                                            };
-                                            if let Some(bytes) = snap_bytes {
-                                                let _ = blob_store.blobs().add_slice(&bytes).await;
-                                            }
-                                            let (members, approved_list) = {
-                                                let s = live_state.read().unwrap();
-                                                (s.members.all().into_iter().cloned().collect::<Vec<_>>(),
-                                                 s.approved.all().into_iter().cloned().collect::<Vec<_>>())
-                                            };
-                                            if let Ok((mut send, _)) = conn.open_bi().await {
-                                                let _ = control::send_msg(&mut send, &ControlMsg::Welcome {
-                                                    members: members.clone(), approved: approved_list,
-                                                }).await;
-                                            }
-                                            peers.add(ip, conn.clone(), peer_identity, &network_name);
-                                            forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
-                                            broadcast_member_sync(&peers, &members, Some(ip)).await;
-                                        } else if is_member {
-                                            peers.add(ip, conn.clone(), peer_identity, &network_name);
-                                            forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
-                                        }
-                                    }
-                                    Ok(ControlMsg::ReconnectRequest { identity: peer_identity, ip }) => {
-                                        if peer_identity != transport_id { continue; }
-                                        let is_known = live_state.read().unwrap().members.is_member(&peer_identity);
-                                        if is_known {
-                                            peers.add(ip, conn.clone(), peer_identity, &network_name);
-                                            let current_members: Vec<Member> = live_state.read().unwrap().members.all().into_iter().cloned().collect();
-                                            if let Ok((mut send, _)) = conn.open_bi().await {
-                                                let _ = control::send_msg(&mut send, &ControlMsg::MemberSync { members: current_members }).await;
-                                            }
-                                            forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
-                                        }
-                                    }
-                                    _ => {}
+                    msg = conn_rx.recv() => {
+                        match msg {
+                            Some(c) => c,
+                            None => return,
+                        }
+                    }
+                };
+                if let Ok((_send, mut recv)) = conn.accept_bi().await {
+                    let transport_id = conn.remote_id();
+                    match control::recv_msg(&mut recv).await {
+                        Ok(ControlMsg::MeshHello { identity: peer_identity, ip }) => {
+                            if peer_identity != transport_id { continue; }
+                            let (is_member, is_approved) = {
+                                let s = live_state.read().unwrap();
+                                (s.members.is_member(&peer_identity), s.approved.is_approved(&peer_identity))
+                            };
+                            if is_approved {
+                                let snap_bytes = {
+                                    let mut s = live_state.write().unwrap();
+                                    s.approved.remove(&peer_identity);
+                                    let _ = s.members.add(Member { identity: peer_identity, ip, is_coordinator: false });
+                                    s.refresh_snapshot();
+                                    s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
+                                };
+                                if let Some(bytes) = snap_bytes {
+                                    let _ = blob_store.blobs().add_slice(&bytes).await;
                                 }
+                                let (members, approved_list) = {
+                                    let s = live_state.read().unwrap();
+                                    (s.members.all().into_iter().cloned().collect::<Vec<_>>(),
+                                     s.approved.all().into_iter().cloned().collect::<Vec<_>>())
+                                };
+                                if let Ok((mut send, _)) = conn.open_bi().await {
+                                    let _ = control::send_msg(&mut send, &ControlMsg::Welcome {
+                                        members: members.clone(), approved: approved_list,
+                                    }).await;
+                                }
+                                peers.add(ip, conn.clone(), peer_identity, &network_name);
+                                forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
+                                broadcast_member_sync(&peers, &members, Some(ip)).await;
+                            } else if is_member {
+                                peers.add(ip, conn.clone(), peer_identity, &network_name);
+                                forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                             }
                         }
+                        Ok(ControlMsg::ReconnectRequest { identity: peer_identity, ip }) => {
+                            if peer_identity != transport_id { continue; }
+                            let is_known = live_state.read().unwrap().members.is_member(&peer_identity);
+                            if is_known {
+                                peers.add(ip, conn.clone(), peer_identity, &network_name);
+                                let current_members: Vec<Member> = live_state.read().unwrap().members.all().into_iter().cloned().collect();
+                                if let Ok((mut send, _)) = conn.open_bi().await {
+                                    let _ = control::send_msg(&mut send, &ControlMsg::MemberSync { members: current_members }).await;
+                                }
+                                forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }

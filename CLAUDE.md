@@ -51,7 +51,8 @@ Only `daemon` (and its alias `up`) requires `sudo`. All other commands run unpri
 
 ```bash
 just cross                   # build for x86_64 Linux
-just deploy <ip>             # cross-build + install + create group + start daemon service
+just deploy <ip>             # cross-build (release) + install + create group + start daemon service
+just deploy-dev <ip>         # cross-build (debug) + install + start daemon service
 ```
 
 ## Architecture
@@ -63,8 +64,8 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 ### Modules
 
 - `src/main.rs` — thin CLI client (clap), IPC client functions, `spawn_path_logger`, service install/uninstall; `pitopi create` (generates network, prints join code), `pitopi join <public-key> [--name alias]`, `pitopi nuke <name>`, `pitopi acl <network> tag/untag/allow/remove/show/apply` subcommands
-- `src/daemon.rs` — daemon process: DaemonState (shared endpoint + TUN + PeerTable), NetworkHandle per active network, IPC server over Unix socket, coordinator accept loop, joiner mesh logic, reconnect loop, single DHT publisher (`spawn_network_publisher`), group poller (`spawn_group_poller`), three-word name generation, `nuke_network()`, `restore_coordinator_network()`, ACL state on NetworkHandle, IPC handlers for ACL commands, ACL included in GroupBlob, ACL load from file on startup, empty record publish on nuke
-- `src/network_name.rs` — three-word name generation: adjective-noun-noun word lists embedded at compile time, `generate_name()` (random selection via rand), `is_valid_name()` for validation
+- `src/daemon.rs` — daemon process: DaemonState (shared endpoint + TUN + PeerTable), NetworkHandle per active network, IPC server over Unix socket, coordinator accept loop, joiner mesh logic, reconnect loop, single DHT publisher (`spawn_network_publisher`), group poller (`spawn_group_poller`), local alias generation, `nuke_network()`, `restore_coordinator_network()`, ACL state on NetworkHandle, IPC handlers for ACL commands, ACL included in GroupBlob, ACL load from file on startup, empty record publish on nuke
+- `src/network_name.rs` — local alias generation: adjective-noun-noun word lists embedded at compile time, `generate_name()` (random selection via rand), `is_valid_name()` for validation
 - `src/ipc.rs` — IPC protocol types (IpcRequest, IpcResponse, NetworkStatus, PeerStatus), length-prefixed JSON wire helpers, socket path (`/var/run/pitopi/pitopi.sock`), client connect helper; `IpcRequest::Create` has no `name` field, `IpcRequest::Join { network_key, name: Option }`, `IpcRequest::Nuke { name, force }`, `IpcRequest::AclTag`, `AclUntag`, `AclAllow`, `AclRemove`, `AclShow`, `AclApply`; `IpcResponse::Created { name, network_key, my_ip }`, `IpcResponse::AclState`
 - `src/identity.rs` — persistent Ed25519 keypair at `~/.config/pitopi/secret_key`
 - `src/membership.rs` — IdentityProvider trait, FNV-1a IP derivation, MemberList, ApprovedList, GroupMode, MembershipPolicy, canonical msgpack serialization + blake3 hashing; `GroupBlob { members, approved, acl }`, `canonical_group_bytes()`, `group_blob_hash()`, `decode_group_blob()`, `verify_group_blob()`
@@ -82,7 +83,7 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 
 ### Key flows
 
-**Create (coordinator):** generates three-word name (adjective-noun-noun via `network_name::generate_name()`) → generates random per-network `SecretKey` → builds initial `GroupBlob` (self as member, empty approved, empty ACL) → serializes + blake3 hashes → publishes blob to iroh-blobs store → publishes single pkarr record (blob hash + seed peers) signed with network secret key → persists `network_secret_key` (hex) + `network_public_key` to config → spawns single `spawn_network_publisher` (replaces old 3-publisher model) → prints public key as the join code.
+**Create (coordinator):** generates local alias (three-word name via `network_name::generate_name()`) → generates random per-network `SecretKey` → builds initial `GroupBlob` (self as member, empty approved, empty ACL) → serializes + blake3 hashes → publishes blob to iroh-blobs store → publishes single pkarr record (blob hash + seed peers) signed with network secret key → persists `network_secret_key` (hex) + `network_public_key` to config → spawns `spawn_network_publisher` → prints public key as the join code.
 
 **Join:** parses public key join code → resolves single pkarr record (blob hash + seed peers) → connects to a seed peer, fetches GroupBlob via iroh-blobs → verifies `blake3(blob) == hash` → applies members, approved list, ACL from GroupBlob → connects to coordinator or mesh peer → receives Welcome (latest member list + approved list) → joiner checks own IP for collision → connects to each existing peer with MeshHello → spawns per-peer datagram readers → spawns `spawn_group_poller` to poll pkarr for blob updates.
 
@@ -100,9 +101,9 @@ A background `spawn_group_poller()` checks the pkarr record every 60s and fetche
 
 **Mesh forwarding:** TUN read loop extracts dest IP from IPv4 header bytes 16-19, looks up PeerTable, sends datagram on correct connection. Per-peer reader tasks write incoming datagrams to a shared TUN writer channel.
 
-**Network isolation:** each network gets its own ALPN (`pitopi/net/<name>`). A single shared iroh Endpoint accepts connections for all networks, filtering by ALPN on accept. Single TUN device with /10 netmask shared across networks.
+**Network isolation:** each network gets its own ALPN (`pitopi/net/<pubkey-prefix>`, first 16 hex chars of the network public key). A single shared iroh Endpoint accepts connections for all networks, filtering by ALPN on accept. Single TUN device with /10 netmask shared across networks.
 
-**Daemon/IPC:** `pitopi daemon` starts a long-lived root process that owns the iroh Endpoint, TUN device, and PeerTable. CLI commands (`create`, `join`, `leave`, `nuke`, `status`, `down`) connect via Unix socket IPC (`/var/run/pitopi/pitopi.sock`) using the same length-prefixed JSON wire format as `control.rs`. The daemon uses `Endpoint::set_alpns()` to dynamically add/remove network ALPNs at runtime. Each active network gets a `NetworkHandle` with a child `CancellationToken` for clean teardown on leave. `create` generates a three-word name and per-network keypair; `join` accepts a public key string and resolves it via pkarr; `nuke` publishes empty record before leaving.
+**Daemon/IPC:** `pitopi daemon` starts a long-lived root process that owns the iroh Endpoint, TUN device, and PeerTable. CLI commands (`create`, `join`, `leave`, `nuke`, `status`, `down`) connect via Unix socket IPC (`/var/run/pitopi/pitopi.sock`) using the same length-prefixed JSON wire format as `control.rs`. The daemon uses `Endpoint::set_alpns()` to dynamically add/remove network ALPNs at runtime. Each active network gets a `NetworkHandle` with a child `CancellationToken` for clean teardown on leave. `create` generates a per-network keypair and local alias; `join` accepts a public key string and resolves it via pkarr; `nuke` publishes empty record before leaving.
 
 ## Key Dependencies
 
@@ -111,7 +112,7 @@ A background `spawn_group_poller()` checks the pkarr record every 60s and fetche
 - `iroh-dns` — pkarr `SignedPacket` for DHT membership records
 - `blake3` — GroupBlob hashing, data integrity verification
 - `hex` — encoding/decoding per-network secret keys in config
-- `rand` — random three-word network name generation (`network_name::generate_name()`)
+- `rand` — random local alias generation (`network_name::generate_name()`)
 - `tun` — cross-platform TUN device (macOS utun, Linux /dev/net/tun)
 - `tokio` — async runtime
 - `clap` + `clap_complete` — CLI parsing and shell completions
@@ -123,7 +124,7 @@ A background `spawn_group_poller()` checks the pkarr record every 60s and fetche
 
 - Use `cargo -q` for all cargo commands
 - Use `tracing` for logging (INFO level by default, configurable via `RUST_LOG` env var)
-- ALPN per network: `pitopi/net/<name>` (e.g., `pitopi/net/gaming`)
+- ALPN per network: `pitopi/net/<pubkey-prefix>` (first 16 hex chars of network public key)
 - Virtual IPs: 100.64.0.0/10 CGNAT range — FNV-1a hash of identity, 22-bit host space
 - TUN MTU: 1200 (fits within QUIC datagram limits)
 - Identity persists to `~/.config/pitopi/secret_key` — same EndpointId across restarts
@@ -131,7 +132,7 @@ A background `spawn_group_poller()` checks the pkarr record every 60s and fetche
 - ACL rules persist to `~/.config/pitopi/acl/<network>.acl` (text format: `tag <name> <peer-ids>` and `allow <src> -> <dst>` lines)
 - macOS TUN requires destination address (point-to-point interface)
 - Control messages: length-prefixed JSON (4-byte BE length + JSON body) over QUIC bidirectional streams
-- Three-word names: adjective-noun-noun format (e.g., `gentle-amber-fox`), generated by `network_name::generate_name()` at create time; used as optional local aliases only — the join code is the per-network public key string
+- Local aliases: adjective-noun-noun format (e.g., `gentle-amber-fox`), generated at create time; purely local display names with no protocol significance — the join code is the per-network public key string
 - Join code: per-network public key string, printed at create time; the only way to join a network
 - Use split/sink patterns for I/O — never share I/O resources (TUN, sockets, streams) behind a Mutex. Always split into separate read/write halves for concurrent access
 - Avoid Mutex wherever possible — prefer channels (mpsc), split I/O, atomics, or RwLock (only for fast non-async state)

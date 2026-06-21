@@ -8,9 +8,11 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::Connection, endpoint::presets,
 };
 
-/// Returns the ALPN protocol identifier for a network: `pitopi/net/<name>`.
-pub fn network_alpn(network_name: &str) -> Vec<u8> {
-    format!("pitopi/net/{network_name}").into_bytes()
+/// Returns the ALPN protocol identifier for a network: `pitopi/net/<pubkey-prefix>`.
+/// Uses the first 16 hex chars of the network public key.
+pub fn network_alpn(network_pubkey: &str) -> Vec<u8> {
+    let prefix = &network_pubkey[..network_pubkey.len().min(16)];
+    format!("pitopi/net/{prefix}").into_bytes()
 }
 
 /// Creates an iroh endpoint with the N0 preset (NAT traversal + relay fallback).
@@ -33,8 +35,7 @@ pub async fn create_endpoint_with_alpns(
     Ok(ep)
 }
 
-/// Accepts an incoming connection and returns it along with the negotiated ALPN.
-/// The caller filters by ALPN to route to the correct network.
+#[allow(dead_code)]
 pub async fn accept_connection_with_alpn(ep: &Endpoint) -> Result<(Connection, Vec<u8>)> {
     let incoming = ep.accept().await.context("no incoming connection")?;
     let conn = incoming.await.context("failed to accept connection")?;
@@ -73,7 +74,10 @@ mod tests {
 
     #[test]
     fn test_network_alpn() {
-        assert_eq!(network_alpn("gaming"), b"pitopi/net/gaming");
-        assert_eq!(network_alpn("default"), b"pitopi/net/default");
+        assert_eq!(network_alpn("aa8bc368fec8c227"), b"pitopi/net/aa8bc368fec8c227");
+        assert_eq!(
+            network_alpn("aa8bc368fec8c2272cbcd07688d3442bac20bc7f60e19a09604a4f9447af5b1d"),
+            b"pitopi/net/aa8bc368fec8c227"
+        );
     }
 }
