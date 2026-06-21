@@ -3,13 +3,13 @@
 //! Configures the system to route `.pi` queries to our local resolver at 100.64.0.1:53.
 //! Supports multiple backends with automatic detection and fallback.
 
-use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use crate::DNS_DOMAIN;
 
+const RESOLVER_IP: &str = "127.0.0.1";
 const BACKUP_SUFFIX: &str = ".before-pitopi";
 const HEADER_COMMENT: &str = "# Added by pitopi - do not edit\n";
 
@@ -19,27 +19,25 @@ pub trait DnsConfigurator: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
-pub fn detect_and_configure(resolver_ip: Ipv4Addr) -> Result<Box<dyn DnsConfigurator>> {
-    let ip_str = resolver_ip.to_string();
-
+pub fn detect_and_configure() -> Result<Box<dyn DnsConfigurator>> {
     #[cfg(target_os = "macos")]
     {
-        let configurator = MacosResolver { resolver_ip: ip_str };
+        let configurator = MacosResolver;
         configurator.apply()?;
         return Ok(Box::new(configurator));
     }
 
     #[cfg(target_os = "linux")]
     {
-        if let Some(c) = try_systemd_resolved(ip_str.clone()) {
+        if let Some(c) = try_systemd_resolved() {
             c.apply()?;
             return Ok(Box::new(c));
         }
-        if let Some(c) = try_resolvconf(ip_str.clone()) {
+        if let Some(c) = try_resolvconf() {
             c.apply()?;
             return Ok(Box::new(c));
         }
-        let c = DirectResolvConf { resolver_ip: ip_str };
+        let c = DirectResolvConf;
         c.apply()?;
         return Ok(Box::new(c));
     }
@@ -99,9 +97,7 @@ fn restore_file(path: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
-struct MacosResolver {
-    resolver_ip: String,
-}
+struct MacosResolver;
 
 #[cfg(target_os = "macos")]
 impl DnsConfigurator for MacosResolver {
@@ -112,9 +108,9 @@ impl DnsConfigurator for MacosResolver {
         }
         let path = dir.join(DNS_DOMAIN);
         backup_file(&path)?;
-        let content = format!("{HEADER_COMMENT}nameserver {}\n", self.resolver_ip);
+        let content = format!("{HEADER_COMMENT}nameserver {RESOLVER_IP}\n");
         std::fs::write(&path, content).context("writing /etc/resolver file")?;
-        tracing::info!(ip = %self.resolver_ip, "configured macOS scoped resolver for .{DNS_DOMAIN}");
+        tracing::info!("configured macOS scoped resolver for .{DNS_DOMAIN} via {RESOLVER_IP}");
         Ok(())
     }
 
@@ -137,11 +133,10 @@ impl DnsConfigurator for MacosResolver {
 #[cfg(target_os = "linux")]
 struct SystemdResolved {
     tun_iface: String,
-    resolver_ip: String,
 }
 
 #[cfg(target_os = "linux")]
-fn try_systemd_resolved(resolver_ip: String) -> Option<SystemdResolved> {
+fn try_systemd_resolved() -> Option<SystemdResolved> {
     use std::process::Command;
     let output = Command::new("resolvectl").arg("status").output().ok()?;
     if !output.status.success() {
@@ -149,7 +144,6 @@ fn try_systemd_resolved(resolver_ip: String) -> Option<SystemdResolved> {
     }
     Some(SystemdResolved {
         tun_iface: "utun_pitopi".to_string(),
-        resolver_ip,
     })
 }
 
@@ -158,7 +152,7 @@ impl DnsConfigurator for SystemdResolved {
     fn apply(&self) -> Result<()> {
         use std::process::Command;
         let status = Command::new("resolvectl")
-            .args(["dns", &self.tun_iface, &self.resolver_ip])
+            .args(["dns", &self.tun_iface, RESOLVER_IP])
             .status()
             .context("resolvectl dns")?;
         anyhow::ensure!(status.success(), "resolvectl dns failed");
@@ -169,7 +163,7 @@ impl DnsConfigurator for SystemdResolved {
             .context("resolvectl domain")?;
         anyhow::ensure!(status.success(), "resolvectl domain failed");
 
-        tracing::info!(ip = %self.resolver_ip, "configured systemd-resolved for .{DNS_DOMAIN} via {}", self.tun_iface);
+        tracing::info!("configured systemd-resolved for .{DNS_DOMAIN} via {}", self.tun_iface);
         Ok(())
     }
 
@@ -192,15 +186,13 @@ impl DnsConfigurator for SystemdResolved {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-struct Resolvconf {
-    resolver_ip: String,
-}
+struct Resolvconf;
 
 #[cfg(target_os = "linux")]
-fn try_resolvconf(resolver_ip: String) -> Option<Resolvconf> {
+fn try_resolvconf() -> Option<Resolvconf> {
     let paths = ["/sbin/resolvconf", "/usr/sbin/resolvconf"];
     if paths.iter().any(|p| Path::new(p).exists()) {
-        Some(Resolvconf { resolver_ip })
+        Some(Resolvconf)
     } else {
         None
     }
@@ -211,7 +203,7 @@ impl DnsConfigurator for Resolvconf {
     fn apply(&self) -> Result<()> {
         use std::io::Write;
         use std::process::{Command, Stdio};
-        let config = format!("nameserver {}\n", self.resolver_ip);
+        let config = format!("nameserver {RESOLVER_IP}\n");
         let mut child = Command::new("resolvconf")
             .args(["-a", "tun-pitopi.inet"])
             .stdin(Stdio::piped())
@@ -220,7 +212,7 @@ impl DnsConfigurator for Resolvconf {
         child.stdin.as_mut().unwrap().write_all(config.as_bytes())?;
         let status = child.wait()?;
         anyhow::ensure!(status.success(), "resolvconf -a failed");
-        tracing::info!(ip = %self.resolver_ip, "configured resolvconf for .{DNS_DOMAIN}");
+        tracing::info!("configured resolvconf for .{DNS_DOMAIN}");
         Ok(())
     }
 
@@ -243,9 +235,7 @@ impl DnsConfigurator for Resolvconf {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-struct DirectResolvConf {
-    resolver_ip: String,
-}
+struct DirectResolvConf;
 
 #[cfg(target_os = "linux")]
 impl DnsConfigurator for DirectResolvConf {
@@ -253,9 +243,9 @@ impl DnsConfigurator for DirectResolvConf {
         let path = Path::new("/etc/resolv.conf");
         backup_file(path)?;
         let existing = std::fs::read_to_string(path).unwrap_or_default();
-        let new_content = format!("{HEADER_COMMENT}nameserver {}\n{existing}", self.resolver_ip);
+        let new_content = format!("{HEADER_COMMENT}nameserver {RESOLVER_IP}\n{existing}");
         std::fs::write(path, new_content).context("writing /etc/resolv.conf")?;
-        tracing::info!(ip = %self.resolver_ip, "configured /etc/resolv.conf directly (fallback)");
+        tracing::info!("configured /etc/resolv.conf directly (fallback)");
         Ok(())
     }
 

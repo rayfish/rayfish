@@ -94,6 +94,9 @@ pub struct NetworkConfig {
     pub group_mode: GroupMode,
     /// Our assigned IP in this network (None if coordinator, Some if member).
     pub my_ip: Option<Ipv4Addr>,
+    /// Our hostname in this network (persisted so it survives daemon restarts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub my_hostname: Option<String>,
     /// Known members in this network.
     #[serde(default)]
     pub members: Vec<MemberEntry>,
@@ -192,6 +195,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    my_hostname: None,
                 },
                 NetworkConfig {
                     name: "work".to_string(),
@@ -201,6 +205,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    my_hostname: None,
                 },
             ],
         };
@@ -230,6 +235,7 @@ mod tests {
             approved: vec![],
             network_secret_key: None,
             network_public_key: None,
+            my_hostname: None,
         };
         upsert_network(&mut config, net);
         assert_eq!(config.networks.len(), 1);
@@ -248,6 +254,7 @@ mod tests {
                 approved: vec![],
                 network_secret_key: None,
                 network_public_key: None,
+                my_hostname: None,
             }],
         };
         let updated = NetworkConfig {
@@ -258,6 +265,7 @@ mod tests {
             approved: vec![],
             network_secret_key: None,
             network_public_key: None,
+            my_hostname: None,
         };
         upsert_network(&mut config, updated.clone());
         assert_eq!(config.networks.len(), 1);
@@ -277,6 +285,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    my_hostname: None,
                 },
                 NetworkConfig {
                     name: "remove-me".to_string(),
@@ -286,6 +295,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    my_hostname: None,
                 },
             ],
         };
@@ -322,6 +332,7 @@ mod tests {
                 }],
                 network_secret_key: None,
                 network_public_key: None,
+                my_hostname: None,
             }],
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -343,6 +354,7 @@ mod tests {
                 approved: vec![],
                 network_secret_key: Some(secret.clone()),
                 network_public_key: Some(public),
+                my_hostname: None,
             }],
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();

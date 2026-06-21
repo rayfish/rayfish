@@ -23,11 +23,10 @@ pub fn new_hostname_table() -> HostnameTable {
 }
 
 pub async fn spawn_dns_server(
-    bind_ip: std::net::Ipv4Addr,
     table: HostnameTable,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let addr = SocketAddr::new(bind_ip.into(), 53);
+    let addr: SocketAddr = "127.0.0.1:53".parse().unwrap();
     let socket = UdpSocket::bind(addr).await?;
     tracing::info!("DNS resolver listening on {addr}");
 

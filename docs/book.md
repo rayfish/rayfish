@@ -1324,17 +1324,19 @@ App DNS query (e.g., "alice.gaming.pi")
 System resolver (macOS /etc/resolver/pi, Linux systemd-resolved, etc.)
     |  routes only .pi queries to pitopi
     v
-pitopi DNS server (UDP, <my-ip>:53)
+pitopi DNS server (UDP, 127.0.0.1:53)
     |  looks up HostnameTable (network → hostname → IP)
     v
 A record response (100.64.x.x)
 ```
 
-The daemon runs a minimal UDP DNS responder bound to the device's own TUN IP (e.g. 100.91.237.103:53). It only handles A queries for `.pi` names — everything else gets REFUSED, so normal DNS is never affected.
+The daemon runs a minimal UDP DNS responder bound to `127.0.0.1:53`. It only handles A queries for `.pi` names — everything else gets REFUSED, so normal DNS is never affected.
 
 ### Hostname assignment
 
 Hostnames are stored in the `Member` struct and propagated via the GroupBlob (the same mechanism used for membership and ACLs). This means hostnames are available even when the named peer is offline — any peer that has fetched the blob can resolve the name.
+
+Hostnames are also persisted in `~/.config/pitopi/networks.toml` (the `my_hostname` field) so they survive daemon restarts. If no hostname is chosen and none was previously assigned, a random one is generated from a word list.
 
 ```bash
 pitopi create --hostname alice       # choose your hostname
@@ -1348,10 +1350,10 @@ Pitopi configures the OS to split-route `.pi` queries to its local resolver. The
 
 | Platform | Method | How |
 |----------|--------|-----|
-| macOS | Scoped resolver | Writes `/etc/resolver/pi` with the device's TUN IP — macOS natively routes queries for that TLD |
-| Linux | systemd-resolved | `resolvectl dns <tun> <my-ip>` + `resolvectl domain <tun> ~pi` |
+| macOS | Scoped resolver | Writes `/etc/resolver/pi` pointing to `127.0.0.1` — macOS natively routes queries for that TLD |
+| Linux | systemd-resolved | `resolvectl dns <tun> 127.0.0.1` + `resolvectl domain <tun> ~pi` |
 | Linux | resolvconf | Pipes config to `resolvconf -a tun-pitopi.inet` |
-| Linux | Direct | Prepends `nameserver <my-ip>` to `/etc/resolv.conf` (fallback) |
+| Linux | Direct | Prepends `nameserver 127.0.0.1` to `/etc/resolv.conf` (fallback) |
 
 ### Backup and crash recovery
 

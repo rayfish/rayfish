@@ -325,6 +325,7 @@ impl DaemonState {
             name: name.clone(),
             group_mode: mode,
             my_ip: Some(my_ip),
+            my_hostname: Some(my_hostname.clone()),
             members: member_entries,
             approved: approved_entries,
             network_secret_key: Some(net_secret_key.clone()),
@@ -753,6 +754,7 @@ impl DaemonState {
             .and_then(|nc| nc.network_secret_key.clone())
             .context("no network secret key in config — cannot restore as coordinator")?;
         let net_public_key = net_secret_key.public();
+        let persisted_hostname = net_config.and_then(|nc| nc.my_hostname.clone());
 
         // Load persisted members and approved entries
         let mut member_list = MemberList::new();
@@ -772,7 +774,7 @@ impl DaemonState {
                     identity: self.identity.local_identity(),
                     ip: my_ip,
                     is_coordinator: true,
-                    hostname: None,
+                    hostname: persisted_hostname.clone(),
                 })
                 .expect("self-add cannot collide");
         }
@@ -848,6 +850,7 @@ impl DaemonState {
             name: name.to_string(),
             group_mode: mode,
             my_ip: Some(my_ip),
+            my_hostname: persisted_hostname.clone(),
             members: member_entries,
             approved: approved_entries,
             network_secret_key: Some(net_secret_key.clone()),
@@ -901,6 +904,21 @@ impl DaemonState {
             self.firewall.clone(),
         );
         tasks.push(accept_handle);
+
+        // Register hostnames in DNS table
+        {
+            let members_snapshot: Vec<_> = {
+                let s = state.read().unwrap();
+                s.members.all().into_iter().filter_map(|m| {
+                    m.hostname.as_ref().map(|h| (h.clone(), m.ip))
+                }).collect()
+            };
+            let mut table = self.hostname_table.write().await;
+            let network_hosts = table.entry(name.to_string()).or_default();
+            for (hostname, ip) in members_snapshot {
+                network_hosts.insert(hostname, ip);
+            }
+        }
 
         let handle = NetworkHandle {
             name: name.to_string(),
@@ -1421,19 +1439,18 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
 
     let hostname_table = dns::new_hostname_table();
 
-    // Start DNS resolver
+    // Start DNS resolver on 127.0.0.1:53
     let dns_table = hostname_table.clone();
     let dns_token = token.clone();
-    let dns_ip = my_ip;
     tokio::spawn(async move {
-        if let Err(e) = dns::spawn_dns_server(dns_ip, dns_table, dns_token).await {
+        if let Err(e) = dns::spawn_dns_server(dns_table, dns_token).await {
             tracing::warn!(error = %e, "DNS server failed to start (Magic DNS disabled)");
         }
     });
 
-    // Configure system DNS to route .pi queries to our TUN IP
+    // Configure system DNS to route .pi queries to 127.0.0.1
     dns_config::restore_stale_backups();
-    let dns_configurator = match dns_config::detect_and_configure(my_ip) {
+    let dns_configurator = match dns_config::detect_and_configure() {
         Ok(c) => {
             tracing::info!(backend = c.name(), "system DNS configured for .pitopi");
             Some(c)
@@ -1489,6 +1506,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
         } else {
             // We're a member — rejoin via DHT lookup
             let name = net.name.clone();
+            let persisted_hostname = net.my_hostname.clone();
             let net_pubkey = match &net.network_public_key {
                 Some(k) => k.to_string(),
                 None => {
@@ -1498,7 +1516,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
             };
             let daemon_c = daemon.clone();
             tokio::spawn(async move {
-                match daemon_c.join_network_inner(&net_pubkey, Some(&name), None).await {
+                match daemon_c.join_network_inner(&net_pubkey, Some(&name), persisted_hostname).await {
                     Ok(IpcResponse::Joined { name, my_ip }) => {
                         tracing::info!(network = %name, ip = %my_ip, "restored member network");
                     }
@@ -2059,11 +2077,15 @@ async fn join_mesh_shared(
     let approved_config: Vec<config::ApprovedConfigEntry> = approved.iter().map(|a| config::ApprovedConfigEntry {
         identity: a.identity, ip: a.ip, hostname: a.hostname.clone(),
     }).collect();
+    let my_hostname = members.iter()
+        .find(|m| m.identity == my_identity)
+        .and_then(|m| m.hostname.clone());
     let mut app_config = config::load()?;
     config::upsert_network(&mut app_config, config::NetworkConfig {
         name: network_name.to_string(),
         group_mode: GroupMode::Restricted,
         my_ip: Some(my_ip),
+        my_hostname,
         members: member_entries,
         approved: approved_config,
         network_secret_key: None,
