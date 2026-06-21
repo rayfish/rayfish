@@ -212,6 +212,7 @@ impl DaemonState {
             IpcRequest::FirewallRemove { index } => self.firewall_remove(index),
             IpcRequest::FirewallShow => self.firewall_show(),
             IpcRequest::FirewallDefault { action } => self.firewall_default(&action),
+            IpcRequest::SetHostname { network, hostname } => self.set_hostname(&network, &hostname).await,
         }
     }
 
@@ -1116,6 +1117,71 @@ impl DaemonState {
             datagrams_tx: stats.udp_tx.datagrams,
             datagrams_rx: stats.udp_rx.datagrams,
             lost_packets: stats.lost_packets,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Hostname
+    // -----------------------------------------------------------------------
+
+    async fn set_hostname(&self, network: &str, hostname: &str) -> IpcResponse {
+        use crate::hostname;
+
+        if !hostname::is_valid_hostname(hostname) {
+            return IpcResponse::Error {
+                message: "invalid hostname (lowercase ASCII, 1-63 chars)".to_string(),
+            };
+        }
+
+        let handle = match self.networks.get(network) {
+            Some(h) => h,
+            None => return IpcResponse::Error {
+                message: format!("network '{}' not found", network),
+            },
+        };
+
+        let my_ip = handle.my_ip;
+        let my_identity = self.endpoint.id();
+        let new_hostname = hostname.to_string();
+
+        // Update member list in memory
+        if let Ok(mut state) = handle.state.write()
+            && let Some(me) = state.members.get_mut(&my_identity)
+        {
+            me.hostname = Some(new_hostname.clone());
+        }
+
+        // Update DNS table: remove old entry for our IP, insert new one
+        if let Ok(mut table) = self.hostname_table.try_write() {
+            let hosts = table.entry(network.to_string()).or_default();
+            hosts.retain(|_, ip| *ip != my_ip);
+            hosts.insert(new_hostname.clone(), my_ip);
+        }
+
+        // Persist to config
+        if let Ok(mut app_config) = config::load() {
+            if let Some(net) = app_config.networks.iter_mut().find(|n| n.name == network) {
+                net.my_hostname = Some(new_hostname.clone());
+            }
+            let _ = config::save(&app_config);
+        }
+
+        // Re-send MeshHello to all peers on this network
+        let peers = self.peers.peers_for_network_with_conn(network);
+        for (_peer_id, _peer_ip, conn) in &peers {
+            if let Ok((mut send, _recv)) = conn.open_bi().await {
+                let msg = ControlMsg::MeshHello {
+                    identity: my_identity,
+                    ip: my_ip,
+                    hostname: Some(new_hostname.clone()),
+                };
+                let _ = control::send_msg(&mut send, &msg).await;
+            }
+        }
+
+        let dns_name = format!("{}.{}.{}", new_hostname, network, crate::DNS_DOMAIN);
+        IpcResponse::Ok {
+            message: format!("hostname set to {} ({})", new_hostname, dns_name),
         }
     }
 

@@ -165,6 +165,7 @@ Hostnames propagate via the membership blob and MeshHello messages — they're r
 | `pitopi join KEY [--name ALIAS]` | Join a network by public key join code | Yes |
 | `pitopi leave NAME` | Leave a network and remove config | Yes |
 | `pitopi nuke NAME [--force]` | Publish empty records to DHT then leave | Yes |
+| `pitopi hostname NET NAME` | Change your hostname on a network | Yes |
 | `pitopi status` | Show active networks, peers (DNS names when available) | Yes |
 | `pitopi down` | Shut down the daemon | Yes |
 | `pitopi list` | Show networks (queries daemon if running) | No |

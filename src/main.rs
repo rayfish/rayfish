@@ -142,6 +142,13 @@ enum Command {
         #[command(subcommand)]
         action: FirewallAction,
     },
+    /// Change your hostname on a network
+    Hostname {
+        /// Network name
+        network: String,
+        /// New hostname (e.g. "alice" → alice.network.pi)
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -250,6 +257,7 @@ async fn main() -> Result<()> {
         }
         Command::Acl { network, action } => ipc_acl(&network, action).await,
         Command::Firewall { action } => ipc_firewall(action).await,
+        Command::Hostname { network, name } => ipc_set_hostname(&network, &name).await,
     }
 }
 
@@ -461,6 +469,21 @@ async fn ipc_status() -> Result<()> {
 async fn ipc_down() -> Result<()> {
     let mut stream = ipc::connect().await?;
     ipc::send_msg(&mut stream, &ipc::IpcRequest::Shutdown).await?;
+    let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+    match resp {
+        ipc::IpcResponse::Ok { message } => println!("{}", message),
+        ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send_msg(&mut stream, &ipc::IpcRequest::SetHostname {
+        network: network.to_string(),
+        hostname: hostname.to_string(),
+    }).await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
         ipc::IpcResponse::Ok { message } => println!("{}", message),

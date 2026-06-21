@@ -72,6 +72,10 @@ pub enum IpcRequest {
     FirewallDefault {
         action: String,
     },
+    SetHostname {
+        network: String,
+        hostname: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
