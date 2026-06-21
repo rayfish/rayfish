@@ -1870,33 +1870,40 @@ impl DaemonState {
 
     async fn leave_network(&self, name: &str) -> IpcMessage {
         let handle = self.networks.remove(name).map(|(_, v)| v);
-        let Some(handle) = handle else {
-            return IpcMessage::Error {
-                message: format!("network '{}' not active", name),
-            };
-        };
+        let was_active = handle.is_some();
 
-        handle.cancel.cancel();
-        for task in handle.tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        if let Some(handle) = handle {
+            handle.cancel.cancel();
+            for task in handle.tasks {
+                let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+            }
+
+            self.peers.remove_by_network(name);
+            self.shared_acl.remove(name);
+            self.protocol_router
+                .unregister(&transport::network_alpn(&handle.network_key));
+            self.refresh_alpns();
         }
 
-        self.peers.remove_by_network(name);
-        self.shared_acl.remove(name);
-        self.protocol_router
-            .unregister(&transport::network_alpn(&handle.network_key));
-        self.refresh_alpns();
-
-        // Remove from config
-        if let Ok(mut app_config) = config::load()
+        // Remove from config even if the network wasn't active
+        let removed_from_config = if let Ok(mut app_config) = config::load()
             && config::remove_network(&mut app_config, name)
         {
             let _ = config::save(&app_config);
-        }
+            true
+        } else {
+            false
+        };
 
-        tracing::info!(network = %name, "left network");
-        IpcMessage::Ok {
-            message: format!("left network '{}'", name),
+        if was_active || removed_from_config {
+            tracing::info!(network = %name, "left network");
+            IpcMessage::Ok {
+                message: format!("left network '{}'", name),
+            }
+        } else {
+            IpcMessage::Error {
+                message: format!("network '{}' not found", name),
+            }
         }
     }
 
