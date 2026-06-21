@@ -58,6 +58,13 @@ pub enum ControlMsg {
     BlobUpdated {
         hash: blake3::Hash,
     },
+    FileOffer {
+        from: EndpointId,
+        filename: String,
+        size: u64,
+        mime_type: String,
+        blob_hash: blake3::Hash,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +221,20 @@ mod tests {
                 ip: Ipv4Addr::new(100, 64, 0, 5),
                 hostname: None,
             }],
+        };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_file_offer() {
+        let msg = ControlMsg::FileOffer {
+            from: test_id(1),
+            filename: "report.pdf".to_string(),
+            size: 1_048_576,
+            mime_type: "application/pdf".to_string(),
+            blob_hash: blake3::hash(b"file contents"),
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();

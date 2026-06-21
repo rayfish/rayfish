@@ -23,6 +23,8 @@ iroh-metrics = { version = "1", features = ["service", "metrics"] }
 iroh-dns = "1"
 iroh-blobs = { version = "0.103", default-features = false, features = ["fs-store"] }
 iroh-mdns-address-lookup = "0.4"
+humansize = "2"
+mime_guess = "2"
 rand = "0.10"
 rmp-serde = "1"
 libc = "0.2"

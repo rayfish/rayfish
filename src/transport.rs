@@ -10,6 +10,8 @@ use iroh::{
 #[cfg(feature = "tor")]
 use std::sync::Arc;
 
+pub const FILES_ALPN: &[u8] = b"pitopi/files/1";
+
 pub fn network_alpn(network_pubkey: &EndpointId) -> Vec<u8> {
     let full = network_pubkey.to_string();
     let prefix = &full[..full.len().min(16)];

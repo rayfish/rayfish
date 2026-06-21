@@ -118,11 +118,24 @@ pub struct NetworkConfig {
     pub transport: Option<TransportMode>,
 }
 
+fn default_true() -> bool { true }
+
 /// Top-level config stored at `~/.config/pitopi/networks.toml`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default = "default_true")]
+    pub mdns_enabled: bool,
     #[serde(default)]
     pub networks: Vec<NetworkConfig>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            mdns_enabled: true,
+            networks: Vec::new(),
+        }
+    }
 }
 
 fn config_path() -> Result<PathBuf> {
@@ -219,6 +232,7 @@ mod tests {
                     transport: None,
                 },
             ],
+            ..Default::default()
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -269,6 +283,7 @@ mod tests {
                 my_hostname: None,
                 transport: None,
             }],
+            ..Default::default()
         };
         let updated = NetworkConfig {
             name: "test".to_string(),
@@ -317,6 +332,7 @@ mod tests {
                     transport: None,
                 },
             ],
+            ..Default::default()
         };
         assert!(remove_network(&mut config, "remove-me"));
         assert_eq!(config.networks.len(), 1);
@@ -354,6 +370,7 @@ mod tests {
                 my_hostname: None,
                 transport: None,
             }],
+            ..Default::default()
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: AppConfig = toml::from_str(&toml_str).unwrap();
@@ -377,6 +394,7 @@ mod tests {
                 my_hostname: None,
                 transport: None,
             }],
+            ..Default::default()
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: AppConfig = toml::from_str(&toml_str).unwrap();

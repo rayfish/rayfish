@@ -1,5 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -602,9 +604,20 @@ impl ProtocolHandler for MeshProtocol {
     }
 }
 
+struct PendingFile {
+    id: u64,
+    from: EndpointId,
+    filename: String,
+    size: u64,
+    mime_type: String,
+    blob_hash: blake3::Hash,
+}
+
 struct ProtocolRouter {
     blobs: BlobsProtocol,
     handlers: DashMap<Vec<u8>, Arc<MeshProtocol>>,
+    pending_files: Arc<std::sync::Mutex<Vec<PendingFile>>>,
+    file_id_counter: Arc<AtomicU64>,
 }
 
 impl ProtocolRouter {
@@ -612,6 +625,8 @@ impl ProtocolRouter {
         Self {
             blobs,
             handlers: DashMap::new(),
+            pending_files: Arc::new(std::sync::Mutex::new(Vec::new())),
+            file_id_counter: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -627,6 +642,7 @@ impl ProtocolRouter {
     fn alpns(&self) -> Vec<Vec<u8>> {
         let mut alpns: Vec<Vec<u8>> = self.handlers.iter().map(|r| r.key().clone()).collect();
         alpns.push(iroh_blobs::protocol::ALPN.to_vec());
+        alpns.push(transport::FILES_ALPN.to_vec());
         alpns
     }
 
@@ -652,18 +668,32 @@ impl ProtocolRouter {
                                 }
                             };
                             let alpn = conn.alpn().to_vec();
-                            if alpn == iroh_blobs::protocol::ALPN {
-                                let blobs = router.blobs.clone();
-                                let _ = blobs.accept(conn).await;
-                            } else {
-                                let handler = router.handlers.get(&alpn).map(|r| r.clone());
-                                if let Some(handler) = handler {
-                                    let _ = handler.accept(conn).await;
-                                } else {
-                                    tracing::warn!(
-                                        alpn = %String::from_utf8_lossy(&alpn),
-                                        "no handler for ALPN"
-                                    );
+                            match alpn.as_slice() {
+                                a if a == iroh_blobs::protocol::ALPN => {
+                                    let _ = router.blobs.clone().accept(conn).await;
+                                }
+                                a if a == transport::FILES_ALPN => {
+                                    let pending = router.pending_files.clone();
+                                    let counter = router.file_id_counter.clone();
+                                    let remote_id = conn.remote_id();
+                                    if let Ok((_send, mut recv)) = conn.accept_bi().await
+                                        && let Ok(control::ControlMsg::FileOffer { from, filename, size, mime_type, blob_hash }) = control::recv_msg(&mut recv).await
+                                        && from == remote_id
+                                    {
+                                        let id = counter.fetch_add(1, Ordering::Relaxed);
+                                        tracing::info!(from = %from.fmt_short(), filename = %filename, size, "file offer received");
+                                        pending.lock().unwrap().push(PendingFile { id, from, filename, size, mime_type, blob_hash });
+                                    }
+                                }
+                                _ => {
+                                    if let Some(handler) = router.handlers.get(&alpn).map(|r| r.clone()) {
+                                        let _ = handler.accept(conn).await;
+                                    } else {
+                                        tracing::warn!(
+                                            alpn = %String::from_utf8_lossy(&alpn),
+                                            "no handler for ALPN"
+                                        );
+                                    }
                                 }
                             }
                         });
@@ -730,6 +760,7 @@ pub struct DaemonState {
     firewall: SharedFirewall,
     protocol_router: Arc<ProtocolRouter>,
     hostname_table: dns::HostnameTable,
+    mdns_enabled: bool,
 }
 
 impl DaemonState {
@@ -804,6 +835,9 @@ impl DaemonState {
             IpcRequest::SetHostname { network, hostname } => {
                 self.set_hostname(&network, &hostname).await
             }
+            IpcRequest::SendFile { path, peer } => self.send_file(&path, &peer).await,
+            IpcRequest::ListFiles => self.list_files(),
+            IpcRequest::AcceptFile { id, output } => self.accept_file(id, output).await,
         }
     }
 
@@ -1896,6 +1930,7 @@ impl DaemonState {
 
         IpcResponse::Status {
             endpoint_id: self.endpoint.id(),
+            mdns_enabled: self.mdns_enabled,
             networks: statuses,
             packets_rx: self.stats.packets_rx.get(),
             packets_tx: self.stats.packets_tx.get(),
@@ -2470,6 +2505,203 @@ impl DaemonState {
             ),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // File sharing
+    // -----------------------------------------------------------------------
+
+    fn resolve_peer_name(&self, name: &str) -> Option<EndpointId> {
+        for entry in self.networks.iter() {
+            let state = entry.value().state.read().unwrap();
+            if let Some(m) = state
+                .members
+                .all()
+                .iter()
+                .find(|m| m.hostname.as_deref() == Some(name))
+            {
+                return Some(m.identity);
+            }
+        }
+        self.resolve_short_id_any_network(name)
+    }
+
+    async fn send_file(&self, path: &str, peer: &str) -> IpcResponse {
+        let peer_id = match self.resolve_peer_name(peer) {
+            Some(id) => id,
+            None => {
+                return IpcResponse::Error {
+                    message: format!("unknown peer '{peer}'"),
+                }
+            }
+        };
+
+        let file_path = std::path::Path::new(path);
+        let file_bytes = match std::fs::read(file_path) {
+            Ok(b) => b,
+            Err(e) => {
+                return IpcResponse::Error {
+                    message: format!("cannot read '{}': {e}", file_path.display()),
+                }
+            }
+        };
+
+        let filename = file_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+        let size = file_bytes.len() as u64;
+        let mime_type = guess_mime_type(&filename);
+        let hash = blake3::hash(&file_bytes);
+
+        if let Err(e) = self.blob_store.blobs().add_slice(&file_bytes).await {
+            return IpcResponse::Error {
+                message: format!("blob store error: {e}"),
+            };
+        }
+
+        let msg = control::ControlMsg::FileOffer {
+            from: self.endpoint.id(),
+            filename: filename.clone(),
+            size,
+            mime_type: mime_type.clone(),
+            blob_hash: hash,
+        };
+
+        match transport::connect_to_peer_with_alpn(
+            &self.endpoint,
+            peer_id,
+            transport::FILES_ALPN,
+        )
+        .await
+        {
+            Ok(conn) => {
+                if let Ok((mut send, _)) = conn.open_bi().await
+                    && let Err(e) = control::send_msg(&mut send, &msg).await
+                {
+                    return IpcResponse::Error {
+                        message: format!("failed to send offer: {e}"),
+                    };
+                }
+            }
+            Err(e) => {
+                return IpcResponse::Error {
+                    message: format!("cannot reach peer '{peer}': {e}"),
+                };
+            }
+        }
+
+        IpcResponse::Ok {
+            message: format!(
+                "offered {} ({}) to {}",
+                filename,
+                format_size(size),
+                peer
+            ),
+        }
+    }
+
+    fn list_files(&self) -> IpcResponse {
+        let pending = self.protocol_router.pending_files.lock().unwrap();
+        let files = pending
+            .iter()
+            .map(|f| ipc::PendingFileInfo {
+                id: f.id,
+                from: f.from.fmt_short().to_string(),
+                filename: f.filename.clone(),
+                size: f.size,
+                mime_type: f.mime_type.clone(),
+            })
+            .collect();
+        IpcResponse::FileList { files }
+    }
+
+    async fn accept_file(&self, id: u64, output: Option<String>) -> IpcResponse {
+        let pending_file = {
+            let mut pending = self.protocol_router.pending_files.lock().unwrap();
+            let idx = pending.iter().position(|f| f.id == id);
+            match idx {
+                Some(i) => pending.remove(i),
+                None => {
+                    return IpcResponse::Error {
+                        message: format!("no pending file with id {id}"),
+                    }
+                }
+            }
+        };
+
+        let blob_hash = iroh_blobs::Hash::from_bytes(*pending_file.blob_hash.as_bytes());
+
+        let conn = match transport::connect_to_peer_with_alpn(
+            &self.endpoint,
+            pending_file.from,
+            iroh_blobs::protocol::ALPN,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return IpcResponse::Error {
+                    message: format!("cannot reach sender: {e}"),
+                };
+            }
+        };
+
+        if let Err(e) = self
+            .blob_store
+            .remote()
+            .fetch(conn, iroh_blobs::HashAndFormat::raw(blob_hash))
+            .await
+        {
+            return IpcResponse::Error {
+                message: format!("blob fetch failed: {e}"),
+            };
+        }
+
+        let bytes = match self.blob_store.blobs().get_bytes(blob_hash).await {
+            Ok(b) => b,
+            Err(e) => {
+                return IpcResponse::Error {
+                    message: format!("blob read failed: {e}"),
+                };
+            }
+        };
+
+        let dir = match output {
+            Some(ref p) => PathBuf::from(p),
+            None => dirs::download_dir().unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("Downloads")
+            }),
+        };
+
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return IpcResponse::Error {
+                message: format!("cannot create directory '{}': {e}", dir.display()),
+            };
+        }
+
+        let dest = dir.join(&pending_file.filename);
+        if let Err(e) = std::fs::write(&dest, &bytes) {
+            return IpcResponse::Error {
+                message: format!("write failed: {e}"),
+            };
+        }
+
+        IpcResponse::Ok {
+            message: format!("saved to {}", dest.display()),
+        }
+    }
+}
+
+fn guess_mime_type(filename: &str) -> String {
+    mime_guess::from_path(filename)
+        .first_or_octet_stream()
+        .to_string()
+}
+
+fn format_size(bytes: u64) -> String {
+    humansize::format_size(bytes, humansize::BINARY)
 }
 
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
@@ -2555,6 +2787,56 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         }
     };
 
+    // mDNS local peer discovery
+    let mdns_enabled = app_config.mdns_enabled;
+    if mdns_enabled {
+        match iroh_mdns_address_lookup::MdnsAddressLookup::builder()
+            .service_name("pitopi")
+            .advertise(true)
+            .build(ep.id())
+        {
+            Ok(mdns) => {
+                if let Ok(lookups) = ep.address_lookup() {
+                    lookups.add(mdns.clone());
+                    tracing::info!("mDNS discovery enabled (advertising _pitopi._udp.local)");
+                    let mdns_token = token.clone();
+                    tokio::spawn(async move {
+                        use futures::StreamExt;
+                        let mut events = mdns.subscribe().await;
+                        loop {
+                            tokio::select! {
+                                _ = mdns_token.cancelled() => break,
+                                event = events.next() => {
+                                    match event {
+                                        Some(iroh_mdns_address_lookup::DiscoveryEvent::Discovered { endpoint_info, .. }) => {
+                                            tracing::info!(
+                                                peer = %endpoint_info.endpoint_id.fmt_short(),
+                                                "mDNS: peer discovered on LAN"
+                                            );
+                                        }
+                                        Some(iroh_mdns_address_lookup::DiscoveryEvent::Expired { endpoint_id }) => {
+                                            tracing::info!(
+                                                peer = %endpoint_id.fmt_short(),
+                                                "mDNS: peer left LAN"
+                                            );
+                                        }
+                                        None => break,
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to start mDNS discovery");
+            }
+        }
+    } else {
+        tracing::info!("mDNS discovery disabled");
+    }
+
     let protocol_router = Arc::new(ProtocolRouter::new(blobs_proto));
     let daemon = Arc::new(DaemonState {
         endpoint: ep,
@@ -2569,6 +2851,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         firewall: shared_firewall,
         protocol_router: protocol_router.clone(),
         hostname_table,
+        mdns_enabled,
     });
 
     // Accept loop — dispatches connections via ProtocolHandler by ALPN

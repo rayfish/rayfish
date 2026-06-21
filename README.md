@@ -139,6 +139,19 @@ Rules are evaluated first-match-wins. Supports TCP, UDP, ICMP, port ranges (e.g.
 
 The `self` keyword can be used to reference your own device in ACL and firewall commands (e.g. `pitopi acl gaming tag servers self`).
 
+### File sharing
+
+Send files directly between peers over the mesh — no cloud storage, no size limits:
+
+```bash
+pitopi send photo.jpg alice          # send to peer by hostname or short ID
+pitopi files                         # list pending incoming transfers
+pitopi files accept 0                # accept, saves to ~/Downloads
+pitopi files accept 0 --output .     # accept to current directory
+```
+
+Files are content-addressed (blake3) and transferred via iroh-blobs. The sender adds the file to the local blob store and sends a lightweight offer (filename, size, MIME type, hash) to the receiver. The receiver can inspect offers before accepting. On accept, the blob is fetched directly from the sender and verified by hash.
+
 ### Tor transport
 
 Route all your network traffic through Tor for IP-level anonymity. Requires building with the `tor` feature and a running Tor daemon:
@@ -180,6 +193,17 @@ ping alice.pi                     # flat lookup (searches all networks)
 
 Hostnames propagate via the membership blob and MeshHello messages — they're resolvable even when the named peer is offline. Both A (IPv4) and AAAA (IPv6) records are served, so `ping6 alice.gaming.pi` works out of the box. If two peers choose the same hostname, a numeric suffix is appended automatically (e.g., `alice` → `alice2`). Hostnames persist across daemon restarts. The daemon configures your system DNS to route only `.pi` queries to its local resolver; all other DNS is untouched.
 
+### Local peer discovery (mDNS)
+
+Pitopi automatically discovers other peers on your local network via mDNS. When two peers are on the same LAN, they connect directly — skipping relay servers entirely for the lowest possible latency.
+
+This is enabled by default. To disable:
+
+```bash
+pitopi mdns off     # disable mDNS discovery
+pitopi mdns on      # re-enable (restart daemon for changes to take effect)
+```
+
 ## Commands
 
 | Command | Description | Needs daemon |
@@ -198,10 +222,14 @@ Hostnames propagate via the membership blob and MeshHello messages — they're r
 | `pitopi acl NAME allow SRC DST` | Add an allow rule (coordinator) | Yes |
 | `pitopi acl NAME show` | Display current ACL state | Yes |
 | `pitopi acl NAME apply` | Push ACL changes to all peers | Yes |
+| `pitopi send FILE PEER` | Send a file to a peer | Yes |
+| `pitopi files` | List pending incoming file transfers | Yes |
+| `pitopi files accept ID` | Accept a file transfer | Yes |
 | `pitopi firewall show` | Show local firewall rules | Yes |
 | `pitopi firewall default ACTION` | Set default policy (allow/deny) | Yes |
 | `pitopi firewall add DIR ACTION` | Add a firewall rule | Yes |
 | `pitopi firewall remove INDEX` | Remove a rule by index | Yes |
+| `pitopi mdns on\|off` | Enable/disable mDNS local peer discovery | No |
 | `pitopi install-service` | Install systemd/launchd service | No |
 | `pitopi uninstall-service` | Remove system service | No |
 | `pitopi completions SHELL` | Generate shell completions | No |
@@ -276,6 +304,7 @@ See [TODO.md](TODO.md) for the full roadmap. Current status:
 - [x] Tor transport (optional, per-peer)
 - [x] Systemd/launchd service integration
 - [x] Daemon architecture with Unix socket IPC
+- [x] mDNS local peer discovery (LAN peers get direct connections automatically)
 - [ ] Social discovery (Discord, Slack, Steam)
 - [ ] macOS Network Extension (no sudo)
 - [ ] Windows, iOS, Android

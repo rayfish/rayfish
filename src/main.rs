@@ -156,6 +156,23 @@ enum Command {
         /// New hostname (e.g. "alice" → alice.network.pi)
         name: String,
     },
+    /// Enable or disable mDNS local peer discovery
+    Mdns {
+        /// "on" or "off"
+        state: String,
+    },
+    /// Send a file to a peer
+    Send {
+        /// File path to send
+        file: String,
+        /// Peer hostname or short ID
+        peer: String,
+    },
+    /// Manage incoming file transfers
+    Files {
+        #[command(subcommand)]
+        action: Option<FilesAction>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -224,6 +241,18 @@ enum FirewallAction {
     },
 }
 
+#[derive(Subcommand)]
+enum FilesAction {
+    /// Accept a pending file transfer
+    Accept {
+        /// Transfer ID (from 'pitopi files')
+        id: u64,
+        /// Output directory (default: ~/Downloads)
+        #[arg(long, short)]
+        output: Option<String>,
+    },
+}
+
 fn check_root() {
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("pitopi requires root privileges to create TUN devices. Run with sudo.");
@@ -275,12 +304,34 @@ async fn main() -> Result<()> {
         Command::Acl { network, action } => ipc_acl(&network, action).await,
         Command::Firewall { action } => ipc_firewall(action).await,
         Command::Hostname { network, name } => ipc_set_hostname(&network, &name).await,
+        Command::Mdns { state } => cmd_mdns(&state),
+        Command::Send { file, peer } => ipc_send_file(&file, &peer).await,
+        Command::Files { action } => ipc_files(action).await,
     }
 }
 
 // ---------------------------------------------------------------------------
 // Client-side commands (daemon optional)
 // ---------------------------------------------------------------------------
+
+fn cmd_mdns(state: &str) -> Result<()> {
+    let enabled = match state {
+        "on" => true,
+        "off" => false,
+        _ => {
+            eprintln!("Usage: pitopi mdns <on|off>");
+            std::process::exit(1);
+        }
+    };
+    let mut app_config = config::load()?;
+    app_config.mdns_enabled = enabled;
+    config::save(&app_config)?;
+    println!(
+        "mDNS discovery {}. Restart the daemon for changes to take effect.",
+        if enabled { "enabled" } else { "disabled" }
+    );
+    Ok(())
+}
 
 async fn cmd_list() -> Result<()> {
     if let Ok(mut stream) = ipc::connect().await {
@@ -482,6 +533,7 @@ async fn ipc_status() -> Result<()> {
     match resp {
         ipc::IpcResponse::Status {
             endpoint_id,
+            mdns_enabled,
             networks,
             packets_rx,
             packets_tx,
@@ -489,6 +541,7 @@ async fn ipc_status() -> Result<()> {
             bytes_tx,
         } => {
             println!("Endpoint: {}", endpoint_id);
+            println!("  mDNS: {}", if mdns_enabled { "enabled" } else { "disabled" });
             if networks.is_empty() {
                 println!("No active networks.");
             } else {
@@ -673,6 +726,72 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
+}
+
+async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send_msg(
+        &mut stream,
+        &ipc::IpcRequest::SendFile {
+            path: file.to_string(),
+            peer: peer.to_string(),
+        },
+    )
+    .await?;
+    let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+    match resp {
+        ipc::IpcResponse::Ok { message } => println!("{}", message),
+        ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    match action {
+        None => {
+            ipc::send_msg(&mut stream, &ipc::IpcRequest::ListFiles).await?;
+            let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+            match resp {
+                ipc::IpcResponse::FileList { files } => {
+                    if files.is_empty() {
+                        println!("No pending file transfers.");
+                    } else {
+                        println!("Pending file transfers:");
+                        for f in &files {
+                            println!(
+                                "  {}  {} ({})  {}  {}",
+                                f.id, f.from, f.mime_type, f.filename, format_size(f.size),
+                            );
+                        }
+                        println!();
+                        println!("Accept with: pitopi files accept <id>");
+                    }
+                }
+                ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+                other => eprintln!("Unexpected response: {:?}", other),
+            }
+        }
+        Some(FilesAction::Accept { id, output }) => {
+            ipc::send_msg(
+                &mut stream,
+                &ipc::IpcRequest::AcceptFile { id, output },
+            )
+            .await?;
+            let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+            match resp {
+                ipc::IpcResponse::Ok { message } => println!("{}", message),
+                ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+                other => eprintln!("Unexpected response: {:?}", other),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn format_size(bytes: u64) -> String {
+    humansize::format_size(bytes, humansize::BINARY)
 }
 
 // ---------------------------------------------------------------------------

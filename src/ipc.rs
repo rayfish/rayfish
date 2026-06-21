@@ -81,6 +81,15 @@ pub enum IpcRequest {
         network: String,
         hostname: String,
     },
+    SendFile {
+        path: String,
+        peer: String,
+    },
+    ListFiles,
+    AcceptFile {
+        id: u64,
+        output: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -106,6 +115,8 @@ pub enum IpcResponse {
     },
     Status {
         endpoint_id: EndpointId,
+        #[serde(default)]
+        mdns_enabled: bool,
         networks: Vec<NetworkStatus>,
         #[serde(default)]
         packets_rx: u64,
@@ -122,6 +133,18 @@ pub enum IpcResponse {
     FirewallState {
         display: String,
     },
+    FileList {
+        files: Vec<PendingFileInfo>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingFileInfo {
+    pub id: u64,
+    pub from: String,
+    pub filename: String,
+    pub size: u64,
+    pub mime_type: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -311,6 +334,7 @@ mod tests {
         let peer_id = iroh::SecretKey::generate().public();
         let resp = IpcResponse::Status {
             endpoint_id: ep_id,
+            mdns_enabled: true,
             networks: vec![NetworkStatus {
                 name: "gaming".to_string(),
                 role: NetworkRole::Coordinator,

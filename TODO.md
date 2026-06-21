@@ -47,27 +47,7 @@ an item serves that socket/DNS surface.
 
 ---
 
-## Tier 1 — Prove the thesis (zero-SDK, existing apps work unmodified)
-
-- [ ] **Local peer discovery via mDNS**
-  - Advertise `_pitopi._udp.local`; detect peers on the same LAN
-  - Direct LAN connections skip NAT traversal entirely (lowest latency)
-  - "Detected user X nearby, invite to network Y?" — one-click join
-  - Disable with `pitopi mdns off`; pairs with Magic DNS (discovered peers get a name)
-- [ ] **Minimal lifecycle API + identity primitives (NEW, scoped down from "SDK")**
-  - Sockets+DNS is already the data API. The only real API needed is lifecycle:
-    create network, join by code, list peers, resolve a name
-  - **Verified peer identity exposed locally** (Tailscale `whois`-style): an app can ask
-    "which pitopi identity is this connection from?" and do its own auth
-  - **Path-type visibility**: expose direct-vs-relay + latency for latency-sensitive apps
-- [ ] **One demo app on the public surface (NEW — the actual MVP milestone)**
-  - A P2P call OR a tiny game, built ENTIRELY through the public socket/DNS API
-  - Separate binary, not a core feature. If it can't be built cleanly on the public
-    surface, the surface is wrong — learn that on purpose
-
----
-
-## Tier 2 — Gateway features (high-bandwidth, always-on Linux peers)
+## Tier 1 — Gateway features (high-bandwidth, always-on Linux peers)
 
 These are where bulk throughput matters and where the optional WG fast path applies.
 
@@ -102,7 +82,7 @@ These are where bulk throughput matters and where the optional WG fast path appl
 
 ---
 
-## Tier 3 — UX / friction reduction
+## Tier 2 — UX / friction reduction
 
 - [ ] **Invite links**
   - `pitopi://join/<base58>` URI scheme handler, click-to-join anywhere
@@ -118,7 +98,7 @@ These are where bulk throughput matters and where the optional WG fast path appl
 
 ---
 
-## Tier 4 — Protocol correctness (before public / scale)
+## Tier 3 — Protocol correctness (before public / scale)
 
 Foundational but not blocking the MVP demo. Land before you have users who'd be hurt by bugs.
 
@@ -131,7 +111,7 @@ Foundational but not blocking the MVP demo. Land before you have users who'd be 
 
 ---
 
-## Tier 5 — Hardening (DEMOTED — after the protocol stops moving)
+## Tier 4 — Hardening (DEMOTED — after the protocol stops moving)
 
 - [ ] **Deterministic network simulator (TigerBeetle-style VOPR)**
   - Premature as a *next* item: multi-month sink to harden a committed protocol
@@ -141,7 +121,7 @@ Foundational but not blocking the MVP demo. Land before you have users who'd be 
 
 ---
 
-## Tier 6 — Social product (SEPARATE PRODUCT — build ON pitopi, not IN it)
+## Tier 5 — Social product (SEPARATE PRODUCT — build ON pitopi, not IN it)
 
 A different company with a different moat. Build at most one as a demo; defer the rest.
 Discovery is centralized (Slack/Discord identity as trust anchor); once connected it's all P2P.
@@ -155,7 +135,7 @@ Discovery is centralized (Slack/Discord identity as trust anchor); once connecte
 
 ---
 
-## Tier 7 — Platform expansion
+## Tier 6 — Platform expansion
 
 - [ ] macOS Network Extension (no sudo)
 - [ ] BLE transport — local/offline mesh via `btleplug`, needs fragmentation layer (MTU 23-247)

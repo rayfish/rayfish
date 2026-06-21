@@ -56,6 +56,16 @@ cargo -q run -- list                # show saved networks from config
 sudo cargo -q run -- install-service
 sudo cargo -q run -- uninstall-service
 
+# mDNS local peer discovery
+cargo -q run -- mdns on                       # enable (default)
+cargo -q run -- mdns off                      # disable
+
+# File sharing (requires daemon running)
+cargo -q run -- send photo.jpg alice          # send file to peer by hostname or short ID
+cargo -q run -- files                         # list pending incoming transfers
+cargo -q run -- files accept 0                # accept transfer, saves to ~/Downloads
+cargo -q run -- files accept 0 --output .     # accept to current directory
+
 # Shell completions
 cargo -q run -- completions bash > /etc/bash_completion.d/pitopi
 ```
@@ -78,8 +88,8 @@ App (Minecraft, etc.) → TUN device (100.64.x.x / 200::x) → pitopi → iroh Q
 
 ### Modules
 
-- `src/main.rs` — thin CLI client (clap), IPC client functions, `spawn_path_logger`, service install/uninstall; `pitopi create [--name custom-name]` (generates network with optional custom name, prints join code), `pitopi join <public-key> [--name alias]`, `pitopi nuke <name>`, `pitopi hostname <network> <name>` (change hostname on existing network), `pitopi acl <network> tag/untag/allow/remove/show/apply` subcommands; `pitopi status` displays DNS names (hostname.network.pi) instead of IPs when available
-- `src/daemon.rs` — daemon process: DaemonState (shared endpoint + TUN + PeerTable + ProtocolRouter), NetworkHandle per active network, IPC server over Unix socket, ProtocolRouter dispatches connections via iroh ProtocolHandler by ALPN (MeshProtocol per network + BlobsProtocol for blob transfers); `CoordinatorAcceptState` and `MemberAcceptState` implement per-connection handling directly in `ProtocolHandler::accept()` via `AcceptHandler` enum — coordinator handles member auth/approval/sync, member handles MeshHello/ReconnectRequest from peers; reconnect loop, single DHT publisher (`spawn_network_publisher`), group poller (`spawn_group_poller`), local alias generation, `nuke_network()`, `restore_coordinator_network()`, ACL state on NetworkHandle, IPC handlers for ACL commands, ACL included in GroupBlob, ACL load from file on startup, empty record publish on nuke; MeshHello propagates hostname to peers with collision resolution via `resolve_collision()`, DNS table updated on peer connection; hostname persisted per-network in config (`my_hostname`); coordinator reads MeshHello from connecting peers via `spawn_coordinator_hello_reader()` to learn their hostname, update member list, and register in DNS table; joiner sends MeshHello to coordinator on initial connection
+- `src/main.rs` — thin CLI client (clap), IPC client functions, `spawn_path_logger`, service install/uninstall; `pitopi create [--name custom-name]` (generates network with optional custom name, prints join code), `pitopi join <public-key> [--name alias]`, `pitopi nuke <name>`, `pitopi hostname <network> <name>` (change hostname on existing network), `pitopi acl <network> tag/untag/allow/remove/show/apply` subcommands; `pitopi mdns on|off` (enable/disable mDNS local discovery, persisted to config); `pitopi send <file> <peer>` sends a file, `pitopi files` lists pending transfers, `pitopi files accept <id> [--output <dir>]` accepts a transfer; `pitopi status` displays DNS names (hostname.network.pi) instead of IPs when available + mDNS status
+- `src/daemon.rs` — daemon process: DaemonState (shared endpoint + TUN + PeerTable + ProtocolRouter), NetworkHandle per active network, IPC server over Unix socket, ProtocolRouter dispatches connections via iroh ProtocolHandler by ALPN (MeshProtocol per network + BlobsProtocol for blob transfers); `CoordinatorAcceptState` and `MemberAcceptState` implement per-connection handling directly in `ProtocolHandler::accept()` via `AcceptHandler` enum — coordinator handles member auth/approval/sync, member handles MeshHello/ReconnectRequest from peers; reconnect loop, single DHT publisher (`spawn_network_publisher`), group poller (`spawn_group_poller`), local alias generation, `nuke_network()`, `restore_coordinator_network()`, ACL state on NetworkHandle, IPC handlers for ACL commands, ACL included in GroupBlob, ACL load from file on startup, empty record publish on nuke; MeshHello propagates hostname to peers with collision resolution via `resolve_collision()`, DNS table updated on peer connection; hostname persisted per-network in config (`my_hostname`); coordinator reads MeshHello from connecting peers via `spawn_coordinator_hello_reader()` to learn their hostname, update member list, and register in DNS table; joiner sends MeshHello to coordinator on initial connection; mDNS local peer discovery via `iroh-mdns-address-lookup` (advertises `_pitopi._udp.local`, enabled by default, configurable via `mdns_enabled` in AppConfig); file sharing: `PendingFile` queue on ProtocolRouter, FILES_ALPN (`pitopi/files/1`) for file offer control messages, `send_file()`/`list_files()`/`accept_file()` IPC handlers, `resolve_peer_name()` resolves hostname or short ID to EndpointId, `guess_mime_type()` via mime_guess crate
 - `src/network_name.rs` — local alias generation: adjective-noun-noun word lists embedded at compile time, `generate_name()` (random selection via rand), `is_valid_name()` for validation
 - `src/ipc.rs` — IPC protocol types (IpcRequest, IpcResponse, NetworkStatus, PeerStatus), length-prefixed JSON wire helpers, socket path (`/var/run/pitopi/pitopi.sock`), client connect helper; `IpcRequest::Create` has no `name` field, `IpcRequest::Join { network_key, name: Option }`, `IpcRequest::Nuke { name, force }`, `IpcRequest::AclTag`, `AclUntag`, `AclAllow`, `AclRemove`, `AclShow`, `AclApply`, `FirewallAdd`, `FirewallRemove`, `FirewallShow`, `FirewallDefault`, `SetHostname`; `IpcResponse::Created { name, network_key, my_ip, my_ipv6 }`, `IpcResponse::AclState`, `IpcResponse::FirewallState`; `NetworkStatus` includes `my_ipv6`, `PeerStatus` includes `ipv6`
 - `src/identity.rs` — persistent Ed25519 keypair at `~/.config/pitopi/secret_key`
@@ -112,6 +122,8 @@ App (Minecraft, etc.) → TUN device (100.64.x.x / 200::x) → pitopi → iroh Q
 
 **Local firewall:** Each device has its own firewall rules (independent of coordinator-managed network ACL). Rules specify direction (in/out), action (allow/deny), protocol (tcp/udp/icmp/any), optional port or port range, and optional peer identity filter. Evaluated first-match-wins with a configurable default action (allow by default). Enforced in `forward.rs` after network ACL checks — both inbound (`spawn_peer_reader`, checks dst port) and outbound (`run_mesh`, checks dst port). Persisted to `~/.config/pitopi/firewall.toml`. Managed via `pitopi firewall` CLI commands through IPC. The `self` keyword in `resolve_short_id` resolves to the local device's EndpointId for use in both ACL and firewall commands.
 
+**File sharing:** `pitopi send <file> <peer>` reads the file, adds it to the iroh-blobs store, resolves the peer (by hostname or short ID), connects via FILES_ALPN (`pitopi/files/1`), and sends a `FileOffer` control message (filename, size, MIME type, blake3 hash). The receiver's ProtocolRouter accept loop matches FILES_ALPN, reads the offer, and queues it as a `PendingFile` with an auto-incrementing ID. `pitopi files` lists pending offers. `pitopi files accept <id>` connects to the sender via iroh-blobs ALPN, fetches the blob by hash, verifies integrity, and writes to `~/Downloads` (or `--output <dir>`).
+
 **Gatekeeper model:** coordinator approves identities and broadcasts MemberApproved. Any peer can then welcome an approved identity when it connects. The coordinator doesn't need to be online when the approved peer actually joins.
 
 **DHT model (single-record):** One pkarr record per network, signed with a random per-network secret key. The record contains the GroupBlob hash and a list of online seed peers. Only the coordinator (holder of the secret key) can publish. This prevents MITM attacks — the pkarr address IS the network's public key, so the record can't be spoofed. The join code is the public key string.
@@ -135,6 +147,7 @@ A background `spawn_group_poller()` checks the pkarr record every 60s and fetche
 - `iroh` — P2P QUIC transport with NAT traversal and relay fallback; `unstable-custom-transports` feature enables pluggable transport API
 - `iroh-tor-transport` — (optional, `tor` feature) Tor hidden service transport for iroh; derives onion address from iroh SecretKey, handles stream-to-datagram bridging; requires running Tor daemon with `ControlPort 9051`
 - `iroh-blobs` — content-addressed blob transfer for membership and ACL data exchange (FsStore, BlobsProtocol)
+- `iroh-mdns-address-lookup` — mDNS local peer discovery; advertises `_pitopi._udp.local`, auto-resolves LAN peers for direct connections
 - `iroh-dns` — pkarr `SignedPacket` for DHT membership records
 - `blake3` — GroupBlob hashing, data integrity verification
 - `hex` — encoding/decoding per-network secret keys in config
@@ -149,6 +162,8 @@ A background `spawn_group_poller()` checks the pkarr record every 60s and fetche
 - `dashmap` — lock-free concurrent hash map for ProtocolRouter handler dispatch
 - `smol_str` — inline strings for PeerTable network name keys (no heap allocation on lookup)
 - `arc-swap` — lock-free atomic pointer swap for SharedFirewall (zero-cost reads on hot path)
+- `humansize` — human-readable file size formatting
+- `mime_guess` — extension-based MIME type detection for file sharing
 - `dirs` — platform config directory resolution
 
 ## Conventions

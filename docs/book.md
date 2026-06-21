@@ -19,15 +19,16 @@ A complete guide to pitopi's architecture, protocols, and internals.
 11. [Three-Word Names](#11-three-word-names)
 12. [Access Control](#12-access-control)
 13. [Local Device Firewall](#13-local-device-firewall)
-14. [Magic DNS](#14-magic-dns)
-15. [Audit Logging](#15-audit-logging)
-16. [Statistics](#16-statistics)
-17. [Shutdown](#17-shutdown)
-18. [DHT Network Records](#18-dht-network-records)
-19. [Network Lifecycle](#19-network-lifecycle)
-20. [Daemon Architecture](#20-daemon-architecture)
-21. [Code Flow Diagrams](#21-code-flow-diagrams)
-22. [Security Model](#22-security-model)
+14. [File Sharing](#14-file-sharing)
+15. [Magic DNS](#15-magic-dns)
+16. [Audit Logging](#16-audit-logging)
+17. [Statistics](#17-statistics)
+18. [Shutdown](#18-shutdown)
+19. [DHT Network Records](#19-dht-network-records)
+20. [Network Lifecycle](#20-network-lifecycle)
+21. [Daemon Architecture](#21-daemon-architecture)
+22. [Code Flow Diagrams](#22-code-flow-diagrams)
+23. [Security Model](#23-security-model)
 
 ---
 
@@ -338,6 +339,7 @@ TUN devices are virtual network interfaces. Creating them requires root privileg
 | `pitopi acl NAME remove INDEX` | Remove a rule by index | Yes |
 | `pitopi acl NAME show` | Display current ACL state | Yes |
 | `pitopi acl NAME apply` | Re-publish current ACL to all peers | Yes |
+| `pitopi mdns on\|off` | Enable/disable mDNS local peer discovery | No |
 | `pitopi install-service` | Install systemd/launchd service | No |
 | `pitopi uninstall-service` | Remove system service | No |
 | `pitopi completions SHELL` | Generate shell completions | No |
@@ -1378,7 +1380,41 @@ pitopi firewall add out allow
 
 ---
 
-## 14. Magic DNS
+## 14. File Sharing
+
+**Modules:** `src/daemon.rs` (IPC handlers, PendingFile queue), `src/control.rs` (FileOffer message), `src/transport.rs` (FILES_ALPN)
+
+Pitopi includes peer-to-peer file sharing over the mesh. Files are content-addressed via blake3 and transferred using iroh-blobs — no cloud storage, no size limits.
+
+### Sending a file
+
+```bash
+pitopi send photo.jpg alice
+```
+
+The sender reads the file, adds it to the local iroh-blobs store, resolves the peer (by hostname or short ID across all networks), connects via the dedicated `pitopi/files/1` ALPN, and sends a `FileOffer` control message containing the filename, size, MIME type (detected via `mime_guess`), and blake3 hash.
+
+### Receiving files
+
+The daemon's ProtocolRouter accept loop matches the FILES_ALPN and queues incoming offers as `PendingFile` entries with auto-incrementing IDs:
+
+```bash
+pitopi files                         # list pending offers
+pitopi files accept 0                # accept, saves to ~/Downloads
+pitopi files accept 0 --output .     # accept to specific directory
+```
+
+### Accept flow
+
+On accept, the daemon connects to the sender via iroh-blobs ALPN (`/iroh-bytes/4`), fetches the blob by hash, verifies integrity (blake3), and writes to the output directory.
+
+### Wire protocol
+
+File offers use a dedicated ALPN (`pitopi/files/1`) separate from mesh traffic. The sender opens a bidirectional QUIC stream and sends a single `FileOffer` control message (length-prefixed msgpack). The receiver validates that the `from` field matches the connection's remote identity.
+
+---
+
+## 15. Magic DNS
 
 **Modules:** `src/dns.rs`, `src/dns_config.rs`, `src/hostname.rs`
 
@@ -1456,9 +1492,19 @@ Endpoint: ab3f...
 
 The DNS domain is controlled by `DNS_DOMAIN` in `src/main.rs`. Changing it from `"pi"` to something else updates all resolver paths, split-DNS routing, and query matching.
 
+### mDNS local peer discovery
+
+Pitopi uses `iroh-mdns-address-lookup` to advertise the daemon's endpoint on the local network via mDNS (service name `_pitopi._udp.local`). When two peers are on the same LAN, iroh automatically uses the mDNS-discovered addresses for direct connections — bypassing relay servers entirely.
+
+mDNS is enabled by default. The setting is stored as `mdns_enabled` in `~/.config/pitopi/networks.toml` and can be toggled with `pitopi mdns on|off` (requires daemon restart).
+
+On startup, the daemon builds an `MdnsAddressLookup` instance and registers it with the iroh endpoint's address lookup system. A background task logs `Discovered` and `Expired` events at INFO level. The mDNS subsystem uses its own UDP multicast sockets (via the `swarm-discovery` crate) — it is independent of iroh's transport layer and works alongside relay and Tor transports.
+
+No changes are needed in the connect or join flow. iroh queries all registered address lookups when resolving a peer, so any peer already known through network membership will automatically get a direct LAN path if both peers are on the same network.
+
 ---
 
-## 15. Audit Logging
+## 16. Audit Logging
 
 **Module:** `src/audit.rs`
 
@@ -1502,7 +1548,7 @@ audit.log_disconnect(peer_ip, &endpoint_id);
 
 ---
 
-## 16. Metrics
+## 17. Statistics
 
 **Module:** `src/stats.rs`
 
@@ -1561,7 +1607,7 @@ INFO (30s) rx=42 tx=38 bytes_rx=49356 bytes_tx=44100 drops=0
 
 ---
 
-## 17. Shutdown
+## 18. Shutdown
 
 **Module:** `src/shutdown.rs`
 
@@ -1597,7 +1643,7 @@ The shutdown is cooperative, not forceful. Each task exits at its next `tokio::s
 
 ---
 
-## 18. DHT Network Records
+## 19. DHT Network Records
 
 **Module:** `src/dht.rs`
 
@@ -1679,7 +1725,7 @@ The single-record model eliminates the MITM vulnerability of name-based director
 
 ---
 
-## 19. Network Lifecycle
+## 20. Network Lifecycle
 
 This chapter ties the modules together by walking through the complete lifecycle of a network.
 
@@ -1830,7 +1876,7 @@ All networks share the same TUN device and routing table, since the address spac
 
 ---
 
-## 20. Daemon Architecture
+## 21. Daemon Architecture
 
 Pitopi uses a daemon/client split similar to Tailscale. The daemon (`pitopi daemon`) is a long-lived root process that owns all shared resources, while CLI commands are thin IPC clients.
 
@@ -1890,7 +1936,7 @@ When a network is left:
 
 ---
 
-## 21. Code Flow Diagrams
+## 22. Code Flow Diagrams
 
 Visual reference for how data and control flow through the codebase.
 
@@ -2064,7 +2110,7 @@ spawn_peer_reader detects conn.read_datagram() error
 
 ---
 
-## 22. Security Model
+## 23. Security Model
 
 ### Transport security
 
