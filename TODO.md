@@ -15,8 +15,9 @@ an item serves that socket/DNS surface.
 - [x] Distributed ACLs with tag-based allow rules
 - [x] Systemd/launchd service integration
 - [x] Daemon architecture with Unix socket IPC
-- [x] Magic DNS with .pi domain resolution
+- [x] Magic DNS with .pi domain resolution (A + AAAA)
 - [x] Local device firewall with port/protocol/peer filtering
+- [x] Dual-stack IPv6/IPv4 with stable addresses
 
 ---
 
@@ -26,24 +27,19 @@ an item serves that socket/DNS surface.
   - MeshProtocol implements `ProtocolHandler`, one instance per network
   - ProtocolRouter dispatches by ALPN to MeshProtocol + BlobsProtocol handlers
   - Dynamic registration/unregistration as networks are created/joined/left
-- [ ] **Dual-stack IPv6/IPv4 with local collision handling**
-  - **IPv6 (stable, identity-bound):** derive from EndpointId into `200::/7` range
-    (blake3 hash of public key, take 15 bytes, prepend `0x02` → 128-bit address).
-    Never rotates, never collides (120 bits of address space)
-  - **IPv4 (best-effort compat):** keep CGNAT `100.64.0.0/10` with FNV-1a derivation.
-    On collision: re-derive as `hash(pubkey + index)` where index increments per collision.
-    Collision index is **local state** — each node resolves independently in its own peer table.
-    Persist `(EndpointId, collision_index)` in local config so it survives restarts
-  - **Single TUN, host routes:** one TUN interface for all networks (current design).
-    TUN gets a `/32` + `/128` local address. Add per-peer host routes (`/32`, `/128`)
-    as peers come online, remove on disconnect. No subnet allocation, no overlap conflicts
-  - **Forwarding:** detect IPv4 vs IPv6 via version nibble (byte 0 upper 4 bits),
-    extract dest from bytes 16-19 (v4) or 24-39 (v6), look up PeerTable
-  - **MagicDNS makes IPs opaque:** users never see raw addresses.
-    `alice.mynet.pi` resolves to AAAA (stable IPv6) + A (possibly-rotated IPv4).
-    IPv4 rotation is transparent because apps resolve via DNS, not hardcoded IPs
+- [x] **Dual-stack IPv6/IPv4 with stable addresses**
+  - **IPv6 (stable, identity-bound):** derived from EndpointId into `200::/7` range
+    (blake3 hash, 15 bytes + `0x02` prefix → 128-bit address). Never rotates, never
+    collides (120 bits of address space). TUN gets `/128` host address
+  - **IPv4 (compat):** CGNAT `100.64.0.0/10` via FNV-1a. `derive_ip_with_index()`
+    ready for future collision rotation (`hash(pubkey + index)`)
+  - **Dual-stack forwarding:** version nibble dispatch, PeerTable with dual DashMaps
+    (v4 + v6), `parse_packet_info()` handles both IPv4 and IPv6 headers
+  - **DNS:** A + AAAA queries answered from `HostnameEntry = (Ipv4Addr, Ipv6Addr)`
+  - **Hot-path:** SmolStr network names, Arc<AclData>, ArcSwap firewall — zero heap
+    allocations and zero locks on the per-packet forwarding path
 - [x] **Magic DNS**
-  - Local resolver intercepts `.pi` queries → A records (IPv4); AAAA when IPv6 lands
+  - Local resolver intercepts `.pi` queries → A records (IPv4) + AAAA records (IPv6)
   - Per-network names: `alice.gaming.pi`, registered on join via `--hostname`
   - Multi-platform DNS config (macOS scoped resolver, Linux systemd-resolved/resolvconf/direct)
   - Backup/restore of DNS files with crash recovery

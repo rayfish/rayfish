@@ -1844,7 +1844,8 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 
     let key = identity::load_or_create()?;
     let public_key = key.public();
-    let identity = IrohIdentityProvider::new(public_key);
+    let collision_index = identity::load_collision_index()?;
+    let identity = IrohIdentityProvider::new(public_key, collision_index);
     let my_ip = identity.local_ip();
 
     // Load saved networks to determine initial ALPNs

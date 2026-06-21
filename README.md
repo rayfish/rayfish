@@ -4,7 +4,7 @@ A peer-to-peer mesh VPN that lets you create private virtual networks without an
 
 ## Why?
 
-You want to play Minecraft with friends, but nobody wants to set up port forwarding or pay for a hosted server. With Pitopi, one person creates a network, shares a short code, and everyone joins. Each player gets a virtual IP and the game thinks you're all on the same LAN.
+You want to play Minecraft with friends, but nobody wants to set up port forwarding or pay for a hosted server. With Pitopi, one person creates a network, shares a short code, and everyone joins. Each player gets virtual IPv4 and IPv6 addresses and the game thinks you're all on the same LAN.
 
 But it's not just for games. Pitopi gives you a private, encrypted network between any set of devices — work machines, home servers, cloud instances — without trusting a third party.
 
@@ -14,7 +14,7 @@ But it's not just for games. Pitopi gives you a private, encrypted network betwe
 2. **Share the join code** — the creator gets a public key string to share with friends
 3. **Join** — peers connect using the join code. iroh handles NAT traversal, hole-punching, and encrypted transport automatically
 4. **Full mesh** — the coordinator assigns virtual IPs and broadcasts the peer list. Every peer connects directly to every other peer
-5. **Use it** — every peer gets a virtual IP (100.64.x.x). Any app that uses TCP/UDP just works
+5. **Use it** — every peer gets a virtual IPv4 (100.64.x.x) and IPv6 (200::/7) address. Any app that uses TCP/UDP just works
 
 Under the hood, Pitopi creates a TUN device on each machine, captures IP packets, and tunnels them through iroh's QUIC-based P2P connections. If direct connections aren't possible (~10% of cases), traffic falls back to encrypted relay servers.
 
@@ -48,7 +48,8 @@ sudo pitopi daemon &    # start the daemon in the background
 # Create a network — you become the coordinator
 pitopi create --hostname alice
 # > Network created: gentle-amber-fox
-# >   IP: 100.64.23.142
+# >   IPv4: 100.64.23.142
+# >   IPv6: 200:ab3f:d92c:1e4a::1
 # >   Hostname: alice.gentle-amber-fox.pi
 # >   Join code: 3f8a...c7d2
 # >   Share this join code to invite others
@@ -56,7 +57,8 @@ pitopi create --hostname alice
 # On another machine, join using the join code
 pitopi join 3f8a...c7d2 --name gaming --hostname bob
 # > Joined network 'gaming'.
-# >   IP: 100.64.7.201
+# >   IPv4: 100.64.7.201
+# >   IPv6: 200:e71a:f083:29b1::1
 # >   Hostname: bob.gaming.pi
 
 # Check what's running
@@ -153,7 +155,7 @@ ping alice.gentle-amber-fox.pi    # fully qualified
 ping alice.pi                     # flat lookup (searches all networks)
 ```
 
-Hostnames propagate via the membership blob and MeshHello messages — they're resolvable even when the named peer is offline. If two peers choose the same hostname, a numeric suffix is appended automatically (e.g., `alice` → `alice2`). Hostnames persist across daemon restarts. The daemon configures your system DNS to route only `.pi` queries to its local resolver; all other DNS is untouched.
+Hostnames propagate via the membership blob and MeshHello messages — they're resolvable even when the named peer is offline. Both A (IPv4) and AAAA (IPv6) records are served, so `ping6 alice.gaming.pi` works out of the box. If two peers choose the same hostname, a numeric suffix is appended automatically (e.g., `alice` → `alice2`). Hostnames persist across daemon restarts. The daemon configures your system DNS to route only `.pi` queries to its local resolver; all other DNS is untouched.
 
 ## Commands
 
@@ -203,7 +205,7 @@ Includes pitopi forwarding counters (`pitopi_packets_rx_total`, `pitopi_bytes_tx
 
 ## Configuration
 
-Network memberships are stored at `~/.config/pitopi/networks.toml`. Identity (Ed25519 keypair) persists at `~/.config/pitopi/secret_key` — same endpoint ID across restarts.
+Network memberships are stored at `~/.config/pitopi/networks.toml`. Identity (Ed25519 keypair) persists at `~/.config/pitopi/secret_key` — same endpoint ID across restarts. IPv4 and IPv6 addresses are both derived deterministically from peer identity, so they are stable and never change.
 
 ## Building
 
@@ -221,7 +223,7 @@ just deploy <ip>             # cross-build + install + start daemon service
 ## Architecture
 
 ```
-App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi daemon → iroh QUIC datagrams → peer
+App (Minecraft, etc.) → TUN device (100.64.x.x + 200::/7) → pitopi daemon → iroh QUIC datagrams → peer
 ```
 
 Pitopi uses a daemon/client split similar to Tailscale. The daemon (`pitopi daemon`) is a long-lived root process that owns the iroh endpoint, TUN device, and all peer connections. CLI commands talk to it over a Unix socket.
@@ -229,7 +231,7 @@ Pitopi uses a daemon/client split similar to Tailscale. The daemon (`pitopi daem
 - Full mesh topology — every peer connects directly to every other peer
 - Coordinator assigns IPs and broadcasts peer list via a control channel (QUIC bidirectional stream)
 - Data flows as QUIC datagrams (low-latency, no head-of-line blocking)
-- Routing table dispatches packets by destination IP from the IPv4 header
+- Routing table dispatches packets by destination IP from IPv4 and IPv6 headers
 - Split TUN I/O (TunReader/TunWriter) for lock-free concurrent read/write
 - Per-network ALPN isolation on a single shared iroh endpoint
 - Dynamic network management — create, join, and leave without restarting
@@ -247,6 +249,7 @@ See [TODO.md](TODO.md) for the full roadmap. Current status:
 - [x] Distributed ACLs with tag-based allow rules (coordinator-managed, enforced on all peers)
 - [x] Local device firewall with port/protocol/peer filtering
 - [x] Magic DNS with .pi domain resolution
+- [x] Dual-stack IPv6/IPv4 with stable addresses
 - [x] Systemd/launchd service integration
 - [x] Daemon architecture with Unix socket IPC
 - [ ] Social discovery (Discord, Slack, Steam)

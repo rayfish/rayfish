@@ -1,10 +1,10 @@
 mod acl;
+mod config;
+mod control;
 mod daemon;
 mod dht;
 mod dns;
 mod dns_config;
-mod config;
-mod control;
 mod firewall;
 mod forward;
 mod hostname;
@@ -22,12 +22,13 @@ mod tun;
 pub const APP_NAME: &str = "pitopi";
 pub const DNS_DOMAIN: &str = "pi";
 
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 
 use futures::StreamExt;
-use iroh::endpoint::{PathEvent, Connection as IrohConnection};
+use iroh::endpoint::{Connection as IrohConnection, PathEvent};
 
 use membership::GroupMode;
 
@@ -237,14 +238,22 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::List => cmd_list().await,
         Command::Leave { name } => ipc_leave(&name).await,
-        Command::Create { mode, name, hostname } => ipc_create(mode, name, hostname).await,
-        Command::Join { network_key, name, hostname } => ipc_join(&network_key, name.as_deref(), hostname).await,
+        Command::Create {
+            mode,
+            name,
+            hostname,
+        } => ipc_create(mode, name, hostname).await,
+        Command::Join {
+            network_key,
+            name,
+            hostname,
+        } => ipc_join(&network_key, name.as_deref(), hostname).await,
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Status => ipc_status().await,
         Command::Daemon | Command::Up => {
             check_root();
             let token = shutdown::token();
-            let stats = std::sync::Arc::new(stats::ForwardMetrics::default());
+            let stats = Arc::new(stats::ForwardMetrics::default());
             stats.spawn_logger(token.clone());
             daemon::run_daemon(token, stats).await
         }
@@ -282,12 +291,20 @@ async fn cmd_list() -> Result<()> {
                         if let Some(ref h) = net.my_hostname {
                             println!(
                                 "{} (role: {}, dns: {}.{}.{}, peers: {})",
-                                net.name, role, h, net.name, DNS_DOMAIN, net.peers.len(),
+                                net.name,
+                                role,
+                                h,
+                                net.name,
+                                DNS_DOMAIN,
+                                net.peers.len(),
                             );
                         } else {
                             println!(
                                 "{} (role: {}, ip: {}, peers: {})",
-                                net.name, role, net.my_ip, net.peers.len(),
+                                net.name,
+                                role,
+                                net.my_ip,
+                                net.peers.len(),
                             );
                         }
                     }
@@ -311,7 +328,10 @@ async fn cmd_list() -> Result<()> {
             .unwrap_or_else(|| "?".to_string());
         println!(
             "{} (ip: {}, members: {}, mode: {:?})",
-            net.name, ip_str, net.members.len(), net.group_mode,
+            net.name,
+            ip_str,
+            net.members.len(),
+            net.group_mode,
         );
     }
     Ok(())
@@ -323,10 +343,23 @@ async fn cmd_list() -> Result<()> {
 
 async fn ipc_create(mode: GroupMode, name: Option<String>, hostname: Option<String>) -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(&mut stream, &ipc::IpcRequest::Create { mode, name, hostname }).await?;
+    ipc::send_msg(
+        &mut stream,
+        &ipc::IpcRequest::Create {
+            mode,
+            name,
+            hostname,
+        },
+    )
+    .await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Created { name, network_key, my_ip, my_ipv6 } => {
+        ipc::IpcResponse::Created {
+            name,
+            network_key,
+            my_ip,
+            my_ipv6,
+        } => {
             println!("Network created: {}", name);
             println!("  IPv4: {}", my_ip);
             if let Some(v6) = my_ipv6 {
@@ -345,14 +378,22 @@ async fn ipc_create(mode: GroupMode, name: Option<String>, hostname: Option<Stri
 
 async fn ipc_join(network_key: &str, name: Option<&str>, hostname: Option<String>) -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(&mut stream, &ipc::IpcRequest::Join {
-        network_key: network_key.to_string(),
-        name: name.map(|s| s.to_string()),
-        hostname,
-    }).await?;
+    ipc::send_msg(
+        &mut stream,
+        &ipc::IpcRequest::Join {
+            network_key: network_key.to_string(),
+            name: name.map(|s| s.to_string()),
+            hostname,
+        },
+    )
+    .await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Joined { name, my_ip, my_ipv6 } => {
+        ipc::IpcResponse::Joined {
+            name,
+            my_ip,
+            my_ipv6,
+        } => {
             println!("Joined network '{}'.", name);
             println!("  IPv4: {}", my_ip);
             if let Some(v6) = my_ipv6 {
@@ -369,10 +410,14 @@ async fn ipc_join(network_key: &str, name: Option<&str>, hostname: Option<String
 
 async fn ipc_nuke(name: &str, force: bool) -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(&mut stream, &ipc::IpcRequest::Nuke {
-        name: name.to_string(),
-        force,
-    }).await?;
+    ipc::send_msg(
+        &mut stream,
+        &ipc::IpcRequest::Nuke {
+            name: name.to_string(),
+            force,
+        },
+    )
+    .await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
         ipc::IpcResponse::Ok { message } => println!("{}", message),
@@ -384,9 +429,13 @@ async fn ipc_nuke(name: &str, force: bool) -> Result<()> {
 
 async fn ipc_leave(name: &str) -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(&mut stream, &ipc::IpcRequest::Leave {
-        name: name.to_string(),
-    }).await?;
+    ipc::send_msg(
+        &mut stream,
+        &ipc::IpcRequest::Leave {
+            name: name.to_string(),
+        },
+    )
+    .await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
         ipc::IpcResponse::Ok { message } => println!("{}", message),
@@ -401,7 +450,14 @@ async fn ipc_status() -> Result<()> {
     ipc::send_msg(&mut stream, &ipc::IpcRequest::Status).await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Status { endpoint_id, networks, packets_rx, packets_tx, bytes_rx, bytes_tx } => {
+        ipc::IpcResponse::Status {
+            endpoint_id,
+            networks,
+            packets_rx,
+            packets_tx,
+            bytes_rx,
+            bytes_tx,
+        } => {
             println!("Endpoint: {}", endpoint_id);
             if networks.is_empty() {
                 println!("No active networks.");
@@ -411,7 +467,9 @@ async fn ipc_status() -> Result<()> {
                         ipc::NetworkRole::Coordinator => "coordinator",
                         ipc::NetworkRole::Member => "member",
                     };
-                    let dns_name = net.my_hostname.as_ref()
+                    let dns_name = net
+                        .my_hostname
+                        .as_ref()
                         .map(|h| format!("{}.{}.{}", h, net.name, DNS_DOMAIN));
                     print!("  {} [{}]", net.name, role);
                     if let Some(ref dns) = dns_name {
@@ -419,9 +477,17 @@ async fn ipc_status() -> Result<()> {
                     }
                     println!("  ({})", net.my_ip);
                     if let Some(ref key) = net.network_key {
-                        println!("    Key: {}…{}", &key[..8.min(key.len())], &key[key.len().saturating_sub(4)..]);
+                        println!(
+                            "    Key: {}…{}",
+                            &key[..8.min(key.len())],
+                            &key[key.len().saturating_sub(4)..]
+                        );
                     }
-                    println!("    Members: {}/{} online", net.peers.len() + 1, net.member_count);
+                    println!(
+                        "    Members: {}/{} online",
+                        net.peers.len() + 1,
+                        net.member_count
+                    );
                     if !net.peers.is_empty() {
                         println!("    Peers:");
                         for peer in &net.peers {
@@ -463,8 +529,12 @@ async fn ipc_status() -> Result<()> {
                     format!("{} B", b)
                 }
             }
-            println!("  Traffic: rx:{} tx:{} ({})",
-                packets_rx, packets_tx, format_bytes(bytes_rx + bytes_tx));
+            println!(
+                "  Traffic: rx:{} tx:{} ({})",
+                packets_rx,
+                packets_tx,
+                format_bytes(bytes_rx + bytes_tx)
+            );
         }
         ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
@@ -486,10 +556,14 @@ async fn ipc_down() -> Result<()> {
 
 async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(&mut stream, &ipc::IpcRequest::SetHostname {
-        network: network.to_string(),
-        hostname: hostname.to_string(),
-    }).await?;
+    ipc::send_msg(
+        &mut stream,
+        &ipc::IpcRequest::SetHostname {
+            network: network.to_string(),
+            hostname: hostname.to_string(),
+        },
+    )
+    .await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
         ipc::IpcResponse::Ok { message } => println!("{}", message),
@@ -503,16 +577,23 @@ async fn ipc_acl(network: &str, action: AclAction) -> Result<()> {
     let mut stream = ipc::connect().await?;
     let req = match action {
         AclAction::Tag { tag, peer_ids } => ipc::IpcRequest::AclTag {
-            network: network.to_string(), tag, peer_ids,
+            network: network.to_string(),
+            tag,
+            peer_ids,
         },
         AclAction::Untag { tag, peer_id } => ipc::IpcRequest::AclUntag {
-            network: network.to_string(), tag, peer_id,
+            network: network.to_string(),
+            tag,
+            peer_id,
         },
         AclAction::Allow { src, dst } => ipc::IpcRequest::AclAllow {
-            network: network.to_string(), src, dst,
+            network: network.to_string(),
+            src,
+            dst,
         },
         AclAction::Remove { index } => ipc::IpcRequest::AclRemove {
-            network: network.to_string(), index,
+            network: network.to_string(),
+            index,
         },
         AclAction::Show => ipc::IpcRequest::AclShow {
             network: network.to_string(),
@@ -535,8 +616,18 @@ async fn ipc_acl(network: &str, action: AclAction) -> Result<()> {
 async fn ipc_firewall(action: FirewallAction) -> Result<()> {
     let mut stream = ipc::connect().await?;
     let req = match action {
-        FirewallAction::Add { direction, action, proto, port, peer } => ipc::IpcRequest::FirewallAdd {
-            direction, action, protocol: proto, port, peer,
+        FirewallAction::Add {
+            direction,
+            action,
+            proto,
+            port,
+            peer,
+        } => ipc::IpcRequest::FirewallAdd {
+            direction,
+            action,
+            protocol: proto,
+            port,
+            peer,
         },
         FirewallAction::Remove { index } => ipc::IpcRequest::FirewallRemove { index },
         FirewallAction::Show => ipc::IpcRequest::FirewallShow,

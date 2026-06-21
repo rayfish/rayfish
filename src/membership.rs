@@ -305,13 +305,18 @@ pub struct IrohIdentityProvider {
     endpoint_id: EndpointId,
     ip: Ipv4Addr,
     ipv6: Ipv6Addr,
+    collision_index: u32,
 }
 
 impl IrohIdentityProvider {
-    pub fn new(endpoint_id: EndpointId) -> Self {
-        let ip = derive_ip(&endpoint_id);
+    pub fn new(endpoint_id: EndpointId, collision_index: u32) -> Self {
+        let ip = derive_ip_with_index(&endpoint_id, collision_index);
         let ipv6 = derive_ipv6(&endpoint_id);
-        Self { endpoint_id, ip, ipv6 }
+        Self { endpoint_id, ip, ipv6, collision_index }
+    }
+
+    pub fn collision_index(&self) -> u32 {
+        self.collision_index
     }
 }
 
@@ -547,7 +552,7 @@ mod tests {
     fn test_iroh_identity_provider() {
         let key = iroh::SecretKey::generate();
         let endpoint_id = key.public();
-        let provider = IrohIdentityProvider::new(endpoint_id);
+        let provider = IrohIdentityProvider::new(endpoint_id, 0);
 
         let ip = provider.local_ip();
         let octets = ip.octets();
