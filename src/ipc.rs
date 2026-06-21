@@ -2,6 +2,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use iroh::EndpointId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -63,7 +64,7 @@ pub enum IpcResponse {
     },
     Created {
         name: String,
-        network_key: String,
+        network_key: EndpointId,
         my_ip: Ipv4Addr,
     },
     Joined {
@@ -71,7 +72,7 @@ pub enum IpcResponse {
         my_ip: Ipv4Addr,
     },
     Status {
-        endpoint_id: String,
+        endpoint_id: EndpointId,
         networks: Vec<NetworkStatus>,
     },
     AclState {
@@ -95,7 +96,7 @@ pub enum NetworkRole {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PeerStatus {
-    pub endpoint_id: String,
+    pub endpoint_id: EndpointId,
     pub ip: Ipv4Addr,
 }
 
@@ -160,9 +161,10 @@ mod tests {
 
     #[test]
     fn test_response_roundtrip() {
+        let key = iroh::SecretKey::generate().public();
         let resp = IpcResponse::Created {
             name: "test".to_string(),
-            network_key: "abc123key".to_string(),
+            network_key: key,
             my_ip: Ipv4Addr::new(100, 64, 10, 5),
         };
         let json = serde_json::to_vec(&resp).unwrap();
@@ -170,7 +172,7 @@ mod tests {
         match decoded {
             IpcResponse::Created { name, network_key, my_ip } => {
                 assert_eq!(name, "test");
-                assert_eq!(network_key, "abc123key");
+                assert_eq!(network_key, key);
                 assert_eq!(my_ip, Ipv4Addr::new(100, 64, 10, 5));
             }
             _ => panic!("wrong variant"),
@@ -213,14 +215,16 @@ mod tests {
 
     #[test]
     fn test_status_response_roundtrip() {
+        let ep_id = iroh::SecretKey::generate().public();
+        let peer_id = iroh::SecretKey::generate().public();
         let resp = IpcResponse::Status {
-            endpoint_id: "abc123".to_string(),
+            endpoint_id: ep_id,
             networks: vec![NetworkStatus {
                 name: "gaming".to_string(),
                 role: NetworkRole::Coordinator,
                 my_ip: Ipv4Addr::new(100, 64, 10, 5),
                 peers: vec![PeerStatus {
-                    endpoint_id: "def456".to_string(),
+                    endpoint_id: peer_id,
                     ip: Ipv4Addr::new(100, 64, 10, 6),
                 }],
             }],
@@ -229,9 +233,9 @@ mod tests {
         let decoded: IpcResponse = serde_json::from_slice(&json).unwrap();
         match decoded {
             IpcResponse::Status { endpoint_id, networks } => {
-                assert_eq!(endpoint_id, "abc123");
+                assert_eq!(endpoint_id, ep_id);
                 assert_eq!(networks.len(), 1);
-                assert_eq!(networks[0].peers.len(), 1);
+                assert_eq!(networks[0].peers[0].endpoint_id, peer_id);
             }
             _ => panic!("wrong variant"),
         }

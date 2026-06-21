@@ -327,21 +327,18 @@ pub fn canonical_group_bytes(
     rmp_serde::to_vec_named(&data).expect("msgpack serialize")
 }
 
-/// Computes the blake3 hash of the canonical group blob encoding.
-pub fn group_blob_hash(members: &MemberList, approved: &ApprovedList, acl: &AclData) -> String {
+pub fn group_blob_hash(members: &MemberList, approved: &ApprovedList, acl: &AclData) -> blake3::Hash {
     let bytes = canonical_group_bytes(members, approved, acl);
-    blake3::hash(&bytes).to_hex().to_string()
+    blake3::hash(&bytes)
 }
 
-/// Deserializes canonical msgpack bytes into [`GroupBlob`].
 pub fn decode_group_blob(bytes: &[u8]) -> Result<GroupBlob> {
     rmp_serde::from_slice(bytes).map_err(|e| anyhow::anyhow!("invalid group blob: {e}"))
 }
 
-/// Verifies that bytes match the expected hash, then deserializes.
-pub fn verify_group_blob(bytes: &[u8], expected_hash: &str) -> Result<GroupBlob> {
-    let actual = blake3::hash(bytes).to_hex().to_string();
-    if actual != expected_hash {
+pub fn verify_group_blob(bytes: &[u8], expected_hash: &blake3::Hash) -> Result<GroupBlob> {
+    let actual = blake3::hash(bytes);
+    if actual != *expected_hash {
         bail!("group blob hash mismatch: expected {expected_hash}, got {actual}");
     }
     decode_group_blob(bytes)
@@ -736,7 +733,8 @@ mod tests {
         let approved = ApprovedList::new();
         let acl = crate::acl::AclData::empty();
         let bytes = canonical_group_bytes(&members, &approved, &acl);
-        let result = verify_group_blob(&bytes, "badhash");
+        let bad_hash = blake3::hash(b"wrong data");
+        let result = verify_group_blob(&bytes, &bad_hash);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("hash mismatch"));
     }

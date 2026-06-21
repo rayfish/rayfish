@@ -50,7 +50,7 @@ pub enum ControlMsg {
         approved: Vec<ApprovedEntry>,
     },
     BlobUpdated {
-        hash: String,
+        hash: blake3::Hash,
     },
 }
 
@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn test_roundtrip_blob_updated() {
         let msg = ControlMsg::BlobUpdated {
-            hash: "abc123def456".to_string(),
+            hash: blake3::hash(b"test blob"),
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();

@@ -130,7 +130,7 @@ impl ProtocolRouter {
 
 #[derive(Clone)]
 struct GroupSnapshot {
-    hash: String,
+    hash: blake3::Hash,
     msgpack_bytes: Vec<u8>,
 }
 
@@ -146,7 +146,7 @@ struct NetworkState {
 impl NetworkState {
     fn refresh_snapshot(&mut self) {
         let bytes = canonical_group_bytes(&self.members, &self.approved, &self.acl);
-        let hash = blake3::hash(&bytes).to_hex().to_string();
+        let hash = blake3::hash(&bytes);
         self.snapshot = Some(GroupSnapshot { hash, msgpack_bytes: bytes });
     }
 }
@@ -267,7 +267,7 @@ impl DaemonState {
 
         // Publish single pkarr record
         if let Ok(pkarr_client) = dht::create_pkarr_client(&self.endpoint) {
-            let blob_hash = net_state.snapshot.as_ref().map(|s| s.hash.clone()).unwrap_or_default();
+            let blob_hash = net_state.snapshot.as_ref().map(|s| s.hash).expect("snapshot set");
             if let Err(e) = dht::publish_network(
                 &pkarr_client,
                 &net_secret_key,
@@ -295,8 +295,8 @@ impl DaemonState {
             my_ip: Some(my_ip),
             members: member_entries,
             approved: approved_entries,
-            network_secret_key: Some(hex::encode(net_secret_key.to_bytes())),
-            network_public_key: Some(net_public_key.to_string()),
+            network_secret_key: Some(net_secret_key.clone()),
+            network_public_key: Some(net_public_key),
         });
         config::save(&app_config)?;
 
@@ -356,12 +356,11 @@ impl DaemonState {
         self.networks.insert(name.clone(), handle);
         self.refresh_alpns();
 
-        let network_key = net_public_key.to_string();
-        tracing::info!(name = %name, key = %network_key, ip = %my_ip, "network created");
+        tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network created");
 
         Ok(IpcResponse::Created {
             name,
-            network_key,
+            network_key: net_public_key,
             my_ip,
         })
     }
@@ -396,12 +395,7 @@ impl DaemonState {
             });
         }
 
-        // Fetch group blob from a seed peer
-        let blob_hash = {
-            let b3_hash: blake3::Hash = expected_hash.parse()
-                .context("invalid blob hash from DHT")?;
-            iroh_blobs::Hash::from_bytes(*b3_hash.as_bytes())
-        };
+        let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
 
         let mut group_blob = None;
         for peer_id in &peer_ids {
@@ -520,7 +514,7 @@ impl DaemonState {
         // Save config with network public key (use display_name for config)
         if let Ok(mut app_config) = config::load() {
             if let Some(net) = app_config.networks.iter_mut().find(|n| n.name == display_name) {
-                net.network_public_key = Some(net_pubkey.to_string());
+                net.network_public_key = Some(net_pubkey);
             }
             let _ = config::save(&app_config);
         }
@@ -585,11 +579,7 @@ impl DaemonState {
         let (expected_hash, _peer_ids) = dht::resolve_network(&pkarr_client, net_pubkey).await?;
 
         let my_identity = self.identity.local_identity();
-        let blob_hash = {
-            let b3_hash: blake3::Hash = expected_hash.parse()
-                .context("invalid blob hash from DHT")?;
-            iroh_blobs::Hash::from_bytes(*b3_hash.as_bytes())
-        };
+        let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
 
         let app_config = config::load()?;
         let net_config = app_config.networks.iter()
@@ -701,11 +691,7 @@ impl DaemonState {
         let app_config = config::load()?;
         let net_config = app_config.networks.iter().find(|n| n.name == name);
         let net_secret_key = net_config
-            .and_then(|nc| nc.network_secret_key.as_ref())
-            .and_then(|hex_str| {
-                let bytes: [u8; 32] = hex::decode(hex_str).ok()?.try_into().ok()?;
-                Some(SecretKey::from_bytes(&bytes))
-            })
+            .and_then(|nc| nc.network_secret_key.clone())
             .context("no network secret key in config — cannot restore as coordinator")?;
         let net_public_key = net_secret_key.public();
 
@@ -773,7 +759,7 @@ impl DaemonState {
 
         // Publish single pkarr record
         if let Ok(pkarr_client) = dht::create_pkarr_client(&self.endpoint) {
-            let blob_hash = net_state.snapshot.as_ref().map(|s| s.hash.clone()).unwrap_or_default();
+            let blob_hash = net_state.snapshot.as_ref().map(|s| s.hash).expect("snapshot set");
             if let Err(e) = dht::publish_network(
                 &pkarr_client,
                 &net_secret_key,
@@ -801,8 +787,8 @@ impl DaemonState {
             my_ip: Some(my_ip),
             members: member_entries,
             approved: approved_entries,
-            network_secret_key: Some(hex::encode(net_secret_key.to_bytes())),
-            network_public_key: Some(net_public_key.to_string()),
+            network_secret_key: Some(net_secret_key.clone()),
+            network_public_key: Some(net_public_key),
         });
         config::save(&app_config)?;
 
@@ -864,12 +850,11 @@ impl DaemonState {
         self.networks.insert(name.to_string(), handle);
         self.refresh_alpns();
 
-        let network_key = net_public_key.to_string();
-        tracing::info!(name = %name, key = %network_key, ip = %my_ip, "network restored (coordinator)");
+        tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network restored (coordinator)");
 
         Ok(IpcResponse::Created {
             name: name.to_string(),
-            network_key,
+            network_key: net_public_key,
             my_ip,
         })
     }
@@ -962,7 +947,7 @@ impl DaemonState {
         let statuses: Vec<NetworkStatus> = self.networks.iter().map(|h| {
             let peer_entries = self.peers.peers_for_network(&h.name);
             let peers = peer_entries.into_iter().map(|(eid, ip)| PeerStatus {
-                endpoint_id: eid.to_string(),
+                endpoint_id: eid,
                 ip,
             }).collect();
             NetworkStatus {
@@ -974,7 +959,7 @@ impl DaemonState {
         }).collect();
 
         IpcResponse::Status {
-            endpoint_id: self.endpoint.id().to_string(),
+            endpoint_id: self.endpoint.id(),
             networks: statuses,
         }
     }
@@ -1021,7 +1006,7 @@ impl DaemonState {
                 let mut state = handle.state.write().unwrap();
                 state.acl = data.clone();
                 state.refresh_snapshot();
-                let h = state.snapshot.as_ref().map(|s| s.hash.clone()).unwrap_or_default();
+                let h = state.snapshot.as_ref().map(|s| s.hash).expect("snapshot set");
                 (h, state.network_secret_key.clone())
             } else {
                 return;
@@ -1227,8 +1212,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
         .networks
         .iter()
         .filter_map(|net| net.network_public_key.as_ref()
-            .and_then(|k| k.parse::<EndpointId>().ok())
-            .map(|id| transport::network_alpn(&id)))
+            .map(transport::network_alpn))
         .collect();
 
     alpns.push(iroh_blobs::protocol::ALPN.to_vec());
@@ -1305,7 +1289,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
             // We're a member — rejoin via DHT lookup
             let name = net.name.clone();
             let net_pubkey = match &net.network_public_key {
-                Some(k) => k.clone(),
+                Some(k) => k.to_string(),
                 None => {
                     tracing::warn!(network = %name, "no network public key in config, skipping restore");
                     continue;
@@ -1421,7 +1405,7 @@ fn spawn_network_publisher(
         loop {
             let hash = {
                 let s = state.read().unwrap();
-                s.snapshot.as_ref().map(|snap| snap.hash.clone())
+                s.snapshot.as_ref().map(|snap| snap.hash)
                     .unwrap_or_else(|| group_blob_hash(&s.members, &s.approved, &s.acl))
             };
             let mut seed_peers: Vec<EndpointId> = peers
@@ -1467,7 +1451,7 @@ fn spawn_group_poller(
 
             let current_hash = {
                 let s = state.read().unwrap();
-                s.snapshot.as_ref().map(|snap| snap.hash.clone())
+                s.snapshot.as_ref().map(|snap| snap.hash)
             };
 
             let (remote_hash, _seed_peers) = match dht::resolve_network(&client, net_pubkey).await {
@@ -1478,19 +1462,13 @@ fn spawn_group_poller(
                 }
             };
 
-            if current_hash.as_deref() == Some(remote_hash.as_str()) {
+            if current_hash == Some(remote_hash) {
                 continue;
             }
 
             tracing::info!(old = ?current_hash, new = %remote_hash, "group blob changed");
 
-            let blob_hash = match remote_hash.parse::<blake3::Hash>() {
-                Ok(h) => iroh_blobs::Hash::from_bytes(*h.as_bytes()),
-                Err(e) => {
-                    tracing::warn!(error = %e, "invalid blob hash");
-                    continue;
-                }
-            };
+            let blob_hash = iroh_blobs::Hash::from_bytes(*remote_hash.as_bytes());
 
             let peer_ids: Vec<EndpointId> = peers
                 .peers_for_network(&network_name)
@@ -1877,7 +1855,7 @@ async fn join_mesh_shared(
         members: member_entries,
         approved: approved_config,
         network_secret_key: None,
-        network_public_key: Some(net_pubkey.to_string()),
+        network_public_key: Some(net_pubkey),
     });
     config::save(&app_config)?;
 
@@ -1965,10 +1943,7 @@ async fn join_mesh_shared(
                                     }
                                     Ok(ControlMsg::BlobUpdated { hash }) => {
                                         tracing::info!(hash = %hash, "received blob update");
-                                        let blob_hash = match hash.parse::<blake3::Hash>() {
-                                            Ok(h) => iroh_blobs::Hash::from_bytes(*h.as_bytes()),
-                                            Err(_) => continue,
-                                        };
+                                        let blob_hash = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
                                         let peer_ids: Vec<EndpointId> = peers_c.peers_for_network(&network_name)
                                             .into_iter().map(|(id, _)| id).collect();
                                         let mut fetched = false;

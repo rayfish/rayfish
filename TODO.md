@@ -24,19 +24,26 @@ an item serves that socket/DNS surface.
   - MeshProtocol implements `ProtocolHandler`, one instance per network
   - ProtocolRouter dispatches by ALPN to MeshProtocol + BlobsProtocol handlers
   - Dynamic registration/unregistration as networks are created/joined/left
-- [ ] **Per-network TUN devices for IP isolation**
-  - Each network gets its own TUN; PeerTable and forwarding loop become per-network
-  - Eliminates cross-network IP collisions; true OS-level isolation
-  - NetworkHandle owns its TunReader/TunWriter, created on join, torn down on leave
-  - Enables future per-network MTU/routing/firewall rules
+- [ ] **Dual-stack IPv6/IPv4 with local collision handling**
+  - **IPv6 (stable, identity-bound):** derive from EndpointId into `200::/7` range
+    (blake3 hash of public key, take 15 bytes, prepend `0x02` → 128-bit address).
+    Never rotates, never collides (120 bits of address space)
+  - **IPv4 (best-effort compat):** keep CGNAT `100.64.0.0/10` with FNV-1a derivation.
+    On collision: re-derive as `hash(pubkey + index)` where index increments per collision.
+    Collision index is **local state** — each node resolves independently in its own peer table.
+    Persist `(EndpointId, collision_index)` in local config so it survives restarts
+  - **Single TUN, host routes:** one TUN interface for all networks (current design).
+    TUN gets a `/32` + `/128` local address. Add per-peer host routes (`/32`, `/128`)
+    as peers come online, remove on disconnect. No subnet allocation, no overlap conflicts
+  - **Forwarding:** detect IPv4 vs IPv6 via version nibble (byte 0 upper 4 bits),
+    extract dest from bytes 16-19 (v4) or 24-39 (v6), look up PeerTable
+  - **MagicDNS makes IPs opaque:** users never see raw addresses.
+    `alice.mynet.pitopi` resolves to AAAA (stable IPv6) + A (possibly-rotated IPv4).
+    IPv4 rotation is transparent because apps resolve via DNS, not hardcoded IPs
 - [ ] **Magic DNS**
-  - Local resolver intercepts `.pitopi` queries → `100.64.x.x`
+  - Local resolver intercepts `.pitopi` queries → IPv6 (AAAA) + IPv4 (A)
   - Per-network names: `alice.gaming.pitopi`, registered on join
   - This is the contract apps depend on: resolve a name, open a socket, pitopi is invisible
-- [ ] **Address stability contract (NEW)**
-  - The identity→IP/name mapping must be stable across reconnects and sessions
-  - FNV-1a-derived IPs need documented, collision-handled, stable-per-identity guarantees
-  - Treat breaking this like breaking an API — apps connect to these addresses
 
 ---
 

@@ -42,7 +42,7 @@ pub fn create_pkarr_client(ep: &Endpoint) -> Result<PkarrRelayClient> {
 /// The record contains the group blob hash and a list of seed peers.
 pub fn encode_network_record(
     key: &SecretKey,
-    blob_hash: &str,
+    blob_hash: &blake3::Hash,
     seed_peers: &[EndpointId],
 ) -> Result<SignedPacket> {
     let mut values = vec![
@@ -56,8 +56,7 @@ pub fn encode_network_record(
         .map_err(|e| anyhow::anyhow!("failed to build network record: {e}"))
 }
 
-/// Decodes a signed pkarr network record, returning the blob hash and seed peers.
-pub fn decode_network_record(packet: &SignedPacket) -> Result<(String, Vec<EndpointId>)> {
+pub fn decode_network_record(packet: &SignedPacket) -> Result<(blake3::Hash, Vec<EndpointId>)> {
     let records = packet.txt_records(RECORD_NAME);
     ensure!(!records.is_empty(), "no network records found");
     ensure!(
@@ -70,8 +69,8 @@ pub fn decode_network_record(packet: &SignedPacket) -> Result<(String, Vec<Endpo
     let mut peers = Vec::new();
 
     for record in &records[1..] {
-        if let Some(hash) = record.strip_prefix("h,") {
-            blob_hash = Some(hash.to_string());
+        if let Some(hash_str) = record.strip_prefix("h,") {
+            blob_hash = Some(hash_str.parse::<blake3::Hash>().context("invalid blob hash")?);
         } else if let Some(id_str) = record.strip_prefix("p,") {
             peers.push(id_str.parse::<EndpointId>().context("invalid peer endpoint ID")?);
         }
@@ -90,7 +89,7 @@ pub fn decode_network_record(packet: &SignedPacket) -> Result<(String, Vec<Endpo
 pub async fn publish_network(
     client: &PkarrRelayClient,
     key: &SecretKey,
-    blob_hash: &str,
+    blob_hash: &blake3::Hash,
     seed_peers: &[EndpointId],
 ) -> Result<()> {
     let packet = encode_network_record(key, blob_hash, seed_peers)?;
@@ -103,7 +102,7 @@ pub async fn publish_network(
 pub async fn resolve_network(
     client: &PkarrRelayClient,
     network_pubkey: EndpointId,
-) -> Result<(String, Vec<EndpointId>)> {
+) -> Result<(blake3::Hash, Vec<EndpointId>)> {
     let packet = client
         .resolve(network_pubkey)
         .await
@@ -123,12 +122,12 @@ mod tests {
     #[test]
     fn network_record_roundtrip() {
         let key = SecretKey::generate();
-        let hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let hash = blake3::hash(b"test data");
         let peers = vec![
             SecretKey::generate().public(),
             SecretKey::generate().public(),
         ];
-        let packet = encode_network_record(&key, hash, &peers).unwrap();
+        let packet = encode_network_record(&key, &hash, &peers).unwrap();
         let (decoded_hash, decoded_peers) = decode_network_record(&packet).unwrap();
         assert_eq!(decoded_hash, hash);
         assert_eq!(decoded_peers, peers);
@@ -137,8 +136,8 @@ mod tests {
     #[test]
     fn network_record_empty_peers() {
         let key = SecretKey::generate();
-        let hash = "somehash";
-        let packet = encode_network_record(&key, hash, &[]).unwrap();
+        let hash = blake3::hash(b"test");
+        let packet = encode_network_record(&key, &hash, &[]).unwrap();
         let (decoded_hash, decoded_peers) = decode_network_record(&packet).unwrap();
         assert_eq!(decoded_hash, hash);
         assert!(decoded_peers.is_empty());
@@ -147,7 +146,8 @@ mod tests {
     #[test]
     fn record_version_check() {
         let key = SecretKey::generate();
-        let packet = encode_network_record(&key, "somehash", &[]).unwrap();
+        let hash = blake3::hash(b"test");
+        let packet = encode_network_record(&key, &hash, &[]).unwrap();
         let records = packet.txt_records("_pitopi");
         assert_eq!(records[0], "v1");
     }

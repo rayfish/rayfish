@@ -2,10 +2,67 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use iroh::EndpointId;
+use iroh::{EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 
 use crate::membership::GroupMode;
+
+#[allow(dead_code)]
+mod secret_key_hex {
+    use iroh::SecretKey;
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(key: &SecretKey, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(key.to_bytes()))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<SecretKey, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes: [u8; 32] = hex::decode(&s)
+            .map_err(serde::de::Error::custom)?
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("secret key must be 32 bytes"))?;
+        Ok(SecretKey::from(bytes))
+    }
+}
+
+mod option_secret_key_hex {
+    use iroh::SecretKey;
+    use serde::{self, Deserializer, Serializer};
+
+    pub fn serialize<S>(key: &Option<SecretKey>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match key {
+            Some(k) => super::secret_key_hex::serialize(k, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<SecretKey>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+        match opt {
+            Some(s) => {
+                let bytes: [u8; 32] = hex::decode(&s)
+                    .map_err(serde::de::Error::custom)?
+                    .try_into()
+                    .map_err(|_| serde::de::Error::custom("secret key must be 32 bytes"))?;
+                Ok(Some(SecretKey::from(bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+}
 
 /// Info about a member in a saved network config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +81,7 @@ pub struct ApprovedConfigEntry {
 }
 
 /// A single saved network membership.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// Human-friendly network alias (local only, not used for discovery).
     pub name: String,
@@ -39,16 +96,14 @@ pub struct NetworkConfig {
     /// Pre-approved peers that haven't connected yet.
     #[serde(default)]
     pub approved: Vec<ApprovedConfigEntry>,
-    /// Per-network secret key (hex-encoded). Only present for coordinators.
+    #[serde(default, with = "option_secret_key_hex")]
+    pub network_secret_key: Option<SecretKey>,
     #[serde(default)]
-    pub network_secret_key: Option<String>,
-    /// Per-network public key (hex-encoded). The join code.
-    #[serde(default)]
-    pub network_public_key: Option<String>,
+    pub network_public_key: Option<EndpointId>,
 }
 
 /// Top-level config stored at `~/.config/pitopi/networks.toml`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub networks: Vec<NetworkConfig>,
@@ -146,13 +201,15 @@ mod tests {
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: AppConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(config, parsed);
+        assert_eq!(parsed.networks.len(), 2);
+        assert_eq!(parsed.networks[0].name, "gaming");
+        assert_eq!(parsed.networks[0].members.len(), 2);
+        assert_eq!(parsed.networks[1].name, "work");
     }
 
     #[test]
     fn test_deserialize_empty() {
         let config: AppConfig = toml::from_str("").unwrap();
-        assert_eq!(config, AppConfig::default());
         assert!(config.networks.is_empty());
     }
 
@@ -168,9 +225,10 @@ mod tests {
             network_secret_key: None,
             network_public_key: None,
         };
-        upsert_network(&mut config, net.clone());
+        upsert_network(&mut config, net);
         assert_eq!(config.networks.len(), 1);
-        assert_eq!(config.networks[0], net);
+        assert_eq!(config.networks[0].name, "test");
+        assert_eq!(config.networks[0].group_mode, GroupMode::Open);
     }
 
     #[test]
@@ -260,13 +318,14 @@ mod tests {
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: AppConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(config, parsed);
         assert_eq!(parsed.networks[0].approved.len(), 1);
         assert_eq!(parsed.networks[0].approved[0].identity, id2);
     }
 
     #[test]
     fn test_serialize_with_network_key() {
+        let secret = iroh::SecretKey::generate();
+        let public = secret.public();
         let config = AppConfig {
             networks: vec![NetworkConfig {
                 name: "gaming".to_string(),
@@ -274,14 +333,14 @@ mod tests {
                 my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
                 members: vec![],
                 approved: vec![],
-                network_secret_key: Some("deadbeef".to_string()),
-                network_public_key: Some("cafebabe".to_string()),
+                network_secret_key: Some(secret.clone()),
+                network_public_key: Some(public),
             }],
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: AppConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(config, parsed);
-        assert_eq!(parsed.networks[0].network_public_key, Some("cafebabe".to_string()));
+        assert_eq!(parsed.networks[0].network_public_key, Some(public));
+        assert!(parsed.networks[0].network_secret_key.is_some());
     }
 
     #[test]
@@ -296,7 +355,7 @@ name = "test"
         assert_eq!(config.networks[0].group_mode, GroupMode::Restricted);
         assert!(config.networks[0].members.is_empty());
         assert!(config.networks[0].approved.is_empty());
-        assert_eq!(config.networks[0].network_secret_key, None);
-        assert_eq!(config.networks[0].network_public_key, None);
+        assert!(config.networks[0].network_secret_key.is_none());
+        assert!(config.networks[0].network_public_key.is_none());
     }
 }
