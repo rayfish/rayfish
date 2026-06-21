@@ -66,6 +66,14 @@ impl PeerTable {
             .collect()
     }
 
+    pub fn peers_for_network_with_conn(&self, network: &str) -> Vec<(EndpointId, Ipv4Addr, Connection)> {
+        self.inner
+            .iter()
+            .filter(|e| e.network == network)
+            .map(|e| (e.endpoint_id, *e.key(), e.conn.clone()))
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn all_peer_ids(&self) -> Vec<(Ipv4Addr, EndpointId)> {
         self.inner

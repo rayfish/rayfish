@@ -311,6 +311,8 @@ pub struct GroupBlob {
     pub members: Vec<Member>,
     pub approved: Vec<ApprovedEntry>,
     pub acl: AclData,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Produces a deterministic msgpack encoding of a group blob.
@@ -320,6 +322,7 @@ pub fn canonical_group_bytes(
     members: &MemberList,
     approved: &ApprovedList,
     acl: &AclData,
+    name: Option<&str>,
 ) -> Vec<u8> {
     let mut sorted_members: Vec<Member> = members.all().into_iter().cloned().collect();
     sorted_members.sort_by_key(|m| m.identity.to_string());
@@ -331,12 +334,13 @@ pub fn canonical_group_bytes(
         members: sorted_members,
         approved: sorted_approved,
         acl: acl.clone(),
+        name: name.map(|s| s.to_string()),
     };
     rmp_serde::to_vec_named(&data).expect("msgpack serialize")
 }
 
-pub fn group_blob_hash(members: &MemberList, approved: &ApprovedList, acl: &AclData) -> blake3::Hash {
-    let bytes = canonical_group_bytes(members, approved, acl);
+pub fn group_blob_hash(members: &MemberList, approved: &ApprovedList, acl: &AclData, name: Option<&str>) -> blake3::Hash {
+    let bytes = canonical_group_bytes(members, approved, acl, name);
     blake3::hash(&bytes)
 }
 
@@ -767,8 +771,8 @@ mod tests {
         let members = make_member_list(&[1, 2, 3]);
         let approved = ApprovedList::new();
         let acl = crate::acl::AclData::empty();
-        let a = canonical_group_bytes(&members, &approved, &acl);
-        let b = canonical_group_bytes(&members, &approved, &acl);
+        let a = canonical_group_bytes(&members, &approved, &acl, None);
+        let b = canonical_group_bytes(&members, &approved, &acl, None);
         assert_eq!(a, b);
     }
 
@@ -779,8 +783,8 @@ mod tests {
         let approved = ApprovedList::new();
         let acl = crate::acl::AclData::empty();
         assert_eq!(
-            canonical_group_bytes(&m1, &approved, &acl),
-            canonical_group_bytes(&m2, &approved, &acl),
+            canonical_group_bytes(&m1, &approved, &acl, None),
+            canonical_group_bytes(&m2, &approved, &acl, None),
         );
     }
 
@@ -789,9 +793,9 @@ mod tests {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
         let acl = crate::acl::AclData::empty();
-        let h1 = group_blob_hash(&members, &approved, &acl);
+        let h1 = group_blob_hash(&members, &approved, &acl, None);
         let members2 = make_member_list(&[1, 2, 3]);
-        let h2 = group_blob_hash(&members2, &approved, &acl);
+        let h2 = group_blob_hash(&members2, &approved, &acl, None);
         assert_ne!(h1, h2);
     }
 
@@ -803,7 +807,7 @@ mod tests {
         approved.approve(ApprovedEntry { identity: id3, ip: derive_ip(&id3), hostname: None }, &members).unwrap();
         let acl = crate::acl::AclData::empty();
 
-        let bytes = canonical_group_bytes(&members, &approved, &acl);
+        let bytes = canonical_group_bytes(&members, &approved, &acl, None);
         let data = decode_group_blob(&bytes).unwrap();
         assert_eq!(data.members.len(), 2);
         assert_eq!(data.approved.len(), 1);
@@ -814,8 +818,8 @@ mod tests {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
         let acl = crate::acl::AclData::empty();
-        let bytes = canonical_group_bytes(&members, &approved, &acl);
-        let hash = group_blob_hash(&members, &approved, &acl);
+        let bytes = canonical_group_bytes(&members, &approved, &acl, None);
+        let hash = group_blob_hash(&members, &approved, &acl, None);
         let data = verify_group_blob(&bytes, &hash).unwrap();
         assert_eq!(data.members.len(), 2);
     }
@@ -825,7 +829,7 @@ mod tests {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
         let acl = crate::acl::AclData::empty();
-        let bytes = canonical_group_bytes(&members, &approved, &acl);
+        let bytes = canonical_group_bytes(&members, &approved, &acl, None);
         let bad_hash = blake3::hash(b"wrong data");
         let result = verify_group_blob(&bytes, &bad_hash);
         assert!(result.is_err());
@@ -844,8 +848,8 @@ mod tests {
                 dst: crate::acl::Target::All,
             }],
         };
-        let h1 = group_blob_hash(&members, &approved, &acl_empty);
-        let h2 = group_blob_hash(&members, &approved, &acl_with_rule);
+        let h1 = group_blob_hash(&members, &approved, &acl_empty, None);
+        let h2 = group_blob_hash(&members, &approved, &acl_with_rule, None);
         assert_ne!(h1, h2);
     }
 
@@ -952,6 +956,7 @@ mod tests {
             members: vec![bad_member],
             approved: vec![],
             acl: crate::acl::AclData::empty(),
+            name: None,
         };
         let bytes = rmp_serde::to_vec_named(&blob).unwrap();
         let err = decode_group_blob(&bytes).unwrap_err().to_string();
@@ -971,6 +976,7 @@ mod tests {
             members: vec![bad_member],
             approved: vec![],
             acl: crate::acl::AclData::empty(),
+            name: None,
         };
         let bytes = rmp_serde::to_vec_named(&blob).unwrap();
         assert!(decode_group_blob(&bytes).is_err());

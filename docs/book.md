@@ -692,18 +692,19 @@ This is the primary mechanism for keeping all peers' view of the network in sync
 
 #### MeshHello
 
-Sent by a newly joining peer to each existing mesh member to establish a direct connection:
+Sent by a newly joining peer to each existing mesh member (including the coordinator) to establish a direct connection and announce its hostname:
 
 ```json
 {
     "MeshHello": {
         "identity": "def456...",
-        "ip": "100.64.23.142"
+        "ip": "100.64.23.142",
+        "hostname": "tide"
     }
 }
 ```
 
-The receiving peer adds the sender to its routing table and spawns a datagram reader for the connection.
+The receiving peer adds the sender to its routing table and spawns a datagram reader for the connection. On the coordinator side, `spawn_coordinator_hello_reader()` accepts the MeshHello, resolves hostname collisions, updates the member list, and registers the hostname in the DNS table.
 
 #### MeshWelcome
 

@@ -108,6 +108,9 @@ pub struct NetworkStatus {
     pub my_ip: Ipv4Addr,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub my_hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_key: Option<String>,
+    pub member_count: usize,
     pub peers: Vec<PeerStatus>,
 }
 
@@ -123,6 +126,29 @@ pub struct PeerStatus {
     pub ip: Ipv4Addr,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<ConnectionInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConnectionInfo {
+    pub conn_type: ConnType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f64>,
+    pub bytes_tx: u64,
+    pub bytes_rx: u64,
+    pub datagrams_tx: u64,
+    pub datagrams_rx: u64,
+    pub lost_packets: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConnType {
+    Direct,
+    Relay,
+    Unknown,
 }
 
 pub fn socket_path() -> PathBuf {
@@ -250,10 +276,13 @@ mod tests {
                 role: NetworkRole::Coordinator,
                 my_ip: Ipv4Addr::new(100, 64, 10, 5),
                 my_hostname: Some("alice".to_string()),
+                network_key: Some("abc123".to_string()),
+                member_count: 2,
                 peers: vec![PeerStatus {
                     endpoint_id: peer_id,
                     ip: Ipv4Addr::new(100, 64, 10, 6),
                     hostname: None,
+                    connection: None,
                 }],
             }],
         };

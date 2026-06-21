@@ -22,6 +22,7 @@ mod tun;
 pub const APP_NAME: &str = "pitopi";
 pub const DNS_DOMAIN: &str = "pi";
 
+
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 
@@ -393,19 +394,43 @@ async fn ipc_status() -> Result<()> {
                         ipc::NetworkRole::Coordinator => "coordinator",
                         ipc::NetworkRole::Member => "member",
                     };
-                    if let Some(ref h) = net.my_hostname {
-                        println!("  {} [{}] — {}.{}.{}", net.name, role, h, net.name, DNS_DOMAIN);
-                    } else {
-                        println!("  {} [{}] — {}", net.name, role, net.my_ip);
+                    let dns_name = net.my_hostname.as_ref()
+                        .map(|h| format!("{}.{}.{}", h, net.name, DNS_DOMAIN));
+                    print!("  {} [{}]", net.name, role);
+                    if let Some(ref dns) = dns_name {
+                        print!(" — {}", dns);
                     }
+                    println!("  ({})", net.my_ip);
+                    if let Some(ref key) = net.network_key {
+                        println!("    Key: {}…{}", &key[..8.min(key.len())], &key[key.len().saturating_sub(4)..]);
+                    }
+                    println!("    Members: {}/{} online", net.peers.len() + 1, net.member_count);
                     if !net.peers.is_empty() {
                         println!("    Peers:");
                         for peer in &net.peers {
-                            if let Some(ref h) = peer.hostname {
-                                println!("      {}.{}.{} ({})", h, net.name, DNS_DOMAIN, peer.endpoint_id.fmt_short());
+                            let name = if let Some(ref h) = peer.hostname {
+                                format!("{}.{}.{}", h, net.name, DNS_DOMAIN)
                             } else {
-                                println!("      {} ({})", peer.ip, peer.endpoint_id.fmt_short());
+                                peer.ip.to_string()
+                            };
+                            print!("      {} ({})", name, peer.endpoint_id.fmt_short());
+                            if let Some(ref ci) = peer.connection {
+                                let conn_type = match ci.conn_type {
+                                    ipc::ConnType::Direct => "direct",
+                                    ipc::ConnType::Relay => "relay",
+                                    ipc::ConnType::Unknown => "?",
+                                };
+                                print!(" [{conn_type}");
+                                if let Some(rtt) = ci.rtt_ms {
+                                    print!(", {:.1}ms", rtt);
+                                }
+                                print!("]");
+                                print!("  tx:{} rx:{}", ci.bytes_tx, ci.bytes_rx);
+                                if ci.lost_packets > 0 {
+                                    print!(" lost:{}", ci.lost_packets);
+                                }
                             }
+                            println!();
                         }
                     }
                 }

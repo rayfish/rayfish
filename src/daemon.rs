@@ -144,11 +144,12 @@ struct NetworkState {
     acl: acl::AclData,
     network_secret_key: Option<SecretKey>,
     network_public_key: EndpointId,
+    network_name: Option<String>,
 }
 
 impl NetworkState {
     fn refresh_snapshot(&mut self) {
-        let bytes = canonical_group_bytes(&self.members, &self.approved, &self.acl);
+        let bytes = canonical_group_bytes(&self.members, &self.approved, &self.acl, self.network_name.as_deref());
         let hash = blake3::hash(&bytes);
         self.snapshot = Some(GroupSnapshot { hash, msgpack_bytes: bytes });
     }
@@ -272,6 +273,7 @@ impl DaemonState {
             acl: acl::AclData::empty(),
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: net_public_key,
+            network_name: Some(name.clone()),
         };
 
         // Load ACL from file if it exists
@@ -374,6 +376,7 @@ impl DaemonState {
             self.blob_store.clone(),
             self.shared_acl.clone(),
             self.firewall.clone(),
+            self.hostname_table.clone(),
         );
         tasks.push(accept_handle);
 
@@ -449,9 +452,10 @@ impl DaemonState {
 
         let alpn = transport::network_alpn(&net_pubkey);
         let my_ip = self.identity.local_ip();
-        // Local alias for display/config (defaults to truncated key)
-        let default_name = &network_key[..network_key.len().min(8)];
-        let display_name = alias.unwrap_or(default_name);
+        // Use coordinator's network name from GroupBlob, or user alias, or truncated key as fallback
+        let blob_name = data.name.clone().unwrap_or_else(|| network_key[..network_key.len().min(8)].to_string());
+        let display_name_owned = alias.map(|a| a.to_string()).unwrap_or(blob_name);
+        let display_name = display_name_owned.as_str();
 
         if self.networks.contains_key(display_name) {
             return Ok(IpcResponse::Error {
@@ -714,6 +718,7 @@ impl DaemonState {
                 acl: data.acl,
                 network_secret_key: None,
                 network_public_key: net_pubkey,
+                network_name: data.name.clone(),
             };
             ns.refresh_snapshot();
             let live_state = Arc::new(std::sync::RwLock::new(ns));
@@ -800,6 +805,7 @@ impl DaemonState {
             acl: acl::AclData::empty(),
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: net_public_key,
+            network_name: Some(name.to_string()),
         };
 
         // Load persisted ACL file if it exists
@@ -908,6 +914,7 @@ impl DaemonState {
             self.blob_store.clone(),
             self.shared_acl.clone(),
             self.firewall.clone(),
+            self.hostname_table.clone(),
         );
         tasks.push(accept_handle);
 
@@ -988,7 +995,7 @@ impl DaemonState {
         if let Some(key) = net_secret_key
             && let Ok(client) = dht::create_pkarr_client(&self.endpoint)
         {
-            let empty_hash = group_blob_hash(&MemberList::new(), &ApprovedList::new(), &acl::AclData::empty());
+            let empty_hash = group_blob_hash(&MemberList::new(), &ApprovedList::new(), &acl::AclData::empty(), None);
             if let Err(e) = dht::publish_network(&client, &key, &empty_hash, &[]).await {
                 tracing::warn!(error = %e, "failed to publish empty network record on nuke");
             }
@@ -1034,14 +1041,17 @@ impl DaemonState {
     fn status(&self) -> IpcResponse {
         let hostname_snapshot = self.hostname_table.try_read().ok();
         let statuses: Vec<NetworkStatus> = self.networks.iter().map(|h| {
-            let peer_entries = self.peers.peers_for_network(&h.name);
-            let peers = peer_entries.into_iter().map(|(eid, ip)| {
+            let peer_entries = self.peers.peers_for_network_with_conn(&h.name);
+            let member_count = h.state.read().map(|s| s.members.all().len()).unwrap_or(0);
+            let network_key = Some(h.network_key.to_string());
+            let peers = peer_entries.into_iter().map(|(eid, ip, conn)| {
                 let hostname = hostname_snapshot.as_ref().and_then(|table| {
                     table.get(&h.name).and_then(|hosts| {
                         hosts.iter().find(|(_, v)| **v == ip).map(|(k, _)| k.clone())
                     })
                 });
-                PeerStatus { endpoint_id: eid, ip, hostname }
+                let connection = Self::gather_conn_info(&conn);
+                PeerStatus { endpoint_id: eid, ip, hostname, connection: Some(connection) }
             }).collect();
             let my_hostname = hostname_snapshot.as_ref().and_then(|table| {
                 table.get(&h.name).and_then(|hosts| {
@@ -1053,6 +1063,8 @@ impl DaemonState {
                 role: h.role.clone(),
                 my_ip: h.my_ip,
                 my_hostname,
+                network_key,
+                member_count,
                 peers,
             }
         }).collect();
@@ -1060,6 +1072,37 @@ impl DaemonState {
         IpcResponse::Status {
             endpoint_id: self.endpoint.id(),
             networks: statuses,
+        }
+    }
+
+    fn gather_conn_info(conn: &iroh::endpoint::Connection) -> ipc::ConnectionInfo {
+        let paths = conn.paths();
+        let selected = paths.iter().find(|p| p.is_selected());
+
+        let (conn_type, remote_addr, rtt_ms) = match selected {
+            Some(path) => {
+                let addr = path.remote_addr();
+                let ct = if addr.is_relay() {
+                    ipc::ConnType::Relay
+                } else {
+                    ipc::ConnType::Direct
+                };
+                let rtt = path.rtt().as_secs_f64() * 1000.0;
+                (ct, Some(addr.to_string()), Some(rtt))
+            }
+            None => (ipc::ConnType::Unknown, None, None),
+        };
+
+        let stats = conn.stats();
+        ipc::ConnectionInfo {
+            conn_type,
+            remote_addr,
+            rtt_ms,
+            bytes_tx: stats.udp_tx.bytes,
+            bytes_rx: stats.udp_rx.bytes,
+            datagrams_tx: stats.udp_tx.datagrams,
+            datagrams_rx: stats.udp_rx.datagrams,
+            lost_packets: stats.lost_packets,
         }
     }
 
@@ -1635,7 +1678,7 @@ fn spawn_network_publisher(
             let hash = {
                 let s = state.read().unwrap();
                 s.snapshot.as_ref().map(|snap| snap.hash)
-                    .unwrap_or_else(|| group_blob_hash(&s.members, &s.approved, &s.acl))
+                    .unwrap_or_else(|| group_blob_hash(&s.members, &s.approved, &s.acl, s.network_name.as_deref()))
             };
             let mut seed_peers: Vec<EndpointId> = peers
                 .peers_for_network(&network_name)
@@ -1813,6 +1856,7 @@ fn spawn_coordinator_accept(
     blob_store: FsStore,
     shared_acl: forward::SharedAcl,
     firewall: SharedFirewall,
+    hostname_table: dns::HostnameTable,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = run_accept_loop(
@@ -1831,6 +1875,7 @@ fn spawn_coordinator_accept(
             blob_store,
             shared_acl,
             firewall,
+            hostname_table,
         ).await {
             tracing::warn!(network = %network_name, error = %e, "accept loop stopped");
         }
@@ -1854,6 +1899,7 @@ async fn run_accept_loop(
     blob_store: FsStore,
     shared_acl: forward::SharedAcl,
     firewall: SharedFirewall,
+    hostname_table: dns::HostnameTable,
 ) -> Result<()> {
     let self_member = {
         let s = state.read().unwrap();
@@ -1891,8 +1937,12 @@ async fn run_accept_loop(
             let network_c = network_name.to_string();
             let shared_acl_c = shared_acl.clone();
             let firewall_c = firewall.clone();
+            let state_c = state.clone();
+            let hostname_table_c = hostname_table.clone();
+            let network_name_c = network_name.to_string();
             tokio::spawn(async move {
                 send_member_sync(&conn, &members).await;
+                spawn_coordinator_hello_reader(conn.clone(), remote_id, peer_ip, &network_name_c, state_c, hostname_table_c).await;
                 forward::spawn_peer_reader(conn, remote_id, peer_ip, local_id, network_c, shared_acl_c, firewall_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
             });
             continue;
@@ -1934,7 +1984,14 @@ async fn run_accept_loop(
             let network_c = network_name.to_string();
             let shared_acl_c = shared_acl.clone();
             let firewall_c = firewall.clone();
+            let state_c = state.clone();
+            let hostname_table_c = hostname_table.clone();
+            let dht_notify_c = dht_notify.clone();
+            let blob_store_c = blob_store.clone();
+            let network_name_c = network_name.to_string();
             tokio::spawn(async move {
+                spawn_coordinator_hello_reader(conn.clone(), remote_id, peer_ip, &network_name_c, state_c.clone(), hostname_table_c).await;
+                update_snapshot_and_publish(&state_c, &blob_store_c, &dht_notify_c).await;
                 forward::spawn_peer_reader(conn, remote_id, peer_ip, local_id, network_c, shared_acl_c, firewall_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
             });
             continue;
@@ -1973,7 +2030,7 @@ async fn run_accept_loop(
             continue;
         }
 
-        // Broadcast MemberApproved
+        // Broadcast MemberApproved (hostname will be updated after MeshHello)
         broadcast_control_msg(&peers, &ControlMsg::MemberApproved { identity: remote_id, ip: peer_ip, hostname: None }).await;
 
         // Promote to member
@@ -2023,10 +2080,78 @@ async fn run_accept_loop(
         let network_c = network_name.to_string();
         let shared_acl_c = shared_acl.clone();
         let firewall_c = firewall.clone();
+        let state_c = state.clone();
+        let hostname_table_c = hostname_table.clone();
+        let dht_notify_c = dht_notify.clone();
+        let blob_store_c = blob_store.clone();
+        let network_name_c = network_name.to_string();
         tokio::spawn(async move {
+            spawn_coordinator_hello_reader(conn.clone(), remote_id, peer_ip, &network_name_c, state_c.clone(), hostname_table_c).await;
+            update_snapshot_and_publish(&state_c, &blob_store_c, &dht_notify_c).await;
             forward::spawn_peer_reader(conn, remote_id, peer_ip, local_id, network_c, shared_acl_c, firewall_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
         });
     }
+}
+
+async fn spawn_coordinator_hello_reader(
+    conn: Connection,
+    remote_id: EndpointId,
+    peer_ip: Ipv4Addr,
+    network_name: &str,
+    state: Arc<std::sync::RwLock<NetworkState>>,
+    hostname_table: dns::HostnameTable,
+) {
+    let result: Result<()> = async {
+        let (_send, mut recv) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.accept_bi(),
+        ).await.context("timeout waiting for MeshHello")?
+        .context("accept bi for MeshHello")?;
+        let msg = control::recv_msg(&mut recv).await?;
+        if let ControlMsg::MeshHello { hostname: Some(desired), .. } = msg {
+            let taken: Vec<String> = {
+                let s = state.read().unwrap();
+                s.members.all().iter()
+                    .filter(|m| m.identity != remote_id)
+                    .filter_map(|m| m.hostname.clone())
+                    .collect()
+            };
+            let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
+            let final_hostname = crate::hostname::resolve_collision(&desired, &taken_refs);
+            tracing::info!(peer = %remote_id.fmt_short(), hostname = %final_hostname, "peer hostname via MeshHello");
+            {
+                let mut s = state.write().unwrap();
+                if let Some(m) = s.members.get_mut(&remote_id) {
+                    m.hostname = Some(final_hostname.clone());
+                }
+            }
+            {
+                let mut table = hostname_table.write().await;
+                let network_hosts = table.entry(network_name.to_string()).or_default();
+                network_hosts.insert(final_hostname, peer_ip);
+            }
+        }
+        Ok(())
+    }.await;
+    if let Err(e) = result {
+        tracing::debug!(peer = %remote_id.fmt_short(), error = %e, "failed to read MeshHello from peer");
+    }
+}
+
+async fn update_snapshot_and_publish(
+    state: &Arc<std::sync::RwLock<NetworkState>>,
+    blob_store: &FsStore,
+    dht_notify: &Option<Arc<tokio::sync::Notify>>,
+) {
+    let snap_bytes = {
+        let mut s = state.write().unwrap();
+        s.refresh_snapshot();
+        s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
+    };
+    if let Some(bytes) = snap_bytes {
+        let _ = blob_store.blobs().add_slice(&bytes).await;
+    }
+    if let Some(notify) = dht_notify { notify.notify_one(); }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2102,6 +2227,12 @@ async fn join_mesh_shared(
     });
     config::save(&app_config)?;
 
+    // Send MeshHello to coordinator so it learns our hostname
+    {
+        let (mut send, _recv) = initial_conn.open_bi().await?;
+        control::send_msg(&mut send, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip, hostname: my_hostname.clone() }).await?;
+    }
+
     // Add initial connection peer
     let remote_id = initial_conn.remote_id();
     let remote_ip = identity.derive_ip(&remote_id);
@@ -2140,6 +2271,7 @@ async fn join_mesh_shared(
             acl: acl::AclData::empty(),
             network_secret_key: None,
             network_public_key: net_pubkey,
+            network_name: Some(network_name.to_string()),
         };
         ns.refresh_snapshot();
         if let Some(snap) = &ns.snapshot {
