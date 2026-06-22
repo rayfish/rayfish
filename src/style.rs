@@ -18,6 +18,10 @@ fn enabled() -> bool {
         {
             return true;
         }
+        // On legacy Windows consoles, ANSI sequences are inert until VT
+        // processing is switched on. No-op on modern terminals (and elsewhere).
+        #[cfg(windows)]
+        let _ = enable_ansi_support::enable_ansi_support();
         std::io::stdout().is_terminal()
     })
 }

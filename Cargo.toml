@@ -71,3 +71,7 @@ zbus = { version = "4", default-features = false, features = ["tokio"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 system-configuration = "0.7"
 core-foundation = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+# Enables ANSI escape processing on legacy Windows consoles (no-op on modern terminals).
+enable-ansi-support = "0.2"
