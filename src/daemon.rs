@@ -34,13 +34,14 @@ use crate::membership::{
     policy_for_mode, verify_group_blob,
 };
 use crate::network_name;
-use crate::peers::PeerTable;
+use crate::peers::{self, PeerTable};
 use crate::stats::ForwardMetrics;
 use crate::transport;
 use crate::tun::{self, check_cgnat_conflict};
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+const PAIR_ALPN: &[u8] = b"pitopi/pair/1";
 
 struct CoordinatorAcceptState {
     endpoint: Endpoint,
@@ -59,6 +60,7 @@ struct CoordinatorAcceptState {
     firewall: SharedFirewall,
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
+    device_user_map: peers::DeviceUserMap,
 }
 
 impl CoordinatorAcceptState {
@@ -99,6 +101,7 @@ impl CoordinatorAcceptState {
             let state = self.state.clone();
             let hostname_table = self.hostname_table.clone();
             let reverse_table = self.reverse_table.clone();
+            let device_user_map = self.device_user_map.clone();
             tokio::spawn(async move {
                 send_member_sync(&conn, &members).await;
                 spawn_coordinator_hello_reader(
@@ -109,6 +112,7 @@ impl CoordinatorAcceptState {
                     state,
                     hostname_table,
                     reverse_table,
+                    device_user_map.clone(),
                 )
                 .await;
                 forward::spawn_peer_reader(
@@ -124,6 +128,7 @@ impl CoordinatorAcceptState {
                     disconnect_tx,
                     token,
                     stats,
+                    device_user_map,
                 );
             });
             return;
@@ -141,6 +146,8 @@ impl CoordinatorAcceptState {
                     ip: peer_ip,
                     is_coordinator: false,
                     hostname: None,
+                    user_identity: None,
+                    device_cert: None,
                 };
                 s.members
                     .add(new_member)
@@ -191,6 +198,7 @@ impl CoordinatorAcceptState {
             let state = self.state.clone();
             let hostname_table = self.hostname_table.clone();
             let reverse_table = self.reverse_table.clone();
+            let device_user_map = self.device_user_map.clone();
             let dht_notify = self.dht_notify.clone();
             let blob_store = self.blob_store.clone();
             tokio::spawn(async move {
@@ -202,6 +210,7 @@ impl CoordinatorAcceptState {
                     state.clone(),
                     hostname_table,
                     reverse_table,
+                    device_user_map.clone(),
                 )
                 .await;
                 update_snapshot_and_publish(&state, &blob_store, &dht_notify).await;
@@ -218,6 +227,7 @@ impl CoordinatorAcceptState {
                     disconnect_tx,
                     token,
                     stats,
+                    device_user_map,
                 );
             });
             return;
@@ -274,6 +284,7 @@ impl CoordinatorAcceptState {
                 identity: remote_id,
                 ip: peer_ip,
                 hostname: None,
+                device_cert: None,
             },
         )
         .await;
@@ -288,6 +299,8 @@ impl CoordinatorAcceptState {
                     ip: peer_ip,
                     is_coordinator: false,
                     hostname: None,
+                    user_identity: None,
+                    device_cert: None,
                 })
                 .err()
                 .map(|e| format!("IP collision: {e}"));
@@ -352,6 +365,7 @@ impl CoordinatorAcceptState {
         let state = self.state.clone();
         let hostname_table = self.hostname_table.clone();
         let reverse_table = self.reverse_table.clone();
+        let device_user_map = self.device_user_map.clone();
         let dht_notify = self.dht_notify.clone();
         let blob_store = self.blob_store.clone();
         tokio::spawn(async move {
@@ -363,6 +377,7 @@ impl CoordinatorAcceptState {
                 state.clone(),
                 hostname_table,
                 reverse_table,
+                device_user_map.clone(),
             )
             .await;
             update_snapshot_and_publish(&state, &blob_store, &dht_notify).await;
@@ -379,6 +394,7 @@ impl CoordinatorAcceptState {
                 disconnect_tx,
                 token,
                 stats,
+                device_user_map,
             );
         });
     }
@@ -398,6 +414,7 @@ struct MemberAcceptState {
     firewall: SharedFirewall,
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
+    device_user_map: peers::DeviceUserMap,
 }
 
 impl MemberAcceptState {
@@ -411,10 +428,25 @@ impl MemberAcceptState {
                 identity: peer_identity,
                 ip,
                 hostname,
+                device_cert,
+                ..
             }) => {
-                if peer_identity != transport_id {
+                // Verify identity: either transport key matches, or a valid device cert is present
+                let effective_user_id = if peer_identity == transport_id {
+                    peer_identity
+                } else if let Some(ref cert) = device_cert {
+                    if !cert.verify() || cert.device_key != transport_id || cert.user_identity != peer_identity {
+                        tracing::warn!(peer = %transport_id.fmt_short(), "invalid device certificate");
+                        return;
+                    }
+                    cert.user_identity
+                } else {
                     return;
+                };
+                if let Some(ref cert) = device_cert {
+                    self.device_user_map.insert(transport_id, cert.user_identity);
                 }
+                let _ = effective_user_id;
                 let (is_member, is_approved) = {
                     let s = self.state.read().unwrap();
                     (
@@ -447,11 +479,14 @@ impl MemberAcceptState {
                     let snap_bytes = {
                         let mut s = self.state.write().unwrap();
                         s.approved.remove(&peer_identity);
+                        let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
                         let _ = s.members.add(Member {
                             identity: peer_identity,
                             ip,
                             is_coordinator: false,
                             hostname: final_hostname.clone(),
+                            user_identity: user_id_opt,
+                            device_cert: device_cert.clone(),
                         });
                         s.refresh_snapshot();
                         s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
@@ -497,6 +532,7 @@ impl MemberAcceptState {
                         self.disconnect_tx.clone(),
                         self.token.clone(),
                         self.stats.clone(),
+                        self.device_user_map.clone(),
                     );
                     broadcast_member_sync(&self.peers, &members, Some(ip)).await;
                 } else if is_member {
@@ -527,12 +563,14 @@ impl MemberAcceptState {
                         self.disconnect_tx.clone(),
                         self.token.clone(),
                         self.stats.clone(),
+                        self.device_user_map.clone(),
                     );
                 }
             }
             Ok(ControlMsg::ReconnectRequest {
                 identity: peer_identity,
                 ip,
+                ..
             }) => {
                 if peer_identity != transport_id {
                     return;
@@ -578,6 +616,7 @@ impl MemberAcceptState {
                         self.disconnect_tx.clone(),
                         self.token.clone(),
                         self.stats.clone(),
+                        self.device_user_map.clone(),
                     );
                 }
             }
@@ -625,15 +664,19 @@ struct ProtocolRouter {
     handlers: DashMap<Vec<u8>, Arc<MeshProtocol>>,
     pending_files: Arc<std::sync::Mutex<Vec<PendingFile>>>,
     file_id_counter: Arc<AtomicU64>,
+    pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    secret_key: SecretKey,
 }
 
 impl ProtocolRouter {
-    fn new(blobs: BlobsProtocol) -> Self {
+    fn new(blobs: BlobsProtocol, secret_key: SecretKey, pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>) -> Self {
         Self {
             blobs,
             handlers: DashMap::new(),
             pending_files: Arc::new(std::sync::Mutex::new(Vec::new())),
             file_id_counter: Arc::new(AtomicU64::new(1)),
+            pairing_secret,
+            secret_key,
         }
     }
 
@@ -650,6 +693,7 @@ impl ProtocolRouter {
         let mut alpns: Vec<Vec<u8>> = self.handlers.iter().map(|r| r.key().clone()).collect();
         alpns.push(iroh_blobs::protocol::ALPN.to_vec());
         alpns.push(transport::FILES_ALPN.to_vec());
+        alpns.push(PAIR_ALPN.to_vec());
         alpns
     }
 
@@ -705,6 +749,76 @@ impl ProtocolRouter {
                                         }
                                         Err(e) => {
                                             tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to accept bi stream for file offer");
+                                        }
+                                    }
+                                }
+                                a if a == PAIR_ALPN => {
+                                    let pairing_secret = router.pairing_secret.clone();
+                                    let secret_key = router.secret_key.clone();
+                                    let remote_id = conn.remote_id();
+                                    match conn.accept_bi().await {
+                                        Ok((mut send, mut recv)) => {
+                                            // Read length-prefixed PairMsg::Request
+                                            let mut len_buf = [0u8; 4];
+                                            if let Err(e) = recv.read_exact(&mut len_buf).await {
+                                                tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to read pair request length");
+                                                return;
+                                            }
+                                            let body_len = u32::from_be_bytes(len_buf) as usize;
+                                            let mut body = vec![0u8; body_len];
+                                            if let Err(e) = recv.read_exact(&mut body).await {
+                                                tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to read pair request body");
+                                                return;
+                                            }
+                                            let request: control::PairMsg = match rmp_serde::from_slice(&body) {
+                                                Ok(r) => r,
+                                                Err(e) => {
+                                                    tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to decode pair request");
+                                                    return;
+                                                }
+                                            };
+                                            match request {
+                                                control::PairMsg::Request { secret, device_pubkey } => {
+                                                    // Verify the secret matches the stored pairing secret
+                                                    let stored = pairing_secret.lock().unwrap().take();
+                                                    match stored {
+                                                        Some(expected) if expected == secret => {
+                                                            // Sign the device's public key
+                                                            let cert = control::DeviceCert::create(&secret_key, &device_pubkey);
+                                                            let response = control::PairMsg::Response { cert };
+                                                            let response_bytes = match rmp_serde::to_vec_named(&response) {
+                                                                Ok(b) => b,
+                                                                Err(e) => {
+                                                                    tracing::warn!(error = %e, "failed to encode pair response");
+                                                                    return;
+                                                                }
+                                                            };
+                                                            let len = (response_bytes.len() as u32).to_be_bytes();
+                                                            if let Err(e) = send.write_all(&len).await {
+                                                                tracing::warn!(error = %e, "failed to send pair response length");
+                                                                return;
+                                                            }
+                                                            if let Err(e) = send.write_all(&response_bytes).await {
+                                                                tracing::warn!(error = %e, "failed to send pair response body");
+                                                                return;
+                                                            }
+                                                            tracing::info!(device = %device_pubkey.fmt_short(), "device paired successfully");
+                                                        }
+                                                        Some(_) => {
+                                                            tracing::warn!(peer = %remote_id.fmt_short(), "pairing secret mismatch");
+                                                        }
+                                                        None => {
+                                                            tracing::warn!(peer = %remote_id.fmt_short(), "no pairing session active");
+                                                        }
+                                                    }
+                                                }
+                                                _ => {
+                                                    tracing::warn!(peer = %remote_id.fmt_short(), "unexpected pair message type");
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to accept bi stream for pairing");
                                         }
                                     }
                                 }
@@ -772,6 +886,7 @@ pub struct NetworkHandle {
 
 pub struct DaemonState {
     endpoint: Endpoint,
+    secret_key: SecretKey,
     identity: IrohIdentityProvider,
     peers: PeerTable,
     stats: Arc<ForwardMetrics>,
@@ -786,6 +901,9 @@ pub struct DaemonState {
     reverse_table: dns::ReverseLookupTable,
     mdns_enabled: bool,
     tun_name: String,
+    pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    device_cert: Option<control::DeviceCert>,
+    device_user_map: peers::DeviceUserMap,
 }
 
 impl DaemonState {
@@ -866,6 +984,11 @@ impl DaemonState {
             IpcMessage::SendFile { path, peer } => self.send_file(&path, &peer).await,
             IpcMessage::ListFiles => self.list_files(),
             IpcMessage::AcceptFile { id, output } => self.accept_file(id, output, peer_cred).await,
+            IpcMessage::StartPairing => self.start_pairing(),
+            IpcMessage::PairWithDevice {
+                endpoint_id,
+                secret,
+            } => self.pair_with_device(endpoint_id, secret).await,
             other => IpcMessage::Error {
                 message: format!("unexpected message: {:?}", other),
             },
@@ -934,6 +1057,8 @@ impl DaemonState {
                 ip: my_ip,
                 is_coordinator: true,
                 hostname: Some(my_hostname.clone()),
+                user_identity: None,
+                device_cert: None,
             })
             .expect("self-add cannot collide");
 
@@ -1079,6 +1204,7 @@ impl DaemonState {
                 firewall: self.firewall.clone(),
                 hostname_table: self.hostname_table.clone(),
                 reverse_table: self.reverse_table.clone(),
+                device_user_map: self.device_user_map.clone(),
             })),
         );
 
@@ -1251,6 +1377,8 @@ impl DaemonState {
             self.stats.clone(),
             self.shared_acl.clone(),
             self.firewall.clone(),
+            self.device_cert.clone(),
+            self.device_user_map.clone(),
         )];
 
         // Apply ACL from group blob
@@ -1272,6 +1400,8 @@ impl DaemonState {
             self.shared_acl.clone(),
             self.firewall.clone(),
             net_pubkey,
+            self.device_cert.clone(),
+            self.device_user_map.clone(),
         )
         .await?;
 
@@ -1291,6 +1421,7 @@ impl DaemonState {
                 firewall: self.firewall.clone(),
                 hostname_table: self.hostname_table.clone(),
                 reverse_table: self.reverse_table.clone(),
+                device_user_map: self.device_user_map.clone(),
             })),
         );
 
@@ -1469,6 +1600,8 @@ impl DaemonState {
                 self.stats.clone(),
                 self.shared_acl.clone(),
                 self.firewall.clone(),
+                self.device_cert.clone(),
+                self.device_user_map.clone(),
             )];
 
             self.shared_acl.set(network_name, data.acl.clone());
@@ -1487,6 +1620,7 @@ impl DaemonState {
                                 identity: my_identity,
                                 ip: my_ip,
                                 hostname: my_hostname.clone(),
+                                device_cert: self.device_cert.clone(),
                             },
                         )
                         .await;
@@ -1512,6 +1646,7 @@ impl DaemonState {
                         disconnect_tx.clone(),
                         cancel.clone(),
                         self.stats.clone(),
+                        self.device_user_map.clone(),
                     );
                 }
             }
@@ -1585,6 +1720,8 @@ impl DaemonState {
                     ip: entry.ip,
                     is_coordinator: entry.is_coordinator,
                     hostname: entry.hostname.clone(),
+                    user_identity: None,
+                    device_cert: None,
                 });
             }
         }
@@ -1595,6 +1732,8 @@ impl DaemonState {
                     ip: my_ip,
                     is_coordinator: true,
                     hostname: persisted_hostname.clone(),
+                    user_identity: None,
+                    device_cert: None,
                 })
                 .expect("self-add cannot collide");
         }
@@ -1606,6 +1745,8 @@ impl DaemonState {
                     identity: entry.identity,
                     ip: entry.ip,
                     hostname: entry.hostname.clone(),
+                    user_identity: None,
+                    device_cert: None,
                 };
                 let _ = approved_list.approve(ae, &member_list);
             }
@@ -1756,6 +1897,7 @@ impl DaemonState {
                 firewall: self.firewall.clone(),
                 hostname_table: self.hostname_table.clone(),
                 reverse_table: self.reverse_table.clone(),
+                device_user_map: self.device_user_map.clone(),
             })),
         );
 
@@ -1923,11 +2065,14 @@ impl DaemonState {
                             })
                         });
                         let connection = Self::gather_conn_info(&conn);
+                        let user_id = self.device_user_map.resolve(&eid);
+                        let user_identity = if user_id != eid { Some(user_id) } else { None };
                         PeerStatus {
                             endpoint_id: eid,
                             ip,
                             ipv6: Some(derive_ipv6(&eid)),
                             hostname,
+                            user_identity,
                             connection: Some(connection),
                         }
                     })
@@ -2050,6 +2195,7 @@ impl DaemonState {
                     identity: my_identity,
                     ip: my_ip,
                     hostname: Some(new_hostname.clone()),
+                    device_cert: self.device_cert.clone(),
                 };
                 let _ = control::send_msg(&mut send, &msg).await;
             }
@@ -2727,6 +2873,121 @@ impl DaemonState {
             message: format!("saved to {}", dest.display()),
         }
     }
+
+    fn start_pairing(&self) -> IpcMessage {
+        let secret: [u8; 32] = rand::random();
+
+        let endpoint_id = self.endpoint.id();
+        let mut ticket_bytes = Vec::with_capacity(64);
+        ticket_bytes.extend_from_slice(endpoint_id.as_bytes());
+        ticket_bytes.extend_from_slice(&secret);
+        let ticket = bs58::encode(&ticket_bytes).into_string();
+
+        *self.pairing_secret.lock().unwrap() = Some(secret);
+
+        IpcMessage::PairingTicket { ticket }
+    }
+
+    async fn pair_with_device(
+        &self,
+        endpoint_id: EndpointId,
+        secret: Vec<u8>,
+    ) -> IpcMessage {
+        let addr: iroh::EndpointAddr = endpoint_id.into();
+        let conn = match self.endpoint.connect(addr, PAIR_ALPN).await {
+            Ok(c) => c,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to connect to primary device: {e}"),
+                };
+            }
+        };
+        let (mut send, mut recv) = match conn.open_bi().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to open stream: {e}"),
+                };
+            }
+        };
+
+        let secret_arr: [u8; 32] = match secret.try_into() {
+            Ok(a) => a,
+            Err(_) => {
+                return IpcMessage::Error {
+                    message: "invalid secret length".to_string(),
+                };
+            }
+        };
+
+        let request = control::PairMsg::Request {
+            secret: secret_arr,
+            device_pubkey: self.endpoint.id(),
+        };
+        let request_bytes = match rmp_serde::to_vec_named(&request) {
+            Ok(b) => b,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to encode pair request: {e}"),
+                };
+            }
+        };
+        let len = (request_bytes.len() as u32).to_be_bytes();
+        if let Err(e) = send.write_all(&len).await {
+            return IpcMessage::Error {
+                message: format!("failed to send pair request: {e}"),
+            };
+        }
+        if let Err(e) = send.write_all(&request_bytes).await {
+            return IpcMessage::Error {
+                message: format!("failed to send pair request: {e}"),
+            };
+        }
+
+        // Read PairResponse
+        let mut len_buf = [0u8; 4];
+        if let Err(e) = recv.read_exact(&mut len_buf).await {
+            return IpcMessage::Error {
+                message: format!("failed to read pair response: {e}"),
+            };
+        }
+        let body_len = u32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; body_len];
+        if let Err(e) = recv.read_exact(&mut body).await {
+            return IpcMessage::Error {
+                message: format!("failed to read pair response body: {e}"),
+            };
+        }
+        let response: control::PairMsg = match rmp_serde::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to decode pair response: {e}"),
+                };
+            }
+        };
+
+        match response {
+            control::PairMsg::Response { cert } => {
+                if !cert.verify() {
+                    return IpcMessage::Error {
+                        message: "received invalid device certificate".to_string(),
+                    };
+                }
+                if let Err(e) = identity::store_device_cert(&cert) {
+                    return IpcMessage::Error {
+                        message: format!("failed to store device certificate: {e}"),
+                    };
+                }
+                IpcMessage::PairingComplete {
+                    user_identity: cert.user_identity,
+                }
+            }
+            _ => IpcMessage::Error {
+                message: "unexpected pairing response".to_string(),
+            },
+        }
+    }
 }
 
 fn guess_mime_type(filename: &str) -> String {
@@ -2745,6 +3006,10 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 
     let key = identity::load_or_create()?;
     let public_key = key.public();
+    let device_cert = identity::load_device_cert()?;
+    if let Some(ref cert) = device_cert {
+        tracing::info!(user = %cert.user_identity.fmt_short(), "loaded device certificate");
+    }
     let collision_index = identity::load_collision_index()?;
     let identity = IrohIdentityProvider::new(public_key, collision_index);
     let my_ip = identity.local_ip();
@@ -2762,7 +3027,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         .networks
         .iter()
         .any(|net| net.transport.as_ref().is_some_and(|t| t.is_tor()));
-    let ep = transport::create_endpoint_with_alpns(key, alpns, use_tor).await?;
+    let ep = transport::create_endpoint_with_alpns(key.clone(), alpns, use_tor).await?;
 
     let blobs_dir = dirs::config_dir()
         .context("no config directory")?
@@ -2788,6 +3053,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     shared_firewall.clone().spawn_evictor(token.clone());
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(256);
     forward::spawn_tun_writer(tun_writer, tun_rx);
+    let device_user_map = peers::DeviceUserMap::new();
     tokio::spawn(forward::run_mesh(
         tun_reader,
         peers.clone(),
@@ -2796,6 +3062,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         shared_firewall.clone(),
         token.clone(),
         stats.clone(),
+        device_user_map.clone(),
     ));
 
     let hostname_table = dns::new_hostname_table();
@@ -2874,9 +3141,16 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         tracing::info!("mDNS discovery disabled");
     }
 
-    let protocol_router = Arc::new(ProtocolRouter::new(blobs_proto));
+    let pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let protocol_router = Arc::new(ProtocolRouter::new(
+        blobs_proto,
+        key.clone(),
+        pairing_secret.clone(),
+    ));
     let daemon = Arc::new(DaemonState {
         endpoint: ep,
+        secret_key: key,
         identity,
         peers,
         stats: stats.clone(),
@@ -2891,6 +3165,9 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         reverse_table,
         mdns_enabled,
         tun_name: tun_name.clone(),
+        pairing_secret,
+        device_cert,
+        device_user_map,
     });
 
     // Accept loop — dispatches connections via ProtocolHandler by ALPN
@@ -3254,6 +3531,7 @@ async fn spawn_coordinator_hello_reader(
     state: Arc<std::sync::RwLock<NetworkState>>,
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
+    device_user_map: peers::DeviceUserMap,
 ) {
     let result: Result<()> = async {
         let (_send, mut recv) = tokio::time::timeout(
@@ -3262,25 +3540,44 @@ async fn spawn_coordinator_hello_reader(
         ).await.context("timeout waiting for MeshHello")?
         .context("accept bi for MeshHello")?;
         let msg = control::recv_msg(&mut recv).await?;
-        if let ControlMsg::MeshHello { hostname: Some(desired), .. } = msg {
-            let taken: Vec<String> = {
-                let s = state.read().unwrap();
-                s.members.all().iter()
-                    .filter(|m| m.identity != remote_id)
-                    .filter_map(|m| m.hostname.clone())
-                    .collect()
-            };
-            let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
-            let final_hostname = crate::hostname::resolve_collision(&desired, &taken_refs);
-            tracing::info!(peer = %remote_id.fmt_short(), hostname = %final_hostname, "peer hostname via MeshHello");
+        if let ControlMsg::MeshHello { hostname, device_cert, .. } = msg {
+            // Verify and store device cert if present
+            if let Some(ref cert) = device_cert
+                && cert.verify()
+                && cert.device_key == remote_id
             {
                 let mut s = state.write().unwrap();
                 if let Some(m) = s.members.get_mut(&remote_id) {
-                    m.hostname = Some(final_hostname.clone());
+                    m.user_identity = Some(cert.user_identity);
+                    m.device_cert = Some(cert.clone());
                 }
+                device_user_map.insert(remote_id, cert.user_identity);
+                tracing::info!(
+                    peer = %remote_id.fmt_short(),
+                    user = %cert.user_identity.fmt_short(),
+                    "verified device certificate"
+                );
             }
-            let ipv6 = derive_ipv6(&remote_id);
-            dns::update_hostname(&hostname_table, &reverse_table, network_name, &final_hostname, peer_ip, ipv6).await;
+            if let Some(desired) = hostname {
+                let taken: Vec<String> = {
+                    let s = state.read().unwrap();
+                    s.members.all().iter()
+                        .filter(|m| m.identity != remote_id)
+                        .filter_map(|m| m.hostname.clone())
+                        .collect()
+                };
+                let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
+                let final_hostname = crate::hostname::resolve_collision(&desired, &taken_refs);
+                tracing::info!(peer = %remote_id.fmt_short(), hostname = %final_hostname, "peer hostname via MeshHello");
+                {
+                    let mut s = state.write().unwrap();
+                    if let Some(m) = s.members.get_mut(&remote_id) {
+                        m.hostname = Some(final_hostname.clone());
+                    }
+                }
+                let ipv6 = derive_ipv6(&remote_id);
+                dns::update_hostname(&hostname_table, &reverse_table, network_name, &final_hostname, peer_ip, ipv6).await;
+            }
         }
         Ok(())
     }.await;
@@ -3324,6 +3621,8 @@ async fn join_mesh_shared(
     shared_acl: forward::SharedAcl,
     firewall: SharedFirewall,
     net_pubkey: EndpointId,
+    device_cert: Option<control::DeviceCert>,
+    device_user_map: peers::DeviceUserMap,
 ) -> Result<Arc<std::sync::RwLock<NetworkState>>> {
     let my_identity = identity.local_identity();
     let my_ip = identity.local_ip();
@@ -3413,6 +3712,7 @@ async fn join_mesh_shared(
                 identity: my_identity,
                 ip: my_ip,
                 hostname: my_hostname.clone(),
+                device_cert: device_cert.clone(),
             },
         )
         .await?;
@@ -3443,6 +3743,7 @@ async fn join_mesh_shared(
         disconnect_tx.clone(),
         token.clone(),
         stats.clone(),
+        device_user_map.clone(),
     );
 
     // Connect to other known members
@@ -3459,6 +3760,7 @@ async fn join_mesh_shared(
                         identity: my_identity,
                         ip: my_ip,
                         hostname: my_hostname.clone(),
+                        device_cert: device_cert.clone(),
                     },
                 )
                 .await?;
@@ -3483,6 +3785,7 @@ async fn join_mesh_shared(
                     disconnect_tx.clone(),
                     token.clone(),
                     stats.clone(),
+                    device_user_map.clone(),
                 );
                 tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
             }
@@ -3527,8 +3830,8 @@ async fn join_mesh_shared(
                         match result {
                             Ok((_send, mut recv)) => {
                                 match control::recv_msg(&mut recv).await {
-                                    Ok(ControlMsg::MemberApproved { identity, ip, hostname }) => {
-                                        let entry = ApprovedEntry { identity, ip, hostname };
+                                    Ok(ControlMsg::MemberApproved { identity, ip, hostname, .. }) => {
+                                        let entry = ApprovedEntry { identity, ip, hostname, user_identity: None, device_cert: None };
                                         let mut s = live_state.write().unwrap();
                                         let members = s.members.clone();
                                         let _ = s.approved.approve(entry, &members);
@@ -3611,6 +3914,8 @@ fn spawn_reconnect_loop(
     stats: Arc<ForwardMetrics>,
     shared_acl: forward::SharedAcl,
     firewall: SharedFirewall,
+    device_cert: Option<control::DeviceCert>,
+    device_user_map: peers::DeviceUserMap,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -3638,6 +3943,8 @@ fn spawn_reconnect_loop(
             let shared_acl = shared_acl.clone();
             let firewall = firewall.clone();
             let my_hostname = my_hostname.clone();
+            let device_cert = device_cert.clone();
+            let device_user_map = device_user_map.clone();
 
             tokio::spawn(async move {
                 let mut backoff = BACKOFF_INITIAL;
@@ -3667,6 +3974,7 @@ fn spawn_reconnect_loop(
                                     identity: my_identity,
                                     ip: my_ip,
                                     hostname: my_hostname.clone(),
+                                    device_cert: device_cert.clone(),
                                 },
                             )
                             .await
@@ -3689,6 +3997,7 @@ fn spawn_reconnect_loop(
                                 disconnect_tx,
                                 token,
                                 stats,
+                                device_user_map,
                             );
                             return;
                         }

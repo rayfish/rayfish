@@ -171,6 +171,29 @@ enum Command {
         #[command(subcommand)]
         action: Option<FilesAction>,
     },
+    /// Pair this device with another device (share user identity)
+    Pair {
+        #[command(subcommand)]
+        action: Option<PairAction>,
+        /// Pairing ticket from the primary device (shorthand for `pitopi pair accept <ticket>`)
+        ticket: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PairAction {
+    /// Accept a pairing ticket from the primary device
+    Accept {
+        /// The pairing ticket
+        ticket: String,
+    },
+    /// Export an encrypted backup of the signing key
+    Backup,
+    /// Restore a signing key from an encrypted backup
+    Restore {
+        /// The encrypted backup string
+        backup: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -304,6 +327,7 @@ async fn main() -> Result<()> {
         Command::Mdns { state } => cmd_mdns(&state),
         Command::Send { file, peer } => ipc_send_file(&file, &peer).await,
         Command::Files { action } => ipc_files(action).await,
+        Command::Pair { action, ticket } => cmd_pair(action, ticket).await,
     }
 }
 
@@ -531,6 +555,9 @@ async fn ipc_status() -> Result<()> {
                                 peer.ip.to_string()
                             };
                             print!("      {} ({})", name, peer.endpoint_id.fmt_short());
+                            if let Some(ref uid) = peer.user_identity {
+                                print!(" user:{}", uid.fmt_short());
+                            }
                             if let Some(ref ci) = peer.connection {
                                 let conn_type = match ci.conn_type {
                                     ipc::ConnType::Direct => "direct",
@@ -763,6 +790,182 @@ async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
 
 fn format_size(bytes: u64) -> String {
     humansize::format_size(bytes, humansize::BINARY)
+}
+
+// ---------------------------------------------------------------------------
+// Device pairing
+// ---------------------------------------------------------------------------
+
+async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>) -> Result<()> {
+    match (action, ticket) {
+        // `pitopi pair <ticket>` shorthand
+        (None, Some(ticket)) | (Some(PairAction::Accept { ticket }), _) => {
+            ipc_pair_accept(&ticket).await
+        }
+        // `pitopi pair` — start pairing on primary device
+        (None, None) => ipc_pair_start().await,
+        // `pitopi pair backup`
+        (Some(PairAction::Backup), _) => cmd_pair_backup(),
+        // `pitopi pair restore <backup>`
+        (Some(PairAction::Restore { backup }), _) => cmd_pair_restore(&backup),
+    }
+}
+
+async fn ipc_pair_start() -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(&mut stream, ipc::IpcMessage::StartPairing).await?;
+    let resp = ipc::recv(&mut stream).await?;
+    match resp {
+        ipc::IpcMessage::PairingTicket { ticket } => {
+            println!("Pairing ticket: {}", ticket);
+            println!();
+            qr2term::print_qr(&ticket).ok();
+            println!();
+            println!("On the other device, run:");
+            println!("  pitopi pair {}", ticket);
+            println!();
+            println!("Waiting for device to connect...");
+            // The daemon handles the pairing asynchronously via the accept loop.
+            // We could poll for completion, but the daemon logs when it happens.
+            // For now, just tell the user it's ready.
+        }
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+async fn ipc_pair_accept(ticket: &str) -> Result<()> {
+    let ticket_bytes = bs58::decode(ticket)
+        .into_vec()
+        .map_err(|e| anyhow::anyhow!("invalid pairing ticket: {e}"))?;
+    if ticket_bytes.len() != 64 {
+        anyhow::bail!(
+            "invalid pairing ticket: expected 64 bytes, got {}",
+            ticket_bytes.len()
+        );
+    }
+    let endpoint_id = iroh::EndpointId::from_bytes(&ticket_bytes[..32].try_into().unwrap())
+        .map_err(|e| anyhow::anyhow!("invalid endpoint ID in ticket: {e}"))?;
+    let secret = ticket_bytes[32..].to_vec();
+
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::PairWithDevice {
+            endpoint_id,
+            secret,
+        },
+    )
+    .await?;
+    let resp = ipc::recv(&mut stream).await?;
+    match resp {
+        ipc::IpcMessage::PairingComplete { user_identity } => {
+            println!("Paired successfully!");
+            println!("  User identity: {}", user_identity);
+            println!("  Device certificate stored.");
+            println!();
+            println!("This device will present its certificate when joining networks.");
+        }
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+fn cmd_pair_backup() -> Result<()> {
+    use argon2::Argon2;
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::Aead, KeyInit};
+
+    let key = identity::load_or_create()?;
+    let password = rpassword::prompt_password("Enter backup password: ")?;
+    if password.is_empty() {
+        anyhow::bail!("password cannot be empty");
+    }
+    let confirm = rpassword::prompt_password("Confirm password: ")?;
+    if password != confirm {
+        anyhow::bail!("passwords do not match");
+    }
+
+    let salt: [u8; 16] = rand::random();
+    let mut derived_key = [0u8; 32];
+    Argon2::default()
+        .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
+        .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
+
+    let cipher = XChaCha20Poly1305::new((&derived_key).into());
+    let nonce_bytes: [u8; 24] = rand::random();
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, key.to_bytes().as_ref())
+        .map_err(|e| anyhow::anyhow!("encryption failed: {e}"))?;
+
+    // Format: "enc1" (4) || salt (16) || nonce (24) || ciphertext (32 + 16 tag)
+    let mut backup_bytes = Vec::with_capacity(4 + 16 + 24 + ciphertext.len());
+    backup_bytes.extend_from_slice(b"enc1");
+    backup_bytes.extend_from_slice(&salt);
+    backup_bytes.extend_from_slice(&nonce_bytes);
+    backup_bytes.extend_from_slice(&ciphertext);
+
+    let backup = bs58::encode(&backup_bytes).into_string();
+    println!("Backup code: {}", backup);
+    println!();
+    println!("Store this safely. To restore on a new device:");
+    println!("  pitopi pair restore {}", backup);
+    Ok(())
+}
+
+fn cmd_pair_restore(backup: &str) -> Result<()> {
+    use argon2::Argon2;
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::Aead, KeyInit};
+
+    let backup_bytes = bs58::decode(backup)
+        .into_vec()
+        .map_err(|e| anyhow::anyhow!("invalid backup code: {e}"))?;
+    if backup_bytes.len() < 4 + 16 + 24 + 32 {
+        anyhow::bail!("invalid backup code: too short");
+    }
+    if &backup_bytes[..4] != b"enc1" {
+        anyhow::bail!("invalid backup code: unknown format");
+    }
+    let salt = &backup_bytes[4..20];
+    let nonce_bytes = &backup_bytes[20..44];
+    let ciphertext = &backup_bytes[44..];
+
+    let password = rpassword::prompt_password("Enter backup password: ")?;
+    let mut derived_key = [0u8; 32];
+    Argon2::default()
+        .hash_password_into(password.as_bytes(), salt, &mut derived_key)
+        .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
+
+    let cipher = XChaCha20Poly1305::new((&derived_key).into());
+    let nonce = XNonce::from_slice(nonce_bytes);
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| anyhow::anyhow!("decryption failed: wrong password or corrupted backup"))?;
+
+    let key_bytes: [u8; 32] = plaintext
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid key data"))?;
+    let key = iroh::SecretKey::from_bytes(&key_bytes);
+
+    // Check if a key already exists
+    let existing = identity::load_or_create()?;
+    if existing.public() == key.public() {
+        println!("This device already has this identity.");
+        return Ok(());
+    }
+
+    // Write the restored key
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?
+        .join("pitopi");
+    std::fs::create_dir_all(&config_dir)?;
+    std::fs::write(config_dir.join("secret_key"), key.to_bytes())?;
+
+    println!("Restored user identity: {}", key.public());
+    println!("Restart the daemon for changes to take effect.");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

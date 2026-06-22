@@ -88,6 +88,11 @@ pub enum IpcMessage {
         id: u64,
         output: Option<String>,
     },
+    StartPairing,
+    PairWithDevice {
+        endpoint_id: EndpointId,
+        secret: Vec<u8>,
+    },
 
     // Responses
     Ok {
@@ -125,6 +130,12 @@ pub enum IpcMessage {
     FileList {
         files: Vec<PendingFileInfo>,
     },
+    PairingTicket {
+        ticket: String,
+    },
+    PairingComplete {
+        user_identity: EndpointId,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -160,6 +171,7 @@ pub struct PeerStatus {
     pub ip: Ipv4Addr,
     pub ipv6: Option<Ipv6Addr>,
     pub hostname: Option<String>,
+    pub user_identity: Option<EndpointId>,
     pub connection: Option<ConnectionInfo>,
 }
 
@@ -362,6 +374,7 @@ mod tests {
                     ip: Ipv4Addr::new(100, 64, 10, 6),
                     ipv6: None,
                     hostname: None,
+                    user_identity: None,
                     connection: None,
                 }],
             }],

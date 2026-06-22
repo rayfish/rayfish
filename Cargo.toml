@@ -41,6 +41,11 @@ hex = "0.4.3"
 simple-dns = "0.9"
 smol_str = { version = "0.3.6", features = ["serde"] }
 arc-swap = "1.9.1"
+qr2term = "0.3.3"
+bs58 = "0.5.1"
+chacha20poly1305 = "0.10.1"
+argon2 = "0.5.3"
+rpassword = "7.5.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "4", default-features = false, features = ["tokio"] }

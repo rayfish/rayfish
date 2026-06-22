@@ -193,6 +193,26 @@ ping alice.pi                     # flat lookup (searches all networks)
 
 Hostnames propagate via the membership blob and MeshHello messages — they're resolvable even when the named peer is offline. A (IPv4), AAAA (IPv6), and PTR (reverse DNS) records are served, so `ping6 alice.gaming.pi` and `dig -x 100.64.x.x` both work. EDNS/OPT and DNS-over-TCP are supported. If two peers choose the same hostname, a numeric suffix is appended automatically (e.g., `alice` → `alice2`). Hostnames persist across daemon restarts. The daemon configures your system DNS to route only `.pi` queries to its local resolver (macOS: SCDynamicStore, Linux: systemd-resolved/NetworkManager D-Bus, resolvconf, or direct); all other DNS is untouched.
 
+### Device pairing
+
+Use the same identity across multiple devices. The primary device signs a certificate for each secondary device, so all your devices share one identity for ACL purposes:
+
+```bash
+# On your primary device — displays a QR code and pairing ticket
+pitopi pair
+
+# On your secondary device — pair using the ticket
+pitopi pair <ticket>
+
+# Backup your identity key (encrypted with a passphrase)
+pitopi pair backup
+
+# Restore on a new device
+pitopi pair restore <backup-code>
+```
+
+After pairing, ACL tags assigned to your user identity cover all your devices automatically. Each device still gets its own IP and connections, but the network treats them as one user.
+
 ### Local peer discovery (mDNS)
 
 Pitopi automatically discovers other peers on your local network via mDNS. When two peers are on the same LAN, they connect directly — skipping relay servers entirely for the lowest possible latency.
@@ -228,6 +248,10 @@ pitopi mdns on      # re-enable (restart daemon for changes to take effect)
 | `pitopi firewall default ACTION` | Set default policy (allow/deny) | Yes |
 | `pitopi firewall add DIR ACTION` | Add a firewall rule | Yes |
 | `pitopi firewall remove INDEX` | Remove a rule by index | Yes |
+| `pitopi pair` | Start device pairing (displays QR + ticket) | Yes |
+| `pitopi pair TICKET` | Pair with a primary device | Yes |
+| `pitopi pair backup` | Backup identity key (encrypted) | No |
+| `pitopi pair restore CODE` | Restore identity from backup | No |
 | `pitopi mdns on\|off` | Enable/disable mDNS local peer discovery | No |
 | `pitopi install-service` | Install systemd/launchd service | No |
 | `pitopi uninstall-service` | Remove system service | No |
@@ -304,6 +328,7 @@ See [TODO.md](TODO.md) for the full roadmap. Current status:
 - [x] Systemd/launchd service integration
 - [x] Daemon architecture with Unix socket IPC
 - [x] mDNS local peer discovery (LAN peers get direct connections automatically)
+- [x] Multi-device identity via certificate-based pairing
 - [ ] Social discovery (Discord, Slack, Steam)
 - [ ] macOS Network Extension (no sudo)
 - [ ] Windows, iOS, Android

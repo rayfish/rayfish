@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::acl::AclData;
 use crate::firewall::{self, Action, Direction, SharedFirewall};
-use crate::peers::PeerTable;
+use crate::peers::{DeviceUserMap, PeerTable};
 use crate::stats::{DropReason, ForwardMetrics};
 use crate::tun::{TunReader, TunWriter};
 
@@ -114,6 +114,7 @@ pub async fn run_mesh(
     firewall: SharedFirewall,
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
+    device_user_map: DeviceUserMap,
 ) -> Result<()> {
     let mut buf = vec![0u8; 1500];
     loop {
@@ -131,7 +132,9 @@ pub async fn run_mesh(
                         };
                         if let Some((conn, peer_endpoint_id, network)) = lookup {
                             let acl = shared_acl.get(&network);
-                            if !acl.is_allowed(&local_id, &peer_endpoint_id) {
+                            let local_user = device_user_map.resolve(&local_id);
+                            let peer_user = device_user_map.resolve(&peer_endpoint_id);
+                            if !acl.is_allowed(&local_user, &peer_user) {
                                 tracing::debug!(dst = %info.dst_ip, "ACL denied outbound");
                                 stats.record_drop(DropReason::Acl);
                                 continue;
@@ -179,6 +182,7 @@ pub fn spawn_peer_reader(
     disconnect_tx: mpsc::Sender<DisconnectEvent>,
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
+    device_user_map: DeviceUserMap,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -188,7 +192,9 @@ pub fn spawn_peer_reader(
                     match result {
                         Ok(datagram) => {
                             let acl = shared_acl.get(&network);
-                            match evaluate_inbound(&datagram, &acl, &firewall, &peer_id, &local_id) {
+                            let peer_user = device_user_map.resolve(&peer_id);
+                            let local_user = device_user_map.resolve(&local_id);
+                            match evaluate_inbound(&datagram, &acl, &firewall, &peer_user, &local_user) {
                                 InboundDecision::Accept => {
                                     stats.record_rx(datagram.len());
                                     if tun_tx.send(datagram.to_vec()).await.is_err() {

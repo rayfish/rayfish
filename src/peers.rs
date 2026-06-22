@@ -114,6 +114,32 @@ impl PeerTable {
     }
 }
 
+/// Maps device transport keys to user identities for paired devices.
+/// Used by the forwarding path to resolve ACL identities.
+#[derive(Clone)]
+pub struct DeviceUserMap {
+    inner: Arc<DashMap<EndpointId, EndpointId>>,
+}
+
+impl DeviceUserMap {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn insert(&self, device_key: EndpointId, user_identity: EndpointId) {
+        self.inner.insert(device_key, user_identity);
+    }
+
+    pub fn resolve(&self, transport_key: &EndpointId) -> EndpointId {
+        self.inner
+            .get(transport_key)
+            .map(|e| *e.value())
+            .unwrap_or(*transport_key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

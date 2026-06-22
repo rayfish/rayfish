@@ -29,6 +29,7 @@ A complete guide to pitopi's architecture, protocols, and internals.
 21. [Daemon Architecture](#21-daemon-architecture)
 22. [Code Flow Diagrams](#22-code-flow-diagrams)
 23. [Security Model](#23-security-model)
+24. [Device Pairing](#24-device-pairing)
 
 ---
 
@@ -2170,3 +2171,107 @@ Peers verify the blake3 hash of the GroupBlob before trusting its contents. The 
 - **Denial of service:** A peer can flood the network with packets. No rate limiting is currently implemented.
 - **Member list confidentiality:** The member list (identities and IPs) is shared with all members. A member can see who else is in the network.
 - **Reconnection window:** Packets to a disconnected peer are silently dropped until the reconnect loop establishes a new connection (up to 30 seconds with backoff).
+
+---
+
+## 24. Device Pairing
+
+**Modules:** `src/identity.rs` (device certs), `src/control.rs` (PairMsg), `src/daemon.rs` (pairing handler), `src/peers.rs` (DeviceUserMap)
+
+Pitopi's identity model normally binds one cryptographic key to one device. Device pairing extends this so that a single user can operate multiple devices under a shared identity, using certificate-based pairing.
+
+### The problem
+
+Without pairing, each device has its own Ed25519 keypair and its own EndpointId. If you use pitopi on a laptop and a phone, they appear as two separate peers -- different IPs, different ACL identities, different tags. You'd need to tag and authorize each device independently.
+
+### How pairing works
+
+Pairing creates a certificate chain: the primary device's identity key signs a certificate for each secondary device, binding the secondary's transport key to the primary's user identity.
+
+```
+Primary device (user identity key)
+    |
+    |-- signs DeviceCert for secondary device A
+    |       binds: device_transport_key_A → user_identity
+    |
+    |-- signs DeviceCert for secondary device B
+            binds: device_transport_key_B → user_identity
+```
+
+After pairing, all devices share the same user identity for ACL purposes, while maintaining separate transport keys for independent QUIC connections.
+
+### Pairing flow
+
+**On the primary device:**
+
+```bash
+pitopi pair
+```
+
+This generates a pairing secret, creates a pairing ticket (`bs58(endpoint_id || pairing_secret)`), and displays it as both a text string and a QR code (rendered in the terminal via `qr2term`). The daemon registers a temporary handler on the `pitopi/pair/1` ALPN to accept the incoming pairing connection.
+
+**On the secondary device:**
+
+```bash
+pitopi pair <ticket>
+```
+
+The secondary daemon decodes the ticket, extracts the primary's EndpointId and the pairing secret, and connects to the primary via the PAIR_ALPN. The pairing secret authenticates the request -- only someone with the ticket can pair.
+
+The primary verifies the secret, then signs a `DeviceCert` that binds the secondary's transport key to the primary's user identity. The signed certificate is sent back to the secondary, which stores it at `~/.config/pitopi/device_cert`.
+
+### After pairing
+
+When a paired device joins a network, it presents its `DeviceCert` in the MeshHello message. Receiving peers verify the certificate signature against the user identity and register a `DeviceUserMap` entry that maps the device's transport key to the user identity.
+
+This means:
+- **ACL tags** assigned to the user identity automatically cover all paired devices
+- **ACL rules** referencing the user identity apply to traffic from any of the user's devices
+- **IP addresses** remain per-device (each device still has its own transport key and derived IPs)
+- **Connections** remain per-device (each device maintains its own QUIC connections)
+
+The `DeviceUserMap` is consulted during ACL evaluation in the forwarding path (`forward.rs`). Before checking ACL rules, the transport key is resolved to the user identity via the map. If no mapping exists (unpaired device), the transport key is used directly as the identity, preserving backward compatibility.
+
+### Key backup and restore
+
+If you lose your primary device, you lose the identity key that signed all device certificates. To guard against this, pitopi supports encrypted key backup:
+
+**Backup:**
+
+```bash
+pitopi pair backup
+```
+
+You are prompted for a passphrase (via `rpassword`, no terminal echo). The identity key is encrypted using chacha20poly1305 with a key derived from the passphrase via argon2. The resulting backup code is displayed for you to store securely (e.g., print it, write it down, save it in a password manager).
+
+**Restore:**
+
+```bash
+pitopi pair restore <backup-code>
+```
+
+You are prompted for the passphrase. The backup code is decrypted and the identity key is restored to `~/.config/pitopi/secret_key`. After restore, the device has the same EndpointId and user identity as the original primary device.
+
+### ACLs with paired devices
+
+With pairing, ACL tags reference user identities rather than individual device transport keys. This simplifies multi-device management:
+
+```bash
+# Tag a user (covers all their devices)
+pitopi acl gaming tag admins ab3f
+
+# This rule applies to traffic from any of the user's paired devices
+pitopi acl gaming allow admins all
+```
+
+The coordinator sees all devices of a paired user as the same identity for tagging and rule purposes. Each device still appears as a separate peer in the mesh (separate IP, separate connection), but ACL evaluation treats them as one user.
+
+### Wire protocol
+
+The pairing protocol uses a dedicated ALPN (`pitopi/pair/1`) and the `PairMsg` enum in `src/control.rs`:
+
+- **PairRequest** -- sent by secondary with the pairing secret
+- **PairResponse** -- sent by primary with the signed `DeviceCert` (or rejection)
+- **PairComplete** -- acknowledgment from secondary
+
+The `DeviceCert` type contains the device's transport public key, the user identity public key, and an Ed25519 signature over the binding.

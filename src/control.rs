@@ -6,11 +6,51 @@
 use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result};
-use iroh::EndpointId;
+use iroh::{EndpointId, SecretKey, Signature};
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 
 use crate::membership::{ApprovedEntry, Member};
+
+/// Certificate proving a device belongs to a user identity.
+///
+/// The user's private key signs the device's public key. Any peer can verify
+/// the binding using only the user's public key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceCert {
+    pub user_identity: EndpointId,
+    pub device_key: EndpointId,
+    pub signature: Signature,
+}
+
+impl DeviceCert {
+    pub fn create(user_secret: &SecretKey, device_pubkey: &EndpointId) -> Self {
+        let signature = user_secret.sign(device_pubkey.as_bytes());
+        Self {
+            user_identity: user_secret.public(),
+            device_key: *device_pubkey,
+            signature,
+        }
+    }
+
+    pub fn verify(&self) -> bool {
+        self.user_identity
+            .verify(self.device_key.as_bytes(), &self.signature)
+            .is_ok()
+    }
+}
+
+/// Messages for the device pairing protocol (ALPN `pitopi/pair/1`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PairMsg {
+    Request {
+        secret: [u8; 32],
+        device_pubkey: EndpointId,
+    },
+    Response {
+        cert: DeviceCert,
+    },
+}
 
 /// Control messages exchanged between peers over QUIC bidirectional streams.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,18 +68,24 @@ pub enum ControlMsg {
     ReconnectRequest {
         identity: EndpointId,
         ip: Ipv4Addr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_cert: Option<DeviceCert>,
     },
     MeshHello {
         identity: EndpointId,
         ip: Ipv4Addr,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hostname: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_cert: Option<DeviceCert>,
     },
     MeshWelcome {
         identity: EndpointId,
         ip: Ipv4Addr,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hostname: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_cert: Option<DeviceCert>,
     },
     AdvertiseServices {
         ip: Ipv4Addr,
@@ -50,6 +96,8 @@ pub enum ControlMsg {
         ip: Ipv4Addr,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hostname: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_cert: Option<DeviceCert>,
     },
     Welcome {
         members: Vec<Member>,
@@ -131,6 +179,8 @@ mod tests {
                 ip: Ipv4Addr::new(100, 64, 0, 2),
                 is_coordinator: true,
                 hostname: None,
+                user_identity: None,
+                device_cert: None,
             }],
         };
         let bytes = encode_msg(&msg);
@@ -144,6 +194,7 @@ mod tests {
             identity: test_id(1),
             ip: Ipv4Addr::new(100, 64, 0, 4),
             hostname: None,
+            device_cert: None,
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -169,12 +220,16 @@ mod tests {
                     ip: Ipv4Addr::new(100, 64, 0, 2),
                     is_coordinator: true,
                     hostname: None,
+                    user_identity: None,
+                    device_cert: None,
                 },
                 Member {
                     identity: test_id(2),
                     ip: Ipv4Addr::new(100, 64, 0, 3),
                     is_coordinator: false,
                     hostname: None,
+                    user_identity: None,
+                    device_cert: None,
                 },
             ],
         };
@@ -188,6 +243,7 @@ mod tests {
         let msg = ControlMsg::ReconnectRequest {
             identity: test_id(1),
             ip: Ipv4Addr::new(100, 64, 7, 42),
+            device_cert: None,
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -200,6 +256,7 @@ mod tests {
             identity: test_id(1),
             ip: Ipv4Addr::new(100, 64, 12, 34),
             hostname: None,
+            device_cert: None,
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -215,11 +272,15 @@ mod tests {
                 ip: Ipv4Addr::new(100, 64, 0, 2),
                 is_coordinator: true,
                 hostname: None,
+                user_identity: None,
+                device_cert: None,
             }],
             approved: vec![ApprovedEntry {
                 identity: test_id(2),
                 ip: Ipv4Addr::new(100, 64, 0, 5),
                 hostname: None,
+                user_identity: None,
+                device_cert: None,
             }],
         };
         let bytes = encode_msg(&msg);
@@ -249,5 +310,52 @@ mod tests {
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    fn test_key(seed: u8) -> SecretKey {
+        let mut key_bytes = [0u8; 32];
+        key_bytes[0] = seed;
+        SecretKey::from(key_bytes)
+    }
+
+    #[test]
+    fn test_device_cert_sign_verify() {
+        let user_key = test_key(1);
+        let device_key = test_key(2);
+        let cert = DeviceCert::create(&user_key, &device_key.public());
+        assert!(cert.verify());
+        assert_eq!(cert.user_identity, user_key.public());
+        assert_eq!(cert.device_key, device_key.public());
+    }
+
+    #[test]
+    fn test_device_cert_rejects_wrong_signer() {
+        let user_key = test_key(1);
+        let device_key = test_key(2);
+        let wrong_key = test_key(3);
+        let mut cert = DeviceCert::create(&user_key, &device_key.public());
+        cert.user_identity = wrong_key.public();
+        assert!(!cert.verify());
+    }
+
+    #[test]
+    fn test_roundtrip_mesh_hello_with_cert() {
+        let user_key = test_key(1);
+        let device_key = test_key(2);
+        let cert = DeviceCert::create(&user_key, &device_key.public());
+        let msg = ControlMsg::MeshHello {
+            identity: device_key.public(),
+            ip: Ipv4Addr::new(100, 64, 0, 5),
+            hostname: Some("alice".to_string()),
+            device_cert: Some(cert),
+        };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+        if let ControlMsg::MeshHello { device_cert: Some(c), .. } = &decoded {
+            assert!(c.verify());
+        } else {
+            panic!("expected MeshHello with cert");
+        }
     }
 }

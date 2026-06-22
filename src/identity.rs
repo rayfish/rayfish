@@ -6,7 +6,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use iroh::SecretKey;
+use iroh::{EndpointId, SecretKey};
+
+use crate::control::DeviceCert;
 
 fn config_dir() -> Result<PathBuf> {
     let dir = dirs::config_dir()
@@ -49,5 +51,35 @@ pub fn load_collision_index() -> Result<u32> {
         s.trim().parse::<u32>().context("parse collision_index")
     } else {
         Ok(0)
+    }
+}
+
+fn device_cert_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("device_cert"))
+}
+
+pub fn create_device_cert(user_secret: &SecretKey, device_pubkey: &EndpointId) -> DeviceCert {
+    DeviceCert::create(user_secret, device_pubkey)
+}
+
+pub fn store_device_cert(cert: &DeviceCert) -> Result<()> {
+    let path = device_cert_path()?;
+    let bytes = rmp_serde::to_vec_named(cert).context("serialize device cert")?;
+    std::fs::write(&path, bytes).context("write device cert")?;
+    tracing::info!(user = %cert.user_identity.fmt_short(), "stored device certificate");
+    Ok(())
+}
+
+pub fn load_device_cert() -> Result<Option<DeviceCert>> {
+    let path = device_cert_path()?;
+    if path.exists() {
+        let bytes = std::fs::read(&path).context("read device cert")?;
+        let cert: DeviceCert = rmp_serde::from_slice(&bytes).context("decode device cert")?;
+        if !cert.verify() {
+            anyhow::bail!("stored device certificate has invalid signature");
+        }
+        Ok(Some(cert))
+    } else {
+        Ok(None)
     }
 }

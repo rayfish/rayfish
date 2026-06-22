@@ -11,6 +11,8 @@ use anyhow::{Result, bail};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
+use crate::control::DeviceCert;
+
 /// A peer that has been admitted to the network.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
@@ -19,6 +21,18 @@ pub struct Member {
     pub is_coordinator: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_identity: Option<EndpointId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_cert: Option<DeviceCert>,
+}
+
+impl Member {
+    /// Returns the user identity this device belongs to.
+    /// For device 0 / legacy nodes, this equals the transport identity.
+    pub fn effective_user_identity(&self) -> EndpointId {
+        self.user_identity.unwrap_or(self.identity)
+    }
 }
 
 /// Controls who can approve new members joining the network.
@@ -142,6 +156,10 @@ pub struct ApprovedEntry {
     pub ip: Ipv4Addr,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_identity: Option<EndpointId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_cert: Option<DeviceCert>,
 }
 
 /// Pre-approved peers that the coordinator has broadcast but that haven't
@@ -559,6 +577,8 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         list.add(member.clone()).unwrap();
         assert!(list.is_member(&id));
@@ -575,6 +595,8 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         list.add(member).unwrap();
         let found = list.get_by_ip(Ipv4Addr::new(100, 64, 10, 5)).unwrap();
@@ -590,6 +612,8 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         })
         .unwrap();
         let result = list.add(Member {
@@ -597,6 +621,8 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         });
         assert!(result.is_err());
     }
@@ -610,6 +636,8 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         })
         .unwrap();
         list.add(Member {
@@ -617,6 +645,8 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: true,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         })
         .unwrap();
         assert!(list.get(&id).unwrap().is_coordinator);
@@ -631,6 +661,8 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         })
         .unwrap();
         let removed = list.remove(&id);
@@ -647,6 +679,8 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 0, 2),
             is_coordinator: true,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         })
         .unwrap();
         list.add(Member {
@@ -654,6 +688,8 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 0, 3),
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         })
         .unwrap();
         assert_eq!(list.all().len(), 2);
@@ -667,6 +703,8 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 0, 5),
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         assert!(policy.can_authorize(&member));
     }
@@ -679,12 +717,16 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 0, 2),
             is_coordinator: true,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         let regular = Member {
             identity: test_id(2),
             ip: Ipv4Addr::new(100, 64, 0, 3),
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         assert!(policy.can_authorize(&coordinator));
         assert!(!policy.can_authorize(&regular));
@@ -698,6 +740,8 @@ mod tests {
             identity: id,
             ip: Ipv4Addr::new(100, 64, 5, 10),
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         let members = MemberList::new();
         list.approve(entry, &members).unwrap();
@@ -715,12 +759,16 @@ mod tests {
                 ip: Ipv4Addr::new(100, 64, 5, 10),
                 is_coordinator: false,
                 hostname: None,
+                user_identity: None,
+                device_cert: None,
             })
             .unwrap();
         let entry = ApprovedEntry {
             identity: test_id(2),
             ip: Ipv4Addr::new(100, 64, 5, 10),
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         assert!(approved.approve(entry, &members).is_err());
     }
@@ -735,6 +783,8 @@ mod tests {
                     identity: test_id(1),
                     ip: Ipv4Addr::new(100, 64, 5, 10),
                     hostname: None,
+                    user_identity: None,
+                    device_cert: None,
                 },
                 &members,
             )
@@ -744,6 +794,8 @@ mod tests {
                 identity: test_id(2),
                 ip: Ipv4Addr::new(100, 64, 5, 10),
                 hostname: None,
+                user_identity: None,
+                device_cert: None,
             },
             &members,
         );
@@ -761,6 +813,8 @@ mod tests {
                     identity: id,
                     ip: Ipv4Addr::new(100, 64, 5, 10),
                     hostname: None,
+                    user_identity: None,
+                    device_cert: None,
                 },
                 &members,
             )
@@ -771,6 +825,8 @@ mod tests {
                     identity: id,
                     ip: Ipv4Addr::new(100, 64, 5, 10),
                     hostname: None,
+                    user_identity: None,
+                    device_cert: None,
                 },
                 &members,
             )
@@ -789,6 +845,8 @@ mod tests {
                     identity: id,
                     ip: Ipv4Addr::new(100, 64, 5, 10),
                     hostname: None,
+                    user_identity: None,
+                    device_cert: None,
                 },
                 &members,
             )
@@ -805,11 +863,15 @@ mod tests {
                 identity: test_id(1),
                 ip: Ipv4Addr::new(100, 64, 0, 2),
                 hostname: None,
+                user_identity: None,
+                device_cert: None,
             },
             ApprovedEntry {
                 identity: test_id(2),
                 ip: Ipv4Addr::new(100, 64, 0, 3),
                 hostname: None,
+                user_identity: None,
+                device_cert: None,
             },
         ];
         let list = ApprovedList::from_entries(entries);
@@ -829,6 +891,8 @@ mod tests {
                 ip: derive_ip(&id),
                 is_coordinator: false,
                 hostname: None,
+                user_identity: None,
+                device_cert: None,
             });
         }
         list
@@ -878,6 +942,8 @@ mod tests {
                     identity: id3,
                     ip: derive_ip(&id3),
                     hostname: None,
+                    user_identity: None,
+                    device_cert: None,
                 },
                 &members,
             )
@@ -940,6 +1006,8 @@ mod tests {
             ip: derive_ip(&id),
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         assert!(validate_member(&member).is_ok());
     }
@@ -954,6 +1022,8 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 10, 5), // does NOT equal derive_ip(test_id(7))
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         let err = validate_member(&member).unwrap_err().to_string();
         assert!(err.contains("does not match"), "{err}");
@@ -967,6 +1037,8 @@ mod tests {
             ip: Ipv4Addr::new(10, 0, 0, 5),
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         assert!(validate_member(&member).is_err());
     }
@@ -980,12 +1052,16 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 0, 0),
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         let gw = Member {
             identity: id,
             ip: Ipv4Addr::new(100, 64, 0, 1),
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         assert!(validate_member(&net).is_err());
         assert!(validate_member(&gw).is_err());
@@ -998,6 +1074,8 @@ mod tests {
             identity: id,
             ip: Ipv4Addr::new(100, 64, 99, 99),
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         assert!(validate_approved(&entry).is_err());
     }
@@ -1012,6 +1090,8 @@ mod tests {
                 ip: derive_ip(&id),
                 is_coordinator: false,
                 hostname: None,
+                user_identity: None,
+                device_cert: None,
             };
             assert!(
                 validate_member(&member).is_ok(),
@@ -1032,6 +1112,8 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 10, 5), // not derive_ip(test_id(1))
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         let blob = GroupBlob {
             members: vec![bad_member],
@@ -1052,6 +1134,8 @@ mod tests {
             ip: Ipv4Addr::new(100, 64, 0, 1), // TUN gateway
             is_coordinator: false,
             hostname: None,
+            user_identity: None,
+            device_cert: None,
         };
         let blob = GroupBlob {
             members: vec![bad_member],
