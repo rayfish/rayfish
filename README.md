@@ -16,7 +16,7 @@ Rayfish is built on [iroh](https://iroh.computer) and connects peers by *cryptog
 
 1. **Create** — one peer starts a network and becomes the coordinator. It gets a public-key *join code* to share.
 2. **Join** — peers connect using the join code. iroh handles NAT traversal and encrypted transport.
-3. **Mesh** — the coordinator assigns each peer a stable virtual IPv4 (`100.64.0.0/10`) and IPv6 (`200::/7`), then broadcasts the peer list. Every peer connects directly to every other.
+3. **Mesh** — each peer derives its own stable virtual IPv4 (`100.64.0.0/10`) and IPv6 (`200::/7`) directly from its cryptographic identity, so addresses need no central assignment. The coordinator approves identities and the membership list is shared with everyone. Every peer connects directly to every other.
 4. **Use it** — any app over TCP/UDP just works, and Magic DNS lets you reach peers by `name.network.ray` instead of memorizing IPs.
 
 Under the hood, each machine runs a daemon (similar to Tailscale's `tailscaled`) that creates a TUN device, captures IP packets, and tunnels them through iroh's QUIC-based P2P connections. Everything else — `create`, `join`, `status`, file sharing, ACLs — runs unprivileged and talks to the daemon over a local socket.
@@ -40,21 +40,20 @@ sudo ray up    # installs the system service if needed, then starts the daemon
 
 ```bash
 ray create --hostname alice
-# > Network created: gentle-amber-fox
-# >   IPv4: 100.64.23.142
-# >   IPv6: 200:ab3f:d92c:1e4a::1
-# >   Hostname: alice.gentle-amber-fox.ray
-# >   Join code: 3f8a...c7d2
-# >   Share this join code to invite others
+# > ✓ network created gentle-amber-fox
+# >   IPv4  100.64.23.142
+# >   IPv6  200:ab3f:d92c:1e4a::1
+# >   join  3f8a…c7d2
+# >   ray join 3f8a...c7d2   # share this command to invite
 ```
 
 ### 3. Join from another machine
 
 ```bash
 ray join 3f8a...c7d2 --name gaming --hostname bob
-# > Joined network 'gaming'.
-# >   IPv4: 100.64.7.201
-# >   Hostname: bob.gaming.ray
+# > ✓ joined gaming
+# >   IPv4  100.64.7.201
+# >   IPv6  200:7c10:5e8b:33a1::1
 ```
 
 ### 4. Reach each other
