@@ -2,6 +2,14 @@
 name = "rayfish"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "P2P mesh VPN powered by iroh — connect peers by cryptographic identity, not IP address"
+license = "MPL-2.0"
+repository = "https://github.com/rayfish/rayfish"
+homepage = "https://github.com/rayfish/rayfish"
+readme = "README.md"
+keywords = ["vpn", "p2p", "mesh", "networking", "iroh"]
+categories = ["network-programming", "command-line-utilities"]
 
 # The repo root is both the `rayfish` package (binary `ray`) and the workspace
 # root. `ray-proto` is a member crate holding the shared IPC wire protocol.
