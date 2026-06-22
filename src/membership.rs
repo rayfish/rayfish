@@ -29,34 +29,10 @@ pub struct Member {
 
 
 /// Controls who can approve new members joining the network.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum GroupMode {
-    Open,
-    #[default]
-    Restricted,
-}
-
-impl fmt::Display for GroupMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            GroupMode::Open => write!(f, "open"),
-            GroupMode::Restricted => write!(f, "restricted"),
-        }
-    }
-}
-
-impl std::str::FromStr for GroupMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "open" => Ok(GroupMode::Open),
-            "restricted" => Ok(GroupMode::Restricted),
-            other => Err(format!("unknown group mode: {other}")),
-        }
-    }
-}
+///
+/// Defined in `ray-proto` (shared with GUI frontends); re-exported here so
+/// existing `crate::membership::GroupMode` paths keep working.
+pub use ray_proto::GroupMode;
 
 /// Two different identities hashed to the same virtual IP (extremely rare with 22-bit space).
 #[derive(Debug)]

@@ -3,6 +3,11 @@ name = "rayfish"
 version = "0.1.0"
 edition = "2024"
 
+# The repo root is both the `rayfish` package (binary `ray`) and the workspace
+# root. `ray-proto` is a member crate holding the shared IPC wire protocol.
+[workspace]
+members = ["ray-proto"]
+
 [[bin]]
 name = "ray"
 path = "src/main.rs"
@@ -12,6 +17,7 @@ default = []
 tor = ["dep:iroh-tor-transport"]
 
 [dependencies]
+ray-proto = { path = "ray-proto" }
 anyhow = "1"
 blake3 = { version = "1", features = ["serde"] }
 bytes = "1"

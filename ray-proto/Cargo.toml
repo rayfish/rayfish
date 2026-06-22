@@ -1,0 +1,20 @@
+[package]
+name = "ray-proto"
+version = "0.1.0"
+edition = "2024"
+
+# Shared wire protocol between the `ray` daemon/CLI and GUI frontends.
+# Holds the IPC message enum + msgpack codec and the small enums those
+# messages reference. Intentionally light on dependencies so frontends
+# (e.g. the Tauri UI) don't pull in the daemon's TUN/DNS/blob stack.
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+derive_more = { version = "2", features = ["is_variant"] }
+futures = "0.3"
+iroh = { version = "1" }
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["net"] }
+tokio-util = { version = "0.7", features = ["codec"] }

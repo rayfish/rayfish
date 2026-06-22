@@ -3640,6 +3640,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ray-proto"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "derive_more 2.1.1",
+ "futures",
+ "iroh",
+ "rmp-serde",
+ "serde",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "rayfish"
 version = "0.1.0"
 dependencies = [
@@ -3669,6 +3684,7 @@ dependencies = [
  "mime_guess",
  "qr2term",
  "rand 0.10.1",
+ "ray-proto",
  "rmp-serde",
  "rpassword",
  "serde",
