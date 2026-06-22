@@ -179,19 +179,15 @@ mod macos {
 
     use anyhow::{Context, Result};
     use core_foundation::{
-        array::CFArray,
-        base::TCFType,
-        dictionary::CFDictionary,
-        string::CFString,
+        array::CFArray, base::TCFType, dictionary::CFDictionary, string::CFString,
     };
     use system_configuration::dynamic_store::{SCDynamicStore, SCDynamicStoreBuilder};
     use system_configuration::sys::schema_definitions::{
-        kSCPropNetDNSSearchDomains,
-        kSCPropNetDNSServerAddresses,
+        kSCPropNetDNSSearchDomains, kSCPropNetDNSServerAddresses,
         kSCPropNetDNSSupplementalMatchDomains,
     };
 
-    use super::{DnsConfigurator, DNS_DOMAIN, RESOLVER_IP};
+    use super::{DNS_DOMAIN, DnsConfigurator, RESOLVER_IP};
 
     const SC_DNS_KEY: &str = "State:/Network/Service/rayfish/DNS";
 
@@ -222,17 +218,12 @@ mod macos {
         Ok(STORE.get().unwrap())
     }
 
-    pub fn write_dns_config(
-        search_domains: &[String],
-        network_names: &[String],
-    ) -> Result<()> {
+    pub fn write_dns_config(search_domains: &[String], network_names: &[String]) -> Result<()> {
         let store = get_or_init_store()?;
         let store = store.lock().unwrap();
 
-        let server_key =
-            unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSServerAddresses) };
-        let server_val =
-            CFArray::from_CFTypes(&[CFString::from_static_string(RESOLVER_IP)]);
+        let server_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSServerAddresses) };
+        let server_val = CFArray::from_CFTypes(&[CFString::from_static_string(RESOLVER_IP)]);
 
         // Route .ray + each bare network name to our resolver
         let match_key =
@@ -243,8 +234,7 @@ mod macos {
         }
         let match_val = CFArray::from_CFTypes(&match_domains);
 
-        let search_key =
-            unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSSearchDomains) };
+        let search_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSSearchDomains) };
         let search_cfstrings: Vec<CFString> =
             search_domains.iter().map(|s| CFString::new(s)).collect();
         let search_val = CFArray::from_CFTypes(&search_cfstrings);
@@ -254,8 +244,7 @@ mod macos {
             (match_key, match_val),
             (search_key, search_val),
         ]);
-        let dict =
-            unsafe { CFDictionary::wrap_under_get_rule(typed_dict.as_concrete_TypeRef()) };
+        let dict = unsafe { CFDictionary::wrap_under_get_rule(typed_dict.as_concrete_TypeRef()) };
 
         anyhow::ensure!(
             store.0.set(SC_DNS_KEY, dict),
@@ -338,7 +327,11 @@ fn set_search_domains_linux(
 
     // Fall back to resolvectl CLI
     use std::process::Command;
-    if Command::new("resolvectl").arg("status").output().is_ok_and(|o| o.status.success()) {
+    if Command::new("resolvectl")
+        .arg("status")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
         let mut args = vec!["domain".to_string(), tun_name.to_string()];
         args.push(format!("~{DNS_DOMAIN}"));
         for name in network_names {
@@ -398,8 +391,8 @@ fn try_systemd_resolved_dbus(tun_name: &str) -> Option<SystemdResolvedDBus> {
 #[cfg(target_os = "linux")]
 impl DnsConfigurator for SystemdResolvedDBus {
     fn apply(&self) -> Result<()> {
-        let conn = zbus::blocking::Connection::system()
-            .context("failed to connect to system D-Bus")?;
+        let conn =
+            zbus::blocking::Connection::system().context("failed to connect to system D-Bus")?;
 
         // SetLinkDNS(ifindex, [(family, address)])
         // AF_INET = 2, address = [127, 0, 0, 1]
@@ -410,7 +403,8 @@ impl DnsConfigurator for SystemdResolvedDBus {
             Some("org.freedesktop.resolve1.Manager"),
             "SetLinkDNS",
             &(self.ifindex, &dns_addrs),
-        ).context("SetLinkDNS failed")?;
+        )
+        .context("SetLinkDNS failed")?;
 
         // SetLinkDomains(ifindex, [(domain, routing_only)])
         let domains: Vec<(&str, bool)> = vec![(DNS_DOMAIN, true)];
@@ -420,7 +414,8 @@ impl DnsConfigurator for SystemdResolvedDBus {
             Some("org.freedesktop.resolve1.Manager"),
             "SetLinkDomains",
             &(self.ifindex, &domains),
-        ).context("SetLinkDomains failed")?;
+        )
+        .context("SetLinkDomains failed")?;
 
         tracing::info!(
             ifindex = self.ifindex,
@@ -468,16 +463,19 @@ fn try_networkmanager_dbus(tun_name: &str) -> Option<NetworkManagerDns> {
         Some("org.freedesktop.DBus.Peer"),
         "Ping",
         &(),
-    ).ok()?;
+    )
+    .ok()?;
 
     // Check NM DNS mode — if "systemd-resolved" or "none", skip (resolved handles it)
-    let dns_reply = conn.call_method(
-        Some("org.freedesktop.NetworkManager"),
-        "/org/freedesktop/NetworkManager/DnsManager",
-        Some("org.freedesktop.DBus.Properties"),
-        "Get",
-        &("org.freedesktop.NetworkManager.DnsManager", "Mode"),
-    ).ok()?;
+    let dns_reply = conn
+        .call_method(
+            Some("org.freedesktop.NetworkManager"),
+            "/org/freedesktop/NetworkManager/DnsManager",
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("org.freedesktop.NetworkManager.DnsManager", "Mode"),
+        )
+        .ok()?;
 
     if let Ok(mode) = dns_reply.body().deserialize::<zbus::zvariant::Value>() {
         if let Ok(s) = mode.downcast_ref::<String>() {
@@ -497,36 +495,47 @@ fn try_networkmanager_dbus(tun_name: &str) -> Option<NetworkManagerDns> {
 
 #[cfg(target_os = "linux")]
 impl NetworkManagerDns {
-    fn get_device_path(&self, conn: &zbus::blocking::Connection) -> Result<zbus::zvariant::OwnedObjectPath> {
-        let reply = conn.call_method(
-            Some("org.freedesktop.NetworkManager"),
-            "/org/freedesktop/NetworkManager",
-            Some("org.freedesktop.NetworkManager"),
-            "GetDeviceByIpIface",
-            &(&*self.tun_iface,),
-        ).context("GetDeviceByIpIface")?;
-        reply.body().deserialize().context("deserialize device path")
+    fn get_device_path(
+        &self,
+        conn: &zbus::blocking::Connection,
+    ) -> Result<zbus::zvariant::OwnedObjectPath> {
+        let reply = conn
+            .call_method(
+                Some("org.freedesktop.NetworkManager"),
+                "/org/freedesktop/NetworkManager",
+                Some("org.freedesktop.NetworkManager"),
+                "GetDeviceByIpIface",
+                &(&*self.tun_iface,),
+            )
+            .context("GetDeviceByIpIface")?;
+        reply
+            .body()
+            .deserialize()
+            .context("deserialize device path")
     }
 }
 
 #[cfg(target_os = "linux")]
 impl DnsConfigurator for NetworkManagerDns {
     fn apply(&self) -> Result<()> {
-        let conn = zbus::blocking::Connection::system()
-            .context("D-Bus system bus")?;
+        let conn = zbus::blocking::Connection::system().context("D-Bus system bus")?;
 
         let device_path = self.get_device_path(&conn)?;
 
         // Get the Ip4Config object path for this device
-        let reply = conn.call_method(
-            Some("org.freedesktop.NetworkManager"),
-            device_path.as_str(),
-            Some("org.freedesktop.DBus.Properties"),
-            "Get",
-            &("org.freedesktop.NetworkManager.Device", "Ip4Config"),
-        ).context("get Ip4Config")?;
+        let reply = conn
+            .call_method(
+                Some("org.freedesktop.NetworkManager"),
+                device_path.as_str(),
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &("org.freedesktop.NetworkManager.Device", "Ip4Config"),
+            )
+            .context("get Ip4Config")?;
 
-        let config_val: zbus::zvariant::OwnedValue = reply.body().deserialize()
+        let config_val: zbus::zvariant::OwnedValue = reply
+            .body()
+            .deserialize()
             .context("deserialize Ip4Config")?;
 
         if let Ok(config_path) = <&zbus::zvariant::ObjectPath>::try_from(&*config_val) {
@@ -553,7 +562,14 @@ impl DnsConfigurator for NetworkManagerDns {
             device_path.as_str(),
             Some("org.freedesktop.NetworkManager.Device"),
             "Reapply",
-            &(std::collections::HashMap::<String, std::collections::HashMap<String, zbus::zvariant::Value>>::new(), 0u64, 0u32),
+            &(
+                std::collections::HashMap::<
+                    String,
+                    std::collections::HashMap<String, zbus::zvariant::Value>,
+                >::new(),
+                0u64,
+                0u32,
+            ),
         );
 
         tracing::info!("configured NetworkManager DNS via D-Bus for .{DNS_DOMAIN}");
@@ -695,16 +711,17 @@ impl DnsConfigurator for Resolvconf {
             ResolvconfVariant::Debian => "debian",
             ResolvconfVariant::Openresolv => "openresolv",
         };
-        tracing::info!(variant = variant_name, "configured resolvconf for .{DNS_DOMAIN}");
+        tracing::info!(
+            variant = variant_name,
+            "configured resolvconf for .{DNS_DOMAIN}"
+        );
         Ok(())
     }
 
     fn revert(&self) -> Result<()> {
         use std::process::Command;
         let iface = self.iface_name();
-        let _ = Command::new("resolvconf")
-            .args(["-d", iface])
-            .status();
+        let _ = Command::new("resolvconf").args(["-d", iface]).status();
         tracing::info!("reverted resolvconf configuration");
         Ok(())
     }
@@ -734,8 +751,7 @@ fn backup_path(original: &std::path::Path) -> std::path::PathBuf {
 fn backup_file(path: &std::path::Path) -> Result<()> {
     let backup = backup_path(path);
     if path.exists() {
-        std::fs::copy(path, &backup)
-            .with_context(|| format!("backing up {}", path.display()))?;
+        std::fs::copy(path, &backup).with_context(|| format!("backing up {}", path.display()))?;
     }
     Ok(())
 }
@@ -744,8 +760,7 @@ fn backup_file(path: &std::path::Path) -> Result<()> {
 fn restore_file(path: &std::path::Path) -> Result<()> {
     let backup = backup_path(path);
     if backup.exists() {
-        std::fs::copy(&backup, path)
-            .with_context(|| format!("restoring {}", path.display()))?;
+        std::fs::copy(&backup, path).with_context(|| format!("restoring {}", path.display()))?;
         std::fs::remove_file(&backup)?;
     } else if path.exists() {
         std::fs::remove_file(path)?;

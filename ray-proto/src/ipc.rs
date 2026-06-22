@@ -244,7 +244,9 @@ impl<T: DeserializeOwned> Decoder for MsgpackCodec<T> {
         }
         src.advance(4);
         let body = src.split_to(len);
-        Ok(Some(rmp_serde::from_slice(&body).context("decode IPC message")?))
+        Ok(Some(
+            rmp_serde::from_slice(&body).context("decode IPC message")?,
+        ))
     }
 }
 
@@ -277,10 +279,7 @@ pub async fn send(framed: &mut IpcFramed, msg: IpcMessage) -> Result<()> {
 
 pub async fn recv(framed: &mut IpcFramed) -> Result<IpcMessage> {
     use futures::StreamExt;
-    framed
-        .next()
-        .await
-        .context("connection closed")?
+    framed.next().await.context("connection closed")?
 }
 
 #[cfg(test)]

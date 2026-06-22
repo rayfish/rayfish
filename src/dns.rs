@@ -14,8 +14,8 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use simple_dns::{
-    CLASS, Name, Packet, PacketFlag, QTYPE, RCODE, ResourceRecord,
-    rdata::A, rdata::AAAA, rdata::RData, rdata::SOA, rdata::OPT,
+    CLASS, Name, Packet, PacketFlag, QTYPE, RCODE, ResourceRecord, rdata::A, rdata::AAAA,
+    rdata::OPT, rdata::RData, rdata::SOA,
 };
 
 use crate::DNS_DOMAIN;
@@ -49,8 +49,14 @@ pub async fn update_hostname(
         let hosts = t.entry(network.to_string()).or_default();
         hosts.insert(hostname.to_string(), (ipv4, ipv6));
     }
-    reverse.insert(IpAddr::V4(ipv4), (hostname.to_string(), network.to_string()));
-    reverse.insert(IpAddr::V6(ipv6), (hostname.to_string(), network.to_string()));
+    reverse.insert(
+        IpAddr::V4(ipv4),
+        (hostname.to_string(), network.to_string()),
+    );
+    reverse.insert(
+        IpAddr::V6(ipv6),
+        (hostname.to_string(), network.to_string()),
+    );
 }
 
 /// Remove a hostname from both tables.
@@ -92,11 +98,7 @@ pub async fn remove_hostname_by_ip(
 }
 
 /// Remove all hostnames for a network from both tables.
-pub async fn remove_network(
-    table: &HostnameTable,
-    reverse: &ReverseLookupTable,
-    network: &str,
-) {
+pub async fn remove_network(table: &HostnameTable, reverse: &ReverseLookupTable, network: &str) {
     let mut t = table.write().await;
     if let Some(hosts) = t.remove(network) {
         for (_, (ipv4, ipv6)) in hosts {
@@ -269,7 +271,10 @@ async fn handle_query(
 
     // Bare network name that didn't resolve — check if the TLD is a known network
     {
-        let tld = name_lower.rsplit_once('.').map(|(_, t)| t).unwrap_or(&name_lower);
+        let tld = name_lower
+            .rsplit_once('.')
+            .map(|(_, t)| t)
+            .unwrap_or(&name_lower);
         let table_guard = table.read().await;
         if table_guard.contains_key(tld) {
             if is_a || is_aaaa {
@@ -357,7 +362,11 @@ async fn resolve_bare_network_name(name: &str, table: &HostnameTable) -> Option<
     table_guard.get(network)?.get(hostname).copied()
 }
 
-pub async fn resolve_name(name: &str, suffix: &str, table: &HostnameTable) -> Option<HostnameEntry> {
+pub async fn resolve_name(
+    name: &str,
+    suffix: &str,
+    table: &HostnameTable,
+) -> Option<HostnameEntry> {
     let stripped = name.strip_suffix(suffix)?;
     let table_guard = table.read().await;
 

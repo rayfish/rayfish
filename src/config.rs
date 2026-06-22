@@ -115,7 +115,9 @@ pub struct NetworkConfig {
     pub transport: Option<TransportMode>,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 /// Top-level config stored at `~/.config/rayfish/networks.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

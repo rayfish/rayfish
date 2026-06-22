@@ -6,8 +6,8 @@
 use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result};
-use iroh::{EndpointId, SecretKey, Signature};
 use iroh::endpoint::{RecvStream, SendStream};
+use iroh::{EndpointId, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 
 use crate::membership::{ApprovedEntry, Member};
@@ -352,7 +352,11 @@ mod tests {
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
         assert_eq!(msg, decoded);
-        if let ControlMsg::MeshHello { device_cert: Some(c), .. } = &decoded {
+        if let ControlMsg::MeshHello {
+            device_cert: Some(c),
+            ..
+        } = &decoded
+        {
             assert!(c.verify());
         } else {
             panic!("expected MeshHello with cert");

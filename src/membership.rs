@@ -27,7 +27,6 @@ pub struct Member {
     pub device_cert: Option<DeviceCert>,
 }
 
-
 /// Controls who can approve new members joining the network.
 ///
 /// Defined in `ray-proto` (shared with GUI frontends); re-exported here so

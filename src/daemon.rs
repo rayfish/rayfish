@@ -1,3 +1,40 @@
+//! The rayfish daemon: a long-lived, root-owned process that holds the iroh
+//! [`Endpoint`], the TUN device, the [`PeerTable`], and the [`ProtocolRouter`],
+//! and serves the unprivileged CLI over a Unix-socket IPC channel.
+//!
+//! # Two lifecycles
+//!
+//! The daemon deliberately separates two concepts that are easy to conflate:
+//!
+//! - **Process / infrastructure lifecycle** — the iroh endpoint, IPC socket,
+//!   accept loop, blob store, DNS resolver, metrics server, and the TUN *file
+//!   descriptor*. These are built once in [`run_daemon`] and live for the whole
+//!   process. They are torn down only by the daemon-wide `shutdown_token`
+//!   (real shutdown / `IpcMessage::Shutdown`).
+//! - **Active VPN state** — the TUN link being *up*, system DNS being
+//!   configured, and the saved networks being connected. This is toggled at
+//!   runtime by [`DaemonState::activate`] / [`DaemonState::deactivate`], driven
+//!   by the `Up` / `Down` IPC commands, and tracked by [`DaemonState::active`].
+//!
+//! This mirrors Tailscale's split between the always-running `tailscaled`
+//! daemon and the `tailscale up` / `tailscale down` client toggles: `down`
+//! puts the daemon on *standby* (VPN state torn down) without killing the
+//! process, so the next `up` is a cheap, unprivileged IPC call rather than a
+//! root service restart.
+//!
+//! # Cancellation tokens
+//!
+//! There are two tiers, and the distinction is what makes standby work:
+//!
+//! - `shutdown_token` (the token passed into [`run_daemon`]) gates all the
+//!   always-on infrastructure. Cancelling it stops the **process**. `Down`
+//!   never touches it — otherwise the IPC accept loop would die and there would
+//!   be nothing left to receive the next `Up`.
+//! - Each active network owns a `shutdown_token.child_token()` stored on its
+//!   [`NetworkHandle`]. `deactivate` cancels these per-network children to stop
+//!   that network's background tasks. Because cancellation is one-shot, every
+//!   `activate` mints *fresh* child tokens, so `up → down → up` cycles work.
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -435,7 +472,10 @@ impl MemberAcceptState {
                 let effective_user_id = if peer_identity == transport_id {
                     peer_identity
                 } else if let Some(ref cert) = device_cert {
-                    if !cert.verify() || cert.device_key != transport_id || cert.user_identity != peer_identity {
+                    if !cert.verify()
+                        || cert.device_key != transport_id
+                        || cert.user_identity != peer_identity
+                    {
                         tracing::warn!(peer = %transport_id.fmt_short(), "invalid device certificate");
                         return;
                     }
@@ -444,7 +484,8 @@ impl MemberAcceptState {
                     return;
                 };
                 if let Some(ref cert) = device_cert {
-                    self.device_user_map.insert(transport_id, cert.user_identity);
+                    self.device_user_map
+                        .insert(transport_id, cert.user_identity);
                 }
                 let _ = effective_user_id;
                 let (is_member, is_approved) = {
@@ -473,7 +514,15 @@ impl MemberAcceptState {
                 // Update DNS table
                 if let Some(ref h) = final_hostname {
                     let ipv6 = derive_ipv6(&peer_identity);
-                    dns::update_hostname(&self.hostname_table, &self.reverse_table, &self.network_name, h, ip, ipv6).await;
+                    dns::update_hostname(
+                        &self.hostname_table,
+                        &self.reverse_table,
+                        &self.network_name,
+                        h,
+                        ip,
+                        ipv6,
+                    )
+                    .await;
                 }
                 if is_approved {
                     let snap_bytes = {
@@ -669,7 +718,11 @@ struct ProtocolRouter {
 }
 
 impl ProtocolRouter {
-    fn new(blobs: BlobsProtocol, secret_key: SecretKey, pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>) -> Self {
+    fn new(
+        blobs: BlobsProtocol,
+        secret_key: SecretKey,
+        pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    ) -> Self {
         Self {
             blobs,
             handlers: DashMap::new(),
@@ -873,6 +926,11 @@ impl NetworkState {
     }
 }
 
+/// Runtime state for one active network. Created when a network is joined,
+/// created, or reconnected; dropped (after `cancel`ling and awaiting `tasks`)
+/// when the network is left or the VPN is put on standby. The persisted config
+/// (in `networks.toml`) outlives this handle — standby tears down the handle
+/// but keeps the config so `activate` can rebuild it.
 #[allow(dead_code)]
 pub struct NetworkHandle {
     name: String,
@@ -880,10 +938,18 @@ pub struct NetworkHandle {
     role: NetworkRole,
     my_ip: Ipv4Addr,
     state: Arc<std::sync::RwLock<NetworkState>>,
+    /// Child of the daemon `shutdown_token`. Cancelling it stops this network's
+    /// background tasks (reconnect loop, group poller, publisher, peer readers)
+    /// without affecting the rest of the daemon.
     cancel: CancellationToken,
+    /// Background tasks owned by this network, awaited on teardown.
     tasks: Vec<JoinHandle<()>>,
 }
 
+/// Shared, always-on daemon state. Cloned (via `Arc`) into every IPC handler
+/// and background task. Holds both the infrastructure that lives for the whole
+/// process and the handles for the currently-active networks. See the
+/// module-level docs for the two-lifecycle model.
 pub struct DaemonState {
     endpoint: Endpoint,
     identity: IrohIdentityProvider,
@@ -1073,7 +1139,15 @@ impl DaemonState {
             .expect("self-add cannot collide");
 
         // Register in DNS hostname table
-        dns::update_hostname(&self.hostname_table, &self.reverse_table, &name, &my_hostname, my_ip, derive_ipv6(&self.identity.local_identity())).await;
+        dns::update_hostname(
+            &self.hostname_table,
+            &self.reverse_table,
+            &name,
+            &my_hostname,
+            my_ip,
+            derive_ipv6(&self.identity.local_identity()),
+        )
+        .await;
 
         let mut net_state = NetworkState {
             members: member_list,
@@ -1493,10 +1567,26 @@ impl DaemonState {
         self.refresh_alpns();
 
         // Register hostnames in DNS table
-        dns::update_hostname(&self.hostname_table, &self.reverse_table, display_name, &my_hostname, my_ip, derive_ipv6(&self.identity.local_identity())).await;
+        dns::update_hostname(
+            &self.hostname_table,
+            &self.reverse_table,
+            display_name,
+            &my_hostname,
+            my_ip,
+            derive_ipv6(&self.identity.local_identity()),
+        )
+        .await;
         for member in &data.members {
             if let Some(ref h) = member.hostname {
-                dns::update_hostname(&self.hostname_table, &self.reverse_table, display_name, h, member.ip, derive_ipv6(&member.identity)).await;
+                dns::update_hostname(
+                    &self.hostname_table,
+                    &self.reverse_table,
+                    display_name,
+                    h,
+                    member.ip,
+                    derive_ipv6(&member.identity),
+                )
+                .await;
             }
         }
 
@@ -1696,11 +1786,7 @@ impl DaemonState {
     }
 
     /// Restores a coordinator network from saved config (uses the existing name).
-    async fn restore_coordinator_network(
-        &self,
-        name: &str,
-        mode: GroupMode,
-    ) -> Result<IpcMessage> {
+    async fn restore_coordinator_network(&self, name: &str, mode: GroupMode) -> Result<IpcMessage> {
         {
             if self.networks.contains_key(name) {
                 return Ok(IpcMessage::Error {
@@ -1926,7 +2012,15 @@ impl DaemonState {
                     .collect()
             };
             for (hostname, ip, ipv6) in members_snapshot {
-                dns::update_hostname(&self.hostname_table, &self.reverse_table, name, &hostname, ip, ipv6).await;
+                dns::update_hostname(
+                    &self.hostname_table,
+                    &self.reverse_table,
+                    name,
+                    &hostname,
+                    ip,
+                    ipv6,
+                )
+                .await;
             }
         }
 
@@ -2327,7 +2421,15 @@ impl DaemonState {
 
         // Update DNS table: remove old entry for our IP, insert new one
         dns::remove_hostname_by_ip(&self.hostname_table, &self.reverse_table, network, my_ip).await;
-        dns::update_hostname(&self.hostname_table, &self.reverse_table, network, &new_hostname, my_ip, derive_ipv6(&self.identity.local_identity())).await;
+        dns::update_hostname(
+            &self.hostname_table,
+            &self.reverse_table,
+            network,
+            &new_hostname,
+            my_ip,
+            derive_ipv6(&self.identity.local_identity()),
+        )
+        .await;
 
         // Persist to config
         if let Ok(mut app_config) = config::load() {
@@ -2936,7 +3038,12 @@ impl DaemonState {
         IpcMessage::FileList { files }
     }
 
-    async fn accept_file(&self, id: u64, output: Option<String>, peer_cred: Option<(u32, u32)>) -> IpcMessage {
+    async fn accept_file(
+        &self,
+        id: u64,
+        output: Option<String>,
+        peer_cred: Option<(u32, u32)>,
+    ) -> IpcMessage {
         let pending_file = {
             let mut pending = self.protocol_router.pending_files.lock().unwrap();
             let idx = pending.iter().position(|f| f.id == id);
@@ -3038,11 +3145,7 @@ impl DaemonState {
         IpcMessage::PairingTicket { ticket }
     }
 
-    async fn pair_with_device(
-        &self,
-        endpoint_id: EndpointId,
-        secret: Vec<u8>,
-    ) -> IpcMessage {
+    async fn pair_with_device(&self, endpoint_id: EndpointId, secret: Vec<u8>) -> IpcMessage {
         let addr: iroh::EndpointAddr = endpoint_id.into();
         let conn = match self.endpoint.connect(addr, PAIR_ALPN).await {
             Ok(c) => c,
@@ -3150,10 +3253,33 @@ fn format_size(bytes: u64) -> String {
     humansize::format_size(bytes, humansize::BINARY)
 }
 
+/// Entry point for `ray daemon`. Builds the always-on infrastructure, enters
+/// the active VPN state, then serves IPC until shutdown. The heavy lifting is
+/// delegated to [`build_daemon`] (construction) and [`serve_ipc`] (the request
+/// loop); see the module docs for the infrastructure-vs-active-state split.
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
-    // Check for CGNAT conflicts (e.g. Tailscale) before any setup
+    // Bail early on a CGNAT clash (e.g. Tailscale) before touching anything.
     check_cgnat_conflict()?;
 
+    let (daemon, _metrics_server) = build_daemon(token.clone(), stats).await?;
+
+    // Start active by default so a fresh boot behaves like before; `ray up` /
+    // `ray down` toggle this at runtime without restarting the process.
+    daemon.activate().await;
+
+    serve_ipc(&daemon, token).await
+}
+
+/// Construct all always-on daemon infrastructure: identity, iroh endpoint, blob
+/// store, TUN device, forwarding loop, DNS resolver, mDNS discovery, protocol
+/// router, and metrics server. Returns the shared [`DaemonState`] — still on
+/// standby, so the caller is expected to run [`DaemonState::activate`] — and the
+/// metrics-server guard, which must outlive the process.
+async fn build_daemon(
+    token: CancellationToken,
+    stats: Arc<ForwardMetrics>,
+) -> Result<(Arc<DaemonState>, Option<iroh_metrics::service::MetricsServer>)> {
+    // --- Identity (persistent transport key + optional device certificate) ---
     let key = identity::load_or_create()?;
     let public_key = key.public();
     let device_cert = identity::load_device_cert()?;
@@ -3164,14 +3290,13 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     let identity = IrohIdentityProvider::new(public_key, collision_index);
     let my_ip = identity.local_ip();
 
-    // Load saved networks to determine initial ALPNs
+    // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
     let app_config = config::load()?;
     let mut alpns: Vec<Vec<u8>> = app_config
         .networks
         .iter()
         .filter_map(|net| net.network_public_key.as_ref().map(transport::network_alpn))
         .collect();
-
     alpns.push(iroh_blobs::protocol::ALPN.to_vec());
     let use_tor = app_config
         .networks
@@ -3179,6 +3304,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         .any(|net| net.transport.as_ref().is_some_and(|t| t.is_tor()));
     let ep = transport::create_endpoint_with_alpns(key.clone(), alpns, use_tor).await?;
 
+    // --- Content-addressed blob store (membership/ACL/file transfer) ---
     let blobs_dir = dirs::config_dir()
         .context("no config directory")?
         .join("rayfish")
@@ -3189,12 +3315,11 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         .context("failed to open blob store")?;
     let blobs_proto = BlobsProtocol::new(&blob_store, None);
 
-    // Single TUN for all networks
+    // --- Single TUN device + the forwarding loop, shared across networks ---
     let my_ipv6 = derive_ipv6(&identity.local_identity());
-    let (tun_reader, tun_writer, tun_name) =
-        tun::create(my_ip, my_ipv6)
-            .await
-            .context("failed to create TUN device")?;
+    let (tun_reader, tun_writer, tun_name) = tun::create(my_ip, my_ipv6)
+        .await
+        .context("failed to create TUN device")?;
     let peers = PeerTable::new();
     let shared_acl = forward::SharedAcl::new();
     let fw_config = firewall::load_firewall().unwrap_or_else(|e| {
@@ -3217,72 +3342,19 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         device_user_map.clone(),
     ));
 
+    // --- Magic DNS resolver + optional mDNS local discovery ---
     let hostname_table = dns::new_hostname_table();
     let reverse_table = dns::new_reverse_table();
+    spawn_dns_resolver(hostname_table.clone(), reverse_table.clone(), token.clone());
 
-    // Start DNS resolver on 127.0.0.1:53
-    let dns_table = hostname_table.clone();
-    let dns_reverse = reverse_table.clone();
-    let dns_token = token.clone();
-    tokio::spawn(async move {
-        if let Err(e) = dns::spawn_dns_server(dns_table, dns_reverse, dns_token).await {
-            tracing::warn!(error = %e, "DNS server failed to start (Magic DNS disabled)");
-        }
-    });
-
-    // System DNS configuration and network reconnection happen in
-    // `DaemonState::activate()`, invoked once below (and again on `ray up`).
-
-    // mDNS local peer discovery
     let mdns_enabled = app_config.mdns_enabled;
     if mdns_enabled {
-        match iroh_mdns_address_lookup::MdnsAddressLookup::builder()
-            .service_name("rayfish")
-            .advertise(true)
-            .build(ep.id())
-        {
-            Ok(mdns) => {
-                if let Ok(lookups) = ep.address_lookup() {
-                    lookups.add(mdns.clone());
-                    tracing::info!("mDNS discovery enabled (advertising _rayfish._udp.local)");
-                    let mdns_token = token.clone();
-                    tokio::spawn(async move {
-                        use futures::StreamExt;
-                        let mut events = mdns.subscribe().await;
-                        loop {
-                            tokio::select! {
-                                _ = mdns_token.cancelled() => break,
-                                event = events.next() => {
-                                    match event {
-                                        Some(iroh_mdns_address_lookup::DiscoveryEvent::Discovered { endpoint_info, .. }) => {
-                                            tracing::info!(
-                                                peer = %endpoint_info.endpoint_id.fmt_short(),
-                                                "mDNS: peer discovered on LAN"
-                                            );
-                                        }
-                                        Some(iroh_mdns_address_lookup::DiscoveryEvent::Expired { endpoint_id }) => {
-                                            tracing::info!(
-                                                peer = %endpoint_id.fmt_short(),
-                                                "mDNS: peer left LAN"
-                                            );
-                                        }
-                                        None => break,
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to start mDNS discovery");
-            }
-        }
+        spawn_mdns_discovery(&ep, token.clone());
     } else {
         tracing::info!("mDNS discovery disabled");
     }
 
+    // --- Protocol router + the shared DaemonState ---
     let pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>> =
         Arc::new(std::sync::Mutex::new(None));
     let protocol_router = Arc::new(ProtocolRouter::new(
@@ -3305,7 +3377,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         hostname_table,
         reverse_table,
         mdns_enabled,
-        tun_name: tun_name.clone(),
+        tun_name,
         pairing_secret,
         device_cert,
         device_user_map,
@@ -3313,21 +3385,95 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         dns_configurator: Arc::new(std::sync::Mutex::new(None)),
     });
 
-    // Accept loop — dispatches connections via ProtocolHandler by ALPN
+    // --- Accept loop (ALPN dispatch) + Prometheus metrics ---
     protocol_router.spawn_accept_loop(daemon.endpoint.clone(), token.clone());
+    let metrics_server =
+        spawn_metrics_server(stats, daemon.peers.clone(), &daemon.endpoint, token).await;
 
-    // Metrics registry: rayfish counters + per-peer gauges + iroh endpoint metrics
+    tracing::info!(ip = %my_ip, id = %daemon.endpoint.id().fmt_short(), "daemon started");
+    Ok((daemon, metrics_server))
+}
+
+/// Spawn the Magic DNS resolver on `127.0.0.1:53`. Non-fatal: if the socket
+/// can't be bound, Magic DNS is simply disabled and the daemon runs on.
+fn spawn_dns_resolver(
+    table: dns::HostnameTable,
+    reverse: dns::ReverseLookupTable,
+    token: CancellationToken,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = dns::spawn_dns_server(table, reverse, token).await {
+            tracing::warn!(error = %e, "DNS server failed to start (Magic DNS disabled)");
+        }
+    });
+}
+
+/// Advertise this endpoint over mDNS (`_rayfish._udp.local`) and log LAN peer
+/// discovery events until cancellation. Non-fatal: a failure just means no
+/// local discovery.
+fn spawn_mdns_discovery(ep: &Endpoint, token: CancellationToken) {
+    let mdns = match iroh_mdns_address_lookup::MdnsAddressLookup::builder()
+        .service_name("rayfish")
+        .advertise(true)
+        .build(ep.id())
+    {
+        Ok(mdns) => mdns,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to start mDNS discovery");
+            return;
+        }
+    };
+    let Ok(lookups) = ep.address_lookup() else {
+        return;
+    };
+    lookups.add(mdns.clone());
+    tracing::info!("mDNS discovery enabled (advertising _rayfish._udp.local)");
+
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        let mut events = mdns.subscribe().await;
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                event = events.next() => match event {
+                    Some(iroh_mdns_address_lookup::DiscoveryEvent::Discovered { endpoint_info, .. }) => {
+                        tracing::info!(
+                            peer = %endpoint_info.endpoint_id.fmt_short(),
+                            "mDNS: peer discovered on LAN"
+                        );
+                    }
+                    Some(iroh_mdns_address_lookup::DiscoveryEvent::Expired { endpoint_id }) => {
+                        tracing::info!(
+                            peer = %endpoint_id.fmt_short(),
+                            "mDNS: peer left LAN"
+                        );
+                    }
+                    None => break,
+                    _ => {}
+                }
+            }
+        }
+    });
+}
+
+/// Register rayfish counters, per-peer gauges, and iroh endpoint metrics, then
+/// start the Prometheus HTTP endpoint on `:9090`. The returned guard must be
+/// kept alive for the process lifetime; `None` means metrics export is disabled.
+async fn spawn_metrics_server(
+    stats: Arc<ForwardMetrics>,
+    peers: PeerTable,
+    endpoint: &Endpoint,
+    token: CancellationToken,
+) -> Option<iroh_metrics::service::MetricsServer> {
     let mut registry = iroh_metrics::Registry::default();
-    registry.register(stats.clone());
+    registry.register(stats);
     let peer_metrics = Arc::new(crate::stats::PeerMetrics::default());
     registry.register(peer_metrics.clone());
-    peer_metrics.spawn_collector(daemon.peers.clone(), token.clone());
-    registry.register_all(daemon.endpoint.metrics());
+    peer_metrics.spawn_collector(peers, token);
+    registry.register_all(endpoint.metrics());
+
     let metrics_addr: SocketAddr = ([0, 0, 0, 0], 9090).into();
-    let registry = Arc::new(registry);
-    let _metrics_server = match iroh_metrics::service::MetricsServer::spawn(metrics_addr, registry)
-        .await
-    {
+    match iroh_metrics::service::MetricsServer::spawn(metrics_addr, Arc::new(registry)).await {
         Ok(server) => {
             tracing::info!(addr = %server.local_addr(), "metrics server started");
             Some(server)
@@ -3336,16 +3482,14 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
             tracing::warn!(error = %e, "failed to start metrics server (Prometheus export disabled)");
             None
         }
-    };
+    }
+}
 
-    tracing::info!(ip = %my_ip, id = %daemon.endpoint.id().fmt_short(), "daemon started");
-
-    // Enter the active state: bring up DNS and reconnect saved networks. The
-    // daemon starts active by default so a fresh boot behaves like before;
-    // `ray down` / `ray up` toggle this at runtime without restarting.
-    daemon.activate().await;
-
-    // IPC server
+/// Bind the IPC Unix socket and serve client requests until the daemon-wide
+/// `token` is cancelled. On shutdown, put the VPN on standby (revert DNS, drop
+/// connections, bring the TUN down) and remove the socket file. Each request is
+/// handled on its own task so a slow client can't block the accept loop.
+async fn serve_ipc(daemon: &Arc<DaemonState>, token: CancellationToken) -> Result<()> {
     let socket_path = ipc::socket_path();
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -3361,25 +3505,20 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         tokio::select! {
             _ = token.cancelled() => {
                 tracing::info!("daemon shutting down");
-                // Revert DNS, drop connections, and bring the TUN down.
                 daemon.deactivate().await;
                 let _ = std::fs::remove_file(&socket_path);
                 return Ok(());
             }
-            result = listener.accept() => {
-                match result {
-                    Ok((stream, _)) => {
-                        let daemon_c = daemon.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_ipc_client(stream, &daemon_c).await {
-                                tracing::debug!(error = %e, "IPC client error");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "IPC accept error");
-                    }
+            result = listener.accept() => match result {
+                Ok((stream, _)) => {
+                    let daemon = daemon.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_ipc_client(stream, &daemon).await {
+                            tracing::debug!(error = %e, "IPC client error");
+                        }
+                    });
                 }
+                Err(e) => tracing::warn!(error = %e, "IPC accept error"),
             }
         }
     }

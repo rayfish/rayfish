@@ -159,10 +159,26 @@ async fn configure_ipv6(tun_name: &str, addr: Ipv6Addr) -> Result<()> {
     // `route add` fails if the route already exists (e.g. daemon restart), so
     // delete any stale entry first and ignore its result.
     let _ = std::process::Command::new("route")
-        .args(["-n", "delete", "-inet6", "-net", "200::/7", "-interface", tun_name])
+        .args([
+            "-n",
+            "delete",
+            "-inet6",
+            "-net",
+            "200::/7",
+            "-interface",
+            tun_name,
+        ])
         .status();
     let status = std::process::Command::new("route")
-        .args(["-n", "add", "-inet6", "-net", "200::/7", "-interface", tun_name])
+        .args([
+            "-n",
+            "add",
+            "-inet6",
+            "-net",
+            "200::/7",
+            "-interface",
+            tun_name,
+        ])
         .status()
         .context("run route add -inet6")?;
     anyhow::ensure!(status.success(), "route add -inet6 failed with {status}");

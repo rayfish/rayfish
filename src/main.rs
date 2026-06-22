@@ -395,10 +395,22 @@ async fn ipc_create(
                 key_str.clone()
             };
             println!();
-            println!("{} {}", style::green("✓ network created"), style::bold(&name));
-            println!("  {}  {}", style::label("IPv4"), style::value(&my_ip.to_string()));
+            println!(
+                "{} {}",
+                style::green("✓ network created"),
+                style::bold(&name)
+            );
+            println!(
+                "  {}  {}",
+                style::label("IPv4"),
+                style::value(&my_ip.to_string())
+            );
             if let Some(v6) = my_ipv6 {
-                println!("  {}  {}", style::label("IPv6"), style::value(&v6.to_string()));
+                println!(
+                    "  {}  {}",
+                    style::label("IPv6"),
+                    style::value(&v6.to_string())
+                );
             }
             println!("  {}  {}", style::label("join"), style::rose(&short));
             println!(
@@ -447,9 +459,17 @@ async fn ipc_join(
         } => {
             println!();
             println!("{} {}", style::green("✓ joined"), style::bold(&name));
-            println!("  {}  {}", style::label("IPv4"), style::value(&my_ip.to_string()));
+            println!(
+                "  {}  {}",
+                style::label("IPv4"),
+                style::value(&my_ip.to_string())
+            );
             if let Some(v6) = my_ipv6 {
-                println!("  {}  {}", style::label("IPv6"), style::value(&v6.to_string()));
+                println!(
+                    "  {}  {}",
+                    style::label("IPv6"),
+                    style::value(&v6.to_string())
+                );
             }
             println!();
         }
@@ -745,7 +765,7 @@ async fn ipc_acl(network: &str, action: AclAction) -> Result<()> {
             network: network.to_string(),
         },
     };
-    ipc::send(&mut stream,req).await?;
+    ipc::send(&mut stream, req).await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
@@ -776,7 +796,7 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
         FirewallAction::Show => ipc::IpcMessage::FirewallShow,
         FirewallAction::Default { action } => ipc::IpcMessage::FirewallDefault { action },
     };
-    ipc::send(&mut stream,req).await?;
+    ipc::send(&mut stream, req).await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
@@ -810,7 +830,7 @@ async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
     let mut stream = ipc::connect().await?;
     match action {
         None => {
-            ipc::send(&mut stream,ipc::IpcMessage::ListFiles).await?;
+            ipc::send(&mut stream, ipc::IpcMessage::ListFiles).await?;
             let resp = ipc::recv(&mut stream).await?;
             match resp {
                 ipc::IpcMessage::FileList { files } => {
@@ -821,7 +841,11 @@ async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                         for f in &files {
                             println!(
                                 "  {}  {} ({})  {}  {}",
-                                f.id, f.from, f.mime_type, f.filename, format_size(f.size),
+                                f.id,
+                                f.from,
+                                f.mime_type,
+                                f.filename,
+                                format_size(f.size),
                             );
                         }
                         println!();
@@ -838,11 +862,7 @@ async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                     .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
                     .map(|p| p.to_string_lossy().to_string())
             });
-            ipc::send(
-                &mut stream,
-                ipc::IpcMessage::AcceptFile { id, output },
-            )
-            .await?;
+            ipc::send(&mut stream, ipc::IpcMessage::AcceptFile { id, output }).await?;
             let resp = ipc::recv(&mut stream).await?;
             match resp {
                 ipc::IpcMessage::Ok { message } => println!("{}", message),
@@ -941,7 +961,7 @@ async fn ipc_pair_accept(ticket: &str) -> Result<()> {
 
 fn cmd_pair_backup() -> Result<()> {
     use argon2::Argon2;
-    use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::Aead, KeyInit};
+    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 
     let key = identity::load_or_create()?;
     let password = rpassword::prompt_password("Enter backup password: ")?;
@@ -983,7 +1003,7 @@ fn cmd_pair_backup() -> Result<()> {
 
 fn cmd_pair_restore(backup: &str) -> Result<()> {
     use argon2::Argon2;
-    use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::Aead, KeyInit};
+    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 
     let backup_bytes = bs58::decode(backup)
         .into_vec()
