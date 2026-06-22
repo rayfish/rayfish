@@ -130,6 +130,10 @@ enum Command {
     Down,
     /// Uninstall system service
     Uninstall,
+    /// Install or refresh the system service and start it (requires root)
+    Install,
+    /// Restart the system service (requires root)
+    Restart,
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -317,6 +321,8 @@ async fn main() -> Result<()> {
         Command::Up => cmd_up().await,
         Command::Down => ipc_down().await,
         Command::Uninstall => cmd_uninstall_service(),
+        Command::Install => cmd_install().await,
+        Command::Restart => cmd_restart().await,
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "ray", &mut std::io::stdout());
             Ok(())
@@ -1172,6 +1178,72 @@ async fn install_and_start_service() -> Result<()> {
                  It likely crashed on startup — a common cause is another VPN (e.g. Tailscale)\n\
                  already using the 100.64.0.0/10 range, DNS port 53, or a conflicting route."
             );
+            print_daemon_log_tail();
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Ensure the process is running as root for service-manager operations.
+/// Prints a clear `sudo` hint and exits non-zero otherwise.
+fn require_root() -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!(
+            "this command manages the system service and needs root.\n\
+             Re-run with: sudo ray <command>"
+        );
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `ray install`: install the system service if needed (or refresh an existing
+/// install), then start it and verify the daemon comes up. Requires root.
+async fn cmd_install() -> Result<()> {
+    require_root()?;
+    install_and_start_service().await
+}
+
+/// `ray restart`: restart the already-installed system service via the OS
+/// service manager (does not rewrite the unit file). Requires root. The daemon
+/// comes back up active.
+async fn cmd_restart() -> Result<()> {
+    require_root()?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let unit = std::path::Path::new("/etc/systemd/system/rayfish.service");
+        if !unit.exists() {
+            eprintln!("rayfish service is not installed. Run: sudo ray up");
+            std::process::exit(1);
+        }
+        run_cmd("systemctl", &["restart", "rayfish"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist = std::path::Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist");
+        if !plist.exists() {
+            eprintln!("rayfish service is not installed. Run: sudo ray up");
+            std::process::exit(1);
+        }
+        run_cmd("launchctl", &["kickstart", "-k", "system/com.rayfish.vpn"]);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        anyhow::bail!("system service not supported on this platform");
+    }
+
+    // Confirm the daemon came back, mirroring `up`/`install` diagnostics.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    match wait_for_daemon(std::time::Duration::from_secs(8)).await {
+        Some(_) => {
+            println!("rayfish service restarted.");
+            Ok(())
+        }
+        None => {
+            eprintln!("rayfish service was restarted but the daemon never became reachable.");
             print_daemon_log_tail();
             std::process::exit(1);
         }
