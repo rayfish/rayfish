@@ -89,10 +89,10 @@ sudo usermod -aG rayfish $USER
 
 ```bash
 cargo build
-sudo ray daemon &    # start the daemon in the background
+sudo ray up    # installs the system service if needed, then starts the daemon
 ```
 
-> The daemon needs root (it creates the TUN device and owns the iroh endpoint). Every other command runs unprivileged and talks to the daemon over a Unix socket.
+> `ray up` needs root (the daemon creates the TUN device and owns the iroh endpoint). Every other command runs unprivileged and talks to the daemon over a Unix socket.
 
 ### Basic usage
 
@@ -249,8 +249,7 @@ Tor runs alongside the default relay transport and iroh picks the best path. Bot
 
 | Command | Description | Needs daemon |
 |---------|-------------|:---:|
-| `sudo ray daemon` | Start the daemon (owns TUN + endpoint) | — |
-| `sudo ray up` | Alias for `daemon` | — |
+| `sudo ray up` | Install the service if needed and start it | — |
 | `ray create [--tor]` | Create a network (generates name + join code) | Yes |
 | `ray join KEY [--name ALIAS] [--tor]` | Join a network by join code | Yes |
 | `ray leave NAME` | Leave a network and remove config | Yes |
@@ -273,8 +272,7 @@ Tor runs alongside the default relay transport and iroh picks the best path. Bot
 | `ray pair backup` | Back up identity key (encrypted) | No |
 | `ray pair restore CODE` | Restore identity from backup | No |
 | `ray mdns on\|off` | Toggle mDNS local discovery | No |
-| `ray install-service` | Install systemd/launchd service | No |
-| `ray uninstall-service` | Remove system service | No |
+| `sudo ray uninstall` | Stop and remove the system service | No |
 | `ray completions SHELL` | Generate shell completions | No |
 
 <sub>\* `ray status` shows saved networks even without a running daemon.</sub>
@@ -286,10 +284,10 @@ Commands other than the daemon run unprivileged — they talk to the daemon over
 ## Running as a service
 
 ```bash
-sudo ray install-service    # installs a systemd unit or launchd plist
+sudo ray up    # installs a systemd unit or launchd plist if missing, then starts it
 ```
 
-The service runs `ray daemon` on boot, restoring all saved networks automatically. `just deploy <ip>` sets this up on Linux servers.
+The service runs `ray daemon` on boot, restoring all saved networks automatically. `just deploy <ip>` sets this up on Linux servers. Use `sudo ray uninstall` to stop and remove it.
 
 ---
 

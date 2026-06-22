@@ -14,13 +14,13 @@ cross:
 deploy ip:
     cross -q build --release --target {{target}}
     rsync -az --progress target/{{target}}/release/{{binary}} {{user}}@{{ip}}:/tmp/
-    ssh {{user}}@{{ip}} "getent group rayfish >/dev/null || groupadd rayfish && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && {{binary}} install-service && systemctl daemon-reload && systemctl enable rayfish && systemctl restart rayfish"
+    ssh {{user}}@{{ip}} "getent group rayfish >/dev/null || groupadd rayfish && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && {{binary}} up && systemctl restart rayfish"
     @echo "Deployed and installed daemon on {{ip}}"
 
 deploy-dev ip:
     cross -q build --target {{target}}
     rsync -az --progress target/{{target}}/debug/{{binary}} {{user}}@{{ip}}:/tmp/
-    ssh {{user}}@{{ip}} "getent group rayfish >/dev/null || groupadd rayfish && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && {{binary}} install-service && systemctl daemon-reload && systemctl enable rayfish && systemctl restart rayfish"
+    ssh {{user}}@{{ip}} "getent group rayfish >/dev/null || groupadd rayfish && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && {{binary}} up && systemctl restart rayfish"
     @echo "Deployed and installed daemon on {{ip}} (debug build)"
 
 check:

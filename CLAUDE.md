@@ -15,8 +15,9 @@ cargo -q clippy
 ### Running
 
 ```bash
-# Start the daemon (required first — owns TUN device and iroh endpoint)
-sudo cargo -q run -- daemon
+# Start the service (required first — owns TUN device and iroh endpoint)
+# `up` installs the system service if needed and starts it; the service runs `ray daemon`.
+sudo cargo -q run -- up
 
 # In another terminal: create/join/manage networks (talks to daemon via IPC)
 cargo -q run -- create                      # generates network + prints join code (public key)
@@ -50,8 +51,8 @@ cargo -q run -- firewall add out deny --peer e71a          # block outbound to p
 cargo -q run -- firewall remove 0                          # remove rule by index
 
 # System service
-sudo cargo -q run -- install-service
-sudo cargo -q run -- uninstall-service
+sudo cargo -q run -- up           # installs the service if needed, then starts it
+sudo cargo -q run -- uninstall    # stop and remove the system service
 
 # mDNS local peer discovery
 cargo -q run -- mdns on                       # enable (default)
@@ -73,7 +74,7 @@ cargo -q run -- pair restore <backup-code>   # restore identity from backup
 cargo -q run -- completions bash > /etc/bash_completion.d/rayfish
 ```
 
-Only `daemon` (and its alias `up`) requires `sudo`. All other commands run unprivileged via IPC.
+Only `up` (and the service-internal `daemon`) requires `sudo`. All other commands run unprivileged via IPC.
 
 ### Cross-compile & deploy
 
@@ -91,7 +92,7 @@ App (Minecraft, etc.) → TUN device (100.64.x.x / 200::x) → rayfish → iroh 
 
 ### Modules
 
-- `src/main.rs` — thin CLI client (clap), IPC client functions, `spawn_path_logger`, service install/uninstall; `ray create [--name custom-name]` (generates network with optional custom name, prints join code), `ray join <public-key> [--name alias]`, `ray nuke <name>`, `ray hostname <network> <name>` (change hostname on existing network), `ray acl <network> tag/untag/allow/remove/show/apply` subcommands; `ray mdns on|off` (enable/disable mDNS local discovery, persisted to config); `ray send <file> <peer>` sends a file, `ray files` lists pending transfers, `ray files accept <id> [--output <dir>]` accepts a transfer; `ray status` displays DNS names (hostname.network.ray) instead of IPs when available + mDNS status; `PairAction` enum and `cmd_pair` function for device pairing (start pairing, pair with ticket, backup, restore)
+- `src/main.rs` — thin CLI client (clap), IPC client functions, `spawn_path_logger`; `ray up` (`cmd_up` — `ensure_service_installed()` writes the systemd unit / launchd plist if missing, then starts the service) and `ray uninstall` (`cmd_uninstall_service` — stops and removes the service); `ray daemon` runs the foreground daemon loop and is hidden from help (invoked by the service); `ray create [--name custom-name]` (generates network with optional custom name, prints join code), `ray join <public-key> [--name alias]`, `ray nuke <name>`, `ray hostname <network> <name>` (change hostname on existing network), `ray acl <network> tag/untag/allow/remove/show/apply` subcommands; `ray mdns on|off` (enable/disable mDNS local discovery, persisted to config); `ray send <file> <peer>` sends a file, `ray files` lists pending transfers, `ray files accept <id> [--output <dir>]` accepts a transfer; `ray status` displays DNS names (hostname.network.ray) instead of IPs when available + mDNS status; `PairAction` enum and `cmd_pair` function for device pairing (start pairing, pair with ticket, backup, restore)
 - `src/daemon.rs` — daemon process: DaemonState (shared endpoint + TUN + PeerTable + ProtocolRouter), NetworkHandle per active network, IPC server over Unix socket, ProtocolRouter dispatches connections via iroh ProtocolHandler by ALPN (MeshProtocol per network + BlobsProtocol for blob transfers); `CoordinatorAcceptState` and `MemberAcceptState` implement per-connection handling directly in `ProtocolHandler::accept()` via `AcceptHandler` enum — coordinator handles member auth/approval/sync, member handles MeshHello/ReconnectRequest from peers; reconnect loop, single DHT publisher (`spawn_network_publisher`), group poller (`spawn_group_poller`), local alias generation, `nuke_network()`, `restore_coordinator_network()`, ACL state on NetworkHandle, IPC handlers for ACL commands, ACL included in GroupBlob, ACL load from file on startup, empty record publish on nuke; MeshHello propagates hostname to peers with collision resolution via `resolve_collision()`, DNS table updated on peer connection; hostname persisted per-network in config (`my_hostname`); coordinator reads MeshHello from connecting peers via `spawn_coordinator_hello_reader()` to learn their hostname, update member list, and register in DNS table; joiner sends MeshHello to coordinator on initial connection; mDNS local peer discovery via `iroh-mdns-address-lookup` (advertises `_rayfish._udp.local`, enabled by default, configurable via `mdns_enabled` in AppConfig); file sharing: `PendingFile` queue on ProtocolRouter, FILES_ALPN (`rayfish/files/1`) for file offer control messages, `send_file()`/`list_files()`/`accept_file()` IPC handlers, `resolve_peer_name()` resolves hostname or short ID to EndpointId, `guess_mime_type()` via mime_guess crate; device pairing: PAIR_ALPN (`rayfish/pair/1`) for pairing protocol, pairing protocol handler in ProtocolRouter, device cert verification in accept handlers (CoordinatorAcceptState/MemberAcceptState verify device certs and resolve transport keys to user identities), `DeviceUserMap` for transport-key-to-user-identity resolution
 - `src/network_name.rs` — local alias generation: adjective-noun-noun word lists embedded at compile time, `generate_name()` (random selection via rand), `is_valid_name()` for validation
 - `src/ipc.rs` — IPC protocol: single `IpcMessage` enum (request + response variants), `MsgpackCodec` (length-prefixed msgpack over Unix socket via `tokio_util::codec::Framed`), socket path (`/var/run/rayfish/rayfish.sock`), `connect()` returns `IpcFramed`, `framed(stream)` wraps raw `UnixStream`, `send()`/`recv()` helpers; request variants: `Create`, `Join`, `Leave`, `Nuke`, `Status`, `Shutdown`, `AclTag`, `AclUntag`, `AclAllow`, `AclRemove`, `AclShow`, `AclApply`, `FirewallAdd`, `FirewallRemove`, `FirewallShow`, `FirewallDefault`, `SetHostname`, `SendFile`, `ListFiles`, `AcceptFile`, `StartPairing`, `PairWithDevice`; response variants: `Ok`, `Error`, `Created`, `Joined`, `StatusResponse`, `AclState`, `FirewallState`, `FileList`, `PairingTicket`, `PairingComplete`; `NetworkStatus` includes `my_ipv6`, `PeerStatus` includes `ipv6`

@@ -25,7 +25,7 @@ pub const DNS_DOMAIN: &str = "ray";
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 
 use futures::StreamExt;
@@ -121,16 +121,15 @@ enum Command {
     },
     /// Show status of all networks (active + saved)
     Status,
-    /// Start the daemon (manages all networks, listens for IPC commands)
+    /// Run the daemon in the foreground (invoked by the system service)
+    #[command(hide = true)]
     Daemon,
-    /// Connect to all saved networks (alias for daemon)
+    /// Install the system service if needed and start it
     Up,
     /// Disconnect from all networks (signals daemon to shut down)
     Down,
-    /// Install system service (systemd on Linux, launchd on macOS)
-    InstallService,
     /// Uninstall system service
-    UninstallService,
+    Uninstall,
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -308,16 +307,19 @@ async fn main() -> Result<()> {
         } => ipc_join(&network_key, name.as_deref(), hostname, tor).await,
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Status => ipc_status().await,
-        Command::Daemon | Command::Up => {
+        Command::Daemon => {
             check_root();
             let token = shutdown::token();
             let stats = Arc::new(stats::ForwardMetrics::default());
             stats.spawn_logger(token.clone());
             daemon::run_daemon(token, stats).await
         }
+        Command::Up => {
+            check_root();
+            cmd_up()
+        }
         Command::Down => ipc_down().await,
-        Command::InstallService => cmd_install_service(),
-        Command::UninstallService => cmd_uninstall_service(),
+        Command::Uninstall => cmd_uninstall_service(),
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "ray", &mut std::io::stdout());
             Ok(())
@@ -401,13 +403,12 @@ async fn ipc_create(
             if let Some(v6) = my_ipv6 {
                 println!("  {}  {}", style::label("IPv6"), style::value(&v6.to_string()));
             }
+            println!("  {}  {}", style::label("join"), style::rose(&short));
             println!(
-                "  {}  {}  {}",
-                style::label("join"),
-                style::rose(&short),
-                style::faint("# share this code to invite")
+                "  {}  {}",
+                style::faint(&format!("ray join {network_key}")),
+                style::faint("# share this command to invite")
             );
-            println!("  {}", style::faint(&format!("full: {network_key}")));
             println!();
         }
         ipc::IpcMessage::Error { message } => {
@@ -1032,31 +1033,90 @@ fn cmd_pair_restore(backup: &str) -> Result<()> {
 // Service install/uninstall
 // ---------------------------------------------------------------------------
 
-fn cmd_install_service() -> Result<()> {
+/// Write the system service unit/plist, substituting the path of the binary
+/// currently running so the service execs the same `ray` the user invoked
+/// (rather than a hardcoded /usr/local/bin/ray). Idempotent — safe to call on
+/// every `ray up`, keeping the exec path fresh if the binary moves.
+#[allow(unused_variables)]
+fn ensure_service_installed() -> Result<()> {
+    let exe = std::env::current_exe()
+        .context("failed to determine current executable path")?
+        .to_string_lossy()
+        .into_owned();
+
     #[cfg(target_os = "linux")]
     {
-        let service = include_str!("../contrib/rayfish.service");
         let path = std::path::Path::new("/etc/systemd/system/rayfish.service");
-        std::fs::write(path, service)?;
-        println!("Installed systemd service to {}", path.display());
-        println!("Run: sudo systemctl enable --now rayfish");
+        let service =
+            include_str!("../contrib/rayfish.service").replace("/usr/local/bin/ray", &exe);
+        std::fs::write(path, service)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        run_cmd("systemctl", &["daemon-reload"]);
         return Ok(());
     }
 
     #[cfg(target_os = "macos")]
     {
-        let plist = include_str!("../contrib/com.rayfish.vpn.plist");
         let path = std::path::Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist");
-        std::fs::write(path, plist)?;
-        println!("Installed launchd daemon to {}", path.display());
-        println!("Run: sudo launchctl load {}", path.display());
+        let plist =
+            include_str!("../contrib/com.rayfish.vpn.plist").replace("/usr/local/bin/ray", &exe);
+        std::fs::write(path, plist)
+            .with_context(|| format!("failed to write {}", path.display()))?;
         return Ok(());
     }
 
     #[allow(unreachable_code)]
     {
-        anyhow::bail!("service installation not supported on this platform");
+        anyhow::bail!("system service not supported on this platform");
     }
+}
+
+/// `ray up`: install/refresh the service, then (re)start it.
+fn cmd_up() -> Result<()> {
+    ensure_service_installed()?;
+
+    #[cfg(target_os = "linux")]
+    {
+        run_cmd("systemctl", &["enable", "rayfish"]);
+        run_cmd("systemctl", &["restart", "rayfish"]);
+        println!("rayfish service started. Check `ray status`.");
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let path = "/Library/LaunchDaemons/com.rayfish.vpn.plist";
+        // Tear down any previously loaded job (e.g. one pointing at a stale
+        // binary path) before loading the freshly written plist.
+        run_cmd_quiet("launchctl", &["unload", path]);
+        run_cmd("launchctl", &["load", "-w", path]);
+        println!("rayfish service started. Check `ray status`.");
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    {
+        anyhow::bail!("system service not supported on this platform");
+    }
+}
+
+#[allow(dead_code)]
+fn run_cmd(program: &str, args: &[&str]) {
+    match std::process::Command::new(program).args(args).status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!("warning: `{program}` exited with {status}"),
+        Err(e) => eprintln!("warning: failed to run `{program}`: {e}"),
+    }
+}
+
+/// Run a command, ignoring its exit status (used for best-effort teardown).
+#[allow(dead_code)]
+fn run_cmd_quiet(program: &str, args: &[&str]) {
+    let _ = std::process::Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 fn cmd_uninstall_service() -> Result<()> {
@@ -1064,9 +1124,10 @@ fn cmd_uninstall_service() -> Result<()> {
     {
         let path = std::path::Path::new("/etc/systemd/system/rayfish.service");
         if path.exists() {
+            run_cmd("systemctl", &["disable", "--now", "rayfish"]);
             std::fs::remove_file(path)?;
+            run_cmd("systemctl", &["daemon-reload"]);
             println!("Removed systemd service.");
-            println!("Run: sudo systemctl daemon-reload");
         } else {
             println!("Service not installed.");
         }
@@ -1077,7 +1138,7 @@ fn cmd_uninstall_service() -> Result<()> {
     {
         let path = std::path::Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist");
         if path.exists() {
-            println!("Run: sudo launchctl unload {}", path.display());
+            run_cmd("launchctl", &["unload", "-w", &path.to_string_lossy()]);
             std::fs::remove_file(path)?;
             println!("Removed launchd daemon.");
         } else {

@@ -224,15 +224,15 @@ Requires Rust 2024 edition.
 
 ### Starting the daemon
 
-Before using any network commands, start the daemon:
+Before using any network commands, start the service:
 
 ```bash
-sudo ray daemon
+sudo ray up
 ```
 
-The daemon is a long-lived process that owns the iroh endpoint, TUN device, and all peer connections. It listens for commands on a Unix socket at `/var/run/rayfish/rayfish.sock`. On startup, it restores all previously saved networks from config.
+`ray up` installs the system service (a systemd unit on Linux, a launchd plist on macOS) if it isn't already present, then starts it. The service runs `ray daemon`, a long-lived process that owns the iroh endpoint, TUN device, and all peer connections. It listens for commands on a Unix socket at `/var/run/rayfish/rayfish.sock`. On startup, it restores all previously saved networks from config.
 
-`ray up` is an alias for `ray daemon`.
+`ray daemon` runs the daemon loop in the foreground and is invoked by the service — you normally use `ray up` rather than calling it directly. To stop and remove the service, run `sudo ray uninstall`.
 
 ### Creating a network
 
@@ -319,14 +319,13 @@ The daemon automatically sets the socket to `root:rayfish` with mode `0660` if t
 
 ### Why sudo?
 
-TUN devices are virtual network interfaces. Creating them requires root privileges on both Linux and macOS. Only `ray daemon` (and its alias `ray up`) requires root. All other commands are thin IPC clients that talk to the daemon and run unprivileged.
+TUN devices are virtual network interfaces. Creating them requires root privileges on both Linux and macOS. Only `ray up` (and the service-internal `ray daemon`) requires root. All other commands are thin IPC clients that talk to the daemon and run unprivileged.
 
 ### All commands
 
 | Command | Description | Needs daemon |
 |---------|-------------|:---:|
-| `sudo ray daemon` | Start the daemon (owns TUN + endpoint) | — |
-| `sudo ray up` | Alias for `daemon` | — |
+| `sudo ray up` | Install the service if needed and start it | — |
 | `ray create [--name NAME]` | Create a network (custom or random name + join code) | Yes |
 | `ray join KEY [--name ALIAS]` | Join a network by public key | Yes |
 | `ray leave NAME` | Leave a network and remove config | Yes |
@@ -340,8 +339,7 @@ TUN devices are virtual network interfaces. Creating them requires root privileg
 | `ray acl NAME show` | Display current ACL state | Yes |
 | `ray acl NAME apply` | Re-publish current ACL to all peers | Yes |
 | `ray mdns on\|off` | Enable/disable mDNS local peer discovery | No |
-| `ray install-service` | Install systemd/launchd service | No |
-| `ray uninstall-service` | Remove system service | No |
+| `sudo ray uninstall` | Stop and remove the system service | No |
 | `ray completions SHELL` | Generate shell completions | No |
 
 ### Deploying to servers
@@ -1008,7 +1006,7 @@ In the `cmd_up` path (connecting to all saved networks), a single `PeerTable` is
 
 **Module:** `src/config.rs`
 
-Rayfish persists network memberships to `~/.config/rayfish/networks.toml` so that networks survive restarts. The `ray up` command reads this file to reconnect to all saved networks.
+Rayfish persists network memberships to `~/.config/rayfish/networks.toml` so that networks survive restarts. The daemon reads this file on startup to reconnect to all saved networks.
 
 ### File format
 
@@ -1860,7 +1858,7 @@ When the entire mesh session fails (e.g., `enter_mesh` returns an error):
 
 ### Daemon startup
 
-When a user runs `sudo ray daemon` (or `sudo ray up`):
+When the service starts the daemon (via `sudo ray up`, which runs `ray daemon`):
 
 1. **Load identity** from `~/.config/rayfish/secret_key`.
 
