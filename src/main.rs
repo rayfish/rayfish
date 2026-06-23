@@ -9,6 +9,7 @@ mod firewall;
 mod forward;
 mod hostname;
 mod identity;
+mod invite;
 mod ipc;
 mod logdir;
 mod membership;
@@ -80,9 +81,13 @@ struct Cli {
 enum Command {
     /// Create a new network and wait for peers
     Create {
-        /// Membership mode: open or restricted
-        #[arg(long, default_value = "restricted")]
-        mode: GroupMode,
+        /// Make the network public: anyone with the room id can join directly.
+        /// Without this flag the network is closed (gated by approval/invites).
+        #[arg(long, conflicts_with = "closed")]
+        open: bool,
+        /// Explicitly create a closed (gated) network. This is the default.
+        #[arg(long)]
+        closed: bool,
         /// Network name used in DNS (e.g. "gaming" → alice.gaming.ray). Random if not set
         #[arg(long)]
         name: Option<String>,
@@ -93,9 +98,9 @@ enum Command {
         #[arg(long)]
         tor: bool,
     },
-    /// Join an existing network using its public key
+    /// Join an existing network using its room id or an invite code
     Join {
-        /// The network public key (join code)
+        /// The network public key (room id) or a one-time invite code
         network_key: String,
         /// Optional local alias for the network
         #[arg(long)]
@@ -149,6 +154,32 @@ enum Command {
         #[command(subcommand)]
         action: AclAction,
     },
+    /// Mint and manage one-time invite codes for a network (coordinator only)
+    Invite {
+        /// Network name to issue/manage invites for
+        network: String,
+        #[command(subcommand)]
+        action: Option<InviteAction>,
+    },
+    /// List peers awaiting approval on a closed network (coordinator only)
+    Requests {
+        /// Network name
+        network: String,
+    },
+    /// Admit a peer waiting for approval (coordinator only)
+    Accept {
+        /// Network name
+        network: String,
+        /// Short id of the pending peer (from `ray requests`)
+        id: String,
+    },
+    /// Reject a peer waiting for approval (coordinator only)
+    Deny {
+        /// Network name
+        network: String,
+        /// Short id of the pending peer (from `ray requests`)
+        id: String,
+    },
     /// Manage local device firewall rules
     Firewall {
         #[command(subcommand)]
@@ -189,6 +220,23 @@ enum Command {
         action: Option<PairAction>,
         /// Pairing ticket from the primary device (shorthand for `rayfish pair accept <ticket>`)
         ticket: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum InviteAction {
+    /// Mint a new one-time invite code (default action)
+    Create {
+        /// How long the invite stays valid, e.g. 24h, 7d, 30m (default 7d)
+        #[arg(long, default_value = "7d")]
+        expires: String,
+    },
+    /// List issued invites and their status
+    List,
+    /// Revoke an unused invite by id
+    Revoke {
+        /// Invite id (from `ray invite <network> list`)
+        id: String,
     },
 }
 
@@ -501,11 +549,19 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Leave { name } => ipc_leave(&name).await,
         Command::Create {
-            mode,
+            open,
+            closed: _,
             name,
             hostname,
             tor,
-        } => ipc_create(mode, name, hostname, tor).await,
+        } => {
+            let mode = if open {
+                GroupMode::Open
+            } else {
+                GroupMode::Restricted
+            };
+            ipc_create(mode, name, hostname, tor).await
+        }
         Command::Join {
             network_key,
             name,
@@ -533,6 +589,10 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Acl { network, action } => ipc_acl(&network, action).await,
+        Command::Invite { network, action } => ipc_invite(&network, action).await,
+        Command::Requests { network } => ipc_requests(&network).await,
+        Command::Accept { network, id } => ipc_accept_request(&network, &id).await,
+        Command::Deny { network, id } => ipc_deny_request(&network, &id).await,
         Command::Firewall { action } => ipc_firewall(action).await,
         Command::Hostname { network, name } => ipc_set_hostname(&network, &name).await,
         Command::Mdns { state } => cmd_mdns(&state),
@@ -683,19 +743,33 @@ async fn ipc_join(
     } else {
         None
     };
+    // `ray join <arg>` accepts either a bare room id (the network public key) or
+    // a self-contained invite code. An invite decodes to the network key plus the
+    // coordinator to dial and a one-time secret to present.
+    let (network_key, invite, coordinator) = match invite::decode_invite_code(network_key) {
+        Ok((net_pubkey, coord, secret)) => {
+            (net_pubkey.to_string(), Some(secret), Some(coord))
+        }
+        Err(_) => (network_key.to_string(), None, None),
+    };
     let mut stream = ipc::connect().await?;
     ipc::send(
         &mut stream,
         ipc::IpcMessage::Join {
-            network_key: network_key.to_string(),
+            network_key,
             name: name.map(|s| s.to_string()),
             hostname,
             transport,
+            invite,
+            coordinator,
         },
     )
     .await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
+        ipc::IpcMessage::Ok { message } => {
+            println!("{}", message);
+        }
         ipc::IpcMessage::Joined {
             name,
             my_ip,
@@ -1069,6 +1143,161 @@ async fn ipc_acl(network: &str, action: AclAction) -> Result<()> {
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::AclState { display } => print!("{}", display),
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+/// Parse a duration like `30m`, `24h`, `7d`, `90s` into seconds.
+fn parse_duration_secs(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (num, mult) = if let Some(rest) = s.strip_suffix('s') {
+        (rest, 1u64)
+    } else if let Some(rest) = s.strip_suffix('m') {
+        (rest, 60)
+    } else if let Some(rest) = s.strip_suffix('h') {
+        (rest, 3600)
+    } else if let Some(rest) = s.strip_suffix('d') {
+        (rest, 86400)
+    } else {
+        (s, 1)
+    };
+    let value: u64 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid duration '{s}': use e.g. 30m, 24h, 7d"))?;
+    Ok(value * mult)
+}
+
+async fn ipc_invite(network: &str, action: Option<InviteAction>) -> Result<()> {
+    let action = action.unwrap_or(InviteAction::Create {
+        expires: "7d".to_string(),
+    });
+    let req = match action {
+        InviteAction::Create { expires } => ipc::IpcMessage::InviteCreate {
+            network: network.to_string(),
+            expires_secs: parse_duration_secs(&expires)?,
+        },
+        InviteAction::List => ipc::IpcMessage::InviteList {
+            network: network.to_string(),
+        },
+        InviteAction::Revoke { id } => ipc::IpcMessage::InviteRevoke {
+            network: network.to_string(),
+            id,
+        },
+    };
+    let mut stream = ipc::connect().await?;
+    ipc::send(&mut stream, req).await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::InviteCreated {
+            code,
+            id,
+            expires_secs,
+        } => {
+            println!();
+            println!("{} {}", style::green("✓ invite"), style::faint(&id));
+            println!();
+            println!("  {}", style::bold(&code));
+            println!();
+            qr2term::print_qr(&code).ok();
+            println!(
+                "\n  share this code; the holder joins with: {}",
+                style::faint(&format!("ray join {code}"))
+            );
+            let days = expires_secs / 86400;
+            let hours = (expires_secs % 86400) / 3600;
+            let ttl = if days > 0 {
+                format!("{days}d")
+            } else if hours > 0 {
+                format!("{hours}h")
+            } else {
+                format!("{}m", expires_secs / 60)
+            };
+            println!("  single-use, expires in {ttl}");
+        }
+        ipc::IpcMessage::InviteListResponse { invites } => {
+            if invites.is_empty() {
+                println!("No invites.");
+            } else {
+                for inv in invites {
+                    let who = inv
+                        .redeemer
+                        .map(|r| format!(" by {r}"))
+                        .unwrap_or_default();
+                    println!("  {}  {}{}", style::rose(&inv.id), inv.status, who);
+                }
+            }
+        }
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+async fn ipc_requests(network: &str) -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::Requests {
+            network: network.to_string(),
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::PendingRequests { requests } => {
+            if requests.is_empty() {
+                println!("No pending join requests.");
+            } else {
+                println!("Pending join requests:");
+                for r in requests {
+                    let host = r.hostname.unwrap_or_else(|| "—".to_string());
+                    println!(
+                        "  {}  {}  waiting {}s",
+                        style::rose(&r.short_id),
+                        host,
+                        r.waiting_secs
+                    );
+                }
+                println!("\nAdmit with: ray accept {network} <id>");
+            }
+        }
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+async fn ipc_accept_request(network: &str, id: &str) -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::AcceptRequest {
+            network: network.to_string(),
+            id: id.to_string(),
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+async fn ipc_deny_request(network: &str, id: &str) -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::DenyRequest {
+            network: network.to_string(),
+            id: id.to_string(),
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
     }

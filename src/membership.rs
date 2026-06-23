@@ -196,11 +196,17 @@ impl ApprovedList {
 }
 
 /// Determines whether a given member is allowed to approve new peers.
+///
+/// Superseded at runtime by the per-network access mode gate in the daemon
+/// (open auto-admits; closed routes through the invite/approval flow); retained
+/// for reference and unit coverage.
+#[allow(dead_code)]
 pub trait MembershipPolicy: Send + Sync {
     fn can_authorize(&self, acceptor: &Member) -> bool;
 }
 
 /// Any member can approve new peers.
+#[allow(dead_code)]
 pub struct OpenPolicy;
 
 impl MembershipPolicy for OpenPolicy {
@@ -210,6 +216,7 @@ impl MembershipPolicy for OpenPolicy {
 }
 
 /// Only the coordinator can approve new peers.
+#[allow(dead_code)]
 pub struct RestrictedPolicy;
 
 impl MembershipPolicy for RestrictedPolicy {
@@ -218,6 +225,7 @@ impl MembershipPolicy for RestrictedPolicy {
     }
 }
 
+#[allow(dead_code)]
 pub fn policy_for_mode(mode: GroupMode) -> Box<dyn MembershipPolicy> {
     match mode {
         GroupMode::Open => Box::new(OpenPolicy),

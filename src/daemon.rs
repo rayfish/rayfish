@@ -35,6 +35,7 @@
 //!   that network's background tasks. Because cancellation is one-shot, every
 //!   `activate` mints *fresh* child tokens, so `up → down → up` cycles work.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,8 +68,7 @@ use crate::identity;
 use crate::ipc::{self, IpcMessage, NetworkRole, NetworkStatus, PeerStatus};
 use crate::membership::{
     ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
-    MemberList, MembershipPolicy, canonical_group_bytes, derive_ipv6, group_blob_hash,
-    policy_for_mode, verify_group_blob,
+    MemberList, canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
 };
 use crate::network_name;
 use crate::peers::{self, PeerTable};
@@ -84,7 +84,6 @@ struct CoordinatorAcceptState {
     endpoint: Endpoint,
     network_name: String,
     identity: IrohIdentityProvider,
-    policy: Arc<dyn MembershipPolicy>,
     state: Arc<std::sync::RwLock<NetworkState>>,
     peers: PeerTable,
     tun_tx: mpsc::Sender<Vec<u8>>,
@@ -98,6 +97,8 @@ struct CoordinatorAcceptState {
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
     device_user_map: peers::DeviceUserMap,
+    /// Shared with this network's [`NetworkHandle`]; see its `invite_lock`.
+    invite_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CoordinatorAcceptState {
@@ -171,193 +172,201 @@ impl CoordinatorAcceptState {
             return;
         }
 
-        // Approved but not yet connected
+        // Non-member: read the joiner's JoinRequest first, then gate by prior
+        // approval, invite secret, and access mode. Known members are handled
+        // above (send-first) and never reach here; fresh joiners always send a
+        // JoinRequest first (see `join_mesh_shared`).
+        let (send, mut recv) =
+            match tokio::time::timeout(Duration::from_secs(5), conn.accept_bi()).await {
+                Ok(Ok(pair)) => pair,
+                _ => return,
+            };
+        let msg =
+            match tokio::time::timeout(Duration::from_secs(5), control::recv_msg(&mut recv)).await {
+                Ok(Ok(m)) => m,
+                _ => return,
+            };
+        let (invite_secret, hostname, device_cert) = match msg {
+            ControlMsg::JoinRequest {
+                invite_secret,
+                hostname,
+                device_cert,
+            } => (invite_secret, hostname, device_cert),
+            // Tolerate a bare MeshHello from older clients as a no-invite join.
+            ControlMsg::MeshHello {
+                hostname,
+                device_cert,
+                ..
+            } => (None, hostname, device_cert),
+            _ => return,
+        };
+
+        // Verify a device certificate if one is presented, and record the
+        // transport-key → user-identity binding so paired devices resolve.
+        if let Some(ref cert) = device_cert {
+            if !cert.verify() || cert.device_key != remote_id {
+                tracing::warn!(peer = %remote_id.fmt_short(), "invalid device certificate");
+                return;
+            }
+            self.device_user_map.insert(remote_id, cert.user_identity);
+        }
+
+        // A peer pre-approved via `ray accept` is admitted directly.
         let is_approved = self.state.read().unwrap().approved.is_approved(&remote_id);
         if is_approved {
-            tracing::info!(ip = %peer_ip, "approved peer connecting");
-            let snap_bytes = {
-                let mut s = self.state.write().unwrap();
-                s.approved.remove(&remote_id);
-                let new_member = Member {
-                    identity: remote_id,
-                    ip: peer_ip,
-                    is_coordinator: false,
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                };
-                s.members
-                    .add(new_member)
-                    .expect("was approved, no collision");
-                s.refresh_snapshot();
-                s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
+            self.admit_peer(conn, send, remote_id, peer_ip, hostname, device_cert, true)
+                .await;
+            return;
+        }
+
+        // Unknown peer presenting an invite secret: verify and burn it.
+        if let Some(secret) = invite_secret {
+            let redeemed = {
+                let _guard = self.invite_lock.lock().await;
+                match crate::invite::InviteStore::load(&self.network_name) {
+                    Ok(mut store) => store.redeem(&secret, remote_id),
+                    Err(e) => Err(e),
+                }
             };
-            if let Some(bytes) = snap_bytes {
-                let _ = self.blob_store.blobs().add_slice(&bytes).await;
+            match redeemed {
+                Ok(()) => {
+                    tracing::info!(peer = %remote_id.fmt_short(), "invite redeemed");
+                    self.admit_peer(conn, send, remote_id, peer_ip, hostname, device_cert, false)
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "invite rejected");
+                    self.deny(send, format!("invite rejected: {e}")).await;
+                }
             }
-            if let Some(notify) = &self.dht_notify {
-                notify.notify_one();
+            return;
+        }
+
+        // Unknown peer, no invite: open networks auto-admit; closed networks
+        // queue the request for live operator approval (`ray accept`).
+        let mode = self.state.read().unwrap().mode;
+        match mode {
+            GroupMode::Open => {
+                self.admit_peer(conn, send, remote_id, peer_ip, hostname, device_cert, false)
+                    .await;
             }
-            let (members, approved) = {
+            GroupMode::Restricted => {
+                {
+                    let mut s = self.state.write().unwrap();
+                    s.pending.insert(
+                        remote_id,
+                        PendingJoin {
+                            hostname,
+                            device_cert,
+                            requested_at: Instant::now(),
+                        },
+                    );
+                }
+                tracing::info!(peer = %remote_id.fmt_short(), ip = %peer_ip, "join queued for approval");
+                let mut send = send;
+                let _ = control::send_msg(&mut send, &ControlMsg::JoinPending).await;
+            }
+        }
+    }
+
+    /// Reply on the joiner's stream that the join was refused.
+    async fn deny(&self, mut send: iroh::endpoint::SendStream, reason: String) {
+        let _ = control::send_msg(&mut send, &ControlMsg::JoinDenied { reason }).await;
+    }
+
+    /// Admit a non-member peer into the network: assign hostname/IP, add to the
+    /// member list, broadcast `MemberApproved`, reply `Welcome` on the joiner's
+    /// stream, and start forwarding. Shared by the invite, open-mode, and
+    /// live-approval admission paths.
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_peer(
+        &self,
+        conn: Connection,
+        mut send: iroh::endpoint::SendStream,
+        remote_id: EndpointId,
+        peer_ip: Ipv4Addr,
+        hostname: Option<String>,
+        device_cert: Option<control::DeviceCert>,
+        was_approved: bool,
+    ) {
+        // Resolve hostname collisions against the current members.
+        let final_hostname = if let Some(desired) = hostname {
+            let taken: Vec<String> = {
                 let s = self.state.read().unwrap();
-                (
-                    s.members.all().into_iter().cloned().collect::<Vec<_>>(),
-                    s.approved.all().into_iter().cloned().collect::<Vec<_>>(),
-                )
+                s.members
+                    .all()
+                    .iter()
+                    .filter(|m| m.identity != remote_id)
+                    .filter_map(|m| m.hostname.clone())
+                    .collect()
             };
-            if let Ok((mut send, _)) = conn.open_bi().await {
-                let _ = control::send_msg(
-                    &mut send,
-                    &ControlMsg::Welcome {
-                        members: members.clone(),
-                        approved,
-                    },
-                )
-                .await;
-            }
-            broadcast_member_sync(&self.peers, &members, Some(peer_ip)).await;
-            let peer_ipv6 = derive_ipv6(&remote_id);
-            self.peers.add(
-                peer_ip,
-                peer_ipv6,
-                conn.clone(),
-                remote_id,
-                &self.network_name,
-            );
-            let token = self.token.clone();
-            let stats = self.stats.clone();
-            let tun_tx = self.tun_tx.clone();
-            let disconnect_tx = self.disconnect_tx.clone();
-            let local_id = self.endpoint.id();
-            let network = self.network_name.clone();
-            let shared_acl = self.shared_acl.clone();
-            let firewall = self.firewall.clone();
-            let state = self.state.clone();
-            let hostname_table = self.hostname_table.clone();
-            let reverse_table = self.reverse_table.clone();
-            let device_user_map = self.device_user_map.clone();
-            let dht_notify = self.dht_notify.clone();
-            let blob_store = self.blob_store.clone();
-            tokio::spawn(async move {
-                spawn_coordinator_hello_reader(
-                    conn.clone(),
-                    remote_id,
-                    peer_ip,
-                    &network,
-                    state.clone(),
-                    hostname_table,
-                    reverse_table,
-                    device_user_map.clone(),
-                )
-                .await;
-                update_snapshot_and_publish(&state, &blob_store, &dht_notify).await;
-                forward::spawn_peer_reader(
-                    conn,
-                    remote_id,
-                    peer_ip,
-                    peer_ipv6,
-                    local_id,
-                    network,
-                    shared_acl,
-                    firewall,
-                    tun_tx,
-                    disconnect_tx,
-                    token,
-                    stats,
-                    device_user_map,
-                );
-            });
-            return;
-        }
-
-        // Unknown peer — check policy
-        let self_member = {
-            let s = self.state.read().unwrap();
-            s.members
-                .get(&self.identity.local_identity())
-                .cloned()
-                .unwrap()
+            let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
+            Some(crate::hostname::resolve_collision(&desired, &taken_refs))
+        } else {
+            None
         };
-        if !self.policy.can_authorize(&self_member) {
-            tracing::warn!(peer = %remote_id, "not authorized to accept new members");
-            if let Ok((mut send, _)) = conn.open_bi().await {
-                let _ = control::send_msg(
-                    &mut send,
-                    &ControlMsg::JoinDenied {
-                        reason: "not authorized".to_string(),
-                    },
-                )
-                .await;
-            }
-            return;
-        }
 
-        // Check IP collision
-        let collision_reason: Option<String> = {
+        // Reject an IP collision with a different identity.
+        let collision = {
             let s = self.state.read().unwrap();
-            if let Some(existing) = s.members.get_by_ip(peer_ip)
-                && existing.identity != remote_id
-            {
-                Some(format!("IP collision: {} already assigned", peer_ip))
-            } else if let Some(existing) = s.approved.get_by_ip(peer_ip)
-                && existing.identity != remote_id
-            {
-                Some(format!("IP collision: {} already assigned", peer_ip))
+            if let Some(existing) = s.members.get_by_ip(peer_ip) {
+                existing.identity != remote_id
+            } else if let Some(existing) = s.approved.get_by_ip(peer_ip) {
+                existing.identity != remote_id
             } else {
-                None
+                false
             }
         };
-        if let Some(reason) = collision_reason {
-            if let Ok((mut send, _)) = conn.open_bi().await {
-                let _ = control::send_msg(&mut send, &ControlMsg::JoinDenied { reason }).await;
-            }
+        if collision {
+            self.deny(send, format!("IP collision: {peer_ip} already assigned"))
+                .await;
             return;
         }
 
-        // Broadcast MemberApproved (hostname will be updated after MeshHello)
+        let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
+        let snap_bytes = {
+            let mut s = self.state.write().unwrap();
+            if was_approved {
+                s.approved.remove(&remote_id);
+            }
+            s.pending.remove(&remote_id);
+            let _ = s.members.add(Member {
+                identity: remote_id,
+                ip: peer_ip,
+                is_coordinator: false,
+                hostname: final_hostname.clone(),
+                user_identity: user_id_opt,
+                device_cert: device_cert.clone(),
+            });
+            s.refresh_snapshot();
+            s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
+        };
+        if let Some(bytes) = snap_bytes {
+            let _ = self.blob_store.blobs().add_slice(&bytes).await;
+        }
+
+        if let Some(ref h) = final_hostname {
+            dns::update_hostname(
+                &self.hostname_table,
+                &self.reverse_table,
+                &self.network_name,
+                h,
+                peer_ip,
+                derive_ipv6(&remote_id),
+            )
+            .await;
+        }
+
         broadcast_control_msg(
             &self.peers,
             &ControlMsg::MemberApproved {
                 identity: remote_id,
                 ip: peer_ip,
-                hostname: None,
-                device_cert: None,
+                hostname: final_hostname.clone(),
+                device_cert: device_cert.clone(),
             },
         )
         .await;
-
-        // Promote to member
-        let (add_collision, snap_bytes): (Option<String>, Option<Vec<u8>>) = {
-            let mut s = self.state.write().unwrap();
-            let result = s
-                .members
-                .add(Member {
-                    identity: remote_id,
-                    ip: peer_ip,
-                    is_coordinator: false,
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                })
-                .err()
-                .map(|e| format!("IP collision: {e}"));
-            if result.is_none() {
-                s.refresh_snapshot();
-            }
-            let bytes = s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone());
-            (result, bytes)
-        };
-        if add_collision.is_none()
-            && let Some(bytes) = snap_bytes
-        {
-            let _ = self.blob_store.blobs().add_slice(&bytes).await;
-        }
-        if let Some(reason) = add_collision {
-            if let Ok((mut send, _)) = conn.open_bi().await {
-                let _ = control::send_msg(&mut send, &ControlMsg::JoinDenied { reason }).await;
-            }
-            return;
-        }
 
         let (members, approved) = {
             let s = self.state.read().unwrap();
@@ -367,73 +376,40 @@ impl CoordinatorAcceptState {
             )
         };
 
-        tracing::info!(ip = %peer_ip, "new member approved and joined");
+        tracing::info!(ip = %peer_ip, "new member admitted and joined");
+        let _ = control::send_msg(
+            &mut send,
+            &ControlMsg::Welcome {
+                members: members.clone(),
+                approved,
+            },
+        )
+        .await;
+
         if let Some(notify) = &self.dht_notify {
             notify.notify_one();
         }
-
-        if let Ok((mut send, _)) = conn.open_bi().await {
-            let _ = control::send_msg(
-                &mut send,
-                &ControlMsg::Welcome {
-                    members: members.clone(),
-                    approved,
-                },
-            )
-            .await;
-        }
         broadcast_member_sync(&self.peers, &members, Some(peer_ip)).await;
+
         let peer_ipv6 = derive_ipv6(&remote_id);
-        self.peers.add(
+        crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
+        self.peers
+            .add(peer_ip, peer_ipv6, conn.clone(), remote_id, &self.network_name);
+        forward::spawn_peer_reader(
+            conn,
+            remote_id,
             peer_ip,
             peer_ipv6,
-            conn.clone(),
-            remote_id,
-            &self.network_name,
+            self.endpoint.id(),
+            self.network_name.clone(),
+            self.shared_acl.clone(),
+            self.firewall.clone(),
+            self.tun_tx.clone(),
+            self.disconnect_tx.clone(),
+            self.token.clone(),
+            self.stats.clone(),
+            self.device_user_map.clone(),
         );
-        let token = self.token.clone();
-        let stats = self.stats.clone();
-        let tun_tx = self.tun_tx.clone();
-        let disconnect_tx = self.disconnect_tx.clone();
-        let local_id = self.endpoint.id();
-        let network = self.network_name.clone();
-        let shared_acl = self.shared_acl.clone();
-        let firewall = self.firewall.clone();
-        let state = self.state.clone();
-        let hostname_table = self.hostname_table.clone();
-        let reverse_table = self.reverse_table.clone();
-        let device_user_map = self.device_user_map.clone();
-        let dht_notify = self.dht_notify.clone();
-        let blob_store = self.blob_store.clone();
-        tokio::spawn(async move {
-            spawn_coordinator_hello_reader(
-                conn.clone(),
-                remote_id,
-                peer_ip,
-                &network,
-                state.clone(),
-                hostname_table,
-                reverse_table,
-                device_user_map.clone(),
-            )
-            .await;
-            update_snapshot_and_publish(&state, &blob_store, &dht_notify).await;
-            forward::spawn_peer_reader(
-                conn,
-                remote_id,
-                peer_ip,
-                peer_ipv6,
-                local_id,
-                network,
-                shared_acl,
-                firewall,
-                tun_tx,
-                disconnect_tx,
-                token,
-                stats,
-                device_user_map,
-            );
-        });
     }
 }
 
@@ -908,6 +884,19 @@ struct NetworkState {
     network_secret_key: Option<SecretKey>,
     network_public_key: EndpointId,
     network_name: Option<String>,
+    /// Access mode (open auto-admits; restricted gates unknown joiners). Only the
+    /// coordinator's accept path consults this; members default to `Restricted`.
+    mode: GroupMode,
+    /// Peers awaiting live operator approval on a closed network (coordinator
+    /// only, in-memory, never persisted or published).
+    pending: HashMap<EndpointId, PendingJoin>,
+}
+
+/// A join request held pending live approval on a closed network.
+struct PendingJoin {
+    hostname: Option<String>,
+    device_cert: Option<control::DeviceCert>,
+    requested_at: Instant,
 }
 
 impl NetworkState {
@@ -944,6 +933,10 @@ pub struct NetworkHandle {
     cancel: CancellationToken,
     /// Background tasks owned by this network, awaited on teardown.
     tasks: Vec<JoinHandle<()>>,
+    /// Serializes invite-ledger reads/writes (mint, redeem, revoke) so concurrent
+    /// joins can't double-burn a single-use invite (TOCTOU on the toml file).
+    /// Shared with this network's [`CoordinatorAcceptState`].
+    invite_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Shared, always-on daemon state. Cloned (via `Arc`) into every IPC handler
@@ -1084,8 +1077,10 @@ impl DaemonState {
                 name,
                 hostname,
                 transport: _,
+                invite,
+                coordinator,
             } => {
-                self.join_network(&network_key, name.as_deref(), hostname)
+                self.join_network(&network_key, name.as_deref(), hostname, invite, coordinator)
                     .await
             }
             IpcMessage::Leave { name } => self.leave_network(&name).await,
@@ -1144,6 +1139,15 @@ impl DaemonState {
                 secret,
             } => self.pair_with_device(endpoint_id, secret).await,
             IpcMessage::SetOperator { uid } => self.set_operator(uid),
+            IpcMessage::InviteCreate {
+                network,
+                expires_secs,
+            } => self.invite_create(&network, expires_secs).await,
+            IpcMessage::InviteList { network } => self.invite_list(&network).await,
+            IpcMessage::InviteRevoke { network, id } => self.invite_revoke(&network, &id).await,
+            IpcMessage::Requests { network } => self.list_requests(&network),
+            IpcMessage::AcceptRequest { network, id } => self.accept_request(&network, &id).await,
+            IpcMessage::DenyRequest { network, id } => self.deny_request(&network, &id),
             other => IpcMessage::Error {
                 message: format!("unexpected message: {:?}", other),
             },
@@ -1193,7 +1197,6 @@ impl DaemonState {
         }
 
         let my_ip = self.identity.local_ip();
-        let policy = policy_for_mode(mode);
 
         let my_hostname = match hostname {
             Some(h) => {
@@ -1237,6 +1240,8 @@ impl DaemonState {
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: net_public_key,
             network_name: Some(name.clone()),
+            mode,
+            pending: HashMap::new(),
         };
 
         // Load ACL from file if it exists
@@ -1323,6 +1328,7 @@ impl DaemonState {
 
         let cancel = self.shutdown_token.child_token();
         let state = Arc::new(std::sync::RwLock::new(net_state));
+        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
         let mut tasks = Vec::new();
 
         // Network publisher (single pkarr record: blob hash + seed peers)
@@ -1364,7 +1370,6 @@ impl DaemonState {
                 endpoint: self.endpoint.clone(),
                 network_name: name.clone(),
                 identity: self.identity.clone(),
-                policy: policy.into(),
                 state: state.clone(),
                 peers: self.peers.clone(),
                 tun_tx: self.tun_tx.clone(),
@@ -1378,6 +1383,7 @@ impl DaemonState {
                 hostname_table: self.hostname_table.clone(),
                 reverse_table: self.reverse_table.clone(),
                 device_user_map: self.device_user_map.clone(),
+                invite_lock: invite_lock.clone(),
             })),
         );
 
@@ -1390,6 +1396,7 @@ impl DaemonState {
             state,
             cancel,
             tasks,
+            invite_lock,
         };
         self.networks.insert(name.clone(), handle);
         self.refresh_alpns().await;
@@ -1406,13 +1413,66 @@ impl DaemonState {
 
     #[tracing::instrument(skip(self, hostname), fields(net = name.unwrap_or(network_key)))]
     async fn join_network(
-        &self,
+        self: &Arc<Self>,
         network_key: &str,
         name: Option<&str>,
         hostname: Option<String>,
+        invite: Option<Vec<u8>>,
+        coordinator: Option<EndpointId>,
     ) -> IpcMessage {
-        match self.join_network_inner(network_key, name, hostname).await {
-            Ok(resp) => resp,
+        match self
+            .join_network_inner(
+                network_key,
+                name,
+                hostname.clone(),
+                invite.clone(),
+                coordinator,
+                true,
+            )
+            .await
+        {
+            Ok(TryJoin::Joined(resp)) => resp,
+            Ok(TryJoin::Pending) => {
+                // Closed network: queued for live approval. Retry in the
+                // background on a backoff until `ray accept` admits us.
+                let me = Arc::clone(self);
+                let nk = network_key.to_string();
+                let nm = name.map(|s| s.to_string());
+                tokio::spawn(async move {
+                    let mut backoff = BACKOFF_INITIAL;
+                    loop {
+                        tokio::select! {
+                            _ = me.shutdown_token.cancelled() => return,
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = (backoff * 2).min(BACKOFF_MAX);
+                        match me
+                            .join_network_inner(
+                                &nk,
+                                nm.as_deref(),
+                                hostname.clone(),
+                                invite.clone(),
+                                coordinator,
+                                true,
+                            )
+                            .await
+                        {
+                            Ok(TryJoin::Joined(_)) => {
+                                tracing::info!(net = %nk, "approval granted — joined");
+                                return;
+                            }
+                            Ok(TryJoin::Pending) => continue,
+                            Err(e) => {
+                                tracing::warn!(net = %nk, error = %e, "join retry failed");
+                            }
+                        }
+                    }
+                });
+                IpcMessage::Ok {
+                    message: "join request sent — waiting for coordinator approval (run `ray status` to check)"
+                        .to_string(),
+                }
+            }
             Err(e) => IpcMessage::Error {
                 message: format!("{e:#}"),
             },
@@ -1420,19 +1480,23 @@ impl DaemonState {
     }
 
     async fn join_network_inner(
-        &self,
+        self: &Arc<Self>,
         network_key: &str,
         alias: Option<&str>,
         hostname: Option<String>,
-    ) -> Result<IpcMessage> {
+        invite: Option<Vec<u8>>,
+        coordinator: Option<EndpointId>,
+        // True for a fresh join (we send a JoinRequest first); false when
+        // restoring a network we're already a member of (legacy handshake where
+        // the coordinator speaks first).
+        initial: bool,
+    ) -> Result<TryJoin> {
         let net_pubkey: EndpointId = network_key.parse().context("invalid network key")?;
 
         if let Some(a) = alias
             && self.networks.contains_key(a)
         {
-            return Ok(IpcMessage::Error {
-                message: format!("already in network '{a}'"),
-            });
+            anyhow::bail!("already in network '{a}'");
         }
 
         // Resolve single pkarr record → (blob_hash, seed_peers)
@@ -1442,9 +1506,7 @@ impl DaemonState {
             .context("failed to resolve network record")?;
 
         if peer_ids.is_empty() {
-            return Ok(IpcMessage::Error {
-                message: "no peers found in network record".to_string(),
-            });
+            anyhow::bail!("no peers found in network record");
         }
 
         let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
@@ -1476,51 +1538,26 @@ impl DaemonState {
         let display_name = display_name_owned.as_str();
 
         if self.networks.contains_key(display_name) {
-            return Ok(IpcMessage::Error {
-                message: format!("already in network '{display_name}'"),
-            });
+            anyhow::bail!("already in network '{display_name}'");
         }
 
-        // Connect to the first reachable peer
-        tracing::info!(alpn = %String::from_utf8_lossy(&alpn), peers = peer_ids.len(), "connecting to seed peers");
-        let mut initial_conn = None;
-        for peer_id in &peer_ids {
-            if *peer_id == self.endpoint.id() {
-                continue;
-            }
-            match transport::connect_to_peer_with_alpn(&self.endpoint, *peer_id, &alpn).await {
-                Ok(conn) => {
-                    initial_conn = Some(conn);
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(peer = %peer_id.fmt_short(), error = ?e, "failed to connect to seed peer");
-                }
-            }
-        }
-
-        // Fall back to known members from the group blob
-        if initial_conn.is_none() {
-            let my_identity = self.identity.local_identity();
-            for member in &data.members {
-                if member.identity == my_identity {
-                    continue;
-                }
-                match transport::connect_to_peer_with_alpn(&self.endpoint, member.identity, &alpn)
-                    .await
-                {
-                    Ok(conn) => {
-                        initial_conn = Some(conn);
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!(peer = %member.identity.fmt_short(), error = %e, "failed to connect to member");
-                    }
-                }
-            }
-        }
-
-        let conn = initial_conn.context("could not connect to any peer in the network")?;
+        // Admission always runs through the coordinator (only it can approve an
+        // unknown peer or redeem an invite). An invite pins the coordinator's id;
+        // otherwise it's the member flagged `is_coordinator` in the GroupBlob.
+        let coordinator_id = coordinator
+            .or_else(|| {
+                data.members
+                    .iter()
+                    .find(|m| m.is_coordinator)
+                    .map(|m| m.identity)
+            })
+            .context("no coordinator found in network record")?;
+        tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
+        let conn = transport::connect_to_peer_with_alpn(&self.endpoint, coordinator_id, &alpn)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("coordinator offline; cannot join this network right now: {e}")
+            })?;
 
         let my_hostname = match hostname {
             Some(h) => {
@@ -1558,7 +1595,7 @@ impl DaemonState {
         // Apply ACL from group blob
         self.shared_acl.set(display_name, data.acl.clone());
 
-        let state = join_mesh_shared(
+        let state = match join_mesh_shared(
             conn,
             &self.endpoint,
             display_name,
@@ -1576,8 +1613,20 @@ impl DaemonState {
             net_pubkey,
             self.device_cert.clone(),
             self.device_user_map.clone(),
+            invite,
+            initial,
         )
-        .await?;
+        .await?
+        {
+            JoinResult::Joined(state) => state,
+            JoinResult::Pending => {
+                // Closed network: we've been queued for live approval. Stop the
+                // just-spawned reconnect loop (nothing is connected yet) and let
+                // the caller retry on a backoff until `ray accept` lets us in.
+                cancel.cancel();
+                return Ok(TryJoin::Pending);
+            }
+        };
 
         self.protocol_router.register(
             alpn.clone(),
@@ -1652,6 +1701,7 @@ impl DaemonState {
             state,
             cancel,
             tasks,
+            invite_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         self.networks.insert(display_name.to_string(), handle);
         self.refresh_alpns().await;
@@ -1682,11 +1732,11 @@ impl DaemonState {
 
         tracing::info!(network = %display_name, key = %network_key, ip = %my_ip, "joined network");
 
-        Ok(IpcMessage::Joined {
+        Ok(TryJoin::Joined(IpcMessage::Joined {
             name: display_name.to_string(),
             my_ip,
             my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
-        })
+        }))
     }
 
     async fn try_fetch_group_blob(
@@ -1849,6 +1899,8 @@ impl DaemonState {
                 network_secret_key: None,
                 network_public_key: net_pubkey,
                 network_name: data.name.clone(),
+                mode: GroupMode::Restricted,
+                pending: HashMap::new(),
             };
             ns.refresh_snapshot();
             let live_state = Arc::new(std::sync::RwLock::new(ns));
@@ -1861,6 +1913,7 @@ impl DaemonState {
                 state: live_state,
                 cancel,
                 tasks,
+                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
             };
             self.networks.insert(network_name.to_string(), handle);
             self.refresh_alpns().await;
@@ -1886,7 +1939,6 @@ impl DaemonState {
         }
 
         let my_ip = self.identity.local_ip();
-        let policy = policy_for_mode(mode);
 
         // Load persisted network secret key from config
         let app_config = config::load()?;
@@ -1946,6 +1998,8 @@ impl DaemonState {
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: net_public_key,
             network_name: Some(name.to_string()),
+            mode,
+            pending: HashMap::new(),
         };
 
         // Load persisted ACL file if it exists
@@ -2035,6 +2089,7 @@ impl DaemonState {
 
         let cancel = self.shutdown_token.child_token();
         let state = Arc::new(std::sync::RwLock::new(net_state));
+        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
         let mut tasks = Vec::new();
 
         let dht_notify = Arc::new(tokio::sync::Notify::new());
@@ -2079,7 +2134,6 @@ impl DaemonState {
                 endpoint: self.endpoint.clone(),
                 network_name: name.to_string(),
                 identity: self.identity.clone(),
-                policy: policy.into(),
                 state: state.clone(),
                 peers: self.peers.clone(),
                 tun_tx: self.tun_tx.clone(),
@@ -2093,6 +2147,7 @@ impl DaemonState {
                 hostname_table: self.hostname_table.clone(),
                 reverse_table: self.reverse_table.clone(),
                 device_user_map: self.device_user_map.clone(),
+                invite_lock: invite_lock.clone(),
             })),
         );
 
@@ -2131,6 +2186,7 @@ impl DaemonState {
             state,
             cancel,
             tasks,
+            invite_lock,
         };
         self.networks.insert(name.to_string(), handle);
         self.refresh_alpns().await;
@@ -2298,19 +2354,23 @@ impl DaemonState {
                 let daemon_c = Arc::clone(self);
                 tokio::spawn(async move {
                     match daemon_c
-                        .join_network_inner(&net_pubkey, Some(&name), persisted_hostname)
+                        .join_network_inner(
+                            &net_pubkey,
+                            Some(&name),
+                            persisted_hostname,
+                            None,
+                            None,
+                            false,
+                        )
                         .await
                     {
-                        Ok(IpcMessage::Joined { name, my_ip, .. }) => {
+                        Ok(TryJoin::Joined(IpcMessage::Joined { name, my_ip, .. })) => {
                             tracing::info!(network = %name, ip = %my_ip, "restored member network");
                         }
-                        Ok(IpcMessage::Error { message }) => {
-                            tracing::warn!(network = %name, error = %message, "failed to restore network");
-                        }
+                        Ok(_) => {}
                         Err(e) => {
                             tracing::warn!(network = %name, error = %e, "failed to restore network");
                         }
-                        _ => {}
                     }
                 });
             }
@@ -3040,6 +3100,260 @@ impl DaemonState {
         self.publish_and_broadcast_acl(network, &data).await;
         IpcMessage::Ok {
             message: "ACL applied".to_string(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Invite + join-request handlers (coordinator only)
+    // -----------------------------------------------------------------------
+
+    /// Look up an active network we coordinate, returning its public key and
+    /// invite lock, or an error response if it's absent or we're only a member.
+    #[allow(clippy::result_large_err)]
+    fn coordinator_handle(
+        &self,
+        network: &str,
+    ) -> std::result::Result<(EndpointId, Arc<tokio::sync::Mutex<()>>), IpcMessage> {
+        let Some(handle) = self.networks.get(network) else {
+            return Err(IpcMessage::Error {
+                message: format!("network '{network}' not active"),
+            });
+        };
+        if !handle.role.is_coordinator() {
+            return Err(IpcMessage::Error {
+                message: format!("only the coordinator of '{network}' can manage invites/requests"),
+            });
+        }
+        Ok((handle.network_key, handle.invite_lock.clone()))
+    }
+
+    async fn invite_create(&self, network: &str, expires_secs: u64) -> IpcMessage {
+        let (net_pubkey, lock) = match self.coordinator_handle(network) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let minted = {
+            let _guard = lock.lock().await;
+            match crate::invite::InviteStore::load(network) {
+                Ok(mut store) => store.mint(Duration::from_secs(expires_secs)),
+                Err(e) => Err(e),
+            }
+        };
+        match minted {
+            Ok((secret, id)) => {
+                let code =
+                    crate::invite::encode_invite_code(&net_pubkey, &self.endpoint.id(), &secret);
+                IpcMessage::InviteCreated {
+                    code,
+                    id,
+                    expires_secs,
+                }
+            }
+            Err(e) => IpcMessage::Error {
+                message: format!("failed to mint invite: {e:#}"),
+            },
+        }
+    }
+
+    async fn invite_list(&self, network: &str) -> IpcMessage {
+        let (_net_pubkey, lock) = match self.coordinator_handle(network) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let _guard = lock.lock().await;
+        let store = match crate::invite::InviteStore::load(network) {
+            Ok(s) => s,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to read invites: {e:#}"),
+                };
+            }
+        };
+        let invites = store
+            .list()
+            .into_iter()
+            .map(|v| ipc::InviteInfo {
+                id: v.id,
+                status: v.status,
+                created: v.created,
+                expires: v.expires,
+                redeemer: v.redeemer,
+            })
+            .collect();
+        IpcMessage::InviteListResponse { invites }
+    }
+
+    async fn invite_revoke(&self, network: &str, id: &str) -> IpcMessage {
+        let (_net_pubkey, lock) = match self.coordinator_handle(network) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let result = {
+            let _guard = lock.lock().await;
+            match crate::invite::InviteStore::load(network) {
+                Ok(mut store) => store.revoke(id),
+                Err(e) => Err(e),
+            }
+        };
+        match result {
+            Ok(()) => IpcMessage::Ok {
+                message: format!("revoked invite '{id}'"),
+            },
+            Err(e) => IpcMessage::Error {
+                message: format!("{e:#}"),
+            },
+        }
+    }
+
+    fn list_requests(&self, network: &str) -> IpcMessage {
+        let Some(handle) = self.networks.get(network) else {
+            return IpcMessage::Error {
+                message: format!("network '{network}' not active"),
+            };
+        };
+        if !handle.role.is_coordinator() {
+            return IpcMessage::Error {
+                message: format!("only the coordinator of '{network}' has join requests"),
+            };
+        }
+        let s = handle.state.read().unwrap();
+        let requests = s
+            .pending
+            .iter()
+            .map(|(id, pj)| ipc::PendingRequestInfo {
+                short_id: id.fmt_short().to_string(),
+                hostname: pj.hostname.clone(),
+                waiting_secs: pj.requested_at.elapsed().as_secs(),
+            })
+            .collect();
+        IpcMessage::PendingRequests { requests }
+    }
+
+    async fn accept_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
+        if let Err(e) = self.coordinator_handle(network) {
+            return e;
+        }
+        // Find and remove the pending request matching the short id prefix.
+        let pending = {
+            let Some(handle) = self.networks.get(network) else {
+                return IpcMessage::Error {
+                    message: format!("network '{network}' not active"),
+                };
+            };
+            let mut s = handle.state.write().unwrap();
+            let found = s
+                .pending
+                .keys()
+                .find(|k| {
+                    k.fmt_short().to_string().starts_with(id_prefix) || k.to_string().starts_with(id_prefix)
+                })
+                .copied();
+            found.and_then(|id| s.pending.remove(&id).map(|pj| (id, pj)))
+        };
+        let Some((identity, pj)) = pending else {
+            return IpcMessage::Error {
+                message: format!("no pending request matching '{id_prefix}'"),
+            };
+        };
+
+        let ip = self.identity.derive_ip(&identity);
+        let user_id = pj.device_cert.as_ref().map(|c| c.user_identity);
+        {
+            let Some(handle) = self.networks.get(network) else {
+                return IpcMessage::Error {
+                    message: format!("network '{network}' not active"),
+                };
+            };
+            let mut s = handle.state.write().unwrap();
+            let members = s.members.clone();
+            let _ = s.approved.approve(
+                ApprovedEntry {
+                    identity,
+                    ip,
+                    hostname: pj.hostname.clone(),
+                    user_identity: user_id,
+                    device_cert: pj.device_cert.clone(),
+                },
+                &members,
+            );
+            s.refresh_snapshot();
+        }
+        self.store_and_publish_group(network).await;
+        broadcast_control_msg(
+            &self.peers,
+            &ControlMsg::MemberApproved {
+                identity,
+                ip,
+                hostname: pj.hostname.clone(),
+                device_cert: pj.device_cert.clone(),
+            },
+        )
+        .await;
+        IpcMessage::Ok {
+            message: format!("accepted {} — they'll join shortly", identity.fmt_short()),
+        }
+    }
+
+    fn deny_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
+        if let Err(e) = self.coordinator_handle(network) {
+            return e;
+        }
+        let Some(handle) = self.networks.get(network) else {
+            return IpcMessage::Error {
+                message: format!("network '{network}' not active"),
+            };
+        };
+        let mut s = handle.state.write().unwrap();
+        let found = s
+            .pending
+            .keys()
+            .find(|k| k.fmt_short().to_string().starts_with(id_prefix) || k.to_string().starts_with(id_prefix))
+            .copied();
+        match found {
+            Some(id) => {
+                s.pending.remove(&id);
+                IpcMessage::Ok {
+                    message: format!("denied {}", id.fmt_short()),
+                }
+            }
+            None => IpcMessage::Error {
+                message: format!("no pending request matching '{id_prefix}'"),
+            },
+        }
+    }
+
+    /// Store the current group snapshot as a blob and re-publish the pkarr record
+    /// so members reconcile the new membership (used after `ray accept`).
+    async fn store_and_publish_group(&self, network: &str) {
+        let (hash, net_key, snap_bytes) = {
+            let Some(handle) = self.networks.get(network) else {
+                return;
+            };
+            let s = handle.state.read().unwrap();
+            (
+                s.snapshot.as_ref().map(|x| x.hash),
+                s.network_secret_key.clone(),
+                s.snapshot.as_ref().map(|x| x.msgpack_bytes.clone()),
+            )
+        };
+        if let Some(bytes) = snap_bytes {
+            let _ = self.blob_store.blobs().add_slice(&bytes).await;
+        }
+        if let (Some(hash), Some(key)) = (hash, net_key)
+            && let Ok(client) = dht::create_pkarr_client(&self.endpoint)
+        {
+            let mut seed_peers: Vec<EndpointId> = self
+                .peers
+                .peers_for_network(network)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            seed_peers.push(self.endpoint.id());
+            seed_peers.sort_by_key(|id| id.to_string());
+            seed_peers.dedup();
+            if let Err(e) = dht::publish_network(&client, &key, &hash, &seed_peers).await {
+                tracing::warn!(error = %e, "failed to publish network record after accept");
+            }
         }
     }
 
@@ -4174,6 +4488,21 @@ async fn update_snapshot_and_publish(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Result of the initial join handshake against the coordinator.
+enum JoinResult {
+    /// Admitted (open network, valid invite, or pre-approved): live network state.
+    Joined(Arc<std::sync::RwLock<NetworkState>>),
+    /// Queued for live approval on a closed network; the caller should retry.
+    Pending,
+}
+
+/// Outcome of one `join_network_inner` attempt.
+enum TryJoin {
+    Joined(IpcMessage),
+    Pending,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn join_mesh_shared(
     initial_conn: Connection,
     ep: &Endpoint,
@@ -4192,43 +4521,85 @@ async fn join_mesh_shared(
     net_pubkey: EndpointId,
     device_cert: Option<control::DeviceCert>,
     device_user_map: peers::DeviceUserMap,
-) -> Result<Arc<std::sync::RwLock<NetworkState>>> {
+    invite_secret: Option<Vec<u8>>,
+    initial: bool,
+) -> Result<JoinResult> {
     let my_identity = identity.local_identity();
     let my_ip = identity.local_ip();
 
-    let (_send, mut recv) = initial_conn
-        .accept_bi()
+    // Handshake. A fresh join (`initial`) opens a stream and sends a JoinRequest
+    // first (carrying the invite secret + hostname), then reads the coordinator's
+    // verdict on the same stream. A reconnect/restore keeps the legacy handshake
+    // where the coordinator speaks first (Welcome/MemberSync).
+    let (members, approved) = if initial {
+        let (mut send, mut recv) = initial_conn
+            .open_bi()
+            .await
+            .context("open join control stream")?;
+        control::send_msg(
+            &mut send,
+            &ControlMsg::JoinRequest {
+                invite_secret,
+                hostname: my_hostname.clone(),
+                device_cert: device_cert.clone(),
+            },
+        )
         .await
-        .context("accept control stream")?;
-    let msg = control::recv_msg(&mut recv).await?;
-    let (members, approved) = match msg {
-        ControlMsg::Welcome { members, approved } => {
-            tracing::info!(network = %network_name, "welcomed to network");
-            if let Some(existing) = members
-                .iter()
-                .find(|m| m.ip == my_ip && m.identity != my_identity)
-            {
-                anyhow::bail!(
-                    "IP collision: {} is already assigned to {}",
-                    my_ip,
-                    existing.identity
-                );
+        .context("send join request")?;
+        let msg = tokio::time::timeout(Duration::from_secs(30), control::recv_msg(&mut recv))
+            .await
+            .context("timeout awaiting join response")??;
+        match msg {
+            ControlMsg::Welcome { members, approved } => {
+                tracing::info!(network = %network_name, "welcomed to network");
+                if let Some(existing) = members
+                    .iter()
+                    .find(|m| m.ip == my_ip && m.identity != my_identity)
+                {
+                    anyhow::bail!(
+                        "IP collision: {} is already assigned to {}",
+                        my_ip,
+                        existing.identity
+                    );
+                }
+                (members, approved)
             }
-            (members, approved)
+            ControlMsg::JoinPending => {
+                tracing::info!(network = %network_name, "join pending operator approval");
+                return Ok(JoinResult::Pending);
+            }
+            ControlMsg::JoinDenied { reason } => {
+                anyhow::bail!("join denied: {reason}");
+            }
+            other => {
+                anyhow::bail!("expected Welcome or JoinPending, got {other:?}");
+            }
         }
-        ControlMsg::JoinApproved { your_ip, members } => {
-            tracing::info!(ip = %your_ip, network = %network_name, "joined network (legacy)");
-            (members, vec![])
-        }
-        ControlMsg::MemberSync { members } => {
-            tracing::info!(network = %network_name, "reconnected via peer");
-            (members, vec![])
-        }
-        ControlMsg::JoinDenied { reason } => {
-            anyhow::bail!("join denied: {reason}");
-        }
-        other => {
-            anyhow::bail!("expected Welcome or MemberSync, got {other:?}");
+    } else {
+        let (_send, mut recv) = initial_conn
+            .accept_bi()
+            .await
+            .context("accept control stream")?;
+        let msg = control::recv_msg(&mut recv).await?;
+        match msg {
+            ControlMsg::Welcome { members, approved } => {
+                tracing::info!(network = %network_name, "welcomed to network");
+                (members, approved)
+            }
+            ControlMsg::JoinApproved { your_ip, members } => {
+                tracing::info!(ip = %your_ip, network = %network_name, "joined network (legacy)");
+                (members, vec![])
+            }
+            ControlMsg::MemberSync { members } => {
+                tracing::info!(network = %network_name, "reconnected via peer");
+                (members, vec![])
+            }
+            ControlMsg::JoinDenied { reason } => {
+                anyhow::bail!("join denied: {reason}");
+            }
+            other => {
+                anyhow::bail!("expected Welcome or MemberSync, got {other:?}");
+            }
         }
     };
 
@@ -4272,8 +4643,9 @@ async fn join_mesh_shared(
     );
     config::save(&app_config)?;
 
-    // Send MeshHello to coordinator so it learns our hostname
-    {
+    // On reconnect/restore the coordinator hasn't seen our hostname this session,
+    // so send a MeshHello. A fresh join already conveyed it in the JoinRequest.
+    if !initial {
         let (mut send, _recv) = initial_conn.open_bi().await?;
         control::send_msg(
             &mut send,
@@ -4373,6 +4745,8 @@ async fn join_mesh_shared(
             network_secret_key: None,
             network_public_key: net_pubkey,
             network_name: Some(network_name.to_string()),
+            mode: GroupMode::Restricted,
+            pending: HashMap::new(),
         };
         ns.refresh_snapshot();
         if let Some(snap) = &ns.snapshot {
@@ -4464,7 +4838,7 @@ async fn join_mesh_shared(
         }
     });
 
-    Ok(live_state)
+    Ok(JoinResult::Joined(live_state))
 }
 
 #[allow(clippy::too_many_arguments)]

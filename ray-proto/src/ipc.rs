@@ -25,6 +25,13 @@ pub enum IpcMessage {
         name: Option<String>,
         hostname: Option<String>,
         transport: Option<TransportMode>,
+        /// One-time invite secret to present for invite-gated admission. When set,
+        /// `coordinator` is dialed directly (no pkarr lookup).
+        #[serde(default)]
+        invite: Option<Vec<u8>>,
+        /// Coordinator endpoint id to dial directly when joining via an invite.
+        #[serde(default)]
+        coordinator: Option<EndpointId>,
     },
     Leave {
         name: String,
@@ -109,6 +116,34 @@ pub enum IpcMessage {
     SetOperator {
         uid: u32,
     },
+    /// Mint a one-time invite for a closed network (coordinator-only).
+    InviteCreate {
+        network: String,
+        expires_secs: u64,
+    },
+    /// List invites for a network (coordinator-only).
+    InviteList {
+        network: String,
+    },
+    /// Revoke an unused invite by id (coordinator-only).
+    InviteRevoke {
+        network: String,
+        id: String,
+    },
+    /// List peers awaiting live approval on a closed network (coordinator-only).
+    Requests {
+        network: String,
+    },
+    /// Admit a pending peer by short id (coordinator-only).
+    AcceptRequest {
+        network: String,
+        id: String,
+    },
+    /// Drop a pending peer's join request by short id (coordinator-only).
+    DenyRequest {
+        network: String,
+        id: String,
+    },
 
     // Responses
     Ok {
@@ -162,6 +197,37 @@ pub enum IpcMessage {
         issue_title: String,
         issue_body: String,
     },
+    /// An invite was minted; `code` is the shareable invite string.
+    InviteCreated {
+        code: String,
+        id: String,
+        expires_secs: u64,
+    },
+    /// The list of invites for a network.
+    InviteListResponse {
+        invites: Vec<InviteInfo>,
+    },
+    /// The list of peers awaiting live approval.
+    PendingRequests {
+        requests: Vec<PendingRequestInfo>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InviteInfo {
+    pub id: String,
+    /// One of `pending`, `redeemed`, `revoked`, `expired`.
+    pub status: String,
+    pub created: u64,
+    pub expires: u64,
+    pub redeemer: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingRequestInfo {
+    pub short_id: String,
+    pub hostname: Option<String>,
+    pub waiting_secs: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -397,6 +463,72 @@ mod tests {
         match decoded {
             IpcMessage::ReportBundle { path, .. } => {
                 assert!(path.ends_with(".tgz"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_invite_create_roundtrip() {
+        let req = IpcMessage::InviteCreate {
+            network: "gaming".to_string(),
+            expires_secs: 604_800,
+        };
+        let bytes = rmp_serde::to_vec(&req).unwrap();
+        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded {
+            IpcMessage::InviteCreate {
+                network,
+                expires_secs,
+            } => {
+                assert_eq!(network, "gaming");
+                assert_eq!(expires_secs, 604_800);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_invite_list_response_roundtrip() {
+        let resp = IpcMessage::InviteListResponse {
+            invites: vec![InviteInfo {
+                id: "ab3f9c01".to_string(),
+                status: "pending".to_string(),
+                created: 1000,
+                expires: 2000,
+                redeemer: None,
+            }],
+        };
+        let bytes = rmp_serde::to_vec(&resp).unwrap();
+        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded {
+            IpcMessage::InviteListResponse { invites } => {
+                assert_eq!(invites.len(), 1);
+                assert_eq!(invites[0].status, "pending");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_join_with_invite_roundtrip() {
+        let coord = iroh::SecretKey::generate().public();
+        let req = IpcMessage::Join {
+            network_key: "abc".to_string(),
+            name: None,
+            hostname: None,
+            transport: None,
+            invite: Some(vec![1, 2, 3]),
+            coordinator: Some(coord),
+        };
+        let bytes = rmp_serde::to_vec(&req).unwrap();
+        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded {
+            IpcMessage::Join {
+                invite, coordinator, ..
+            } => {
+                assert_eq!(invite, Some(vec![1, 2, 3]));
+                assert_eq!(coordinator, Some(coord));
             }
             _ => panic!("wrong variant"),
         }

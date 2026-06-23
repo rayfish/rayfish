@@ -55,6 +55,21 @@ pub enum PairMsg {
 /// Control messages exchanged between peers over QUIC bidirectional streams.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMsg {
+    /// Sent by a joining peer as the first message on an initial (non-reconnect)
+    /// join. Carries an optional invite secret (for invite-gated admission) and
+    /// the joiner's desired hostname/device cert. The coordinator branches on the
+    /// secret and the network's access mode to admit, gate, or deny.
+    JoinRequest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invite_secret: Option<Vec<u8>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_cert: Option<DeviceCert>,
+    },
+    /// Coordinator response telling the joiner it has been queued for live
+    /// approval (closed network, no invite). The joiner retries until accepted.
+    JoinPending,
     JoinApproved {
         your_ip: Ipv4Addr,
         members: Vec<Member>,
@@ -196,6 +211,38 @@ mod tests {
             hostname: None,
             device_cert: None,
         };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_join_request() {
+        let msg = ControlMsg::JoinRequest {
+            invite_secret: Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
+            hostname: Some("alice".to_string()),
+            device_cert: None,
+        };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_join_request_no_invite() {
+        let msg = ControlMsg::JoinRequest {
+            invite_secret: None,
+            hostname: None,
+            device_cert: None,
+        };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_join_pending() {
+        let msg = ControlMsg::JoinPending;
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
         assert_eq!(msg, decoded);

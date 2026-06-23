@@ -3810,6 +3810,7 @@ dependencies = [
  "smol_str 0.3.6",
  "system-configuration",
  "tar",
+ "tempfile",
  "tokio",
  "tokio-util",
  "toml",

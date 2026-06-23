@@ -17,14 +17,18 @@ The daemon (`ray daemon`) owns the TUN device and iroh endpoint and runs as a sy
 
 ```bash
 sudo ray up                    # install+start the service, then activate the VPN
-ray create [--name n] [--hostname h] [--tor]   # create network, prints join code (public key)
-ray join <public-key> [--name alias] [--hostname h] [--tor]
+ray create [--open] [--name n] [--hostname h] [--tor]   # closed by default; --open = public network. Prints room id (public key)
+ray join <room-id-or-invite> [--name alias] [--hostname h] [--tor]  # join by room id or one-time invite code
 ray leave <net> | nuke <net>   # nuke = publish empty record then leave
 ray hostname <net> <name>      # change hostname on existing network
 ray status                     # all networks (works without daemon)
 ray report                     # bundle logs+metrics, open a pre-filled GitHub issue
 ray up | down                  # activate / standby (TUN + DNS), daemon stays running
 
+ray invite <net> [--expires 7d]            # coordinator-only: mint single-use invite (+QR)
+ray invite <net> list|revoke <id>          # list / revoke invites
+ray requests <net>             # coordinator-only: peers awaiting live approval
+ray accept <net> <id> | deny <net> <id>    # admit / reject a pending join request
 ray acl <net> tag|untag|allow|remove|show|apply ...   # coordinator-only network ACL
 ray firewall show|default|add|remove ...               # per-device local firewall
 ray mdns on|off                # local peer discovery (default on)
@@ -59,17 +63,18 @@ A single iroh Endpoint and TUN device are shared across all networks. Each netwo
 ### Modules
 
 - `src/main.rs` — thin clap CLI + IPC client; service install/start (`cmd_up`, `install_and_start_service`), `cmd_install`/`cmd_restart`/`cmd_uninstall_service` (root-gated), `cmd_set_operator`, `cmd_pair`. `ray daemon` (hidden) runs the foreground daemon loop.
-- `src/daemon.rs` — daemon process: `DaemonState` (endpoint + TUN + PeerTable + ProtocolRouter), `NetworkHandle` per active network, IPC server, accept handling (`CoordinatorAcceptState`/`MemberAcceptState` via `AcceptHandler`), reconnect loop, DHT publisher, group poller, activate/deactivate (up/down), nuke, ACL/firewall/file/pairing IPC handlers, DNS table updates.
-- `src/ipc.rs` — `IpcMessage` enum (requests + responses), `MsgpackCodec` (length-prefixed msgpack over Unix socket), socket at `/var/run/rayfish/rayfish.sock`.
+- `src/daemon.rs` — daemon process: `DaemonState` (endpoint + TUN + PeerTable + ProtocolRouter), `NetworkHandle` per active network (with per-network `invite_lock`), `NetworkState` (carries access `mode` + in-memory `pending` join requests), IPC server, accept handling (`CoordinatorAcceptState`/`MemberAcceptState` via `AcceptHandler`), reconnect loop, DHT publisher, group poller, activate/deactivate (up/down), nuke, invite/approval + ACL/firewall/file/pairing IPC handlers, DNS table updates. Coordinator admission gate lives in `CoordinatorAcceptState::handle_connection` → `admit_peer` (open mode / valid invite / pre-approved) vs queue-as-pending (closed).
+- `src/ipc.rs` — `IpcMessage` enum (requests + responses incl. `InviteCreate`/`InviteList`/`InviteRevoke`/`Requests`/`AcceptRequest`/`DenyRequest` + `InviteCreated`/`InviteListResponse`/`PendingRequests`; `Join` carries optional `invite` secret + `coordinator` to dial directly), `MsgpackCodec` (length-prefixed msgpack over Unix socket), socket at `/var/run/rayfish/rayfish.sock`.
 - `src/identity.rs` — persistent Ed25519 keypair (`~/.config/rayfish/secret_key`); device certs (`create/store/load_device_cert`).
+- `src/invite.rs` — coordinator-only one-time invite ledger (`~/.config/rayfish/invites/<network>.toml`): `Invite { id, secret_hash, created, expires, status }`, `InviteStore` (`mint`/`redeem`/`revoke`/`list`, single-use + expiry, blake3-hashed secrets); `encode_invite_code`/`decode_invite_code` = `bs58(network_pubkey(32) || coordinator(32) || secret(16))`. Never published in the GroupBlob.
 - `src/membership.rs` — `IdentityProvider`, IPv4/IPv6 derivation, `MemberList`/`ApprovedList`, `GroupBlob { members, approved, acl }` with canonical msgpack + blake3 hashing; `Member`/`ApprovedEntry` carry optional `user_identity` + `device_cert`.
 - `src/transport.rs` — iroh endpoint setup, per-network ALPN; optional Tor transport (`tor` feature).
 - `src/tun.rs` — async dual-stack TUN (IPv4 /10 + IPv6 /128), split into `TunReader`/`TunWriter`; `configure_ipv6()` assigns the TUN's own IPv6 address at creation (Linux netlink via rtnetlink, macOS ifconfig); `route_peer_range()` installs the `200::/7` peer-range route into the TUN and **must run after link-up** (called from `DaemonState::activate()` post-`set_link_up`) — on Linux the kernel won't install an IPv6 connected route while the link is down, so peer traffic would otherwise leak out the host's default IPv6 route (Linux: rtnetlink `RouteMessageBuilder`; macOS: explicit `route add -inet6 -net 200::/7`). Idempotent across `up`/`down` cycles.
 - `src/forward.rs` — TUN ↔ peer forwarding via dual-stack routing lookup; ACL + firewall enforcement; labeled drop counters; resolves transport keys to user identities via `DeviceUserMap`.
 - `src/dht.rs` — one pkarr record per network (blob hash + seed peers); only the coordinator (per-network secret key) can publish.
-- `src/control.rs` — length-prefixed msgpack control protocol over QUIC streams (Welcome, MemberApproved, MeshHello, BlobUpdated, …); `DeviceCert`, `PairMsg`.
+- `src/control.rs` — length-prefixed msgpack control protocol over QUIC streams (`JoinRequest`, `JoinPending`, Welcome, MemberApproved, MeshHello, BlobUpdated, …); `DeviceCert`, `PairMsg`. A fresh joiner sends `JoinRequest { invite_secret, hostname, device_cert }` first; the coordinator replies `Welcome`, `JoinPending`, or `JoinDenied` on the same stream.
 - `src/peers.rs` — `PeerTable` (dual v4/v6 DashMaps), `DeviceUserMap`, ACL-aware `lookup_full()`.
-- `src/config.rs` — network config (`~/.config/rayfish/networks.toml`): per-network secret/public key, `my_hostname`; `AppConfig.operator_uid`.
+- `src/config.rs` — network config (`~/.config/rayfish/networks.toml`): per-network secret/public key, `my_hostname`, `group_mode` (open/restricted, persisted at create); `AppConfig.operator_uid`.
 - `src/acl.rs` — identity/tag-based ACL engine + `.acl` file format; no rules = allow-all, any rules = deny-all except explicit allows.
 - `src/firewall.rs` — per-device firewall (direction/proto/port/peer), `ArcSwap` for lock-free reads, dual-stack packet parsing; `firewall.toml`.
 - `src/dns.rs` — Magic DNS server on `127.0.0.1:53` (A/AAAA/PTR/SOA for `*.ray`); forward `HostnameTable` + `ReverseLookupTable`.
@@ -81,9 +86,10 @@ A single iroh Endpoint and TUN device are shared across all networks. Each netwo
 
 ### Key flows
 
-- **Create:** generate per-network `SecretKey` → derive addresses → build initial `GroupBlob` → publish blob + signed pkarr record → persist keys → print public key as join code.
-- **Join:** resolve pkarr record → fetch + verify `GroupBlob` from a seed peer → apply members/approved/ACL → connect to peers with `MeshHello` → poll pkarr for blob updates.
-- **Gatekeeper:** coordinator approves identities and broadcasts `MemberApproved`; any peer can then welcome an approved identity, so the coordinator need not be online when it joins.
+- **Create:** generate per-network `SecretKey` → derive addresses → build initial `GroupBlob` → publish blob + signed pkarr record → persist keys + `group_mode` → print public key as the room id. Closed (`Restricted`) by default; `--open` for a public network.
+- **Access modes & admission:** the room id (network public key) is a published discovery key, **never** an admission credential. **Open** networks auto-admit any peer that reaches the coordinator. **Closed** networks gate admission two ways: a one-time **invite** (`ray invite` → `bs58(pubkey || coordinator || secret)`, redeemed+burned by the coordinator under `invite_lock`) or **live approval** (unknown peer is queued in `NetworkState.pending`, surfaced via `ray requests`, admitted with `ray accept` which moves it to the `ApprovedList`). Either path runs through the coordinator, so it must be online to admit. Invites are coordinator-only local state, never in the GroupBlob.
+- **Join handshake:** resolve pkarr record → fetch + verify `GroupBlob` → dial the **coordinator** (`is_coordinator`, or the id pinned in the invite) → send `JoinRequest { invite_secret? }` first → coordinator replies `Welcome` (admitted), `JoinPending` (closed, awaiting `ray accept` — the joiner retries with backoff until welcomed), or `JoinDenied`. Then connect to other members with `MeshHello` and poll pkarr for blob updates. Reconnecting/restoring members use the legacy coordinator-speaks-first handshake (`initial = false`).
+- **Gatekeeper:** the coordinator approves identities and broadcasts `MemberApproved`; once approved, any peer can welcome that identity, so the coordinator need not be online for the *member's* later reconnects (only for the initial admission).
 - **DHT (single-record):** one pkarr record per network signed by the per-network secret key. The pkarr address *is* the network public key, so records can't be spoofed (MITM-resistant). `spawn_group_poller()` refetches the blob every 60s when the hash changes.
 - **ACL / firewall:** ACL is coordinator-managed, distributed in the GroupBlob, enforced at the routing layer; firewall is per-device, first-match-wins, enforced after ACL. Paired devices resolve to one user identity via `DeviceUserMap`.
 - **File sharing:** `ray send` adds the file to iroh-blobs and sends a `FileOffer` over `FILES_ALPN`; receiver queues it; `ray files accept` fetches the blob by hash and verifies it.
@@ -103,6 +109,6 @@ A single iroh Endpoint and TUN device are shared across all networks. Each netwo
 - Never share I/O resources (TUN, sockets, streams) behind a Mutex — split into read/write halves. Avoid Mutex generally: prefer channels, atomics, or `RwLock`/`ArcSwap` for fast non-async state.
 - ALPN per network: `rayfish/net/<pubkey-prefix>` (first 16 hex chars). File ALPN `rayfish/files/1`, pairing ALPN `rayfish/pair/1`.
 - TUN MTU 1200. Wire format (control + IPC): 4-byte BE length + msgpack body.
-- Join code = per-network public key string; local aliases (adjective-noun-noun) are display-only.
-- Config under `~/.config/rayfish/`: `secret_key`, `device_cert`, `networks.toml`, `firewall.toml`, `acl/<network>.acl`.
-- Always update docs (CLAUDE.md, docs/book.md, README.md) after finishing a feature or significant change.
+- Room id = per-network public key string (discovery only). On a closed network, joining needs a one-time invite or operator approval; on an open network the room id alone admits. Invite code = `bs58(pubkey || coordinator || secret)`. Local aliases (adjective-noun-noun) are display-only.
+- Config under `~/.config/rayfish/`: `secret_key`, `device_cert`, `networks.toml`, `firewall.toml`, `acl/<network>.acl`, `invites/<network>.toml` (coordinator-only).
+- Always update docs (CLAUDE.md, README.md) after finishing a feature or significant change.
