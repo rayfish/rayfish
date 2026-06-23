@@ -82,22 +82,25 @@ pub fn to_toml(spec: &DeploySpec) -> Result<String> {
 /// The example spec printed by `ray apply --example`.
 pub const EXAMPLE_SPEC: &str = r#"# Rayfish deploy spec. See `ray apply --help`.
 # Top level is a [networks] table; keys are network names.
+# Each port spec token is `proto:ports` or a bare proto keyword.
+#   tcp:22 | tcp:80-443 | tcp:* | udp:53 | icmp | any
+# Comma-separate multiple tokens: `tcp:22,icmp`
 
 [networks.gaming]
 trusted = true
 
-# Subject hostname "alice" accepts inbound :22 from "bob" and denies :443
+# Subject hostname "alice" accepts inbound :22 from "bob" and denies ICMP
 # from "eve", with a catch-all deny on everything else from this network.
 [networks.gaming.firewall.alice]
 default = "deny"
 [networks.gaming.firewall.alice.allows]
-bob = "22"
+bob = "tcp:22"
 [networks.gaming.firewall.alice.denies]
-eve = "443"
+eve = "icmp"
 
 [networks.gaming.firewall.bob]
 [networks.gaming.firewall.bob.allows]
-alice = "9000,8123"
+alice = "tcp:9000,tcp:8123"
 "#;
 
 /// Union of every hostname mentioned in the spec's `firewall:` blocks — both
@@ -132,7 +135,7 @@ trusted = true
 
 [networks.gaming.firewall.alice]
 default = "deny"
-allows = { bob = "22" }
+allows = { bob = "tcp:22" }
 "#;
         let spec = parse(toml).unwrap();
         assert_eq!(spec.len(), 1);
@@ -140,7 +143,7 @@ allows = { bob = "22" }
         assert!(g.trusted);
         let alice = g.firewall.get("alice").unwrap();
         assert_eq!(alice.default.as_deref(), Some("deny"));
-        assert_eq!(alice.allows.get("bob").map(|s| s.as_str()), Some("22"));
+        assert_eq!(alice.allows.get("bob").map(|s| s.as_str()), Some("tcp:22"));
     }
 
     #[test]
@@ -162,7 +165,7 @@ trusted = true
             "alice".to_string(),
             HostSuggestions {
                 default: Some("deny".to_string()),
-                allows: [("bob".to_string(), "22".to_string())].into(),
+                allows: [("bob".to_string(), "tcp:22".to_string())].into(),
                 denies: [].into(),
             },
         );
@@ -215,8 +218,8 @@ trusted = true
             "alice".to_string(),
             HostSuggestions {
                 default: None,
-                allows: [("bob".to_string(), "22".to_string())].into(),
-                denies: [("carol".to_string(), "443".to_string())].into(),
+                allows: [("bob".to_string(), "tcp:22".to_string())].into(),
+                denies: [("carol".to_string(), "icmp".to_string())].into(),
             },
         );
         spec.insert(
@@ -249,6 +252,6 @@ trusted = true
         assert_eq!(g.firewall.len(), 2);
         let alice = g.firewall.get("alice").unwrap();
         assert_eq!(alice.default.as_deref(), Some("deny"));
-        assert_eq!(alice.allows.get("bob").map(|s| s.as_str()), Some("22"));
+        assert_eq!(alice.allows.get("bob").map(|s| s.as_str()), Some("tcp:22"));
     }
 }

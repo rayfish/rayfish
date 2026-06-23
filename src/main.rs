@@ -323,7 +323,7 @@ enum FirewallAction {
         /// Protocol: tcp, udp, icmp, any
         #[arg(long, short = 'p', default_value = "any")]
         proto: String,
-        /// Port or port range (e.g. 22, 80-443)
+        /// Port or port range (e.g. 22, 80-443, or * for all)
         #[arg(long, short = 'P')]
         port: Option<String>,
         /// Peer short ID (omit for any peer)
@@ -353,11 +353,13 @@ enum FirewallAction {
         /// Subject host (the hostname the rules protect)
         #[arg(long)]
         subject: String,
-        /// Allow a peer on ports, e.g. `--allow earn01:9000,8123` (repeatable)
-        #[arg(long, value_name = "PEER:PORTS")]
+        /// Allow a peer, e.g. `--allow earn01:tcp:9000,tcp:8123` or `--allow earn01:icmp`
+        /// (repeatable). Token grammar: `proto:ports` or bare proto (`icmp`, `any`, `tcp`).
+        #[arg(long, value_name = "PEER:SPEC")]
         allow: Vec<String>,
-        /// Deny a peer on ports (repeatable)
-        #[arg(long, value_name = "PEER:PORTS")]
+        /// Deny a peer, e.g. `--deny earn01:tcp:443` or `--deny earn01:icmp` (repeatable).
+        /// Same token grammar as `--allow`.
+        #[arg(long, value_name = "PEER:SPEC")]
         deny: Vec<String>,
         /// Default action for the subject on this network: allow or deny
         #[arg(long)]
@@ -1461,10 +1463,10 @@ async fn ipc_firewall_suggest(
     let parse = |spec: &str, flag: &str| -> Result<(String, String)> {
         let (peer, ports) = spec
             .split_once(':')
-            .with_context(|| format!("{flag} expects PEER:PORTS, got '{spec}'"))?;
+            .with_context(|| format!("{flag} expects PEER:SPEC, got '{spec}'"))?;
         anyhow::ensure!(
             !peer.is_empty() && !ports.is_empty(),
-            "{flag} expects PEER:PORTS, got '{spec}'"
+            "{flag} expects PEER:SPEC, got '{spec}'"
         );
         Ok((peer.to_string(), ports.to_string()))
     };

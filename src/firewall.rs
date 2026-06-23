@@ -526,6 +526,11 @@ pub fn parse_protocol(s: &str) -> Result<Protocol> {
 }
 
 pub fn parse_port_range(s: &str) -> Result<PortRange> {
+    // `*` = wildcard = all ports. Accepted anywhere a port spec is expected
+    // (local `ray firewall add --port '*'` and suggested-firewall tokens).
+    if s.trim() == "*" {
+        return Ok(PortRange { start: 0, end: u16::MAX });
+    }
     if let Some((start, end)) = s.split_once('-') {
         let start: u16 = start.parse().context("invalid start port")?;
         let end: u16 = end.parse().context("invalid end port")?;
@@ -539,6 +544,52 @@ pub fn parse_port_range(s: &str) -> Result<PortRange> {
             start: port,
             end: port,
         })
+    }
+}
+
+/// Parse a single suggested-firewall spec token into (protocol, optional port).
+///
+/// Grammar (protocol is always explicit — no bare-number back-compat):
+/// - `tcp:22`, `tcp:80-443`, `tcp:*` → TCP with a port / range / wildcard
+/// - `udp:53`, `udp:*`              → UDP
+/// - `icmp`                         → ICMP (port-less; `:*` ignored)
+/// - `any` / `any:*`                → every protocol, every port
+/// - bare `tcp` / `udp`             → all ports of that protocol
+///
+/// A bare number (`"22"`) is rejected — use `tcp:22`. Comma-separated tokens
+/// (`tcp:22,icmp`) are split by the caller, which produces one rule each.
+pub fn parse_spec_token(tok: &str) -> Result<(Protocol, Option<PortRange>)> {
+    let tok = tok.trim();
+    match tok.split_once(':') {
+        Some((proto_str, port_str)) => {
+            let proto = parse_protocol(proto_str)?;
+            match proto {
+                // Port-less protocols: a port spec is meaningless, ignore it
+                // so `icmp:*` reads the same as `icmp`.
+                Protocol::Icmp | Protocol::Any => Ok((proto, None)),
+                Protocol::Tcp | Protocol::Udp => {
+                    let range = parse_port_range(port_str)?;
+                    Ok((proto, Some(range)))
+                }
+            }
+        }
+        None => {
+            // Bare token: must be a protocol keyword. A bare number is a
+            // missing-protocol error, not an implicit TCP default.
+            if tok.parse::<u16>().is_ok() {
+                bail!(
+                    "missing protocol prefix for '{tok}'; use e.g. 'tcp:{tok}' or 'icmp'"
+                );
+            }
+            let proto = parse_protocol(tok)?;
+            match proto {
+                Protocol::Icmp | Protocol::Any => Ok((proto, None)),
+                // Bare `tcp`/`udp` = all ports of that protocol.
+                Protocol::Tcp | Protocol::Udp => {
+                    Ok((proto, Some(PortRange { start: 0, end: u16::MAX })))
+                }
+            }
+        }
     }
 }
 
@@ -572,7 +623,8 @@ fn format_action(a: Action) -> &'static str {
 /// network-scoped to `net`, and tagged `origin: Network(net)`. When the subject
 /// has an allow-list (or `default: deny`), a trailing network-scoped catch-all
 /// deny is appended so only the listed peers pass, without touching the global
-/// default action. Proto defaults to TCP.
+/// default action. Each port spec token is `proto:ports` or a bare proto keyword
+/// (`icmp`, `any`, `tcp`); a comma-separated value yields one rule per token.
 pub fn materialize_suggestions(
     net: &str,
     my_hostname: &str,
@@ -587,16 +639,20 @@ pub fn materialize_suggestions(
         for (peer, ports) in list {
             let Some(id) = resolve(peer) else { continue };
             for tok in ports.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                if let Ok(range) = parse_port_range(tok) {
-                    rules.push(FirewallRule {
+                match parse_spec_token(tok) {
+                    Ok((proto, port)) => rules.push(FirewallRule {
                         direction: Direction::In,
                         action,
-                        protocol: Protocol::Tcp,
-                        port: Some(range),
+                        protocol: proto,
+                        port,
                         peer: PeerFilter::Identity(id),
                         network: Some(net.to_string()),
                         origin: RuleOrigin::Network(net.to_string()),
-                    });
+                    }),
+                    Err(e) => tracing::warn!(
+                        token = %tok, network = %net, error = %e,
+                        "skipping invalid firewall spec token"
+                    ),
                 }
             }
         }
@@ -927,6 +983,8 @@ mod tests {
 
         assert!(parse_port_range("443-80").is_err());
         assert!(parse_port_range("abc").is_err());
+        // wildcard = all ports
+        assert_eq!(parse_port_range("*").unwrap(), PortRange { start: 0, end: u16::MAX });
     }
 
     #[test]
@@ -1296,7 +1354,7 @@ mod tests {
             "peer" => Some(peer),
             _ => None,
         };
-        let suggestions = suggest("me", &[("peer", "9000,8123")]);
+        let suggestions = suggest("me", &[("peer", "tcp:9000,tcp:8123")]);
         let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
         // Two allow rules (one per port), all inbound, network-scoped, origin prod.
         let allows: Vec<_> = rules
@@ -1329,7 +1387,7 @@ mod tests {
             _ => None,
         };
         // An allow-list with no explicit default ⇒ default-deny within network.
-        let suggestions = suggest("me", &[("peer", "9000")]);
+        let suggestions = suggest("me", &[("peer", "tcp:9000")]);
         let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
         let deny_any = rules.iter().find(|r| {
             r.action == Action::Deny
@@ -1375,7 +1433,7 @@ mod tests {
     fn materialize_skips_unresolved_peers() {
         // No resolver ever returns an identity for "ghost".
         let resolve = |_: &str| None;
-        let suggestions = suggest("me", &[("ghost", "9000")]);
+        let suggestions = suggest("me", &[("ghost", "tcp:9000")]);
         let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
         // The allow rule is dropped (peer not joined), but an allow-list is still
         // present, so the catch-all deny remains.
@@ -1391,9 +1449,72 @@ mod tests {
             _ => None,
         };
         // Suggestions target a different subject.
-        let suggestions = suggest("other", &[("me", "9000")]);
+        let suggestions = suggest("other", &[("me", "tcp:9000")]);
         let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
         assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn materialize_icmp_udp_and_wildcard_tokens() {
+        let me = test_id(1);
+        let peer = test_id(2);
+        let resolve = |h: &str| match h {
+            "me" => Some(me),
+            "peer" => Some(peer),
+            _ => None,
+        };
+        // One peer, mixed protocols in a single comma-list.
+        let suggestions = suggest("me", &[("peer", "icmp,tcp:*,udp:53,any")]);
+        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let allows: Vec<_> = rules.iter().filter(|r| r.action == Action::Allow).collect();
+        // icmp + tcp:* + udp:53 + any = 4 rules.
+        assert_eq!(allows.len(), 4);
+        let icmp = allows.iter().find(|r| r.protocol == Protocol::Icmp).unwrap();
+        assert!(icmp.port.is_none(), "icmp rule must be port-less");
+        let tcp_any = allows.iter().find(|r| r.protocol == Protocol::Tcp).unwrap();
+        assert_eq!(tcp_any.port.as_ref().unwrap().end, u16::MAX);
+        let udp = allows.iter().find(|r| r.protocol == Protocol::Udp).unwrap();
+        assert_eq!(udp.port.as_ref().unwrap().start, 53);
+        let any = allows.iter().find(|r| r.protocol == Protocol::Any).unwrap();
+        assert!(any.port.is_none());
+    }
+
+    #[test]
+    fn parse_spec_token_grammar() {
+        // proto:port
+        let (p, r) = parse_spec_token("tcp:22").unwrap();
+        assert_eq!(p, Protocol::Tcp);
+        assert_eq!(r.unwrap().start, 22);
+        // proto:range
+        let (p, r) = parse_spec_token("tcp:80-443").unwrap();
+        assert_eq!(p, Protocol::Tcp);
+        assert_eq!(r.unwrap().end, 443);
+        // proto:wildcard
+        let (p, r) = parse_spec_token("udp:*").unwrap();
+        assert_eq!(p, Protocol::Udp);
+        assert_eq!(r.unwrap().end, u16::MAX);
+        // bare icmp → port-less
+        let (p, r) = parse_spec_token("icmp").unwrap();
+        assert_eq!(p, Protocol::Icmp);
+        assert!(r.is_none());
+        // icmp:* == icmp (port ignored)
+        let (p, r) = parse_spec_token("icmp:*").unwrap();
+        assert_eq!(p, Protocol::Icmp);
+        assert!(r.is_none());
+        // bare any → port-less
+        let (p, r) = parse_spec_token("any").unwrap();
+        assert_eq!(p, Protocol::Any);
+        assert!(r.is_none());
+        // bare tcp → all ports
+        let (p, r) = parse_spec_token("tcp").unwrap();
+        assert_eq!(p, Protocol::Tcp);
+        assert_eq!(r.unwrap().end, u16::MAX);
+        // bare number → error (no implicit tcp)
+        assert!(parse_spec_token("22").is_err());
+        // unknown proto → error
+        assert!(parse_spec_token("foo:22").is_err());
+        // empty port after colon → error
+        assert!(parse_spec_token("tcp:").is_err());
     }
 
     #[test]
