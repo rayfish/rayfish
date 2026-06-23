@@ -45,6 +45,10 @@ pub struct Invite {
     /// Unix seconds after which the invite is no longer redeemable.
     pub expires: u64,
     pub status: InviteStatus,
+    /// Hostname the coordinator assigns authoritatively on redemption (trusted
+    /// networks). `None` = the joiner's `--hostname` claim is used as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 /// On-disk container (so the toml file has a stable `[[invites]]` shape).
@@ -63,6 +67,8 @@ pub struct InviteView {
     pub expires: u64,
     /// Short id of the redeemer, when redeemed.
     pub redeemer: Option<String>,
+    /// Hostname the coordinator assigns on redemption (trusted networks).
+    pub hostname: Option<String>,
 }
 
 /// The coordinator's invite ledger for one network, backed by a toml file.
@@ -176,7 +182,9 @@ impl InviteStore {
 
     /// Mint a new invite valid for `ttl`, persist it, and return `(secret, id)`.
     /// The raw secret is returned only here so it can be encoded into the code.
-    pub fn mint(&mut self, ttl: Duration) -> Result<([u8; SECRET_LEN], String)> {
+    /// `hostname` (trusted networks) is assigned authoritatively on redemption,
+    /// so the holder joins with `ray join <code>` and no `--hostname`.
+    pub fn mint(&mut self, ttl: Duration, hostname: Option<String>) -> Result<([u8; SECRET_LEN], String)> {
         let secret = generate_secret();
         let secret_hash = hash_secret(&secret);
         let id = secret_hash[..8].to_string();
@@ -188,14 +196,16 @@ impl InviteStore {
             created,
             expires,
             status: InviteStatus::Pending,
+            hostname,
         });
         self.save()?;
         Ok((secret, id))
     }
 
     /// Verify a presented secret and burn it (single-use). Errors if the secret is
-    /// unknown, already used, revoked, or expired.
-    pub fn redeem(&mut self, secret: &[u8], by: EndpointId) -> Result<()> {
+    /// unknown, already used, revoked, or expired. Returns the invite's intended
+    /// hostname (trusted networks) so the coordinator can assign it.
+    pub fn redeem(&mut self, secret: &[u8], by: EndpointId) -> Result<Option<String>> {
         let hash = hash_secret(secret);
         let now = now_secs();
         let invite = self
@@ -211,9 +221,10 @@ impl InviteStore {
         if now >= invite.expires {
             bail!("invite expired");
         }
+        let hostname = invite.hostname.clone();
         invite.status = InviteStatus::Redeemed { by, at: now };
         self.save()?;
-        Ok(())
+        Ok(hostname)
     }
 
     /// Revoke an unused invite by id (exact match, or unambiguous prefix).
@@ -259,6 +270,7 @@ impl InviteStore {
                     created: i.created,
                     expires: i.expires,
                     redeemer,
+                    hostname: i.hostname.clone(),
                 }
             })
             .collect()
@@ -303,7 +315,7 @@ mod tests {
     #[test]
     fn mint_then_redeem_succeeds() {
         let (mut store, _dir) = temp_store();
-        let (secret, id) = store.mint(Duration::from_secs(3600)).unwrap();
+        let (secret, id) = store.mint(Duration::from_secs(3600), None).unwrap();
         assert_eq!(id.len(), 8);
         store.redeem(&secret, test_id(9)).unwrap();
         // Status is now redeemed.
@@ -316,7 +328,7 @@ mod tests {
     #[test]
     fn redeem_is_single_use() {
         let (mut store, _dir) = temp_store();
-        let (secret, _id) = store.mint(Duration::from_secs(3600)).unwrap();
+        let (secret, _id) = store.mint(Duration::from_secs(3600), None).unwrap();
         store.redeem(&secret, test_id(9)).unwrap();
         let err = store.redeem(&secret, test_id(10)).unwrap_err();
         assert!(err.to_string().contains("already used"));
@@ -326,7 +338,7 @@ mod tests {
     fn redeem_rejects_expired() {
         let (mut store, _dir) = temp_store();
         // ttl=0 → expires == created == now, so now >= expires immediately.
-        let (secret, _id) = store.mint(Duration::from_secs(0)).unwrap();
+        let (secret, _id) = store.mint(Duration::from_secs(0), None).unwrap();
         let err = store.redeem(&secret, test_id(9)).unwrap_err();
         assert!(err.to_string().contains("expired"));
     }
@@ -334,7 +346,7 @@ mod tests {
     #[test]
     fn redeem_rejects_wrong_secret() {
         let (mut store, _dir) = temp_store();
-        store.mint(Duration::from_secs(3600)).unwrap();
+        store.mint(Duration::from_secs(3600), None).unwrap();
         let err = store.redeem(&generate_secret(), test_id(9)).unwrap_err();
         assert!(err.to_string().contains("invalid invite"));
     }
@@ -342,7 +354,7 @@ mod tests {
     #[test]
     fn revoke_then_redeem_fails() {
         let (mut store, _dir) = temp_store();
-        let (secret, id) = store.mint(Duration::from_secs(3600)).unwrap();
+        let (secret, id) = store.mint(Duration::from_secs(3600), None).unwrap();
         store.revoke(&id).unwrap();
         let err = store.redeem(&secret, test_id(9)).unwrap_err();
         assert!(err.to_string().contains("revoked"));
@@ -351,7 +363,7 @@ mod tests {
     #[test]
     fn cannot_revoke_used_invite() {
         let (mut store, _dir) = temp_store();
-        let (secret, id) = store.mint(Duration::from_secs(3600)).unwrap();
+        let (secret, id) = store.mint(Duration::from_secs(3600), None).unwrap();
         store.redeem(&secret, test_id(9)).unwrap();
         assert!(store.revoke(&id).is_err());
     }
@@ -363,7 +375,7 @@ mod tests {
         let secret;
         {
             let mut store = InviteStore::with_path(&path);
-            let (s, _id) = store.mint(Duration::from_secs(3600)).unwrap();
+            let (s, _id) = store.mint(Duration::from_secs(3600), None).unwrap();
             secret = s;
         }
         // Reload from disk and redeem.
@@ -374,10 +386,51 @@ mod tests {
     #[test]
     fn list_reports_expired_lazily() {
         let (mut store, _dir) = temp_store();
-        store.mint(Duration::from_secs(0)).unwrap();
+        store.mint(Duration::from_secs(0), None).unwrap();
         let view = store.list();
         assert_eq!(view[0].status, "expired");
         // Stored status remains Pending (not mutated).
         assert_eq!(store.invites[0].status, InviteStatus::Pending);
+    }
+
+    #[test]
+    fn mint_with_hostname_returns_it_on_redeem() {
+        let (mut store, _dir) = temp_store();
+        let (secret, _id) = store
+            .mint(Duration::from_secs(3600), Some("ty2-clic01".to_string()))
+            .unwrap();
+        let hostname = store.redeem(&secret, test_id(9)).unwrap();
+        assert_eq!(hostname.as_deref(), Some("ty2-clic01"));
+        // The bound hostname is visible in the list.
+        let view = store.list();
+        assert_eq!(view[0].hostname.as_deref(), Some("ty2-clic01"));
+    }
+
+    #[test]
+    fn mint_without_hostname_returns_none_on_redeem() {
+        let (mut store, _dir) = temp_store();
+        let (secret, _id) = store.mint(Duration::from_secs(3600), None).unwrap();
+        let hostname = store.redeem(&secret, test_id(9)).unwrap();
+        assert!(hostname.is_none());
+    }
+
+    #[test]
+    fn old_ledger_without_hostname_field_decodes() {
+        // A ledger authored before the hostname field existed (no `hostname` key)
+        // must still decode, defaulting to None.
+        let toml = r#"
+[[invites]]
+id = "abcd1234"
+secret_hash = "abcd1234"
+created = 1
+expires = 9999999999
+status = "Pending"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net.toml");
+        std::fs::write(&path, toml).unwrap();
+        let store = InviteStore::from_path(path).unwrap();
+        assert_eq!(store.invites.len(), 1);
+        assert!(store.invites[0].hostname.is_none());
     }
 }

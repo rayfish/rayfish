@@ -138,6 +138,9 @@ pub enum IpcMessage {
     InviteCreate {
         network: String,
         expires_secs: u64,
+        /// Hostname the coordinator assigns on redemption (trusted networks).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
     },
     /// List invites for a network (coordinator-only).
     InviteList {
@@ -246,6 +249,9 @@ pub struct InviteInfo {
     pub created: u64,
     pub expires: u64,
     pub redeemer: Option<String>,
+    /// Hostname assigned on redemption (trusted networks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -461,6 +467,7 @@ mod tests {
         let req = IpcMessage::InviteCreate {
             network: "gaming".to_string(),
             expires_secs: 604_800,
+            hostname: None,
         };
         let bytes = rmp_serde::to_vec(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
@@ -468,6 +475,7 @@ mod tests {
             IpcMessage::InviteCreate {
                 network,
                 expires_secs,
+                hostname: _,
             } => {
                 assert_eq!(network, "gaming");
                 assert_eq!(expires_secs, 604_800);
@@ -485,6 +493,7 @@ mod tests {
                 created: 1000,
                 expires: 2000,
                 redeemer: None,
+                hostname: None,
             }],
         };
         let bytes = rmp_serde::to_vec(&resp).unwrap();

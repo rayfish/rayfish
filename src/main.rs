@@ -240,6 +240,10 @@ enum InviteAction {
         /// How long the invite stays valid, e.g. 24h, 7d, 30m (default 7d)
         #[arg(long, default_value = "7d")]
         expires: String,
+        /// Hostname the coordinator assigns on redemption (trusted networks).
+        /// The holder joins with no `--hostname`.
+        #[arg(long)]
+        hostname: Option<String>,
     },
     /// List issued invites and their status
     List,
@@ -1151,11 +1155,17 @@ fn parse_duration_secs(s: &str) -> Result<u64> {
 async fn ipc_invite(network: &str, action: Option<InviteAction>) -> Result<()> {
     let action = action.unwrap_or(InviteAction::Create {
         expires: "7d".to_string(),
+        hostname: None,
     });
+    let hostname_opt = match &action {
+        InviteAction::Create { hostname, .. } => hostname.clone(),
+        _ => None,
+    };
     let req = match action {
-        InviteAction::Create { expires } => ipc::IpcMessage::InviteCreate {
+        InviteAction::Create { expires, hostname } => ipc::IpcMessage::InviteCreate {
             network: network.to_string(),
             expires_secs: parse_duration_secs(&expires)?,
+            hostname,
         },
         InviteAction::List => ipc::IpcMessage::InviteList {
             network: network.to_string(),
@@ -1193,6 +1203,9 @@ async fn ipc_invite(network: &str, action: Option<InviteAction>) -> Result<()> {
                 format!("{}m", expires_secs / 60)
             };
             println!("  single-use, expires in {ttl}");
+            if let Some(h) = &hostname_opt {
+                println!("  binds hostname: {}", style::bold(h));
+            }
         }
         ipc::IpcMessage::InviteListResponse { invites } => {
             if invites.is_empty() {
@@ -1200,7 +1213,12 @@ async fn ipc_invite(network: &str, action: Option<InviteAction>) -> Result<()> {
             } else {
                 for inv in invites {
                     let who = inv.redeemer.map(|r| format!(" by {r}")).unwrap_or_default();
-                    println!("  {}  {}{}", style::rose(&inv.id), inv.status, who);
+                    let host = inv
+                        .hostname
+                        .as_deref()
+                        .map(|h| format!("  host={h}"))
+                        .unwrap_or_default();
+                    println!("  {}  {}{}{}", style::rose(&inv.id), inv.status, who, host);
                 }
             }
         }

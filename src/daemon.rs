@@ -232,9 +232,12 @@ impl CoordinatorAcceptState {
                 }
             };
             match redeemed {
-                Ok(()) => {
+                Ok(invite_hostname) => {
                     tracing::info!(peer = %remote_id.fmt_short(), "invite redeemed");
-                    self.admit_peer(conn, send, remote_id, peer_ip, hostname, device_cert, false)
+                    // A hostname bound to the invite is authoritative (trusted
+                    // networks); it overrides the joiner's `--hostname` claim.
+                    let assigned = invite_hostname.or(hostname);
+                    self.admit_peer(conn, send, remote_id, peer_ip, assigned, device_cert, false)
                         .await;
                 }
                 Err(e) => {
@@ -292,17 +295,32 @@ impl CoordinatorAcceptState {
         device_cert: Option<control::DeviceCert>,
         was_approved: bool,
     ) {
-        // Resolve hostname collisions against the current members.
+        // Resolve the hostname. In a trusted network the hostname is
+        // coordinator-authoritative: a name already bound to a different identity
+        // is rejected (no silent rename), so no admitted peer can claim another's
+        // name to take its suggested rules. Trustless networks keep the joiner's
+        // choice with collision resolution (`name` → `name-1` → …).
         let final_hostname = if let Some(desired) = hostname {
-            let taken: Vec<String> = {
+            let (taken, trusted) = {
                 let s = self.state.read().unwrap();
-                s.members
-                    .all()
-                    .iter()
-                    .filter(|m| m.identity != remote_id)
-                    .filter_map(|m| m.hostname.clone())
-                    .collect()
+                (
+                    s.members
+                        .all()
+                        .iter()
+                        .filter(|m| m.identity != remote_id)
+                        .filter_map(|m| m.hostname.clone())
+                        .collect::<Vec<String>>(),
+                    s.trusted,
+                )
             };
+            if trusted && taken.iter().any(|h| h == &desired) {
+                self.deny(
+                    send,
+                    format!("hostname '{desired}' is already in use on this trusted network"),
+                )
+                .await;
+                return;
+            }
             let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
             Some(crate::hostname::resolve_collision(&desired, &taken_refs))
         } else {
@@ -1123,7 +1141,8 @@ impl DaemonState {
             IpcMessage::InviteCreate {
                 network,
                 expires_secs,
-            } => self.invite_create(&network, expires_secs).await,
+                hostname,
+            } => self.invite_create(&network, expires_secs, hostname).await,
             IpcMessage::InviteList { network } => self.invite_list(&network).await,
             IpcMessage::InviteRevoke { network, id } => self.invite_revoke(&network, &id).await,
             IpcMessage::Requests { network } => self.list_requests(&network),
@@ -2923,7 +2942,7 @@ impl DaemonState {
         Ok((handle.network_key, handle.invite_lock.clone()))
     }
 
-    async fn invite_create(&self, network: &str, expires_secs: u64) -> IpcMessage {
+    async fn invite_create(&self, network: &str, expires_secs: u64, hostname: Option<String>) -> IpcMessage {
         let (net_pubkey, lock) = match self.coordinator_handle(network) {
             Ok(v) => v,
             Err(e) => return e,
@@ -2931,7 +2950,7 @@ impl DaemonState {
         let minted = {
             let _guard = lock.lock().await;
             match crate::invite::InviteStore::load(network) {
-                Ok(mut store) => store.mint(Duration::from_secs(expires_secs)),
+                Ok(mut store) => store.mint(Duration::from_secs(expires_secs), hostname),
                 Err(e) => Err(e),
             }
         };
@@ -2974,6 +2993,7 @@ impl DaemonState {
                 created: v.created,
                 expires: v.expires,
                 redeemer: v.redeemer,
+                hostname: v.hostname,
             })
             .collect();
         IpcMessage::InviteListResponse { invites }
