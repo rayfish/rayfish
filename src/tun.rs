@@ -9,8 +9,13 @@ use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tun::{Configuration, DeviceReader, DeviceWriter};
 
-/// MTU sized to fit within QUIC datagram limits.
-const TUN_MTU: u16 = 1200;
+/// MTU for the TUN device. IPv6 mandates a minimum link MTU of 1280 bytes
+/// (RFC 8200 §5); Linux refuses to enable IPv6 on a device with a smaller MTU,
+/// which silently breaks IPv6 address/route installation (`configure_ipv6` /
+/// `route_peer_range` fail with `EINVAL`). 1280 is also the value WireGuard and
+/// Tailscale use for their TUN interfaces for the same reason, and it still
+/// fits within QUIC datagram limits.
+const TUN_MTU: u16 = 1280;
 
 /// Read half of the TUN device. Owned by [`forward::run_mesh`].
 pub struct TunReader {
