@@ -182,7 +182,10 @@ trusted = true
         );
         let s1 = to_toml(&spec).unwrap();
         let s2 = to_toml(&parse(&s1).unwrap()).unwrap();
-        assert_eq!(s1, s2, "roundtrip must be byte-identical (sorted canonical)");
+        assert_eq!(
+            s1, s2,
+            "roundtrip must be byte-identical (sorted canonical)"
+        );
         // Canonical wrapper form.
         assert!(s1.contains("[networks.admin]"));
         assert!(s1.contains("[networks.gaming]"));
@@ -224,7 +227,10 @@ trusted = true
             },
         );
         let hosts = expected_hosts(&spec);
-        assert_eq!(hosts, vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]);
+        assert_eq!(
+            hosts,
+            vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
+        );
     }
 
     #[test]
