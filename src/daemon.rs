@@ -61,7 +61,7 @@ use crate::control::{self, ControlMsg};
 use crate::dht;
 use crate::dns;
 use crate::dns_config;
-use crate::firewall::{self, SharedFirewall};
+use crate::firewall::{self, FirewallConfig, SharedFirewall};
 use crate::forward;
 use crate::identity;
 use crate::ipc::{self, IpcMessage, NetworkRole, NetworkStatus, PeerStatus};
@@ -855,6 +855,9 @@ struct NetworkState {
     /// hostname). On a coordinator this is what it publishes; on a member it is
     /// what it last received and materializes rules from.
     suggested_firewall: SuggestedFirewall,
+    /// Materialized suggested rules awaiting manual `ray firewall accept` on a
+    /// member that did not opt into `--allow-trusted`. Empty when auto-taking.
+    pending_suggestions: Vec<firewall::FirewallRule>,
     /// Peers awaiting live operator approval on a closed network (coordinator
     /// only, in-memory, never persisted or published).
     pending: HashMap<EndpointId, PendingJoin>,
@@ -972,6 +975,7 @@ impl DaemonState {
                 | IpcMessage::Report
                 | IpcMessage::FirewallShow
                 | IpcMessage::FirewallSuggestions { .. }
+                | IpcMessage::FirewallPending { .. }
                 | IpcMessage::ListFiles
         ) {
             return None;
@@ -1101,6 +1105,9 @@ impl DaemonState {
                 suggestions,
             } => self.firewall_suggest(&network, suggestions).await,
             IpcMessage::FirewallSuggestions { network } => self.firewall_suggestions(&network),
+            IpcMessage::FirewallPending { network } => self.firewall_pending(&network),
+            IpcMessage::FirewallAccept { network } => self.firewall_accept(&network),
+            IpcMessage::FirewallDeny { network } => self.firewall_deny(&network),
             IpcMessage::SetHostname { network, hostname } => {
                 self.set_hostname(&network, &hostname).await
             }
@@ -1221,6 +1228,7 @@ impl DaemonState {
             mode,
             trusted,
             suggested_firewall: SuggestedFirewall::default(),
+            pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         };
 
@@ -1657,6 +1665,7 @@ impl DaemonState {
                 self.blob_store.clone(),
                 self.peers.clone(),
                 display_name.to_string(),
+                self.firewall.clone(),
                 cancel.clone(),
             ));
         }
@@ -1924,6 +1933,7 @@ impl DaemonState {
                 mode: GroupMode::Restricted,
                 trusted: false,
                 suggested_firewall: SuggestedFirewall::default(),
+                pending_suggestions: Vec::new(),
                 pending: HashMap::new(),
             };
             ns.refresh_snapshot();
@@ -2053,6 +2063,7 @@ impl DaemonState {
             mode,
             trusted: false,
             suggested_firewall: SuggestedFirewall::default(),
+            pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         };
 
@@ -3319,6 +3330,76 @@ impl DaemonState {
         }
     }
 
+    /// Materialized suggested rules awaiting manual review (`ray firewall
+    /// pending`). Pre-formatted like `FirewallShow` so the CLI just prints it.
+    fn firewall_pending(&self, network: &str) -> IpcMessage {
+        match self.networks.get(network) {
+            Some(h) => {
+                let pending = h.state.read().unwrap().pending_suggestions.clone();
+                let display = if pending.is_empty() {
+                    String::from("  (no pending suggested rules)\n")
+                } else {
+                    let config = FirewallConfig {
+                        default_action: firewall::Action::Allow,
+                        rules: pending,
+                    };
+                    let short_id = |id: &EndpointId| -> String { id.fmt_short().to_string() };
+                    firewall::format_firewall_show(&config, &short_id)
+                };
+                IpcMessage::FirewallPendingResponse { display }
+            }
+            None => IpcMessage::Error {
+                message: format!("network '{network}' not found"),
+            },
+        }
+    }
+
+    /// Accept the queued suggested rules for a network: install them (replacing
+    /// the prior `Network(net)` set), persist, and clear the queue.
+    fn firewall_accept(&self, network: &str) -> IpcMessage {
+        let rules = match self.networks.get(network) {
+            Some(h) => {
+                let mut s = h.state.write().unwrap();
+                std::mem::take(&mut s.pending_suggestions)
+            }
+            None => {
+                return IpcMessage::Error {
+                    message: format!("network '{network}' not found"),
+                };
+            }
+        };
+        if rules.is_empty() {
+            return IpcMessage::Error {
+                message: format!("no pending suggested rules for '{network}'"),
+            };
+        }
+        let count = rules.len();
+        let config = self.firewall.replace_network_rules(network, rules);
+        if let Err(e) = firewall::save_firewall(&config) {
+            tracing::warn!(error = %e, "failed to persist firewall config");
+        }
+        IpcMessage::Ok {
+            message: format!("accepted {count} suggested rules from '{network}'"),
+        }
+    }
+
+    /// Discard the queued suggested rules for a network without installing them.
+    fn firewall_deny(&self, network: &str) -> IpcMessage {
+        match self.networks.get(network) {
+            Some(h) => {
+                let mut s = h.state.write().unwrap();
+                let count = s.pending_suggestions.len();
+                s.pending_suggestions.clear();
+                IpcMessage::Ok {
+                    message: format!("discarded {count} pending suggested rules for '{network}'"),
+                }
+            }
+            None => IpcMessage::Error {
+                message: format!("network '{network}' not found"),
+            },
+        }
+    }
+
     fn firewall_default(&self, action: &str) -> IpcMessage {
         let action = match firewall::parse_action(action) {
             Ok(a) => a,
@@ -4074,6 +4155,66 @@ fn spawn_network_publisher(
     })
 }
 
+/// Materialize this node's suggested firewall rules for `network` from the
+/// verified blob state, then either install them (replacing the prior
+/// `Network(net)` set, leaving `Local` rules untouched) when the network is
+/// `allow_trusted`, or queue them for manual `ray firewall accept`. Trustless
+/// networks and a node with no assigned hostname are no-ops. Peer hostnames are
+/// resolved against the blob's member list, so a rule for a not-yet-joined peer
+/// appears once it joins and the roster updates.
+fn apply_suggested_firewall(
+    firewall: &SharedFirewall,
+    my_identity: EndpointId,
+    network_name: &str,
+    state: &std::sync::RwLock<NetworkState>,
+) {
+    let (trusted, suggestions, members): (bool, SuggestedFirewall, Vec<Member>) = {
+        let s = state.read().unwrap();
+        let members = s.members.all().into_iter().cloned().collect();
+        (s.trusted, s.suggested_firewall.clone(), members)
+    };
+    if !trusted {
+        return;
+    }
+    // My hostname is coordinator-authoritative in trusted networks, so derive
+    // it from the member list rather than the join-time claim.
+    let my_hostname = members
+        .iter()
+        .find(|m| m.identity == my_identity)
+        .and_then(|m| m.hostname.clone());
+    let Some(my_hostname) = my_hostname else {
+        return;
+    };
+    let map: HashMap<&str, EndpointId> = members
+        .iter()
+        .filter_map(|m| m.hostname.as_deref().map(|h| (h, m.identity)))
+        .collect();
+    let resolve = |h: &str| map.get(h).copied();
+    let rules = firewall::materialize_suggestions(network_name, &my_hostname, &suggestions, &resolve);
+
+    let allow_trusted = config::load()
+        .ok()
+        .and_then(|c| {
+            c.networks
+                .into_iter()
+                .find(|n| n.name == network_name)
+                .map(|n| n.allow_trusted)
+        })
+        .unwrap_or(false);
+    if allow_trusted {
+        let config = firewall.replace_network_rules(network_name, rules);
+        if let Err(e) = firewall::save_firewall(&config) {
+            tracing::warn!(error = %e, network = network_name, "failed to persist firewall config");
+        }
+        state.write().unwrap().pending_suggestions.clear();
+        tracing::info!(network = network_name, count = 0, "auto-took suggested firewall rules");
+    } else {
+        let count = rules.len();
+        state.write().unwrap().pending_suggestions = rules;
+        tracing::info!(network = network_name, count, "queued suggested firewall rules for review");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_group_poller(
     client: PkarrRelayClient,
@@ -4083,6 +4224,7 @@ fn spawn_group_poller(
     blob_store: FsStore,
     peers: PeerTable,
     network_name: String,
+    fw: SharedFirewall,
     token: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -4182,13 +4324,18 @@ fn spawn_group_poller(
                 break;
             }
 
-            // Update state
+            // Update state and re-materialize suggested firewall rules from the
+            // freshly verified blob (trusted networks only). Suggestions + the
+            // trusted flag ride in the blob, so both are refreshed here.
             {
                 let mut s = state.write().unwrap();
-                s.members = MemberList::from_members(data.members);
-                s.approved = ApprovedList::from_entries(data.approved);
+                s.members = MemberList::from_members(data.members.clone());
+                s.approved = ApprovedList::from_entries(data.approved.clone());
+                s.trusted = data.trusted;
+                s.suggested_firewall = data.suggested_firewall.clone();
                 s.refresh_snapshot();
             }
+            apply_suggested_firewall(&fw, endpoint.id(), &network_name, &state);
         }
     })
 }
@@ -4699,6 +4846,7 @@ async fn join_mesh_shared(
             mode: GroupMode::Restricted,
             trusted,
             suggested_firewall,
+            pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         };
         ns.refresh_snapshot();
@@ -4707,6 +4855,10 @@ async fn join_mesh_shared(
         }
         Arc::new(std::sync::RwLock::new(ns))
     };
+
+    // Materialize this node's suggested rules from the blob we just joined with.
+    // Re-runs on every roster/blob update from the control listener below.
+    apply_suggested_firewall(&firewall, my_identity, network_name, &live_state);
 
     // Control listener
     tokio::spawn({
@@ -4719,6 +4871,7 @@ async fn join_mesh_shared(
         let endpoint_c = ep.clone();
         let hostname_table_c = hostname_table.clone();
         let reverse_table_c = reverse_table.clone();
+        let firewall_c = firewall.clone();
         let my_identity_c = my_identity;
         async move {
             loop {
@@ -4747,6 +4900,9 @@ async fn join_mesh_shared(
                                             let _ = blob_store.blobs().add_slice(&bytes).await;
                                         }
                                         apply_roster_to_dns(&roster, &network_name, my_identity_c, &hostname_table_c, &reverse_table_c).await;
+                                        // Roster change ⇒ peer-hostname→identity bindings may
+                                        // have shifted, so re-materialize suggested rules.
+                                        apply_suggested_firewall(&firewall_c, my_identity_c, &network_name, &live_state);
                                     }
                                     Ok(ControlMsg::BlobUpdated { hash }) => {
                                         tracing::info!(hash = %hash, "received blob update");
@@ -4773,12 +4929,15 @@ async fn join_mesh_shared(
                                                 Ok(data) => {
                                                     let roster = {
                                                         let mut s = live_state.write().unwrap();
-                                                        s.members = MemberList::from_members(data.members);
-                                                        s.approved = ApprovedList::from_entries(data.approved);
+                                                        s.members = MemberList::from_members(data.members.clone());
+                                                        s.approved = ApprovedList::from_entries(data.approved.clone());
+                                                        s.trusted = data.trusted;
+                                                        s.suggested_firewall = data.suggested_firewall.clone();
                                                         s.refresh_snapshot();
                                                         s.members.all().into_iter().cloned().collect::<Vec<Member>>()
                                                     };
                                                     apply_roster_to_dns(&roster, &network_name, my_identity_c, &hostname_table_c, &reverse_table_c).await;
+                                                    apply_suggested_firewall(&firewall_c, my_identity_c, &network_name, &live_state);
                                                     tracing::info!("group blob updated");
                                                 }
                                                 Err(e) => tracing::warn!(error = %e, "group blob verification failed"),

@@ -40,6 +40,7 @@ use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use iroh::EndpointId;
+use ray_proto::SuggestedFirewall;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -347,6 +348,20 @@ impl SharedFirewall {
     pub fn get_config(&self) -> Arc<FirewallConfig> {
         self.inner.load_full()
     }
+
+    /// Replace the set of rules suggested by trusted network `net` with
+    /// `new_rules`, leaving `Local` rules and other networks' rules untouched.
+    /// The blob is authoritative for what it manages, so each reconverge swaps
+    /// the whole `Network(net)` set. Returns the updated config for persistence.
+    pub fn replace_network_rules(&self, net: &str, new_rules: Vec<FirewallRule>) -> FirewallConfig {
+        let mut config = (*self.get_config()).clone();
+        config
+            .rules
+            .retain(|r| !matches!(&r.origin, RuleOrigin::Network(n) if n == net));
+        config.rules.extend(new_rules);
+        self.update(config.clone());
+        config
+    }
 }
 
 fn protocol_matches(filter: Protocol, ip_proto: u8) -> bool {
@@ -550,6 +565,58 @@ fn format_action(a: Action) -> &'static str {
     }
 }
 
+/// Build the concrete local firewall rules a node enforces for trusted network
+/// `net`, from `suggestions` targeting `my_hostname`. Peer hostnames are resolved
+/// to identities via `resolve` (the blob's member list); unresolved peers are
+/// skipped — their rules materialize once they join. Every rule is inbound,
+/// network-scoped to `net`, and tagged `origin: Network(net)`. When the subject
+/// has an allow-list (or `default: deny`), a trailing network-scoped catch-all
+/// deny is appended so only the listed peers pass, without touching the global
+/// default action. Proto defaults to TCP.
+pub fn materialize_suggestions(
+    net: &str,
+    my_hostname: &str,
+    suggestions: &SuggestedFirewall,
+    resolve: &dyn Fn(&str) -> Option<EndpointId>,
+) -> Vec<FirewallRule> {
+    let mut rules = Vec::new();
+    let Some(host) = suggestions.get(my_hostname) else {
+        return rules;
+    };
+    for (action, list) in [(Action::Allow, &host.allows), (Action::Deny, &host.denies)] {
+        for (peer, ports) in list {
+            let Some(id) = resolve(peer) else { continue };
+            for tok in ports.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if let Ok(range) = parse_port_range(tok) {
+                    rules.push(FirewallRule {
+                        direction: Direction::In,
+                        action,
+                        protocol: Protocol::Tcp,
+                        port: Some(range),
+                        peer: PeerFilter::Identity(id),
+                        network: Some(net.to_string()),
+                        origin: RuleOrigin::Network(net.to_string()),
+                    });
+                }
+            }
+        }
+    }
+    let want_default_deny = matches!(host.default.as_deref(), Some("deny"))
+        || (!host.allows.is_empty() && host.default.is_none());
+    if want_default_deny {
+        rules.push(FirewallRule {
+            direction: Direction::In,
+            action: Action::Deny,
+            protocol: Protocol::Any,
+            port: None,
+            peer: PeerFilter::Any,
+            network: Some(net.to_string()),
+            origin: RuleOrigin::Network(net.to_string()),
+        });
+    }
+    rules
+}
+
 pub fn format_firewall_show(
     config: &FirewallConfig,
     short_id: &dyn Fn(&EndpointId) -> String,
@@ -576,8 +643,12 @@ pub fn format_firewall_show(
             None => "any".to_string(),
             Some(n) => n.clone(),
         };
+        let origin_str = match &rule.origin {
+            RuleOrigin::Local => String::new(),
+            RuleOrigin::Network(n) => format!(" (suggested by {n})"),
+        };
         out.push_str(&format!(
-            "  [{}] {} {} proto={} port={} peer={} network={}\n",
+            "  [{}] {} {} proto={} port={} peer={} network={}{}\n",
             i,
             format_direction(rule.direction),
             format_action(rule.action),
@@ -585,6 +656,7 @@ pub fn format_firewall_show(
             port_str,
             peer_str,
             net_str,
+            origin_str,
         ));
     }
     out
@@ -1198,5 +1270,192 @@ mod tests {
             fw.evaluate_packet(Direction::In, &after, &peer_id, None),
             Action::Deny
         );
+    }
+
+    // -- Suggested firewall materialization -----------------------------------
+
+    use ray_proto::{HostSuggestions, SuggestedFirewall};
+
+    /// Build a one-entry suggestion map for `subject` with the given allows.
+    fn suggest(subject: &str, allows: &[(&str, &str)]) -> SuggestedFirewall {
+        let mut entry = HostSuggestions::default();
+        for (peer, ports) in allows {
+            entry.allows.insert((*peer).to_string(), (*ports).to_string());
+        }
+        let mut map = SuggestedFirewall::new();
+        map.insert(subject.to_string(), entry);
+        map
+    }
+
+    #[test]
+    fn materialize_resolves_peer_hostnames_and_expands_comma_ports() {
+        let me = test_id(1);
+        let peer = test_id(2);
+        let resolve = |h: &str| match h {
+            "me" => Some(me),
+            "peer" => Some(peer),
+            _ => None,
+        };
+        let suggestions = suggest("me", &[("peer", "9000,8123")]);
+        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        // Two allow rules (one per port), all inbound, network-scoped, origin prod.
+        let allows: Vec<_> = rules
+            .iter()
+            .filter(|r| r.action == Action::Allow)
+            .collect();
+        assert_eq!(allows.len(), 2);
+        for r in &allows {
+            assert_eq!(r.direction, Direction::In);
+            assert_eq!(r.network.as_deref(), Some("prod"));
+            assert_eq!(r.origin, RuleOrigin::Network("prod".to_string()));
+            assert_eq!(r.peer, PeerFilter::Identity(peer));
+            assert_eq!(r.protocol, Protocol::Tcp);
+        }
+        let ports: Vec<u16> = allows
+            .iter()
+            .map(|r| r.port.as_ref().unwrap().start)
+            .collect();
+        assert!(ports.contains(&9000));
+        assert!(ports.contains(&8123));
+    }
+
+    #[test]
+    fn materialize_appends_catch_all_deny_with_allow_list() {
+        let me = test_id(1);
+        let peer = test_id(2);
+        let resolve = |h: &str| match h {
+            "me" => Some(me),
+            "peer" => Some(peer),
+            _ => None,
+        };
+        // An allow-list with no explicit default ⇒ default-deny within network.
+        let suggestions = suggest("me", &[("peer", "9000")]);
+        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let deny_any = rules.iter().find(|r| {
+            r.action == Action::Deny
+                && r.peer == PeerFilter::Any
+                && r.port.is_none()
+                && r.network.as_deref() == Some("prod")
+        });
+        assert!(deny_any.is_some(), "expected a network-scoped catch-all deny");
+    }
+
+    #[test]
+    fn materialize_explicit_default_deny_also_appends_catch_all() {
+        let me = test_id(1);
+        let resolve = |h: &str| match h {
+            "me" => Some(me),
+            _ => None,
+        };
+        let entry = HostSuggestions {
+            default: Some("deny".to_string()),
+            ..Default::default()
+        };
+        let mut suggestions = SuggestedFirewall::new();
+        suggestions.insert("me".to_string(), entry);
+        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        assert!(rules.iter().any(|r| r.action == Action::Deny && r.peer == PeerFilter::Any));
+    }
+
+    #[test]
+    fn materialize_no_allow_list_no_default_keeps_open() {
+        let me = test_id(1);
+        let resolve = |h: &str| match h {
+            "me" => Some(me),
+            _ => None,
+        };
+        // Subject present but no allows and no default ⇒ no catch-all deny.
+        let mut suggestions = SuggestedFirewall::new();
+        suggestions.insert("me".to_string(), HostSuggestions::default());
+        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        assert!(rules.is_empty(), "expected no rules for an open subject");
+    }
+
+    #[test]
+    fn materialize_skips_unresolved_peers() {
+        // No resolver ever returns an identity for "ghost".
+        let resolve = |_: &str| None;
+        let suggestions = suggest("me", &[("ghost", "9000")]);
+        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        // The allow rule is dropped (peer not joined), but an allow-list is still
+        // present, so the catch-all deny remains.
+        assert!(rules.iter().all(|r| r.action == Action::Deny));
+        assert!(rules.iter().all(|r| r.peer == PeerFilter::Any));
+    }
+
+    #[test]
+    fn materialize_no_rules_for_unknown_subject() {
+        let me = test_id(1);
+        let resolve = |h: &str| match h {
+            "me" => Some(me),
+            _ => None,
+        };
+        // Suggestions target a different subject.
+        let suggestions = suggest("other", &[("me", "9000")]);
+        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn replace_network_rules_swaps_network_set_keeps_local() {
+        let local_rule = FirewallRule {
+            direction: Direction::In,
+            action: Action::Allow,
+            protocol: Protocol::Tcp,
+            port: Some(PortRange { start: 22, end: 22 }),
+            peer: PeerFilter::Any,
+            network: None,
+            origin: RuleOrigin::Local,
+        };
+        let stale_net = FirewallRule {
+            direction: Direction::In,
+            action: Action::Allow,
+            protocol: Protocol::Tcp,
+            port: Some(PortRange { start: 9000, end: 9000 }),
+            peer: PeerFilter::Identity(test_id(9)),
+            network: Some("prod".to_string()),
+            origin: RuleOrigin::Network("prod".to_string()),
+        };
+        // A rule from a *different* network must survive a prod replace.
+        let other_net = FirewallRule {
+            direction: Direction::In,
+            action: Action::Allow,
+            protocol: Protocol::Tcp,
+            port: Some(PortRange { start: 8080, end: 8080 }),
+            peer: PeerFilter::Any,
+            network: Some("dev".to_string()),
+            origin: RuleOrigin::Network("dev".to_string()),
+        };
+        let config = FirewallConfig {
+            default_action: Action::Allow,
+            rules: vec![local_rule.clone(), stale_net, other_net.clone()],
+        };
+        let fw = SharedFirewall::new(config);
+
+        let fresh = FirewallRule {
+            direction: Direction::In,
+            action: Action::Deny,
+            protocol: Protocol::Any,
+            port: None,
+            peer: PeerFilter::Any,
+            network: Some("prod".to_string()),
+            origin: RuleOrigin::Network("prod".to_string()),
+        };
+        let updated = fw.replace_network_rules("prod", vec![fresh.clone()]);
+
+        // Local + other-network rules preserved; prod set fully replaced.
+        assert!(updated.rules.iter().any(|r| r.origin == RuleOrigin::Local));
+        assert!(updated
+            .rules
+            .iter()
+            .any(|r| matches!(&r.origin, RuleOrigin::Network(n) if n == "dev")));
+        let prod: Vec<_> = updated
+            .rules
+            .iter()
+            .filter(|r| matches!(&r.origin, RuleOrigin::Network(n) if n == "prod"))
+            .collect();
+        assert_eq!(prod.len(), 1);
+        assert_eq!(prod[0].action, Action::Deny);
+        assert_eq!(prod[0].peer, PeerFilter::Any);
     }
 }

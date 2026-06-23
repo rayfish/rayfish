@@ -97,6 +97,20 @@ pub enum IpcMessage {
     FirewallSuggestions {
         network: String,
     },
+    /// Read the suggested rules queued for manual review on a network (a member
+    /// that did not opt into `--allow-trusted`). Open read, like `FirewallShow`.
+    FirewallPending {
+        network: String,
+    },
+    /// Accept the queued suggested rules for a network: install them (replacing
+    /// the prior `Network(net)` set) and clear the queue.
+    FirewallAccept {
+        network: String,
+    },
+    /// Discard the queued suggested rules for a network without installing them.
+    FirewallDeny {
+        network: String,
+    },
     SetHostname {
         network: String,
         hostname: String,
@@ -185,6 +199,11 @@ pub enum IpcMessage {
     /// `FirewallSuggestions`).
     FirewallSuggestionsResponse {
         suggestions: SuggestedFirewall,
+    },
+    /// Materialized suggested rules queued for manual review on a network (reply
+    /// to `FirewallPending`). `display` is a pre-formatted, human-readable table.
+    FirewallPendingResponse {
+        display: String,
     },
     FileList {
         files: Vec<PendingFileInfo>,

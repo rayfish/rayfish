@@ -317,6 +317,22 @@ enum FirewallAction {
         #[arg(long)]
         default: Option<String>,
     },
+    /// Show suggested rules queued for manual review on a trusted network
+    /// (a member that did not join with `--allow-trusted`).
+    Pending {
+        /// Network name
+        network: String,
+    },
+    /// Accept and install a network's queued suggested rules
+    Accept {
+        /// Network name
+        network: String,
+    },
+    /// Discard a network's queued suggested rules without installing them
+    Deny {
+        /// Network name
+        network: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1295,6 +1311,9 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
         FirewallAction::Remove { index } => ipc::IpcMessage::FirewallRemove { index },
         FirewallAction::Show => ipc::IpcMessage::FirewallShow,
         FirewallAction::Default { action } => ipc::IpcMessage::FirewallDefault { action },
+        FirewallAction::Pending { network } => ipc::IpcMessage::FirewallPending { network },
+        FirewallAction::Accept { network } => ipc::IpcMessage::FirewallAccept { network },
+        FirewallAction::Deny { network } => ipc::IpcMessage::FirewallDeny { network },
         // Handled above by early return (needs a read-modify-write round trip).
         FirewallAction::Suggest { .. } => unreachable!(),
     };
@@ -1303,6 +1322,7 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::FirewallState { display } => print!("{}", display),
+        ipc::IpcMessage::FirewallPendingResponse { display } => print!("{}", display),
         ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
