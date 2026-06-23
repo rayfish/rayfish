@@ -2587,34 +2587,67 @@ impl DaemonState {
 
     fn status(&self) -> IpcMessage {
         let hostname_snapshot = self.hostname_table.try_read().ok();
+        let my_id = self.endpoint.id();
         let statuses: Vec<NetworkStatus> = self
             .networks
             .iter()
             .map(|h| {
-                let peer_entries = self.peers.peers_for_network_with_conn(&h.name);
-                let member_count = h.state.read().map(|s| s.members.all().len()).unwrap_or(0);
-                let network_key = Some(h.network_key.to_string());
-                let peers = peer_entries
+                // Build the peer list from the *roster* (every known member),
+                // not just the live connections — so `ray status` shows offline
+                // peers too (Tailscale-style). A peer with no active connection
+                // gets `connection: None`; the CLI renders it with an offline dot.
+                let (members, member_count) = {
+                    let s = match h.state.read() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            return NetworkStatus {
+                                name: h.name.clone(),
+                                role: h.role.clone(),
+                                my_ip: h.my_ip,
+                                my_ipv6: Some(derive_ipv6(&my_id)),
+                                my_hostname: None,
+                                network_key: Some(h.network_key.to_string()),
+                                member_count: 0,
+                                peers: vec![],
+                            };
+                        }
+                    };
+                    let count = s.members.all().len();
+                    let all = s.members.all().into_iter().cloned().collect::<Vec<_>>();
+                    (all, count)
+                };
+                // Index live connections by endpoint id for a fast lookup.
+                let connected: HashMap<EndpointId, Connection> = self
+                    .peers
+                    .peers_for_network_with_conn(&h.name)
                     .into_iter()
-                    .map(|(eid, ip, conn)| {
-                        let hostname = hostname_snapshot.as_ref().and_then(|table| {
-                            table.get(&h.name).and_then(|hosts| {
-                                hosts
-                                    .iter()
-                                    .find(|(_, v)| v.0 == ip)
-                                    .map(|(k, _)| k.clone())
+                    .map(|(eid, _, conn)| (eid, conn))
+                    .collect();
+                let network_key = Some(h.network_key.to_string());
+                let peers = members
+                    .iter()
+                    .filter(|m| m.identity != my_id)
+                    .map(|m| {
+                        let hostname = m.hostname.clone().or_else(|| {
+                            hostname_snapshot.as_ref().and_then(|table| {
+                                table.get(&h.name).and_then(|hosts| {
+                                    hosts
+                                        .iter()
+                                        .find(|(_, v)| v.0 == m.ip)
+                                        .map(|(k, _)| k.clone())
+                                })
                             })
                         });
-                        let connection = Self::gather_conn_info(&conn);
-                        let user_id = self.device_user_map.resolve(&eid);
-                        let user_identity = if user_id != eid { Some(user_id) } else { None };
+                        let connection = connected.get(&m.identity).map(Self::gather_conn_info);
+                        let user_id = self.device_user_map.resolve(&m.identity);
+                        let user_identity = if user_id != m.identity { Some(user_id) } else { None };
                         PeerStatus {
-                            endpoint_id: eid,
-                            ip,
-                            ipv6: Some(derive_ipv6(&eid)),
+                            endpoint_id: m.identity,
+                            ip: m.ip,
+                            ipv6: Some(derive_ipv6(&m.identity)),
                             hostname,
                             user_identity,
-                            connection: Some(connection),
+                            connection,
                         }
                     })
                     .collect();
