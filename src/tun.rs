@@ -278,8 +278,16 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
 }
 
 impl TunReader {
-    pub async fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let n = self.reader.read(buf).await?;
+    /// Reads one packet from the TUN device, appending it into the spare
+    /// capacity of `buf` without zeroing or reallocating. The caller MUST ensure
+    /// `buf` has at least one MTU of spare capacity before calling — a short
+    /// buffer truncates the packet. Returns the number of bytes read.
+    ///
+    /// Reading straight into a [`BytesMut`] lets the forward loop hand the
+    /// packet to quinn as a zero-copy `split_to(n).freeze()`, avoiding the
+    /// per-packet allocate-and-copy a `Bytes::copy_from_slice` would cost.
+    pub async fn read_into(&mut self, buf: &mut bytes::BytesMut) -> Result<usize> {
+        let n = self.reader.read_buf(buf).await?;
         Ok(n)
     }
 }

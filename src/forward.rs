@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, ConnectionError, VarInt};
 use tokio::sync::mpsc;
@@ -24,6 +24,13 @@ use crate::tun::{TunReader, TunWriter};
 /// being parsed or written to the TUN device, bounding memory use under a flood
 /// of oversized datagrams from a malicious or buggy peer.
 const MAX_PEER_DATAGRAM: usize = 1500;
+
+/// Size of the TUN read pool. One allocation is amortized across the ~50
+/// datagrams that fit in a chunk: each packet is sliced off with a zero-copy
+/// `split_to(n).freeze()`, and a fresh chunk is only allocated once the current
+/// one is exhausted (the old chunk stays alive via the `Bytes` already handed to
+/// quinn and is freed as those datagrams are sent).
+const TX_POOL_CHUNK: usize = 64 * 1024;
 
 /// Decision returned by [`evaluate_inbound`] for a datagram received from a peer.
 pub(crate) enum InboundDecision {
@@ -91,45 +98,62 @@ pub async fn run_mesh(
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
 ) -> Result<()> {
-    let mut buf = vec![0u8; 1500];
+    let mut pool = BytesMut::with_capacity(TX_POOL_CHUNK);
     loop {
-        tokio::select! {
+        // Ensure a full MTU of contiguous spare capacity before reading (a short
+        // buffer would truncate the packet). `reserve` reuses the current chunk
+        // until it's exhausted, then allocates a fresh one — so allocation is
+        // amortized across many packets instead of paid per packet.
+        if pool.capacity() < MAX_PEER_DATAGRAM {
+            pool.reserve(TX_POOL_CHUNK);
+        }
+        // Race the read against cancellation, but return only the byte count so
+        // no borrow of `pool` escapes the `select!` (it's reused right below).
+        let n = tokio::select! {
             _ = token.cancelled() => return Ok(()),
-            result = tun.read_packet(&mut buf) => {
-                let n = result?;
-                if n == 0 {
-                    continue;
-                }
-                tracing::debug!(len = n, first_byte = buf[0], "TUN read");
-                let pkt = &buf[..n];
-                let Some(info) = firewall::parse_packet_info(pkt) else {
-                    tracing::debug!(len = n, "not IP, dropping");
-                    continue;
-                };
-                let lookup = match info.dst_ip {
-                    IpAddr::V4(v4) => peers.lookup_v4(&v4),
-                    IpAddr::V6(v6) => peers.lookup_v6(&v6),
-                };
-                let Some(route) = lookup else {
-                    tracing::debug!(dst = %info.dst_ip, "no peer for dst");
-                    stats.record_drop(DropReason::NoPeer);
-                    continue;
-                };
-                // Reachability is "we share a network" — enforced by connection
-                // existence. The per-host firewall is the fine-grained gate.
-                if firewall.evaluate_packet(Direction::Out, &info, &route.endpoint_id, Some(&route.network)).is_deny() {
-                    tracing::debug!(dst = %info.dst_ip, port = info.dst_port, "firewall denied outbound");
-                    stats.record_drop(DropReason::Firewall);
-                    continue;
-                }
-                tracing::debug!(dst = %info.dst_ip, "routing to peer");
-                match route.conn.send_datagram(Bytes::copy_from_slice(pkt)) {
-                    Ok(()) => stats.record_tx(n),
-                    Err(e) => {
-                        tracing::debug!(dst = %info.dst_ip, error = %e, "datagram send failed");
-                        stats.record_drop(DropReason::SendFailure);
-                    }
-                }
+            result = tun.read_into(&mut pool) => result?,
+        };
+        if n == 0 {
+            continue;
+        }
+        // Zero-copy hand-off: slice the packet out of the pool as an owned
+        // `Bytes` sharing the chunk's allocation — no copy, no per-packet malloc.
+        let pkt = pool.split_to(n).freeze();
+        tracing::debug!(len = n, first_byte = pkt[0], "TUN read");
+        let Some(info) = firewall::parse_packet_info(&pkt) else {
+            tracing::debug!(len = n, "not IP, dropping");
+            continue;
+        };
+        let lookup = match info.dst_ip {
+            IpAddr::V4(v4) => peers.lookup_v4(&v4),
+            IpAddr::V6(v6) => peers.lookup_v6(&v6),
+        };
+        let Some(route) = lookup else {
+            tracing::debug!(dst = %info.dst_ip, "no peer for dst");
+            stats.record_drop(DropReason::NoPeer);
+            continue;
+        };
+        // Reachability is "we share a network" — enforced by connection
+        // existence. The per-host firewall is the fine-grained gate.
+        if firewall
+            .evaluate_packet(
+                Direction::Out,
+                &info,
+                &route.endpoint_id,
+                Some(&route.network),
+            )
+            .is_deny()
+        {
+            tracing::debug!(dst = %info.dst_ip, port = info.dst_port, "firewall denied outbound");
+            stats.record_drop(DropReason::Firewall);
+            continue;
+        }
+        tracing::debug!(dst = %info.dst_ip, "routing to peer");
+        match route.conn.send_datagram(pkt) {
+            Ok(()) => stats.record_tx(n),
+            Err(e) => {
+                tracing::debug!(dst = %info.dst_ip, error = %e, "datagram send failed");
+                stats.record_drop(DropReason::SendFailure);
             }
         }
     }
@@ -146,7 +170,7 @@ pub fn spawn_peer_reader(
     peer_ipv6: std::net::Ipv6Addr,
     network: String,
     firewall: SharedFirewall,
-    tun_tx: mpsc::Sender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Bytes>,
     disconnect_tx: mpsc::Sender<DisconnectEvent>,
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
@@ -190,7 +214,7 @@ pub fn spawn_peer_reader(
             match evaluate_inbound(&datagram, &firewall, &peer_user, &network) {
                 InboundDecision::Accept => {
                     stats.record_rx(datagram.len());
-                    if tun_tx.send(datagram.to_vec()).await.is_err() {
+                    if tun_tx.send(datagram).await.is_err() {
                         return;
                     }
                 }
@@ -206,7 +230,7 @@ pub fn spawn_peer_reader(
 /// Single instance per session — serializes writes without a Mutex.
 pub fn spawn_tun_writer(
     mut tun: TunWriter,
-    mut tun_rx: mpsc::Receiver<Vec<u8>>,
+    mut tun_rx: mpsc::Receiver<Bytes>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(packet) = tun_rx.recv().await {

@@ -35,6 +35,7 @@
 //!   that network's background tasks. Because cancellation is one-shot, every
 //!   `activate` mints *fresh* child tokens, so `up → down → up` cycles work.
 
+use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -86,7 +87,7 @@ struct CoordinatorAcceptState {
     identity: IrohIdentityProvider,
     state: Arc<std::sync::RwLock<NetworkState>>,
     peers: PeerTable,
-    tun_tx: mpsc::Sender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Bytes>,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
@@ -509,7 +510,7 @@ struct MemberAcceptState {
     network_name: String,
     state: Arc<std::sync::RwLock<NetworkState>>,
     peers: PeerTable,
-    tun_tx: mpsc::Sender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Bytes>,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
@@ -1011,7 +1012,7 @@ pub struct DaemonState {
     stats: Arc<ForwardMetrics>,
     /// When the daemon process started, used for uptime in diagnostics.
     start: Instant,
-    tun_tx: mpsc::Sender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Bytes>,
     networks: Arc<DashMap<String, NetworkHandle>>,
     shutdown_token: CancellationToken,
     blob_store: FsStore,
@@ -4400,7 +4401,7 @@ async fn build_daemon(
     });
     let shared_firewall = SharedFirewall::new(fw_config);
     shared_firewall.clone().spawn_evictor(token.clone());
-    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (tun_tx, tun_rx) = mpsc::channel::<Bytes>(256);
     forward::spawn_tun_writer(tun_writer, tun_rx);
     let device_user_map = peers::DeviceUserMap::new();
     tokio::spawn(forward::run_mesh(
@@ -5294,7 +5295,7 @@ async fn join_mesh_shared(
     alpn: &[u8],
     my_hostname: Option<String>,
     peers: PeerTable,
-    tun_tx: mpsc::Sender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Bytes>,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
@@ -5682,7 +5683,7 @@ fn spawn_reconnect_loop(
     my_ip: Ipv4Addr,
     my_hostname: Option<String>,
     peers: PeerTable,
-    tun_tx: mpsc::Sender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Bytes>,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
