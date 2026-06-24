@@ -237,8 +237,17 @@ impl CoordinatorAcceptState {
                     // A hostname bound to the invite is authoritative (trusted
                     // networks); it overrides the joiner's `--hostname` claim.
                     let assigned = invite_hostname.or(hostname);
-                    self.admit_peer(conn, send, remote_id, peer_ip, assigned, device_cert, false)
+                    let admitted = self
+                        .admit_peer(conn, send, remote_id, peer_ip, assigned, device_cert, false)
                         .await;
+                    // Admission can still be denied (hostname/IP collision) after
+                    // the secret was burned; un-burn so the holder can retry.
+                    if !admitted {
+                        let _guard = self.invite_lock.lock().await;
+                        if let Ok(mut store) = crate::invite::InviteStore::load(&self.network_name) {
+                            let _ = store.restore(&secret);
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "invite rejected");
@@ -284,6 +293,9 @@ impl CoordinatorAcceptState {
     /// member list, broadcast `MemberApproved`, reply `Welcome` on the joiner's
     /// stream, and start forwarding. Shared by the invite, open-mode, and
     /// live-approval admission paths.
+    /// Returns `true` if the peer was admitted, `false` if the join was denied
+    /// (hostname or IP collision). Callers that burned a credential to get here
+    /// (an invite) restore it on `false` so the holder isn't locked out.
     #[allow(clippy::too_many_arguments)]
     async fn admit_peer(
         &self,
@@ -294,7 +306,7 @@ impl CoordinatorAcceptState {
         hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
         was_approved: bool,
-    ) {
+    ) -> bool {
         // Resolve the hostname. In a trusted network the hostname is
         // coordinator-authoritative: a name already bound to a different identity
         // is rejected (no silent rename), so no admitted peer can claim another's
@@ -319,7 +331,7 @@ impl CoordinatorAcceptState {
                     format!("hostname '{desired}' is already in use on this trusted network"),
                 )
                 .await;
-                return;
+                return false;
             }
             let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
             Some(crate::hostname::resolve_collision(&desired, &taken_refs))
@@ -341,7 +353,7 @@ impl CoordinatorAcceptState {
         if collision {
             self.deny(send, format!("IP collision: {peer_ip} already assigned"))
                 .await;
-            return;
+            return false;
         }
 
         let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
@@ -450,6 +462,7 @@ impl CoordinatorAcceptState {
             self.stats.clone(),
             self.device_user_map.clone(),
         );
+        true
     }
 }
 

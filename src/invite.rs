@@ -77,6 +77,9 @@ pub struct InviteStore {
     invites: Vec<Invite>,
 }
 
+/// Current Unix time in seconds. Invite expiry uses wall-clock time, so a large
+/// backward clock adjustment on the coordinator could briefly un-expire an
+/// invite (or a forward jump expire one early) — acceptable for a TTL credential.
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -177,6 +180,13 @@ impl InviteStore {
         let contents = toml::to_string_pretty(&file).context("serializing invites")?;
         std::fs::write(&self.path, contents)
             .with_context(|| format!("writing {}", self.path.display()))?;
+        // The ledger holds only hashes, never raw secrets, but it does expose
+        // invite metadata (expiry, redeemers, bound hostnames); keep it owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(())
     }
 
@@ -229,6 +239,22 @@ impl InviteStore {
         invite.status = InviteStatus::Redeemed { by, at: now };
         self.save()?;
         Ok(hostname)
+    }
+
+    /// Un-burn an invite: revert a `Redeemed` record back to `Pending`. Used when
+    /// admission fails *after* the secret was burned (e.g. a hostname/IP collision
+    /// rejects the join), so the legitimate holder isn't locked out. No-op for an
+    /// unknown or non-`Redeemed` secret. Must be called under the same lock as
+    /// [`redeem`].
+    pub fn restore(&mut self, secret: &[u8]) -> Result<()> {
+        let hash = hash_secret(secret);
+        if let Some(invite) = self.invites.iter_mut().find(|i| i.secret_hash == hash) {
+            if matches!(invite.status, InviteStatus::Redeemed { .. }) {
+                invite.status = InviteStatus::Pending;
+                self.save()?;
+            }
+        }
+        Ok(())
     }
 
     /// Revoke an unused invite by id (exact match, or unambiguous prefix).
@@ -408,6 +434,40 @@ mod tests {
         // The bound hostname is visible in the list.
         let view = store.list();
         assert_eq!(view[0].hostname.as_deref(), Some("ty2-clic01"));
+    }
+
+    #[test]
+    fn restore_reinstates_a_burned_invite() {
+        let (mut store, _dir) = temp_store();
+        let (secret, _id) = store.mint(Duration::from_secs(3600), None).unwrap();
+        store.redeem(&secret, test_id(9)).unwrap();
+        // After restore the invite is pending again and redeemable once more.
+        store.restore(&secret).unwrap();
+        assert_eq!(store.list()[0].status, "pending");
+        store.redeem(&secret, test_id(10)).unwrap();
+        assert_eq!(store.list()[0].status, "redeemed");
+    }
+
+    #[test]
+    fn restore_is_noop_for_unknown_or_pending() {
+        let (mut store, _dir) = temp_store();
+        let (secret, _id) = store.mint(Duration::from_secs(3600), None).unwrap();
+        // Pending stays pending; an unknown secret is ignored.
+        store.restore(&secret).unwrap();
+        store.restore(&generate_secret()).unwrap();
+        assert_eq!(store.list()[0].status, "pending");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net.toml");
+        let mut store = InviteStore::with_path(&path);
+        store.mint(Duration::from_secs(3600), None).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
