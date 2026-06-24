@@ -68,10 +68,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu22-full-x64/extras=s3-cache
             name: ray-linux-x86_64
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04-arm
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-arm64/image=ubuntu22-full-arm64/extras=s3-cache
             name: ray-linux-aarch64
           - target: aarch64-apple-darwin
             runner: macos-latest
@@ -83,6 +83,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
+      - uses: runs-on/action@v2
+        if: ${{ !contains(matrix.runner, 'macos') }}
       - uses: actions/checkout@v4
 
       - name: Install Rust

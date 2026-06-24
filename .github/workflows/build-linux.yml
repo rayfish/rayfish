@@ -1,0 +1,59 @@
+name: Build Linux (RunsOn)
+
+# Builds the `ray` binary for Linux on RunsOn self-hosted runners.
+# Trigger manually from the Actions tab, or on push to master.
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu22-full-x64/extras=s3-cache
+            name: ray-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-arm64/image=ubuntu22-full-arm64/extras=s3-cache
+            name: ray-linux-aarch64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: runs-on/action@v2
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "build-linux"
+          cache-on-failure: true
+
+      - name: Build binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          BINARY=target/${{ matrix.target }}/release/ray
+          cp "$BINARY" ${{ matrix.name }}
+          sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256
