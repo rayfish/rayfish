@@ -1039,6 +1039,19 @@ pub struct DaemonState {
     dns_configurator: Arc<std::sync::Mutex<Option<Box<dyn dns_config::DnsConfigurator>>>>,
 }
 
+/// Map key-holding status to a [`NetworkRole`].
+///
+/// A node that holds the per-network secret key (original coordinator or one
+/// promoted via `ray admin add`) runs as `Coordinator`; all other nodes run
+/// as `Member`.
+fn role_for_key_holder(holds_network_key: bool) -> NetworkRole {
+    if holds_network_key {
+        NetworkRole::Coordinator
+    } else {
+        NetworkRole::Member
+    }
+}
+
 impl DaemonState {
     async fn refresh_alpns(&self) {
         let alpns = self.protocol_router.alpns();
@@ -1051,6 +1064,52 @@ impl DaemonState {
 
         let network_names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
         dns_config::update_search_domains(&network_names, &self.tun_name).await;
+    }
+
+    /// Register a [`CoordinatorAcceptState`] handler for `network` and update
+    /// the network's role in `self.networks` to [`NetworkRole::Coordinator`].
+    ///
+    /// Calling this at create, restore, and admin-promotion sites keeps the
+    /// coordinator-registration logic in one place. The method is synchronous
+    /// (no `.await`) because `protocol_router.register` is a plain HashMap
+    /// swap; the caller is responsible for spawning the `disconnect_rx` cleanup
+    /// task **before** calling this so the channel is live when the first
+    /// incoming connection arrives.
+    #[allow(clippy::too_many_arguments)]
+    fn register_coordinator_handler(
+        &self,
+        network: &str,
+        state: Arc<std::sync::RwLock<NetworkState>>,
+        invite_lock: Arc<tokio::sync::Mutex<()>>,
+        dht_notify: Option<Arc<tokio::sync::Notify>>,
+        network_key: EndpointId,
+        disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+        cancel: CancellationToken,
+    ) {
+        self.protocol_router.register(
+            transport::network_alpn(&network_key),
+            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
+                network_name: network.to_string(),
+                identity: self.identity.clone(),
+                state,
+                peers: self.peers.clone(),
+                tun_tx: self.tun_tx.clone(),
+                disconnect_tx,
+                token: cancel,
+                stats: self.stats.clone(),
+                dht_notify,
+                blob_store: self.blob_store.clone(),
+                firewall: self.firewall.clone(),
+                hostname_table: self.hostname_table.clone(),
+                reverse_table: self.reverse_table.clone(),
+                device_user_map: self.device_user_map.clone(),
+                invite_lock,
+            })),
+        );
+        // Flip the stored role so `ray status` reports Coordinator immediately.
+        if let Some(mut handle) = self.networks.get_mut(network) {
+            handle.role = NetworkRole::Coordinator;
+        }
     }
 
     /// Tailscale-style access control. Read-only queries are open to any local
@@ -1439,41 +1498,30 @@ impl DaemonState {
             }),
         ));
 
-        // Register protocol handler for this network
-        self.protocol_router.register(
-            transport::network_alpn(&net_public_key),
-            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-                network_name: name.clone(),
-                identity: self.identity.clone(),
-                state: state.clone(),
-                peers: self.peers.clone(),
-                tun_tx: self.tun_tx.clone(),
-                disconnect_tx,
-                token: cancel.clone(),
-                stats: self.stats.clone(),
-                dht_notify: Some(dht_notify.clone()),
-                blob_store: self.blob_store.clone(),
-                firewall: self.firewall.clone(),
-                hostname_table: self.hostname_table.clone(),
-                reverse_table: self.reverse_table.clone(),
-                device_user_map: self.device_user_map.clone(),
-                invite_lock: invite_lock.clone(),
-            })),
-        );
-
-        // Update ALPNs
+        // Insert the handle first so register_coordinator_handler can update the role.
         let handle = NetworkHandle {
             name: name.clone(),
             network_key: net_public_key,
             role: NetworkRole::Coordinator,
             my_ip,
-            state,
-            dht_notify: Some(dht_notify),
-            cancel,
+            state: state.clone(),
+            dht_notify: Some(dht_notify.clone()),
+            cancel: cancel.clone(),
             tasks,
-            invite_lock,
+            invite_lock: invite_lock.clone(),
         };
         self.networks.insert(name.clone(), handle);
+
+        // Register protocol handler for this network
+        self.register_coordinator_handler(
+            &name,
+            state,
+            invite_lock,
+            Some(dht_notify),
+            net_public_key,
+            disconnect_tx,
+            cancel,
+        );
         self.refresh_alpns().await;
 
         tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network created");
@@ -1713,23 +1761,46 @@ impl DaemonState {
             }
         };
 
-        self.protocol_router.register(
-            alpn.clone(),
-            AcceptHandler::Member(Arc::new(MemberAcceptState {
-                network_name: display_name.to_string(),
-                state: state.clone(),
-                peers: self.peers.clone(),
-                tun_tx: self.tun_tx.clone(),
-                disconnect_tx,
-                token: cancel.clone(),
-                stats: self.stats.clone(),
-                blob_store: self.blob_store.clone(),
-                firewall: self.firewall.clone(),
-                hostname_table: self.hostname_table.clone(),
-                reverse_table: self.reverse_table.clone(),
-                device_user_map: self.device_user_map.clone(),
-            })),
-        );
+        // A node that already holds the network secret key (e.g. a
+        // co-coordinator joining after a config-only restore) should run as
+        // Coordinator so it can admit future peers immediately — even though
+        // it arrived here via join rather than restore.
+        let held_key = state.read().unwrap().network_secret_key.clone();
+        let role = role_for_key_holder(held_key.is_some());
+        match role {
+            NetworkRole::Coordinator => {
+                let net_public_key = state.read().unwrap().network_public_key;
+                let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
+                self.register_coordinator_handler(
+                    display_name,
+                    state.clone(),
+                    invite_lock,
+                    None,
+                    net_public_key,
+                    disconnect_tx,
+                    cancel.clone(),
+                );
+            }
+            NetworkRole::Member => {
+                self.protocol_router.register(
+                    alpn.clone(),
+                    AcceptHandler::Member(Arc::new(MemberAcceptState {
+                        network_name: display_name.to_string(),
+                        state: state.clone(),
+                        peers: self.peers.clone(),
+                        tun_tx: self.tun_tx.clone(),
+                        disconnect_tx,
+                        token: cancel.clone(),
+                        stats: self.stats.clone(),
+                        blob_store: self.blob_store.clone(),
+                        firewall: self.firewall.clone(),
+                        hostname_table: self.hostname_table.clone(),
+                        reverse_table: self.reverse_table.clone(),
+                        device_user_map: self.device_user_map.clone(),
+                    })),
+                );
+            }
+        }
 
         // Set the network public key on the state
         {
@@ -2334,25 +2405,14 @@ impl DaemonState {
             }),
         ));
 
-        self.protocol_router.register(
-            transport::network_alpn(&net_public_key),
-            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-                network_name: name.to_string(),
-                identity: self.identity.clone(),
-                state: state.clone(),
-                peers: self.peers.clone(),
-                tun_tx: self.tun_tx.clone(),
-                disconnect_tx: disconnect_tx.clone(),
-                token: cancel.clone(),
-                stats: self.stats.clone(),
-                dht_notify: Some(dht_notify.clone()),
-                blob_store: self.blob_store.clone(),
-                firewall: self.firewall.clone(),
-                hostname_table: self.hostname_table.clone(),
-                reverse_table: self.reverse_table.clone(),
-                device_user_map: self.device_user_map.clone(),
-                invite_lock: invite_lock.clone(),
-            })),
+        self.register_coordinator_handler(
+            name,
+            state.clone(),
+            invite_lock.clone(),
+            Some(dht_notify.clone()),
+            net_public_key,
+            disconnect_tx.clone(),
+            cancel.clone(),
         );
 
         // Register hostnames in DNS table
@@ -6017,5 +6077,11 @@ mod accept_handler_tests {
         // AcceptHandler exposes whether it is the coordinator variant.
         assert!(!sample_member_handler().await.is_coordinator());
         assert!(sample_coordinator_handler().await.is_coordinator());
+    }
+
+    #[test]
+    fn holds_key_implies_coordinator_role() {
+        assert_eq!(role_for_key_holder(true), NetworkRole::Coordinator);
+        assert_eq!(role_for_key_holder(false), NetworkRole::Member);
     }
 }

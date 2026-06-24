@@ -351,7 +351,7 @@ pub struct NetworkStatus {
     pub peers: Vec<PeerStatus>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, derive_more::IsVariant)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, derive_more::IsVariant)]
 pub enum NetworkRole {
     Coordinator,
     Member,
