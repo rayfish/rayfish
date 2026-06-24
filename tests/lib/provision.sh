@@ -1,4 +1,4 @@
-# Generic Scaleway provisioner, sourced by each scenario's provision.sh.
+# Generic Scaleway provisioner, sourced by the tests/e2e.sh dispatcher.
 #
 # The caller must set, before sourcing:
 #   NAMES  - array of Scaleway instance names (one per host)

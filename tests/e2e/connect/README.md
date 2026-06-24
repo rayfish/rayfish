@@ -27,12 +27,14 @@ srv-b  identity V   recipient   (ray connections approve <id>)
 
 ```bash
 # Requires: scw (authenticated), jq, just, cross + docker, an SSH key.
-tests/e2e/connect/provision.sh    # spin up 2 DEV1-S instances -> .servers
-tests/e2e/connect/run.sh          # cross-build, deploy, drive the flow, assert
-tests/e2e/connect/teardown.sh     # destroy the instances when done
+tests/e2e.sh connect             # provision (if needed), cross-build, deploy, drive, assert
+tests/e2e.sh connect provision   # just spin up 2 DEV1-S instances -> .servers
+tests/e2e.sh connect teardown    # destroy the instances when done
 ```
 
-Env knobs: `ZONE`, `TYPE`, `IMAGE` (provision); `SSH_KEY`, `KEEP_STATE=1`
-(run, skips the per-run state reset). The run is re-runnable — it resets rayfish
-state on each host (fresh identities, contact ids, and a fresh direct network)
-unless `KEEP_STATE=1`.
+`tests/e2e.sh` is the shared dispatcher (the scenario steps live in `run.sh`,
+which you can also invoke directly once `.servers` exists). Env knobs: `ZONE`,
+`TYPE`, `IMAGE` (provision); `SSH_KEY`, `KEEP_STATE=1` (run, skips the per-run
+state reset). The run is re-runnable — it resets rayfish state on each host
+(fresh identities, contact ids, and a fresh direct network) unless
+`KEEP_STATE=1`.

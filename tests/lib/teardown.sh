@@ -1,4 +1,4 @@
-# Generic teardown, sourced by each scenario's teardown.sh.
+# Generic teardown, sourced by the tests/e2e.sh dispatcher.
 #
 # The caller must set, before sourcing:
 #   SERVERS - path to the .servers file (`id ip label zone` per line)

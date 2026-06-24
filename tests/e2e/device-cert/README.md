@@ -30,22 +30,23 @@ IP (the multi-homed-peer model). The test pings and `ray send`s between srv-c an
 ## Run
 
 ```bash
-tests/e2e/device-cert/provision.sh   # create 3 DEV1-S Ubuntu instances in fr-par-1
-tests/e2e/device-cert/run.sh         # deploy + pair + create/join + assert ping & ray send
-tests/e2e/device-cert/teardown.sh    # destroy the instances when done (manual)
+tests/e2e.sh device-cert            # provision (if needed) + deploy + pair + create/join + assert
+tests/e2e.sh device-cert provision  # just create 3 DEV1-S Ubuntu instances in fr-par-1
+tests/e2e.sh device-cert teardown   # destroy the instances when done (manual)
 ```
 
-Shared SSH/deploy/assert plumbing lives in `tests/lib/` (sourced by these
-scripts); only the scenario-specific steps live here.
+`tests/e2e.sh` is the shared dispatcher; the scenario-specific steps live in
+`run.sh` here (sourcing the SSH/deploy/assert plumbing from `tests/lib/`). You
+can also invoke `tests/e2e/device-cert/run.sh` directly once `.servers` exists.
 
-- `provision.sh` writes `tests/e2e/device-cert/.servers` (gitignored:
+- `provision` writes `tests/e2e/device-cert/.servers` (gitignored:
   `id ip label zone`). It is a no-op while that file exists; delete it to
   provision a fresh set.
-- `run.sh` is fully re-runnable against the same `.servers`: it **resets each
+- The run is fully re-runnable against the same `.servers`: it **resets each
   host's rayfish state** (stops the daemon, wipes `/root/.config/rayfish`) at the
   start of every run, so you get a clean slate from scratch each time — fresh
-  identities, no leftover `e2e` network. Just run `tests/e2e/device-cert/run.sh`
-  again. Pass `KEEP_STATE=1 tests/e2e/device-cert/run.sh` to skip the reset
+  identities, no leftover `e2e` network. Just run `tests/e2e.sh device-cert`
+  again. Pass `KEEP_STATE=1 tests/e2e.sh device-cert` to skip the reset
   (re-run against the existing network). It prints a `PASS`/`FAIL` line per check
   and exits non-zero if any failed.
 
@@ -54,9 +55,9 @@ scripts); only the scenario-specific steps live here.
 > srv-b's daemon after pairing and before joining. This is a workaround for a
 > real product bug (see "Findings" below); without the restart srv-b would join
 > as an independent identity rather than as user U.
-- Servers are **left running** after `run.sh` so you can inspect them
-  (`ssh root@<ip> ray status`). `teardown.sh` terminates them and removes
-  `.servers`.
+- Servers are **left running** after the run so you can inspect them
+  (`ssh root@<ip> ray status`). `tests/e2e.sh device-cert teardown` terminates
+  them and removes `.servers`.
 
 ## Environment overrides
 

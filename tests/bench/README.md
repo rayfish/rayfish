@@ -18,14 +18,16 @@ registered in the Scaleway account, Docker running (for `cross`), plus `jq` and
 ## Usage
 
 ```bash
-tests/bench/provision.sh      # create 2 DEV1-S instances -> tests/bench/.servers
-tests/bench/run.sh            # deploy ray + iperf3, peer, benchmark, print table
-tests/bench/teardown.sh       # destroy the instances when done
+tests/e2e.sh bench            # provision (if needed) + deploy ray + iperf3, benchmark, print table
+tests/e2e.sh bench provision  # just create 2 DEV1-S instances -> tests/bench/.servers
+tests/e2e.sh bench teardown   # destroy the instances when done
 ```
 
-Overrides: `ZONE`, `TYPE`, `IMAGE` (provision); `DURATION` (seconds/iperf run),
-`SSH_KEY`, `KEEP_STATE=1` (skip the state wipe and re-use an existing network) for
-`run.sh`. Results are printed and saved to `results/<stamp>.md` (+ `.raw` TSV).
+`tests/e2e.sh` is the shared dispatcher (the benchmark steps live in `run.sh`
+here, which you can also invoke directly once `.servers` exists). Overrides:
+`ZONE`, `TYPE`, `IMAGE` (provision); `DURATION` (seconds/iperf run), `SSH_KEY`,
+`KEEP_STATE=1` (skip the state wipe and re-use an existing network) for the run.
+Results are printed and saved to `results/<stamp>.md` (+ `.raw` TSV).
 
 ## Caveats
 

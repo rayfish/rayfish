@@ -12,16 +12,21 @@ failure). The shared SSH/deploy/reset/assert plumbing lives in
 | [`device-cert/`](device-cert) | 3 | A third peer reaches a user identity backed by two paired devices (`ray pair` + DeviceCert), over a closed (invite-gated) network. |
 | [`connect/`](connect) | 2 | The `ray connect` direct 2-peer friend-request flow over the public pkarr DHT — request, approve, `[direct]` network, ping + `ray send`, per-network firewall, offline negative case. |
 
-Each scenario is self-contained:
+Everything runs through one dispatcher, [`../e2e.sh`](../e2e.sh):
 
 ```bash
-tests/e2e/<scenario>/provision.sh   # spin up instances -> <scenario>/.servers
-tests/e2e/<scenario>/run.sh         # deploy + drive the flow + assert
-tests/e2e/<scenario>/teardown.sh    # destroy the instances (manual)
+tests/e2e.sh <scenario>             # provision (if needed) + deploy + drive + assert
+tests/e2e.sh <scenario> provision   # just spin up instances -> <dir>/.servers
+tests/e2e.sh <scenario> teardown    # destroy the instances (manual)
 ```
 
-The throughput/latency benchmark is a sibling suite under
-[`../bench/`](../bench) (same shared `tests/lib/`).
+where `<scenario>` is `device-cert`, `connect`, or `bench` (run `tests/e2e.sh`
+with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
+(still runnable directly once `.servers` exists); the fleet definitions and the
+provision/teardown/assert bodies are shared in [`../lib/`](../lib).
+
+The throughput/latency benchmark (`tests/e2e.sh bench`) is a sibling suite
+under [`../bench/`](../bench) (same shared `tests/lib/`).
 
 ## Prerequisites (all scenarios)
 
