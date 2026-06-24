@@ -55,6 +55,16 @@ sudo ray up    # installs the system service if needed, then activates the VPN
 
 The **first** `ray up` needs root — it installs the system service and starts the daemon (which owns the TUN device and the iroh endpoint). After that the daemon stays running and **every command, including `ray up`/`ray down`, runs unprivileged** over a local socket.
 
+#### Updating
+
+```bash
+ray --version            # show the installed version (also `ray version`)
+ray update --check       # report current vs the latest GitHub release
+sudo ray update          # download + verify the latest release, swap the binary, restart the daemon
+```
+
+`ray update` fetches the latest release from GitHub, verifies its SHA-256, atomically replaces the running `ray` binary, and — if the system service is installed — restarts the daemon onto the new version. It needs root when the installed binary lives in a system path (so do `sudo ray update`); `ray --version` and `ray update --check` do not.
+
 ### 2. Create a network
 
 ```bash

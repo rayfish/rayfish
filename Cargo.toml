@@ -93,6 +93,19 @@ argon2 = "0.5.3"
 rpassword = "7.5.4"
 async-trait = "0.1"
 bytesize = "2.4.0"
+# `ray update`: query the GitHub releases API and download the new binary.
+# rustls reuses the TLS stack already in the tree (iroh) — no OpenSSL system dep.
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls",
+] }
+# Atomically replace the running executable during `ray update`.
+self-replace = "1"
+# SHA-256 verification of the downloaded release asset against its .sha256 file.
+sha2 = "0.10"
+# Semantic version comparison for `ray update` (only upgrade when newer).
+semver = "1"
 
 [dev-dependencies]
 tempfile = "3"

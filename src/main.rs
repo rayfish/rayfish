@@ -14,7 +14,11 @@ use clap::{CommandFactory, Parser, Subcommand};
 use membership::GroupMode;
 
 #[derive(Parser)]
-#[command(name = "ray", about = "P2P mesh VPN powered by iroh")]
+#[command(
+    name = "ray",
+    about = "P2P mesh VPN powered by iroh",
+    version = env!("CARGO_PKG_VERSION")
+)]
 struct Cli {
     /// Emit machine-readable JSON instead of styled text (disables color and
     /// spinners). Supported by `status`, `firewall show`, `files`, and other
@@ -228,6 +232,17 @@ enum Command {
         action: Option<PairAction>,
         /// Pairing ticket from the primary device (shorthand for `rayfish pair accept <ticket>`)
         ticket: Option<String>,
+    },
+    /// Print the rayfish version
+    Version,
+    /// Update rayfish to the latest GitHub release
+    Update {
+        /// Reinstall even if already on the latest version
+        #[arg(long)]
+        force: bool,
+        /// Report the latest available version without installing
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -708,6 +723,11 @@ async fn main() -> Result<()> {
         Command::Send { file, peer } => ipc_send_file(&file, &peer).await,
         Command::Files { action } => ipc_files(action).await,
         Command::Pair { action, ticket } => cmd_pair(action, ticket).await,
+        Command::Version => {
+            println!("ray {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Command::Update { force, check } => cmd_update(force, check).await,
     }
 }
 
@@ -2738,39 +2758,34 @@ async fn cmd_install() -> Result<()> {
     install_and_start_service(None).await
 }
 
-/// `ray restart`: restart the already-installed system service via the OS
-/// service manager (does not rewrite the unit file). Requires root. The daemon
-/// comes back up active.
-async fn cmd_restart() -> Result<()> {
-    require_root()?;
-
+/// Whether the system service unit/plist is installed on this host.
+fn service_unit_exists() -> bool {
     #[cfg(target_os = "linux")]
     {
-        let unit = std::path::Path::new("/etc/systemd/system/rayfish.service");
-        if !unit.exists() {
-            eprintln!("rayfish service is not installed. Run: sudo ray up");
-            std::process::exit(1);
-        }
-        run_cmd("systemctl", &["restart", "rayfish"]);
+        return std::path::Path::new("/etc/systemd/system/rayfish.service").exists();
     }
-
     #[cfg(target_os = "macos")]
     {
-        let plist = std::path::Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist");
-        if !plist.exists() {
-            eprintln!("rayfish service is not installed. Run: sudo ray up");
-            std::process::exit(1);
-        }
-        run_cmd("launchctl", &["kickstart", "-k", "system/com.rayfish.vpn"]);
+        return std::path::Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist").exists();
     }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Restart the installed service via the OS service manager (without rewriting
+/// the unit file) and wait for the daemon to accept IPC again. Shared by
+/// `ray restart` and `ray update`; mirrors the `up`/`install` diagnostics.
+#[allow(unreachable_code)]
+async fn restart_service_and_wait() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    run_cmd("systemctl", &["restart", "rayfish"]);
+
+    #[cfg(target_os = "macos")]
+    run_cmd("launchctl", &["kickstart", "-k", "system/com.rayfish.vpn"]);
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        anyhow::bail!("system service not supported on this platform");
-    }
+    anyhow::bail!("system service not supported on this platform");
 
-    // Confirm the daemon came back, mirroring `up`/`install` diagnostics.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     match wait_for_daemon(std::time::Duration::from_secs(8)).await {
         Some(_) => {
             println!("rayfish service restarted.");
@@ -2781,6 +2796,219 @@ async fn cmd_restart() -> Result<()> {
             print_daemon_log_tail();
             std::process::exit(1);
         }
+    }
+}
+
+/// `ray restart`: restart the already-installed system service via the OS
+/// service manager (does not rewrite the unit file). Requires root. The daemon
+/// comes back up active.
+async fn cmd_restart() -> Result<()> {
+    require_root()?;
+    if !service_unit_exists() {
+        eprintln!("rayfish service is not installed. Run: sudo ray up");
+        std::process::exit(1);
+    }
+    restart_service_and_wait().await
+}
+
+// ---------------------------------------------------------------------------
+// Self-update (`ray update`)
+// ---------------------------------------------------------------------------
+
+/// owner/repo slug for the GitHub releases this binary updates from. Matches
+/// `REPORT_REPO_URL` and the `install.sh` bootstrap installer.
+const REPO_SLUG: &str = "rayfish/rayfish";
+
+/// Map the host OS/arch to the release asset name CI publishes
+/// (`ray-{os}-{arch}`, e.g. `ray-linux-x86_64`). Errors on platforms we don't
+/// build binaries for, so the user falls back to building from source.
+fn release_asset_name(os: &str, arch: &str) -> Result<String> {
+    let os = match os {
+        "linux" => "linux",
+        "macos" => "macos",
+        other => anyhow::bail!("no rayfish release binary for OS '{other}'; build from source"),
+    };
+    let arch = match arch {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => {
+            anyhow::bail!("no rayfish release binary for architecture '{other}'; build from source")
+        }
+    };
+    Ok(format!("ray-{os}-{arch}"))
+}
+
+/// Strip a leading `v` from a release tag for comparison with
+/// `CARGO_PKG_VERSION` (`v0.1.0` → `0.1.0`).
+fn normalize_version(tag: &str) -> &str {
+    tag.strip_prefix('v').unwrap_or(tag)
+}
+
+/// Whether `latest` is a strictly newer semver than `current`. Falls back to a
+/// plain string inequality if either side fails to parse, so an unusual tag
+/// still triggers an update rather than being silently ignored.
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    match (semver::Version::parse(latest), semver::Version::parse(current)) {
+        (Ok(l), Ok(c)) => l > c,
+        _ => latest != current,
+    }
+}
+
+/// Whether a sibling temp file can be created in `dir` (i.e. it is writable by
+/// us). `self_replace` writes a temp next to the running binary then renames, so
+/// directory write permission is what decides if we need root.
+fn dir_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".ray-update-probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct GhRelease {
+    tag_name: String,
+}
+
+/// `ray update`: replace this binary with the latest GitHub release and, if the
+/// system service is installed, restart the daemon onto the new binary.
+///
+/// `--check` only reports current vs latest (no root, no install); `--force`
+/// reinstalls even when already current.
+async fn cmd_update(force: bool, check: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    // Fail fast on unsupported platforms before any network I/O.
+    let asset = release_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
+
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("ray/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    // Discover the latest release tag via the GitHub API.
+    let spinner = progress::spinner("checking for updates…");
+    let api = format!("https://api.github.com/repos/{REPO_SLUG}/releases/latest");
+    let release: GhRelease = (async {
+        client
+            .get(&api)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+    })
+    .await
+    .context("failed to query the GitHub releases API (is a release published yet?)")?;
+    spinner.finish_and_clear();
+
+    let latest = normalize_version(&release.tag_name);
+
+    if check {
+        println!("current: {current}");
+        println!("latest:  {latest}");
+        if version_is_newer(latest, current) {
+            println!("run `sudo ray update` to upgrade");
+        } else {
+            println!("rayfish is up to date");
+        }
+        return Ok(());
+    }
+
+    if !version_is_newer(latest, current) && !force {
+        println!("rayfish is already up to date (v{current})");
+        return Ok(());
+    }
+
+    // Replacing the installed binary (typically root-owned) and restarting the
+    // service both need root. Decide up front so we exit with a clean sudo hint
+    // before downloading.
+    let service_installed = service_unit_exists();
+    let exe = std::env::current_exe().context("failed to determine current executable path")?;
+    let needs_root = service_installed
+        || exe
+            .parent()
+            .map(|dir| !dir_writable(dir))
+            .unwrap_or(true);
+    if needs_root {
+        require_root()?;
+    }
+
+    // Download the binary and its checksum sidecar from the tagged release.
+    let base = format!(
+        "https://github.com/{REPO_SLUG}/releases/download/{}",
+        release.tag_name
+    );
+    let bin_url = format!("{base}/{asset}");
+    let sha_url = format!("{bin_url}.sha256");
+
+    let spinner = progress::spinner(format!("downloading {asset} (v{latest})…"));
+    let result: Result<(bytes::Bytes, String)> = async {
+        let bytes = client
+            .get(&bin_url)
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("no release asset at {bin_url}"))?
+            .bytes()
+            .await?;
+        let sha_text = client
+            .get(&sha_url)
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("no checksum at {sha_url}"))?
+            .text()
+            .await?;
+        Ok((bytes, sha_text))
+    }
+    .await;
+    spinner.finish_and_clear();
+    let (bytes, sha_text) = result.context("download failed")?;
+
+    // Verify the SHA-256 against the published `.sha256` (first whitespace field).
+    let expected = sha_text.split_whitespace().next().unwrap_or("").to_lowercase();
+    if expected.is_empty() {
+        anyhow::bail!("no checksum published for {asset}; aborting for safety");
+    }
+    let actual = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        hex::encode(hasher.finalize())
+    };
+    if actual != expected {
+        anyhow::bail!(
+            "checksum mismatch for {asset}\n  expected: {expected}\n  got:      {actual}"
+        );
+    }
+
+    // Stage the new binary in a temp file, make it executable, then atomically
+    // swap it in for the running binary (handles the "can't overwrite a running
+    // executable" problem via rename).
+    let tmp = std::env::temp_dir().join(format!("{asset}.new"));
+    std::fs::write(&tmp, &bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .context("failed to set executable permissions on the downloaded binary")?;
+    }
+    self_replace::self_replace(&tmp).context("failed to replace the running binary")?;
+    let _ = std::fs::remove_file(&tmp);
+
+    println!("updated rayfish {current} → {latest}");
+
+    // If the service is installed, the daemon is still the old binary — refresh
+    // the unit's exec path and restart it onto the new one.
+    if service_installed {
+        ensure_service_installed()?;
+        restart_service_and_wait().await
+    } else {
+        println!("run `sudo ray up` to start the service with the new binary");
+        Ok(())
     }
 }
 
@@ -2883,6 +3111,39 @@ fn cmd_uninstall_service() -> Result<()> {
 mod tests {
     use super::*;
     use ipc::FirewallRuleView;
+
+    #[test]
+    fn release_asset_name_maps_supported_platforms() {
+        assert_eq!(release_asset_name("linux", "x86_64").unwrap(), "ray-linux-x86_64");
+        assert_eq!(release_asset_name("linux", "aarch64").unwrap(), "ray-linux-aarch64");
+        assert_eq!(release_asset_name("macos", "x86_64").unwrap(), "ray-macos-x86_64");
+        assert_eq!(release_asset_name("macos", "aarch64").unwrap(), "ray-macos-aarch64");
+    }
+
+    #[test]
+    fn release_asset_name_rejects_unsupported_platforms() {
+        assert!(release_asset_name("windows", "x86_64").is_err());
+        assert!(release_asset_name("linux", "riscv64").is_err());
+    }
+
+    #[test]
+    fn normalize_version_strips_leading_v() {
+        assert_eq!(normalize_version("v0.1.0"), "0.1.0");
+        assert_eq!(normalize_version("0.1.0"), "0.1.0");
+        assert_eq!(normalize_version("v1.2.3-rc1"), "1.2.3-rc1");
+    }
+
+    #[test]
+    fn version_is_newer_orders_semver() {
+        assert!(version_is_newer("0.2.0", "0.1.0"));
+        assert!(version_is_newer("1.0.0", "0.9.9"));
+        assert!(!version_is_newer("0.1.0", "0.1.0"));
+        assert!(!version_is_newer("0.1.0", "0.2.0")); // older latest ⇒ no downgrade
+        assert!(version_is_newer("0.1.0", "0.1.0-rc1")); // release beats prerelease
+        // Unparseable tags fall back to inequality.
+        assert!(version_is_newer("nightly", "0.1.0"));
+        assert!(!version_is_newer("weird", "weird"));
+    }
 
     fn view(
         dir: &str,
