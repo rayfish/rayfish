@@ -2916,6 +2916,12 @@ async fn cmd_update(force: bool, check: bool) -> Result<()> {
     // Fail fast on unsupported platforms before any network I/O.
     let asset = release_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
 
+    // reqwest is built with `rustls-no-provider`, so it relies on a process-level
+    // default CryptoProvider. Install ring (already in the tree via iroh) before
+    // building the client. `install_default` errors only if one is already set —
+    // harmless here, so ignore it.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let client = reqwest::Client::builder()
         .user_agent(concat!("ray/", env!("CARGO_PKG_VERSION")))
         .build()

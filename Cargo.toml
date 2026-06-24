@@ -94,12 +94,17 @@ rpassword = "7.5.4"
 async-trait = "0.1"
 bytesize = "2.4.0"
 # `ray update`: query the GitHub releases API and download the new binary.
-# rustls reuses the TLS stack already in the tree (iroh) — no OpenSSL system dep.
+# `rustls-no-provider` reuses the ring TLS stack already in the tree (iroh's
+# `tls-ring`) — no aws-lc-rs C build (which breaks cross-compilation), no OpenSSL
+# system dep. We install ring as the process-default CryptoProvider in cmd_update.
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "stream",
-    "rustls",
+    "rustls-no-provider",
 ] }
+# Direct handle on rustls so we can install the ring crypto provider as the
+# process default before reqwest builds its client (reqwest pulls no provider).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Atomically replace the running executable during `ray update`.
 self-replace = "1"
 # SHA-256 verification of the downloaded release asset against its .sha256 file.
