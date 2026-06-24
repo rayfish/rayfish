@@ -19,9 +19,6 @@ pub enum IpcMessage {
         name: Option<String>,
         hostname: Option<String>,
         transport: Option<TransportMode>,
-        /// Trusted network: the coordinator may suggest firewall rules to members.
-        #[serde(default)]
-        trusted: bool,
     },
     Join {
         network_key: String,
@@ -35,10 +32,10 @@ pub enum IpcMessage {
         /// Coordinator endpoint id to dial directly when joining via an invite.
         #[serde(default)]
         coordinator: Option<EndpointId>,
-        /// Auto-take coordinator-suggested firewall rules on this network without
-        /// a manual review queue (`--allow-trusted`).
-        #[serde(default)]
-        allow_trusted: bool,
+        /// Auto-install coordinator-suggested firewall rules on this network
+        /// without a manual review queue (`--auto-accept-firewall`).
+        #[serde(default, alias = "allow_trusted")]
+        auto_accept_firewall: bool,
     },
     Leave {
         name: String,
@@ -60,10 +57,6 @@ pub enum IpcMessage {
     Up {
         #[serde(default)]
         hostname: Option<String>,
-        /// Auto-take coordinator-suggested rules on trusted networks being
-        /// activated (`--allow-trusted`).
-        #[serde(default)]
-        allow_trusted: bool,
     },
     /// Put the daemon on standby: tear down active network connections, revert
     /// system DNS, and bring the TUN interface down. The daemon process keeps
@@ -86,8 +79,8 @@ pub enum IpcMessage {
         action: String,
     },
     /// Coordinator-only: replace the network's suggested firewall rules and
-    /// republish the signed blob. Gated on a trusted network whose secret key
-    /// the caller holds.
+    /// republish the signed blob. Authority comes from holding the network's
+    /// secret key; works on any network (suggestions are advisory).
     FirewallSuggest {
         network: String,
         suggestions: SuggestedFirewall,
@@ -97,10 +90,16 @@ pub enum IpcMessage {
     FirewallSuggestions {
         network: String,
     },
-    /// Read the suggested rules queued for manual review on a network (a member
-    /// that did not opt into `--allow-trusted`). Open read, like `FirewallShow`.
+    /// Read the suggested rules queued for manual review on a network (a node that
+    /// did not opt into `--auto-accept-firewall`). Open read, like `FirewallShow`.
     FirewallPending {
         network: String,
+    },
+    /// Toggle per-network auto-accept of coordinator-suggested firewall rules.
+    /// `on` immediately installs the queued set; `off` stops future auto-install.
+    FirewallAutoAccept {
+        network: String,
+        enabled: bool,
     },
     /// Accept the queued suggested rules for a network: install them (replacing
     /// the prior `Network(net)` set) and clear the queue.
@@ -453,7 +452,6 @@ mod tests {
             name: None,
             hostname: None,
             transport: None,
-            trusted: false,
         };
         let bytes = rmp_serde::to_vec(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
@@ -609,7 +607,7 @@ mod tests {
             transport: None,
             invite: Some(vec![1, 2, 3]),
             coordinator: Some(coord),
-            allow_trusted: false,
+            auto_accept_firewall: false,
         };
         let bytes = rmp_serde::to_vec(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();

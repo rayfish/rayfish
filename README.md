@@ -36,8 +36,8 @@ Each machine runs a small daemon (think Tailscale's `tailscaled`) that creates a
 - 🔒 **Closed-by-default networks** with one-time invites or live approval (`--open` for public ones)
 - 🌐 **Magic DNS** — `name.network.ray`, updated live as peers join, leave, or rename
 - 🧱 **Per-device firewall** — directional, per-port, per-network rules with stateful return traffic
-- 🤝 **Trusted networks** — the coordinator can *suggest* firewall rules that ride the signed network record; nodes auto-take or review them
-- 📜 **Declarative provisioning** — `ray apply deploy.yaml` to stand up networks and rules from a spec
+- 🤝 **Coordinator firewall suggestions** — on any network the coordinator can *suggest* firewall rules that ride the signed network record (`*` targets all hosts); each node reviews them or opts into auto-install with `--auto-accept-firewall`
+- 📜 **Declarative provisioning** — `ray apply deploy.yaml` (YAML) to stand up networks and firewall rules from a spec
 - 👥 **Multi-device identity** — pair your laptop and phone under one identity; encrypted key backup (optionally to 1Password)
 - 📁 **File sharing** — `ray send file.zip bob`
 - 📡 **mDNS** local discovery, and optional **Tor** transport

@@ -209,7 +209,8 @@ impl CoordinatorAcceptState {
         // A peer pre-approved via `ray accept` is admitted directly.
         let is_approved = self.state.read().unwrap().approved.is_approved(&remote_id);
         if is_approved {
-            self.admit_peer(conn, send, remote_id, peer_ip, hostname, device_cert, true)
+            // Live-approved name is joiner-chosen, not authoritative.
+            self.admit_peer(conn, send, remote_id, peer_ip, hostname, device_cert, true, false)
                 .await;
             return;
         }
@@ -226,11 +227,22 @@ impl CoordinatorAcceptState {
             match redeemed {
                 Ok(invite_hostname) => {
                     tracing::info!(peer = %remote_id.fmt_short(), "invite redeemed");
-                    // A hostname bound to the invite is authoritative (trusted
-                    // networks); it overrides the joiner's `--hostname` claim.
+                    // A hostname bound to the invite is authoritative: it overrides
+                    // the joiner's `--hostname` claim and is rejected on collision.
+                    // A free-chosen name (no binding) keeps collision-rename.
+                    let authoritative = invite_hostname.is_some();
                     let assigned = invite_hostname.or(hostname);
                     let admitted = self
-                        .admit_peer(conn, send, remote_id, peer_ip, assigned, device_cert, false)
+                        .admit_peer(
+                            conn,
+                            send,
+                            remote_id,
+                            peer_ip,
+                            assigned,
+                            device_cert,
+                            false,
+                            authoritative,
+                        )
                         .await;
                     // Admission can still be denied (hostname/IP collision) after
                     // the secret was burned; un-burn so the holder can retry.
@@ -254,7 +266,8 @@ impl CoordinatorAcceptState {
         let mode = self.state.read().unwrap().mode;
         match mode {
             GroupMode::Open => {
-                self.admit_peer(conn, send, remote_id, peer_ip, hostname, device_cert, false)
+                // Open-mode name is joiner-chosen, not authoritative.
+                self.admit_peer(conn, send, remote_id, peer_ip, hostname, device_cert, false, false)
                     .await;
             }
             GroupMode::Restricted => {
@@ -303,36 +316,37 @@ impl CoordinatorAcceptState {
         hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
         was_approved: bool,
+        // The hostname is coordinator-authoritative (came from an invite binding).
+        // Authoritative names are rejected on collision (no silent rename), so no
+        // peer can claim another's name to take its suggested firewall rules.
+        authoritative: bool,
     ) -> bool {
-        // Resolve the hostname. In a trusted network the hostname is
-        // coordinator-authoritative: a name already bound to a different identity
-        // is rejected (no silent rename), so no admitted peer can claim another's
-        // name to take its suggested rules. Trustless networks keep the joiner's
-        // choice with collision resolution (`name` → `name-1` → …).
+        // Resolve the hostname. An authoritative (invite-bound) name already bound
+        // to a different identity is rejected. A joiner-chosen name keeps
+        // collision resolution (`name` → `name-1` → …).
         let final_hostname = if let Some(desired) = hostname {
-            let (taken, trusted) = {
+            let taken = {
                 let s = self.state.read().unwrap();
-                (
-                    s.members
-                        .all()
-                        .iter()
-                        .filter(|m| m.identity != remote_id)
-                        .filter_map(|m| m.hostname.clone())
-                        .collect::<Vec<String>>(),
-                    s.trusted,
-                )
+                s.members
+                    .all()
+                    .iter()
+                    .filter(|m| m.identity != remote_id)
+                    .filter_map(|m| m.hostname.clone())
+                    .collect::<Vec<String>>()
             };
-            if trusted && taken.iter().any(|h| h == &desired) {
-                self.deny(
-                    &conn,
-                    send,
-                    format!("hostname '{desired}' is already in use on this trusted network"),
-                )
-                .await;
-                return false;
-            }
             let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
-            Some(crate::hostname::resolve_collision(&desired, &taken_refs))
+            match crate::hostname::admission_hostname(&desired, &taken_refs, authoritative) {
+                Ok(name) => Some(name),
+                Err(conflict) => {
+                    self.deny(
+                        &conn,
+                        send,
+                        format!("hostname '{conflict}' is already in use on this network"),
+                    )
+                    .await;
+                    return false;
+                }
+            }
         } else {
             None
         };
@@ -888,15 +902,14 @@ struct NetworkState {
     /// Access mode (open auto-admits; restricted gates unknown joiners). Only the
     /// coordinator's accept path consults this; members default to `Restricted`.
     mode: GroupMode,
-    /// Trusted network: the coordinator distributes the `suggested_firewall`
-    /// below in the signed blob and members may take it.
-    trusted: bool,
     /// Coordinator-suggested firewall rules carried in the blob (keyed by subject
-    /// hostname). On a coordinator this is what it publishes; on a member it is
-    /// what it last received and materializes rules from.
+    /// hostname; the `*` subject targets every node). On a coordinator this is
+    /// what it publishes; on a member it is what it last received and
+    /// materializes rules from.
     suggested_firewall: SuggestedFirewall,
     /// Materialized suggested rules awaiting manual `ray firewall accept` on a
-    /// member that did not opt into `--allow-trusted`. Empty when auto-taking.
+    /// node that did not opt into `--auto-accept-firewall`. Empty when
+    /// auto-accepting.
     pending_suggestions: Vec<firewall::FirewallRule>,
     /// Peers awaiting live operator approval on a closed network (coordinator
     /// only, in-memory, never persisted or published).
@@ -915,7 +928,6 @@ impl NetworkState {
         let bytes = canonical_group_bytes(
             &self.members,
             &self.approved,
-            self.trusted,
             &self.suggested_firewall,
             self.network_name.as_deref(),
         );
@@ -1086,8 +1098,7 @@ impl DaemonState {
                 name,
                 hostname,
                 transport: _,
-                trusted,
-            } => self.create_network(mode, name, hostname, trusted).await,
+            } => self.create_network(mode, name, hostname).await,
             IpcMessage::Join {
                 network_key,
                 name,
@@ -1095,7 +1106,7 @@ impl DaemonState {
                 transport: _,
                 invite,
                 coordinator,
-                allow_trusted,
+                auto_accept_firewall,
             } => {
                 self.join_network(
                     &network_key,
@@ -1103,7 +1114,7 @@ impl DaemonState {
                     hostname,
                     invite,
                     coordinator,
-                    allow_trusted,
+                    auto_accept_firewall,
                 )
                 .await
             }
@@ -1111,10 +1122,7 @@ impl DaemonState {
             IpcMessage::Nuke { name, force } => self.nuke_network(&name, force).await,
             IpcMessage::Status => self.status(),
             IpcMessage::Report => self.build_report(peer_cred),
-            IpcMessage::Up {
-                hostname,
-                allow_trusted,
-            } => self.activate(hostname, allow_trusted).await,
+            IpcMessage::Up { hostname } => self.activate(hostname).await,
             IpcMessage::Down => self.deactivate().await,
             IpcMessage::Shutdown => {
                 self.shutdown_token.cancel();
@@ -1148,6 +1156,9 @@ impl DaemonState {
             IpcMessage::FirewallPending { network } => self.firewall_pending(&network),
             IpcMessage::FirewallAccept { network } => self.firewall_accept(&network),
             IpcMessage::FirewallDeny { network } => self.firewall_deny(&network),
+            IpcMessage::FirewallAutoAccept { network, enabled } => {
+                self.firewall_auto_accept(&network, enabled)
+            }
             IpcMessage::SetHostname { network, hostname } => {
                 self.set_hostname(&network, &hostname).await
             }
@@ -1186,9 +1197,8 @@ impl DaemonState {
         mode: GroupMode,
         name: Option<String>,
         hostname: Option<String>,
-        trusted: bool,
     ) -> IpcMessage {
-        match self.create_network_inner(mode, name, hostname, trusted).await {
+        match self.create_network_inner(mode, name, hostname).await {
             Ok(resp) => resp,
             Err(e) => IpcMessage::Error {
                 message: format!("{e:#}"),
@@ -1201,7 +1211,6 @@ impl DaemonState {
         mode: GroupMode,
         custom_name: Option<String>,
         hostname: Option<String>,
-        trusted: bool,
     ) -> Result<IpcMessage> {
         let name = match custom_name {
             Some(n) => {
@@ -1271,7 +1280,6 @@ impl DaemonState {
             network_public_key: net_public_key,
             network_name: Some(name.clone()),
             mode,
-            trusted,
             suggested_firewall: SuggestedFirewall::default(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
@@ -1336,8 +1344,7 @@ impl DaemonState {
                 network_secret_key: Some(net_secret_key.clone()),
                 network_public_key: Some(net_public_key),
                 transport: None,
-                trusted,
-                allow_trusted: false,
+                auto_accept_firewall: false,
                 admins: vec![],
             },
         );
@@ -1435,7 +1442,7 @@ impl DaemonState {
         hostname: Option<String>,
         invite: Option<Vec<u8>>,
         coordinator: Option<EndpointId>,
-        allow_trusted: bool,
+        auto_accept_firewall: bool,
     ) -> IpcMessage {
         match self
             .join_network_inner(
@@ -1444,7 +1451,7 @@ impl DaemonState {
                 hostname.clone(),
                 invite.clone(),
                 coordinator,
-                allow_trusted,
+                auto_accept_firewall,
                 true,
             )
             .await
@@ -1471,7 +1478,7 @@ impl DaemonState {
                                 hostname.clone(),
                                 invite.clone(),
                                 coordinator,
-                                allow_trusted,
+                                auto_accept_firewall,
                                 true,
                             )
                             .await
@@ -1506,9 +1513,9 @@ impl DaemonState {
         hostname: Option<String>,
         invite: Option<Vec<u8>>,
         coordinator: Option<EndpointId>,
-        // Auto-take coordinator-suggested firewall rules on this network
-        // (`--allow-trusted`); persisted so it survives restarts.
-        allow_trusted: bool,
+        // Auto-install coordinator-suggested firewall rules on this network
+        // (`--auto-accept-firewall`); persisted so it survives restarts.
+        auto_accept_firewall: bool,
         // True for a fresh join (we send a JoinRequest first); false when
         // restoring a network we're already a member of (legacy handshake where
         // the coordinator speaks first).
@@ -1637,9 +1644,8 @@ impl DaemonState {
             self.hostname_table.clone(),
             self.reverse_table.clone(),
             invite,
-            data.trusted,
             data.suggested_firewall.clone(),
-            allow_trusted,
+            auto_accept_firewall,
             initial,
         )
         .await?
@@ -1948,7 +1954,6 @@ impl DaemonState {
                 network_public_key: net_pubkey,
                 network_name: data.name.clone(),
                 mode: GroupMode::Restricted,
-                trusted: false,
                 suggested_firewall: SuggestedFirewall::default(),
                 pending_suggestions: Vec::new(),
                 pending: HashMap::new(),
@@ -2092,13 +2097,11 @@ impl DaemonState {
         // coordinator-only stub.
         let mut member_list = MemberList::new();
         let mut approved_list = ApprovedList::new();
-        // `trusted` + `suggested_firewall` are authoritative in the signed blob;
-        // fall back to the persisted config only if the blob can't be fetched.
-        let mut trusted = net_config.map(|nc| nc.trusted).unwrap_or(false);
+        // `suggested_firewall` is authoritative in the signed blob; fall back to
+        // an empty set only if the blob can't be fetched.
         let mut suggested_firewall = SuggestedFirewall::default();
         match self.restore_roster_from_blob(net_public_key).await {
             Ok(data) => {
-                trusted = data.trusted;
                 suggested_firewall = data.suggested_firewall.clone();
                 for m in &data.members {
                     let _ = member_list.add(m.clone());
@@ -2163,7 +2166,6 @@ impl DaemonState {
             network_public_key: net_public_key,
             network_name: Some(name.to_string()),
             mode,
-            trusted,
             suggested_firewall,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
@@ -2228,11 +2230,12 @@ impl DaemonState {
                 network_secret_key: Some(net_secret_key.clone()),
                 network_public_key: Some(net_public_key),
                 transport: None,
-                // Preserve the persisted consent flags + admin roster across a
+                // Preserve the persisted consent flag + admin roster across a
                 // restart; only the roster (members/approved) is authoritative
                 // from the blob.
-                trusted,
-                allow_trusted: net_config.map(|nc| nc.allow_trusted).unwrap_or(false),
+                auto_accept_firewall: net_config
+                    .map(|nc| nc.auto_accept_firewall)
+                    .unwrap_or(false),
                 admins: net_config.map(|nc| nc.admins.clone()).unwrap_or_default(),
             },
         );
@@ -2412,7 +2415,12 @@ impl DaemonState {
         if let Some(key) = net_secret_key
             && let Ok(client) = dht::create_pkarr_client(&self.endpoint)
         {
-            let empty_hash = group_blob_hash(&MemberList::new(), &ApprovedList::new(), false, &SuggestedFirewall::default(), None);
+            let empty_hash = group_blob_hash(
+                &MemberList::new(),
+                &ApprovedList::new(),
+                &SuggestedFirewall::default(),
+                None,
+            );
             if let Err(e) = dht::publish_network(&client, &key, &empty_hash, &[]).await {
                 tracing::warn!(error = %e, "failed to publish empty network record on nuke");
             }
@@ -2426,21 +2434,7 @@ impl DaemonState {
     /// reconnect every saved network. Idempotent — a no-op if already active.
     /// Runs entirely inside the (root) daemon, so the IPC client needs no
     /// privileges.
-    async fn activate(self: &Arc<Self>, hostname: Option<String>, allow_trusted: bool) -> IpcMessage {
-        // `ray up --allow-trusted` opts every saved network into auto-taking
-        // coordinator-suggested firewall rules (persisted), so it also covers
-        // networks joined later in the same `up; join; join` sequence is handled
-        // at join time. Here we flip the flag on already-saved networks.
-        if allow_trusted
-            && let Ok(mut app_config) = config::load()
-        {
-            for net in &mut app_config.networks {
-                net.allow_trusted = true;
-            }
-            if let Err(e) = config::save(&app_config) {
-                tracing::warn!(error = %e, "failed to persist --allow-trusted");
-            }
-        }
+    async fn activate(self: &Arc<Self>, hostname: Option<String>) -> IpcMessage {
         // Persist the personal default hostname first (before the already-active
         // short-circuit) so `ray up --hostname X` records the new default even
         // when the VPN is already up. Used as the fallback for future
@@ -2541,7 +2535,7 @@ impl DaemonState {
                 // We're a member — rejoin via DHT lookup.
                 let name = net.name.clone();
                 let persisted_hostname = net.my_hostname.clone();
-                let net_allow_trusted = net.allow_trusted;
+                let net_auto_accept = net.auto_accept_firewall;
                 let net_pubkey = match &net.network_public_key {
                     Some(k) => k.to_string(),
                     None => {
@@ -2558,7 +2552,7 @@ impl DaemonState {
                             persisted_hostname,
                             None,
                             None,
-                            net_allow_trusted,
+                            net_auto_accept,
                             false,
                         )
                         .await
@@ -3557,21 +3551,19 @@ impl DaemonState {
         IpcMessage::FirewallState { display }
     }
 
-    /// Coordinator-only: replace a trusted network's suggested firewall rules and
+    /// Coordinator-only: replace a network's suggested firewall rules and
     /// republish the signed blob. Authority comes from holding the per-network
-    /// secret key (so any admin granted the key can suggest).
+    /// secret key (so any admin granted the key can suggest). Suggestions are
+    /// advisory on every network; each node queues or auto-accepts them.
     async fn firewall_suggest(
         &self,
         network: &str,
         suggestions: SuggestedFirewall,
     ) -> IpcMessage {
-        let (state, dht_notify, trusted, has_key) = match self.networks.get(network) {
+        let (state, dht_notify, has_key) = match self.networks.get(network) {
             Some(h) => {
-                let (trusted, has_key) = {
-                    let s = h.state.read().unwrap();
-                    (s.trusted, s.network_secret_key.is_some())
-                };
-                (h.state.clone(), h.dht_notify.clone(), trusted, has_key)
+                let has_key = h.state.read().unwrap().network_secret_key.is_some();
+                (h.state.clone(), h.dht_notify.clone(), has_key)
             }
             None => {
                 return IpcMessage::Error {
@@ -3579,13 +3571,6 @@ impl DaemonState {
                 };
             }
         };
-        if !trusted {
-            return IpcMessage::Error {
-                message: format!(
-                    "network '{network}' is not trusted; recreate it with `--trusted` to suggest rules"
-                ),
-            };
-        }
         if !has_key {
             return IpcMessage::Error {
                 message: "only a coordinator (network key holder) can suggest firewall rules"
@@ -3687,6 +3672,50 @@ impl DaemonState {
             None => IpcMessage::Error {
                 message: format!("network '{network}' not found"),
             },
+        }
+    }
+
+    /// Toggle this node's per-network auto-accept of coordinator-suggested
+    /// firewall rules (persisted in config). Turning it on immediately
+    /// re-materializes and installs the current suggestions; turning it off
+    /// leaves already-installed rules in place but stops future auto-install.
+    fn firewall_auto_accept(&self, network: &str, enabled: bool) -> IpcMessage {
+        if !self.networks.contains_key(network) {
+            return IpcMessage::Error {
+                message: format!("network '{network}' not found"),
+            };
+        }
+        // Persist the per-network flag.
+        match config::load() {
+            Ok(mut app_config) => {
+                let Some(nc) = app_config.networks.iter_mut().find(|n| n.name == network) else {
+                    return IpcMessage::Error {
+                        message: format!("network '{network}' not found in config"),
+                    };
+                };
+                nc.auto_accept_firewall = enabled;
+                if let Err(e) = config::save(&app_config) {
+                    return IpcMessage::Error {
+                        message: format!("failed to persist auto-accept setting: {e}"),
+                    };
+                }
+            }
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to load config: {e}"),
+                };
+            }
+        }
+        // Re-apply suggestions with the new consent setting. With auto-accept on
+        // this installs the queued set; with it off it just (re)queues.
+        if let Some(h) = self.networks.get(network) {
+            apply_suggested_firewall(&self.firewall, self.endpoint.id(), network, &h.state);
+        }
+        IpcMessage::Ok {
+            message: format!(
+                "auto-accept firewall suggestions {} for '{network}'",
+                if enabled { "enabled" } else { "disabled" }
+            ),
         }
     }
 
@@ -4117,7 +4146,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 
     // Start active by default so a fresh boot behaves like before; `ray up` /
     // `ray down` toggle this at runtime without restarting the process.
-    daemon.activate(None, false).await;
+    daemon.activate(None).await;
 
     serve_ipc(&daemon, token).await
 }
@@ -4437,7 +4466,12 @@ fn spawn_network_publisher(
                     .as_ref()
                     .map(|snap| snap.hash)
                     .unwrap_or_else(|| {
-                        group_blob_hash(&s.members, &s.approved, s.trusted, &s.suggested_firewall, s.network_name.as_deref())
+                        group_blob_hash(
+                            &s.members,
+                            &s.approved,
+                            &s.suggested_firewall,
+                            s.network_name.as_deref(),
+                        )
                     })
             };
             let mut seed_peers: Vec<EndpointId> = peers
@@ -4492,7 +4526,6 @@ fn spawn_lazy_publisher(
                         group_blob_hash(
                             &s.members,
                             &s.approved,
-                            s.trusted,
                             &s.suggested_firewall,
                             s.network_name.as_deref(),
                         )
@@ -4528,27 +4561,24 @@ fn spawn_lazy_publisher(
 
 /// Materialize this node's suggested firewall rules for `network` from the
 /// verified blob state, then either install them (replacing the prior
-/// `Network(net)` set, leaving `Local` rules untouched) when the network is
-/// `allow_trusted`, or queue them for manual `ray firewall accept`. Trustless
-/// networks and a node with no assigned hostname are no-ops. Peer hostnames are
-/// resolved against the blob's member list, so a rule for a not-yet-joined peer
-/// appears once it joins and the roster updates.
+/// `Network(net)` set, leaving `Local` rules untouched) when the node opted into
+/// `--auto-accept-firewall`, or queue them for manual `ray firewall accept`. A
+/// node with no assigned hostname is a no-op. Peer hostnames are resolved against
+/// the blob's member list, so a rule for a not-yet-joined peer appears once it
+/// joins and the roster updates.
 fn apply_suggested_firewall(
     firewall: &SharedFirewall,
     my_identity: EndpointId,
     network_name: &str,
     state: &std::sync::RwLock<NetworkState>,
 ) {
-    let (trusted, suggestions, members): (bool, SuggestedFirewall, Vec<Member>) = {
+    let (suggestions, members): (SuggestedFirewall, Vec<Member>) = {
         let s = state.read().unwrap();
         let members = s.members.all().into_iter().cloned().collect();
-        (s.trusted, s.suggested_firewall.clone(), members)
+        (s.suggested_firewall.clone(), members)
     };
-    if !trusted {
-        return;
-    }
-    // My hostname is coordinator-authoritative in trusted networks, so derive
-    // it from the member list rather than the join-time claim.
+    // Derive my hostname from the member roster (the authoritative source) rather
+    // than the join-time claim.
     let my_hostname = members
         .iter()
         .find(|m| m.identity == my_identity)
@@ -4563,22 +4593,24 @@ fn apply_suggested_firewall(
     let resolve = |h: &str| map.get(h).copied();
     let rules = firewall::materialize_suggestions(network_name, &my_hostname, &suggestions, &resolve);
 
-    let allow_trusted = config::load()
+    // Auto-install only if this node opted into `--auto-accept-firewall` for the
+    // network; otherwise queue the materialized rules for `ray firewall accept`.
+    let auto_accept = config::load()
         .ok()
         .and_then(|c| {
             c.networks
                 .into_iter()
                 .find(|n| n.name == network_name)
-                .map(|n| n.allow_trusted)
+                .map(|n| n.auto_accept_firewall)
         })
         .unwrap_or(false);
-    if allow_trusted {
+    if auto_accept {
         let config = firewall.replace_network_rules(network_name, rules);
         if let Err(e) = firewall::save_firewall(&config) {
             tracing::warn!(error = %e, network = network_name, "failed to persist firewall config");
         }
         state.write().unwrap().pending_suggestions.clear();
-        tracing::info!(network = network_name, count = 0, "auto-took suggested firewall rules");
+        tracing::info!(network = network_name, "auto-accepted suggested firewall rules");
     } else {
         let count = rules.len();
         state.write().unwrap().pending_suggestions = rules;
@@ -4669,7 +4701,6 @@ async fn reconverge_and_apply(
         let mut s = state.write().unwrap();
         s.members = MemberList::from_members(data.members.clone());
         s.approved = ApprovedList::from_entries(data.approved.clone());
-        s.trusted = data.trusted;
         s.suggested_firewall = data.suggested_firewall.clone();
         s.refresh_snapshot();
         s.members.all().into_iter().cloned().collect::<Vec<Member>>()
@@ -4812,13 +4843,12 @@ fn spawn_group_poller(
             }
 
             // Update state and re-materialize suggested firewall rules from the
-            // freshly verified blob (trusted networks only). Suggestions + the
-            // trusted flag ride in the blob, so both are refreshed here.
+            // freshly verified blob. Suggestions ride in the blob, so they are
+            // refreshed here.
             {
                 let mut s = state.write().unwrap();
                 s.members = MemberList::from_members(data.members.clone());
                 s.approved = ApprovedList::from_entries(data.approved.clone());
-                s.trusted = data.trusted;
                 s.suggested_firewall = data.suggested_firewall.clone();
                 s.refresh_snapshot();
             }
@@ -5092,12 +5122,11 @@ async fn join_mesh_shared(
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
     invite_secret: Option<Vec<u8>>,
-    // From the fetched blob: whether this is a trusted network and its current
-    // coordinator-suggested firewall rules. Persisted so a member inherits both.
-    trusted: bool,
+    // From the fetched blob: the current coordinator-suggested firewall rules.
+    // Persisted so a member inherits them.
     suggested_firewall: SuggestedFirewall,
-    // Consent: auto-take suggested rules without a manual review queue.
-    allow_trusted: bool,
+    // Consent: auto-install suggested rules without a manual review queue.
+    auto_accept_firewall: bool,
     initial: bool,
 ) -> Result<JoinResult> {
     let my_identity = identity.local_identity();
@@ -5227,8 +5256,7 @@ async fn join_mesh_shared(
             network_secret_key: None,
             network_public_key: Some(net_pubkey),
             transport: None,
-            trusted,
-            allow_trusted,
+            auto_accept_firewall,
             admins: vec![],
         },
     );
@@ -5332,7 +5360,6 @@ async fn join_mesh_shared(
             network_public_key: net_pubkey,
             network_name: Some(network_name.to_string()),
             mode: GroupMode::Restricted,
-            trusted,
             suggested_firewall,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),

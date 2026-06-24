@@ -99,11 +99,6 @@ enum Command {
         /// Route traffic through Tor (requires running Tor daemon with ControlPort 9051)
         #[arg(long)]
         tor: bool,
-        /// Trusted network: as coordinator you may suggest firewall rules to
-        /// members (`ray firewall suggest` / `ray apply`), distributed in the
-        /// signed blob and taken by members that opt in with `--allow-trusted`.
-        #[arg(long)]
-        trusted: bool,
     },
     /// Join an existing network using its room id or an invite code
     Join {
@@ -118,10 +113,11 @@ enum Command {
         /// Route traffic through Tor (requires running Tor daemon with ControlPort 9051)
         #[arg(long)]
         tor: bool,
-        /// Auto-take coordinator-suggested firewall rules on this network without
-        /// a manual review queue (managed node).
+        /// Auto-install coordinator-suggested firewall rules on this network
+        /// without a manual review queue (managed node, e.g. a server). Without
+        /// it, suggestions queue for `ray firewall accept`.
         #[arg(long)]
-        allow_trusted: bool,
+        auto_accept_firewall: bool,
     },
     /// Leave a network (remove from saved config)
     Leave {
@@ -149,10 +145,6 @@ enum Command {
         /// when create/join don't specify one; doesn't rename existing networks
         #[arg(long)]
         hostname: Option<String>,
-        /// Opt every saved network into auto-taking coordinator-suggested
-        /// firewall rules (persisted; applies to trusted networks).
-        #[arg(long)]
-        allow_trusted: bool,
     },
     /// Disconnect from all networks (signals daemon to shut down)
     Down,
@@ -366,12 +358,13 @@ enum FirewallAction {
         /// Default action: allow or deny
         action: String,
     },
-    /// Coordinator-only: suggest firewall rules for a subject host on a trusted
-    /// network. Distributed in the signed blob; members take them per consent.
+    /// Coordinator-only: suggest firewall rules for a subject host on a network.
+    /// Distributed in the signed blob; each node takes them per its own consent.
     Suggest {
         /// Network name
         network: String,
-        /// Subject host (the hostname the rules protect)
+        /// Subject host (the hostname the rules protect). Use `*` to target every
+        /// node on the network (e.g. "everyone opens this port").
         #[arg(long)]
         subject: String,
         /// Allow a peer, e.g. `--allow earn01:tcp:9000,tcp:8123` or `--allow earn01:icmp`
@@ -383,8 +376,8 @@ enum FirewallAction {
         #[arg(long, value_name = "PEER:SPEC")]
         deny: Vec<String>,
     },
-    /// Show suggested rules queued for manual review on a trusted network
-    /// (a member that did not join with `--allow-trusted`).
+    /// Show suggested rules queued for manual review on a network
+    /// (a node that did not join with `--auto-accept-firewall`).
     Pending {
         /// Network name
         network: String,
@@ -398,6 +391,14 @@ enum FirewallAction {
     Deny {
         /// Network name
         network: String,
+    },
+    /// Toggle auto-accepting this network's suggested firewall rules on this node
+    /// (`on` installs the current queue; `off` stops future auto-install).
+    AutoAccept {
+        /// Network name
+        network: String,
+        /// `on` or `off`
+        state: String,
     },
 }
 
@@ -633,22 +634,21 @@ async fn main() -> Result<()> {
             name,
             hostname,
             tor,
-            trusted,
         } => {
             let mode = if open {
                 GroupMode::Open
             } else {
                 GroupMode::Restricted
             };
-            ipc_create(mode, name, hostname, tor, trusted).await
+            ipc_create(mode, name, hostname, tor).await
         }
         Command::Join {
             network_key,
             name,
             hostname,
             tor,
-            allow_trusted,
-        } => ipc_join(&network_key, name.as_deref(), hostname, tor, allow_trusted).await,
+            auto_accept_firewall,
+        } => ipc_join(&network_key, name.as_deref(), hostname, tor, auto_accept_firewall).await,
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Status => ipc_status().await,
         Command::Report => ipc_report().await,
@@ -660,10 +660,7 @@ async fn main() -> Result<()> {
             stats.spawn_logger(token.clone());
             daemon::run_daemon(token, stats).await
         }
-        Command::Up {
-            hostname,
-            allow_trusted,
-        } => cmd_up(hostname, allow_trusted).await,
+        Command::Up { hostname } => cmd_up(hostname).await,
         Command::Down => ipc_down().await,
         Command::Uninstall => cmd_uninstall_service(),
         Command::Install => cmd_install().await,
@@ -758,7 +755,6 @@ async fn ipc_create(
     name: Option<String>,
     hostname: Option<String>,
     tor: bool,
-    trusted: bool,
 ) -> Result<()> {
     let transport = if tor {
         Some(config::TransportMode::Tor)
@@ -773,7 +769,6 @@ async fn ipc_create(
             name,
             hostname,
             transport,
-            trusted,
         },
     )
     .await?;
@@ -830,7 +825,7 @@ async fn ipc_join(
     name: Option<&str>,
     hostname: Option<String>,
     tor: bool,
-    allow_trusted: bool,
+    auto_accept_firewall: bool,
 ) -> Result<()> {
     let transport = if tor {
         Some(config::TransportMode::Tor)
@@ -854,7 +849,7 @@ async fn ipc_join(
             transport,
             invite,
             coordinator,
-            allow_trusted,
+            auto_accept_firewall,
         },
     )
     .await?;
@@ -1431,6 +1426,14 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
         FirewallAction::Pending { network } => ipc::IpcMessage::FirewallPending { network },
         FirewallAction::Accept { network } => ipc::IpcMessage::FirewallAccept { network },
         FirewallAction::Deny { network } => ipc::IpcMessage::FirewallDeny { network },
+        FirewallAction::AutoAccept { network, state } => {
+            let enabled = match state.to_ascii_lowercase().as_str() {
+                "on" | "true" | "yes" => true,
+                "off" | "false" | "no" => false,
+                other => anyhow::bail!("expected `on` or `off`, got '{other}'"),
+            };
+            ipc::IpcMessage::FirewallAutoAccept { network, enabled }
+        }
         // Handled above by early return (needs a read-modify-write round trip).
         FirewallAction::Suggest { .. } => unreachable!(),
     };
@@ -1548,11 +1551,6 @@ async fn ipc_apply(
     if spec.networks.is_empty() {
         anyhow::bail!("spec contains no networks");
     }
-    // A non-trusted spec may only create networks — firewall suggestions ride a
-    // trusted blob, so reject them up front rather than failing per-network.
-    if !spec.trusted && spec.networks.values().any(|fw| !fw.is_empty()) {
-        anyhow::bail!("firewall suggestions require `trusted: true`");
-    }
     if dry_run {
         println!("{}", style::bold("Spec (normalized):"));
         print!("{}", apply::to_yaml(&spec)?);
@@ -1569,15 +1567,14 @@ async fn ipc_apply(
 
     for (net_name, net_firewall) in &spec.networks {
         let is_active = active_names.contains(net_name.as_str());
-        // B2 — create-if-absent.
+        // Create-if-absent (always a closed network).
         if !is_active {
             println!(
-                "{} {}: creating {} network",
+                "{} {}: creating closed network",
                 style::label("apply"),
                 style::bold(net_name),
-                if spec.trusted { "trusted" } else { "closed" }
             );
-            if let Err(e) = ipc_apply_create(net_name, spec.trusted).await {
+            if let Err(e) = ipc_apply_create(net_name).await {
                 eprintln!("{}  create failed: {e}", style::red("  !"));
                 continue;
             }
@@ -1589,26 +1586,22 @@ async fn ipc_apply(
             );
         }
 
-        // B2 — publish suggestions (idempotent). With --prune, publish exactly
-        // the spec's set; without it, merge into the live set (so `apply` never
+        // Publish suggestions (idempotent). With --prune, publish exactly the
+        // spec's set; without it, merge into the live set (so `apply` never
         // silently drops subjects authored out-of-band — use --prune for that).
-        // Non-trusted specs only create networks (validated above to carry no
-        // firewall blocks), so there is nothing to publish.
-        if spec.trusted {
-            let to_publish = if prune {
-                net_firewall.clone()
-            } else {
-                let mut live = ipc_firewall_suggestions_get(net_name).await.unwrap_or_default();
-                // Merge spec subjects over live (spec wins on conflict).
-                for (subj, rules) in net_firewall {
-                    live.insert(subj.clone(), rules.clone());
-                }
-                live
-            };
-            match ipc_firewall_suggest_set(net_name, to_publish).await {
-                Ok(msg) => println!("{}   {msg}", style::faint("→")),
-                Err(e) => eprintln!("{}   suggest failed: {e}", style::red("  !")),
+        let to_publish = if prune {
+            net_firewall.clone()
+        } else {
+            let mut live = ipc_firewall_suggestions_get(net_name).await.unwrap_or_default();
+            // Merge spec subjects over live (spec wins on conflict).
+            for (subj, rules) in net_firewall {
+                live.insert(subj.clone(), rules.clone());
             }
+            live
+        };
+        match ipc_firewall_suggest_set(net_name, to_publish).await {
+            Ok(msg) => println!("{}   {msg}", style::faint("→")),
+            Err(e) => eprintln!("{}   suggest failed: {e}", style::red("  !")),
         }
 
         // B3 — membership diff for this network.
@@ -1669,7 +1662,7 @@ async fn ipc_status_networks() -> Result<Vec<ipc::NetworkStatus>> {
     }
 }
 
-async fn ipc_apply_create(name: &str, trusted: bool) -> Result<()> {
+async fn ipc_apply_create(name: &str) -> Result<()> {
     let mut stream = ipc::connect().await?;
     ipc::send(
         &mut stream,
@@ -1678,7 +1671,6 @@ async fn ipc_apply_create(name: &str, trusted: bool) -> Result<()> {
             name: Some(name.to_string()),
             hostname: None,
             transport: None,
-            trusted,
         },
     )
     .await?;
@@ -2097,16 +2089,9 @@ fn ensure_service_installed() -> Result<()> {
 /// to bring the TUN up, configure DNS, and reconnect networks. Only when no
 /// daemon is reachable do we fall back to installing/starting the system
 /// service, which requires root.
-async fn cmd_up(hostname: Option<String>, allow_trusted: bool) -> Result<()> {
+async fn cmd_up(hostname: Option<String>) -> Result<()> {
     if let Ok(mut stream) = ipc::connect().await {
-        ipc::send(
-            &mut stream,
-            ipc::IpcMessage::Up {
-                hostname,
-                allow_trusted,
-            },
-        )
-        .await?;
+        ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
         match ipc::recv(&mut stream).await? {
             ipc::IpcMessage::Ok { message } => println!("{message}"),
             ipc::IpcMessage::Error { message } => eprintln!("Error: {message}"),
@@ -2123,7 +2108,7 @@ async fn cmd_up(hostname: Option<String>, allow_trusted: bool) -> Result<()> {
         );
         std::process::exit(1);
     }
-    install_and_start_service(hostname, allow_trusted).await
+    install_and_start_service(hostname).await
 }
 
 /// Install/refresh the system service and (re)start it. Requires root.
@@ -2133,7 +2118,7 @@ async fn cmd_up(hostname: Option<String>, allow_trusted: bool) -> Result<()> {
 /// it never comes up (e.g. it crashed on a port/route conflict with another
 /// VPN), we surface the tail of its log so the user knows what went wrong
 /// instead of seeing a cheerful "started" followed by a dead `ray status`.
-async fn install_and_start_service(hostname: Option<String>, allow_trusted: bool) -> Result<()> {
+async fn install_and_start_service(hostname: Option<String>) -> Result<()> {
     ensure_service_installed()?;
 
     #[cfg(target_os = "linux")]
@@ -2159,14 +2144,7 @@ async fn install_and_start_service(hostname: Option<String>, allow_trusted: bool
     // Wait for the freshly started daemon to accept IPC, then activate the VPN.
     match wait_for_daemon(std::time::Duration::from_secs(8)).await {
         Some(mut stream) => {
-            ipc::send(
-                &mut stream,
-                ipc::IpcMessage::Up {
-                    hostname,
-                    allow_trusted,
-                },
-            )
-            .await?;
+            ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
             match ipc::recv(&mut stream).await? {
                 ipc::IpcMessage::Ok { message } => println!("rayfish service started. {message}"),
                 ipc::IpcMessage::Error { message } => eprintln!("Error: {message}"),
@@ -2228,7 +2206,7 @@ fn require_root() -> Result<()> {
 /// install), then start it and verify the daemon comes up. Requires root.
 async fn cmd_install() -> Result<()> {
     require_root()?;
-    install_and_start_service(None, false).await
+    install_and_start_service(None).await
 }
 
 /// `ray restart`: restart the already-installed system service via the OS

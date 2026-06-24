@@ -8,6 +8,7 @@
 *.swp
 *.swo
 *~
+*.log
 
 # Local secrets — never commit
 .env

@@ -113,15 +113,11 @@ pub struct NetworkConfig {
     pub network_public_key: Option<EndpointId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<TransportMode>,
-    /// Trusted network: the coordinator may suggest firewall rules to members
-    /// via the signed blob. Set at create (`ray create --trusted`).
-    #[serde(default)]
-    pub trusted: bool,
-    /// This node auto-takes (installs) coordinator-suggested rules without a
-    /// manual review queue. Set by `ray join --allow-trusted` / `ray up
-    /// --allow-trusted`. Only meaningful on a `trusted` network.
-    #[serde(default)]
-    pub allow_trusted: bool,
+    /// This node auto-installs coordinator-suggested firewall rules without a
+    /// manual review queue. Set per-network by `ray join --auto-accept-firewall`
+    /// or toggled later with `ray firewall auto-accept <net> on|off`.
+    #[serde(default, alias = "allow_trusted")]
+    pub auto_accept_firewall: bool,
     /// Identities this coordinator has granted the per-network secret key to
     /// (`ray admin add`). Local tracking only — the key is shared and not
     /// attributable, so this is the coordinator's record of grants, not a
@@ -244,8 +240,7 @@ mod tests {
                     network_public_key: None,
                     my_hostname: None,
                     transport: None,
-                    trusted: false,
-                    allow_trusted: false,
+                    auto_accept_firewall: false,
                     admins: vec![],
                 },
                 NetworkConfig {
@@ -258,8 +253,7 @@ mod tests {
                     network_public_key: None,
                     my_hostname: None,
                     transport: None,
-                    trusted: false,
-                    allow_trusted: false,
+                    auto_accept_firewall: false,
                     admins: vec![],
                 },
             ],
@@ -293,8 +287,7 @@ mod tests {
             network_public_key: None,
             my_hostname: None,
             transport: None,
-            trusted: false,
-            allow_trusted: false,
+            auto_accept_firewall: false,
             admins: vec![],
         };
         upsert_network(&mut config, net);
@@ -316,8 +309,7 @@ mod tests {
                 network_public_key: None,
                 my_hostname: None,
                 transport: None,
-                trusted: false,
-                allow_trusted: false,
+                auto_accept_firewall: false,
                 admins: vec![],
             }],
             ..Default::default()
@@ -332,8 +324,7 @@ mod tests {
             network_public_key: None,
             my_hostname: None,
             transport: None,
-            trusted: false,
-            allow_trusted: false,
+            auto_accept_firewall: false,
             admins: vec![],
         };
         upsert_network(&mut config, updated.clone());
@@ -359,8 +350,7 @@ mod tests {
                     network_public_key: None,
                     my_hostname: None,
                     transport: None,
-                    trusted: false,
-                    allow_trusted: false,
+                    auto_accept_firewall: false,
                     admins: vec![],
                 },
                 NetworkConfig {
@@ -373,8 +363,7 @@ mod tests {
                     network_public_key: None,
                     my_hostname: None,
                     transport: None,
-                    trusted: false,
-                    allow_trusted: false,
+                    auto_accept_firewall: false,
                     admins: vec![],
                 },
             ],
@@ -415,8 +404,7 @@ mod tests {
                 network_public_key: None,
                 my_hostname: None,
                 transport: None,
-                trusted: false,
-                allow_trusted: false,
+                auto_accept_firewall: false,
                 admins: vec![],
             }],
             ..Default::default()
@@ -442,8 +430,7 @@ mod tests {
                 network_public_key: Some(public),
                 my_hostname: None,
                 transport: None,
-                trusted: false,
-                allow_trusted: false,
+                auto_accept_firewall: false,
                 admins: vec![],
             }],
             ..Default::default()

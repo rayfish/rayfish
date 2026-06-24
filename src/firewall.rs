@@ -616,15 +616,18 @@ fn format_action(a: Action) -> &'static str {
     }
 }
 
-/// Build the concrete local firewall rules a node enforces for trusted network
-/// `net`, from `suggestions` targeting `my_hostname`. Peer hostnames are resolved
-/// to identities via `resolve` (the blob's member list); unresolved peers are
-/// skipped — their rules materialize once they join. Every rule is inbound,
-/// network-scoped to `net`, and tagged `origin: Network(net)`. When the subject
-/// has an allow-list, a trailing network-scoped catch-all
-/// deny is appended so only the listed peers pass, without touching the global
-/// default action. Each port spec token is `proto:ports` or a bare proto keyword
-/// (`icmp`, `any`, `tcp`); a comma-separated value yields one rule per token.
+/// Build the concrete local firewall rules a node enforces for network `net`,
+/// from `suggestions` targeting `my_hostname`. Two subjects apply to a node: its
+/// own hostname and the wildcard `*` subject (which targets every node, e.g.
+/// "everyone opens 6969"). Peer hostnames are resolved to identities via
+/// `resolve` (the blob's member list); unresolved peers are skipped — their rules
+/// materialize once they join. The `*` peer key means *any peer* and bypasses
+/// resolution. Every rule is inbound, network-scoped to `net`, and tagged
+/// `origin: Network(net)`. When any applicable subject has an allow-list, a
+/// trailing network-scoped catch-all deny is appended so only the listed peers
+/// pass, without touching the global default action. Each port spec token is
+/// `proto:ports` or a bare proto keyword (`icmp`, `any`, `tcp`); a comma-separated
+/// value yields one rule per token.
 pub fn materialize_suggestions(
     net: &str,
     my_hostname: &str,
@@ -632,35 +635,52 @@ pub fn materialize_suggestions(
     resolve: &dyn Fn(&str) -> Option<EndpointId>,
 ) -> Vec<FirewallRule> {
     let mut rules = Vec::new();
-    let Some(host) = suggestions.get(my_hostname) else {
+    // The wildcard `*` subject applies to every node, alongside its own subject
+    // (deduped so a node literally named "*" isn't counted twice).
+    let mut keys = vec!["*"];
+    if my_hostname != "*" {
+        keys.push(my_hostname);
+    }
+    let applicable: Vec<_> = keys.iter().filter_map(|k| suggestions.get(*k)).collect();
+    if applicable.is_empty() {
         return rules;
-    };
-    for (action, list) in [(Action::Allow, &host.allows), (Action::Deny, &host.denies)] {
-        for (peer, ports) in list {
-            let Some(id) = resolve(peer) else { continue };
-            for tok in ports.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                match parse_spec_token(tok) {
-                    Ok((proto, port)) => rules.push(FirewallRule {
-                        direction: Direction::In,
-                        action,
-                        protocol: proto,
-                        port,
-                        peer: PeerFilter::Identity(id),
-                        network: Some(net.to_string()),
-                        origin: RuleOrigin::Network(net.to_string()),
-                    }),
-                    Err(e) => tracing::warn!(
-                        token = %tok, network = %net, error = %e,
-                        "skipping invalid firewall spec token"
-                    ),
+    }
+    for host in &applicable {
+        for (action, list) in [(Action::Allow, &host.allows), (Action::Deny, &host.denies)] {
+            for (peer, ports) in list {
+                // `*` ⇒ any peer (no resolution); otherwise resolve the hostname.
+                let filter = if peer == "*" {
+                    PeerFilter::Any
+                } else {
+                    match resolve(peer) {
+                        Some(id) => PeerFilter::Identity(id),
+                        None => continue,
+                    }
+                };
+                for tok in ports.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    match parse_spec_token(tok) {
+                        Ok((proto, port)) => rules.push(FirewallRule {
+                            direction: Direction::In,
+                            action,
+                            protocol: proto,
+                            port,
+                            peer: filter.clone(),
+                            network: Some(net.to_string()),
+                            origin: RuleOrigin::Network(net.to_string()),
+                        }),
+                        Err(e) => tracing::warn!(
+                            token = %tok, network = %net, error = %e,
+                            "skipping invalid firewall spec token"
+                        ),
+                    }
                 }
             }
         }
     }
-    // Whitelist mode: an allow-list is present ⇒ only listed peers pass,
-    // append a network-scoped catch-all deny. A subject with only `denies`
-    // (blacklist) or neither list stays open (global default applies).
-    let want_default_deny = !host.allows.is_empty();
+    // Whitelist mode: an allow-list is present on any applicable subject ⇒ only
+    // listed peers pass, append a network-scoped catch-all deny. A subject with
+    // only `denies` (blacklist) or neither list stays open (global default).
+    let want_default_deny = applicable.iter().any(|h| !h.allows.is_empty());
     if want_default_deny {
         rules.push(FirewallRule {
             direction: Direction::In,
@@ -1487,6 +1507,71 @@ mod tests {
         assert_eq!(udp.port.as_ref().unwrap().start, 53);
         let any = allows.iter().find(|r| r.protocol == Protocol::Any).unwrap();
         assert!(any.port.is_none());
+    }
+
+    #[test]
+    fn materialize_wildcard_subject_applies_to_any_host() {
+        // A `*` subject targets every node, even one whose own hostname has no
+        // dedicated entry. The Minecraft case: "everyone opens 6969 to anyone".
+        let me = test_id(1);
+        let resolve = |h: &str| match h {
+            "me" => Some(me),
+            _ => None,
+        };
+        let mut suggestions = SuggestedFirewall::new();
+        let mut entry = HostSuggestions::default();
+        entry.allows.insert("*".to_string(), "tcp:6969".to_string());
+        suggestions.insert("*".to_string(), entry);
+        // "me" has no own subject, only the wildcard.
+        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let allow = rules
+            .iter()
+            .find(|r| r.action == Action::Allow)
+            .expect("wildcard subject should materialize for any host");
+        assert_eq!(allow.peer, PeerFilter::Any, "`*` peer ⇒ any peer");
+        assert_eq!(allow.protocol, Protocol::Tcp);
+        assert_eq!(allow.port.as_ref().unwrap().start, 6969);
+        assert_eq!(allow.network.as_deref(), Some("prod"));
+        // Allow-list present ⇒ a catch-all deny is appended.
+        assert!(rules.iter().any(|r| r.action == Action::Deny && r.peer == PeerFilter::Any));
+    }
+
+    #[test]
+    fn materialize_any_peer_star_bypasses_resolution() {
+        // A `*` peer key opens the port to anyone, without resolving a hostname.
+        let resolve = |_: &str| None; // resolves nothing
+        let suggestions = suggest("me", &[("*", "udp:53")]);
+        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let allow = rules
+            .iter()
+            .find(|r| r.action == Action::Allow)
+            .expect("`*` peer must not be dropped by the resolver");
+        assert_eq!(allow.peer, PeerFilter::Any);
+        assert_eq!(allow.protocol, Protocol::Udp);
+        assert_eq!(allow.port.as_ref().unwrap().start, 53);
+    }
+
+    #[test]
+    fn materialize_merges_own_subject_and_wildcard() {
+        // A node with its own subject AND a wildcard subject gets both rule sets.
+        let me = test_id(1);
+        let peer = test_id(2);
+        let resolve = |h: &str| match h {
+            "me" => Some(me),
+            "peer" => Some(peer),
+            _ => None,
+        };
+        let mut suggestions = suggest("me", &[("peer", "tcp:22")]);
+        let mut wild = HostSuggestions::default();
+        wild.allows.insert("*".to_string(), "tcp:6969".to_string());
+        suggestions.insert("*".to_string(), wild);
+        let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
+        let allows: Vec<_> = rules.iter().filter(|r| r.action == Action::Allow).collect();
+        assert_eq!(allows.len(), 2, "own subject + wildcard subject");
+        assert!(allows.iter().any(|r| r.peer == PeerFilter::Identity(peer)
+            && r.port.as_ref().unwrap().start == 22));
+        assert!(allows.iter().any(|r| r.peer == PeerFilter::Any
+            && r.port.as_ref().unwrap().start == 6969));
     }
 
     #[test]

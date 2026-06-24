@@ -20,6 +20,31 @@ pub fn is_valid_hostname(name: &str) -> bool {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// Decide the hostname to assign an admitted peer.
+///
+/// `authoritative` names come from an invite binding (`ray invite --hostname`):
+/// they are assigned verbatim, and a clash with a *different* identity is
+/// rejected — no silent rename — so no peer can claim another's name to inherit
+/// its suggested firewall rules. A joiner-chosen (non-authoritative) name keeps
+/// collision-resolution (`alice` → `alice-1` → …).
+///
+/// `taken` must already exclude the joining identity's own current name.
+/// Returns `Ok(assigned)` or `Err(conflicting_name)` when an authoritative name
+/// is already in use.
+pub fn admission_hostname(
+    desired: &str,
+    taken: &[&str],
+    authoritative: bool,
+) -> Result<String, String> {
+    if authoritative {
+        if taken.contains(&desired) {
+            return Err(desired.to_string());
+        }
+        return Ok(desired.to_string());
+    }
+    Ok(resolve_collision(desired, taken))
+}
+
 pub fn resolve_collision(desired: &str, taken: &[&str]) -> String {
     if !taken.contains(&desired) {
         return desired.to_string();
@@ -74,5 +99,37 @@ mod tests {
     fn collision_appends_number() {
         assert_eq!(resolve_collision("alice", &["alice"]), "alice-1");
         assert_eq!(resolve_collision("alice", &["alice", "alice-1"]), "alice-2");
+    }
+
+    #[test]
+    fn admission_authoritative_rejects_collision() {
+        // An invite-bound (authoritative) name already taken by someone else is
+        // rejected — no silent rename — so a peer can't steal another's name.
+        assert_eq!(
+            admission_hostname("alice", &["alice"], true),
+            Err("alice".to_string())
+        );
+    }
+
+    #[test]
+    fn admission_authoritative_free_name_assigned_as_is() {
+        // An authoritative name nobody holds is assigned verbatim (no rename).
+        assert_eq!(
+            admission_hostname("alice", &["bob"], true),
+            Ok("alice".to_string())
+        );
+    }
+
+    #[test]
+    fn admission_free_name_collision_is_renamed() {
+        // A joiner-chosen (non-authoritative) name keeps collision-rename.
+        assert_eq!(
+            admission_hostname("alice", &["alice"], false),
+            Ok("alice-1".to_string())
+        );
+        assert_eq!(
+            admission_hostname("alice", &["bob"], false),
+            Ok("alice".to_string())
+        );
     }
 }
