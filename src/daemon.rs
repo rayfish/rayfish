@@ -435,6 +435,7 @@ impl CoordinatorAcceptState {
                 hostname: final_hostname.clone(),
                 user_identity: user_id_opt,
                 device_cert: device_cert.clone(),
+                collision_index: 0,
             });
             s.refresh_snapshot();
             s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
@@ -631,6 +632,7 @@ impl MemberAcceptState {
                     hostname: final_hostname.clone(),
                     user_identity: user_id_opt,
                     device_cert: device_cert.clone(),
+                    collision_index: 0,
                 });
                 s.refresh_snapshot();
                 s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
@@ -1446,6 +1448,7 @@ impl DaemonState {
                 hostname: Some(my_hostname.clone()),
                 user_identity: None,
                 device_cert: None,
+                collision_index: 0,
             })
             .expect("self-add cannot collide");
 
@@ -2466,6 +2469,7 @@ impl DaemonState {
                             hostname: entry.hostname.clone(),
                             user_identity: None,
                             device_cert: None,
+                            collision_index: 0,
                         });
                     }
                     for entry in &nc.approved {
@@ -2475,6 +2479,7 @@ impl DaemonState {
                             hostname: entry.hostname.clone(),
                             user_identity: None,
                             device_cert: None,
+                            collision_index: 0,
                         };
                         let _ = approved_list.approve(ae, &member_list);
                     }
@@ -2490,6 +2495,7 @@ impl DaemonState {
                     hostname: persisted_hostname.clone(),
                     user_identity: None,
                     device_cert: None,
+                    collision_index: 0,
                 })
                 .expect("self-add cannot collide");
         }
@@ -3705,6 +3711,7 @@ impl DaemonState {
                     hostname: pj.hostname.clone(),
                     user_identity: user_id,
                     device_cert: pj.device_cert.clone(),
+                    collision_index: 0,
                 },
                 &members,
             );
@@ -5408,6 +5415,7 @@ fn persisted_roster(network_name: &str) -> Vec<Member> {
                     hostname: m.hostname,
                     user_identity: None,
                     device_cert: None,
+                    collision_index: 0,
                 })
                 .collect()
         })
@@ -6140,7 +6148,7 @@ async fn join_mesh_shared(
                             Ok((_send, mut recv)) => {
                                 match control::recv_msg(&mut recv).await {
                                     Ok(ControlMsg::MemberApproved { identity, ip, hostname, .. }) => {
-                                        let entry = ApprovedEntry { identity, ip, hostname, user_identity: None, device_cert: None };
+                                        let entry = ApprovedEntry { identity, ip, hostname, user_identity: None, device_cert: None, collision_index: 0 };
                                         let mut s = live_state.write().unwrap();
                                         let members = s.members.clone();
                                         let _ = s.approved.approve(entry, &members);
@@ -6578,6 +6586,7 @@ mod coordinator_dial_order_tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
         // minter = b: b first, then the other coordinator a, never c (not coord), never me.
@@ -6594,6 +6603,7 @@ mod coordinator_dial_order_tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         let members = vec![mk(a, true), mk(b, false), mk(c, true)];
         let me = a;

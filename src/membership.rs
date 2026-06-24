@@ -26,6 +26,11 @@ pub struct Member {
     pub user_identity: Option<EndpointId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_cert: Option<DeviceCert>,
+    /// Index used to resolve IPv4 collisions in the 22-bit CGNAT space.
+    /// 0 for most peers; incremented only when `derive_ip_with_index(identity, 0)`
+    /// collides with an already-assigned address.
+    #[serde(default)]
+    pub collision_index: u32,
 }
 
 /// Controls who can approve new members joining the network.
@@ -128,6 +133,10 @@ pub struct ApprovedEntry {
     pub user_identity: Option<EndpointId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_cert: Option<DeviceCert>,
+    /// Index used to resolve IPv4 collisions. Mirrors `Member.collision_index`
+    /// for the same identity; defaults to 0 for backward-compatible decoding.
+    #[serde(default)]
+    pub collision_index: u32,
 }
 
 /// Pre-approved peers that the coordinator has broadcast but that haven't
@@ -281,6 +290,23 @@ pub fn derive_ip_with_index(identity: &EndpointId, index: u32) -> Ipv4Addr {
         host_bits
     };
     Ipv4Addr::from(base | host_bits)
+}
+
+/// Finds the lowest collision index whose derived IPv4 is free in `members`.
+///
+/// An IP is considered free if no *different* identity holds it — a re-add of
+/// the same identity at its existing index is always accepted. Returns the
+/// `(ip, index)` pair that should be stored in `Member.ip` / `Member.collision_index`.
+#[allow(dead_code)] // public API; will be called from daemon admission once wired in
+pub fn assign_ip(members: &MemberList, identity: &EndpointId) -> (Ipv4Addr, u32) {
+    let mut index = 0u32;
+    loop {
+        let ip = derive_ip_with_index(identity, index);
+        match members.get_by_ip(ip) {
+            Some(existing) if existing.identity != *identity => index += 1,
+            _ => return (ip, index),
+        }
+    }
 }
 
 /// Derives a stable IPv6 address from an [`EndpointId`] in the `200::/7` range.
@@ -478,7 +504,7 @@ pub fn group_blob_hash(
 /// hijacking — see the security audit. This helper exists so enforcement can be
 /// added at the data layer without changing the on-wire format.
 pub fn validate_member(member: &Member) -> Result<()> {
-    let expected = derive_ip(&member.identity);
+    let expected = derive_ip_with_index(&member.identity, member.collision_index);
     anyhow::ensure!(
         member.ip == expected,
         "member ip {} does not match identity-derived ip {}",
@@ -490,7 +516,7 @@ pub fn validate_member(member: &Member) -> Result<()> {
 
 /// Like [`validate_member`] but for [`ApprovedEntry`].
 pub fn validate_approved(entry: &ApprovedEntry) -> Result<()> {
-    let expected = derive_ip(&entry.identity);
+    let expected = derive_ip_with_index(&entry.identity, entry.collision_index);
     anyhow::ensure!(
         entry.ip == expected,
         "approved entry ip {} does not match identity-derived ip {}",
@@ -674,6 +700,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         list.add(member.clone()).unwrap();
         assert!(list.is_member(&id));
@@ -692,6 +719,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         list.add(member).unwrap();
         let found = list.get_by_ip(Ipv4Addr::new(100, 64, 10, 5)).unwrap();
@@ -709,6 +737,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         })
         .unwrap();
         let result = list.add(Member {
@@ -718,6 +747,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         });
         assert!(result.is_err());
     }
@@ -733,6 +763,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         })
         .unwrap();
         list.add(Member {
@@ -742,6 +773,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         })
         .unwrap();
         assert!(list.get(&id).unwrap().is_coordinator);
@@ -758,6 +790,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         })
         .unwrap();
         let removed = list.remove(&id);
@@ -776,6 +809,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         })
         .unwrap();
         list.add(Member {
@@ -785,6 +819,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         })
         .unwrap();
         assert_eq!(list.all().len(), 2);
@@ -800,6 +835,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         assert!(policy.can_authorize(&member));
     }
@@ -814,6 +850,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         let regular = Member {
             identity: test_id(2),
@@ -822,6 +859,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         assert!(policy.can_authorize(&coordinator));
         assert!(!policy.can_authorize(&regular));
@@ -837,6 +875,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         let members = MemberList::new();
         list.approve(entry, &members).unwrap();
@@ -856,6 +895,7 @@ mod tests {
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
+                collision_index: 0,
             })
             .unwrap();
         let entry = ApprovedEntry {
@@ -864,6 +904,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         assert!(approved.approve(entry, &members).is_err());
     }
@@ -880,6 +921,7 @@ mod tests {
                     hostname: None,
                     user_identity: None,
                     device_cert: None,
+                    collision_index: 0,
                 },
                 &members,
             )
@@ -891,6 +933,7 @@ mod tests {
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
+                collision_index: 0,
             },
             &members,
         );
@@ -910,6 +953,7 @@ mod tests {
                     hostname: None,
                     user_identity: None,
                     device_cert: None,
+                    collision_index: 0,
                 },
                 &members,
             )
@@ -922,6 +966,7 @@ mod tests {
                     hostname: None,
                     user_identity: None,
                     device_cert: None,
+                    collision_index: 0,
                 },
                 &members,
             )
@@ -942,6 +987,7 @@ mod tests {
                     hostname: None,
                     user_identity: None,
                     device_cert: None,
+                    collision_index: 0,
                 },
                 &members,
             )
@@ -960,6 +1006,7 @@ mod tests {
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
+                collision_index: 0,
             },
             ApprovedEntry {
                 identity: test_id(2),
@@ -967,6 +1014,7 @@ mod tests {
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
+                collision_index: 0,
             },
         ];
         let list = ApprovedList::from_entries(entries);
@@ -988,6 +1036,7 @@ mod tests {
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
+                collision_index: 0,
             });
         }
         list
@@ -1036,6 +1085,7 @@ mod tests {
                     hostname: None,
                     user_identity: None,
                     device_cert: None,
+                    collision_index: 0,
                 },
                 &members,
             )
@@ -1271,6 +1321,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         assert!(validate_member(&member).is_ok());
     }
@@ -1287,6 +1338,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         let err = validate_member(&member).unwrap_err().to_string();
         assert!(err.contains("does not match"), "{err}");
@@ -1302,6 +1354,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         assert!(validate_member(&member).is_err());
     }
@@ -1317,6 +1370,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         let gw = Member {
             identity: id,
@@ -1325,6 +1379,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         assert!(validate_member(&net).is_err());
         assert!(validate_member(&gw).is_err());
@@ -1339,6 +1394,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         assert!(validate_approved(&entry).is_err());
     }
@@ -1355,6 +1411,7 @@ mod tests {
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
+                collision_index: 0,
             };
             assert!(
                 validate_member(&member).is_ok(),
@@ -1377,6 +1434,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         let blob = GroupBlob {
             members: vec![bad_member],
@@ -1400,6 +1458,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         };
         let blob = GroupBlob {
             members: vec![bad_member],
@@ -1423,9 +1482,72 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            collision_index: 0,
         })
         .unwrap();
         mark_coordinator(&mut list, &id);
         assert!(list.get(&id).unwrap().is_coordinator);
+    }
+
+    /// Brute-force (birthday approach) to find two distinct identities whose
+    /// index-0 IPv4 collides. The 22-bit space makes this likely within ~a few
+    /// thousand iterations. Bounded at 200_000 to avoid a runaway test.
+    fn find_colliding_pair() -> Option<(EndpointId, EndpointId)> {
+        let mut seen: std::collections::HashMap<std::net::Ipv4Addr, EndpointId> =
+            std::collections::HashMap::new();
+        for i in 0u32..200_000 {
+            // Vary bytes across the whole 32-byte key to get good hash dispersion.
+            let mut key_bytes = [0u8; 32];
+            let b = i.to_le_bytes();
+            key_bytes[0] = b[0];
+            key_bytes[1] = b[1];
+            key_bytes[2] = b[2];
+            key_bytes[3] = b[3];
+            let id = iroh::SecretKey::from(key_bytes).public();
+            let ip = derive_ip(&id);
+            if let Some(existing) = seen.get(&ip) {
+                if *existing != id {
+                    return Some((*existing, id));
+                }
+            } else {
+                seen.insert(ip, id);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn assign_ip_rotates_on_collision() {
+        let (a, b) = find_colliding_pair()
+            .expect("birthday bound: should find a collision within 200k identities");
+        // Sanity: a and b both map to the same index-0 IP.
+        assert_eq!(derive_ip(&a), derive_ip(&b));
+        let ip0 = derive_ip(&a);
+
+        // Add `a` to the list at its index-0 IP.
+        let mut list = MemberList::new();
+        let (assigned_a, idx_a) = assign_ip(&list, &a);
+        assert_eq!(idx_a, 0, "first peer always gets index 0");
+        assert_eq!(assigned_a, ip0);
+        list.add(Member {
+            identity: a,
+            ip: assigned_a,
+            is_coordinator: false,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            collision_index: idx_a,
+        })
+        .unwrap();
+
+        // Now assign_ip for `b` must rotate to index >= 1.
+        let (ip_b, idx_b) = assign_ip(&list, &b);
+        assert!(idx_b >= 1, "colliding identity must rotate to index >= 1");
+        assert_ne!(ip_b, ip0, "rotated IP must differ from the occupied slot");
+        assert_eq!(
+            ip_b,
+            derive_ip_with_index(&b, idx_b),
+            "assigned IP must equal derive_ip_with_index at that index"
+        );
     }
 }
