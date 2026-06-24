@@ -279,6 +279,51 @@ impl InviteStore {
         Ok(())
     }
 
+    /// Insert an invite known only by its hash (shared from another coordinator).
+    /// Idempotent: a no-op if an entry with this `id` already exists.
+    /// The `secret_hash` is the full hex blake3 of the secret (same format as
+    /// `mint` stores internally). This lets a co-coordinator redeem an invite it
+    /// did not mint, when the originating coordinator shares the hash out-of-band.
+    pub fn record_shared(&mut self, id: String, secret_hash: String, expires: u64) -> Result<()> {
+        if self.invites.iter().any(|i| i.id == id) {
+            return Ok(());
+        }
+        self.invites.push(Invite {
+            id,
+            secret_hash,
+            created: now_secs(),
+            expires,
+            status: InviteStatus::Pending,
+            hostname: None,
+        });
+        self.save()
+    }
+
+    /// Mark the invite whose `secret_hash` matches `secret_hash` as redeemed.
+    /// Returns `true` if state changed (was `Pending`), `false` if already
+    /// `Redeemed`/`Revoked` or absent. Used by a co-coordinator that learns the
+    /// invite was consumed by another coordinator in the same network.
+    pub fn burn_by_hash(&mut self, secret_hash: &str) -> Result<bool> {
+        let mut changed = false;
+        for inv in self.invites.iter_mut() {
+            if inv.secret_hash == secret_hash {
+                if matches!(inv.status, InviteStatus::Pending) {
+                    inv.status = InviteStatus::Redeemed {
+                        by: EndpointId::from_bytes(&[0u8; 32])
+                            .expect("zero bytes are a valid key"),
+                        at: now_secs(),
+                    };
+                    changed = true;
+                }
+                break;
+            }
+        }
+        if changed {
+            self.save()?;
+        }
+        Ok(changed)
+    }
+
     /// Display view of all invites; lazily reports expired-but-pending as `expired`
     /// without mutating the stored status.
     pub fn list(&self) -> Vec<InviteView> {
@@ -476,6 +521,39 @@ mod tests {
         let (secret, _id) = store.mint(Duration::from_secs(3600), None).unwrap();
         let hostname = store.redeem(&secret, test_id(9)).unwrap();
         assert!(hostname.is_none());
+    }
+
+    #[test]
+    fn record_shared_then_redeem_then_burn_by_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net.toml");
+        let mut store = InviteStore::with_path(&path);
+        let secret = generate_secret();
+        // secret_hash is a hex String in the real code.
+        let hash = blake3::hash(&secret).to_hex().to_string();
+
+        store
+            .record_shared("abcd1234".into(), hash.clone(), u64::MAX)
+            .unwrap();
+        // A shared entry is redeemable by this (non-minting) coordinator
+        // (hostname is None since record_shared has no hostname binding):
+        let by = test_id(5);
+        assert!(store.redeem(&secret, by).unwrap().is_none());
+        // Burning an already-redeemed hash is a no-op (returns false):
+        assert!(!store.burn_by_hash(&hash).unwrap());
+    }
+
+    #[test]
+    fn burn_by_hash_marks_unredeemed_entry_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = InviteStore::with_path(dir.path().join("n.toml"));
+        let secret = generate_secret();
+        let hash = blake3::hash(&secret).to_hex().to_string();
+        store
+            .record_shared("id00".into(), hash.clone(), u64::MAX)
+            .unwrap();
+        assert!(store.burn_by_hash(&hash).unwrap()); // first burn changes state
+        assert!(store.redeem(&secret, test_id(9)).is_err()); // now unusable
     }
 
     #[test]
