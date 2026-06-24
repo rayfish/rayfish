@@ -6,8 +6,21 @@
 
 use std::io::IsTerminal;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Hard override that forces all styling, spinners, and interactive UI off —
+/// set once by `--json` so machine-readable output is never colorized.
+static PLAIN: AtomicBool = AtomicBool::new(false);
+
+/// Force plain (uncolored, non-interactive) output for the rest of the process.
+pub fn set_plain(plain: bool) {
+    PLAIN.store(plain, Ordering::Relaxed);
+}
 
 fn enabled() -> bool {
+    if PLAIN.load(Ordering::Relaxed) {
+        return false;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         if std::env::var_os("NO_COLOR").is_some() {
@@ -64,9 +77,36 @@ pub fn red(s: &str) -> String {
     paint("38;5;203", s)
 }
 
+/// Whether colorized/styled output is active (TTY + not `NO_COLOR`). Exposed so
+/// callers can gate interactive UI (spinners, the firewall picker) on the same
+/// signal as coloring.
+pub fn is_enabled() -> bool {
+    enabled()
+}
+
 /// A filled status dot, colored by liveness.
 pub fn dot_online() -> String {
     green("●")
+}
+
+/// A hollow status dot for offline/standby peers.
+pub fn dot_offline() -> String {
+    faint("○")
+}
+
+/// Success check mark.
+pub fn check() -> String {
+    green("✓")
+}
+
+/// Failure cross.
+pub fn cross() -> String {
+    red("✗")
+}
+
+/// A faint `·tag·` marker for inline annotations (roles, "suggested by …").
+pub fn marker(s: &str) -> String {
+    faint(&format!("·{s}·"))
 }
 
 /// Color a latency value (in ms): green is snappy, amber is fine, red is laggy.

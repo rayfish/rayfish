@@ -2,6 +2,7 @@
 name = "ray-proto"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.91"
 authors = ["Dario <dario@rayfish.xyz>"]
 license = "MPL-2.0"
 description = "Shared IPC wire protocol for the rayfish daemon/CLI and frontends"

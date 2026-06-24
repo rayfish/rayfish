@@ -63,10 +63,10 @@ use crate::dht;
 use crate::audit;
 use crate::dns;
 use crate::dns_config;
-use crate::firewall::{self, FirewallConfig, SharedFirewall};
+use crate::firewall::{self, SharedFirewall};
 use crate::forward;
 use crate::identity;
-use crate::ipc::{self, IpcMessage, NetworkRole, NetworkStatus, PeerStatus};
+use crate::ipc::{self, FirewallRuleView, IpcMessage, NetworkRole, NetworkStatus, PeerStatus};
 use crate::membership::{
     ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
     MemberList, canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
@@ -1191,6 +1191,11 @@ impl DaemonState {
             IpcMessage::FirewallPending { network } => self.firewall_pending(&network),
             IpcMessage::FirewallAccept { network } => self.firewall_accept(&network),
             IpcMessage::FirewallDeny { network } => self.firewall_deny(&network),
+            IpcMessage::FirewallResolveSuggestions {
+                network,
+                accept,
+                deny,
+            } => self.firewall_resolve_suggestions(&network, &accept, &deny),
             IpcMessage::FirewallAutoAccept { network, enabled } => {
                 self.firewall_auto_accept(&network, enabled)
             }
@@ -3721,8 +3726,10 @@ impl DaemonState {
     fn firewall_show(&self) -> IpcMessage {
         let config = self.firewall.get_config();
         let short_id = |id: &EndpointId| -> String { id.fmt_short().to_string() };
-        let display = firewall::format_firewall_show(&config, &short_id);
-        IpcMessage::FirewallState { display }
+        IpcMessage::FirewallState {
+            default: config.default_action.to_string(),
+            rules: firewall::rule_views(&config.rules, &short_id),
+        }
     }
 
     /// Coordinator-only: replace a network's suggested firewall rules and
@@ -3780,26 +3787,85 @@ impl DaemonState {
     }
 
     /// Materialized suggested rules awaiting manual review (`ray firewall
-    /// pending`). Pre-formatted like `FirewallShow` so the CLI just prints it.
+    /// pending`). Returns the rules as structured views; the CLI renders them as
+    /// an interactive picker on a TTY or a static table otherwise.
     fn firewall_pending(&self, network: &str) -> IpcMessage {
         match self.networks.get(network) {
             Some(h) => {
                 let pending = h.state.read().unwrap().pending_suggestions.clone();
-                let display = if pending.is_empty() {
-                    String::from("  (no pending suggested rules)\n")
-                } else {
-                    let config = FirewallConfig {
-                        default_action: firewall::Action::Allow,
-                        rules: pending,
-                    };
-                    let short_id = |id: &EndpointId| -> String { id.fmt_short().to_string() };
-                    firewall::format_firewall_show(&config, &short_id)
-                };
-                IpcMessage::FirewallPendingResponse { display }
+                let short_id = |id: &EndpointId| -> String { id.fmt_short().to_string() };
+                IpcMessage::FirewallPendingResponse {
+                    network: network.to_string(),
+                    rules: firewall::rule_views(&pending, &short_id),
+                }
             }
             None => IpcMessage::Error {
                 message: format!("network '{network}' not found"),
             },
+        }
+    }
+
+    /// Resolve individual queued suggestions from the interactive picker: install
+    /// the rules whose view is in `accept`, drop both `accept`+`deny` from the
+    /// queue, and persist. Matching is by view value so it's robust to queue
+    /// reordering between fetch and resolve.
+    fn firewall_resolve_suggestions(
+        &self,
+        network: &str,
+        accept: &[FirewallRuleView],
+        deny: &[FirewallRuleView],
+    ) -> IpcMessage {
+        let short_id = |id: &EndpointId| -> String { id.fmt_short().to_string() };
+        let h = match self.networks.get(network) {
+            Some(h) => h,
+            None => {
+                return IpcMessage::Error {
+                    message: format!("network '{network}' not found"),
+                };
+            }
+        };
+        let accept_set: std::collections::HashSet<&FirewallRuleView> = accept.iter().collect();
+        let deny_set: std::collections::HashSet<&FirewallRuleView> = deny.iter().collect();
+
+        // Partition the queue: keep the still-undecided rules; collect accepted.
+        let mut accepted_rules = Vec::new();
+        {
+            let mut s = h.state.write().unwrap();
+            let mut remaining = Vec::new();
+            for rule in std::mem::take(&mut s.pending_suggestions) {
+                let view = firewall::rule_view(&rule, &short_id);
+                if accept_set.contains(&view) {
+                    accepted_rules.push(rule);
+                } else if deny_set.contains(&view) {
+                    // dropped
+                } else {
+                    remaining.push(rule);
+                }
+            }
+            s.pending_suggestions = remaining;
+        }
+
+        let n_accept = accepted_rules.len();
+        let n_deny = deny.len();
+        if !accepted_rules.is_empty() {
+            // Merge accepted rules into the network's existing installed set,
+            // rather than replacing it, so earlier per-rule accepts survive.
+            let mut existing: Vec<firewall::FirewallRule> = self
+                .firewall
+                .get_config()
+                .rules
+                .iter()
+                .filter(|r| matches!(&r.origin, firewall::RuleOrigin::Network(n) if n == network))
+                .cloned()
+                .collect();
+            existing.extend(accepted_rules);
+            let config = self.firewall.replace_network_rules(network, existing);
+            if let Err(e) = firewall::save_firewall(&config) {
+                tracing::warn!(error = %e, "failed to persist firewall config");
+            }
+        }
+        IpcMessage::Ok {
+            message: format!("accepted {n_accept}, denied {n_deny} suggested rules for '{network}'"),
         }
     }
 

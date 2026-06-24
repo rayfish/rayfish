@@ -110,6 +110,14 @@ pub enum IpcMessage {
     FirewallDeny {
         network: String,
     },
+    /// Resolve individual queued suggestions (from the interactive picker):
+    /// install the `accept` views and drop both `accept`+`deny` from the queue.
+    /// Matching is by view value, so it's robust to queue reordering.
+    FirewallResolveSuggestions {
+        network: String,
+        accept: Vec<FirewallRuleView>,
+        deny: Vec<FirewallRuleView>,
+    },
     SetHostname {
         network: String,
         hostname: String,
@@ -210,8 +218,13 @@ pub enum IpcMessage {
         bytes_rx: u64,
         bytes_tx: u64,
     },
+    /// The device's local firewall (reply to `FirewallShow`). Structured so the
+    /// CLI renders it with color on the *user's* TTY and serializes it for
+    /// `--json`.
     FirewallState {
-        display: String,
+        /// Default action when no rule matches: `"allow"` or `"deny"`.
+        default: String,
+        rules: Vec<FirewallRuleView>,
     },
     /// Current suggested firewall rules for a network (reply to
     /// `FirewallSuggestions`).
@@ -219,9 +232,11 @@ pub enum IpcMessage {
         suggestions: SuggestedFirewall,
     },
     /// Materialized suggested rules queued for manual review on a network (reply
-    /// to `FirewallPending`). `display` is a pre-formatted, human-readable table.
+    /// to `FirewallPending`). The CLI renders these as an interactive picker on a
+    /// TTY, or a static table otherwise.
     FirewallPendingResponse {
-        display: String,
+        network: String,
+        rules: Vec<FirewallRuleView>,
     },
     FileList {
         files: Vec<PendingFileInfo>,
@@ -259,6 +274,29 @@ pub enum IpcMessage {
     AdminListResponse {
         admins: Vec<AdminInfo>,
     },
+}
+
+/// A display-oriented view of one firewall rule, sent over IPC so the CLI can
+/// render (with color) and serialize (`--json`) without depending on the
+/// daemon-side `firewall::FirewallRule` type. All fields are pre-stringified;
+/// `PartialEq`/`Eq`/`Hash` let the daemon value-match views back to queued rules.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FirewallRuleView {
+    /// `"in"` / `"out"`.
+    pub direction: String,
+    /// `"allow"` / `"deny"`.
+    pub action: String,
+    /// `"tcp"` / `"udp"` / `"icmp"` / `"any"`.
+    pub protocol: String,
+    /// Port or range: `"443"`, `"8000-9000"`, or `"*"`.
+    pub port: String,
+    /// `"any"` or a peer's short id.
+    pub peer: String,
+    /// `"any"` or a network name.
+    pub network: String,
+    /// `Some(net)` if this rule was suggested by network `net`; `None` if local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_by: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

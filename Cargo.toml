@@ -2,7 +2,7 @@
 name = "rayfish"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.91"
 authors = ["Dario <dario@rayfish.xyz>"]
 description = "P2P mesh VPN powered by iroh — connect peers by cryptographic identity, not IP address"
 license = "MPL-2.0"
@@ -41,7 +41,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 dashmap = "6"
-derive_more = { version = "2", features = ["is_variant"] }
+derive_more = { version = "2", features = ["is_variant", "display"] }
 dirs = "6.0.0"
 futures = "0.3"
 iroh = { version = "1", features = ["metrics", "unstable-custom-transports"] }
@@ -51,6 +51,9 @@ iroh-dns = "1"
 iroh-blobs = { version = "0.103", default-features = false, features = ["fs-store"] }
 iroh-mdns-address-lookup = "0.4"
 humansize = "2"
+unicode-width = "0.2"
+indicatif = "0.18"
+crossterm = "0.29"
 mime_guess = "2"
 rand = "0.10"
 rmp-serde = "1"

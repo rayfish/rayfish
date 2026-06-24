@@ -41,29 +41,40 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use iroh::EndpointId;
 use ray_proto::SuggestedFirewall;
+use ray_proto::ipc::FirewallRuleView;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, derive_more::Display)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
+    #[display("in")]
     In,
+    #[display("out")]
     Out,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, derive_more::Display)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
+    #[display("tcp")]
     Tcp,
+    #[display("udp")]
     Udp,
+    #[display("icmp")]
     Icmp,
+    #[display("any")]
     Any,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, derive_more::IsVariant)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, derive_more::IsVariant, derive_more::Display,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
+    #[display("allow")]
     Allow,
+    #[display("deny")]
     Deny,
 }
 
@@ -593,29 +604,6 @@ pub fn parse_spec_token(tok: &str) -> Result<(Protocol, Option<PortRange>)> {
     }
 }
 
-fn format_protocol(p: Protocol) -> &'static str {
-    match p {
-        Protocol::Tcp => "tcp",
-        Protocol::Udp => "udp",
-        Protocol::Icmp => "icmp",
-        Protocol::Any => "any",
-    }
-}
-
-fn format_direction(d: Direction) -> &'static str {
-    match d {
-        Direction::In => "in",
-        Direction::Out => "out",
-    }
-}
-
-fn format_action(a: Action) -> &'static str {
-    match a {
-        Action::Allow => "allow",
-        Action::Deny => "deny",
-    }
-}
-
 /// Build the concrete local firewall rules a node enforces for network `net`,
 /// from `suggestions` targeting `my_hostname`. Two subjects apply to a node: its
 /// own hostname and the wildcard `*` subject (which targets every node, e.g.
@@ -695,49 +683,41 @@ pub fn materialize_suggestions(
     rules
 }
 
-pub fn format_firewall_show(
-    config: &FirewallConfig,
+/// Build a display-oriented [`FirewallRuleView`] for one rule, resolving the
+/// peer identity to a short id via `short_id`. Used for IPC (the CLI renders /
+/// serializes the view) and for value-matching queued suggestions.
+pub fn rule_view(rule: &FirewallRule, short_id: &dyn Fn(&EndpointId) -> String) -> FirewallRuleView {
+    let peer = match &rule.peer {
+        PeerFilter::Any => "any".to_string(),
+        PeerFilter::Identity(id) => short_id(id),
+    };
+    let port = match &rule.port {
+        None => "*".to_string(),
+        Some(r) if r.start == r.end => r.start.to_string(),
+        Some(r) => format!("{}-{}", r.start, r.end),
+    };
+    let network = rule.network.clone().unwrap_or_else(|| "any".to_string());
+    let suggested_by = match &rule.origin {
+        RuleOrigin::Local => None,
+        RuleOrigin::Network(n) => Some(n.clone()),
+    };
+    FirewallRuleView {
+        direction: rule.direction.to_string(),
+        action: rule.action.to_string(),
+        protocol: rule.protocol.to_string(),
+        port,
+        peer,
+        network,
+        suggested_by,
+    }
+}
+
+/// Build the views for every rule in `config`, in order.
+pub fn rule_views(
+    rules: &[FirewallRule],
     short_id: &dyn Fn(&EndpointId) -> String,
-) -> String {
-    let mut out = format!("Default: {}\n", format_action(config.default_action));
-
-    if config.rules.is_empty() {
-        out.push_str("No rules.\n");
-        return out;
-    }
-
-    out.push_str("Rules:\n");
-    for (i, rule) in config.rules.iter().enumerate() {
-        let peer_str = match &rule.peer {
-            PeerFilter::Any => "any".to_string(),
-            PeerFilter::Identity(id) => short_id(id),
-        };
-        let port_str = match &rule.port {
-            None => "*".to_string(),
-            Some(r) if r.start == r.end => r.start.to_string(),
-            Some(r) => format!("{}-{}", r.start, r.end),
-        };
-        let net_str = match &rule.network {
-            None => "any".to_string(),
-            Some(n) => n.clone(),
-        };
-        let origin_str = match &rule.origin {
-            RuleOrigin::Local => String::new(),
-            RuleOrigin::Network(n) => format!(" (suggested by {n})"),
-        };
-        out.push_str(&format!(
-            "  [{}] {} {} proto={} port={} peer={} network={}{}\n",
-            i,
-            format_direction(rule.direction),
-            format_action(rule.action),
-            format_protocol(rule.protocol),
-            port_str,
-            peer_str,
-            net_str,
-            origin_str,
-        ));
-    }
-    out
+) -> Vec<FirewallRuleView> {
+    rules.iter().map(|r| rule_view(r, short_id)).collect()
 }
 
 #[cfg(test)]

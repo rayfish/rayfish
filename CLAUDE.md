@@ -21,7 +21,8 @@ ray create [--open] [--name n] [--hostname h] [--tor]   # closed by default; --o
 ray join <room-id-or-invite> [--name alias] [--hostname h] [--auto-accept-firewall] [--tor]  # join by room id or one-time invite code; --auto-accept-firewall auto-installs suggested rules (managed node/server)
 ray leave <net> | nuke <net>   # nuke = publish empty record then leave
 ray hostname <net> <name>      # change hostname on existing network
-ray status                     # all networks (works without daemon)
+ray status                     # all networks (works without daemon); per-host traffic, member count excludes self
+ray <cmd> --json               # global flag: machine-readable JSON for status/firewall show/files/invite list/requests/admin list (color + spinners off)
 ray report                     # bundle logs+metrics, open a pre-filled GitHub issue
 ray up [--hostname h] | down   # activate / standby (TUN + DNS), daemon stays running; --hostname sets your default name
 
@@ -34,7 +35,7 @@ ray admin <net> add <id> | list            # coordinator-only: grant the network
 ray firewall show|default|add|remove ...               # per-device local firewall
 ray apply <spec> [--prune] [--dry-run] [--invite-missing] [--example]   # declarative deploy (YAML only): create closed nets + suggest firewall + report membership gap
 ray firewall suggest <net> --subject H [--allow peer:proto:ports] [--deny peer:proto:ports]  # coordinator-only: suggest rules on any network (rides the signed blob). Subject/peer `*` = all hosts / any peer. Token grammar: `proto:ports` (tcp:22, udp:53, tcp:*, any:*) or bare proto (icmp, any, tcp). An allow-list ⇒ whitelist (catch-all deny appended); denies-only ⇒ blacklist
-ray firewall pending <net> | accept <net> | deny <net>  # review/accept/discard queued suggested rules (manual consent queue)
+ray firewall pending <net> | accept <net> | deny <net>  # review/accept/discard queued suggested rules (manual consent queue). On a TTY, `pending` is an interactive picker (↑↓ move · enter accept · d deny · a all · q done) resolving rules per-record; piped/`--json` falls back to a static table
 ray firewall auto-accept <net> on|off  # toggle this node's auto-install of suggested rules for a network (on = install current queue)
 ray mdns on|off                # local peer discovery (default on)
 ray send <file> <peer>         # file sharing; ray files [accept <id> [--output dir]]
@@ -89,6 +90,7 @@ A single iroh Endpoint and TUN device are shared across all networks. Each netwo
 - `src/dns_config.rs` — OS DNS config (`DnsConfigurator` trait). macOS: SCDynamicStore. Linux detection chain: systemd-resolved D-Bus → NetworkManager D-Bus → resolvectl → resolvconf → `/etc/resolv.conf`.
 - `src/hostname.rs` / `src/network_name.rs` — hostname + local-alias generation and collision resolution (`resolve_collision` appends `-1`, `-2`, … on a clash, e.g. `dario` → `dario-1`).
 - `src/stats.rs` — iroh-metrics `ForwardMetrics`/`PeerMetrics`, Prometheus export on `:9090`; `ForwardMetrics::snapshot()` reads counters into a serializable `MetricsSnapshot` for `ray report`.
+- **CLI presentation** (dependency-light, all gated on `style::is_enabled()` = TTY + not `NO_COLOR`/`--json`): `src/style.rs` — 256-color ANSI palette + glyphs (`dot_online`/`dot_offline`/`check`/`cross`/`marker`/`latency`); `set_plain(true)` forces everything off (used by `--json`). `src/layout.rs` — ANSI-width-aware borderless column aligner (`Cell`/`columns`, via `unicode-width`); `main::table()` is the shared header+rows helper every list routes through. `src/progress.rs` — `indicatif` spinner factory (stderr, hidden when plain) for slow ops (`join`, service start, file download). `src/picker.rs` — `crossterm` inline (no alt-screen) interactive list for `ray firewall pending`; returns per-rule accept/deny `Resolution`s the CLI sends as `FirewallResolveSuggestions`. Firewall rules cross IPC as `ray_proto::ipc::FirewallRuleView` (pre-stringified, `Eq`/`Hash`) so the CLI renders/serializes and the daemon value-matches queued rules.
 - `src/logdir.rs` — daemon log directory (`/var/log/rayfish` on Linux, `/Library/Logs/rayfish` on macOS). The daemon writes rolling daily files there via `tracing-appender` (set up in `main::init_tracing`); `ray report` bundles them.
 - `src/shutdown.rs` — SIGINT/SIGTERM via `CancellationToken`. `src/audit.rs` — append-only audit log (`~/.config/rayfish/audit.log`, TSV `timestamp\tevent\tip\tendpoint_id`); `AuditLog` is held by `PeerTable` (`PeerTable::with_audit`, constructed in the daemon), which logs a `connect` on a peer's first connection in a network and a `disconnect` when its last connection in a network is dropped (or the peer is removed for identity rotation). Best-effort: the daemon runs without auditing if the log can't be opened.
 
