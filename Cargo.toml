@@ -97,6 +97,14 @@ bytesize = "2.4.0"
 
 [dev-dependencies]
 tempfile = "3"
+criterion = "0.5"
+
+# Microbenchmarks for the per-packet data path (firewall eval + the zero-copy
+# Bytes hand-off). Run with `cargo bench`. `harness = false` lets Criterion own
+# `fn main`.
+[[bench]]
+name = "forward"
+harness = false
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.21.0"

@@ -1,79 +1,17 @@
-mod apply;
-mod audit;
-mod config;
-mod control;
-mod daemon;
-mod dht;
-mod dns;
-mod dns_config;
-mod firewall;
-mod forward;
-mod hostname;
-mod identity;
-mod invite;
-mod ipc;
-mod layout;
-mod logdir;
-mod membership;
-mod network_name;
-mod onepassword;
-mod peers;
-mod picker;
-mod progress;
-
-mod shutdown;
-mod stats;
-mod style;
-mod transport;
-mod tun;
-
-pub const APP_NAME: &str = "ray";
-pub const DNS_DOMAIN: &str = "ray";
+// The daemon's modules live in the `rayfish` library crate (`src/lib.rs`) so
+// integration tests and benchmarks can reach them; this binary is the CLI/IPC
+// client built on top.
+use rayfish::{
+    DNS_DOMAIN, apply, config, daemon, firewall, identity, invite, ipc, layout, logdir, membership,
+    onepassword, picker, progress, shutdown, stats, style,
+};
 
 use std::sync::{Arc, atomic};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 
-use futures::StreamExt;
-use iroh::endpoint::{Connection as IrohConnection, PathEvent};
-
 use membership::GroupMode;
-
-/// Logs iroh path events (opened, closed, selected) for a peer connection.
-pub(crate) fn spawn_path_logger(conn: IrohConnection, label: String) {
-    let paths = conn.paths();
-    for path in paths.iter() {
-        tracing::info!(
-            peer = %label,
-            addr = ?path.remote_addr(),
-            rtt = ?path.rtt(),
-            selected = path.is_selected(),
-            "existing path"
-        );
-    }
-
-    tokio::spawn(async move {
-        let mut events = conn.path_events();
-        while let Some(event) = events.next().await {
-            match event {
-                PathEvent::Opened { remote_addr, .. } => {
-                    tracing::info!(peer = %label, addr = ?remote_addr, "path opened");
-                }
-                PathEvent::Closed { remote_addr, .. } => {
-                    tracing::info!(peer = %label, addr = ?remote_addr, "path closed");
-                }
-                PathEvent::Selected { remote_addr, .. } => {
-                    tracing::info!(peer = %label, addr = ?remote_addr, "path selected");
-                }
-                PathEvent::Lagged { missed, .. } => {
-                    tracing::warn!(peer = %label, missed, "path events lagged");
-                }
-                _ => {}
-            }
-        }
-    });
-}
 
 #[derive(Parser)]
 #[command(name = "ray", about = "P2P mesh VPN powered by iroh")]

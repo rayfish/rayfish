@@ -9,7 +9,13 @@ cargo -q build                 # add --features tor for Tor transport, --feature
 cargo -q check
 cargo -q test
 cargo -q clippy
+cargo bench                    # Criterion microbenchmarks of the per-packet data path (benches/forward.rs)
 ```
+
+The crate is split into a library (`src/lib.rs`, the daemon's modules as `pub mod`)
+and a thin binary (`src/main.rs`, the `ray` CLI/IPC client, `use rayfish::…`). The
+split exists so benchmarks (`benches/`) and integration tests can reach the internal
+data path; `cargo install` builds the binary against the in-package library unchanged.
 
 ## Run
 
