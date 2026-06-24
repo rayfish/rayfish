@@ -20,9 +20,9 @@ Rayfish is built on [iroh](https://iroh.computer) and connects peers by *cryptog
 3. **Mesh** — each peer derives its own stable virtual IPv4 (`100.64.0.0/10`) and IPv6 (`200::/7`) directly from its cryptographic identity, so addresses need no central assignment. The membership list is shared with everyone. Every peer connects directly to every other.
 4. **Use it** — any app over TCP/UDP just works, and Magic DNS lets you reach peers by `name.network.ray` instead of memorizing IPs.
 
-Under the hood, each machine runs a daemon (similar to Tailscale's `tailscaled`) that creates a TUN device, captures IP packets, and tunnels them through iroh's QUIC-based P2P connections. Everything else — `create`, `join`, `status`, file sharing, ACLs — runs unprivileged and talks to the daemon over a local socket.
+Under the hood, each machine runs a daemon (similar to Tailscale's `tailscaled`) that creates a TUN device, captures IP packets, and tunnels them through iroh's QUIC-based P2P connections. Everything else — `create`, `join`, `status`, file sharing — runs unprivileged and talks to the daemon over a local socket.
 
-There's a lot more under the surface: distributed ACLs, a per-device firewall, multi-device identity via pairing, file sharing, mDNS local discovery, and optional Tor transport. See [docs/book.md](docs/book.md) for the full guide.
+There's a lot more under the surface: a per-device firewall, trusted networks with coordinator-suggested firewall rules, declarative provisioning (`ray apply`), multi-device identity via pairing, file sharing, mDNS local discovery, and optional Tor transport. Run `ray --help` and see the [Quick start](#quick-start) below to explore.
 
 ---
 
@@ -92,7 +92,7 @@ sudo ray set-operator bob # let user 'bob' run ray without sudo
 >
 > **Who can run `ray`?** Like Tailscale, the daemon authorizes each command by the caller's UID, not by file permissions: `status` and other read-only commands are open to any local user, while mutating commands need root or the **operator**. The user who installs the service (`sudo ray up` / `ray install`) is granted operator access automatically, so they keep working without sudo. To authorize someone else, run `sudo ray set-operator <user>`.
 
-That's the whole loop. Run `ray --help` to discover the rest (`invite`, `requests`/`accept`/`deny`, `acl`, `firewall`, `send`, `pair`, `mdns`, …).
+That's the whole loop. Run `ray --help` to discover the rest (`invite`, `requests`/`accept`/`deny`, `firewall`, `apply`, `send`, `pair`, `mdns`, …).
 
 ### Controlling who can join
 
@@ -120,6 +120,15 @@ The daemon writes rolling logs to `/var/log/rayfish/` (Linux) or `/Library/Logs/
 ```bash
 cargo build                  # debug build
 cargo build --features tor   # with optional Tor transport
+cargo build --features otel  # with OTLP span export
 ```
 
 Requires the Rust 2024 edition (Rust 1.85+).
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and [SECURITY.md](SECURITY.md) to report vulnerabilities.
+
+---
+
+## License
+
+Rayfish is licensed under the [Mozilla Public License 2.0](LICENSE) (MPL-2.0).

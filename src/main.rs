@@ -1,4 +1,5 @@
 mod apply;
+mod audit;
 mod config;
 mod control;
 mod daemon;

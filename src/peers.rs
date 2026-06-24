@@ -7,6 +7,8 @@ use iroh::EndpointId;
 use iroh::endpoint::Connection;
 use smol_str::SmolStr;
 
+use crate::audit::AuditLog;
+
 /// The data-plane routing table: virtual IP → peer, shared by every network.
 ///
 /// Maps each peer's stable virtual IP (one per identity, identical across all
@@ -31,6 +33,10 @@ pub struct PeerTable {
     /// IPv6 virtual address → peer (same peers as `v4`, keyed by their `200::/7`
     /// address so v6 packets resolve without a v4↔v6 translation step).
     v6: Arc<DashMap<Ipv6Addr, PeerEntry>>,
+    /// Optional append-only audit log. When present, registering a peer's first
+    /// connection in a network logs a `connect` event and dropping its last
+    /// connection in a network logs a `disconnect` event. `None` in tests.
+    audit: Option<Arc<AuditLog>>,
 }
 
 /// A single peer's identity and its per-network connections.
@@ -69,11 +75,23 @@ impl PeerEntry {
 }
 
 impl PeerTable {
-    /// Creates an empty table.
+    /// Creates an empty table with no audit logging (used in tests).
     pub fn new() -> Self {
         Self {
             v4: Arc::new(DashMap::new()),
             v6: Arc::new(DashMap::new()),
+            audit: None,
+        }
+    }
+
+    /// Creates an empty table that logs peer connect/disconnect events to the
+    /// given audit log. The daemon constructs the table this way and clones it
+    /// to every per-network task (clones share the same audit handle).
+    pub fn with_audit(audit: Arc<AuditLog>) -> Self {
+        Self {
+            v4: Arc::new(DashMap::new()),
+            v6: Arc::new(DashMap::new()),
+            audit: Some(audit),
         }
     }
 
@@ -88,13 +106,17 @@ impl PeerTable {
         network: &str,
     ) {
         let net = SmolStr::new(network);
+        // Whether this is the peer's *first* connection in `network` — a true
+        // connect rather than a refresh of an existing link (which happens on
+        // reconnect churn). Drives the audit `connect` event below.
+        let newly_connected;
         {
             let mut e = self.v4.entry(ip).or_insert_with(|| PeerEntry {
                 endpoint_id,
                 conns: HashMap::new(),
             });
             e.endpoint_id = endpoint_id;
-            e.conns.insert(net.clone(), conn.clone());
+            newly_connected = e.conns.insert(net.clone(), conn.clone()).is_none();
         }
         {
             let mut e = self.v6.entry(ipv6).or_insert_with(|| PeerEntry {
@@ -103,6 +125,9 @@ impl PeerTable {
             });
             e.endpoint_id = endpoint_id;
             e.conns.insert(net, conn);
+        }
+        if newly_connected && let Some(audit) = &self.audit {
+            audit.log_connect(ip, &endpoint_id.to_string());
         }
     }
 
@@ -120,22 +145,31 @@ impl PeerTable {
 
     /// Removes the peer entirely (all networks). Used for identity rotation.
     pub fn remove(&self, ip: &Ipv4Addr, ipv6: &Ipv6Addr) {
-        self.v4.remove(ip);
+        let removed = self.v4.remove(ip);
         self.v6.remove(ipv6);
+        if let (Some((_, entry)), Some(audit)) = (removed, &self.audit) {
+            audit.log_disconnect(*ip, &entry.endpoint_id.to_string());
+        }
     }
 
     /// Drops a peer's connection in a single `network`. The peer entry is removed
     /// only once it has no connections left in any network — so losing the `dev`
     /// link doesn't unroute a peer still reachable via `db`.
     pub fn remove_peer_from_network(&self, ip: &Ipv4Addr, ipv6: &Ipv6Addr, network: &str) {
+        let mut dropped = None;
         if let Some(mut e) = self.v4.get_mut(ip) {
-            e.conns.remove(network);
+            if e.conns.remove(network).is_some() {
+                dropped = Some(e.endpoint_id);
+            }
         }
         self.v4.remove_if(ip, |_, e| e.conns.is_empty());
         if let Some(mut e) = self.v6.get_mut(ipv6) {
             e.conns.remove(network);
         }
         self.v6.remove_if(ipv6, |_, e| e.conns.is_empty());
+        if let (Some(endpoint_id), Some(audit)) = (dropped, &self.audit) {
+            audit.log_disconnect(*ip, &endpoint_id.to_string());
+        }
     }
 
     /// One connection per peer (deterministic pick), for global broadcasts.

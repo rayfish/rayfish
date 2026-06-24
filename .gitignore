@@ -2,3 +2,15 @@
 /ray-proto/target
 /docs
 .superpowers
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Local secrets — never commit
+.env
+.env.local
+*.key
+secrets/

@@ -59,6 +59,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 use crate::control::{self, ControlMsg};
 use crate::dht;
+use crate::audit;
 use crate::dns;
 use crate::dns_config;
 use crate::firewall::{self, FirewallConfig, SharedFirewall};
@@ -4169,7 +4170,15 @@ async fn build_daemon(
     let (tun_reader, tun_writer, tun_name) = tun::create(my_ip, my_ipv6)
         .await
         .context("failed to create TUN device")?;
-    let peers = PeerTable::new();
+    // Append-only audit log of peer connect/disconnect events. If it can't be
+    // opened (e.g. unwritable config dir) the daemon still runs without auditing.
+    let peers = match audit::AuditLog::open() {
+        Ok(log) => PeerTable::with_audit(Arc::new(log)),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to open audit log; peer events will not be audited");
+            PeerTable::new()
+        }
+    };
     let fw_config = firewall::load_firewall().unwrap_or_else(|e| {
         tracing::warn!(error = %e, "failed to load firewall config, using defaults");
         firewall::FirewallConfig::default()
