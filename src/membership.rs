@@ -234,6 +234,13 @@ pub fn policy_for_mode(mode: GroupMode) -> Box<dyn MembershipPolicy> {
     }
 }
 
+/// Flag an existing member as a coordinator (idempotent; no-op if absent).
+pub fn mark_coordinator(members: &mut MemberList, identity: &EndpointId) {
+    if let Some(m) = members.get_mut(identity) {
+        m.is_coordinator = true;
+    }
+}
+
 /// Abstracts identity and IP derivation so the membership system doesn't
 /// depend directly on iroh types.
 pub trait IdentityProvider: Send + Sync {
@@ -1403,5 +1410,22 @@ mod tests {
         };
         let bytes = rmp_serde::to_vec_named(&blob).unwrap();
         assert!(decode_group_blob(&bytes).is_err());
+    }
+
+    #[test]
+    fn mark_coordinator_sets_flag_for_target() {
+        let id = test_id(7);
+        let mut list = MemberList::new();
+        list.add(Member {
+            identity: id,
+            ip: derive_ip(&id),
+            is_coordinator: false,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        })
+        .unwrap();
+        mark_coordinator(&mut list, &id);
+        assert!(list.get(&id).unwrap().is_coordinator);
     }
 }

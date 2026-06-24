@@ -3658,6 +3658,20 @@ impl DaemonState {
             }
         }
 
+        // Publish the grantee as a coordinator in the signed group blob so
+        // joiners can discover co-coordinators to dial.
+        {
+            let Some(handle) = self.networks.get(network) else {
+                return IpcMessage::Error {
+                    message: format!("network '{network}' not active"),
+                };
+            };
+            let mut s = handle.state.write().unwrap();
+            crate::membership::mark_coordinator(&mut s.members, &identity);
+            s.refresh_snapshot();
+        }
+        self.store_and_publish_group(network).await;
+
         // Record the grant locally (coordinator's record; not verifiable).
         if let Ok(mut cfg) = config::load()
             && let Some(net) = cfg.networks.iter_mut().find(|n| n.name == network)
