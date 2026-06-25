@@ -490,11 +490,9 @@ async fn try_networkmanager_dbus(tun_name: &str) -> Option<NetworkManagerDns> {
     // Extract the mode string. If we can't read it at all, conservatively
     // return None — safer to fall through to direct /etc/resolv.conf than
     // to claim NM supports split-DNS when we can't confirm it.
-    let mode_val = dns_reply
-        .body()
-        .deserialize::<zbus::zvariant::Value>()
-        .ok()?;
-    let mode = mode_val.downcast_ref::<String>().ok()?;
+    let body = dns_reply.body();
+    let mode_val = body.deserialize::<zbus::zvariant::Value>().ok()?;
+    let mode = mode_val.downcast_ref::<String>().ok()?.to_string();
 
     // If NM delegates to systemd-resolved, skip — the resolved D-Bus path handles it.
     // If NM DNS is "none", it's not managing DNS at all.
@@ -504,7 +502,7 @@ async fn try_networkmanager_dbus(tun_name: &str) -> Option<NetworkManagerDns> {
 
     // Only proceed if this mode supports per-domain split-DNS.
     // "default" and "unbound" modes do not, so fall through to direct mode.
-    if !nm_supports_split_dns(mode) {
+    if !nm_supports_split_dns(&mode) {
         return None;
     }
 
