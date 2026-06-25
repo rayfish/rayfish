@@ -2977,6 +2977,44 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// A GitHub token for authenticating REST API calls, which lifts the
+/// unauthenticated 60-request/hour-per-IP rate limit to 5000/hour. Prefers an
+/// explicit env var (the same `GH_TOKEN`/`GITHUB_TOKEN` precedence `gh` uses),
+/// then falls back to the `gh` CLI's stored credential when it is installed and
+/// logged in. Returns `None` if no token is available, leaving calls anonymous.
+fn github_token() -> Option<String> {
+    for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(v) = std::env::var(var) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    // `gh auth token` prints the active token to stdout (and exits non-zero if
+    // `gh` is unauthenticated). A missing `gh` makes `output()` error → `None`.
+    let out = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Attach `Authorization: Bearer <token>` to a GitHub REST request when a token
+/// is present; otherwise leave the request anonymous. Only used for the
+/// api.github.com calls — the release-asset downloads on github.com aren't
+/// subject to the API rate limit and are left unauthenticated.
+fn authed(req: reqwest::RequestBuilder, token: &Option<String>) -> reqwest::RequestBuilder {
+    match token {
+        Some(t) => req.bearer_auth(t),
+        None => req,
+    }
+}
+
 /// `ray update`: replace this binary with a GitHub release and, if the system
 /// service is installed, restart the daemon onto the new binary.
 ///
@@ -3010,14 +3048,17 @@ async fn cmd_update(
         .build()
         .context("failed to build HTTP client")?;
 
+    // Authenticate the api.github.com calls below when a token is available so
+    // repeated `ray update` runs don't trip the 60/hr-per-IP anonymous limit.
+    let token = github_token();
+
     // `--list`: enumerate published releases (newest first) and exit. No root,
     // no install.
     if list {
         let spinner = progress::spinner("fetching releases…");
         let api = format!("https://api.github.com/repos/{REPO_SLUG}/releases?per_page=30");
         let releases: Vec<GhRelease> = (async {
-            client
-                .get(&api)
+            authed(client.get(&api), &token)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3062,8 +3103,7 @@ async fn cmd_update(
         format!("https://api.github.com/repos/{REPO_SLUG}/releases/latest")
     };
     let release: GhRelease = (async {
-        client
-            .get(&api)
+        authed(client.get(&api), &token)
             .send()
             .await?
             .error_for_status()?
