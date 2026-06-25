@@ -13,11 +13,16 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use membership::GroupMode;
 
+/// Full version string: the crate version plus the git short SHA stamped in by
+/// `build.rs` (e.g. `0.1.0 (abc12345)`). The SHA distinguishes nightly builds
+/// that share a crate version, and is what a tester quotes in a `ray report`.
+const FULL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("RAY_GIT_SHA"), ")");
+
 #[derive(Parser)]
 #[command(
     name = "ray",
     about = "P2P mesh VPN powered by iroh",
-    version = env!("CARGO_PKG_VERSION")
+    version = FULL_VERSION
 )]
 struct Cli {
     /// Emit machine-readable JSON instead of styled text (disables color and
@@ -243,6 +248,16 @@ enum Command {
         /// Report the latest available version without installing
         #[arg(long)]
         check: bool,
+        /// Track the rolling `nightly` pre-release (built from every commit to
+        /// master) instead of the latest stable release
+        #[arg(long, conflicts_with_all = ["list", "version"])]
+        nightly: bool,
+        /// List the available releases (newest first) and exit
+        #[arg(long, conflicts_with_all = ["check", "force", "version"])]
+        list: bool,
+        /// Install a specific release version, e.g. 0.1.0 (downgrades allowed)
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
     },
 }
 
@@ -736,10 +751,16 @@ async fn main() -> Result<()> {
         Command::Files { action } => ipc_files(action).await,
         Command::Pair { action, ticket } => cmd_pair(action, ticket).await,
         Command::Version => {
-            println!("ray {}", env!("CARGO_PKG_VERSION"));
+            println!("ray {FULL_VERSION}");
             Ok(())
         }
-        Command::Update { force, check } => cmd_update(force, check).await,
+        Command::Update {
+            force,
+            check,
+            nightly,
+            list,
+            version,
+        } => cmd_update(force, check, nightly, list, version).await,
     }
 }
 
@@ -1098,6 +1119,7 @@ async fn ipc_status() -> Result<()> {
             mdns_enabled,
             active,
             contact_id,
+            daemon_version,
             networks,
             packets_rx,
             packets_tx,
@@ -1110,6 +1132,7 @@ async fn ipc_status() -> Result<()> {
                     "mdns": mdns_enabled,
                     "active": active,
                     "contact_id": contact_id,
+                    "daemon_version": daemon_version,
                     "networks": networks,
                     "traffic": {
                         "packets_rx": packets_rx, "packets_tx": packets_tx,
@@ -1258,6 +1281,25 @@ async fn ipc_status() -> Result<()> {
                         style::marker("inactive")
                     );
                 }
+            }
+
+            // Daemon/CLI version skew: after a self-update the CLI binary is new
+            // but the long-running daemon may still be the old one (e.g. its
+            // restart failed). Empty `daemon_version` means the daemon predates
+            // this field — say nothing rather than guess.
+            let cli_version = env!("CARGO_PKG_VERSION");
+            if !daemon_version.is_empty() && daemon_version != cli_version {
+                println!();
+                println!(
+                    "  {} daemon is v{} but CLI is v{}",
+                    style::red("!"),
+                    daemon_version,
+                    cli_version,
+                );
+                println!(
+                    "  {}",
+                    style::faint("run `sudo ray update` to restart the daemon onto the new binary"),
+                );
             }
             println!();
         }
@@ -2730,7 +2772,7 @@ async fn install_and_start_service(hostname: Option<String>) -> Result<()> {
 
     // Wait for the freshly started daemon to accept IPC, then activate the VPN.
     let spinner = progress::spinner("starting service…");
-    let daemon = wait_for_daemon(std::time::Duration::from_secs(8)).await;
+    let daemon = wait_for_daemon(DAEMON_REACHABLE_TIMEOUT).await;
     spinner.finish_and_clear();
     match daemon {
         Some(mut stream) => {
@@ -2827,7 +2869,7 @@ async fn restart_service_and_wait() -> Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     anyhow::bail!("system service not supported on this platform");
 
-    match wait_for_daemon(std::time::Duration::from_secs(8)).await {
+    match wait_for_daemon(DAEMON_REACHABLE_TIMEOUT).await {
         Some(_) => {
             println!("rayfish service restarted.");
             Ok(())
@@ -2915,14 +2957,44 @@ fn dir_writable(dir: &std::path::Path) -> bool {
 #[derive(serde::Deserialize)]
 struct GhRelease {
     tag_name: String,
+    /// The release's display name. For the rolling nightly this carries the
+    /// source commit (`nightly (abc12345)`), so we surface it instead of the
+    /// bare `nightly` tag.
+    #[serde(default)]
+    name: Option<String>,
+    /// Whether GitHub marks this a pre-release (nightlies and `-rc`/`-` tags),
+    /// used to annotate `ray update --list`.
+    #[serde(default)]
+    prerelease: bool,
 }
 
-/// `ray update`: replace this binary with the latest GitHub release and, if the
-/// system service is installed, restart the daemon onto the new binary.
+/// SHA-256 of a byte slice as lowercase hex — used both to verify a download
+/// and to fingerprint the running binary on the nightly channel.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+/// `ray update`: replace this binary with a GitHub release and, if the system
+/// service is installed, restart the daemon onto the new binary.
+///
+/// Stable (default) tracks the latest published release and gates on semver.
+/// `--nightly` tracks the rolling `nightly` pre-release (rebuilt on every commit
+/// to master); since nightlies share a crate version, the swap decision compares
+/// the published checksum against the *running* binary rather than the version.
 ///
 /// `--check` only reports current vs latest (no root, no install); `--force`
-/// reinstalls even when already current.
-async fn cmd_update(force: bool, check: bool) -> Result<()> {
+/// reinstalls even when already current. `--list` prints the available releases
+/// and exits; `--version X` pins a specific release (downgrades allowed).
+async fn cmd_update(
+    force: bool,
+    check: bool,
+    nightly: bool,
+    list: bool,
+    version: Option<String>,
+) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     // Fail fast on unsupported platforms before any network I/O.
     let asset = release_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
@@ -2938,9 +3010,57 @@ async fn cmd_update(force: bool, check: bool) -> Result<()> {
         .build()
         .context("failed to build HTTP client")?;
 
-    // Discover the latest release tag via the GitHub API.
+    // `--list`: enumerate published releases (newest first) and exit. No root,
+    // no install.
+    if list {
+        let spinner = progress::spinner("fetching releases…");
+        let api = format!("https://api.github.com/repos/{REPO_SLUG}/releases?per_page=30");
+        let releases: Vec<GhRelease> = (async {
+            client
+                .get(&api)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await
+        })
+        .await
+        .context("failed to list releases")?;
+        spinner.finish_and_clear();
+
+        if releases.is_empty() {
+            println!("no releases published yet");
+            return Ok(());
+        }
+        for r in &releases {
+            let installed = if normalize_version(&r.tag_name) == current {
+                "  (installed)"
+            } else {
+                ""
+            };
+            let kind = if r.prerelease { "  [pre-release]" } else { "" };
+            println!("{}{kind}{installed}", r.tag_name);
+        }
+        return Ok(());
+    }
+
+    // A pinned `--version` resolves to a `v`-prefixed tag (releases are tagged
+    // `vX.Y.Z`); accept the version with or without the leading `v`.
+    let pinned_tag = version.as_ref().map(|v| {
+        let v = v.strip_prefix('v').unwrap_or(v);
+        format!("v{v}")
+    });
+
+    // Resolve the release: pinned version → that tag; nightly → the rolling
+    // `nightly` pre-release; otherwise the latest published release.
     let spinner = progress::spinner("checking for updates…");
-    let api = format!("https://api.github.com/repos/{REPO_SLUG}/releases/latest");
+    let api = if let Some(tag) = &pinned_tag {
+        format!("https://api.github.com/repos/{REPO_SLUG}/releases/tags/{tag}")
+    } else if nightly {
+        format!("https://api.github.com/repos/{REPO_SLUG}/releases/tags/nightly")
+    } else {
+        format!("https://api.github.com/repos/{REPO_SLUG}/releases/latest")
+    };
     let release: GhRelease = (async {
         client
             .get(&api)
@@ -2951,24 +3071,100 @@ async fn cmd_update(force: bool, check: bool) -> Result<()> {
             .await
     })
     .await
-    .context("failed to query the GitHub releases API (is a release published yet?)")?;
+    .context(if let Some(tag) = &pinned_tag {
+        format!("failed to find release {tag} (see `ray update --list`)")
+    } else if nightly {
+        "failed to query the nightly pre-release (is one published yet?)".to_string()
+    } else {
+        "failed to query the GitHub releases API (is a release published yet?)".to_string()
+    })?;
     spinner.finish_and_clear();
 
-    let latest = normalize_version(&release.tag_name);
+    let tag = release.tag_name.clone();
+    let latest = normalize_version(&tag);
+    // Human label for messages: nightly carries its commit in the release name.
+    let remote_label = if nightly {
+        release.name.clone().unwrap_or_else(|| "nightly".to_string())
+    } else {
+        format!("v{latest}")
+    };
+
+    // Fetch the published checksum sidecar first (it is tiny) so the swap
+    // decision — especially the nightly checksum compare — can run before
+    // downloading the whole binary.
+    let base = format!("https://github.com/{REPO_SLUG}/releases/download/{tag}");
+    let bin_url = format!("{base}/{asset}");
+    let sha_url = format!("{bin_url}.sha256");
+    let spinner = progress::spinner("checking for updates…");
+    let sha_text = (async {
+        client
+            .get(&sha_url)
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("no checksum at {sha_url}"))?
+            .text()
+            .await
+            .map_err(anyhow::Error::from)
+    })
+    .await
+    .context("failed to fetch the published checksum")?;
+    spinner.finish_and_clear();
+
+    // The first whitespace field of the `.sha256` is the digest.
+    let expected = sha_text
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    if expected.is_empty() {
+        anyhow::bail!("no checksum published for {asset}; aborting for safety");
+    }
+
+    // "Up to date?" — a pinned version is "current" only if it equals what we
+    // run (so `--version` can downgrade); nightly compares the running binary's
+    // checksum to the published one (two nightlies share a crate version, so
+    // semver can't tell them apart); stable gates on semver. If we can't read
+    // our own executable on the nightly path, proceed rather than assume current.
+    let up_to_date = if pinned_tag.is_some() {
+        latest == current
+    } else if nightly {
+        match std::env::current_exe().and_then(std::fs::read) {
+            Ok(bytes) => sha256_hex(&bytes) == expected,
+            Err(_) => false,
+        }
+    } else {
+        !version_is_newer(latest, current)
+    };
 
     if check {
-        println!("current: {current}");
-        println!("latest:  {latest}");
-        if version_is_newer(latest, current) {
-            println!("run `sudo ray update` to upgrade");
-        } else {
+        println!("current: {FULL_VERSION}");
+        println!("latest:  {remote_label}");
+        // Best-effort: report the running daemon's version too. If it differs
+        // from this CLI binary the daemon is stale (e.g. a prior update never
+        // restarted it) — a restart, not a download, is what's needed.
+        if let Some(daemon_version) = daemon_version().await
+            && daemon_version != current
+        {
+            println!("daemon:  {daemon_version} (stale — run `sudo ray update` to restart it)");
+        }
+        if up_to_date {
             println!("rayfish is up to date");
+        } else {
+            let flag = if nightly {
+                " --nightly".to_string()
+            } else if let Some(v) = &version {
+                format!(" --version {v}")
+            } else {
+                String::new()
+            };
+            println!("run `sudo ray update{flag}` to upgrade");
         }
         return Ok(());
     }
 
-    if !version_is_newer(latest, current) && !force {
-        println!("rayfish is already up to date (v{current})");
+    if up_to_date && !force {
+        println!("rayfish is already up to date ({remote_label})");
         return Ok(());
     }
 
@@ -2983,53 +3179,26 @@ async fn cmd_update(force: bool, check: bool) -> Result<()> {
         require_root()?;
     }
 
-    // Download the binary and its checksum sidecar from the tagged release.
-    let base = format!(
-        "https://github.com/{REPO_SLUG}/releases/download/{}",
-        release.tag_name
-    );
-    let bin_url = format!("{base}/{asset}");
-    let sha_url = format!("{bin_url}.sha256");
-
-    let spinner = progress::spinner(format!("downloading {asset} (v{latest})…"));
-    let result: Result<(bytes::Bytes, String)> = async {
-        let bytes = client
+    // Download the binary from the same tagged release (the checksum was already
+    // fetched above to make the up-to-date decision).
+    let spinner = progress::spinner(format!("downloading {asset} ({remote_label})…"));
+    let bytes = (async {
+        client
             .get(&bin_url)
             .send()
             .await?
             .error_for_status()
             .with_context(|| format!("no release asset at {bin_url}"))?
             .bytes()
-            .await?;
-        let sha_text = client
-            .get(&sha_url)
-            .send()
-            .await?
-            .error_for_status()
-            .with_context(|| format!("no checksum at {sha_url}"))?
-            .text()
-            .await?;
-        Ok((bytes, sha_text))
-    }
+            .await
+            .map_err(anyhow::Error::from)
+    })
     .await;
     spinner.finish_and_clear();
-    let (bytes, sha_text) = result.context("download failed")?;
+    let bytes = bytes.context("download failed")?;
 
-    // Verify the SHA-256 against the published `.sha256` (first whitespace field).
-    let expected = sha_text
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
-    if expected.is_empty() {
-        anyhow::bail!("no checksum published for {asset}; aborting for safety");
-    }
-    let actual = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        hex::encode(hasher.finalize())
-    };
+    // Verify the download against the checksum we already fetched and validated.
+    let actual = sha256_hex(&bytes);
     if actual != expected {
         anyhow::bail!(
             "checksum mismatch for {asset}\n  expected: {expected}\n  got:      {actual}"
@@ -3050,18 +3219,45 @@ async fn cmd_update(force: bool, check: bool) -> Result<()> {
     self_replace::self_replace(&tmp).context("failed to replace the running binary")?;
     let _ = std::fs::remove_file(&tmp);
 
-    println!("updated rayfish {current} → {latest}");
+    println!("updated rayfish v{current} → {remote_label}");
 
-    // If the service is installed, the daemon is still the old binary — refresh
-    // the unit's exec path and restart it onto the new one.
+    // If the service is installed, the daemon is still running the old binary.
+    // Go through the full install path: rewrite the unit (its exec path may have
+    // changed when `ray update` runs from a different location than the
+    // installed binary) and fully reload it via unload+load (launchctl) /
+    // daemon-reload+restart (systemd) so the service manager honors the
+    // rewritten unit. A bare `kickstart`/in-place restart would relaunch the
+    // stale cached unit, leaving the daemon on the old binary. `wait_for_daemon`
+    // then confirms the new daemon actually comes up.
     if service_installed {
-        ensure_service_installed()?;
-        restart_service_and_wait().await
+        install_and_start_service(None).await
     } else {
         println!("run `sudo ray up` to start the service with the new binary");
         Ok(())
     }
 }
+
+/// Best-effort fetch of the running daemon's compiled version over IPC.
+/// Returns `None` if no daemon is reachable or it predates the version field
+/// (empty string). Used by `ray update --check` and never fails the caller.
+async fn daemon_version() -> Option<String> {
+    let mut stream = ipc::connect().await.ok()?;
+    ipc::send(&mut stream, ipc::IpcMessage::Status).await.ok()?;
+    match ipc::recv(&mut stream).await.ok()? {
+        ipc::IpcMessage::StatusResponse { daemon_version, .. } if !daemon_version.is_empty() => {
+            Some(daemon_version)
+        }
+        _ => None,
+    }
+}
+
+/// How long to wait for a freshly (re)started daemon to accept IPC before
+/// declaring it unreachable. Must comfortably exceed the service manager's
+/// stop-then-relaunch latency (SIGTERM → exit → respawn); the old 8s value was
+/// shorter than an ungraceful shutdown could take, so a healthy daemon was
+/// reported as "never became reachable" and a re-run would kill the one that
+/// had just come up.
+const DAEMON_REACHABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Poll the IPC socket until the daemon answers or the deadline passes.
 async fn wait_for_daemon(timeout: std::time::Duration) -> Option<ipc::IpcFramed> {

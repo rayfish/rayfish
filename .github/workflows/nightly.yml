@@ -1,0 +1,112 @@
+name: Nightly
+
+# Rolling pre-release built from every push to master. Moves the `nightly` tag
+# to the new commit, recreates the `nightly` pre-release, and overwrites its
+# Linux + macOS binaries. Consumed by `ray update --nightly`, which compares the
+# published checksum against the running binary (not the version) to decide
+# whether to swap — so a shared `0.x.y` across nightlies is fine.
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+# Avoid two master pushes racing to move the tag / clobber assets.
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  roll-tag:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Move the nightly tag to this commit
+        id: meta
+        run: |
+          SHA=$(git rev-parse --short=8 HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git tag -f nightly
+          git push -f origin nightly
+
+      - name: Create / refresh the nightly pre-release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: nightly
+          name: nightly (${{ steps.meta.outputs.sha }})
+          body: "Rolling nightly built from master @ ${{ steps.meta.outputs.sha }}. Install with `ray update --nightly`."
+          prerelease: true
+
+  build:
+    needs: roll-tag
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            name: ray-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            name: ray-linux-aarch64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            name: ray-macos-aarch64
+          - target: x86_64-apple-darwin
+            # Cross-compiled on Apple Silicon (universal SDK); macos-13 Intel
+            # runners are being retired and leave the job queued indefinitely.
+            runner: macos-latest
+            name: ray-macos-x86_64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release"
+          cache-on-failure: true
+
+      - name: Build binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package for release
+        run: |
+          BINARY=target/${{ matrix.target }}/release/ray
+          cp "$BINARY" ${{ matrix.name }}
+          if command -v sha256sum &>/dev/null; then
+            sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
+          else
+            shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
+          fi
+
+      - name: Upload nightly assets
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: nightly
+          files: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256

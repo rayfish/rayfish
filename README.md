@@ -58,12 +58,15 @@ The **first** `ray up` needs root — it installs the system service and starts 
 #### Updating
 
 ```bash
-ray --version            # show the installed version (also `ray version`)
+ray --version            # show the installed version + git sha (also `ray version`)
 ray update --check       # report current vs the latest GitHub release
-sudo ray update          # download + verify the latest release, swap the binary, restart the daemon
+ray update --list        # list available releases (newest first)
+sudo ray update          # download + verify the latest stable release, swap the binary, restart the daemon
+sudo ray update --nightly        # track the rolling nightly (rebuilt on every commit to master)
+sudo ray update --version 0.1.0  # install a specific release (downgrades allowed)
 ```
 
-`ray update` fetches the latest release from GitHub, verifies its SHA-256, atomically replaces the running `ray` binary, and — if the system service is installed — restarts the daemon onto the new version. It needs root when the installed binary lives in a system path (so do `sudo ray update`); `ray --version` and `ray update --check` do not.
+`ray update` fetches a release from GitHub, verifies its SHA-256, atomically replaces the running `ray` binary, and — if the system service is installed — restarts the daemon onto the new version. By default it tracks the latest **stable** release; `--nightly` follows the rolling pre-release built from every commit, and `--version X` pins a specific release. There is no persisted channel — each run picks its target from the flag. It needs root when the installed binary lives in a system path (so do `sudo ray update`); `ray --version`, `ray update --check`, and `ray update --list` do not.
 
 ### 2. Create a network
 

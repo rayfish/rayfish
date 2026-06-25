@@ -235,6 +235,12 @@ pub enum IpcMessage {
         /// `None` if the daemon has not generated one yet.
         #[serde(default)]
         contact_id: Option<String>,
+        /// The running daemon's compiled version (`CARGO_PKG_VERSION`). The CLI
+        /// compares it to its own version and hints `ray update` on a mismatch
+        /// — e.g. after a self-update where the daemon never restarted onto the
+        /// new binary. Empty when talking to a daemon predating this field.
+        #[serde(default)]
+        daemon_version: String,
         networks: Vec<NetworkStatus>,
         packets_rx: u64,
         packets_tx: u64,
@@ -757,6 +763,7 @@ mod tests {
             mdns_enabled: true,
             active: true,
             contact_id: Some("contact123".to_string()),
+            daemon_version: "0.1.0".to_string(),
             networks: vec![NetworkStatus {
                 name: "gaming".to_string(),
                 role: NetworkRole::Coordinator,

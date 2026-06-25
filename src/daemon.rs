@@ -3353,6 +3353,7 @@ impl DaemonState {
             mdns_enabled: self.mdns_enabled,
             active: self.active.load(Ordering::SeqCst),
             contact_id: Some(self.contact_public.to_string()),
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             networks: statuses,
             packets_rx: self.stats.packets_rx.get(),
             packets_tx: self.stats.packets_tx.get(),
@@ -5267,7 +5268,18 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // `ray down` toggle this at runtime without restarting the process.
     daemon.activate(None).await;
 
-    serve_ipc(&daemon, promote_rx, token).await
+    let result = serve_ipc(&daemon, promote_rx, token).await;
+
+    // Close the iroh endpoint before returning. Dropping it on return logs
+    // "Endpoint dropped without calling `Endpoint::close`. Aborting
+    // ungracefully." and can leave the process lingering until the service
+    // manager escalates to SIGKILL — which delays the relaunch on
+    // `ray restart`/`ray update` past the client's reachability probe. Closing
+    // it here lets QUIC connections terminate cleanly and the process exit
+    // promptly so the new daemon comes up fast.
+    daemon.endpoint.close().await;
+
+    result
 }
 
 /// Construct all always-on daemon infrastructure: identity, iroh endpoint, blob
