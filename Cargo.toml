@@ -47,7 +47,7 @@ ratelimit = "0.10"
 dashmap = "6"
 dirs = "6.0.0"
 futures = "0.3"
-iroh = { version = "1", features = ["metrics", "unstable-custom-transports"] }
+iroh = { version = "1", features = ["metrics", "unstable-custom-transports", "unstable-net-report"] }
 iroh-tor-transport = { version = "0.1", optional = true }
 iroh-metrics = { version = "1", features = ["service", "metrics"] }
 iroh-dns = "1"

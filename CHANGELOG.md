@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ray ping <peer>`** — active mesh diagnostics: sends live echo probes to a
+  peer (by hostname, mesh IP, or short id) and reports per-probe round-trip
+  latency, packet loss, and whether the path is direct or relayed. `-c/--count`
+  and `-i/--interval` tune the probe run; `--json` emits the per-probe array.
+  Unlike `ray status` (a passive snapshot), this verifies the round-trip works
+  end to end.
+- **`ray netcheck`** — local network diagnostics: bound UDP port (and whether
+  it is the fixed forwardable port or an ephemeral fallback), home relay and its
+  latency, public IPv4/IPv6 addresses, and whether UDP is working. `--json`
+  supported.
 - **Release notes on `ray update`** — before swapping the binary (and in
   `ray update --check` when behind), print what the update brings: the stable
   channel walks every release in `(current, latest]` newest-first, while

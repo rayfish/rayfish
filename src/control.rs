@@ -159,6 +159,17 @@ pub enum ControlMsg {
     InviteUsed {
         secret_hash: Vec<u8>,
     },
+    /// Active liveness probe for `ray ping`. The receiver echoes back a `Pong`
+    /// carrying the same nonce over a fresh stream (the control readers drop the
+    /// stream's send half, so the reply cannot ride the request stream). The
+    /// pinging side correlates by nonce to measure round-trip time.
+    Ping {
+        nonce: u64,
+    },
+    /// Echo reply to a `Ping`, carrying the originating nonce.
+    Pong {
+        nonce: u64,
+    },
 }
 
 pub fn encode_msg(msg: &ControlMsg) -> Vec<u8> {
@@ -481,6 +492,22 @@ mod tests {
             },
             ControlMsg::InviteUsed {
                 secret_hash: vec![4, 5, 6],
+            },
+        ] {
+            let bytes = encode_msg(&msg);
+            assert_eq!(decode_msg(&bytes).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_ping_pong() {
+        for msg in [
+            ControlMsg::Ping { nonce: 0 },
+            ControlMsg::Ping {
+                nonce: u64::MAX,
+            },
+            ControlMsg::Pong {
+                nonce: 0x0123_4567_89ab_cdef,
             },
         ] {
             let bytes = encode_msg(&msg);

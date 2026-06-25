@@ -174,6 +174,22 @@ enum Command {
         #[command(subcommand)]
         action: Option<ContactAction>,
     },
+    /// Probe a peer over the mesh: report round-trip latency, packet loss, and
+    /// whether the path is direct or relayed. Unlike `status`, this sends live
+    /// echo probes that verify the round-trip end to end.
+    Ping {
+        /// Peer to probe: hostname, mesh IP, or short id.
+        peer: String,
+        /// Number of probes to send.
+        #[arg(short, long, default_value_t = 3)]
+        count: u32,
+        /// Delay between probes, in milliseconds.
+        #[arg(short, long, default_value_t = 1000)]
+        interval: u64,
+    },
+    /// Report this node's network conditions: bound UDP port, home relay and its
+    /// latency, public addresses, and IPv4/IPv6/UDP reachability.
+    Netcheck,
     /// Grant the network key to a member (coordinator only). The grantee becomes
     /// a co-coordinator: it can publish the signed blob and suggest firewall
     /// rules. Trusted-network multi-admin.
@@ -827,6 +843,12 @@ async fn main() -> Result<()> {
         } => ipc_connect(&contact_id, hostname).await,
         Command::Connections { action } => ipc_connections(action).await,
         Command::Contact { action } => ipc_contact(action).await,
+        Command::Ping {
+            peer,
+            count,
+            interval,
+        } => ipc_ping(&peer, count, interval).await,
+        Command::Netcheck => ipc_netcheck().await,
         Command::Admin { network, action } => ipc_admin(&network, action).await,
         Command::Firewall { action } => ipc_firewall(action).await,
         Command::Apply {
@@ -1956,6 +1978,172 @@ async fn ipc_contact(action: Option<ContactAction>) -> Result<()> {
                     style::faint("share this so others can: ray connect <contact-id>")
                 );
             }
+        }
+        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+async fn ipc_ping(peer: &str, count: u32, interval: u64) -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::Ping {
+            peer: peer.to_string(),
+            count,
+            interval_ms: interval,
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::PingResponse {
+            peer_name,
+            conn_type,
+            remote_addr,
+            network,
+            probes,
+        } => {
+            let conn_str = match conn_type {
+                ipc::ConnType::Direct => "direct",
+                ipc::ConnType::Relay => "relay",
+                ipc::ConnType::Tor => "tor",
+                ipc::ConnType::Unknown => "?",
+            };
+            let sent = probes.len();
+            let rtts: Vec<f64> = probes.iter().filter_map(|p| *p).collect();
+            let received = rtts.len();
+
+            if json_enabled() {
+                print_json(&serde_json::json!({
+                    "peer": peer_name,
+                    "network": network,
+                    "conn_type": conn_str,
+                    "remote_addr": remote_addr,
+                    "sent": sent,
+                    "received": received,
+                    "rtts_ms": probes,
+                }));
+                return Ok(());
+            }
+
+            let addr = remote_addr.unwrap_or_else(|| "?".to_string());
+            for (seq, probe) in probes.iter().enumerate() {
+                match probe {
+                    Some(ms) => println!(
+                        "  {} pong from {} via {} {}  seq={seq} rtt={}",
+                        style::green("✓"),
+                        style::value(&peer_name),
+                        conn_str,
+                        style::faint(&addr),
+                        style::latency(*ms),
+                    ),
+                    None => println!(
+                        "  {} no reply from {}  seq={seq} {}",
+                        style::red("✗"),
+                        style::value(&peer_name),
+                        style::faint("(timeout)"),
+                    ),
+                }
+            }
+
+            let loss = if sent > 0 {
+                (sent - received) as f64 * 100.0 / sent as f64
+            } else {
+                0.0
+            };
+            println!();
+            println!("  --- {peer_name} ping statistics ---");
+            if rtts.is_empty() {
+                println!("  {sent} sent, {received} received, {loss:.0}% loss");
+                println!(
+                    "  {}",
+                    style::faint(
+                        "no replies — the peer may be offline, firewalled, or on an \
+                         incompatible version (run ray update)"
+                    )
+                );
+            } else {
+                let min = rtts.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max = rtts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let avg = rtts.iter().sum::<f64>() / received as f64;
+                println!(
+                    "  {sent} sent, {received} received, {loss:.0}% loss, \
+                     rtt min/avg/max {min:.0}/{avg:.0}/{max:.0} ms"
+                );
+            }
+        }
+        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+async fn ipc_netcheck() -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(&mut stream, ipc::IpcMessage::Netcheck).await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::NetcheckResponse {
+            bound_port,
+            port_is_fixed,
+            home_relay,
+            relay_latency_ms,
+            public_ipv4,
+            public_ipv6,
+            udp,
+        } => {
+            if json_enabled() {
+                print_json(&serde_json::json!({
+                    "bound_port": bound_port,
+                    "port_is_fixed": port_is_fixed,
+                    "home_relay": home_relay,
+                    "relay_latency_ms": relay_latency_ms,
+                    "public_ipv4": public_ipv4,
+                    "public_ipv6": public_ipv6,
+                    "udp": udp,
+                }));
+                return Ok(());
+            }
+            let na = || style::faint("—").to_string();
+            let port_note = if port_is_fixed {
+                style::faint("  (fixed, forwardable)")
+            } else {
+                style::faint("  (ephemeral fallback)")
+            };
+            println!(
+                "  {:<15}{}{port_note}",
+                "UDP port",
+                style::value(&bound_port.to_string())
+            );
+            println!(
+                "  {:<15}{}",
+                "UDP working",
+                if udp {
+                    style::green("yes")
+                } else {
+                    style::red("no")
+                }
+            );
+            println!(
+                "  {:<15}{}",
+                "Home relay",
+                home_relay.map(|s| style::value(&s)).unwrap_or_else(na)
+            );
+            println!(
+                "  {:<15}{}",
+                "Relay latency",
+                relay_latency_ms.map(style::latency).unwrap_or_else(na)
+            );
+            println!(
+                "  {:<15}{}",
+                "Public IPv4",
+                public_ipv4.map(|s| style::value(&s)).unwrap_or_else(na)
+            );
+            println!(
+                "  {:<15}{}",
+                "Public IPv6",
+                public_ipv6.map(|s| style::value(&s)).unwrap_or_else(na)
+            );
         }
         ipc::IpcMessage::Error { message } => print_error("error", &message, None),
         other => eprintln!("Unexpected response: {:?}", other),

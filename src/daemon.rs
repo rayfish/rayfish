@@ -103,6 +103,8 @@ struct CoordinatorAcceptState {
     device_user_map: peers::DeviceUserMap,
     /// Shared with this network's [`NetworkHandle`]; see its `invite_lock`.
     invite_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Shared with the router; lets the control reader resolve `ray ping` Pongs.
+    pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl CoordinatorAcceptState {
@@ -144,6 +146,7 @@ impl CoordinatorAcceptState {
             let token_ctrl = token.clone();
             let network_ctrl = network.clone();
             let invite_lock_ctrl = self.invite_lock.clone();
+            let pending_pongs_ctrl = self.pending_pongs.clone();
             tokio::spawn(async move {
                 send_member_sync(&conn).await;
                 spawn_coordinator_control_reader(
@@ -160,6 +163,7 @@ impl CoordinatorAcceptState {
                     dht_notify_ctrl,
                     token_ctrl,
                     invite_lock_ctrl,
+                    pending_pongs_ctrl,
                 );
                 forward::spawn_peer_reader(
                     conn,
@@ -568,6 +572,7 @@ impl CoordinatorAcceptState {
             self.dht_notify.clone(),
             self.token.clone(),
             self.invite_lock.clone(),
+            self.pending_pongs.clone(),
         );
         forward::spawn_peer_reader(
             conn,
@@ -843,6 +848,10 @@ struct ProtocolRouter {
     /// the concurrency tie-break: if both peers requested *and* approved each
     /// other, only the higher endpoint id mints, avoiding a duplicate network.
     outgoing_connects: Arc<DashSet<EndpointId>>,
+    /// In-flight `ray ping` probes, keyed by nonce. The control reader fires the
+    /// oneshot when the matching `Pong` arrives so the ping handler can measure
+    /// round-trip time. Cloned into both control readers.
+    pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl ProtocolRouter {
@@ -861,6 +870,7 @@ impl ProtocolRouter {
             pending_connects: Arc::new(DashMap::new()),
             approved_connects: Arc::new(DashMap::new()),
             outgoing_connects: Arc::new(DashSet::new()),
+            pending_pongs: Arc::new(DashMap::new()),
         }
     }
 
@@ -1310,6 +1320,7 @@ impl DaemonState {
                 reverse_table: self.reverse_table.clone(),
                 device_user_map: self.device_user_map.clone(),
                 invite_lock,
+                pending_pongs: self.protocol_router.pending_pongs.clone(),
             })),
         );
         // Flip the stored role so `ray status` reports Coordinator immediately.
@@ -1371,6 +1382,8 @@ impl DaemonState {
                 | IpcMessage::ListFiles
                 | IpcMessage::Connections
                 | IpcMessage::ContactId
+                | IpcMessage::Ping { .. }
+                | IpcMessage::Netcheck
         ) {
             return None;
         }
@@ -1545,6 +1558,12 @@ impl DaemonState {
                 contact_id: self.contact_public.to_string(),
             },
             IpcMessage::RotateContact => self.rotate_contact().await,
+            IpcMessage::Ping {
+                peer,
+                count,
+                interval_ms,
+            } => self.ping(&peer, count, interval_ms).await,
+            IpcMessage::Netcheck => self.netcheck().await,
             other => IpcMessage::Error {
                 message: format!("unexpected message: {:?}", other),
             },
@@ -2085,6 +2104,7 @@ impl DaemonState {
                     true,
                     self.promote_tx.clone(),
                     invite_lock.clone(),
+                    self.protocol_router.pending_pongs.clone(),
                 )
                 .await
                 {
@@ -2184,6 +2204,7 @@ impl DaemonState {
                 false,
                 self.promote_tx.clone(),
                 invite_lock.clone(),
+                self.protocol_router.pending_pongs.clone(),
             )
             .await?
             {
@@ -3577,6 +3598,154 @@ impl DaemonState {
             datagrams_tx: stats.udp_tx.datagrams,
             datagrams_rx: stats.udp_rx.datagrams,
             lost_packets: stats.lost_packets,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Diagnostics (ray ping / ray netcheck)
+    // -----------------------------------------------------------------------
+
+    /// Resolve a `ray ping` peer argument (hostname / IPv4 / short id / `self`)
+    /// to its virtual IPv4 plus a display name. Mirrors `resolve_peer_name` but
+    /// returns the address (so `lookup_v4` can yield a live connection).
+    async fn resolve_peer_ip(&self, name: &str) -> Option<(Ipv4Addr, String)> {
+        let id = self.resolve_peer_name(name).await?;
+        for entry in self.networks.iter() {
+            let state = entry.value().state.read().unwrap();
+            if let Some(m) = state.members.all().iter().find(|m| m.identity == id) {
+                let display = m
+                    .hostname
+                    .clone()
+                    .unwrap_or_else(|| id.fmt_short().to_string());
+                return Some((m.ip, display));
+            }
+        }
+        None
+    }
+
+    /// Active liveness probe: send `count` `Ping` control messages over the
+    /// peer's live mesh connection and time each `Pong` reply.
+    async fn ping(&self, peer: &str, count: u32, interval_ms: u64) -> IpcMessage {
+        let (ip, display) = match self.resolve_peer_ip(peer).await {
+            Some(x) => x,
+            None => {
+                return IpcMessage::Error {
+                    message: format!("unknown peer '{peer}'"),
+                };
+            }
+        };
+        let route = match self.peers.lookup_v4(&ip) {
+            Some(r) => r,
+            None => {
+                return IpcMessage::Error {
+                    message: format!(
+                        "{display} is not connected (no live mesh link to {ip})"
+                    ),
+                };
+            }
+        };
+        let conn = route.conn;
+        let network = route.network.to_string();
+        let count = count.clamp(1, 100);
+        let mut probes: Vec<Option<f64>> = Vec::with_capacity(count as usize);
+
+        for seq in 0..count {
+            if seq > 0 {
+                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            }
+            let nonce: u64 = rand::random();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.protocol_router.pending_pongs.insert(nonce, tx);
+            let sent = Instant::now();
+            let sent_ok = match conn.open_bi().await {
+                Ok((mut send, _)) => {
+                    control::send_msg(&mut send, &control::ControlMsg::Ping { nonce })
+                        .await
+                        .is_ok()
+                }
+                Err(_) => false,
+            };
+            let rtt = if sent_ok {
+                match tokio::time::timeout(Duration::from_secs(1), rx).await {
+                    Ok(Ok(())) => Some(sent.elapsed().as_secs_f64() * 1000.0),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            // Drop the slot whether or not the Pong arrived (timeout / send error).
+            self.protocol_router.pending_pongs.remove(&nonce);
+            probes.push(rtt);
+        }
+
+        let info = Self::gather_conn_info(&conn);
+        IpcMessage::PingResponse {
+            peer_name: display,
+            conn_type: info.conn_type,
+            remote_addr: info.remote_addr,
+            network,
+            probes,
+        }
+    }
+
+    /// Local endpoint diagnostics: bound port, home relay, reachability.
+    async fn netcheck(&self) -> IpcMessage {
+        use iroh::Watcher as _;
+
+        let bound = self.endpoint.bound_sockets();
+        let bound_port = bound.first().map(|a| a.port()).unwrap_or(0);
+        let port_is_fixed = bound_port == transport::RAYFISH_LISTEN_PORT;
+
+        // The endpoint runs net reports continuously; the first may still be in
+        // flight, so wait briefly for an initialized report, then fall back to
+        // whatever the watcher currently holds.
+        let report = {
+            let mut w = self.endpoint.net_report();
+            match tokio::time::timeout(Duration::from_secs(3), w.initialized()).await {
+                Ok(r) => Some(r),
+                Err(_) => w.get(),
+            }
+        };
+
+        let mut home_relay = None;
+        let mut relay_latency_ms = None;
+        let mut public_ipv4 = None;
+        let mut public_ipv6 = None;
+        let mut udp = false;
+
+        if let Some(r) = report {
+            udp = r.has_udp();
+            public_ipv4 = r.global_v4.map(|a| a.to_string());
+            public_ipv6 = r.global_v6.map(|a| a.to_string());
+            if let Some(pref) = r.preferred_relay.clone() {
+                home_relay = Some(pref.to_string());
+                // Lowest measured latency to the preferred relay across probes.
+                relay_latency_ms = r
+                    .relay_latency
+                    .iter()
+                    .filter(|(_, url, _)| **url == pref)
+                    .map(|(_, _, d)| d.as_secs_f64() * 1000.0)
+                    .fold(None, |acc: Option<f64>, v| {
+                        Some(acc.map_or(v, |a| a.min(v)))
+                    });
+            }
+        }
+
+        // Fall back to the connection-status watcher for the relay URL if the net
+        // report has not surfaced a preferred relay yet.
+        if home_relay.is_none() {
+            let status = self.endpoint.home_relay_status().get();
+            home_relay = status.first().map(|s| s.url().to_string());
+        }
+
+        IpcMessage::NetcheckResponse {
+            bound_port,
+            port_is_fixed,
+            home_relay,
+            relay_latency_ms,
+            public_ipv4,
+            public_ipv6,
+            udp,
         }
     }
 
@@ -6433,6 +6602,8 @@ fn spawn_coordinator_control_reader(
     token: CancellationToken,
     // Serializes single-use invite ledger access for the invite-gossip arms.
     invite_lock: Arc<tokio::sync::Mutex<()>>,
+    // Fires the waiting `ray ping` handler when a matching `Pong` arrives.
+    pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
 ) {
     tokio::spawn(async move {
         let mut gate = crate::ratelimit::ControlGate::new();
@@ -6495,6 +6666,16 @@ fn spawn_coordinator_control_reader(
                     let _guard = invite_lock.lock().await;
                     if let Ok(mut store) = crate::invite::InviteStore::load(&network_name) {
                         let _ = store.burn_by_hash(&hash);
+                    }
+                    continue;
+                }
+                ControlMsg::Ping { nonce } => {
+                    respond_pong(&conn, nonce).await;
+                    continue;
+                }
+                ControlMsg::Pong { nonce } => {
+                    if let Some((_, tx)) = pending_pongs.remove(&nonce) {
+                        let _ = tx.send(());
                     }
                     continue;
                 }
@@ -6883,6 +7064,9 @@ async fn join_mesh_shared(
     // control listener's `InviteShare`/`InviteUsed` handling (a co-coordinator
     // learning of invites it didn't mint) is serialized with mint/redeem.
     invite_lock: Arc<tokio::sync::Mutex<()>>,
+    // Shared with the router; lets the member control reader resolve `ray ping`
+    // Pongs back to the waiting handler.
+    pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
 ) -> Result<JoinResult> {
     let my_identity = identity.local_identity();
     let my_ip = identity.local_ip();
@@ -7225,6 +7409,7 @@ async fn join_mesh_shared(
         let promote_tx = promote_tx.clone();
         let invite_lock = invite_lock.clone();
         let reconverge_notify = reconverge_notify.clone();
+        let pending_pongs = pending_pongs.clone();
         async move {
             let mut gate = crate::ratelimit::ControlGate::new();
             loop {
@@ -7368,6 +7553,14 @@ async fn join_mesh_shared(
                                         let _guard = invite_lock.lock().await;
                                         if let Ok(mut store) = crate::invite::InviteStore::load(&network_name) {
                                             let _ = store.burn_by_hash(&hash);
+                                        }
+                                    }
+                                    ControlMsg::Ping { nonce } => {
+                                        respond_pong(&initial_conn, nonce).await;
+                                    }
+                                    ControlMsg::Pong { nonce } => {
+                                        if let Some((_, tx)) = pending_pongs.remove(&nonce) {
+                                            let _ = tx.send(());
                                         }
                                     }
                                     _ => {}
@@ -7519,6 +7712,15 @@ async fn send_member_sync(conn: &Connection) {
     }
 }
 
+/// Reply to a `ray ping` probe by echoing `Pong{nonce}` over a fresh stream.
+/// The control readers drop the request stream's send half, so the reply cannot
+/// ride it back; a new `open_bi` carries the echo as its own control message.
+async fn respond_pong(conn: &Connection, nonce: u64) {
+    if let Ok((mut send, _)) = conn.open_bi().await {
+        let _ = control::send_msg(&mut send, &ControlMsg::Pong { nonce }).await;
+    }
+}
+
 async fn broadcast_member_sync(peers: &PeerTable, exclude_ip: Option<Ipv4Addr>) {
     let msg = ControlMsg::MemberSync;
     for (ip, conn) in peers.all_connections() {
@@ -7628,6 +7830,7 @@ mod accept_handler_tests {
             reverse_table: dns::new_reverse_table(),
             device_user_map: peers::DeviceUserMap::new(),
             invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pending_pongs: Arc::new(DashMap::new()),
         }))
     }
 

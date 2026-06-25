@@ -104,7 +104,16 @@ ray status               # networks, peers, and traffic
 ping alice.gaming.ray    # by name
 ping bob.ray             # flat lookup
 ping 100.64.23.142       # or just the IP
+ray ping alice           # mesh probe: RTT, loss, and direct-vs-relay path
+ray netcheck             # your own bound port, relay, and reachability
 ```
+
+`ray ping` is a mesh-aware probe: it sends live echo probes over the encrypted
+connection and reports per-probe latency, packet loss, and whether traffic is
+flowing **direct** (hole-punched) or via a **relay**, so you can tell at a glance
+why a link is slow. `ray netcheck` reports your own node's conditions: the bound
+UDP port (and whether it is the fixed, forwardable port), your home relay and its
+latency, your public addresses, and whether UDP is getting through.
 
 ### 6. Leave or pause
 
