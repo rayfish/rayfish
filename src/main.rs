@@ -409,13 +409,16 @@ enum FirewallAction {
         /// node on the network (e.g. "everyone opens this port").
         #[arg(long)]
         subject: String,
-        /// Allow a peer, e.g. `--allow earn01:tcp:9000,tcp:8123` or `--allow earn01:icmp`
-        /// (repeatable). Token grammar: `proto:ports` or bare proto (`icmp`, `any`, `tcp`).
-        #[arg(long, value_name = "PEER:SPEC")]
+        /// Allow inbound traffic, e.g. `--allow tcp:22` (any peer) or
+        /// `--allow earn01:tcp:9000,tcp:8123` (repeatable). The `PEER:` prefix is
+        /// optional — omit it (start with a protocol) to mean "any peer".
+        /// Spec grammar: `proto:ports` or bare proto (`icmp`, `any`, `tcp`).
+        #[arg(long, value_name = "[PEER:]SPEC")]
         allow: Vec<String>,
-        /// Deny a peer, e.g. `--deny earn01:tcp:443` or `--deny earn01:icmp` (repeatable).
-        /// Same token grammar as `--allow`.
-        #[arg(long, value_name = "PEER:SPEC")]
+        /// Deny inbound traffic, e.g. `--deny udp:53` (any peer) or
+        /// `--deny earn01:tcp:443` (repeatable). Same grammar as `--allow`; the
+        /// `PEER:` prefix is optional.
+        #[arg(long, value_name = "[PEER:]SPEC")]
         deny: Vec<String>,
     },
     /// Show suggested rules queued for manual review on a network
@@ -2031,6 +2034,36 @@ async fn ipc_firewall_pending(network: &str) -> Result<()> {
     Ok(())
 }
 
+/// Parse a `--allow`/`--deny` value into `(peer, proto:ports-list)`.
+///
+/// The grammar is `PEER:proto:ports`, but the leading `PEER:` is optional: when
+/// the value begins with a protocol keyword (`tcp`/`udp`/`icmp`/`any`) the peer
+/// defaults to `*` (any peer). So `tcp:22` is read as "tcp/22 from any peer" —
+/// the intuitive form — instead of "any port from a peer named `tcp`", which
+/// would silently drop on the joiner (unresolvable hostname) and leave only the
+/// whitelist catch-all deny, inverting the intent into a lockdown.
+fn parse_suggest_token(spec: &str, flag: &str) -> Result<(String, String)> {
+    let spec = spec.trim();
+    anyhow::ensure!(
+        !spec.is_empty(),
+        "{flag} expects PEER:proto:ports (e.g. '*:tcp:22'), got an empty value"
+    );
+    // A leading protocol keyword means the peer was omitted: treat the whole
+    // value as the proto:ports list against any peer.
+    let first = spec.split(':').next().unwrap_or("");
+    if first.parse::<firewall::Protocol>().is_ok() {
+        return Ok(("*".to_string(), spec.to_string()));
+    }
+    let (peer, ports) = spec
+        .split_once(':')
+        .with_context(|| format!("{flag} expects PEER:proto:ports, got '{spec}'"))?;
+    anyhow::ensure!(
+        !peer.is_empty() && !ports.is_empty(),
+        "{flag} expects PEER:proto:ports, got '{spec}'"
+    );
+    Ok((peer.to_string(), ports.to_string()))
+}
+
 /// `ray firewall suggest`: read the network's current suggestions, merge the
 /// requested subject edits, and publish the updated set (coordinator-only).
 async fn ipc_firewall_suggest(
@@ -2061,24 +2094,13 @@ async fn ipc_firewall_suggest(
         }
     };
 
-    let parse = |spec: &str, flag: &str| -> Result<(String, String)> {
-        let (peer, ports) = spec
-            .split_once(':')
-            .with_context(|| format!("{flag} expects PEER:SPEC, got '{spec}'"))?;
-        anyhow::ensure!(
-            !peer.is_empty() && !ports.is_empty(),
-            "{flag} expects PEER:SPEC, got '{spec}'"
-        );
-        Ok((peer.to_string(), ports.to_string()))
-    };
-
     let entry = suggestions.entry(subject.to_string()).or_default();
     for a in &allow {
-        let (peer, ports) = parse(a, "--allow")?;
+        let (peer, ports) = parse_suggest_token(a, "--allow")?;
         entry.allows.insert(peer, ports);
     }
     for d in &deny {
-        let (peer, ports) = parse(d, "--deny")?;
+        let (peer, ports) = parse_suggest_token(d, "--deny")?;
         entry.denies.insert(peer, ports);
     }
     // Drop a now-empty subject so removing all of a host's rules clears it.
@@ -3398,6 +3420,53 @@ fn cmd_uninstall_service() -> Result<()> {
 mod tests {
     use super::*;
     use ipc::FirewallRuleView;
+
+    #[test]
+    fn parse_suggest_token_defaults_peer_to_any_for_bare_proto() {
+        // A leading protocol keyword ⇒ peer defaults to `*` (any).
+        assert_eq!(
+            parse_suggest_token("tcp:22", "--allow").unwrap(),
+            ("*".to_string(), "tcp:22".to_string())
+        );
+        assert_eq!(
+            parse_suggest_token("udp:53", "--allow").unwrap(),
+            ("*".to_string(), "udp:53".to_string())
+        );
+        // Bare port-less protocols too.
+        assert_eq!(
+            parse_suggest_token("icmp", "--allow").unwrap(),
+            ("*".to_string(), "icmp".to_string())
+        );
+        assert_eq!(
+            parse_suggest_token("any:*", "--allow").unwrap(),
+            ("*".to_string(), "any:*".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_suggest_token_keeps_explicit_peer() {
+        // A non-protocol first segment is a peer hostname.
+        assert_eq!(
+            parse_suggest_token("earn01:tcp:9000,tcp:8123", "--allow").unwrap(),
+            ("earn01".to_string(), "tcp:9000,tcp:8123".to_string())
+        );
+        // Explicit `*` peer still works.
+        assert_eq!(
+            parse_suggest_token("*:tcp:22", "--allow").unwrap(),
+            ("*".to_string(), "tcp:22".to_string())
+        );
+        // Hostname with a bare proto spec.
+        assert_eq!(
+            parse_suggest_token("alice:icmp", "--deny").unwrap(),
+            ("alice".to_string(), "icmp".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_suggest_token_rejects_empty() {
+        assert!(parse_suggest_token("", "--allow").is_err());
+        assert!(parse_suggest_token("alice", "--allow").is_err());
+    }
 
     #[test]
     fn release_asset_name_maps_supported_platforms() {

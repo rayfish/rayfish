@@ -4679,6 +4679,11 @@ impl DaemonState {
             s.suggested_firewall = suggestions;
         }
         update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+        // Nudge connected members to reconverge from the freshly-published signed
+        // record now, instead of waiting up to 60s for the group poller. Like the
+        // rename flow, this is a payload-free trigger — the suggestions still come
+        // exclusively from the network-key-signed blob, never from this message.
+        broadcast_member_sync(&self.peers, None).await;
         // The coordinator is the blob's source, so the group poller's hash
         // check (local == published) short-circuits and it never re-applies its
         // own authored suggestions. Materialize them here so the coordinator is
