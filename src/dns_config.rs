@@ -1,6 +1,6 @@
 //! OS-level DNS resolver configuration for Magic DNS.
 //!
-//! Configures the system to route `.ray` queries to our local resolver at 127.0.0.1:53.
+//! Configures the system to route `.ray` queries to our local resolver at 100.100.100.53:53.
 //! macOS: SCDynamicStore with session keys (auto-cleanup on process exit).
 //! Linux: systemd-resolved / resolvconf / direct /etc/resolv.conf.
 
@@ -11,7 +11,8 @@ use async_trait::async_trait;
 
 use crate::DNS_DOMAIN;
 
-const RESOLVER_IP: &str = "127.0.0.1";
+// Must equal dns::MAGIC_DNS_V4.
+const RESOLVER_IP: &str = "100.100.100.53";
 
 #[async_trait]
 pub trait DnsConfigurator: Send + Sync {
@@ -538,8 +539,8 @@ impl DnsConfigurator for NetworkManagerDns {
         if let Ok(config_path) = <&zbus::zvariant::ObjectPath>::try_from(&*config_val)
             && config_path.as_str() != "/"
         {
-            // Set DNS nameservers via D-Bus Properties — 127.0.0.1 as u32 (network byte order)
-            let dns_servers: Vec<u32> = vec![0x0100007f]; // 127.0.0.1 in NBO
+            // Set DNS nameservers via D-Bus Properties — magic DNS IP as u32 (NM host u32 of network-order bytes)
+            let dns_servers: Vec<u32> = vec![u32::from_le_bytes(crate::dns::MAGIC_DNS_V4.octets())]; // NM wants the address as a host u32 of its network-order bytes
             let _ = conn
                 .call_method(
                     Some("org.freedesktop.NetworkManager"),
@@ -817,5 +818,18 @@ impl DnsConfigurator for DirectResolvConf {
 
     fn name(&self) -> &'static str {
         "direct-resolv.conf"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RESOLVER_IP;
+
+    #[test]
+    fn resolver_ip_matches_magic_dns_constant() {
+        assert_eq!(
+            RESOLVER_IP.parse::<std::net::Ipv4Addr>().unwrap(),
+            crate::dns::MAGIC_DNS_V4
+        );
     }
 }
