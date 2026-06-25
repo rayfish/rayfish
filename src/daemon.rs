@@ -5494,12 +5494,11 @@ async fn build_daemon(
     // --- Accept loop (ALPN dispatch) + Prometheus metrics ---
     protocol_router.spawn_accept_loop(daemon.endpoint.clone(), token.clone());
 
-    // --- Contact record publisher (ray connect), active-gated ---
+    // --- Contact record publisher (ray connect) ---
     if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
         spawn_contact_publisher(
             pkarr_client,
             daemon.endpoint.id(),
-            daemon.active.clone(),
             token.clone(),
         );
     }
@@ -5714,29 +5713,26 @@ fn spawn_network_publisher(
     })
 }
 
-/// Publish this node's contact record (`ray connect`) while the VPN is active.
-/// Republishes on a TTL/2 interval (record TTL is 300s) so `contact_key ->
-/// current endpoint` stays fresh; skips publishing while on standby so an
-/// inactive node is unreachable for connect requests (the requester sees it
-/// offline). Reads `contact_secret` fresh from config each cycle so a
-/// `RotateContact` takes effect without a restart.
+/// Publish this node's contact record (`ray connect`).
+/// Publishes the `contact_key -> current endpoint` pkarr record on a TTL/2
+/// interval (record TTL is 300s). Runs for the lifetime of the daemon (control
+/// plane), not gated by the data-plane `active` flag, so standby nodes stay
+/// reachable for `ray connect` requests. Reads `contact_secret` fresh from
+/// config each cycle so a `RotateContact` takes effect without a restart.
 fn spawn_contact_publisher(
     client: PkarrRelayClient,
     endpoint_id: EndpointId,
-    active: Arc<AtomicBool>,
     token: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if active.load(Ordering::SeqCst) {
-                let secret = config::load().ok().and_then(|c| c.contact_secret_key);
-                if let Some(secret) = secret {
-                    match dht::publish_contact(&client, &secret, endpoint_id).await {
-                        Ok(()) => {
-                            tracing::debug!(contact = %secret.public().fmt_short(), "published contact record")
-                        }
-                        Err(e) => tracing::warn!(error = %e, "failed to publish contact record"),
+            let secret = config::load().ok().and_then(|c| c.contact_secret_key);
+            if let Some(secret) = secret {
+                match dht::publish_contact(&client, &secret, endpoint_id).await {
+                    Ok(()) => {
+                        tracing::debug!(contact = %secret.public().fmt_short(), "published contact record")
                     }
+                    Err(e) => tracing::warn!(error = %e, "failed to publish contact record"),
                 }
             }
             tokio::select! {
