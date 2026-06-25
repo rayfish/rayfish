@@ -665,6 +665,25 @@ pub fn parse_port_range(s: &str) -> Result<PortRange> {
     }
 }
 
+/// Parse a comma-separated port list into one `PortRange` per item.
+///
+/// Each item is a single port, a `start-end` range, or `*` (see
+/// `parse_port_range`); empty items (e.g. a trailing comma) are skipped. Used by
+/// `ray firewall add --port 80,443`, which turns each range into its own rule.
+/// Errors if no usable item remains.
+pub fn parse_port_list(s: &str) -> Result<Vec<PortRange>> {
+    let ranges = s
+        .split(',')
+        .map(str::trim)
+        .filter(|i| !i.is_empty())
+        .map(parse_port_range)
+        .collect::<Result<Vec<_>>>()?;
+    if ranges.is_empty() {
+        bail!("no valid port given");
+    }
+    Ok(ranges)
+}
+
 /// Parse a single suggested-firewall spec token into (protocol, optional port).
 ///
 /// Grammar (protocol is always explicit — no bare-number back-compat):
@@ -1276,6 +1295,42 @@ mod tests {
                 end: u16::MAX
             }
         );
+    }
+
+    #[test]
+    fn port_list_parsing() {
+        // Single item behaves like parse_port_range.
+        assert_eq!(
+            parse_port_list("80").unwrap(),
+            vec![PortRange { start: 80, end: 80 }]
+        );
+        // Comma list of discrete ports and a range, mixed.
+        assert_eq!(
+            parse_port_list("80,443,8000-9000").unwrap(),
+            vec![
+                PortRange { start: 80, end: 80 },
+                PortRange {
+                    start: 443,
+                    end: 443
+                },
+                PortRange {
+                    start: 8000,
+                    end: 9000
+                },
+            ]
+        );
+        // Whitespace and a trailing comma are tolerated.
+        assert_eq!(
+            parse_port_list(" 22 , 80 ,").unwrap(),
+            vec![
+                PortRange { start: 22, end: 22 },
+                PortRange { start: 80, end: 80 },
+            ]
+        );
+        // One bad item fails the whole list.
+        assert!(parse_port_list("80,abc").is_err());
+        // Nothing usable.
+        assert!(parse_port_list(",").is_err());
     }
 
     #[test]

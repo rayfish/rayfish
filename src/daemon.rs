@@ -4563,16 +4563,20 @@ impl DaemonState {
         peer: Option<&str>,
         network: Option<&str>,
     ) -> IpcMessage {
-        let port = match port {
-            Some(s) => match firewall::parse_port_range(s) {
-                Ok(r) => Some(r),
+        // A port spec may be a comma-separated list (e.g. `80,443` or
+        // `22,8000-9000`): each item is its own range and becomes its own rule,
+        // since a FirewallRule carries a single contiguous PortRange. `None` (no
+        // --port) yields a single port-agnostic rule.
+        let ports: Vec<Option<firewall::PortRange>> = match port {
+            Some(s) => match firewall::parse_port_list(s) {
+                Ok(ranges) => ranges.into_iter().map(Some).collect(),
                 Err(e) => {
                     return IpcMessage::Error {
                         message: e.to_string(),
                     };
                 }
             },
-            None => None,
+            None => vec![None],
         };
         let peer = match peer {
             Some(s) => match self.resolve_short_id_any_network(s) {
@@ -4595,32 +4599,40 @@ impl DaemonState {
         if let Some(net) = unknown_network {
             tracing::warn!(network = %net, "firewall rule scoped to a network this node is not on");
         }
-        let rule = firewall::FirewallRule {
-            direction,
-            action,
-            protocol,
-            port,
-            peer,
-            network: network.map(str::to_string),
-            origin: firewall::RuleOrigin::Local,
-        };
         let mut config = (*self.firewall.get_config()).clone();
-        // A new rule supersedes a contradicting one with the *same selector*
-        // (direction/proto/port/peer/network, ignoring action): drop the old
-        // entry, then insert at the front so it wins under first-match. So
-        // `deny in icmp` after the seeded `allow in icmp` makes deny prevail
-        // (and re-adding `allow` flips it back) without leaving dead rules. A
-        // narrower selector (e.g. `deny in icmp --peer X`) keeps the broader
-        // rule and just layers ahead of it.
-        config.rules.retain(|r| !firewall::same_selector(r, &rule));
-        config.rules.insert(0, rule);
+        for port in ports.iter().cloned() {
+            let rule = firewall::FirewallRule {
+                direction,
+                action,
+                protocol,
+                port,
+                peer: peer.clone(),
+                network: network.map(str::to_string),
+                origin: firewall::RuleOrigin::Local,
+            };
+            // A new rule supersedes a contradicting one with the *same selector*
+            // (direction/proto/port/peer/network, ignoring action): drop the old
+            // entry, then insert at the front so it wins under first-match. So
+            // `deny in icmp` after the seeded `allow in icmp` makes deny prevail
+            // (and re-adding `allow` flips it back) without leaving dead rules. A
+            // narrower selector (e.g. `deny in icmp --peer X`) keeps the broader
+            // rule and just layers ahead of it. With a comma list each range
+            // inserts at the front, so they end up in reverse spec order; order
+            // doesn't matter between same-action rules that differ only by port.
+            config.rules.retain(|r| !firewall::same_selector(r, &rule));
+            config.rules.insert(0, rule);
+        }
         self.firewall.update(config.clone());
         if let Err(e) = firewall::save_firewall(&config) {
             tracing::warn!(error = %e, "failed to persist firewall config");
         }
+        let count = ports.len();
+        let plural = if count == 1 { "rule" } else { "rules" };
         let message = match unknown_network {
-            Some(net) => format!("rule added (note: not currently on network '{net}')"),
-            None => "rule added".to_string(),
+            Some(net) => {
+                format!("{count} {plural} added (note: not currently on network '{net}')")
+            }
+            None => format!("{count} {plural} added"),
         };
         IpcMessage::Ok { message }
     }

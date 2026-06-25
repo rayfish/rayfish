@@ -44,6 +44,7 @@ fn json_enabled() -> bool {
 #[derive(Subcommand)]
 enum Command {
     /// Create a new network and wait for peers
+    #[command(visible_alias = "new")]
     Create {
         /// Make the network public: anyone with the room id can join directly.
         /// Without this flag the network is closed (gated by approval/invites).
@@ -82,6 +83,7 @@ enum Command {
         auto_accept_firewall: bool,
     },
     /// Leave a network (remove from saved config)
+    #[command(visible_alias = "rm")]
     Leave {
         /// Three-word network name
         name: String,
@@ -95,6 +97,7 @@ enum Command {
         force: bool,
     },
     /// Show status of all networks (active + saved)
+    #[command(visible_aliases = ["st", "ls"])]
     Status,
     /// Collect diagnostics (logs + metrics) and open a pre-filled GitHub issue
     Report,
@@ -239,8 +242,10 @@ enum Command {
         ticket: Option<String>,
     },
     /// Print the rayfish version
+    #[command(visible_alias = "ver")]
     Version,
     /// Update rayfish to the latest GitHub release
+    #[command(visible_alias = "upgrade")]
     Update {
         /// Reinstall even if already on the latest version
         #[arg(long)]
@@ -286,8 +291,10 @@ enum InviteAction {
         qr: bool,
     },
     /// List issued invites and their status
+    #[command(visible_alias = "ls")]
     List,
     /// Revoke an unused invite by id
+    #[command(visible_alias = "rm")]
     Revoke {
         /// Invite id (from `ray invite <network> list`)
         id: String,
@@ -337,14 +344,17 @@ enum AdminAction {
         identity: String,
     },
     /// List this network's key-holders (the local node + granted members)
+    #[command(visible_alias = "ls")]
     List,
 }
 
 #[derive(Subcommand)]
 enum ConnectionsAction {
     /// List pending incoming connection requests (default)
+    #[command(visible_alias = "ls")]
     List,
     /// Approve a pending request, forming the direct 2-peer network
+    #[command(visible_alias = "ok")]
     Approve {
         /// Short id of the requester (from `ray connections`)
         id: String,
@@ -366,6 +376,7 @@ enum FirewallAction {
     /// overrides the seeded `allow in icmp` (and re-adding `allow` flips it back).
     /// A rule with the same selector (direction/proto/port/peer/network) replaces
     /// the old one rather than stacking, so toggling never accumulates dead rules.
+    #[command(visible_alias = "a")]
     Add {
         /// Direction: in or out
         direction: String,
@@ -374,7 +385,8 @@ enum FirewallAction {
         /// Protocol: tcp, udp, icmp, any
         #[arg(long, short = 'p', default_value = "any")]
         proto: String,
-        /// Port or port range (e.g. 22, 80-443, or * for all)
+        /// Port, range, or comma list (e.g. 22, 80-443, 80,443, or * for all).
+        /// A comma list adds one rule per item.
         #[arg(long, short = 'P')]
         port: Option<String>,
         /// Peer short ID (omit for any peer)
@@ -385,11 +397,13 @@ enum FirewallAction {
         network: Option<String>,
     },
     /// Remove a rule by index
+    #[command(visible_aliases = ["rm", "del"])]
     Remove {
         /// Rule index (from 'firewall show')
         index: usize,
     },
     /// Show current firewall rules
+    #[command(visible_aliases = ["ls", "list"])]
     Show,
     /// Set the inbound default policy (allow or deny). `deny` (the secure
     /// built-in default) blocks unsolicited inbound TCP/UDP; `allow` restores the
