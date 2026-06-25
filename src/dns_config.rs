@@ -25,6 +25,13 @@ pub trait DnsConfigurator: Send + Sync {
     fn captured_upstreams(&self) -> Vec<std::net::Ipv4Addr> {
         Vec::new()
     }
+    /// Search domains this configurator wrote into resolv.conf (direct mode
+    /// only). Threaded into the re-assert loop so a trample-repair preserves
+    /// them instead of dropping back to a bare `nameserver` line.
+    /// Default: empty (split-DNS backends manage search domains out of band).
+    fn search_domains(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Revert a DNS configuration.
@@ -104,6 +111,18 @@ pub fn restore_stale_backups() {
                 tracing::warn!(error = %e, "failed to restore DNS backup");
             }
             let _ = std::fs::remove_file(&backup);
+        }
+        // Drop a stale `dns=none` NM snippet left by a hard kill (a panic would
+        // have cleaned it via emergency_restore_resolv_conf). Marker-guarded so
+        // we never touch an operator's own NM config. If we're about to
+        // re-activate, apply() reinstalls it; if we boot into standby, this stops
+        // NM staying quieted while the VPN is down.
+        if std::fs::read_to_string(NM_DROPIN)
+            .map(|c| resolv_conf_is_ours(&c))
+            .unwrap_or(false)
+        {
+            tracing::info!("removing stale NetworkManager dns=none drop-in from previous crash");
+            let _ = std::fs::remove_file(NM_DROPIN);
         }
     }
 }
@@ -828,23 +847,170 @@ async fn reassert_resolv_conf(search: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Periodically re-assert our resolv.conf if another program (NetworkManager,
-/// dhclient) tramples it. Dep-free poll (no inotify). Runs until cancelled.
+/// Re-assert our resolv.conf the instant another program (NetworkManager,
+/// dhclient) tramples it, repairing in ~ms via an inotify watch on `/etc`
+/// instead of a fixed-interval poll. A 30s tick backstops the watch in case a
+/// trample slips past inotify (or the watch fails to arm), and we re-assert
+/// once on entry. Runs until cancelled.
+///
+/// NM is told to stop owning resolv.conf (`dns=none`, see [`nm_quiet_install`])
+/// in direct mode, so on an NM host this watch mostly fires for dhclient or
+/// other writers; it remains the catch-all repair either way.
 #[cfg(target_os = "linux")]
 pub async fn run_resolv_reassert(
     search: Vec<String>,
     token: tokio_util::sync::CancellationToken,
 ) {
+    use futures::StreamExt;
+
+    // Re-assert immediately: covers any trample between apply() and our arrival.
+    if let Err(e) = reassert_resolv_conf(&search).await {
+        tracing::warn!(error = %e, "initial resolv.conf re-assert failed");
+    }
+
+    // Watch the parent directory, not the file: NetworkManager/resolvconf
+    // replace resolv.conf via atomic rename, which a file-level watch stops
+    // seeing after the first swap (the watched inode is gone). A directory
+    // watch catches the create/rename of a fresh `resolv.conf`.
+    let stream = (|| {
+        use inotify::{Inotify, WatchMask};
+        let inotify = Inotify::init()?;
+        inotify.watches().add(
+            std::path::Path::new("/etc"),
+            WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO | WatchMask::CREATE,
+        )?;
+        inotify.into_event_stream([0u8; 1024])
+    })();
+
+    let mut stream = match stream {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(error = %e, "inotify watch on /etc failed; falling back to 30s poll only");
+            None
+        }
+    };
+
     loop {
+        // When inotify armed, wait on it; otherwise this future never resolves
+        // and only the 30s tick + cancel drive the loop.
+        let event = async {
+            match stream.as_mut() {
+                Some(s) => s.next().await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             _ = token.cancelled() => break,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            ev = event => {
+                // Only react to events naming resolv.conf (the /etc watch is broad).
+                let relevant = match ev {
+                    Some(Ok(e)) => e.name.as_deref().is_none_or(|n| n == "resolv.conf"),
+                    Some(Err(e)) => { tracing::warn!(error = %e, "inotify stream error"); false }
+                    None => { stream = None; false } // stream ended; rely on the tick
+                };
+                if relevant
+                    && let Err(e) = reassert_resolv_conf(&search).await {
+                    tracing::warn!(error = %e, "resolv.conf re-assert failed");
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                 if let Err(e) = reassert_resolv_conf(&search).await {
                     tracing::warn!(error = %e, "resolv.conf re-assert failed");
                 }
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// NetworkManager quieting (direct mode): stop NM regenerating resolv.conf.
+//
+// When we fall to the direct /etc/resolv.conf takeover it's because no
+// split-DNS backend was found — on an NM host that means NM is in plain
+// `default` mode and owns resolv.conf, regenerating it on every connection /
+// DHCP-lease event and trampling our `nameserver 100.100.100.53`. Dropping a
+// `dns=none` config snippet makes NM leave resolv.conf entirely to us
+// (Tailscale takes the same "stop the fight" stance over re-asserting forever).
+// Reversible: removed + reloaded on revert. The inotify re-assert remains the
+// backstop for non-NM writers (dhclient).
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+const NM_CONF_DIR: &str = "/etc/NetworkManager/conf.d";
+#[cfg(target_os = "linux")]
+const NM_DROPIN: &str = "/etc/NetworkManager/conf.d/rayfish-dns.conf";
+
+/// The `dns=none` drop-in that tells NetworkManager to stop managing resolv.conf.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn nm_dns_none_dropin() -> String {
+    format!("{HEADER_COMMENT}[main]\ndns=none\n")
+}
+
+/// True iff NetworkManager appears installed (its conf.d dir exists). Best-effort
+/// gate so we only quiet NM on hosts that actually run it.
+#[cfg(target_os = "linux")]
+fn nm_present() -> bool {
+    std::path::Path::new(NM_CONF_DIR).is_dir()
+}
+
+/// Ask NetworkManager to reload its configuration so a conf.d change takes effect.
+#[cfg(target_os = "linux")]
+async fn nm_reload() {
+    use tokio::process::Command;
+    if Command::new("nmcli")
+        .args(["general", "reload"])
+        .status()
+        .await
+        .is_ok_and(|s| s.success())
+    {
+        return;
+    }
+    let _ = Command::new("systemctl")
+        .args(["reload", "NetworkManager"])
+        .status()
+        .await;
+}
+
+/// Install the `dns=none` drop-in and reload NM (no-op if NM isn't present, or
+/// the drop-in already exists). Best-effort: logs and returns on any error so a
+/// failure here never blocks bringing the VPN up.
+#[cfg(target_os = "linux")]
+async fn nm_quiet_install() {
+    if !nm_present() {
+        return;
+    }
+    let path = std::path::Path::new(NM_DROPIN);
+    let already = tokio::fs::read_to_string(path)
+        .await
+        .map(|c| resolv_conf_is_ours(&c))
+        .unwrap_or(false);
+    if already {
+        return;
+    }
+    if let Err(e) = tokio::fs::write(path, nm_dns_none_dropin()).await {
+        tracing::warn!(error = %e, "failed to install NetworkManager dns=none drop-in");
+        return;
+    }
+    tracing::info!("told NetworkManager to stop managing resolv.conf (dns=none); reloading NM");
+    nm_reload().await;
+}
+
+/// Remove our `dns=none` drop-in and reload NM so it resumes managing DNS.
+/// Only removes a file carrying our marker, so we never delete an operator's
+/// own NM config. Best-effort.
+#[cfg(target_os = "linux")]
+async fn nm_quiet_remove() {
+    let path = std::path::Path::new(NM_DROPIN);
+    match tokio::fs::read_to_string(path).await {
+        Ok(c) if resolv_conf_is_ours(&c) => {}
+        _ => return, // absent or not ours — leave it
+    }
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        tracing::warn!(error = %e, "failed to remove NetworkManager dns=none drop-in");
+        return;
+    }
+    tracing::info!("restored NetworkManager DNS management (removed dns=none drop-in); reloading NM");
+    nm_reload().await;
 }
 
 #[cfg(target_os = "linux")]
@@ -878,6 +1044,39 @@ async fn restore_file(path: &std::path::Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Synchronous emergency restore of the direct-mode DNS artifacts, safe to call
+/// from the panic hook just before `abort()`. Undoes exactly what
+/// [`DirectResolvConf`] installs: copies the backed-up `/etc/resolv.conf` back
+/// (so it stops pointing at our now-dead resolver) and removes the `dns=none`
+/// NetworkManager drop-in (so NM resumes owning DNS). No async, best-effort.
+///
+/// This is the safety net the user asked for: with NM quieting, a panic that
+/// left `dns=none` in place **and** resolv.conf pointing at 100.100.100.53 would
+/// blackhole all DNS until the service restarts and `restore_stale_backups()`
+/// runs. Restoring synchronously here closes that window immediately. A no-op
+/// when no backup exists (split-DNS modes never overwrite resolv.conf).
+#[cfg(target_os = "linux")]
+pub fn emergency_restore_resolv_conf() {
+    let path = std::path::Path::new("/etc/resolv.conf");
+    let backup = backup_path(path);
+    if backup.exists() {
+        let _ = std::fs::copy(&backup, path);
+        let _ = std::fs::remove_file(&backup);
+    }
+    // Remove our NM drop-in, but only if it carries our marker (never an
+    // operator's own NM config).
+    if let Ok(c) = std::fs::read_to_string(NM_DROPIN)
+        && resolv_conf_is_ours(&c)
+    {
+        let _ = std::fs::remove_file(NM_DROPIN);
+    }
+}
+
+/// No-op on non-Linux: only the direct `/etc/resolv.conf` takeover has artifacts
+/// to restore.
+#[cfg(not(target_os = "linux"))]
+pub fn emergency_restore_resolv_conf() {}
 
 #[cfg(target_os = "linux")]
 struct DirectResolvConf {
@@ -917,6 +1116,9 @@ impl DnsConfigurator for DirectResolvConf {
         use std::path::Path;
         let path = Path::new("/etc/resolv.conf");
         backup_file(path).await?;
+        // Quiet NM first so it doesn't regenerate the file out from under the
+        // write we're about to make (the inotify re-assert covers any residual).
+        nm_quiet_install().await;
         let new_content = render_direct_resolv_conf(&self.search);
         tokio::fs::write(path, new_content)
             .await
@@ -932,6 +1134,8 @@ impl DnsConfigurator for DirectResolvConf {
         use std::path::Path;
         let path = Path::new("/etc/resolv.conf");
         restore_file(path).await?;
+        // Hand resolv.conf back to NetworkManager before it regenerates one.
+        nm_quiet_remove().await;
         tracing::info!("reverted /etc/resolv.conf");
         Ok(())
     }
@@ -943,11 +1147,18 @@ impl DnsConfigurator for DirectResolvConf {
     fn captured_upstreams(&self) -> Vec<std::net::Ipv4Addr> {
         self.captured_upstreams.clone()
     }
+
+    fn search_domains(&self) -> Vec<String> {
+        self.search.clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RESOLVER_IP, parse_resolv_nameservers, render_direct_resolv_conf, resolv_conf_is_ours};
+    use super::{
+        RESOLVER_IP, nm_dns_none_dropin, parse_resolv_nameservers, render_direct_resolv_conf,
+        resolv_conf_is_ours,
+    };
 
     #[test]
     fn resolv_conf_is_ours_detects_marker() {
@@ -992,6 +1203,15 @@ mod tests {
         let out = render_direct_resolv_conf(&[]);
         assert!(out.contains("nameserver 100.100.100.53"));
         assert!(!out.contains("search "));
+    }
+
+    #[test]
+    fn nm_dns_none_dropin_carries_marker_and_setting() {
+        let out = nm_dns_none_dropin();
+        // Marker so revert only removes a file we own (nm_quiet_remove guard).
+        assert!(resolv_conf_is_ours(&out));
+        assert!(out.contains("[main]"));
+        assert!(out.contains("dns=none"));
     }
 
     #[cfg(target_os = "linux")]

@@ -126,6 +126,10 @@ harness = false
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.21.0"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+# Watch /etc/resolv.conf for trampling (NetworkManager/dhclient) in direct mode
+# so we re-assert in ~ms instead of polling. `stream` gives a tokio-driven
+# EventStream we can select! on alongside the cancellation token.
+inotify = { version = "0.11", default-features = false, features = ["stream"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 system-configuration = "0.7"

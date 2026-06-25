@@ -647,6 +647,12 @@ fn install_panic_hook() {
             eprintln!("failed to write panic log: {e}");
         }
 
+        // Hand DNS back to the OS before we abort: restore the backed-up
+        // resolv.conf and drop the NetworkManager `dns=none` snippet, so a crash
+        // can't leave the host pointing at our dead resolver (it would otherwise
+        // blackhole all DNS until the service restarts). Synchronous, best-effort.
+        rayfish::dns_config::emergency_restore_resolv_conf();
+
         // Print the standard panic message to stderr (journal), then fail fast so
         // the service manager restarts the daemon cleanly.
         default_hook(info);

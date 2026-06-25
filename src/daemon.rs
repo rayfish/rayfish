@@ -3070,16 +3070,18 @@ impl DaemonState {
             Ok(c) => {
                 let upstreams = c.captured_upstreams();
                 let is_direct = c.name() == "direct-resolv.conf";
+                #[cfg(target_os = "linux")]
+                let search = c.search_domains();
                 tracing::info!(backend = c.name(), resolver_ip = %crate::dns::MAGIC_DNS_V4, upstreams = ?upstreams, "Magic DNS active");
                 self.resolver.set_upstreams(upstreams);
                 *self.dns_configurator.lock().unwrap() = Some(c);
-                // In direct mode, periodically re-assert /etc/resolv.conf against
-                // programs that overwrite it (NetworkManager, dhclient).
+                // In direct mode, re-assert /etc/resolv.conf the instant another
+                // program (NetworkManager, dhclient) overwrites it (inotify watch).
                 #[cfg(target_os = "linux")]
                 if is_direct {
                     let rt = tokio_util::sync::CancellationToken::new();
                     *self.dns_reassert_token.lock().unwrap() = Some(rt.clone());
-                    tokio::spawn(dns_config::run_resolv_reassert(Vec::new(), rt));
+                    tokio::spawn(dns_config::run_resolv_reassert(search, rt));
                 }
                 #[cfg(not(target_os = "linux"))]
                 let _ = is_direct;
