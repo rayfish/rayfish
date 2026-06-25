@@ -444,6 +444,16 @@ struct NetworkManagerDns {
     tun_iface: String,
 }
 
+/// Returns true only for NM DNS modes that support per-domain split-DNS.
+/// `"dnsmasq"` routes specific domains to specific resolvers (what we need).
+/// `"systemd-resolved"` also supports split-DNS but is handled by its own
+/// configurator earlier in the detection chain, so including it here is
+/// harmless (the call site already returns `None` for it first).
+#[cfg(target_os = "linux")]
+fn nm_supports_split_dns(mode: &str) -> bool {
+    matches!(mode, "dnsmasq" | "systemd-resolved")
+}
+
 #[cfg(target_os = "linux")]
 async fn try_networkmanager_dbus(tun_name: &str) -> Option<NetworkManagerDns> {
     let conn = zbus::Connection::system().await.ok()?;
@@ -471,16 +481,28 @@ async fn try_networkmanager_dbus(tun_name: &str) -> Option<NetworkManagerDns> {
         .await
         .ok()?;
 
+    // Extract the mode string. If we can't read it at all, conservatively
+    // return None — safer to fall through to direct /etc/resolv.conf than
+    // to claim NM supports split-DNS when we can't confirm it.
+    let mode_val = dns_reply
+        .body()
+        .deserialize::<zbus::zvariant::Value>()
+        .ok()?;
+    let mode = mode_val.downcast_ref::<String>().ok()?;
+
     // If NM delegates to systemd-resolved, skip — the resolved D-Bus path handles it.
     // If NM DNS is "none", it's not managing DNS at all.
-    if let Ok(mode) = dns_reply.body().deserialize::<zbus::zvariant::Value>()
-        && let Ok(s) = mode.downcast_ref::<String>()
-        && (s == "systemd-resolved" || s == "none")
-    {
+    if mode == "systemd-resolved" || mode == "none" {
         return None;
     }
 
-    // NM is managing DNS directly (dnsmasq, default, or unbound mode).
+    // Only proceed if this mode supports per-domain split-DNS.
+    // "default" and "unbound" modes do not, so fall through to direct mode.
+    if !nm_supports_split_dns(mode) {
+        return None;
+    }
+
+    // NM is managing DNS in a split-DNS-capable mode (dnsmasq).
     Some(NetworkManagerDns {
         tun_iface: tun_name.to_string(),
     })
@@ -831,5 +853,16 @@ mod tests {
             RESOLVER_IP.parse::<std::net::Ipv4Addr>().unwrap(),
             crate::dns::MAGIC_DNS_V4
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nm_split_dns_only_for_capable_modes() {
+        use super::nm_supports_split_dns;
+        assert!(nm_supports_split_dns("dnsmasq"));
+        assert!(nm_supports_split_dns("systemd-resolved"));
+        assert!(!nm_supports_split_dns("default"));
+        assert!(!nm_supports_split_dns("unbound"));
+        assert!(!nm_supports_split_dns(""));
     }
 }
