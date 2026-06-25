@@ -60,7 +60,12 @@ jobs:
         uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
-          args: --current --strip all
+          # --latest (not --current): pick the newest tag matching cliff.toml's
+          # tag_pattern from the full timeline, instead of relying on "the tag at
+          # HEAD". On a tag-push the runner checks out a detached HEAD and the
+          # rolling `nightly` tag also sits on the commit, which breaks
+          # --current's HEAD-tag detection ("No tag exists for the current commit").
+          args: --latest --strip all
         env:
           OUTPUT: CHANGELOG.md
 
