@@ -41,6 +41,9 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 ahash = "0.8"
 clap_complete = "4"
+# Token-bucket rate limiter guarding inbound control streams against floods
+# (src/ratelimit.rs). One per control-listener task; no shared state.
+ratelimit = "0.10"
 dashmap = "6"
 dirs = "6.0.0"
 futures = "0.3"

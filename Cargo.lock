@@ -661,6 +661,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "clocksource"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46a4f8c23584e9dc6e40de1406e8c776ae727c49f7cb85c0bb23fb8c2096f7e0"
+dependencies = [
+ "libc",
+ "time",
+ "winapi",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4085,6 +4096,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratelimit"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5dc94ed8e3de45f6d8d052869d48c0dbeebcaa7a6c345ec7f0f917e10347428e"
+dependencies = [
+ "clocksource",
+ "parking_lot",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ray-proto"
 version = "0.1.1"
 dependencies = [
@@ -4141,6 +4163,7 @@ dependencies = [
  "opentelemetry_sdk",
  "qr2term",
  "rand 0.10.1",
+ "ratelimit",
  "ray-proto",
  "reqwest",
  "rmp-serde",

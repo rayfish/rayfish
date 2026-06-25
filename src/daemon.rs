@@ -359,6 +359,11 @@ impl CoordinatorAcceptState {
                 .await;
             }
             GroupMode::Restricted => {
+                // TODO(abuse-hardening): the pending-join queue is unbounded and
+                // has no TTL — a peer could open many join streams to grow it. Out
+                // of scope for the control-flood rate limiter (see
+                // ~/.claude/plans/hidden-jumping-fountain.md); cap/evict here and
+                // add a per-peer concurrent-stream limit if this becomes a vector.
                 {
                     let mut s = self.state.write().unwrap();
                     s.pending.insert(
@@ -6289,6 +6294,7 @@ fn spawn_coordinator_control_reader(
     invite_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
     tokio::spawn(async move {
+        let mut gate = crate::ratelimit::ControlGate::new();
         loop {
             let accepted = tokio::select! {
                 _ = token.cancelled() => return,
@@ -6302,6 +6308,17 @@ fn spawn_coordinator_control_reader(
                 Ok(m) => m,
                 Err(_) => continue,
             };
+            // Throttle inbound control messages per connection: drop over-budget
+            // ones, and drop the peer entirely if it sustains a flood.
+            match gate.check() {
+                crate::ratelimit::Verdict::Allow => {}
+                crate::ratelimit::Verdict::Drop => continue,
+                crate::ratelimit::Verdict::Close => {
+                    tracing::warn!(peer = %remote_id.fmt_short(), "control-plane flood; closing connection");
+                    conn.close(VarInt::from_u32(forward::ABUSE_CODE), b"control flood");
+                    return;
+                }
+            }
             // Invite gossip from another coordinator: a co-coordinator that minted
             // or redeemed an invite tells us so our ledger stays in sync. Honor it
             // only from a coordinator peer in our verified roster.
@@ -6795,57 +6812,106 @@ async fn join_mesh_shared(
     // Re-runs on every roster/blob update from the control listener below.
     apply_suggested_firewall(&firewall, my_identity, network_name, &live_state);
 
+    // Reconverge worker: `MemberSync`/`BlobUpdated` triggers fan into this
+    // single, debounced task instead of each driving a reconverge inline. A
+    // burst of triggers (e.g. several coordinators broadcasting after one roster
+    // change) collapses into one pkarr resolve + reconverge, and a slow
+    // reconverge never blocks the control listener's accept loop. The signed
+    // record stays the source of truth, so converging once per burst suffices.
+    let reconverge_notify = Arc::new(tokio::sync::Notify::new());
+    tokio::spawn({
+        let notify = reconverge_notify.clone();
+        let token = token.clone();
+        let live_state = live_state.clone();
+        let network_name = network_name.to_string();
+        let blob_store = blob_store.clone();
+        let peers_w = peers.clone();
+        let endpoint_w = ep.clone();
+        let hostname_table_w = hostname_table.clone();
+        let reverse_table_w = reverse_table.clone();
+        let firewall_w = firewall.clone();
+        let my_identity_w = my_identity;
+        let net_pubkey_w = net_pubkey;
+        async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => return,
+                    _ = notify.notified() => {}
+                }
+                // Debounce: absorb a burst of triggers into a single reconverge.
+                // A trigger that arrives during the sleep or the reconverge is
+                // retained by `Notify` and handled on the next iteration.
+                tokio::select! {
+                    _ = token.cancelled() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+                }
+                reconverge_and_apply(
+                    &endpoint_w, &blob_store, &peers_w, net_pubkey_w,
+                    &network_name, &live_state, my_identity_w,
+                    &hostname_table_w, &reverse_table_w, &firewall_w,
+                ).await;
+            }
+        }
+    });
+
     // Control listener
     tokio::spawn({
         let initial_conn = initial_conn.clone();
         let token = token.clone();
         let live_state = live_state.clone();
         let network_name = network_name.to_string();
-        let blob_store = blob_store.clone();
         let peers_c = peers.clone();
         let endpoint_c = ep.clone();
-        let hostname_table_c = hostname_table.clone();
-        let reverse_table_c = reverse_table.clone();
-        let firewall_c = firewall.clone();
         let my_identity_c = my_identity;
         let net_pubkey_c = net_pubkey;
         let promote_tx = promote_tx.clone();
         let invite_lock = invite_lock.clone();
+        let reconverge_notify = reconverge_notify.clone();
         async move {
+            let mut gate = crate::ratelimit::ControlGate::new();
             loop {
                 tokio::select! {
                     _ = token.cancelled() => return,
                     result = initial_conn.accept_bi() => {
                         match result {
                             Ok((_send, mut recv)) => {
-                                match control::recv_msg(&mut recv).await {
-                                    Ok(ControlMsg::MemberApproved { identity, ip, hostname, .. }) => {
+                                let msg = match control::recv_msg(&mut recv).await {
+                                    Ok(m) => m,
+                                    Err(_) => continue,
+                                };
+                                // Throttle inbound control messages per connection:
+                                // drop over-budget ones, drop the peer on a flood.
+                                match gate.check() {
+                                    crate::ratelimit::Verdict::Allow => {}
+                                    crate::ratelimit::Verdict::Drop => continue,
+                                    crate::ratelimit::Verdict::Close => {
+                                        tracing::warn!(peer = %remote_id.fmt_short(), "control-plane flood; closing connection");
+                                        initial_conn.close(VarInt::from_u32(forward::ABUSE_CODE), b"control flood");
+                                        return;
+                                    }
+                                }
+                                match msg {
+                                    ControlMsg::MemberApproved { identity, ip, hostname, .. } => {
                                         let entry = ApprovedEntry { identity, ip, hostname, user_identity: None, device_cert: None, collision_index: 0 };
                                         let mut s = live_state.write().unwrap();
                                         let members = s.members.clone();
                                         let _ = s.approved.approve(entry, &members);
                                     }
-                                    Ok(ControlMsg::MemberSync) => {
+                                    ControlMsg::MemberSync => {
                                         // Trigger only. The roster/firewall come exclusively
                                         // from the network-key-signed pkarr record, never from
-                                        // peer-supplied membership.
-                                        reconverge_and_apply(
-                                            &endpoint_c, &blob_store, &peers_c, net_pubkey_c,
-                                            &network_name, &live_state, my_identity_c,
-                                            &hostname_table_c, &reverse_table_c, &firewall_c,
-                                        ).await;
+                                        // peer-supplied membership. Coalesced into the debounced
+                                        // reconverge worker.
+                                        reconverge_notify.notify_one();
                                     }
-                                    Ok(ControlMsg::BlobUpdated) => {
+                                    ControlMsg::BlobUpdated => {
                                         // Trigger only. Reconverge from the network-key-signed
                                         // pkarr record — a malicious member can't inject a
-                                        // forged roster/firewall blob via this message.
-                                        reconverge_and_apply(
-                                            &endpoint_c, &blob_store, &peers_c, net_pubkey_c,
-                                            &network_name, &live_state, my_identity_c,
-                                            &hostname_table_c, &reverse_table_c, &firewall_c,
-                                        ).await;
+                                        // forged roster/firewall blob via this message. Coalesced
+                                        // into the debounced reconverge worker.
+                                        reconverge_notify.notify_one();
                                     }
-                                    Ok(ControlMsg::AdminGrant { network_pubkey, secret_key }) => {
+                                    ControlMsg::AdminGrant { network_pubkey, secret_key } => {
                                         // Coordinator granted us the per-network key.
                                         // Verify it targets this network (the stream is
                                         // already ALPN-scoped, but defense in depth).
@@ -6911,7 +6977,7 @@ async fn join_mesh_shared(
                                         // only means the daemon is shutting down.
                                         let _ = promote_tx.send(network_name.clone()).await;
                                     }
-                                    Ok(ControlMsg::InviteShare { id, secret_hash, expires }) => {
+                                    ControlMsg::InviteShare { id, secret_hash, expires } => {
                                         // Another coordinator minted a single-use
                                         // invite; record its hash so we can redeem
                                         // it too. Only honor it from a peer that is
@@ -6929,7 +6995,7 @@ async fn join_mesh_shared(
                                             let _ = store.record_shared(id, hash, expires);
                                         }
                                     }
-                                    Ok(ControlMsg::InviteUsed { secret_hash }) => {
+                                    ControlMsg::InviteUsed { secret_hash } => {
                                         // Another coordinator redeemed a single-use
                                         // invite; burn it locally so it can't be
                                         // reused here. Coordinator-only.
@@ -6946,8 +7012,7 @@ async fn join_mesh_shared(
                                             let _ = store.burn_by_hash(&hash);
                                         }
                                     }
-                                    Ok(_) => {}
-                                    Err(_) => {}
+                                    _ => {}
                                 }
                             }
                             Err(_) => return,

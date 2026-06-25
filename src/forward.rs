@@ -73,6 +73,12 @@ pub(crate) fn evaluate_inbound(
 /// (timeout/reset), so only deliberate leaves prune the canonical member list.
 pub const LEAVE_CODE: u32 = 0x1ea5e;
 
+/// Application close code used to drop a peer that floods the control plane with
+/// messages (see [`crate::ratelimit::ControlGate`]). Distinct from
+/// [`LEAVE_CODE`]: a flooded-out peer did not depart the network, so it is
+/// treated as a non-intentional disconnect (the peer may reconnect; no quarantine).
+pub const ABUSE_CODE: u32 = 0xab05e;
+
 /// Sent by [`spawn_peer_reader`] when a peer connection drops,
 /// consumed by the reconnect loop (joiner) or cleanup task (coordinator).
 pub struct DisconnectEvent {
