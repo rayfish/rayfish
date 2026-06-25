@@ -1,6 +1,7 @@
 //! iroh endpoint setup and peer connection management.
 //!
-//! Each network gets its own ALPN (`rayfish/net/<name>`) for isolation.
+//! Each network gets its own ALPN (`rayfish/net/<version>/<prefix>`) for isolation
+//! and mesh-protocol version gating (see `MESH_PROTOCOL_VERSION`).
 //! A single shared iroh [`Endpoint`] handles all networks, filtering by ALPN on accept.
 
 use anyhow::{Context, Result};
@@ -26,10 +27,18 @@ pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/1";
 /// ephemeral port (see `create_endpoint_with_alpns`).
 pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 
+/// Mesh wire-protocol version, embedded in the per-network ALPN. Bump this on any
+/// breaking change to the mesh control/forwarding protocol. Because iroh negotiates
+/// the ALPN during the QUIC handshake, two peers on different mesh versions share no
+/// common ALPN and simply cannot connect — the version gate is enforced by the
+/// transport, with no in-band handshake. Per-network discovery still keys on the
+/// pubkey prefix; the version is an independent leading segment.
+pub const MESH_PROTOCOL_VERSION: u32 = 1;
+
 pub fn network_alpn(network_pubkey: &EndpointId) -> Vec<u8> {
     let full = network_pubkey.to_string();
     let prefix = &full[..full.len().min(16)];
-    format!("rayfish/net/{prefix}").into_bytes()
+    format!("rayfish/net/{MESH_PROTOCOL_VERSION}/{prefix}").into_bytes()
 }
 
 /// Creates an iroh endpoint with the N0 preset (NAT traversal + relay fallback).
@@ -146,7 +155,7 @@ mod tests {
         let key = SecretKey::generate().public();
         let alpn = network_alpn(&key);
         let key_str = key.to_string();
-        let expected = format!("rayfish/net/{}", &key_str[..16]);
+        let expected = format!("rayfish/net/{MESH_PROTOCOL_VERSION}/{}", &key_str[..16]);
         assert_eq!(alpn, expected.as_bytes());
     }
 }
