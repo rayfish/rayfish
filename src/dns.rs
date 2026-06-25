@@ -242,7 +242,7 @@ async fn handle_tcp_connection(
     }
 }
 
-async fn handle_query(
+pub(crate) async fn handle_query(
     data: &[u8],
     table: &HostnameTable,
     reverse: &ReverseLookupTable,
