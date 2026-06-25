@@ -248,14 +248,24 @@ pub fn spawn_peer_reader(
     tokio::spawn(reader.instrument(span))
 }
 
-/// Spawns a task that consumes packets from `tun_rx` and writes them to the TUN device.
-/// Single instance per session — serializes writes without a Mutex.
+/// Spawns a task that consumes packets from `tun_rx` and writes them to the TUN
+/// device. Single instance per session, serializes writes without a Mutex.
+/// `active` is the data-plane gate: while it is false (standby, after `ray
+/// down`) inbound datagrams are dropped instead of written, so a node that
+/// stays connected to peers still carries no traffic.
 pub fn spawn_tun_writer(
     mut tun: TunWriter,
     mut tun_rx: mpsc::Receiver<Bytes>,
+    active: Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
     tokio::spawn(async move {
         while let Some(packet) = tun_rx.recv().await {
+            if !active.load(Ordering::Relaxed) {
+                // Data plane is down (standby). Drain and drop so the channel
+                // never backs up while we keep the control plane connected.
+                continue;
+            }
             if let Err(e) = tun.write_packet(&packet).await {
                 tracing::warn!(error = %e, "TUN write failed");
             }

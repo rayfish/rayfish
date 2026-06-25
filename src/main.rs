@@ -111,8 +111,12 @@ enum Command {
         #[arg(long)]
         hostname: Option<String>,
     },
-    /// Disconnect from all networks (signals daemon to shut down)
+    /// Standby: take the data plane (TUN + Magic DNS) offline; stays connected to peers
     Down,
+    /// Stop the system service (go fully offline). Requires root
+    Stop,
+    /// Start the installed system service. Requires root
+    Start,
     /// Uninstall system service
     Uninstall,
     /// Install or refresh the system service and start it (requires root)
@@ -757,6 +761,8 @@ async fn main() -> Result<()> {
         }
         Command::Up { hostname } => cmd_up(hostname).await,
         Command::Down => ipc_down().await,
+        Command::Stop => cmd_stop().await,
+        Command::Start => cmd_start().await,
         Command::Uninstall => cmd_uninstall_service(),
         Command::Install => cmd_install().await,
         Command::Restart => cmd_restart().await,
@@ -3040,6 +3046,69 @@ async fn cmd_restart() -> Result<()> {
         std::process::exit(1);
     }
     restart_service_and_wait().await
+}
+
+/// `ray stop`: stop the installed system service so the daemon exits and all
+/// peer connections close cleanly (a clean offline, distinct from `ray down`
+/// standby). Does not disable or uninstall the unit. Requires root.
+#[allow(unreachable_code)]
+async fn cmd_stop() -> Result<()> {
+    require_root()?;
+    if !service_unit_exists() {
+        eprintln!("rayfish service is not installed. Nothing to stop.");
+        std::process::exit(1);
+    }
+
+    #[cfg(target_os = "linux")]
+    run_cmd("systemctl", &["stop", "rayfish"]);
+
+    #[cfg(target_os = "macos")]
+    run_cmd(
+        "launchctl",
+        &["unload", "/Library/LaunchDaemons/com.rayfish.vpn.plist"],
+    );
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    anyhow::bail!("system service not supported on this platform");
+
+    println!("rayfish service stopped.");
+    Ok(())
+}
+
+/// `ray start`: start the already-installed system service via the OS service
+/// manager and wait for the daemon to accept IPC. The daemon comes back up with
+/// the control and data planes on. Requires root.
+#[allow(unreachable_code)]
+async fn cmd_start() -> Result<()> {
+    require_root()?;
+    if !service_unit_exists() {
+        eprintln!("rayfish service is not installed. Run: sudo ray up");
+        std::process::exit(1);
+    }
+
+    #[cfg(target_os = "linux")]
+    run_cmd("systemctl", &["start", "rayfish"]);
+
+    #[cfg(target_os = "macos")]
+    run_cmd(
+        "launchctl",
+        &["load", "-w", "/Library/LaunchDaemons/com.rayfish.vpn.plist"],
+    );
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    anyhow::bail!("system service not supported on this platform");
+
+    match wait_for_daemon(DAEMON_REACHABLE_TIMEOUT).await {
+        Some(_) => {
+            println!("rayfish service started.");
+            Ok(())
+        }
+        None => {
+            eprintln!("rayfish service was started but the daemon never became reachable.");
+            print_daemon_log_tail();
+            std::process::exit(1);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

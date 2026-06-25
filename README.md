@@ -53,7 +53,7 @@ cargo build
 sudo ray up    # installs the system service if needed, then activates the VPN
 ```
 
-The first `ray up` needs root: it installs the system service and starts the daemon, which owns the TUN device and the iroh endpoint. After that the daemon stays running and every command, including `ray up`/`ray down`, runs unprivileged over a local socket.
+The first `ray up` needs root: it installs the system service and starts the daemon, which owns the TUN device and the iroh endpoint. After that the daemon stays running and every command, including `ray up`/`ray down`, runs unprivileged over a local socket. `ray down` is standby: it takes only the data plane offline (TUN, DNS) while keeping peer connections alive, so `ray up` is near-instant. To stop the daemon entirely (fully offline, connections closed), use `sudo ray stop`; `sudo ray start` brings it back.
 
 #### Updating
 
@@ -110,8 +110,10 @@ ping 100.64.23.142       # or just the IP
 
 ```bash
 ray leave gaming         # leave a network
-ray down                 # standby: TUN + DNS torn down, daemon keeps running
-ray up                   # reactivate (no root needed)
+ray down                 # standby: data plane (TUN + DNS) off, still connected to peers
+ray up                   # reactivate (no root needed, near-instant: connections were kept)
+sudo ray stop            # fully offline: daemon exits, peer connections close
+sudo ray start           # back online: daemon restarts with both planes on
 ```
 
 Run `ray --help` to discover the rest: `invite`, `requests`/`accept`/`deny`, `firewall`, `apply`, `send`, `pair`, `mdns`, and more.
@@ -152,6 +154,7 @@ Only a handful of commands need root, because they manage the system service its
 
 ```bash
 sudo ray install | restart | uninstall   # manage the service unit / launchd plist
+sudo ray start | stop                    # start / stop the service. stop = fully offline (closes peer connections); start = back online
 sudo ray set-operator <user>              # let a user run ray without sudo
 ```
 

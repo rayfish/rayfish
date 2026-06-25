@@ -2984,10 +2984,98 @@ impl DaemonState {
         self.leave_network(name).await
     }
 
-    /// Activate the VPN: bring the TUN interface up, configure system DNS, and
-    /// reconnect every saved network. Idempotent — a no-op if already active.
-    /// Runs entirely inside the (root) daemon, so the IPC client needs no
-    /// privileges.
+    /// Connect to every saved network (control plane). Run once at daemon
+    /// startup so mesh connections follow the daemon lifecycle, not the data
+    /// plane: `ray down` keeps these connected so the node stays online to
+    /// peers. Connections are dropped only on leave/nuke/shutdown.
+    async fn connect_all_networks(self: &Arc<Self>) {
+        let app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to load config during connect");
+                return;
+            }
+        };
+        let mut count = 0;
+        for net in &app_config.networks {
+            count += 1;
+            if net.network_secret_key.is_some() {
+                // We hold the secret key, restore as coordinator.
+                let name = net.name.clone();
+                let mode = net.group_mode;
+                let daemon_c = Arc::clone(self);
+                tokio::spawn(async move {
+                    match daemon_c.restore_coordinator_network(&name, mode).await {
+                        Ok(IpcMessage::Created { name, .. }) => {
+                            tracing::info!(network = %name, "restored coordinator network");
+                        }
+                        Ok(IpcMessage::Error { message }) => {
+                            tracing::warn!(network = %name, error = %message, "failed to restore network");
+                        }
+                        Err(e) => {
+                            tracing::warn!(network = %name, error = %e, "failed to restore network");
+                        }
+                        _ => {}
+                    }
+                });
+            } else {
+                // We're a member, rejoin via DHT lookup.
+                let name = net.name.clone();
+                let persisted_hostname = net.my_hostname.clone();
+                let net_auto_accept = net.auto_accept_firewall;
+                let net_pubkey = match &net.network_public_key {
+                    Some(k) => k.to_string(),
+                    None => {
+                        tracing::warn!(network = %name, "no network public key in config, skipping restore");
+                        continue;
+                    }
+                };
+                let daemon_c = Arc::clone(self);
+                tokio::spawn(async move {
+                    match daemon_c
+                        .join_network_inner(
+                            &net_pubkey,
+                            Some(&name),
+                            persisted_hostname,
+                            None,
+                            None,
+                            net_auto_accept,
+                            false,
+                        )
+                        .await
+                    {
+                        Ok(TryJoin::Joined(IpcMessage::Joined { name, my_ip, .. })) => {
+                            tracing::info!(network = %name, ip = %my_ip, "restored member network");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(network = %name, error = %e, "failed to restore network");
+                        }
+                    }
+                });
+            }
+        }
+
+        // Publish the contact record immediately so `ray connect` works right
+        // away, rather than waiting up to one publisher interval (the active-gated
+        // `spawn_contact_publisher` only re-checks every TTL/2).
+        if let Some(secret) = app_config.contact_secret_key.clone()
+            && let Ok(client) = dht::create_pkarr_client(&self.endpoint)
+        {
+            let endpoint_id = self.endpoint.id();
+            tokio::spawn(async move {
+                if let Err(e) = dht::publish_contact(&client, &secret, endpoint_id).await {
+                    tracing::warn!(error = %e, "failed to publish contact record on connect");
+                }
+            });
+        }
+
+        tracing::info!(networks = count, "control plane connected");
+    }
+
+    /// Activate the VPN: bring the TUN interface up, configure system DNS.
+    /// Idempotent — a no-op if already active. Runs entirely inside the
+    /// (root) daemon, so the IPC client needs no privileges.
     async fn activate(self: &Arc<Self>, hostname: Option<String>) -> IpcMessage {
         // Persist the personal default hostname first (before the already-active
         // short-circuit) so `ray up --hostname X` records the new default even
@@ -3083,91 +3171,7 @@ impl DaemonState {
             }
         }
 
-        // Reconnect every saved network.
-        let app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to load config during activate");
-                return IpcMessage::Ok {
-                    message: "VPN up (no saved networks reconnected)".into(),
-                };
-            }
-        };
-        let mut count = 0;
-        for net in &app_config.networks {
-            count += 1;
-            if net.network_secret_key.is_some() {
-                // We hold the secret key — restore as coordinator.
-                let name = net.name.clone();
-                let mode = net.group_mode;
-                let daemon_c = Arc::clone(self);
-                tokio::spawn(async move {
-                    match daemon_c.restore_coordinator_network(&name, mode).await {
-                        Ok(IpcMessage::Created { name, .. }) => {
-                            tracing::info!(network = %name, "restored coordinator network");
-                        }
-                        Ok(IpcMessage::Error { message }) => {
-                            tracing::warn!(network = %name, error = %message, "failed to restore network");
-                        }
-                        Err(e) => {
-                            tracing::warn!(network = %name, error = %e, "failed to restore network");
-                        }
-                        _ => {}
-                    }
-                });
-            } else {
-                // We're a member — rejoin via DHT lookup.
-                let name = net.name.clone();
-                let persisted_hostname = net.my_hostname.clone();
-                let net_auto_accept = net.auto_accept_firewall;
-                let net_pubkey = match &net.network_public_key {
-                    Some(k) => k.to_string(),
-                    None => {
-                        tracing::warn!(network = %name, "no network public key in config, skipping restore");
-                        continue;
-                    }
-                };
-                let daemon_c = Arc::clone(self);
-                tokio::spawn(async move {
-                    match daemon_c
-                        .join_network_inner(
-                            &net_pubkey,
-                            Some(&name),
-                            persisted_hostname,
-                            None,
-                            None,
-                            net_auto_accept,
-                            false,
-                        )
-                        .await
-                    {
-                        Ok(TryJoin::Joined(IpcMessage::Joined { name, my_ip, .. })) => {
-                            tracing::info!(network = %name, ip = %my_ip, "restored member network");
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(network = %name, error = %e, "failed to restore network");
-                        }
-                    }
-                });
-            }
-        }
-
-        // Publish the contact record immediately so `ray connect` works right
-        // away, rather than waiting up to one publisher interval (the active-gated
-        // `spawn_contact_publisher` only re-checks every TTL/2).
-        if let Some(secret) = app_config.contact_secret_key.clone()
-            && let Ok(client) = dht::create_pkarr_client(&self.endpoint)
-        {
-            let endpoint_id = self.endpoint.id();
-            tokio::spawn(async move {
-                if let Err(e) = dht::publish_contact(&client, &secret, endpoint_id).await {
-                    tracing::warn!(error = %e, "failed to publish contact record on activate");
-                }
-            });
-        }
-
-        tracing::info!(networks = count, "VPN activated");
+        tracing::info!("data plane activated");
         if warnings.is_empty() {
             IpcMessage::Ok {
                 message: "VPN up".into(),
@@ -3182,19 +3186,16 @@ impl DaemonState {
         }
     }
 
-    /// Put the daemon on standby: tear down active network connections, revert
-    /// system DNS, and bring the TUN interface down. The daemon process keeps
-    /// running so it can be reactivated with `activate`. Idempotent.
+    /// Put the daemon on standby: take the data plane offline (revert system
+    /// DNS, bring the TUN link down, stop forwarding) while keeping the control
+    /// plane connected. Network connections, control readers, and pollers stay
+    /// live so the node remains online to peers and keeps receiving roster/blob
+    /// updates. Connections are dropped only on leave/nuke/shutdown. Idempotent.
     async fn deactivate(&self) -> IpcMessage {
         if !self.active.swap(false, Ordering::SeqCst) {
             return IpcMessage::Ok {
                 message: "already on standby".into(),
             };
-        }
-
-        let names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
-        for name in &names {
-            self.teardown_network_runtime(name).await;
         }
 
         if let Some(rt) = self.dns_reassert_token.lock().unwrap().take() {
@@ -3217,14 +3218,14 @@ impl DaemonState {
 
         tracing::info!("VPN on standby");
         IpcMessage::Ok {
-            message: "VPN down (daemon still running)".into(),
+            message: "VPN on standby (still connected to peers)".into(),
         }
     }
 
     /// Tear down a network's runtime state (connections, ALPN, DNS entries,
     /// background tasks) without touching its persisted config. Returns whether
-    /// the network was active. Shared by `leave_network` (which also forgets the
-    /// config) and `deactivate` (which keeps it for later reactivation).
+    /// the network was active. Used by `leave_network` (which also forgets the
+    /// config); standby (`deactivate`) no longer tears connections down.
     async fn teardown_network_runtime(&self, name: &str) -> bool {
         let Some(handle) = self.networks.remove(name).map(|(_, v)| v) else {
             return false;
@@ -5318,8 +5319,11 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 
     let (daemon, _metrics_server, promote_rx) = build_daemon(token.clone(), stats).await?;
 
-    // Start active by default so a fresh boot behaves like before; `ray up` /
-    // `ray down` toggle this at runtime without restarting the process.
+    // Connect the control plane (mesh connections) once, for the daemon's
+    // whole lifetime, then bring the data plane up. `ray up`/`ray down` toggle
+    // only the data plane after this; connections persist across `down` so the
+    // node stays online to peers.
+    daemon.connect_all_networks().await;
     daemon.activate(None).await;
 
     let result = serve_ipc(&daemon, promote_rx, token).await;
@@ -5421,8 +5425,9 @@ async fn build_daemon(
     });
     let shared_firewall = SharedFirewall::new(fw_config);
     shared_firewall.clone().spawn_evictor(token.clone());
+    let active = Arc::new(AtomicBool::new(false));
     let (tun_tx, tun_rx) = mpsc::channel::<Bytes>(256);
-    forward::spawn_tun_writer(tun_writer, tun_rx);
+    forward::spawn_tun_writer(tun_writer, tun_rx, active.clone());
     let device_user_map = peers::DeviceUserMap::new();
 
     // --- Magic DNS resolver + optional mDNS local discovery ---
@@ -5479,7 +5484,7 @@ async fn build_daemon(
         device_cert,
         device_user_map,
         contact_public,
-        active: Arc::new(AtomicBool::new(false)),
+        active: active.clone(),
         dns_configurator: Arc::new(std::sync::Mutex::new(None)),
         resolver: dns_resolver.clone(),
         dns_reassert_token: std::sync::Mutex::new(None),
@@ -5489,12 +5494,11 @@ async fn build_daemon(
     // --- Accept loop (ALPN dispatch) + Prometheus metrics ---
     protocol_router.spawn_accept_loop(daemon.endpoint.clone(), token.clone());
 
-    // --- Contact record publisher (ray connect), active-gated ---
+    // --- Contact record publisher (ray connect) ---
     if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
         spawn_contact_publisher(
             pkarr_client,
             daemon.endpoint.id(),
-            daemon.active.clone(),
             token.clone(),
         );
     }
@@ -5709,29 +5713,26 @@ fn spawn_network_publisher(
     })
 }
 
-/// Publish this node's contact record (`ray connect`) while the VPN is active.
-/// Republishes on a TTL/2 interval (record TTL is 300s) so `contact_key ->
-/// current endpoint` stays fresh; skips publishing while on standby so an
-/// inactive node is unreachable for connect requests (the requester sees it
-/// offline). Reads `contact_secret` fresh from config each cycle so a
-/// `RotateContact` takes effect without a restart.
+/// Publish this node's contact record (`ray connect`).
+/// Publishes the `contact_key -> current endpoint` pkarr record on a TTL/2
+/// interval (record TTL is 300s). Runs for the lifetime of the daemon (control
+/// plane), not gated by the data-plane `active` flag, so standby nodes stay
+/// reachable for `ray connect` requests. Reads `contact_secret` fresh from
+/// config each cycle so a `RotateContact` takes effect without a restart.
 fn spawn_contact_publisher(
     client: PkarrRelayClient,
     endpoint_id: EndpointId,
-    active: Arc<AtomicBool>,
     token: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if active.load(Ordering::SeqCst) {
-                let secret = config::load().ok().and_then(|c| c.contact_secret_key);
-                if let Some(secret) = secret {
-                    match dht::publish_contact(&client, &secret, endpoint_id).await {
-                        Ok(()) => {
-                            tracing::debug!(contact = %secret.public().fmt_short(), "published contact record")
-                        }
-                        Err(e) => tracing::warn!(error = %e, "failed to publish contact record"),
+            let secret = config::load().ok().and_then(|c| c.contact_secret_key);
+            if let Some(secret) = secret {
+                match dht::publish_contact(&client, &secret, endpoint_id).await {
+                    Ok(()) => {
+                        tracing::debug!(contact = %secret.public().fmt_short(), "published contact record")
                     }
+                    Err(e) => tracing::warn!(error = %e, "failed to publish contact record"),
                 }
             }
             tokio::select! {
