@@ -94,6 +94,20 @@ pub struct DisconnectEvent {
     pub intentional: bool,
 }
 
+/// Shared data-plane handles threaded into every per-peer reader. All fields are
+/// cheap `Clone` (channels and Arc-backed handles), so a reader is spawned with a
+/// single cloned context instead of six separate arguments. Built once per active
+/// network and reused across reconnects.
+#[derive(Clone)]
+pub struct ForwardCtx {
+    pub firewall: SharedFirewall,
+    pub tun_tx: mpsc::Sender<Bytes>,
+    pub disconnect_tx: mpsc::Sender<DisconnectEvent>,
+    pub token: CancellationToken,
+    pub stats: Arc<ForwardMetrics>,
+    pub device_user_map: DeviceUserMap,
+}
+
 /// True when a parsed packet is a DNS query addressed to the magic resolver IP.
 pub(crate) fn is_magic_dns(info: &firewall::PacketInfo) -> bool {
     info.dst_port == 53 && info.dst_ip == IpAddr::V4(crate::dns::MAGIC_DNS_V4)
@@ -193,20 +207,22 @@ pub async fn run_mesh(
 /// Spawns a task that reads QUIC datagrams from a single peer connection and
 /// forwards them to the TUN writer via `tun_tx`. On connection loss, sends a
 /// [`DisconnectEvent`] and exits.
-#[allow(clippy::too_many_arguments)]
 pub fn spawn_peer_reader(
     conn: Connection,
     peer_id: EndpointId,
     peer_ip: Ipv4Addr,
     peer_ipv6: std::net::Ipv6Addr,
     network: String,
-    firewall: SharedFirewall,
-    tun_tx: mpsc::Sender<Bytes>,
-    disconnect_tx: mpsc::Sender<DisconnectEvent>,
-    token: CancellationToken,
-    stats: Arc<ForwardMetrics>,
-    device_user_map: DeviceUserMap,
+    ctx: ForwardCtx,
 ) -> tokio::task::JoinHandle<()> {
+    let ForwardCtx {
+        firewall,
+        tun_tx,
+        disconnect_tx,
+        token,
+        stats,
+        device_user_map,
+    } = ctx;
     use tracing::Instrument as _;
     // Tag every event from this reader (drops, connection-lost) with the peer
     // and network so the report bundle's logs are correlatable per peer.
