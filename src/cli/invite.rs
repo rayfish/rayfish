@@ -72,96 +72,117 @@ pub(crate) async fn ipc_invite(network: &str, action: Option<InviteAction>) -> R
             code,
             id,
             expires_secs,
-        } => {
-            println!();
-            println!(
-                "  {} {} {}",
-                style::check(),
-                style::value("invite"),
-                style::faint(&id)
-            );
-            println!();
-            println!("  {}", style::bold(&code));
-            println!();
-            if show_qr {
-                qr2term::print_qr(&code).ok();
-            }
-            print_next(&[(&format!("ray join {code}"), "the holder runs this to join")]);
-            if !show_qr {
-                println!("  {}", style::faint("add --qr for a scannable QR code"));
-            }
-            println!();
-            let days = expires_secs / 86400;
-            let hours = (expires_secs % 86400) / 3600;
-            let ttl = if days > 0 {
-                format!("{days}d")
-            } else if hours > 0 {
-                format!("{hours}h")
-            } else {
-                format!("{}m", expires_secs / 60)
-            };
-            if reusable_requested {
-                println!("  reusable (multi-use), expires in {ttl}");
-                println!(
-                    "  servers join unattended with: {}",
-                    style::faint(&format!(
-                        "ray join {code} --hostname <h> --auto-accept-firewall"
-                    ))
-                );
-            } else {
-                println!("  single-use, expires in {ttl}");
-            }
-            if let Some(h) = &hostname_opt {
-                println!("  binds hostname: {}", style::bold(h));
-            }
-        }
-        ipc::IpcMessage::InviteListResponse { invites } => {
-            if json_enabled() {
-                print_json(&serde_json::json!(
-                    invites
-                        .iter()
-                        .map(|i| serde_json::json!({
-                            "id": i.id, "status": i.status, "redeemer": i.redeemer,
-                            "hostname": i.hostname, "reusable": i.reusable,
-                            "created": i.created, "expires": i.expires,
-                        }))
-                        .collect::<Vec<_>>()
-                ));
-            } else if invites.is_empty() {
-                println!("\n  {}\n", style::faint("no invites"));
-            } else {
-                let rows = invites
-                    .iter()
-                    .map(|inv| {
-                        let kind = if inv.reusable {
-                            "reusable"
-                        } else {
-                            "single-use"
-                        };
-                        let host = inv.hostname.clone().unwrap_or_else(|| "—".to_string());
-                        let who = inv.redeemer.clone().unwrap_or_else(|| "—".to_string());
-                        vec![
-                            layout::Cell::new(inv.id.clone(), style::rose(&inv.id)),
-                            layout::Cell::new(inv.status.clone(), style::value(&inv.status)),
-                            layout::Cell::new(kind, style::faint(kind)),
-                            layout::Cell::new(host.clone(), style::faint(&host)),
-                            layout::Cell::new(who.clone(), style::faint(&who)),
-                        ]
-                    })
-                    .collect();
-                println!();
-                print!(
-                    "{}",
-                    table(&["id", "status", "kind", "host", "redeemer"], rows, 2)
-                );
-                println!();
-            }
-        }
+        } => print_invite_created(
+            &code,
+            &id,
+            expires_secs,
+            show_qr,
+            reusable_requested,
+            &hostname_opt,
+        ),
+        ipc::IpcMessage::InviteListResponse { invites } => print_invite_list(&invites),
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => print_error("error", &message, None),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
+}
+
+/// Render a freshly minted invite: id, join code, optional QR, TTL, and the
+/// reusable/single-use + hostname-binding notes.
+fn print_invite_created(
+    code: &str,
+    id: &str,
+    expires_secs: u64,
+    show_qr: bool,
+    reusable_requested: bool,
+    hostname_opt: &Option<String>,
+) {
+    println!();
+    println!(
+        "  {} {} {}",
+        style::check(),
+        style::value("invite"),
+        style::faint(id)
+    );
+    println!();
+    println!("  {}", style::bold(code));
+    println!();
+    if show_qr {
+        qr2term::print_qr(code).ok();
+    }
+    print_next(&[(&format!("ray join {code}"), "the holder runs this to join")]);
+    if !show_qr {
+        println!("  {}", style::faint("add --qr for a scannable QR code"));
+    }
+    println!();
+    let days = expires_secs / 86400;
+    let hours = (expires_secs % 86400) / 3600;
+    let ttl = if days > 0 {
+        format!("{days}d")
+    } else if hours > 0 {
+        format!("{hours}h")
+    } else {
+        format!("{}m", expires_secs / 60)
+    };
+    if reusable_requested {
+        println!("  reusable (multi-use), expires in {ttl}");
+        println!(
+            "  servers join unattended with: {}",
+            style::faint(&format!(
+                "ray join {code} --hostname <h> --auto-accept-firewall"
+            ))
+        );
+    } else {
+        println!("  single-use, expires in {ttl}");
+    }
+    if let Some(h) = hostname_opt {
+        println!("  binds hostname: {}", style::bold(h));
+    }
+}
+
+/// Render the invite ledger as JSON (when `--json`) or an aligned table.
+fn print_invite_list(invites: &[ipc::InviteInfo]) {
+    if json_enabled() {
+        print_json(&serde_json::json!(
+            invites
+                .iter()
+                .map(|i| serde_json::json!({
+                    "id": i.id, "status": i.status, "redeemer": i.redeemer,
+                    "hostname": i.hostname, "reusable": i.reusable,
+                    "created": i.created, "expires": i.expires,
+                }))
+                .collect::<Vec<_>>()
+        ));
+    } else if invites.is_empty() {
+        println!("\n  {}\n", style::faint("no invites"));
+    } else {
+        let rows = invites
+            .iter()
+            .map(|inv| {
+                let kind = if inv.reusable {
+                    "reusable"
+                } else {
+                    "single-use"
+                };
+                let host = inv.hostname.clone().unwrap_or_else(|| "—".to_string());
+                let who = inv.redeemer.clone().unwrap_or_else(|| "—".to_string());
+                vec![
+                    layout::Cell::new(inv.id.clone(), style::rose(&inv.id)),
+                    layout::Cell::new(inv.status.clone(), style::value(&inv.status)),
+                    layout::Cell::new(kind, style::faint(kind)),
+                    layout::Cell::new(host.clone(), style::faint(&host)),
+                    layout::Cell::new(who.clone(), style::faint(&who)),
+                ]
+            })
+            .collect();
+        println!();
+        print!(
+            "{}",
+            table(&["id", "status", "kind", "host", "redeemer"], rows, 2)
+        );
+        println!();
+    }
 }
 
 pub(crate) async fn ipc_requests(network: &str) -> Result<()> {
