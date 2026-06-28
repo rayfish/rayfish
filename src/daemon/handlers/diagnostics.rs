@@ -21,100 +21,7 @@ impl DaemonState {
         let statuses: Vec<NetworkStatus> = self
             .networks
             .iter()
-            .map(|h| {
-                // Build the peer list from the *roster* (every known member),
-                // not just the live connections — so `ray status` shows offline
-                // peers too (Tailscale-style). A peer with no active connection
-                // gets `connection: None`; the CLI renders it with an offline dot.
-                let (members, member_count, pending_suggestions, pending_requests) = {
-                    let s = match h.state.read() {
-                        Ok(s) => s,
-                        Err(_) => {
-                            return NetworkStatus {
-                                name: h.name.clone(),
-                                role: if direct_names.contains(&h.name) {
-                                    NetworkRole::Direct
-                                } else {
-                                    h.role.clone()
-                                },
-                                my_ip: h.my_ip,
-                                my_ipv6: Some(derive_ipv6(&my_id)),
-                                my_hostname: None,
-                                network_key: Some(h.network_key.to_string()),
-                                member_count: 0,
-                                peers: vec![],
-                                pending_suggestions: 0,
-                                pending_requests: 0,
-                            };
-                        }
-                    };
-                    let count = s.members.all().len();
-                    (s.roster(), count, s.pending_suggestions.len(), s.pending.len())
-                };
-                // Index live connections by endpoint id for a fast lookup.
-                let connected: HashMap<EndpointId, Connection> = self
-                    .peers
-                    .peers_for_network_with_conn(&h.name)
-                    .into_iter()
-                    .map(|(eid, _, conn)| (eid, conn))
-                    .collect();
-                let network_key = Some(h.network_key.to_string());
-                let peers = members
-                    .iter()
-                    .filter(|m| m.identity != my_id)
-                    .map(|m| {
-                        let hostname = m.hostname.clone().or_else(|| {
-                            hostname_snapshot.as_ref().and_then(|table| {
-                                table.get(&h.name).and_then(|hosts| {
-                                    hosts
-                                        .iter()
-                                        .find(|(_, v)| v.0 == m.ip)
-                                        .map(|(k, _)| k.clone())
-                                })
-                            })
-                        });
-                        let connection = connected.get(&m.identity).map(Self::gather_conn_info);
-                        let user_id = self.device_user_map.resolve(&m.identity);
-                        let user_identity = if user_id != m.identity {
-                            Some(user_id)
-                        } else {
-                            None
-                        };
-                        PeerStatus {
-                            endpoint_id: m.identity,
-                            ip: m.ip,
-                            ipv6: Some(derive_ipv6(&m.identity)),
-                            hostname,
-                            user_identity,
-                            connection,
-                        }
-                    })
-                    .collect();
-                let my_hostname = hostname_snapshot.as_ref().and_then(|table| {
-                    table.get(&h.name).and_then(|hosts| {
-                        hosts
-                            .iter()
-                            .find(|(_, v)| v.0 == h.my_ip)
-                            .map(|(k, _)| k.clone())
-                    })
-                });
-                NetworkStatus {
-                    name: h.name.clone(),
-                    role: if direct_names.contains(&h.name) {
-                        NetworkRole::Direct
-                    } else {
-                        h.role.clone()
-                    },
-                    my_ip: h.my_ip,
-                    my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
-                    my_hostname,
-                    network_key,
-                    member_count,
-                    peers,
-                    pending_suggestions,
-                    pending_requests,
-                }
-            })
+            .map(|h| self.network_status(&h, my_id, hostname_snapshot.as_deref(), &direct_names))
             .collect();
 
         IpcMessage::StatusResponse {
@@ -130,6 +37,91 @@ impl DaemonState {
             bytes_tx: self.stats.bytes_tx.get(),
             pending_files: self.protocol_router.pending_files.lock().unwrap().len(),
             pending_connects: self.protocol_router.pending_connects.len(),
+        }
+    }
+
+    /// Build one network's `NetworkStatus` for `ray status`. The peer list comes
+    /// from the *roster* (every known member, not just live connections) so
+    /// offline peers still show (Tailscale-style) with `connection: None`.
+    fn network_status(
+        &self,
+        h: &NetworkHandle,
+        my_id: EndpointId,
+        hostname_snapshot: Option<&HashMap<String, HashMap<String, dns::HostnameEntry>>>,
+        direct_names: &std::collections::HashSet<String>,
+    ) -> NetworkStatus {
+        // Direct-connection networks are tagged `[direct]` regardless of role.
+        let role = if direct_names.contains(&h.name) {
+            NetworkRole::Direct
+        } else {
+            h.role.clone()
+        };
+        // Resolve a mesh IPv4 back to its `.ray` hostname via the DNS snapshot.
+        let lookup_hostname = |ip| {
+            hostname_snapshot.and_then(|table| {
+                table.get(&h.name).and_then(|hosts| {
+                    hosts.iter().find(|(_, v)| v.0 == ip).map(|(k, _)| k.clone())
+                })
+            })
+        };
+
+        let (members, member_count, pending_suggestions, pending_requests) = {
+            let s = match h.state.read() {
+                Ok(s) => s,
+                Err(_) => {
+                    return NetworkStatus {
+                        name: h.name.clone(),
+                        role,
+                        my_ip: h.my_ip,
+                        my_ipv6: Some(derive_ipv6(&my_id)),
+                        my_hostname: None,
+                        network_key: Some(h.network_key.to_string()),
+                        member_count: 0,
+                        peers: vec![],
+                        pending_suggestions: 0,
+                        pending_requests: 0,
+                    };
+                }
+            };
+            let count = s.members.all().len();
+            (s.roster(), count, s.pending_suggestions.len(), s.pending.len())
+        };
+        // Index live connections by endpoint id for a fast lookup.
+        let connected: HashMap<EndpointId, Connection> = self
+            .peers
+            .peers_for_network_with_conn(&h.name)
+            .into_iter()
+            .map(|(eid, _, conn)| (eid, conn))
+            .collect();
+        let peers = members
+            .iter()
+            .filter(|m| m.identity != my_id)
+            .map(|m| {
+                let hostname = m.hostname.clone().or_else(|| lookup_hostname(m.ip));
+                let connection = connected.get(&m.identity).map(Self::gather_conn_info);
+                let user_id = self.device_user_map.resolve(&m.identity);
+                let user_identity = (user_id != m.identity).then_some(user_id);
+                PeerStatus {
+                    endpoint_id: m.identity,
+                    ip: m.ip,
+                    ipv6: Some(derive_ipv6(&m.identity)),
+                    hostname,
+                    user_identity,
+                    connection,
+                }
+            })
+            .collect();
+        NetworkStatus {
+            name: h.name.clone(),
+            role,
+            my_ip: h.my_ip,
+            my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
+            my_hostname: lookup_hostname(h.my_ip),
+            network_key: Some(h.network_key.to_string()),
+            member_count,
+            peers,
+            pending_suggestions,
+            pending_requests,
         }
     }
 

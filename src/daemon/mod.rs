@@ -710,15 +710,7 @@ impl MemberAcceptState {
         };
         // Resolve hostname collisions
         let final_hostname = if let Some(desired) = hostname {
-            let taken: Vec<String> = {
-                let s = self.state.read().unwrap();
-                s.members
-                    .all()
-                    .iter()
-                    .filter(|m| m.identity != peer_identity)
-                    .filter_map(|m| m.hostname.clone())
-                    .collect()
-            };
+            let taken = self.state.read().unwrap().taken_hostnames(peer_identity);
             let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
             Some(crate::hostname::resolve_collision(&desired, &taken_refs))
         } else {
@@ -1202,6 +1194,17 @@ impl NetworkState {
         self.approved.all().into_iter().cloned().collect()
     }
 
+    /// Hostnames currently claimed by other members (excluding `except`), used to
+    /// resolve a rename/join collision against the roster.
+    fn taken_hostnames(&self, except: EndpointId) -> Vec<String> {
+        self.members
+            .all()
+            .iter()
+            .filter(|m| m.identity != except)
+            .filter_map(|m| m.hostname.clone())
+            .collect()
+    }
+
     fn refresh_snapshot(&mut self) {
         let bytes = canonical_group_bytes(
             &self.members,
@@ -1672,15 +1675,7 @@ impl DaemonState {
         // roster up front. A member applies its requested name optimistically and
         // lets the coordinator correct it via the authoritative MemberSync.
         let new_hostname = if is_coord {
-            let taken: Vec<String> = {
-                let s = state.read().unwrap();
-                s.members
-                    .all()
-                    .iter()
-                    .filter(|m| m.identity != my_identity)
-                    .filter_map(|m| m.hostname.clone())
-                    .collect()
-            };
+            let taken = state.read().unwrap().taken_hostnames(my_identity);
             let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
             hostname::resolve_collision(hostname, &taken_refs)
         } else {
@@ -1731,43 +1726,55 @@ impl DaemonState {
             update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
             broadcast_member_sync(&self.peers, None).await;
         } else {
-            // Notify the coordinator via MeshHello (sent to all connected peers;
-            // only the coordinator's continuous control reader acts on it). It
-            // resolves collisions and broadcasts the authoritative MemberSync.
-            let peers = self.peers.peers_for_network_with_conn(network);
-            tracing::info!(
-                network = %network,
-                hostname = %new_hostname,
-                connected_peers = peers.len(),
-                "member rename queued as pending intent; sending MeshHello to connected peers"
-            );
-            let mut sent = 0usize;
-            for (_peer_id, _peer_ip, conn) in &peers {
-                if let Ok((mut send, _recv)) = conn.open_bi().await {
-                    let msg = ControlMsg::MeshHello {
-                        identity: my_identity,
-                        ip: my_ip,
-                        hostname: Some(new_hostname.clone()),
-                        device_cert: self.device_cert.clone(),
-                    };
-                    if control::send_msg(&mut send, &msg).await.is_ok() {
-                        sent += 1;
-                    }
-                }
-            }
-            tracing::debug!(
-                network = %network,
-                hostname = %new_hostname,
-                sent,
-                connected_peers = peers.len(),
-                "fast-path rename MeshHello delivered; drain backstop covers the rest"
-            );
+            self.announce_rename_to_peers(network, my_identity, my_ip, &new_hostname)
+                .await;
         }
 
         let dns_name = format!("{}.{}.{}", new_hostname, network, crate::DNS_DOMAIN);
         IpcMessage::Ok {
             message: format!("hostname set to {} ({})", new_hostname, dns_name),
         }
+    }
+
+    /// Fast-path a member's rename to its connected peers via `MeshHello` (only
+    /// the coordinator's continuous control reader acts on it — resolving
+    /// collisions and broadcasting the authoritative `MemberSync`). The durable
+    /// `pending_hostname` intent + reconverge drain backstop the rest.
+    async fn announce_rename_to_peers(
+        &self,
+        network: &str,
+        my_identity: EndpointId,
+        my_ip: Ipv4Addr,
+        new_hostname: &str,
+    ) {
+        let peers = self.peers.peers_for_network_with_conn(network);
+        tracing::info!(
+            network = %network,
+            hostname = %new_hostname,
+            connected_peers = peers.len(),
+            "member rename queued as pending intent; sending MeshHello to connected peers"
+        );
+        let mut sent = 0usize;
+        for (_peer_id, _peer_ip, conn) in &peers {
+            if let Ok((mut send, _recv)) = conn.open_bi().await {
+                let msg = ControlMsg::MeshHello {
+                    identity: my_identity,
+                    ip: my_ip,
+                    hostname: Some(new_hostname.to_string()),
+                    device_cert: self.device_cert.clone(),
+                };
+                if control::send_msg(&mut send, &msg).await.is_ok() {
+                    sent += 1;
+                }
+            }
+        }
+        tracing::debug!(
+            network = %network,
+            hostname = %new_hostname,
+            sent,
+            connected_peers = peers.len(),
+            "fast-path rename MeshHello delivered; drain backstop covers the rest"
+        );
     }
 
     pub(crate) fn resolve_short_id_any_network(&self, short: &str) -> Option<EndpointId> {
