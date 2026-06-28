@@ -13,6 +13,7 @@ failure). The shared SSH/deploy/reset/assert plumbing lives in
 | [`connect/`](connect) | 2 | The `ray connect` direct 2-peer friend-request flow over the public pkarr DHT — request, approve, `[direct]` network, ping + `ray send`, per-network firewall, offline negative case. |
 | [`firewall/`](firewall) | 3 | The coordinator suggested-firewall pipeline (`suggest` → `pending`/`accept`, `auto-accept`, additive whitelist vs blacklist) and the per-packet rule matrix (UDP, port ranges, same-selector replace, `--network` scoping) over a real TUN. |
 | [`closed-net/`](closed-net) | 3 | Closed-net admission + lifecycle commands: live approval (`requests`/`accept`/`deny`), co-coordinator (`admin add`) gatekeeper resilience with a reusable key, `ray hostname` + magic-DNS, `ray leave`/`nuke`, and a `ray apply` smoke. |
+| [`apply/`](apply) | 3 | Declarative `ray apply` deploy end to end: create-if-absent + membership-gap diff, `--invite-missing`, `ray identityof`, alias/group expansion (`--dry-run`), real suggestion publish + data-plane enforcement, and `--prune`. |
 
 Everything runs through one dispatcher, [`../e2e.sh`](../e2e.sh):
 
@@ -22,8 +23,8 @@ tests/e2e.sh <scenario> provision   # just spin up instances -> <dir>/.servers
 tests/e2e.sh <scenario> teardown    # destroy the instances (manual)
 ```
 
-where `<scenario>` is `device-cert`, `connect`, `firewall`, `closed-net`, or
-`bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
+where `<scenario>` is `device-cert`, `connect`, `firewall`, `closed-net`,
+`apply`, `dns`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
 (still runnable directly once `.servers` exists); the fleet definitions and the
 provision/teardown/assert bodies are shared in [`../lib/`](../lib).
 
