@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Aliases and groups in `ray apply`** — a spec can now define optional
+  top-level `aliases:` (a friendly name → a user's identity string) and
+  `groups:` (a name → a list of aliases and/or hostnames), then reference them
+  as firewall subjects or peers instead of listing every hostname. An alias
+  names a person and expands to all of that person's currently-joined devices;
+  a group expands to the union of its members. Expansion happens client-side at
+  apply time, so the published rules are plain per-host suggestions. Aliases
+  resolve only for members that have already joined (a `note:` is printed and
+  the rule skipped until they do); literal hostnames still work before a host
+  joins. `ray apply --dry-run` shows the fully expanded result.
+- **`ray identityof <net> <host>`** — print a host's identity string (the value
+  to paste into a spec's `aliases:`). Resolves to the user identity if the
+  device is paired, else the device's transport identity. `--json` supported.
 - **`ray ping <peer>`** — active mesh diagnostics: sends live echo probes to a
   peer (by hostname, mesh IP, or short id) and reports per-probe round-trip
   latency, packet loss, and whether the path is direct or relayed. `-c/--count`

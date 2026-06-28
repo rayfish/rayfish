@@ -365,21 +365,54 @@ pub(crate) async fn ipc_apply(
     if spec.networks.is_empty() {
         anyhow::bail!("spec contains no networks");
     }
-    if dry_run {
+    let has_dynamic = !spec.aliases.is_empty() || !spec.groups.is_empty();
+
+    // A dry-run with no aliases/groups needs nothing from the daemon: just echo
+    // the normalized spec (the historical behavior).
+    if dry_run && !has_dynamic {
         println!("{}", style::bold("Spec (normalized):"));
         print!("{}", apply::to_yaml(&spec)?);
         println!("{}", style::faint("(dry-run; no changes applied)"));
         return Ok(());
     }
 
-    // Fetch live state once: status gives active networks + joined hostnames.
-    let status_networks = ipc_status_networks().await?;
+    // Validate alias identity strings CLI-side (where iroh parsing lives) and
+    // canonicalize them so comparison against peer ids is format-insensitive.
+    let aliases = canonicalize_aliases(&spec.aliases)?;
+
+    // Fetch live state once: status gives this node's identity, active networks,
+    // per-peer identities, and joined hostnames.
+    let (self_id, status_networks) = ipc_status_full().await?;
     let active_names: std::collections::HashSet<&str> =
         status_networks.iter().map(|n| n.name.as_str()).collect();
 
+    // Expand groups/aliases against live status into a pure hostname-keyed spec.
+    let mut expanded = apply::DeploySpec::default();
+    for (net_name, fw) in &spec.networks {
+        let resolve = |identity: &str| -> Vec<String> {
+            resolve_identity_hosts(&status_networks, net_name, &self_id, identity)
+        };
+        let (efw, empty_aliases) =
+            apply::expand_firewall(fw, &aliases, &spec.groups, &resolve);
+        for a in empty_aliases {
+            eprintln!(
+                "{}  {net_name}: alias '{a}' has no joined devices yet; its rules are skipped",
+                style::faint("note:")
+            );
+        }
+        expanded.networks.insert(net_name.clone(), efw);
+    }
+
+    if dry_run {
+        println!("{}", style::bold("Spec (expanded):"));
+        print!("{}", apply::to_yaml(&expanded)?);
+        println!("{}", style::faint("(dry-run; no changes applied)"));
+        return Ok(());
+    }
+
     let mut missing_hosts: Vec<(String, String)> = Vec::new(); // (network, hostname)
 
-    for (net_name, net_firewall) in &spec.networks {
+    for (net_name, net_firewall) in &expanded.networks {
         let is_active = active_names.contains(net_name.as_str());
         // Create-if-absent (always a closed network).
         if !is_active {
@@ -422,7 +455,7 @@ pub(crate) async fn ipc_apply(
 
         // B3 — membership diff for this network.
         let joined = joined_hostnames(&status_networks, net_name);
-        for host in apply::expected_hosts(&spec) {
+        for host in apply::expected_hosts(&expanded) {
             if !joined.iter().any(|j| j == &host) {
                 missing_hosts.push((net_name.clone(), host));
             }
@@ -484,13 +517,115 @@ pub(crate) fn joined_hostnames(networks: &[ipc::NetworkStatus], network: &str) -
     hosts.into_iter().collect()
 }
 
-pub(crate) async fn ipc_status_networks() -> Result<Vec<ipc::NetworkStatus>> {
+/// `ray identityof <net> <host>`: print the identity string to paste into a
+/// spec's `aliases:` map. Resolves to the user identity if the device is paired,
+/// else the device's transport identity. Open read.
+pub(crate) async fn cmd_identityof(network: &str, hostname: &str, json: bool) -> Result<()> {
+    let (self_id, networks) = ipc_status_full().await?;
+    let net = networks
+        .iter()
+        .find(|n| n.name == network)
+        .ok_or_else(|| anyhow::anyhow!("network '{network}' not found (is it active?)"))?;
+
+    // (identity, paired) for the matching host: self matches by device identity;
+    // a peer prefers its user identity when paired.
+    let found: Option<(String, bool)> = if net.my_hostname.as_deref() == Some(hostname) {
+        Some((self_id, false))
+    } else {
+        net.peers
+            .iter()
+            .find(|p| p.hostname.as_deref() == Some(hostname))
+            .map(|p| match p.user_identity {
+                Some(u) => (u.to_string(), true),
+                None => (p.endpoint_id.to_string(), false),
+            })
+    };
+
+    let Some((identity, paired)) = found else {
+        anyhow::bail!(
+            "host '{hostname}' is not currently joined on '{network}' \
+             (an alias can only name an already-joined member)"
+        );
+    };
+
+    if json {
+        print_json(&serde_json::json!({
+            "network": network,
+            "hostname": hostname,
+            "identity": identity,
+            "paired": paired,
+        }));
+    } else {
+        println!("{identity}");
+    }
+    Ok(())
+}
+
+/// Fetch live status: this node's own device identity (as a canonical string)
+/// plus every network's roster. The identity is needed to resolve an alias that
+/// names the coordinator itself.
+pub(crate) async fn ipc_status_full() -> Result<(String, Vec<ipc::NetworkStatus>)> {
     let mut stream = ipc::connect().await?;
     ipc::send(&mut stream, ipc::IpcMessage::Status).await?;
     match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::StatusResponse { networks, .. } => Ok(networks),
+        ipc::IpcMessage::StatusResponse {
+            endpoint_id,
+            networks,
+            ..
+        } => Ok((endpoint_id.to_string(), networks)),
         other => anyhow::bail!("unexpected status response: {other:?}"),
     }
+}
+
+/// Parse and canonicalize each alias's identity value (`name -> identity`),
+/// erroring on a value that isn't a valid identity so a typo fails fast instead
+/// of silently resolving to nothing.
+fn canonicalize_aliases(
+    aliases: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    aliases
+        .iter()
+        .map(|(name, id)| {
+            let parsed = id.parse::<iroh::EndpointId>().map_err(|_| {
+                anyhow::anyhow!(
+                    "alias '{name}' has an invalid identity '{id}' (copy it from `ray identityof <net> <host>`)"
+                )
+            })?;
+            Ok((name.clone(), parsed.to_string()))
+        })
+        .collect()
+}
+
+/// Collect the hostnames currently joined for `identity` in `network`: every
+/// peer whose device or user identity matches, plus this node itself when the
+/// alias names the coordinator's own device. Returns sorted, unique hostnames.
+fn resolve_identity_hosts(
+    networks: &[ipc::NetworkStatus],
+    network: &str,
+    self_id: &str,
+    identity: &str,
+) -> Vec<String> {
+    let Some(net) = networks.iter().find(|n| n.name == network) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    if self_id == identity
+        && let Some(h) = &net.my_hostname
+    {
+        out.push(h.clone());
+    }
+    for p in &net.peers {
+        let dev = p.endpoint_id.to_string();
+        let usr = p.user_identity.map(|u| u.to_string());
+        if (dev == identity || usr.as_deref() == Some(identity))
+            && let Some(h) = &p.hostname
+        {
+            out.push(h.clone());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 pub(crate) async fn ipc_apply_create(name: &str) -> Result<()> {

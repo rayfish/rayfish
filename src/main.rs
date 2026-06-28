@@ -239,6 +239,16 @@ pub(crate) enum Command {
         /// New hostname (e.g. "alice" → alice.network.ray)
         name: String,
     },
+    /// Print a host's identity string (the value to paste into a `ray apply`
+    /// spec's `aliases:` map). Resolves to the user identity if the device is
+    /// paired, else the device's transport identity.
+    #[command(visible_alias = "whois")]
+    Identityof {
+        /// Network name
+        network: String,
+        /// Hostname to look up
+        hostname: String,
+    },
     /// Enable or disable mDNS local peer discovery
     Mdns {
         /// "on" or "off"
@@ -866,6 +876,9 @@ async fn main() -> Result<()> {
             example,
         } => ipc_apply(spec, prune, dry_run, invite_missing, example).await,
         Command::Hostname { network, name } => ipc_set_hostname(&network, &name).await,
+        Command::Identityof { network, hostname } => {
+            cmd_identityof(&network, &hostname, cli.json).await
+        }
         Command::Mdns { state } => cmd_mdns(&state),
         Command::Config { action } => cmd_config(action, cli.json),
         Command::SetOperator { user } => cmd_set_operator(&user).await,
