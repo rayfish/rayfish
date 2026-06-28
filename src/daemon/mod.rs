@@ -164,7 +164,7 @@ pub(crate) fn to_approved_entries<'a>(
 struct CoordinatorAcceptState {
     ctx: MeshCtx,
     network_name: String,
-    state: Arc<std::sync::RwLock<NetworkState>>,
+    state: SharedNetworkState,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
@@ -639,7 +639,7 @@ impl CoordinatorAcceptState {
 struct MemberAcceptState {
     ctx: MeshCtx,
     network_name: String,
-    state: Arc<std::sync::RwLock<NetworkState>>,
+    state: SharedNetworkState,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
 }
@@ -736,50 +736,8 @@ impl MemberAcceptState {
             .await;
         }
         if is_approved {
-            let (snap_bytes, ip) = {
-                let mut s = self.state.write().unwrap();
-                let approved_entry = s.approved.remove(&peer_identity);
-                let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
-                // Trust the authoritative IP + collision index recorded when the
-                // peer was approved, not the peer-supplied MeshHello.ip.
-                let (member_ip, member_idx) = approved_entry
-                    .as_ref()
-                    .map(|e| (e.ip, e.collision_index))
-                    .unwrap_or((ip, 0));
-                let _ = s.members.add(Member {
-                    identity: peer_identity,
-                    ip: member_ip,
-                    is_coordinator: false,
-                    hostname: final_hostname.clone(),
-                    user_identity: user_id_opt,
-                    device_cert: device_cert.clone(),
-                    collision_index: member_idx,
-                });
-                s.refresh_snapshot();
-                (
-                    s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone()),
-                    member_ip,
-                )
-            };
-            if let Some(bytes) = snap_bytes {
-                let _ = self.ctx.blob_store.blobs().add_slice(&bytes).await;
-            }
-            let (members, approved_list) = {
-                let s = self.state.read().unwrap();
-                (s.roster(), s.approved_snapshot())
-            };
-            if let Ok((mut send, _)) = conn.open_bi().await {
-                let _ = control::send_msg(
-                    &mut send,
-                    &ControlMsg::Welcome {
-                        members: members.clone(),
-                        approved: approved_list,
-                    },
-                )
+            self.admit_approved_member(conn, peer_identity, ip, final_hostname, device_cert)
                 .await;
-            }
-            self.register_peer(conn, peer_identity, ip);
-            broadcast_member_sync(&self.ctx.peers, Some(ip)).await;
         } else if is_member {
             if final_hostname.is_some() {
                 let mut s = self.state.write().unwrap();
@@ -789,6 +747,64 @@ impl MemberAcceptState {
             }
             self.register_peer(conn, peer_identity, ip);
         }
+    }
+
+    /// Promote a previously-approved peer to a full member on its `MeshHello`:
+    /// seat it with the authoritative IP recorded at approval (not the
+    /// peer-supplied one), republish the blob, send `Welcome`, start its reader,
+    /// and trigger a `MemberSync` so the rest of the mesh learns the new roster.
+    async fn admit_approved_member(
+        &self,
+        conn: Connection,
+        peer_identity: EndpointId,
+        ip: Ipv4Addr,
+        final_hostname: Option<String>,
+        device_cert: Option<control::DeviceCert>,
+    ) {
+        let (snap_bytes, ip) = {
+            let mut s = self.state.write().unwrap();
+            let approved_entry = s.approved.remove(&peer_identity);
+            let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
+            // Trust the authoritative IP + collision index recorded when the
+            // peer was approved, not the peer-supplied MeshHello.ip.
+            let (member_ip, member_idx) = approved_entry
+                .as_ref()
+                .map(|e| (e.ip, e.collision_index))
+                .unwrap_or((ip, 0));
+            let _ = s.members.add(Member {
+                identity: peer_identity,
+                ip: member_ip,
+                is_coordinator: false,
+                hostname: final_hostname.clone(),
+                user_identity: user_id_opt,
+                device_cert: device_cert.clone(),
+                collision_index: member_idx,
+            });
+            s.refresh_snapshot();
+            (
+                s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone()),
+                member_ip,
+            )
+        };
+        if let Some(bytes) = snap_bytes {
+            let _ = self.ctx.blob_store.blobs().add_slice(&bytes).await;
+        }
+        let (members, approved_list) = {
+            let s = self.state.read().unwrap();
+            (s.roster(), s.approved_snapshot())
+        };
+        if let Ok((mut send, _)) = conn.open_bi().await {
+            let _ = control::send_msg(
+                &mut send,
+                &ControlMsg::Welcome {
+                    members,
+                    approved: approved_list,
+                },
+            )
+            .await;
+        }
+        self.register_peer(conn, peer_identity, ip);
+        broadcast_member_sync(&self.ctx.peers, Some(ip)).await;
     }
 }
 
@@ -1131,6 +1147,10 @@ struct GroupSnapshot {
     msgpack_bytes: Vec<u8>,
 }
 
+/// A per-network state cell shared (read-mostly) across the accept handlers,
+/// publisher, poller, and cleanup tasks for that network.
+pub(crate) type SharedNetworkState = Arc<std::sync::RwLock<NetworkState>>;
+
 pub(crate) struct NetworkState {
     members: MemberList,
     approved: ApprovedList,
@@ -1207,7 +1227,7 @@ pub struct NetworkHandle {
     network_key: EndpointId,
     role: NetworkRole,
     my_ip: Ipv4Addr,
-    state: Arc<std::sync::RwLock<NetworkState>>,
+    state: SharedNetworkState,
     /// DHT republish trigger; `Some` only on the coordinator (the sole publisher).
     /// Lets `set_hostname` re-publish the group blob on a coordinator self-rename.
     dht_notify: Option<Arc<tokio::sync::Notify>>,
@@ -1350,7 +1370,7 @@ impl DaemonState {
     pub(crate) fn register_coordinator_handler(
         &self,
         network: &str,
-        state: Arc<std::sync::RwLock<NetworkState>>,
+        state: SharedNetworkState,
         invite_lock: Arc<tokio::sync::Mutex<()>>,
         dht_notify: Option<Arc<tokio::sync::Notify>>,
         network_key: EndpointId,
@@ -2232,7 +2252,7 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<DaemonState>) -> Res
 fn spawn_network_publisher(
     client: PkarrRelayClient,
     net_secret_key: SecretKey,
-    state: Arc<std::sync::RwLock<NetworkState>>,
+    state: SharedNetworkState,
     endpoint_id: EndpointId,
     peers: PeerTable,
     network_name: String,
@@ -2319,7 +2339,7 @@ fn spawn_contact_publisher(
 fn spawn_lazy_publisher(
     client: PkarrRelayClient,
     net_secret_key: SecretKey,
-    state: Arc<std::sync::RwLock<NetworkState>>,
+    state: SharedNetworkState,
     endpoint_id: EndpointId,
     peers: PeerTable,
     network_name: String,
@@ -2512,7 +2532,7 @@ async fn reconverge_and_apply(
     ctx: &MeshCtx,
     net_pubkey: EndpointId,
     network_name: &str,
-    state: &Arc<std::sync::RwLock<NetworkState>>,
+    state: &SharedNetworkState,
     my_identity: EndpointId,
     alpn: &[u8],
     my_ip: Ipv4Addr,
@@ -2632,7 +2652,7 @@ fn gossip_targets(members: &[Member], me: EndpointId) -> Vec<EndpointId> {
 /// Whether `peer` is a coordinator in our verified roster. Invite-gossip arms
 /// (`InviteShare`/`InviteUsed`) act only on messages from a coordinator peer, so
 /// a non-coordinator member can't inject or burn invite state.
-fn sender_is_coordinator(state: &Arc<std::sync::RwLock<NetworkState>>, peer: EndpointId) -> bool {
+fn sender_is_coordinator(state: &SharedNetworkState, peer: EndpointId) -> bool {
     state
         .read()
         .unwrap()
@@ -2717,7 +2737,7 @@ fn persisted_roster(network_name: &str) -> Vec<Member> {
 fn spawn_group_poller(
     client: PkarrRelayClient,
     net_pubkey: EndpointId,
-    state: Arc<std::sync::RwLock<NetworkState>>,
+    state: SharedNetworkState,
     endpoint: Endpoint,
     ctx: MeshCtx,
     network_name: String,
@@ -2845,7 +2865,7 @@ fn spawn_group_poller(
 /// peer leaves deliberately (`ray leave`). Members pass `None` and only ever
 /// drop the connection from the [`PeerTable`].
 struct CoordinatorCleanup {
-    state: Arc<std::sync::RwLock<NetworkState>>,
+    state: SharedNetworkState,
     blob_store: FsStore,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
     hostname_table: dns::HostnameTable,
@@ -2914,7 +2934,7 @@ fn spawn_coordinator_control_reader(
     remote_id: EndpointId,
     peer_ip: Ipv4Addr,
     network_name: String,
-    state: Arc<std::sync::RwLock<NetworkState>>,
+    state: SharedNetworkState,
     ctx: MeshCtx,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
     token: CancellationToken,
@@ -3320,7 +3340,7 @@ fn now_secs() -> u64 {
 }
 
 async fn update_snapshot_and_publish(
-    state: &Arc<std::sync::RwLock<NetworkState>>,
+    state: &SharedNetworkState,
     blob_store: &FsStore,
     dht_notify: &Option<Arc<tokio::sync::Notify>>,
 ) {
@@ -3341,7 +3361,7 @@ async fn update_snapshot_and_publish(
 /// Result of the initial join handshake against the coordinator.
 enum JoinResult {
     /// Admitted (open network, valid invite, or pre-approved): live network state.
-    Joined(Arc<std::sync::RwLock<NetworkState>>),
+    Joined(SharedNetworkState),
     /// Queued for live approval on a closed network; the caller should retry.
     Pending,
 }
@@ -4112,7 +4132,7 @@ mod accept_handler_tests {
     use std::sync::Arc;
 
     // Build a minimal NetworkState for use in test AcceptHandler construction.
-    fn make_network_state() -> Arc<std::sync::RwLock<NetworkState>> {
+    fn make_network_state() -> SharedNetworkState {
         let net_secret = iroh::SecretKey::from_bytes(&[1u8; 32]);
         let net_pub = net_secret.public();
         Arc::new(std::sync::RwLock::new(NetworkState {

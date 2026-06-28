@@ -40,7 +40,7 @@ impl DaemonState {
         &self,
         name: &str,
         net_secret_key: &SecretKey,
-        state: &Arc<std::sync::RwLock<NetworkState>>,
+        state: &SharedNetworkState,
         dht_notify: &Arc<tokio::sync::Notify>,
         cancel: &CancellationToken,
     ) -> (
@@ -471,7 +471,7 @@ impl DaemonState {
 
             // Resources produced by a successful coordinator handshake.
             type JoinResources = (
-                Arc<std::sync::RwLock<NetworkState>>,
+                SharedNetworkState,
                 CancellationToken,
                 mpsc::Sender<forward::DisconnectEvent>,
                 Vec<tokio::task::JoinHandle<()>>,
