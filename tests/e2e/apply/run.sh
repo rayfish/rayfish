@@ -54,7 +54,13 @@ wait_all_ssh "$A" "$B" "$C"
 seed_known_hosts "$A" "$B" "$C"
 reset_state "$A" "$B" "$C"
 deploy_all "$ROOT" "$A" "$B" "$C"
-for h in "$A" "$B" "$C"; do on "$h" 'ray up' >/dev/null 2>&1 || true; done
+# srv-a is the coordinator + apply driver and the spec names it `srv-a`. Pin its
+# default hostname so the network it *creates* (apply never joins) is owned under
+# `srv-a`, not a generated alias — otherwise srv-a is reported as a missing host
+# and peers can't resolve the `srv-a` subject. srv-b/srv-c get their names from
+# the invite binding (`--hostname srv-b|srv-c`), so only srv-a needs this.
+on "$A" 'ray up --hostname srv-a' >/dev/null 2>&1 || true
+for h in "$B" "$C"; do on "$h" 'ray up' >/dev/null 2>&1 || true; done
 wait_daemons "$A" "$B" "$C"
 
 # ---------------------------------------------------------------------------
@@ -76,6 +82,10 @@ echo "$APPLY1" | grep -q "ray invite $NET --hostname srv-c" \
 # apply never joins — the members must not have the network yet.
 ! has_net "$B" "$NET" && ! has_net "$C" "$NET" \
   && pass "apply did not auto-join the members" || fail "apply unexpectedly joined a member"
+# Consent is per-node: srv-b/srv-c auto-accept via their join flag, but srv-a (the
+# coordinator) must opt in to materialize its own suggested rules (step 5 asserts
+# the coordinator installs the rules it publishes for itself).
+on "$A" "ray firewall auto-accept $NET on" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 step "2. --invite-missing mints invites; the named hosts join"
