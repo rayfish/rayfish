@@ -1,0 +1,4 @@
+.servers
+*.tmp
+*.log
+results
