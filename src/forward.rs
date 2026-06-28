@@ -96,9 +96,8 @@ pub struct DisconnectEvent {
 
 /// Shared data-plane handles threaded into every per-peer reader. All fields are
 /// cheap `Clone` (channels and Arc-backed handles), so a reader is spawned with a
-/// single cloned context instead of six separate arguments. Built once per active
-/// network and reused across reconnects.
-#[derive(Clone)]
+/// single bundle instead of six separate arguments. Built per spawn from the
+/// daemon's `MeshCtx` via `MeshCtx::forward_ctx`.
 pub struct ForwardCtx {
     pub firewall: SharedFirewall,
     pub tun_tx: mpsc::Sender<Bytes>,
