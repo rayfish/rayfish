@@ -499,6 +499,28 @@ impl DaemonState {
             warnings.push(format!("failed to install loopback self-route: {e}"));
         }
 
+        self.configure_magic_dns(&mut warnings).await;
+
+        tracing::info!("data plane activated");
+        if warnings.is_empty() {
+            IpcMessage::Ok {
+                message: "VPN up".into(),
+            }
+        } else {
+            let mut message = String::from("VPN up, but some things need attention:");
+            for w in &warnings {
+                message.push_str("\n  - ");
+                message.push_str(w);
+            }
+            IpcMessage::Ok { message }
+        }
+    }
+
+    /// Point system DNS at the in-daemon Magic DNS resolver: detect the OS DNS
+    /// backend, merge any user-configured upstreams over the captured ones, and
+    /// (Linux direct-resolv.conf mode) spawn the inotify re-assert watcher.
+    /// Failures are non-fatal — pushed to `warnings` so `ray up` can surface them.
+    async fn configure_magic_dns(&self, warnings: &mut Vec<String>) {
         // Configure system DNS to route .ray queries to our in-daemon resolver.
         dns_config::restore_stale_backups();
         match dns_config::detect_and_configure(&self.tun_name).await {
@@ -531,20 +553,6 @@ impl DaemonState {
                     "failed to configure system DNS, so .ray names won't resolve: {e}"
                 ));
             }
-        }
-
-        tracing::info!("data plane activated");
-        if warnings.is_empty() {
-            IpcMessage::Ok {
-                message: "VPN up".into(),
-            }
-        } else {
-            let mut message = String::from("VPN up, but some things need attention:");
-            for w in &warnings {
-                message.push_str("\n  - ");
-                message.push_str(w);
-            }
-            IpcMessage::Ok { message }
         }
     }
 
