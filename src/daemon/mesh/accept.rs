@@ -358,65 +358,14 @@ impl CoordinatorAcceptState {
         // peer can claim another's name to take its suggested firewall rules.
         authoritative: bool,
     ) -> bool {
-        // Assign the IP authoritatively from the current roster: lowest free
-        // collision index whose derived IPv4 isn't already held by a *different*
-        // identity. This (not the peer-suggested address) is what we store and
-        // report back, so two coordinators that both admit at index 0 produce a
-        // roster the reconverge tiebreak can resolve deterministically.
-        let (peer_ip, collision_index) = {
-            let s = self.state.read().unwrap();
-            crate::membership::assign_ip(&s.members, &remote_id)
-        };
-        // Resolve the hostname. An authoritative (invite-bound) name already bound
-        // to a different identity is rejected. A joiner-chosen name keeps
-        // collision resolution (`name` → `name-1` → …).
-        let final_hostname = if let Some(desired) = hostname {
-            let taken = {
-                let s = self.state.read().unwrap();
-                s.members
-                    .all()
-                    .iter()
-                    .filter(|m| m.identity != remote_id)
-                    .filter_map(|m| m.hostname.clone())
-                    .collect::<Vec<String>>()
-            };
-            let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
-            match crate::hostname::admission_hostname(&desired, &taken_refs, authoritative) {
-                Ok(name) => Some(name),
-                Err(conflict) => {
-                    self.deny(
-                        &conn,
-                        send,
-                        format!("hostname '{conflict}' is already in use on this network"),
-                    )
-                    .await;
+        let (peer_ip, collision_index, final_hostname) =
+            match self.validate_admission(remote_id, hostname, authoritative) {
+                Ok(plan) => plan,
+                Err(reason) => {
+                    self.deny(&conn, send, reason).await;
                     return false;
                 }
-            }
-        } else {
-            None
-        };
-
-        // Reject an IP collision with a different identity.
-        let collision = {
-            let s = self.state.read().unwrap();
-            if let Some(existing) = s.members.get_by_ip(peer_ip) {
-                existing.identity != remote_id
-            } else if let Some(existing) = s.approved.get_by_ip(peer_ip) {
-                existing.identity != remote_id
-            } else {
-                false
-            }
-        };
-        if collision {
-            self.deny(
-                &conn,
-                send,
-                format!("IP collision: {peer_ip} already assigned"),
-            )
-            .await;
-            return false;
-        }
+            };
 
         let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
         let snap_bytes = {
@@ -484,17 +433,80 @@ impl CoordinatorAcceptState {
         }
         broadcast_member_sync(&self.ctx.peers, Some(peer_ip)).await;
 
+        self.spawn_admitted_member_tasks(conn, remote_id, peer_ip);
+        true
+    }
+
+    /// Decide a joiner's authoritative IP + hostname from the current roster, or
+    /// return a denial reason. The IP is the lowest free collision index (not the
+    /// peer-suggested address) so two coordinators admitting at index 0 produce a
+    /// roster the reconverge tiebreak resolves deterministically. An invite-bound
+    /// (`authoritative`) hostname already held by a different identity is rejected
+    /// (no silent rename); a joiner-chosen name keeps collision resolution
+    /// (`name` → `name-1` → …). An IP collision with a different identity is also
+    /// rejected.
+    fn validate_admission(
+        &self,
+        remote_id: EndpointId,
+        hostname: Option<String>,
+        authoritative: bool,
+    ) -> std::result::Result<(Ipv4Addr, u32, Option<String>), String> {
+        let (peer_ip, collision_index) = {
+            let s = self.state.read().unwrap();
+            crate::membership::assign_ip(&s.members, &remote_id)
+        };
+        let final_hostname = if let Some(desired) = hostname {
+            let taken = {
+                let s = self.state.read().unwrap();
+                s.members
+                    .all()
+                    .iter()
+                    .filter(|m| m.identity != remote_id)
+                    .filter_map(|m| m.hostname.clone())
+                    .collect::<Vec<String>>()
+            };
+            let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
+            match crate::hostname::admission_hostname(&desired, &taken_refs, authoritative) {
+                Ok(name) => Some(name),
+                Err(conflict) => {
+                    return Err(format!(
+                        "hostname '{conflict}' is already in use on this network"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let collision = {
+            let s = self.state.read().unwrap();
+            if let Some(existing) = s.members.get_by_ip(peer_ip) {
+                existing.identity != remote_id
+            } else if let Some(existing) = s.approved.get_by_ip(peer_ip) {
+                existing.identity != remote_id
+            } else {
+                false
+            }
+        };
+        if collision {
+            return Err(format!("IP collision: {peer_ip} already assigned"));
+        }
+        Ok((peer_ip, collision_index, final_hostname))
+    }
+
+    /// Register an admitted member in the peer table and start its control reader
+    /// (so a later rename via `MeshHello` propagates immediately, not only after a
+    /// reconnect) plus its inbound data-plane reader.
+    fn spawn_admitted_member_tasks(
+        &self,
+        conn: Connection,
+        remote_id: EndpointId,
+        peer_ip: Ipv4Addr,
+    ) {
         let peer_ipv6 = derive_ipv6(&remote_id);
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
-        self.ctx.peers.add(
-            peer_ip,
-            peer_ipv6,
-            conn.clone(),
-            remote_id,
-            &self.network_name,
-        );
-        // Keep reading control streams from this member so a later rename (sent
-        // as a MeshHello) propagates immediately, not just after a reconnect.
+        self.ctx
+            .peers
+            .add(peer_ip, peer_ipv6, conn.clone(), remote_id, &self.network_name);
         spawn_coordinator_control_reader(
             conn.clone(),
             remote_id,
@@ -516,7 +528,6 @@ impl CoordinatorAcceptState {
             self.ctx
                 .forward_ctx(self.disconnect_tx.clone(), self.token.clone()),
         );
-        true
     }
 }
 

@@ -144,6 +144,66 @@ impl MeshManager {
     /// `ray status` can tag it). `pre_approve` adds a peer to the `ApprovedList`
     /// before the blob is signed/published, so the named peer can be welcomed
     /// without a separate `ray accept` round-trip — used by `approve_connection`.
+    /// Build the initial [`NetworkState`] for a freshly created network: the
+    /// creator as sole coordinator, plus any `pre_approve` peer (a `ray connect`
+    /// requester) admitted up front so the published blob already carries the
+    /// approval and the peer is welcomed on its join without a separate
+    /// `ray accept`.
+    fn build_initial_roster(
+        &self,
+        name: &str,
+        my_ip: Ipv4Addr,
+        my_hostname: &str,
+        mode: GroupMode,
+        net_secret_key: &SecretKey,
+        pre_approve: Option<(EndpointId, Option<String>)>,
+    ) -> Result<NetworkState> {
+        let mut member_list = MemberList::new();
+        member_list
+            .add(Member {
+                identity: self.identity.local_identity(),
+                ip: my_ip,
+                is_coordinator: true,
+                hostname: Some(my_hostname.to_string()),
+                user_identity: None,
+                device_cert: None,
+                collision_index: 0,
+            })
+            .expect("self-add cannot collide");
+
+        let mut approved = ApprovedList::new();
+        if let Some((peer_id, peer_hostname)) = pre_approve {
+            let peer_ip = self.identity.derive_ip(&peer_id);
+            approved
+                .approve(
+                    ApprovedEntry {
+                        identity: peer_id,
+                        ip: peer_ip,
+                        hostname: peer_hostname,
+                        user_identity: None,
+                        device_cert: None,
+                        collision_index: 0,
+                    },
+                    &member_list,
+                )
+                .map_err(|e| anyhow::anyhow!("failed to pre-approve peer: {e:?}"))?;
+        }
+
+        Ok(NetworkState {
+            members: member_list,
+            approved,
+            snapshot: None,
+            network_secret_key: Some(net_secret_key.clone()),
+            network_public_key: net_secret_key.public(),
+            network_name: Some(name.to_string()),
+            mode,
+            suggested_firewall: SuggestedFirewall::default(),
+            reusable_keys: BTreeMap::new(),
+            pending_suggestions: Vec::new(),
+            pending: HashMap::new(),
+        })
+    }
+
     pub(crate) async fn create_network_inner(
         &self,
         mode: GroupMode,
@@ -189,18 +249,8 @@ impl MeshManager {
                 .unwrap_or_else(crate::hostname::generate_hostname),
         };
 
-        let mut member_list = MemberList::new();
-        member_list
-            .add(Member {
-                identity: self.identity.local_identity(),
-                ip: my_ip,
-                is_coordinator: true,
-                hostname: Some(my_hostname.clone()),
-                user_identity: None,
-                device_cert: None,
-                collision_index: 0,
-            })
-            .expect("self-add cannot collide");
+        let mut net_state =
+            self.build_initial_roster(&name, my_ip, &my_hostname, mode, &net_secret_key, pre_approve)?;
 
         // Register in DNS hostname table
         dns::update_hostname(
@@ -212,41 +262,6 @@ impl MeshManager {
             derive_ipv6(&self.identity.local_identity()),
         )
         .await;
-
-        let mut approved = ApprovedList::new();
-        // Pre-approve the requesting peer (ray connect), so the published blob
-        // already carries the approval and the peer is welcomed on its join
-        // without a separate `ray accept`.
-        if let Some((peer_id, peer_hostname)) = pre_approve {
-            let peer_ip = self.identity.derive_ip(&peer_id);
-            approved
-                .approve(
-                    ApprovedEntry {
-                        identity: peer_id,
-                        ip: peer_ip,
-                        hostname: peer_hostname,
-                        user_identity: None,
-                        device_cert: None,
-                        collision_index: 0,
-                    },
-                    &member_list,
-                )
-                .map_err(|e| anyhow::anyhow!("failed to pre-approve peer: {e:?}"))?;
-        }
-
-        let mut net_state = NetworkState {
-            members: member_list,
-            approved,
-            snapshot: None,
-            network_secret_key: Some(net_secret_key.clone()),
-            network_public_key: net_public_key,
-            network_name: Some(name.clone()),
-            mode,
-            suggested_firewall: SuggestedFirewall::default(),
-            reusable_keys: BTreeMap::new(),
-            pending_suggestions: Vec::new(),
-            pending: HashMap::new(),
-        };
 
         self.seal_and_publish(&mut net_state, &net_secret_key).await;
 
