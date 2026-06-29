@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey,
     address_lookup::{PkarrPublisher, PkarrResolver},
-    endpoint::Builder,
+    endpoint::{Builder, QuicTransportConfig},
     endpoint::Connection,
     endpoint::presets,
 };
@@ -105,7 +105,25 @@ async fn bind_endpoint(
         .alpns(alpns.to_vec())
         .clear_ip_transports()
         .bind_addr(bind)
-        .context("invalid bind address")?;
+        .context("invalid bind address")?
+        // Rayfish's data plane is a single stream of QUIC datagrams per peer
+        // (TUN packets → `send_datagram`), with a few reliable control streams per
+        // connection. Tune the transport config for that shape:
+        //   - `send_fairness(false)`: no competing data streams of equal priority
+        //     to round-robin, so fairness scheduling is pure overhead. (Affects
+        //     stream scheduling only, not datagrams, but is the correct setting and
+        //     removes a small amount of per-packet work.)
+        //   - GSO on (default): confirmed explicit so a future change can't silently
+        //     regress it. GSO coalesces same-destination segments into one sendmsg,
+        //     cutting syscalls under burst.
+        //   - Datagrams enabled (iroh/noq default `Some` receive buffer); the send
+        //     buffer stays at the 1 MiB default, sized via `datagram_send_buffer_space`
+        //     on the hot path (see `forward::run_mesh`).
+        // The congestion controller stays at the noq default (Cubic). Switching to
+        // BBR3 would help on lossy/shallow-buffer consumer uplinks but requires a
+        // `noq-proto` dependency to reach the config type — deferred to a measured
+        // follow-up (see iroh-audit BASELINE.md, cross-parameter sweep).
+        .transport_config(quic_transport_config());
 
     // Override the N0 preset's relay / discovery defaults when configured.
     if let Some(mode) = build_relay_mode(relay)? {
@@ -133,6 +151,24 @@ async fn bind_endpoint(
     }
 
     builder.bind().await.context("failed to bind iroh endpoint")
+}
+
+/// Builds the [`QuicTransportConfig`] for rayfish's data-plane shape (one stream
+/// of QUIC datagrams per peer, plus a few reliable control streams).
+///
+/// Starts from iroh's builder defaults (which carry the multipath / NAT-traversal
+/// / heartbeat settings required for holepunching) and only overrides the
+/// datagram-relevant knobs. See `bind_endpoint` for the rationale.
+fn quic_transport_config() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        // No competing data streams of equal priority → disable round-robin
+        // fairness scheduling (removes overhead; correct for a single datagram
+        // stream per peer).
+        .send_fairness(false)
+        // Keep GSO on (default) explicitly so a future change can't silently
+        // regress it.
+        .enable_segmentation_offload(true)
+        .build()
 }
 
 /// Build a custom [`RelayMode`] from a relay override, or `None` when unset (in
