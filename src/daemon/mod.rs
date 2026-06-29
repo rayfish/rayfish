@@ -13,8 +13,8 @@
 //!   (real shutdown / `IpcMessage::Shutdown`).
 //! - **Active VPN state** — the TUN link being *up*, system DNS being
 //!   configured, and the saved networks being connected. This is toggled at
-//!   runtime by [`DaemonState::activate`] / [`DaemonState::deactivate`], driven
-//!   by the `Up` / `Down` IPC commands, and tracked by [`DaemonState::active`].
+//!   runtime by [`MeshManager::activate`] / [`MeshManager::deactivate`], driven
+//!   by the `Up` / `Down` IPC commands, and tracked by [`MeshManager::active`].
 //!
 //! This mirrors Tailscale's split between the always-running `tailscaled`
 //! daemon and the `tailscale up` / `tailscale down` client toggles: `down`
@@ -78,11 +78,25 @@ use crate::transport;
 use crate::tun::{self, check_cgnat_conflict};
 use ray_proto::SuggestedFirewall;
 
-// `DaemonState`'s IPC handlers are split by domain into the `handlers/`
-// submodule; see `handlers/mod.rs`. Each holds an additional `impl DaemonState`
-// block. Nested a level down so the module names can be the clean domain names
-// without colliding with the `use crate::{firewall, dns, …}` aliases above.
-mod handlers;
+// `MeshManager`'s IPC operations are split by domain into the `mesh/` submodule;
+// see `mesh/mod.rs`. Each holds an additional `impl MeshManager` block. Nested a
+// level down so the module names can be the clean domain names without colliding
+// with the `use crate::{firewall, dns, …}` aliases above.
+mod mesh;
+// Re-export the join machinery (moved to `mesh/join.rs`) at the daemon level so
+// the other `mesh/` submodules reach it through their `use super::super::*` glob.
+pub(crate) use mesh::{JoinParams, JoinResult, TryJoin, join_mesh_shared, spawn_reconnect_loop};
+
+// Domain satellites with their own owned state (and ALPN accept arms), held by
+// `MeshManager` as fields rather than loose on the core. See each module.
+mod dns_manager;
+pub(crate) use dns_manager::DnsManager;
+
+mod file_service;
+pub(crate) use file_service::FileService;
+
+mod connect_service;
+pub(crate) use connect_service::ConnectService;
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -96,7 +110,7 @@ const PAIR_ALPN: &[u8] = b"rayfish/pair/1";
 /// background task. Every field is a cheap `Clone` — an `Arc`-backed handle, a
 /// channel sender, or a small wrapper — so the whole bundle is cloned by value
 /// instead of threaded as a dozen separate arguments/struct fields. Built once
-/// per daemon via [`DaemonState::mesh_ctx`]; a new daemon-wide dependency is one
+/// per daemon via [`MeshManager::mesh_ctx`]; a new daemon-wide dependency is one
 /// field here rather than one parameter at every call site.
 #[derive(Clone)]
 pub(crate) struct MeshCtx {
@@ -834,44 +848,17 @@ impl ProtocolHandler for MeshProtocol {
     }
 }
 
-struct PendingFile {
-    id: u64,
-    from: EndpointId,
-    filename: String,
-    size: u64,
-    mime_type: String,
-    blob_hash: blake3::Hash,
-}
-
-/// A pending incoming `ray connect` request, awaiting `ray connections approve`.
-/// Keyed by the requester's transport endpoint id (not contact id) so it
-/// survives the requester rotating their contact key.
-#[derive(Clone)]
-struct PendingConnect {
-    from_contact_id: EndpointId,
-    from_endpoint: EndpointId,
-    hostname: Option<String>,
-    requested_at: Instant,
-}
-
 struct ProtocolRouter {
     blobs: BlobsProtocol,
     handlers: DashMap<Vec<u8>, Arc<MeshProtocol>>,
-    pending_files: Arc<std::sync::Mutex<Vec<PendingFile>>>,
-    file_id_counter: Arc<AtomicU64>,
-    pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
-    secret_key: SecretKey,
-    /// `ray connect` requests received on `CONNECT_ALPN`, awaiting approval.
-    /// Keyed by the requester's transport endpoint id.
-    pending_connects: Arc<DashMap<EndpointId, PendingConnect>>,
-    /// Approved connect requests: requester endpoint id → (room id, coordinator).
-    /// The `CONNECT_ALPN` handler replies `Approved` from here when the requester
-    /// re-dials after `ray connections approve`.
-    approved_connects: Arc<DashMap<EndpointId, (EndpointId, EndpointId)>>,
-    /// Peer endpoints we have sent an outgoing `ray connect` request to. Used by
-    /// the concurrency tie-break: if both peers requested *and* approved each
-    /// other, only the higher endpoint id mints, avoiding a duplicate network.
-    outgoing_connects: Arc<DashSet<EndpointId>>,
+    /// File-transfer + pairing state and their ALPN accept arms. The accept loop
+    /// delegates the `FILES_ALPN`/`PAIR_ALPN` arms to this; `MeshManager` holds
+    /// the same handle for the IPC-side file/pairing commands.
+    files: Arc<FileService>,
+    /// `ray connect` state (pending/approved/outgoing maps) and the `CONNECT_ALPN`
+    /// accept arm. The accept loop delegates to this; `MeshManager` holds the same
+    /// handle for the IPC-side connect commands.
+    connect: Arc<ConnectService>,
     /// In-flight `ray ping` probes, keyed by nonce. The control reader fires the
     /// oneshot when the matching `Pong` arrives so the ping handler can measure
     /// round-trip time. Cloned into both control readers.
@@ -879,21 +866,12 @@ struct ProtocolRouter {
 }
 
 impl ProtocolRouter {
-    fn new(
-        blobs: BlobsProtocol,
-        secret_key: SecretKey,
-        pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
-    ) -> Self {
+    fn new(blobs: BlobsProtocol, files: Arc<FileService>, connect: Arc<ConnectService>) -> Self {
         Self {
             blobs,
             handlers: DashMap::new(),
-            pending_files: Arc::new(std::sync::Mutex::new(Vec::new())),
-            file_id_counter: Arc::new(AtomicU64::new(1)),
-            pairing_secret,
-            secret_key,
-            pending_connects: Arc::new(DashMap::new()),
-            approved_connects: Arc::new(DashMap::new()),
-            outgoing_connects: Arc::new(DashSet::new()),
+            files,
+            connect,
             pending_pongs: Arc::new(DashMap::new()),
         }
     }
@@ -914,177 +892,6 @@ impl ProtocolRouter {
         alpns.push(PAIR_ALPN.to_vec());
         alpns.push(transport::CONNECT_ALPN.to_vec());
         alpns
-    }
-
-    /// `FILES_ALPN`: read a single `FileOffer` and queue it for `ray files`.
-    /// Rejects offers whose claimed sender doesn't match the dialing identity.
-    async fn accept_file_offer(&self, conn: Connection) {
-        let pending = self.pending_files.clone();
-        let counter = self.file_id_counter.clone();
-        let remote_id = conn.remote_id();
-        match conn.accept_bi().await {
-            Ok((_send, mut recv)) => {
-                match control::recv_msg(&mut recv).await {
-                    Ok(control::ControlMsg::FileOffer { from, filename, size, mime_type, blob_hash }) => {
-                        if from == remote_id {
-                            let id = counter.fetch_add(1, Ordering::Relaxed);
-                            tracing::info!(from = %from.fmt_short(), filename = %filename, size, "file offer received");
-                            pending.lock().unwrap().push(PendingFile { id, from, filename, size, mime_type, blob_hash });
-                        } else {
-                            tracing::warn!(claimed = %from.fmt_short(), actual = %remote_id.fmt_short(), "file offer identity mismatch");
-                        }
-                    }
-                    Ok(other) => {
-                        tracing::warn!(msg = ?other, "unexpected control message on FILES_ALPN");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to read file offer");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to accept bi stream for file offer");
-            }
-        }
-    }
-
-    /// `PAIR_ALPN`: complete a device-pairing handshake. Verifies the dialer's
-    /// secret against the active pairing session and, on match, signs and returns
-    /// a `DeviceCert` binding the new device key to our identity.
-    async fn accept_pair_request(&self, conn: Connection) {
-        let pairing_secret = self.pairing_secret.clone();
-        let secret_key = self.secret_key.clone();
-        let remote_id = conn.remote_id();
-        match conn.accept_bi().await {
-            Ok((mut send, mut recv)) => {
-                // Read length-prefixed PairMsg::Request
-                let mut len_buf = [0u8; 4];
-                if let Err(e) = recv.read_exact(&mut len_buf).await {
-                    tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to read pair request length");
-                    return;
-                }
-                let body_len = u32::from_be_bytes(len_buf) as usize;
-                let mut body = vec![0u8; body_len];
-                if let Err(e) = recv.read_exact(&mut body).await {
-                    tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to read pair request body");
-                    return;
-                }
-                let request: control::PairMsg = match rmp_serde::from_slice(&body) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to decode pair request");
-                        return;
-                    }
-                };
-                match request {
-                    control::PairMsg::Request { secret, device_pubkey } => {
-                        // Verify the secret matches the stored pairing secret
-                        let stored = pairing_secret.lock().unwrap().take();
-                        match stored {
-                            Some(expected) if expected == secret => {
-                                // Sign the device's public key
-                                let cert = control::DeviceCert::create(&secret_key, &device_pubkey);
-                                let response = control::PairMsg::Response { cert };
-                                let response_bytes = match rmp_serde::to_vec_named(&response) {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "failed to encode pair response");
-                                        return;
-                                    }
-                                };
-                                let len = (response_bytes.len() as u32).to_be_bytes();
-                                if let Err(e) = send.write_all(&len).await {
-                                    tracing::warn!(error = %e, "failed to send pair response length");
-                                    return;
-                                }
-                                if let Err(e) = send.write_all(&response_bytes).await {
-                                    tracing::warn!(error = %e, "failed to send pair response body");
-                                    return;
-                                }
-                                // Flush before the connection drops: finish the stream and wait
-                                // (briefly) for the joiner to close. Returning here drops `conn`,
-                                // which RSTs the stream — without this the joiner often sees
-                                // "connection lost" and never receives the cert even though we
-                                // logged success below.
-                                let _ = send.finish();
-                                let _ = tokio::time::timeout(
-                                    Duration::from_secs(5),
-                                    conn.closed(),
-                                )
-                                .await;
-                                tracing::info!(device = %device_pubkey.fmt_short(), "device paired successfully");
-                            }
-                            Some(_) => {
-                                tracing::warn!(peer = %remote_id.fmt_short(), "pairing secret mismatch");
-                            }
-                            None => {
-                                tracing::warn!(peer = %remote_id.fmt_short(), "no pairing session active");
-                            }
-                        }
-                    }
-                    _ => {
-                        tracing::warn!(peer = %remote_id.fmt_short(), "unexpected pair message type");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to accept bi stream for pairing");
-            }
-        }
-    }
-
-    /// `CONNECT_ALPN`: handle a `ray connect` friend request. Binds the request
-    /// to the dialing identity, replies `Approved` if already accepted
-    /// (idempotent), else queues it as `Pending` for `ray connections approve`.
-    async fn accept_connect_request(&self, conn: Connection) {
-        let pending = self.pending_connects.clone();
-        let approved = self.approved_connects.clone();
-        let remote_id = conn.remote_id();
-        match conn.accept_bi().await {
-            Ok((mut send, mut recv)) => {
-                let request: control::ConnectMsg = match control::recv_framed(&mut recv).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to read connect request");
-                        return;
-                    }
-                };
-                if let control::ConnectMsg::Request { from_contact_id, from_endpoint, hostname } = request {
-                    // Bind the request to the dialing identity: the
-                    // endpoint we pre-approve must be the one that dialed.
-                    if from_endpoint != remote_id {
-                        tracing::warn!(claimed = %from_endpoint.fmt_short(), actual = %remote_id.fmt_short(), "connect request endpoint mismatch");
-                        let _ = control::send_framed(&mut send, &control::ConnectMsg::Denied { reason: "endpoint mismatch".to_string() }).await;
-                        return;
-                    }
-                    // Already approved? Reply with the minted room id so
-                    // a re-dialing requester joins it (idempotent).
-                    let already = approved.get(&from_endpoint).map(|r| *r.value());
-                    let reply = if let Some((room_id, coordinator)) = already {
-                        control::ConnectMsg::Approved { room_id, coordinator }
-                    } else {
-                        pending.insert(from_endpoint, PendingConnect {
-                            from_contact_id,
-                            from_endpoint,
-                            hostname,
-                            requested_at: Instant::now(),
-                        });
-                        tracing::info!(from = %from_contact_id.fmt_short(), endpoint = %from_endpoint.fmt_short(), "connect request received");
-                        control::ConnectMsg::Pending
-                    };
-                    if let Err(e) = control::send_framed(&mut send, &reply).await {
-                        tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to send connect reply");
-                        return;
-                    }
-                    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
-                } else {
-                    tracing::warn!(peer = %remote_id.fmt_short(), "unexpected connect message type");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to accept bi stream for connect");
-            }
-        }
     }
 
     fn spawn_accept_loop(
@@ -1113,9 +920,9 @@ impl ProtocolRouter {
                                 a if a == iroh_blobs::protocol::ALPN => {
                                     let _ = router.blobs.clone().accept(conn).await;
                                 }
-                                a if a == transport::FILES_ALPN => router.accept_file_offer(conn).await,
-                                a if a == PAIR_ALPN => router.accept_pair_request(conn).await,
-                                a if a == transport::CONNECT_ALPN => router.accept_connect_request(conn).await,
+                                a if a == transport::FILES_ALPN => router.files.accept_file_offer(conn).await,
+                                a if a == PAIR_ALPN => router.files.accept_pair_request(conn).await,
+                                a if a == transport::CONNECT_ALPN => router.connect.accept_connect_request(conn).await,
                                 _ => {
                                     if let Some(handler) = router.handlers.get(&alpn).map(|r| r.clone()) {
                                         let _ = handler.accept(conn).await;
@@ -1256,7 +1063,7 @@ pub struct NetworkHandle {
 /// and background task. Holds both the infrastructure that lives for the whole
 /// process and the handles for the currently-active networks. See the
 /// module-level docs for the two-lifecycle model.
-pub struct DaemonState {
+pub struct MeshManager {
     endpoint: Endpoint,
     identity: IrohIdentityProvider,
     peers: PeerTable,
@@ -1269,11 +1076,16 @@ pub struct DaemonState {
     blob_store: FsStore,
     firewall: SharedFirewall,
     protocol_router: Arc<ProtocolRouter>,
-    hostname_table: dns::HostnameTable,
-    reverse_table: dns::ReverseLookupTable,
+    /// Magic DNS naming tables, resolver, and OS-DNS configurator (see [`DnsManager`]).
+    dns: DnsManager,
     mdns_enabled: bool,
     tun_name: String,
-    pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    /// File-transfer + pairing state and ALPN accept arms (see [`FileService`]).
+    /// Shared with [`ProtocolRouter`], which runs the accept arms.
+    files: Arc<FileService>,
+    /// `ray connect` state + ALPN accept arm (see [`ConnectService`]). Shared with
+    /// [`ProtocolRouter`], which runs the accept arm.
+    connect: Arc<ConnectService>,
     device_cert: Option<control::DeviceCert>,
     device_user_map: peers::DeviceUserMap,
     /// This node's contact id (`ray connect`): the public half of the rotatable
@@ -1284,18 +1096,12 @@ pub struct DaemonState {
     /// Whether the VPN is currently active (TUN up, networks connected) or on
     /// standby. Toggled by the `Up`/`Down` IPC commands.
     active: Arc<AtomicBool>,
-    /// The system-DNS configurator owned while active, so `Down` can revert it.
-    dns_configurator: Arc<std::sync::Mutex<Option<Box<dyn dns_config::DnsConfigurator>>>>,
-    /// In-daemon Magic DNS resolver (answers `.ray` queries intercepted via TUN).
-    resolver: std::sync::Arc<crate::dns_resolver::Resolver>,
-    /// Cancellation token for the `run_resolv_reassert` task (Linux direct mode).
-    dns_reassert_token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
     /// Promotion signal: a co-coordinator's per-peer control reader sends the
     /// network name here after persisting an `AdminGrant` key, and the main
     /// daemon loop ([`serve_ipc`]) drains it into
-    /// [`DaemonState::promote_to_coordinator`]. The reader holds only field
-    /// clones (not the full `DaemonState`), so it can't promote itself — hence
-    /// the channel hand-off to the loop that does hold the `Arc<DaemonState>`.
+    /// [`MeshManager::promote_to_coordinator`]. The reader holds only field
+    /// clones (not the full `MeshManager`), so it can't promote itself — hence
+    /// the channel hand-off to the loop that does hold the `Arc<MeshManager>`.
     promote_tx: mpsc::Sender<String>,
 }
 
@@ -1332,7 +1138,7 @@ fn should_promote(current: NetworkRole) -> bool {
     !current.is_coordinator()
 }
 
-impl DaemonState {
+impl MeshManager {
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
     /// handlers and background tasks. Every field is a cheap `Clone`.
     pub(crate) fn mesh_ctx(&self) -> MeshCtx {
@@ -1343,8 +1149,8 @@ impl DaemonState {
             stats: self.stats.clone(),
             blob_store: self.blob_store.clone(),
             firewall: self.firewall.clone(),
-            hostname_table: self.hostname_table.clone(),
-            reverse_table: self.reverse_table.clone(),
+            hostname_table: self.dns.hostname_table.clone(),
+            reverse_table: self.dns.reverse_table.clone(),
             device_user_map: self.device_user_map.clone(),
         }
     }
@@ -1690,10 +1496,11 @@ impl DaemonState {
         }
 
         // Update DNS table: remove old entry for our IP, insert new one.
-        dns::remove_hostname_by_ip(&self.hostname_table, &self.reverse_table, network, my_ip).await;
+        dns::remove_hostname_by_ip(&self.dns.hostname_table, &self.dns.reverse_table, network, my_ip)
+            .await;
         dns::update_hostname(
-            &self.hostname_table,
-            &self.reverse_table,
+            &self.dns.hostname_table,
+            &self.dns.reverse_table,
             network,
             &new_hostname,
             my_ip,
@@ -1921,8 +1728,8 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 
 /// Construct all always-on daemon infrastructure: identity, iroh endpoint, blob
 /// store, TUN device, forwarding loop, DNS resolver, mDNS discovery, protocol
-/// router, and metrics server. Returns the shared [`DaemonState`] — still on
-/// standby, so the caller is expected to run [`DaemonState::activate`] — and the
+/// router, and metrics server. Returns the shared [`MeshManager`] — still on
+/// standby, so the caller is expected to run [`MeshManager::activate`] — and the
 /// metrics-server guard, which must outlive the process.
 /// The ALPNs the endpoint advertises at boot: one per saved network plus the
 /// network-independent blobs / file-transfer / pairing / connect ALPNs. A
@@ -1947,7 +1754,7 @@ async fn build_daemon(
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
 ) -> Result<(
-    Arc<DaemonState>,
+    Arc<MeshManager>,
     Option<iroh_metrics::service::MetricsServer>,
     mpsc::Receiver<String>,
 )> {
@@ -1972,7 +1779,7 @@ async fn build_daemon(
     // before any record publish/resolve happens.
     dht::set_discovery_override(&app_config.discovery_dns);
     // Lazily generate + persist this node's contact key (`ray connect`). The
-    // secret stays in config; only its public id is held in `DaemonState`.
+    // secret stays in config; only its public id is held in `MeshManager`.
     let contact_public = config::contact_secret(&mut app_config).public();
     if let Err(e) = config::save_settings(&app_config) {
         tracing::warn!(error = %e, "failed to persist contact key");
@@ -2047,18 +1854,18 @@ async fn build_daemon(
         tracing::info!("mDNS discovery disabled");
     }
 
-    // --- Protocol router + the shared DaemonState ---
-    let pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    // --- Protocol router + the shared MeshManager ---
+    let files = Arc::new(FileService::new(key.clone()));
+    let connect = Arc::new(ConnectService::new());
     let protocol_router = Arc::new(ProtocolRouter::new(
         blobs_proto,
-        key.clone(),
-        pairing_secret.clone(),
+        files.clone(),
+        connect.clone(),
     ));
     // Promotion channel: a co-coordinator's control reader signals the main
     // daemon loop to swap in the coordinator accept handler on `AdminGrant`.
     let (promote_tx, promote_rx) = mpsc::channel::<String>(16);
-    let daemon = Arc::new(DaemonState {
+    let daemon = Arc::new(MeshManager {
         endpoint: ep,
         identity,
         peers,
@@ -2070,18 +1877,15 @@ async fn build_daemon(
         blob_store,
         firewall: shared_firewall,
         protocol_router: protocol_router.clone(),
-        hostname_table,
-        reverse_table,
+        dns: DnsManager::new(hostname_table, reverse_table, dns_resolver.clone()),
         mdns_enabled,
         tun_name,
-        pairing_secret,
+        files,
+        connect,
         device_cert,
         device_user_map,
         contact_public,
         active: active.clone(),
-        dns_configurator: Arc::new(std::sync::Mutex::new(None)),
-        resolver: dns_resolver.clone(),
-        dns_reassert_token: std::sync::Mutex::new(None),
         promote_tx,
     });
 
@@ -2185,7 +1989,7 @@ async fn spawn_metrics_server(
 /// connections, bring the TUN down) and remove the socket file. Each request is
 /// handled on its own task so a slow client can't block the accept loop.
 async fn serve_ipc(
-    daemon: &Arc<DaemonState>,
+    daemon: &Arc<MeshManager>,
     mut promote_rx: mpsc::Receiver<String>,
     token: CancellationToken,
 ) -> Result<()> {
@@ -2244,7 +2048,7 @@ fn set_socket_permissions(path: &std::path::Path) {
     }
 }
 
-async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<DaemonState>) -> Result<()> {
+async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<MeshManager>) -> Result<()> {
     let peer_cred = stream.peer_cred().ok().map(|c| (c.uid(), c.gid()));
     let mut framed = ipc::framed(stream);
     let req = ipc::recv(&mut framed).await?;
@@ -3366,694 +3170,6 @@ async fn update_snapshot_and_publish(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Result of the initial join handshake against the coordinator.
-enum JoinResult {
-    /// Admitted (open network, valid invite, or pre-approved): live network state.
-    Joined(SharedNetworkState),
-    /// Queued for live approval on a closed network; the caller should retry.
-    Pending,
-}
-
-/// Outcome of one `join_network_inner` attempt.
-pub(crate) enum TryJoin {
-    Joined(IpcMessage),
-    Pending,
-}
-
-/// By-value parameters for one [`join_mesh_shared`] handshake, grouped so the
-/// function's argument list stays manageable. These are all decided once, at the
-/// call site, per join: the joiner's chosen hostname and cert, the invite secret
-/// it presents, the blob-derived `suggested_firewall`/`reusable_keys` it
-/// inherits, its firewall consent, and whether this is a fresh join or a
-/// reconnect.
-struct JoinParams {
-    my_hostname: Option<String>,
-    net_pubkey: EndpointId,
-    device_cert: Option<control::DeviceCert>,
-    invite_secret: Option<Vec<u8>>,
-    /// From the fetched blob: the current coordinator-suggested firewall rules,
-    /// persisted so a member inherits them.
-    suggested_firewall: SuggestedFirewall,
-    /// From the fetched blob: reusable join keys, so this node can validate
-    /// redemptions if it later holds the network key (HA admission).
-    reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
-    /// Consent: auto-install suggested rules without a manual review queue.
-    auto_accept_firewall: bool,
-    /// Fresh join (send `JoinRequest` first) vs reconnect/restore (coordinator
-    /// speaks first).
-    initial: bool,
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn join_mesh_shared(
-    initial_conn: Connection,
-    ep: &Endpoint,
-    network_name: &str,
-    alpn: &[u8],
-    ctx: MeshCtx,
-    params: JoinParams,
-    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
-    token: CancellationToken,
-    // Promotion signal: the per-peer control reader sends this network's name
-    // here after persisting an `AdminGrant` key, so the daemon loop can swap in
-    // the coordinator accept handler (see `DaemonState::promote_to_coordinator`).
-    promote_tx: mpsc::Sender<String>,
-    // Guards the single-use invite ledger. Shared with the NetworkHandle so the
-    // control listener's `InviteShare`/`InviteUsed` handling (a co-coordinator
-    // learning of invites it didn't mint) is serialized with mint/redeem.
-    invite_lock: Arc<tokio::sync::Mutex<()>>,
-    // Shared with the router; lets the member control reader resolve `ray ping`
-    // Pongs back to the waiting handler.
-    pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
-) -> Result<JoinResult> {
-    // A whole-bundle clone for the debounced reconverge worker, which forwards
-    // the ctx straight to `reconverge_and_apply`.
-    let worker_ctx = ctx.clone();
-    let MeshCtx {
-        identity,
-        peers,
-        blob_store,
-        firewall,
-        ..
-    } = ctx;
-    let JoinParams {
-        my_hostname,
-        net_pubkey,
-        device_cert,
-        invite_secret,
-        suggested_firewall,
-        reusable_keys,
-        auto_accept_firewall,
-        initial,
-    } = params;
-    let my_identity = identity.local_identity();
-    let my_ip = identity.local_ip();
-
-    // Handshake. A fresh join (`initial`) opens a stream and sends a JoinRequest
-    // first (carrying the invite secret + hostname), then reads the coordinator's
-    // verdict on the same stream. A reconnect/restore keeps the legacy handshake
-    // where the coordinator speaks first (Welcome/MemberSync).
-    let (members, approved) = if initial {
-        let (mut send, mut recv) = initial_conn
-            .open_bi()
-            .await
-            .context("open join control stream")?;
-        control::send_msg(
-            &mut send,
-            &ControlMsg::JoinRequest {
-                invite_secret,
-                hostname: my_hostname.clone(),
-                device_cert: device_cert.clone(),
-            },
-        )
-        .await
-        .context("send join request")?;
-        let msg = tokio::time::timeout(Duration::from_secs(30), control::recv_msg(&mut recv))
-            .await
-            .context("timeout awaiting join response")??;
-        match msg {
-            ControlMsg::Welcome { members, approved } => {
-                tracing::info!(network = %network_name, "welcomed to network");
-                if let Some(existing) = members
-                    .iter()
-                    .find(|m| m.ip == my_ip && m.identity != my_identity)
-                {
-                    anyhow::bail!(
-                        "IP collision: {} is already assigned to {}",
-                        my_ip,
-                        existing.identity
-                    );
-                }
-                (members, approved)
-            }
-            ControlMsg::JoinPending => {
-                tracing::info!(network = %network_name, "join pending operator approval");
-                return Ok(JoinResult::Pending);
-            }
-            ControlMsg::JoinDenied { reason } => {
-                anyhow::bail!("join denied: {reason}");
-            }
-            other => {
-                anyhow::bail!("expected Welcome or JoinPending, got {other:?}");
-            }
-        }
-    } else {
-        let (_send, mut recv) = initial_conn
-            .accept_bi()
-            .await
-            .context("accept control stream")?;
-        let msg = control::recv_msg(&mut recv).await?;
-        match msg {
-            ControlMsg::Welcome { members, approved } => {
-                tracing::info!(network = %network_name, "welcomed to network");
-                (members, approved)
-            }
-            ControlMsg::JoinApproved { your_ip, members } => {
-                tracing::info!(ip = %your_ip, network = %network_name, "joined network (legacy)");
-                (members, vec![])
-            }
-            ControlMsg::MemberSync => {
-                // Reconnected via a peer. The message is only a trigger — fetch
-                // the authoritative roster from the network-key-signed pkarr
-                // record. If it's briefly unreachable, fall back to our last
-                // persisted roster rather than trusting peer-supplied membership.
-                tracing::info!(network = %network_name, "reconnected via peer; reconverging from signed record");
-                match resolve_signed(ep, net_pubkey).await {
-                    Some((signed, seeds)) => {
-                        match fetch_verified_blob(
-                            ep,
-                            &blob_store,
-                            &peers,
-                            signed,
-                            network_name,
-                            &seeds,
-                        )
-                        .await
-                        {
-                            Some(data) => (data.members, data.approved),
-                            None => (persisted_roster(network_name), vec![]),
-                        }
-                    }
-                    None => (persisted_roster(network_name), vec![]),
-                }
-            }
-            ControlMsg::JoinDenied { reason } => {
-                anyhow::bail!("join denied: {reason}");
-            }
-            other => {
-                anyhow::bail!("expected Welcome or MemberSync, got {other:?}");
-            }
-        }
-    };
-
-    // Save membership to config
-    let member_entries = to_member_entries(members.iter());
-    let approved_config = to_approved_entries(approved.iter());
-    let persisted_hostname = members
-        .iter()
-        .find(|m| m.identity == my_identity)
-        .and_then(|m| m.hostname.clone())
-        .or(my_hostname.clone());
-    // Preserve the direct-connection flag across reconnects (a member joining a
-    // 2-peer `ray connect` network). On the first join the flag is set by the
-    // `connect` handler after this returns.
-    // Preserve a queued rename intent across reconnects/restores: the blob we
-    // just fetched won't carry it yet, so persisting it here keeps the drain
-    // alive until a coordinator confirms the new name.
-    let (direct, pending_hostname) = config::load_network(network_name)?
-        .map(|n| (n.direct, n.pending_hostname))
-        .unwrap_or((false, None));
-    config::save_network(&config::NetworkConfig {
-        name: network_name.to_string(),
-        group_mode: GroupMode::Restricted,
-        my_ip: Some(my_ip),
-        my_hostname: persisted_hostname,
-        pending_hostname,
-        members: member_entries,
-        approved: approved_config,
-        network_secret_key: None,
-        network_public_key: Some(net_pubkey),
-        transport: None,
-        auto_accept_firewall,
-        admins: vec![],
-        direct,
-    })?;
-
-    // On reconnect/restore the coordinator hasn't seen our hostname this session,
-    // so send a MeshHello. A fresh join already conveyed it in the JoinRequest.
-    if !initial {
-        let (mut send, _recv) = initial_conn.open_bi().await?;
-        control::send_msg(
-            &mut send,
-            &ControlMsg::MeshHello {
-                identity: my_identity,
-                ip: my_ip,
-                // Read fresh so a rename done since startup (a pending intent or
-                // the confirmed name) is announced on this reconnect, not a name
-                // captured when the daemon launched.
-                hostname: outgoing_hostname(network_name),
-                device_cert: device_cert.clone(),
-            },
-        )
-        .await?;
-    }
-
-    // Add initial connection peer
-    let remote_id = initial_conn.remote_id();
-    let remote_ip = identity.derive_ip(&remote_id);
-    crate::spawn_path_logger(initial_conn.clone(), remote_id.fmt_short().to_string());
-    let remote_ipv6 = derive_ipv6(&remote_id);
-    peers.add(
-        remote_ip,
-        remote_ipv6,
-        initial_conn.clone(),
-        remote_id,
-        network_name,
-    );
-    forward::spawn_peer_reader(
-        initial_conn.clone(),
-        remote_id,
-        remote_ip,
-        remote_ipv6,
-        network_name.to_string(),
-        worker_ctx.forward_ctx(disconnect_tx.clone(), token.clone()),
-    );
-
-    // Connect to other known members
-    for member in &members {
-        if member.identity == my_identity || member.identity == initial_conn.remote_id() {
-            continue;
-        }
-        match transport::connect_to_peer_with_alpn(ep, member.identity, alpn).await {
-            Ok(conn) => {
-                let (mut send, _recv) = conn.open_bi().await?;
-                control::send_msg(
-                    &mut send,
-                    &ControlMsg::MeshHello {
-                        identity: my_identity,
-                        ip: my_ip,
-                        hostname: outgoing_hostname(network_name),
-                        device_cert: device_cert.clone(),
-                    },
-                )
-                .await?;
-                let member_ipv6 = derive_ipv6(&member.identity);
-                peers.add(
-                    member.ip,
-                    member_ipv6,
-                    conn.clone(),
-                    member.identity,
-                    network_name,
-                );
-                forward::spawn_peer_reader(
-                    conn,
-                    member.identity,
-                    member.ip,
-                    member_ipv6,
-                    network_name.to_string(),
-                    worker_ctx.forward_ctx(disconnect_tx.clone(), token.clone()),
-                );
-                tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
-            }
-            Err(e) => {
-                tracing::warn!(peer_ip = %member.ip, error = %e, "mesh peer unavailable");
-            }
-        }
-    }
-
-    let live_state = {
-        let mut ns = NetworkState {
-            members: MemberList::from_members(members.clone()),
-            approved: ApprovedList::from_entries(approved),
-            snapshot: None,
-            network_secret_key: None,
-            network_public_key: net_pubkey,
-            network_name: Some(network_name.to_string()),
-            mode: GroupMode::Restricted,
-            suggested_firewall,
-            reusable_keys,
-            pending_suggestions: Vec::new(),
-            pending: HashMap::new(),
-        };
-        ns.refresh_snapshot();
-        if let Some(snap) = &ns.snapshot {
-            let _ = blob_store.blobs().add_slice(&snap.msgpack_bytes).await;
-        }
-        Arc::new(std::sync::RwLock::new(ns))
-    };
-
-    // Materialize this node's suggested rules from the blob we just joined with.
-    // Re-runs on every roster/blob update from the control listener below.
-    apply_suggested_firewall(&firewall, my_identity, network_name, &live_state);
-
-    // Reconverge worker: `MemberSync`/`BlobUpdated` triggers fan into this
-    // single, debounced task instead of each driving a reconverge inline. A
-    // burst of triggers (e.g. several coordinators broadcasting after one roster
-    // change) collapses into one pkarr resolve + reconverge, and a slow
-    // reconverge never blocks the control listener's accept loop. The signed
-    // record stays the source of truth, so converging once per burst suffices.
-    let reconverge_notify = Arc::new(tokio::sync::Notify::new());
-    tokio::spawn({
-        let notify = reconverge_notify.clone();
-        let token = token.clone();
-        let live_state = live_state.clone();
-        let network_name = network_name.to_string();
-        let ctx_w = worker_ctx;
-        let endpoint_w = ep.clone();
-        let my_identity_w = my_identity;
-        let net_pubkey_w = net_pubkey;
-        let alpn_w = alpn.to_vec();
-        let my_ip_w = my_ip;
-        let device_cert_w = device_cert.clone();
-        async move {
-            // Backstop tick so a queued rename is retried even on a quiet
-            // network that sends no `MemberSync`/`BlobUpdated` triggers. It does
-            // a reconverge only while a rename is outstanding, so steady state
-            // stays trigger-driven (no extra pkarr traffic).
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => return,
-                    _ = notify.notified() => {}
-                    _ = tick.tick() => {
-                        // Only the pending-rename backstop wants the periodic
-                        // wake; otherwise idle until the next real trigger.
-                        if !has_pending_hostname(&network_name) {
-                            continue;
-                        }
-                        tracing::debug!(
-                            network = %network_name,
-                            "backstop tick: pending rename outstanding, reconverging to retry delivery"
-                        );
-                    }
-                }
-                // Debounce: absorb a burst of triggers into a single reconverge.
-                // A trigger that arrives during the sleep or the reconverge is
-                // retained by `Notify` and handled on the next iteration.
-                tokio::select! {
-                    _ = token.cancelled() => return,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
-                }
-                reconverge_and_apply(
-                    &endpoint_w, &ctx_w, net_pubkey_w,
-                    &network_name, &live_state, my_identity_w,
-                    &alpn_w, my_ip_w, &device_cert_w,
-                ).await;
-            }
-        }
-    });
-
-    // Control listener
-    tokio::spawn({
-        let initial_conn = initial_conn.clone();
-        let token = token.clone();
-        let live_state = live_state.clone();
-        let network_name = network_name.to_string();
-        let peers_c = peers.clone();
-        let endpoint_c = ep.clone();
-        let my_identity_c = my_identity;
-        let net_pubkey_c = net_pubkey;
-        let promote_tx = promote_tx.clone();
-        let invite_lock = invite_lock.clone();
-        let reconverge_notify = reconverge_notify.clone();
-        let pending_pongs = pending_pongs.clone();
-        async move {
-            let mut gate = crate::ratelimit::ControlGate::new();
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => return,
-                    result = initial_conn.accept_bi() => {
-                        match result {
-                            Ok((_send, mut recv)) => {
-                                let msg = match control::recv_msg(&mut recv).await {
-                                    Ok(m) => m,
-                                    Err(_) => continue,
-                                };
-                                // Throttle inbound control messages per connection:
-                                // drop over-budget ones, drop the peer on a flood.
-                                match gate.check() {
-                                    crate::ratelimit::Verdict::Allow => {}
-                                    crate::ratelimit::Verdict::Drop => continue,
-                                    crate::ratelimit::Verdict::Close => {
-                                        tracing::warn!(peer = %remote_id.fmt_short(), "control-plane flood; closing connection");
-                                        initial_conn.close(VarInt::from_u32(forward::ABUSE_CODE), b"control flood");
-                                        return;
-                                    }
-                                }
-                                match msg {
-                                    ControlMsg::MemberApproved { identity, ip, hostname, .. } => {
-                                        let entry = ApprovedEntry { identity, ip, hostname, user_identity: None, device_cert: None, collision_index: 0 };
-                                        let mut s = live_state.write().unwrap();
-                                        let members = s.members.clone();
-                                        let _ = s.approved.approve(entry, &members);
-                                    }
-                                    ControlMsg::MemberSync => {
-                                        // Trigger only. The roster/firewall come exclusively
-                                        // from the network-key-signed pkarr record, never from
-                                        // peer-supplied membership. Coalesced into the debounced
-                                        // reconverge worker.
-                                        reconverge_notify.notify_one();
-                                    }
-                                    ControlMsg::BlobUpdated => {
-                                        // Trigger only. Reconverge from the network-key-signed
-                                        // pkarr record — a malicious member can't inject a
-                                        // forged roster/firewall blob via this message. Coalesced
-                                        // into the debounced reconverge worker.
-                                        reconverge_notify.notify_one();
-                                    }
-                                    ControlMsg::AdminGrant { network_pubkey, secret_key } => {
-                                        // Coordinator granted us the per-network key.
-                                        // Verify it targets this network (the stream is
-                                        // already ALPN-scoped, but defense in depth).
-                                        if network_pubkey != net_pubkey_c {
-                                            tracing::warn!(
-                                                peer = %remote_id.fmt_short(),
-                                                "admin grant for a different network; ignoring"
-                                            );
-                                            continue;
-                                        }
-                                        // Self-authenticating: only adopt a key
-                                        // that genuinely is this network's key
-                                        // (its public half must equal the network
-                                        // pubkey). Defeats a forged AdminGrant
-                                        // from a non-coordinator member without
-                                        // relying on reconverge timing for the
-                                        // granter's is_coordinator flag.
-                                        if !admin_grant_key_valid(secret_key, net_pubkey_c) {
-                                            tracing::warn!(
-                                                peer = %remote_id.fmt_short(),
-                                                "admin grant key does not match network pubkey; ignoring"
-                                            );
-                                            continue;
-                                        }
-                                        let key = SecretKey::from(secret_key);
-                                        // Persist + take local publish capability.
-                                        if let Ok(Some(mut net)) = config::load_network(&network_name) {
-                                            net.network_secret_key = Some(key.clone());
-                                            let _ = config::save_network(&net);
-                                        }
-                                        let endpoint_id = endpoint_c.id();
-                                        {
-                                            let mut s = live_state.write().unwrap();
-                                            s.network_secret_key = Some(key.clone());
-                                            if let Some(m) = s.members.get_mut(&my_identity_c) {
-                                                m.is_coordinator = true;
-                                            }
-                                            s.refresh_snapshot();
-                                        }
-                                        // Spawn a lazy publisher (this node can now
-                                        // publish the signed blob / suggest rules).
-                                        if let Ok(client) = dht::create_pkarr_client(&endpoint_c) {
-                                            spawn_lazy_publisher(
-                                                client,
-                                                key,
-                                                live_state.clone(),
-                                                endpoint_id,
-                                                peers_c.clone(),
-                                                network_name.clone(),
-                                                token.clone(),
-                                            );
-                                            tracing::info!(
-                                                network = %network_name,
-                                                "promoted to co-coordinator; lazy publisher started"
-                                            );
-                                        }
-                                        // Signal the daemon loop to swap this
-                                        // network's accept handler to coordinator
-                                        // so it can admit fresh joiners (not just
-                                        // welcome pre-approved peers). The loop
-                                        // holds the `Arc<DaemonState>` this task
-                                        // does not. Best-effort: a closed channel
-                                        // only means the daemon is shutting down.
-                                        let _ = promote_tx.send(network_name.clone()).await;
-                                    }
-                                    ControlMsg::InviteShare { id, secret_hash, expires } => {
-                                        // Another coordinator minted a single-use
-                                        // invite; record its hash so we can redeem
-                                        // it too. Only honor it from a peer that is
-                                        // a coordinator in our verified roster.
-                                        if !sender_is_coordinator(&live_state, remote_id) {
-                                            tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteShare from non-coordinator");
-                                            continue;
-                                        }
-                                        let Ok(hash) = String::from_utf8(secret_hash) else {
-                                            tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteShare with non-utf8 hash");
-                                            continue;
-                                        };
-                                        let _guard = invite_lock.lock().await;
-                                        if let Ok(mut store) = crate::invite::InviteStore::load(&network_name) {
-                                            let _ = store.record_shared(id, hash, expires);
-                                        }
-                                    }
-                                    ControlMsg::InviteUsed { secret_hash } => {
-                                        // Another coordinator redeemed a single-use
-                                        // invite; burn it locally so it can't be
-                                        // reused here. Coordinator-only.
-                                        if !sender_is_coordinator(&live_state, remote_id) {
-                                            tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteUsed from non-coordinator");
-                                            continue;
-                                        }
-                                        let Ok(hash) = String::from_utf8(secret_hash) else {
-                                            tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteUsed with non-utf8 hash");
-                                            continue;
-                                        };
-                                        let _guard = invite_lock.lock().await;
-                                        if let Ok(mut store) = crate::invite::InviteStore::load(&network_name) {
-                                            let _ = store.burn_by_hash(&hash);
-                                        }
-                                    }
-                                    ControlMsg::Ping { nonce } => {
-                                        respond_pong(&initial_conn, nonce).await;
-                                    }
-                                    ControlMsg::Pong { nonce } => {
-                                        if let Some((_, tx)) = pending_pongs.remove(&nonce) {
-                                            let _ = tx.send(());
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Err(_) => return,
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    Ok(JoinResult::Joined(live_state))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn spawn_reconnect_loop(
-    mut disconnect_rx: mpsc::Receiver<forward::DisconnectEvent>,
-    ep: Endpoint,
-    alpn: Vec<u8>,
-    network_name: String,
-    my_identity: EndpointId,
-    my_ip: Ipv4Addr,
-    ctx: MeshCtx,
-    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
-    token: CancellationToken,
-    device_cert: Option<control::DeviceCert>,
-) -> JoinHandle<()> {
-    // The reconnect MeshHello reads the current hostname fresh from config
-    // (`outgoing_hostname`), so no captured hostname is threaded through.
-    let MeshCtx {
-        peers,
-        tun_tx,
-        stats,
-        firewall,
-        device_user_map,
-        ..
-    } = ctx;
-    use tracing::Instrument as _;
-    // Tag all reconnect-loop logs for this network so they correlate in reports.
-    let span = tracing::info_span!("reconnect", net = %network_name);
-    let reconnect_loop = async move {
-        loop {
-            let event = tokio::select! {
-                _ = token.cancelled() => return,
-                event = disconnect_rx.recv() => match event {
-                    Some(ev) => ev,
-                    None => return,
-                },
-            };
-            let peer_id = event.endpoint_id;
-            let peer_ip = event.ip;
-            let peer_ipv6 = event.ipv6;
-            // Drop only this network's route; other networks the peer shares with
-            // us stay live.
-            peers.remove_peer_from_network(&peer_ip, &peer_ipv6, &event.network);
-
-            // A deliberate `ray leave` (graceful close with the leave code) means
-            // the peer is gone for good — don't spin a reconnect task against it.
-            // The coordinator's MemberSync will prune it from our roster.
-            if event.intentional {
-                tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "peer left, not reconnecting");
-                continue;
-            }
-            tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "peer disconnected, will reconnect");
-
-            let ep = ep.clone();
-            let alpn = alpn.clone();
-            let network_name = network_name.clone();
-            let peers = peers.clone();
-            let tun_tx = tun_tx.clone();
-            let disconnect_tx = disconnect_tx.clone();
-            let token = token.clone();
-            let stats = stats.clone();
-            let firewall = firewall.clone();
-            let device_cert = device_cert.clone();
-            let device_user_map = device_user_map.clone();
-
-            tokio::spawn(async move {
-                let mut backoff = BACKOFF_INITIAL;
-                loop {
-                    if token.is_cancelled() {
-                        return;
-                    }
-                    tracing::info!(peer = %peer_id.fmt_short(), secs = backoff.as_secs(), "reconnecting in");
-                    tokio::select! {
-                        _ = token.cancelled() => return,
-                        _ = tokio::time::sleep(backoff) => {}
-                    }
-                    backoff = (backoff * 2).min(BACKOFF_MAX);
-
-                    match transport::connect_to_peer_with_alpn(&ep, peer_id, &alpn).await {
-                        Ok(conn) => {
-                            let (mut send, _) = match conn.open_bi().await {
-                                Ok(bi) => bi,
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "reconnect handshake failed");
-                                    continue;
-                                }
-                            };
-                            if let Err(e) = control::send_msg(
-                                &mut send,
-                                &ControlMsg::MeshHello {
-                                    identity: my_identity,
-                                    ip: my_ip,
-                                    hostname: outgoing_hostname(&network_name),
-                                    device_cert: device_cert.clone(),
-                                },
-                            )
-                            .await
-                            {
-                                tracing::warn!(error = %e, "reconnect MeshHello failed");
-                                continue;
-                            }
-                            tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "reconnected to peer");
-                            peers.add(peer_ip, peer_ipv6, conn.clone(), peer_id, &network_name);
-                            forward::spawn_peer_reader(
-                                conn,
-                                peer_id,
-                                peer_ip,
-                                peer_ipv6,
-                                network_name,
-                                forward::ForwardCtx {
-                                    firewall,
-                                    tun_tx,
-                                    disconnect_tx,
-                                    token,
-                                    stats,
-                                    device_user_map,
-                                },
-                            );
-                            return;
-                        }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "reconnect attempt failed");
-                        }
-                    }
-                }
-            });
-        }
-    };
-    tokio::spawn(reconnect_loop.instrument(span))
-}
 
 // ---------------------------------------------------------------------------
 // Control-message helpers (daemon-initiated, fire-and-forget)

@@ -1,9 +1,9 @@
-//! Network create + join handlers for `DaemonState`: `create_network*`, the join
+//! Network create + join handlers for `MeshManager`: `create_network*`, the join
 //! handshake (`join_network*`, dial/fetch/restore-roster helpers). Split out of `daemon/mod.rs`.
 
 use super::super::*;
 
-impl DaemonState {
+impl MeshManager {
     /// Refresh the network's blob snapshot, store its bytes in the local blob
     /// store, and publish the network-key-signed pkarr record (blob hash + this
     /// endpoint as the seed peer). Shared by network creation and coordinator
@@ -73,8 +73,8 @@ impl DaemonState {
                 state: state.clone(),
                 blob_store: self.blob_store.clone(),
                 dht_notify: Some(dht_notify.clone()),
-                hostname_table: self.hostname_table.clone(),
-                reverse_table: self.reverse_table.clone(),
+                hostname_table: self.dns.hostname_table.clone(),
+                reverse_table: self.dns.reverse_table.clone(),
                 device_user_map: self.device_user_map.clone(),
                 network_name: name.to_string(),
             }),
@@ -167,8 +167,8 @@ impl DaemonState {
 
         // Register in DNS hostname table
         dns::update_hostname(
-            &self.hostname_table,
-            &self.reverse_table,
+            &self.dns.hostname_table,
+            &self.dns.reverse_table,
             &name,
             &my_hostname,
             my_ip,
@@ -729,8 +729,8 @@ impl DaemonState {
 
         // Register hostnames in DNS table
         dns::update_hostname(
-            &self.hostname_table,
-            &self.reverse_table,
+            &self.dns.hostname_table,
+            &self.dns.reverse_table,
             display_name,
             &my_hostname,
             my_ip,
@@ -740,8 +740,8 @@ impl DaemonState {
         for member in &data.members {
             if let Some(ref h) = member.hostname {
                 dns::update_hostname(
-                    &self.hostname_table,
-                    &self.reverse_table,
+                    &self.dns.hostname_table,
+                    &self.dns.reverse_table,
                     display_name,
                     h,
                     member.ip,

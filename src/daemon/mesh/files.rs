@@ -1,9 +1,9 @@
-//! File-sharing and device-pairing handlers for `DaemonState`: `send_file`,
+//! File-sharing and device-pairing handlers for `MeshManager`: `send_file`,
 //! `list_files`, `accept_file`, pairing. Split out of `daemon/mod.rs`.
 
 use super::super::*;
 
-impl DaemonState {
+impl MeshManager {
     pub(crate) async fn resolve_peer_name(&self, name: &str) -> Option<EndpointId> {
         let suffix = format!(".{}", crate::DNS_DOMAIN);
         let qualified = if name.ends_with(&suffix) {
@@ -11,7 +11,8 @@ impl DaemonState {
         } else {
             format!("{name}{suffix}")
         };
-        if let Some((ip, _)) = dns::resolve_name(&qualified, &suffix, &self.hostname_table).await {
+        if let Some((ip, _)) = dns::resolve_name(&qualified, &suffix, &self.dns.hostname_table).await
+        {
             // Try connected peers first
             if let Some(route) = self.peers.lookup_v4(&ip) {
                 return Some(route.endpoint_id);
@@ -102,7 +103,7 @@ impl DaemonState {
     }
 
     pub(crate) fn list_files(&self) -> IpcMessage {
-        let pending = self.protocol_router.pending_files.lock().unwrap();
+        let pending = self.files.pending_files.lock().unwrap();
         let files = pending
             .iter()
             .map(|f| ipc::PendingFileInfo {
@@ -123,7 +124,7 @@ impl DaemonState {
         peer_cred: Option<(u32, u32)>,
     ) -> IpcMessage {
         let pending_file = {
-            let mut pending = self.protocol_router.pending_files.lock().unwrap();
+            let mut pending = self.files.pending_files.lock().unwrap();
             let idx = pending.iter().position(|f| f.id == id);
             match idx {
                 Some(i) => pending.remove(i),
@@ -218,7 +219,7 @@ impl DaemonState {
         ticket_bytes.extend_from_slice(&secret);
         let ticket = bs58::encode(&ticket_bytes).into_string();
 
-        *self.pairing_secret.lock().unwrap() = Some(secret);
+        *self.files.pairing_secret.lock().unwrap() = Some(secret);
 
         IpcMessage::PairingTicket { ticket }
     }

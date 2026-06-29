@@ -1,9 +1,9 @@
-//! Admin (co-coordinator) handlers for `DaemonState`: `admin_add` / `admin_list`.
+//! Admin (co-coordinator) handlers for `MeshManager`: `admin_add` / `admin_list`.
 //! Split out of `daemon/mod.rs`.
 
 use super::super::*;
 
-impl DaemonState {
+impl MeshManager {
     /// Coordinator-only: grant the per-network secret key to a member over an
     /// authenticated mesh stream, making it a co-coordinator (can publish /
     /// suggest firewall rules). The key is shared (shared-key model), so this is
