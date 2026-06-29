@@ -10,6 +10,7 @@
 //! methods attach to `MeshManager` and are called as `self.method()`.
 
 mod admin;
+mod background;
 mod connect;
 mod create_join;
 mod diagnostics;
@@ -19,8 +20,8 @@ mod invite;
 mod join;
 mod runtime;
 
-// The join handshake + reconnect loop moved here from `daemon/mod.rs`; re-export
-// the names the rest of the daemon calls.
-pub(crate) use join::{
-    JoinParams, JoinResult, TryJoin, join_mesh_shared, spawn_reconnect_loop,
-};
+// The join handshake (`join`) and background tasks + reconvergence (`background`)
+// moved here from `daemon/mod.rs`; re-export their names so the rest of the
+// daemon reaches them (via the daemon-level `pub(crate) use mesh::*`).
+pub(crate) use background::*;
+pub(crate) use join::*;
