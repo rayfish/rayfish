@@ -696,58 +696,6 @@ impl AcceptHandler {
     }
 }
 
-#[cfg(test)]
-mod pending_cap_tests {
-    use super::*;
-
-    fn eid(seed: u8) -> EndpointId {
-        let mut b = [0u8; 32];
-        b[0] = seed;
-        iroh::SecretKey::from(b).public()
-    }
-
-    fn pending_at(t: Instant) -> PendingJoin {
-        PendingJoin {
-            hostname: None,
-            device_cert: None,
-            requested_at: t,
-        }
-    }
-
-    #[test]
-    fn no_eviction_below_cap() {
-        let mut pending = HashMap::new();
-        pending.insert(eid(1), pending_at(Instant::now()));
-        assert_eq!(evict_oldest_pending(&mut pending, eid(2), 4), None);
-        assert_eq!(pending.len(), 1);
-    }
-
-    #[test]
-    fn repeat_request_from_same_peer_never_evicts() {
-        let mut pending = HashMap::new();
-        for s in 0..4u8 {
-            pending.insert(eid(s), pending_at(Instant::now()));
-        }
-        // eid(1) is already queued: a re-request must not evict anyone.
-        assert_eq!(evict_oldest_pending(&mut pending, eid(1), 4), None);
-        assert_eq!(pending.len(), 4);
-    }
-
-    #[test]
-    fn full_queue_evicts_the_oldest() {
-        let base = Instant::now();
-        let mut pending = HashMap::new();
-        // eid(0) is the oldest; later ids are progressively newer.
-        for s in 0..4u8 {
-            pending.insert(eid(s), pending_at(base + Duration::from_millis(s as u64)));
-        }
-        let evicted = evict_oldest_pending(&mut pending, eid(99), 4);
-        assert_eq!(evicted, Some(eid(0)));
-        assert_eq!(pending.len(), 3);
-        assert!(!pending.contains_key(&eid(0)));
-    }
-}
-
 pub(crate) struct MeshProtocol {
     handler: AcceptHandler,
 }
@@ -859,5 +807,57 @@ impl ProtocolRouter {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod pending_cap_tests {
+    use super::*;
+
+    fn eid(seed: u8) -> EndpointId {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        iroh::SecretKey::from(b).public()
+    }
+
+    fn pending_at(t: Instant) -> PendingJoin {
+        PendingJoin {
+            hostname: None,
+            device_cert: None,
+            requested_at: t,
+        }
+    }
+
+    #[test]
+    fn no_eviction_below_cap() {
+        let mut pending = HashMap::new();
+        pending.insert(eid(1), pending_at(Instant::now()));
+        assert_eq!(evict_oldest_pending(&mut pending, eid(2), 4), None);
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn repeat_request_from_same_peer_never_evicts() {
+        let mut pending = HashMap::new();
+        for s in 0..4u8 {
+            pending.insert(eid(s), pending_at(Instant::now()));
+        }
+        // eid(1) is already queued: a re-request must not evict anyone.
+        assert_eq!(evict_oldest_pending(&mut pending, eid(1), 4), None);
+        assert_eq!(pending.len(), 4);
+    }
+
+    #[test]
+    fn full_queue_evicts_the_oldest() {
+        let base = Instant::now();
+        let mut pending = HashMap::new();
+        // eid(0) is the oldest; later ids are progressively newer.
+        for s in 0..4u8 {
+            pending.insert(eid(s), pending_at(base + Duration::from_millis(s as u64)));
+        }
+        let evicted = evict_oldest_pending(&mut pending, eid(99), 4);
+        assert_eq!(evicted, Some(eid(0)));
+        assert_eq!(pending.len(), 3);
+        assert!(!pending.contains_key(&eid(0)));
     }
 }
