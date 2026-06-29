@@ -9,6 +9,7 @@
 //! their own (only `impl MeshManager` blocks), so no re-export is needed; the
 //! methods attach to `MeshManager` and are called as `self.method()`.
 
+mod accept;
 mod admin;
 mod background;
 mod connect;
@@ -23,5 +24,6 @@ mod runtime;
 // The join handshake (`join`) and background tasks + reconvergence (`background`)
 // moved here from `daemon/mod.rs`; re-export their names so the rest of the
 // daemon reaches them (via the daemon-level `pub(crate) use mesh::*`).
+pub(crate) use accept::*;
 pub(crate) use background::*;
 pub(crate) use join::*;
