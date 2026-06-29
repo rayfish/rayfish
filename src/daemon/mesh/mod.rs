@@ -12,6 +12,7 @@
 mod accept;
 mod admin;
 mod background;
+mod bootstrap;
 mod connect;
 mod create_join;
 mod diagnostics;
@@ -27,3 +28,5 @@ mod runtime;
 pub(crate) use accept::*;
 pub(crate) use background::*;
 pub(crate) use join::*;
+// `run_daemon` is the public process entry point (called by `ray daemon`).
+pub use bootstrap::run_daemon;
