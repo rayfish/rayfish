@@ -22,6 +22,16 @@ pub(crate) enum TryJoin {
     Pending,
 }
 
+/// Result of [`perform_join_handshake`]: the admitted roster, or a closed-network
+/// queue signal the caller turns into [`JoinResult::Pending`].
+enum HandshakeOutcome {
+    Admitted {
+        members: Vec<crate::membership::Member>,
+        approved: Vec<ApprovedEntry>,
+    },
+    Pending,
+}
+
 /// By-value parameters for one [`join_mesh_shared`] handshake, grouped so the
 /// function's argument list stays manageable. These are all decided once, at the
 /// call site, per join: the joiner's chosen hostname and cert, the invite secret
@@ -91,11 +101,323 @@ pub(crate) async fn join_mesh_shared(
     let my_identity = identity.local_identity();
     let my_ip = identity.local_ip();
 
-    // Handshake. A fresh join (`initial`) opens a stream and sends a JoinRequest
-    // first (carrying the invite secret + hostname), then reads the coordinator's
-    // verdict on the same stream. A reconnect/restore keeps the legacy handshake
-    // where the coordinator speaks first (Welcome/MemberSync).
-    let (members, approved) = if initial {
+    let (members, approved) = match perform_join_handshake(
+        &initial_conn,
+        ep,
+        network_name,
+        &blob_store,
+        &peers,
+        net_pubkey,
+        my_ip,
+        my_identity,
+        initial,
+        invite_secret,
+        &my_hostname,
+        &device_cert,
+    )
+    .await?
+    {
+        HandshakeOutcome::Admitted { members, approved } => (members, approved),
+        HandshakeOutcome::Pending => return Ok(JoinResult::Pending),
+    };
+
+    persist_join_config(
+        network_name,
+        &members,
+        &approved,
+        my_identity,
+        my_ip,
+        net_pubkey,
+        &my_hostname,
+        auto_accept_firewall,
+    )?;
+
+    // On reconnect/restore the coordinator hasn't seen our hostname this session,
+    // so send a MeshHello. A fresh join already conveyed it in the JoinRequest.
+    if !initial {
+        send_reconnect_hello(&initial_conn, my_identity, my_ip, network_name, &device_cert).await?;
+    }
+
+    // Register the coordinator connection as our first peer, then dial the rest
+    // of the roster.
+    let remote_id = initial_conn.remote_id();
+    let remote_ip = identity.derive_ip(&remote_id);
+    crate::spawn_path_logger(initial_conn.clone(), remote_id.fmt_short().to_string());
+    register_mesh_peer(
+        &peers,
+        &worker_ctx,
+        &disconnect_tx,
+        &token,
+        initial_conn.clone(),
+        remote_id,
+        remote_ip,
+        network_name,
+    );
+    connect_to_roster_peers(
+        ep,
+        alpn,
+        &members,
+        network_name,
+        my_identity,
+        my_ip,
+        remote_id,
+        &device_cert,
+        &peers,
+        &worker_ctx,
+        &disconnect_tx,
+        &token,
+    )
+    .await?;
+
+    let live_state = build_member_state(
+        members,
+        approved,
+        net_pubkey,
+        network_name,
+        suggested_firewall,
+        reusable_keys,
+        &blob_store,
+    )
+    .await;
+
+    // Materialize this node's suggested rules from the blob we just joined with.
+    // Re-runs on every roster/blob update from the control listener below.
+    apply_suggested_firewall(&firewall, my_identity, network_name, &live_state);
+
+    // Reconverge worker: `MemberSync`/`BlobUpdated` triggers fan into this single
+    // debounced task (see `spawn_reconverge_worker`).
+    let reconverge_notify = Arc::new(tokio::sync::Notify::new());
+    spawn_reconverge_worker(
+        reconverge_notify.clone(),
+        token.clone(),
+        live_state.clone(),
+        network_name.to_string(),
+        worker_ctx,
+        ep.clone(),
+        my_identity,
+        net_pubkey,
+        alpn.to_vec(),
+        my_ip,
+        device_cert.clone(),
+    );
+
+    spawn_member_control_listener(
+        initial_conn.clone(),
+        remote_id,
+        token.clone(),
+        live_state.clone(),
+        network_name.to_string(),
+        peers.clone(),
+        ep.clone(),
+        my_identity,
+        net_pubkey,
+        promote_tx.clone(),
+        invite_lock.clone(),
+        reconverge_notify.clone(),
+        pending_pongs.clone(),
+    );
+
+    Ok(JoinResult::Joined(live_state))
+}
+
+/// Persist this network's membership to config after a successful handshake.
+/// Preserves the `direct` flag and any queued `pending_hostname` rename intent
+/// from the existing config (the freshly fetched blob won't carry the rename yet,
+/// so keeping it alive lets the drain re-send until a coordinator confirms it).
+#[allow(clippy::too_many_arguments)]
+fn persist_join_config(
+    network_name: &str,
+    members: &[crate::membership::Member],
+    approved: &[ApprovedEntry],
+    my_identity: EndpointId,
+    my_ip: Ipv4Addr,
+    net_pubkey: EndpointId,
+    my_hostname: &Option<String>,
+    auto_accept_firewall: bool,
+) -> Result<()> {
+    let persisted_hostname = members
+        .iter()
+        .find(|m| m.identity == my_identity)
+        .and_then(|m| m.hostname.clone())
+        .or(my_hostname.clone());
+    let (direct, pending_hostname) = config::load_network(network_name)?
+        .map(|n| (n.direct, n.pending_hostname))
+        .unwrap_or((false, None));
+    config::save_network(&config::NetworkConfig {
+        name: network_name.to_string(),
+        group_mode: GroupMode::Restricted,
+        my_ip: Some(my_ip),
+        my_hostname: persisted_hostname,
+        pending_hostname,
+        members: to_member_entries(members.iter()),
+        approved: to_approved_entries(approved.iter()),
+        network_secret_key: None,
+        network_public_key: Some(net_pubkey),
+        transport: None,
+        auto_accept_firewall,
+        admins: vec![],
+        direct,
+    })
+}
+
+/// Send a `MeshHello` to the coordinator on reconnect/restore (a fresh join
+/// already conveyed the hostname in its `JoinRequest`). Reads the hostname fresh
+/// from config so a rename done since startup is announced now, not a stale name.
+async fn send_reconnect_hello(
+    conn: &Connection,
+    my_identity: EndpointId,
+    my_ip: Ipv4Addr,
+    network_name: &str,
+    device_cert: &Option<control::DeviceCert>,
+) -> Result<()> {
+    let (mut send, _recv) = conn.open_bi().await?;
+    control::send_msg(
+        &mut send,
+        &ControlMsg::MeshHello {
+            identity: my_identity,
+            ip: my_ip,
+            hostname: outgoing_hostname(network_name),
+            device_cert: device_cert.clone(),
+        },
+    )
+    .await
+}
+
+/// Build the in-memory `NetworkState` cell for a joined member from the admitted
+/// roster + blob-derived firewall/keys, refresh its snapshot, and seed the local
+/// blob store with those bytes.
+async fn build_member_state(
+    members: Vec<crate::membership::Member>,
+    approved: Vec<ApprovedEntry>,
+    net_pubkey: EndpointId,
+    network_name: &str,
+    suggested_firewall: SuggestedFirewall,
+    reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
+    blob_store: &FsStore,
+) -> SharedNetworkState {
+    let mut ns = NetworkState {
+        members: MemberList::from_members(members),
+        approved: ApprovedList::from_entries(approved),
+        snapshot: None,
+        network_secret_key: None,
+        network_public_key: net_pubkey,
+        network_name: Some(network_name.to_string()),
+        mode: GroupMode::Restricted,
+        suggested_firewall,
+        reusable_keys,
+        pending_suggestions: Vec::new(),
+        pending: HashMap::new(),
+    };
+    ns.refresh_snapshot();
+    if let Some(snap) = &ns.snapshot {
+        let _ = blob_store.blobs().add_slice(&snap.msgpack_bytes).await;
+    }
+    Arc::new(std::sync::RwLock::new(ns))
+}
+
+/// Add a peer's route to the table and start its data-plane reader. Shared by the
+/// initial coordinator connection and each roster member dialed afterward.
+#[allow(clippy::too_many_arguments)]
+fn register_mesh_peer(
+    peers: &PeerTable,
+    ctx: &MeshCtx,
+    disconnect_tx: &mpsc::Sender<forward::DisconnectEvent>,
+    token: &CancellationToken,
+    conn: Connection,
+    peer_id: EndpointId,
+    peer_ip: Ipv4Addr,
+    network_name: &str,
+) {
+    let peer_ipv6 = derive_ipv6(&peer_id);
+    peers.add(peer_ip, peer_ipv6, conn.clone(), peer_id, network_name);
+    forward::spawn_peer_reader(
+        conn,
+        peer_id,
+        peer_ip,
+        peer_ipv6,
+        network_name.to_string(),
+        ctx.forward_ctx(disconnect_tx.clone(), token.clone()),
+    );
+}
+
+/// Dial every other roster member (skipping ourselves and the already-connected
+/// coordinator), send each a `MeshHello`, and register it as a peer. A member
+/// that's offline is logged and skipped; a stream-open/send failure aborts the
+/// join (propagated to the caller).
+#[allow(clippy::too_many_arguments)]
+async fn connect_to_roster_peers(
+    ep: &Endpoint,
+    alpn: &[u8],
+    members: &[crate::membership::Member],
+    network_name: &str,
+    my_identity: EndpointId,
+    my_ip: Ipv4Addr,
+    skip_id: EndpointId,
+    device_cert: &Option<control::DeviceCert>,
+    peers: &PeerTable,
+    ctx: &MeshCtx,
+    disconnect_tx: &mpsc::Sender<forward::DisconnectEvent>,
+    token: &CancellationToken,
+) -> Result<()> {
+    for member in members {
+        if member.identity == my_identity || member.identity == skip_id {
+            continue;
+        }
+        match transport::connect_to_peer_with_alpn(ep, member.identity, alpn).await {
+            Ok(conn) => {
+                let (mut send, _recv) = conn.open_bi().await?;
+                control::send_msg(
+                    &mut send,
+                    &ControlMsg::MeshHello {
+                        identity: my_identity,
+                        ip: my_ip,
+                        hostname: outgoing_hostname(network_name),
+                        device_cert: device_cert.clone(),
+                    },
+                )
+                .await?;
+                register_mesh_peer(
+                    peers,
+                    ctx,
+                    disconnect_tx,
+                    token,
+                    conn,
+                    member.identity,
+                    member.ip,
+                    network_name,
+                );
+                tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
+            }
+            Err(e) => {
+                tracing::warn!(peer_ip = %member.ip, error = %e, "mesh peer unavailable");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run one coordinator handshake. A fresh join (`initial`) opens a stream, sends
+/// a `JoinRequest` (invite secret + hostname), and reads the verdict on the same
+/// stream. A reconnect/restore keeps the legacy handshake where the coordinator
+/// speaks first (Welcome/JoinApproved/MemberSync) — on a `MemberSync` trigger the
+/// roster comes from the network-key-signed pkarr record, never peer-supplied
+/// membership. Returns the admitted roster, or `Pending` on a closed network.
+#[allow(clippy::too_many_arguments)]
+async fn perform_join_handshake(
+    initial_conn: &Connection,
+    ep: &Endpoint,
+    network_name: &str,
+    blob_store: &FsStore,
+    peers: &PeerTable,
+    net_pubkey: EndpointId,
+    my_ip: Ipv4Addr,
+    my_identity: EndpointId,
+    initial: bool,
+    invite_secret: Option<Vec<u8>>,
+    my_hostname: &Option<String>,
+    device_cert: &Option<control::DeviceCert>,
+) -> Result<HandshakeOutcome> {
+    if initial {
         let (mut send, mut recv) = initial_conn
             .open_bi()
             .await
@@ -126,18 +448,14 @@ pub(crate) async fn join_mesh_shared(
                         existing.identity
                     );
                 }
-                (members, approved)
+                Ok(HandshakeOutcome::Admitted { members, approved })
             }
             ControlMsg::JoinPending => {
                 tracing::info!(network = %network_name, "join pending operator approval");
-                return Ok(JoinResult::Pending);
+                Ok(HandshakeOutcome::Pending)
             }
-            ControlMsg::JoinDenied { reason } => {
-                anyhow::bail!("join denied: {reason}");
-            }
-            other => {
-                anyhow::bail!("expected Welcome or JoinPending, got {other:?}");
-            }
+            ControlMsg::JoinDenied { reason } => anyhow::bail!("join denied: {reason}"),
+            other => anyhow::bail!("expected Welcome or JoinPending, got {other:?}"),
         }
     } else {
         let (_send, mut recv) = initial_conn
@@ -145,7 +463,7 @@ pub(crate) async fn join_mesh_shared(
             .await
             .context("accept control stream")?;
         let msg = control::recv_msg(&mut recv).await?;
-        match msg {
+        let (members, approved) = match msg {
             ControlMsg::Welcome { members, approved } => {
                 tracing::info!(network = %network_name, "welcomed to network");
                 (members, approved)
@@ -162,15 +480,8 @@ pub(crate) async fn join_mesh_shared(
                 tracing::info!(network = %network_name, "reconnected via peer; reconverging from signed record");
                 match resolve_signed(ep, net_pubkey).await {
                     Some((signed, seeds)) => {
-                        match fetch_verified_blob(
-                            ep,
-                            &blob_store,
-                            &peers,
-                            signed,
-                            network_name,
-                            &seeds,
-                        )
-                        .await
+                        match fetch_verified_blob(ep, blob_store, peers, signed, network_name, &seeds)
+                            .await
                         {
                             Some(data) => (data.members, data.approved),
                             None => (persisted_roster(network_name), vec![]),
@@ -179,228 +490,94 @@ pub(crate) async fn join_mesh_shared(
                     None => (persisted_roster(network_name), vec![]),
                 }
             }
-            ControlMsg::JoinDenied { reason } => {
-                anyhow::bail!("join denied: {reason}");
-            }
-            other => {
-                anyhow::bail!("expected Welcome or MemberSync, got {other:?}");
-            }
-        }
-    };
-
-    // Save membership to config
-    let member_entries = to_member_entries(members.iter());
-    let approved_config = to_approved_entries(approved.iter());
-    let persisted_hostname = members
-        .iter()
-        .find(|m| m.identity == my_identity)
-        .and_then(|m| m.hostname.clone())
-        .or(my_hostname.clone());
-    // Preserve the direct-connection flag across reconnects (a member joining a
-    // 2-peer `ray connect` network). On the first join the flag is set by the
-    // `connect` handler after this returns.
-    // Preserve a queued rename intent across reconnects/restores: the blob we
-    // just fetched won't carry it yet, so persisting it here keeps the drain
-    // alive until a coordinator confirms the new name.
-    let (direct, pending_hostname) = config::load_network(network_name)?
-        .map(|n| (n.direct, n.pending_hostname))
-        .unwrap_or((false, None));
-    config::save_network(&config::NetworkConfig {
-        name: network_name.to_string(),
-        group_mode: GroupMode::Restricted,
-        my_ip: Some(my_ip),
-        my_hostname: persisted_hostname,
-        pending_hostname,
-        members: member_entries,
-        approved: approved_config,
-        network_secret_key: None,
-        network_public_key: Some(net_pubkey),
-        transport: None,
-        auto_accept_firewall,
-        admins: vec![],
-        direct,
-    })?;
-
-    // On reconnect/restore the coordinator hasn't seen our hostname this session,
-    // so send a MeshHello. A fresh join already conveyed it in the JoinRequest.
-    if !initial {
-        let (mut send, _recv) = initial_conn.open_bi().await?;
-        control::send_msg(
-            &mut send,
-            &ControlMsg::MeshHello {
-                identity: my_identity,
-                ip: my_ip,
-                // Read fresh so a rename done since startup (a pending intent or
-                // the confirmed name) is announced on this reconnect, not a name
-                // captured when the daemon launched.
-                hostname: outgoing_hostname(network_name),
-                device_cert: device_cert.clone(),
-            },
-        )
-        .await?;
-    }
-
-    // Add initial connection peer
-    let remote_id = initial_conn.remote_id();
-    let remote_ip = identity.derive_ip(&remote_id);
-    crate::spawn_path_logger(initial_conn.clone(), remote_id.fmt_short().to_string());
-    let remote_ipv6 = derive_ipv6(&remote_id);
-    peers.add(
-        remote_ip,
-        remote_ipv6,
-        initial_conn.clone(),
-        remote_id,
-        network_name,
-    );
-    forward::spawn_peer_reader(
-        initial_conn.clone(),
-        remote_id,
-        remote_ip,
-        remote_ipv6,
-        network_name.to_string(),
-        worker_ctx.forward_ctx(disconnect_tx.clone(), token.clone()),
-    );
-
-    // Connect to other known members
-    for member in &members {
-        if member.identity == my_identity || member.identity == initial_conn.remote_id() {
-            continue;
-        }
-        match transport::connect_to_peer_with_alpn(ep, member.identity, alpn).await {
-            Ok(conn) => {
-                let (mut send, _recv) = conn.open_bi().await?;
-                control::send_msg(
-                    &mut send,
-                    &ControlMsg::MeshHello {
-                        identity: my_identity,
-                        ip: my_ip,
-                        hostname: outgoing_hostname(network_name),
-                        device_cert: device_cert.clone(),
-                    },
-                )
-                .await?;
-                let member_ipv6 = derive_ipv6(&member.identity);
-                peers.add(
-                    member.ip,
-                    member_ipv6,
-                    conn.clone(),
-                    member.identity,
-                    network_name,
-                );
-                forward::spawn_peer_reader(
-                    conn,
-                    member.identity,
-                    member.ip,
-                    member_ipv6,
-                    network_name.to_string(),
-                    worker_ctx.forward_ctx(disconnect_tx.clone(), token.clone()),
-                );
-                tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
-            }
-            Err(e) => {
-                tracing::warn!(peer_ip = %member.ip, error = %e, "mesh peer unavailable");
-            }
-        }
-    }
-
-    let live_state = {
-        let mut ns = NetworkState {
-            members: MemberList::from_members(members.clone()),
-            approved: ApprovedList::from_entries(approved),
-            snapshot: None,
-            network_secret_key: None,
-            network_public_key: net_pubkey,
-            network_name: Some(network_name.to_string()),
-            mode: GroupMode::Restricted,
-            suggested_firewall,
-            reusable_keys,
-            pending_suggestions: Vec::new(),
-            pending: HashMap::new(),
+            ControlMsg::JoinDenied { reason } => anyhow::bail!("join denied: {reason}"),
+            other => anyhow::bail!("expected Welcome or MemberSync, got {other:?}"),
         };
-        ns.refresh_snapshot();
-        if let Some(snap) = &ns.snapshot {
-            let _ = blob_store.blobs().add_slice(&snap.msgpack_bytes).await;
-        }
-        Arc::new(std::sync::RwLock::new(ns))
-    };
+        Ok(HandshakeOutcome::Admitted { members, approved })
+    }
+}
 
-    // Materialize this node's suggested rules from the blob we just joined with.
-    // Re-runs on every roster/blob update from the control listener below.
-    apply_suggested_firewall(&firewall, my_identity, network_name, &live_state);
-
-    // Reconverge worker: `MemberSync`/`BlobUpdated` triggers fan into this
-    // single, debounced task instead of each driving a reconverge inline. A
-    // burst of triggers (e.g. several coordinators broadcasting after one roster
-    // change) collapses into one pkarr resolve + reconverge, and a slow
-    // reconverge never blocks the control listener's accept loop. The signed
-    // record stays the source of truth, so converging once per burst suffices.
-    let reconverge_notify = Arc::new(tokio::sync::Notify::new());
-    tokio::spawn({
-        let notify = reconverge_notify.clone();
-        let token = token.clone();
-        let live_state = live_state.clone();
-        let network_name = network_name.to_string();
-        let ctx_w = worker_ctx;
-        let endpoint_w = ep.clone();
-        let my_identity_w = my_identity;
-        let net_pubkey_w = net_pubkey;
-        let alpn_w = alpn.to_vec();
-        let my_ip_w = my_ip;
-        let device_cert_w = device_cert.clone();
-        async move {
-            // Backstop tick so a queued rename is retried even on a quiet
-            // network that sends no `MemberSync`/`BlobUpdated` triggers. It does
-            // a reconverge only while a rename is outstanding, so steady state
-            // stays trigger-driven (no extra pkarr traffic).
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => return,
-                    _ = notify.notified() => {}
-                    _ = tick.tick() => {
-                        // Only the pending-rename backstop wants the periodic
-                        // wake; otherwise idle until the next real trigger.
-                        if !has_pending_hostname(&network_name) {
-                            continue;
-                        }
-                        tracing::debug!(
-                            network = %network_name,
-                            "backstop tick: pending rename outstanding, reconverging to retry delivery"
-                        );
+/// Debounced reconverge worker for a joined member. `MemberSync`/`BlobUpdated`
+/// triggers (and a 30s backstop tick while a rename is outstanding) fan into this
+/// single task instead of each driving a reconverge inline: a burst of triggers
+/// collapses into one pkarr resolve + reconverge, and a slow reconverge never
+/// blocks the control listener's accept loop. The network-key-signed record stays
+/// the source of truth, so converging once per burst suffices.
+#[allow(clippy::too_many_arguments)]
+fn spawn_reconverge_worker(
+    notify: Arc<tokio::sync::Notify>,
+    token: CancellationToken,
+    live_state: SharedNetworkState,
+    network_name: String,
+    ctx_w: MeshCtx,
+    endpoint_w: Endpoint,
+    my_identity_w: EndpointId,
+    net_pubkey_w: EndpointId,
+    alpn_w: Vec<u8>,
+    my_ip_w: Ipv4Addr,
+    device_cert_w: Option<control::DeviceCert>,
+) {
+    tokio::spawn(async move {
+        // Backstop tick so a queued rename is retried even on a quiet
+        // network that sends no `MemberSync`/`BlobUpdated` triggers. It does
+        // a reconverge only while a rename is outstanding, so steady state
+        // stays trigger-driven (no extra pkarr traffic).
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = notify.notified() => {}
+                _ = tick.tick() => {
+                    // Only the pending-rename backstop wants the periodic
+                    // wake; otherwise idle until the next real trigger.
+                    if !has_pending_hostname(&network_name) {
+                        continue;
                     }
+                    tracing::debug!(
+                        network = %network_name,
+                        "backstop tick: pending rename outstanding, reconverging to retry delivery"
+                    );
                 }
-                // Debounce: absorb a burst of triggers into a single reconverge.
-                // A trigger that arrives during the sleep or the reconverge is
-                // retained by `Notify` and handled on the next iteration.
-                tokio::select! {
-                    _ = token.cancelled() => return,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
-                }
-                reconverge_and_apply(
-                    &endpoint_w, &ctx_w, net_pubkey_w,
-                    &network_name, &live_state, my_identity_w,
-                    &alpn_w, my_ip_w, &device_cert_w,
-                ).await;
             }
+            // Debounce: absorb a burst of triggers into a single reconverge.
+            // A trigger that arrives during the sleep or the reconverge is
+            // retained by `Notify` and handled on the next iteration.
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+            }
+            reconverge_and_apply(
+                &endpoint_w, &ctx_w, net_pubkey_w,
+                &network_name, &live_state, my_identity_w,
+                &alpn_w, my_ip_w, &device_cert_w,
+            ).await;
         }
     });
+}
 
-    // Control listener
-    tokio::spawn({
-        let initial_conn = initial_conn.clone();
-        let token = token.clone();
-        let live_state = live_state.clone();
-        let network_name = network_name.to_string();
-        let peers_c = peers.clone();
-        let endpoint_c = ep.clone();
-        let my_identity_c = my_identity;
-        let net_pubkey_c = net_pubkey;
-        let promote_tx = promote_tx.clone();
-        let invite_lock = invite_lock.clone();
-        let reconverge_notify = reconverge_notify.clone();
-        let pending_pongs = pending_pongs.clone();
-        async move {
+/// Per-connection control listener for a joined member: reads control messages
+/// off the coordinator connection under a [`ControlGate`] rate limit and applies
+/// each (approval, reconverge triggers, `AdminGrant` promotion, invite gossip,
+/// ping/pong). Roster/firewall state comes only from the signed pkarr record, so
+/// `MemberSync`/`BlobUpdated` are mere triggers into the reconverge worker.
+#[allow(clippy::too_many_arguments)]
+fn spawn_member_control_listener(
+    initial_conn: Connection,
+    remote_id: EndpointId,
+    token: CancellationToken,
+    live_state: SharedNetworkState,
+    network_name: String,
+    peers_c: PeerTable,
+    endpoint_c: Endpoint,
+    my_identity_c: EndpointId,
+    net_pubkey_c: EndpointId,
+    promote_tx: mpsc::Sender<String>,
+    invite_lock: Arc<tokio::sync::Mutex<()>>,
+    reconverge_notify: Arc<tokio::sync::Notify>,
+    pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
+) {
+    tokio::spawn(async move {
             let mut gate = crate::ratelimit::ControlGate::new();
             loop {
                 tokio::select! {
@@ -562,9 +739,7 @@ pub(crate) async fn join_mesh_shared(
                 }
             }
         }
-    });
-
-    Ok(JoinResult::Joined(live_state))
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
