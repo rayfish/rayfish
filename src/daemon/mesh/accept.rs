@@ -9,6 +9,31 @@
 
 use super::super::*;
 
+/// Upper bound on a closed network's in-memory pending-join queue. Keyed by peer
+/// identity, so repeat requests from one peer don't grow it; this caps a flood
+/// across *distinct* identities (an attacker would need a fresh key per slot).
+/// At the cap, the oldest unanswered request is evicted to admit a newer one.
+pub(crate) const MAX_PENDING_JOINS: usize = 256;
+
+/// Make room for a join request from `incoming`: if the queue is full and this is
+/// a new identity, drop the oldest entry and return its id. A no-op (returns
+/// `None`) when `incoming` is already queued or there is spare capacity.
+pub(crate) fn evict_oldest_pending(
+    pending: &mut HashMap<EndpointId, PendingJoin>,
+    incoming: EndpointId,
+    cap: usize,
+) -> Option<EndpointId> {
+    if pending.contains_key(&incoming) || pending.len() < cap {
+        return None;
+    }
+    let oldest = pending
+        .iter()
+        .min_by_key(|(_, p)| p.requested_at)
+        .map(|(id, _)| *id)?;
+    pending.remove(&oldest);
+    Some(oldest)
+}
+
 pub(crate) struct CoordinatorAcceptState {
     pub(crate) ctx: MeshCtx,
     pub(crate) network_name: String,
@@ -172,13 +197,22 @@ impl CoordinatorAcceptState {
                 .await;
             }
             GroupMode::Restricted => {
-                // TODO(abuse-hardening): the pending-join queue is unbounded and
-                // has no TTL — a peer could open many join streams to grow it. Out
-                // of scope for the control-flood rate limiter (see
-                // ~/.claude/plans/hidden-jumping-fountain.md); cap/evict here and
-                // add a per-peer concurrent-stream limit if this becomes a vector.
+                // Queue for live operator approval, bounded by MAX_PENDING_JOINS
+                // (oldest-evicted) so a peer churning fresh identities can't grow
+                // it without limit. Still no per-peer concurrent-stream cap — the
+                // control-flood rate limiter covers sustained message floods.
                 {
                     let mut s = self.state.write().unwrap();
+                    if let Some(dropped) = evict_oldest_pending(
+                        &mut s.pending,
+                        remote_id,
+                        MAX_PENDING_JOINS,
+                    ) {
+                        tracing::warn!(
+                            evicted = %dropped.fmt_short(),
+                            "pending-join queue full; evicted oldest request"
+                        );
+                    }
                     s.pending.insert(
                         remote_id,
                         PendingJoin {
@@ -659,6 +693,58 @@ pub(crate) enum AcceptHandler {
 impl AcceptHandler {
     pub(crate) fn is_coordinator(&self) -> bool {
         matches!(self, AcceptHandler::Coordinator(_))
+    }
+}
+
+#[cfg(test)]
+mod pending_cap_tests {
+    use super::*;
+
+    fn eid(seed: u8) -> EndpointId {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        iroh::SecretKey::from(b).public()
+    }
+
+    fn pending_at(t: Instant) -> PendingJoin {
+        PendingJoin {
+            hostname: None,
+            device_cert: None,
+            requested_at: t,
+        }
+    }
+
+    #[test]
+    fn no_eviction_below_cap() {
+        let mut pending = HashMap::new();
+        pending.insert(eid(1), pending_at(Instant::now()));
+        assert_eq!(evict_oldest_pending(&mut pending, eid(2), 4), None);
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn repeat_request_from_same_peer_never_evicts() {
+        let mut pending = HashMap::new();
+        for s in 0..4u8 {
+            pending.insert(eid(s), pending_at(Instant::now()));
+        }
+        // eid(1) is already queued: a re-request must not evict anyone.
+        assert_eq!(evict_oldest_pending(&mut pending, eid(1), 4), None);
+        assert_eq!(pending.len(), 4);
+    }
+
+    #[test]
+    fn full_queue_evicts_the_oldest() {
+        let base = Instant::now();
+        let mut pending = HashMap::new();
+        // eid(0) is the oldest; later ids are progressively newer.
+        for s in 0..4u8 {
+            pending.insert(eid(s), pending_at(base + Duration::from_millis(s as u64)));
+        }
+        let evicted = evict_oldest_pending(&mut pending, eid(99), 4);
+        assert_eq!(evicted, Some(eid(0)));
+        assert_eq!(pending.len(), 3);
+        assert!(!pending.contains_key(&eid(0)));
     }
 }
 

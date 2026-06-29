@@ -56,6 +56,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Bounded pending-join queue** — on a closed network, the coordinator's queue
+  of join requests awaiting `ray accept` is now capped (oldest request evicted
+  when full), so a peer churning fresh identities can no longer grow it without
+  limit. Legitimate queues are far below the cap, so this is invisible in normal
+  use.
 - **Richer daemon log files** — the rolling daily logs (bundled by `ray report`)
   now capture `debug`-level detail for Rayfish itself while the console stays at
   `info`, so diagnostics like hostname propagation are traceable in a report

@@ -221,10 +221,10 @@ pub(crate) struct NetworkState {
 }
 
 /// A join request held pending live approval on a closed network.
-struct PendingJoin {
-    hostname: Option<String>,
-    device_cert: Option<control::DeviceCert>,
-    requested_at: Instant,
+pub(crate) struct PendingJoin {
+    pub(crate) hostname: Option<String>,
+    pub(crate) device_cert: Option<control::DeviceCert>,
+    pub(crate) requested_at: Instant,
 }
 
 impl NetworkState {
@@ -1186,6 +1186,39 @@ mod coordinator_dial_order_tests {
     }
 
     #[test]
+    fn dial_order_edge_cases() {
+        let (a, b, me) = (test_id(1), test_id(2), test_id(9));
+        let mk = |id, coord| Member {
+            identity: id,
+            ip: derive_ip(&id),
+            is_coordinator: coord,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+        };
+
+        // No coordinators in the roster ⇒ empty order (caller bails).
+        let none_coord = vec![mk(a, false), mk(b, false)];
+        assert!(super::coordinator_dial_order(a, &none_coord, me).is_empty());
+
+        // Minter == me (the no-invite case where we pass our own id): we are
+        // filtered out, leaving just the other coordinators.
+        let members = vec![mk(a, true), mk(me, true)];
+        assert_eq!(super::coordinator_dial_order(me, &members, me), vec![a]);
+
+        // Minter isn't a coordinator in the blob: it is not promoted to the
+        // front, but real coordinators still get dialed.
+        let members = vec![mk(a, true), mk(b, false)];
+        assert_eq!(super::coordinator_dial_order(b, &members, me), vec![a]);
+
+        // Minter is a coordinator AND also appears in the member scan: listed
+        // once (front), no duplicate.
+        let members = vec![mk(a, true), mk(b, true)];
+        assert_eq!(super::coordinator_dial_order(a, &members, me), vec![a, b]);
+    }
+
+    #[test]
     fn admin_grant_key_accepted_only_when_public_matches_network() {
         // The real network key: its public half is the network pubkey.
         let net_secret = iroh::SecretKey::from({
@@ -1228,6 +1261,23 @@ mod coordinator_dial_order_tests {
         // gossip to other coordinators only: c (not b, not me).
         assert_eq!(super::gossip_targets(&members, me), vec![c]);
     }
+
+    #[test]
+    fn gossip_targets_empty_when_sole_coordinator() {
+        let me = test_id(1);
+        let mk = |id, coord| Member {
+            identity: id,
+            ip: derive_ip(&id),
+            is_coordinator: coord,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+        };
+        // Only members are us (coordinator) and a plain member: nobody to gossip to.
+        let members = vec![mk(me, true), mk(test_id(2), false)];
+        assert!(super::gossip_targets(&members, me).is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -1251,5 +1301,20 @@ mod dial_fallback_tests {
         let outcomes = vec![DialOutcome::Unreachable, DialOutcome::Denied];
         let (_idx, welcomed) = pick_first_welcome(&outcomes);
         assert!(!welcomed);
+    }
+
+    #[test]
+    fn dial_fallback_empty_is_not_welcomed() {
+        // Defensive: no coordinators tried at all. Must not panic and must
+        // report "not welcomed" so the caller bails rather than indexing.
+        let (idx, welcomed) = pick_first_welcome(&[]);
+        assert_eq!((idx, welcomed), (0, false));
+    }
+
+    #[test]
+    fn dial_fallback_first_welcome_wins_over_later() {
+        let outcomes = vec![DialOutcome::Welcomed, DialOutcome::Welcomed];
+        let (idx, welcomed) = pick_first_welcome(&outcomes);
+        assert_eq!((idx, welcomed), (0, true));
     }
 }
