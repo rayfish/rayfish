@@ -34,6 +34,22 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploySpec {
+    /// Optional coordinator-defined name → identity string. An alias names a
+    /// *user* (the paired user identity, or a device's transport endpoint id for
+    /// an unpaired node), so a firewall rule referencing the alias expands to all
+    /// of that user's currently-joined device hostnames. Aliases are spec-only
+    /// and expanded client-side at apply time; they never reach the blob. An
+    /// alias only resolves for already-joined members (a user has no identity on
+    /// the mesh until a device joins/pairs).
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
+    /// Optional name → list of members (each an alias name or a literal
+    /// hostname). A group is shorthand for a set of hosts that firewall rules can
+    /// reference as a subject or peer; it is expanded client-side into concrete
+    /// hostnames before publishing. Groups drive firewall rules only, not
+    /// membership.
+    #[serde(default)]
+    pub groups: BTreeMap<String, Vec<String>>,
     /// Network name → its suggested firewall (subject hostname → rules). A bare
     /// [`SuggestedFirewall`], reused verbatim from `ray_proto::policy`.
     #[serde(default)]
@@ -72,9 +88,23 @@ fn deserialize_spec(cfg: config::Config) -> Result<DeploySpec> {
     // "default/empty" (an open subject).
     let mut value: config::Value = cfg.try_deserialize().context("reading config tree")?;
     normalize_nil(&mut value);
-    value
+    let spec = value
         .try_deserialize::<DeploySpec>()
-        .context("expected a top-level `networks:` map")
+        .context("expected a top-level `networks:` map")?;
+    validate_names(&spec)?;
+    Ok(spec)
+}
+
+/// Structural validation independent of live state: a name may not be defined as
+/// both a group and an alias (resolution would be ambiguous).
+fn validate_names(spec: &DeploySpec) -> Result<()> {
+    for name in spec.groups.keys() {
+        anyhow::ensure!(
+            !spec.aliases.contains_key(name),
+            "`{name}` is defined as both a group and an alias; names must be unique"
+        );
+    }
+    Ok(())
 }
 
 /// Recursively replace `ValueKind::Nil` with an empty `Table` so a null
@@ -117,6 +147,19 @@ pub const EXAMPLE_SPEC: &str = r#"# Rayfish deploy spec. See `ray apply --help`.
 # means any peer. Suggestions are advisory: each node queues them for
 # `ray firewall accept`, or auto-installs them if it joined with
 # `--auto-accept-firewall`.
+#
+# Optional `aliases:` and `groups:` are coordinator-side shorthand, expanded
+# client-side before publishing (they never reach the network). An alias names a
+# user by identity (copy it from `ray identityof <net> <host>`) and expands to
+# all of that user's joined device hostnames. A group is a named set of aliases
+# and/or literal hostnames. Both can be used as a rule subject or peer. An alias
+# only resolves once the user has joined; literal hostnames work pre-join.
+
+aliases:
+  # Fill in a real identity, e.g.:
+  #   alice: <paste from `ray identityof infra alice-laptop`>
+groups:
+  admins: [alice, jumpbox]   # `alice` (alias, once defined) + a literal hostname
 
 networks:
   gaming:
@@ -137,6 +180,11 @@ networks:
     "*":
       allows:
         "*": "tcp:6969"
+  infra:
+    # Every node lets the `admins` group (alice's devices + jumpbox) reach SSH.
+    "*":
+      allows:
+        admins: "tcp:22"
 "#;
 
 /// Union of every concrete hostname mentioned in the spec — both subjects and
@@ -158,6 +206,109 @@ pub fn expected_hosts(spec: &DeploySpec) -> Vec<String> {
         }
     }
     set.into_iter().collect()
+}
+
+/// Expand all group/alias references in one network's firewall into a pure,
+/// hostname-keyed [`SuggestedFirewall`] ready to publish unchanged.
+///
+/// `resolve_alias(identity)` returns the hostnames currently joined for that
+/// identity *in this network* (the caller builds it from live `Status`). A name
+/// used as a subject or peer resolves by precedence: **group → alias → literal
+/// hostname** (a name matching no group or alias passes through as itself, so
+/// plain-hostname specs behave exactly as before). `*` is never expanded.
+///
+/// Returns the expanded firewall plus the sorted, unique set of alias names that
+/// resolved to zero joined hosts (the caller surfaces these as warnings; their
+/// rules simply aren't emitted yet and will materialize on a later apply once the
+/// user joins, mirroring how `firewall::materialize_suggestions` skips
+/// unresolved peers).
+pub fn expand_firewall(
+    fw: &SuggestedFirewall,
+    aliases: &BTreeMap<String, String>,
+    groups: &BTreeMap<String, Vec<String>>,
+    resolve_alias: &dyn Fn(&str) -> Vec<String>,
+) -> (SuggestedFirewall, Vec<String>) {
+    let mut empty_aliases: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    // Resolve one alias name to its joined hostnames, recording it if empty.
+    let mut resolve_one_alias = |name: &str, ident: &str| -> Vec<String> {
+        let hosts = resolve_alias(ident);
+        if hosts.is_empty() {
+            empty_aliases.insert(name.to_string());
+        }
+        hosts
+    };
+
+    // Resolve a subject/peer name to concrete hostnames (or keep `*`).
+    let mut resolve_name = |name: &str| -> Vec<String> {
+        if name == "*" {
+            return vec!["*".to_string()];
+        }
+        if let Some(members) = groups.get(name) {
+            let mut out: Vec<String> = Vec::new();
+            for m in members {
+                if m == "*" {
+                    out.push("*".to_string());
+                } else if let Some(ident) = aliases.get(m) {
+                    out.extend(resolve_one_alias(m, ident));
+                } else {
+                    out.push(m.clone()); // literal hostname
+                }
+            }
+            out.sort();
+            out.dedup();
+            return out;
+        }
+        if let Some(ident) = aliases.get(name) {
+            return resolve_one_alias(name, ident);
+        }
+        vec![name.to_string()] // literal hostname
+    };
+
+    let mut out = SuggestedFirewall::new();
+    for (subject, rules) in fw {
+        // Expand the peer side once, reused for every concrete subject.
+        let mut allows: BTreeMap<String, String> = BTreeMap::new();
+        for (peer, spec) in &rules.allows {
+            for host in resolve_name(peer) {
+                merge_spec(allows.entry(host).or_default(), spec);
+            }
+        }
+        let mut denies: BTreeMap<String, String> = BTreeMap::new();
+        for (peer, spec) in &rules.denies {
+            for host in resolve_name(peer) {
+                merge_spec(denies.entry(host).or_default(), spec);
+            }
+        }
+
+        for subj in resolve_name(subject) {
+            let entry = out.entry(subj).or_default();
+            for (peer, spec) in &allows {
+                merge_spec(entry.allows.entry(peer.clone()).or_default(), spec);
+            }
+            for (peer, spec) in &denies {
+                merge_spec(entry.denies.entry(peer.clone()).or_default(), spec);
+            }
+        }
+    }
+
+    (out, empty_aliases.into_iter().collect())
+}
+
+/// Merge a new comma-separated proto-spec into an existing one, keeping the union
+/// of tokens sorted and deduplicated (canonical, so repeated expansions are
+/// idempotent). An empty existing value just adopts the new tokens.
+fn merge_spec(existing: &mut String, new: &str) {
+    let mut tokens: std::collections::BTreeSet<&str> = existing
+        .split(',')
+        .chain(new.split(','))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    *existing = std::mem::take(&mut tokens)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(",");
 }
 
 #[cfg(test)]
@@ -273,6 +424,7 @@ networks:
         );
         let mut spec = DeploySpec {
             networks: BTreeMap::new(),
+            ..Default::default()
         };
         spec.networks.insert("gaming".to_string(), fw);
         spec.networks
@@ -309,6 +461,7 @@ networks:
         );
         let mut spec = DeploySpec {
             networks: BTreeMap::new(),
+            ..Default::default()
         };
         spec.networks.insert("gaming".to_string(), fw);
         let hosts = expected_hosts(&spec);
@@ -316,6 +469,185 @@ networks:
             hosts,
             vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
         );
+    }
+
+    /// Build a HostSuggestions from (peer, spec) allow pairs.
+    fn allows(pairs: &[(&str, &str)]) -> HostSuggestions {
+        HostSuggestions {
+            allows: pairs
+                .iter()
+                .map(|(p, s)| (p.to_string(), s.to_string()))
+                .collect(),
+            denies: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn alias_expands_to_all_user_hostnames() {
+        // alias `alice` -> her identity -> all her joined devices.
+        let aliases: BTreeMap<String, String> =
+            [("alice".to_string(), "id-alice".to_string())].into();
+        let groups = BTreeMap::new();
+        let resolve = |id: &str| -> Vec<String> {
+            if id == "id-alice" {
+                vec!["alice-laptop".to_string(), "alice-phone".to_string()]
+            } else {
+                vec![]
+            }
+        };
+        let mut fw = SuggestedFirewall::new();
+        fw.insert("*".to_string(), allows(&[("alice", "tcp:22")]));
+
+        let (out, warnings) = expand_firewall(&fw, &aliases, &groups, &resolve);
+        assert!(warnings.is_empty());
+        let wild = out.get("*").unwrap();
+        assert_eq!(wild.allows.get("alice-laptop").map(String::as_str), Some("tcp:22"));
+        assert_eq!(wild.allows.get("alice-phone").map(String::as_str), Some("tcp:22"));
+        assert!(!wild.allows.contains_key("alice"), "alias name must not survive");
+    }
+
+    #[test]
+    fn group_as_peer_expands_aliases_and_literals() {
+        let aliases: BTreeMap<String, String> =
+            [("alice".to_string(), "id-alice".to_string())].into();
+        let groups: BTreeMap<String, Vec<String>> = [(
+            "admins".to_string(),
+            vec!["alice".to_string(), "bob-server".to_string()],
+        )]
+        .into();
+        let resolve = |id: &str| -> Vec<String> {
+            if id == "id-alice" {
+                vec!["alice-laptop".to_string()]
+            } else {
+                vec![]
+            }
+        };
+        let mut fw = SuggestedFirewall::new();
+        fw.insert("*".to_string(), allows(&[("admins", "tcp:22")]));
+
+        let (out, _) = expand_firewall(&fw, &aliases, &groups, &resolve);
+        let wild = out.get("*").unwrap();
+        assert_eq!(wild.allows.get("alice-laptop").map(String::as_str), Some("tcp:22"));
+        assert_eq!(wild.allows.get("bob-server").map(String::as_str), Some("tcp:22"));
+        assert!(!wild.allows.contains_key("admins"));
+    }
+
+    #[test]
+    fn group_as_subject_expands_to_each_member() {
+        let aliases = BTreeMap::new();
+        let groups: BTreeMap<String, Vec<String>> = [(
+            "webservers".to_string(),
+            vec!["web1".to_string(), "web2".to_string()],
+        )]
+        .into();
+        let resolve = |_: &str| -> Vec<String> { vec![] };
+        let mut fw = SuggestedFirewall::new();
+        fw.insert("webservers".to_string(), allows(&[("*", "tcp:80")]));
+
+        let (out, _) = expand_firewall(&fw, &aliases, &groups, &resolve);
+        assert!(!out.contains_key("webservers"));
+        assert_eq!(out.get("web1").unwrap().allows.get("*").map(String::as_str), Some("tcp:80"));
+        assert_eq!(out.get("web2").unwrap().allows.get("*").map(String::as_str), Some("tcp:80"));
+    }
+
+    #[test]
+    fn colliding_peer_specs_merge_and_dedup() {
+        // `admins` and `alice` both resolve to alice-laptop with different ports;
+        // the two allow specs merge into one comma-joined, deduped token list.
+        let aliases: BTreeMap<String, String> =
+            [("alice".to_string(), "id-alice".to_string())].into();
+        let groups: BTreeMap<String, Vec<String>> =
+            [("admins".to_string(), vec!["alice".to_string()])].into();
+        let resolve = |id: &str| -> Vec<String> {
+            if id == "id-alice" {
+                vec!["alice-laptop".to_string()]
+            } else {
+                vec![]
+            }
+        };
+        let mut fw = SuggestedFirewall::new();
+        fw.insert(
+            "*".to_string(),
+            allows(&[("admins", "tcp:22"), ("alice", "tcp:80")]),
+        );
+
+        let (out, _) = expand_firewall(&fw, &aliases, &groups, &resolve);
+        let merged = out.get("*").unwrap().allows.get("alice-laptop").unwrap();
+        assert_eq!(merged, "tcp:22,tcp:80", "specs must merge sorted+deduped");
+    }
+
+    #[test]
+    fn wildcards_pass_through_untouched() {
+        let aliases = BTreeMap::new();
+        let groups = BTreeMap::new();
+        let resolve = |_: &str| -> Vec<String> { vec![] };
+        let mut fw = SuggestedFirewall::new();
+        fw.insert("*".to_string(), allows(&[("*", "tcp:6969")]));
+
+        let (out, _) = expand_firewall(&fw, &aliases, &groups, &resolve);
+        assert_eq!(out.get("*").unwrap().allows.get("*").map(String::as_str), Some("tcp:6969"));
+    }
+
+    #[test]
+    fn unknown_name_passes_through_as_literal() {
+        let aliases = BTreeMap::new();
+        let groups = BTreeMap::new();
+        let resolve = |_: &str| -> Vec<String> { vec![] };
+        let mut fw = SuggestedFirewall::new();
+        fw.insert("jumpbox".to_string(), allows(&[("monitor", "tcp:9100")]));
+
+        let (out, warnings) = expand_firewall(&fw, &aliases, &groups, &resolve);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            out.get("jumpbox").unwrap().allows.get("monitor").map(String::as_str),
+            Some("tcp:9100")
+        );
+    }
+
+    #[test]
+    fn alias_resolving_to_zero_hosts_warns_and_emits_nothing() {
+        let aliases: BTreeMap<String, String> =
+            [("ghost".to_string(), "id-ghost".to_string())].into();
+        let groups = BTreeMap::new();
+        let resolve = |_: &str| -> Vec<String> { vec![] }; // never joined
+        let mut fw = SuggestedFirewall::new();
+        fw.insert("*".to_string(), allows(&[("ghost", "tcp:22")]));
+
+        let (out, warnings) = expand_firewall(&fw, &aliases, &groups, &resolve);
+        assert_eq!(warnings, vec!["ghost".to_string()]);
+        assert!(out.get("*").unwrap().allows.is_empty(), "no rule for an unjoined alias");
+    }
+
+    #[test]
+    fn group_and_alias_name_collision_errors() {
+        let yaml = r#"
+aliases:
+  admins: someidentitystring
+groups:
+  admins: [alice]
+networks:
+  prod: {}
+"#;
+        let err = parse(yaml).unwrap_err().to_string();
+        assert!(err.contains("admins"), "collision must name the offending key: {err}");
+    }
+
+    #[test]
+    fn aliases_and_groups_parse() {
+        let yaml = r#"
+aliases:
+  alice: someidentitystring
+groups:
+  admins: [alice, bob-server]
+networks:
+  prod:
+    "*":
+      allows:
+        admins: "tcp:22"
+"#;
+        let spec = parse(yaml).unwrap();
+        assert_eq!(spec.aliases.get("alice").map(String::as_str), Some("someidentitystring"));
+        assert_eq!(spec.groups.get("admins").unwrap().len(), 2);
     }
 
     #[test]
