@@ -152,7 +152,7 @@ impl SshServer {
     /// sshd keeps `:22` on every other interface.
     pub fn spawn(self, addrs: Vec<IpAddr>, token: CancellationToken) {
         tokio::spawn(async move {
-            let key = match load_or_generate_host_key() {
+            let key = match load_host_key() {
                 Ok(k) => k,
                 Err(e) => {
                     warn!(error = %e, "mesh SSH: could not load host key; SSH disabled");
@@ -671,6 +671,78 @@ async fn run_pipe_session(
     Ok(status.code().unwrap_or(0) as u32)
 }
 
+/// Load the SSH host key the embedded server presents.
+///
+/// Prefers the machine's real OpenSSH ed25519 host key so a stock client that
+/// already trusts the host keeps seeing the same fingerprint once the mesh SSH
+/// NAT takes over `:22` (no `known_hosts` mismatch). Falls back to a persisted
+/// generated key when no usable host key is found.
+fn load_host_key() -> Result<PrivateKey> {
+    if let Some((path, key)) = discover_host_ed25519_key() {
+        info!(path = %path.display(), "mesh SSH: reusing host ed25519 key");
+        return Ok(key);
+    }
+    let key = load_or_generate_host_key()?;
+    info!("mesh SSH: using generated host key");
+    Ok(key)
+}
+
+/// Run `sshd -T` and return the first configured ed25519 host key that loads
+/// unencrypted, together with its path. Best-effort: any failure (no `sshd`,
+/// dump error, no ed25519 key, unreadable or encrypted key) yields `None`, so
+/// the caller falls back to the generated key. The daemon is root, so it can
+/// read the `0600` host key files.
+fn discover_host_ed25519_key() -> Option<(PathBuf, PrivateKey)> {
+    let dump = run_sshd_dump()?;
+    for path in parse_hostkey_paths(&dump) {
+        let Ok(pem) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match PrivateKey::from_openssh(&pem) {
+            Ok(key)
+                if !key.is_encrypted()
+                    && key.algorithm() == russh::keys::Algorithm::Ed25519 =>
+            {
+                return Some((path, key));
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// Dump the effective sshd config (`sshd -T`). Tries `sshd` on `PATH` then the
+/// common absolute locations, since the daemon's `PATH` may not include
+/// `/usr/sbin`. Returns `None` if none run successfully.
+fn run_sshd_dump() -> Option<String> {
+    for bin in ["sshd", "/usr/sbin/sshd", "/usr/local/sbin/sshd"] {
+        match std::process::Command::new(bin)
+            .arg("-T")
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(out) if out.status.success() => return String::from_utf8(out.stdout).ok(),
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// Extract the `hostkey <path>` entries from `sshd -T` output, in order. `sshd`
+/// prints one lowercase directive per line; other directives are ignored.
+fn parse_hostkey_paths(dump: &str) -> Vec<PathBuf> {
+    dump.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let directive = parts.next()?;
+            directive
+                .eq_ignore_ascii_case("hostkey")
+                .then(|| parts.next().map(PathBuf::from))
+                .flatten()
+        })
+        .collect()
+}
+
 /// Load the persisted SSH host key, generating and persisting one on first use.
 /// Stored as OpenSSH PEM at `<config_dir>/ssh_host_key`, mode 0600.
 fn load_or_generate_host_key() -> Result<PrivateKey> {
@@ -731,6 +803,33 @@ mod tests {
         assert!(!authorized(&alice, &["net3"]));
         // union across shared networks: alice shares net3 (no rule) + net2 (*).
         assert!(authorized(&alice, &["net3", "net2"]));
+    }
+
+    #[test]
+    fn parse_hostkey_paths_extracts_hostkey_lines() {
+        // `sshd -T` prints one lowercase directive per line; only `hostkey`
+        // lines carry a path, and there can be several. Other directives and
+        // blank lines are ignored.
+        let dump = "port 22\n\
+            hostkey /etc/ssh/ssh_host_rsa_key\n\
+            hostkey /etc/ssh/ssh_host_ecdsa_key\n\
+            HostKey /etc/ssh/ssh_host_ed25519_key\n\
+            hostkeyalgorithms ssh-ed25519\n\
+            permitrootlogin no\n";
+        let paths = parse_hostkey_paths(dump);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/etc/ssh/ssh_host_rsa_key"),
+                PathBuf::from("/etc/ssh/ssh_host_ecdsa_key"),
+                PathBuf::from("/etc/ssh/ssh_host_ed25519_key"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_hostkey_paths_empty_when_no_hostkey() {
+        assert!(parse_hostkey_paths("port 22\npermitrootlogin no\n").is_empty());
     }
 
     #[test]

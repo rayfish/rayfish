@@ -17,6 +17,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   networks (where the peer could immediately re-join) and against another
   coordinator or yourself.
 
+### Fixed
+
+- **Mesh SSH host-key mismatch**: enabling `ray firewall ssh on` no longer makes
+  `ssh <host>.ray` fail with a "REMOTE HOST IDENTIFICATION HAS CHANGED" warning.
+  The embedded SSH server now presents the machine's existing OpenSSH ed25519
+  host key (discovered via `sshd -T`) instead of a separate generated key, so
+  clients that already trust the host keep matching the fingerprint pinned in
+  their `known_hosts`. Hosts without a usable OpenSSH key fall back to a
+  generated key as before.
+
 ## [0.1.4]
 
 ### Added
