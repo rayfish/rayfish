@@ -1,10 +1,12 @@
 //! `TunRead` / `TunWrite` over an Android `VpnService` file descriptor.
 //!
-//! Kotlin hands us the raw `int` fd returned by `VpnService.Builder.establish()`.
-//! We `dup()` it so the reader and writer each own an independent descriptor that
-//! is closed on drop; the underlying tunnel closes once every dup is dropped and
-//! Kotlin closes its own copy. `tokio::io::unix::AsyncFd` drives readiness; the
-//! raw `read`/`write` syscalls move one IP packet at a time.
+//! Kotlin hands us the raw `int` fd returned by `VpnService.Builder.establish()`
+//! after `detachFd()`, transferring ownership to native code. The reader takes
+//! ownership of that fd directly; the writer owns a single `dup()` of it. Both
+//! close on drop, so the underlying tunnel closes once the reader and writer (and
+//! their tasks) drop: exactly two owned fds, each closed exactly once, no leak.
+//! `tokio::io::unix::AsyncFd` drives readiness; the raw `read`/`write` syscalls
+//! move one IP packet at a time.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -19,8 +21,22 @@ use tokio::io::unix::AsyncFd;
 /// packet is never truncated.
 const READ_CHUNK: usize = 2048;
 
-/// `dup` the caller's fd, mark the copy non-blocking (required by `AsyncFd`), and
-/// take ownership of the copy.
+/// Mark an already-owned fd non-blocking (required by `AsyncFd`), in place.
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `dup` the caller's fd, mark the copy non-blocking, and take ownership of it.
+///
+/// The dup shares the underlying open-file-description, so `O_NONBLOCK` set on
+/// either fd applies to both; we set it explicitly here to be safe.
 fn dup_nonblocking(fd: RawFd) -> io::Result<OwnedFd> {
     // SAFETY: `dup` returns a fresh, independent descriptor we then own.
     let dup = unsafe { libc::dup(fd) };
@@ -29,13 +45,7 @@ fn dup_nonblocking(fd: RawFd) -> io::Result<OwnedFd> {
     }
     // SAFETY: `dup` is a valid, owned fd; wrap it so it closes on drop.
     let owned = unsafe { OwnedFd::from_raw_fd(dup) };
-    let flags = unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    set_nonblocking(owned.as_raw_fd())?;
     Ok(owned)
 }
 
@@ -45,9 +55,19 @@ pub struct AndroidTunReader {
 }
 
 impl AndroidTunReader {
-    pub fn new(fd: RawFd) -> Result<Self> {
+    /// Take ownership of the detached `VpnService` fd directly (no dup). The fd
+    /// is closed on drop, so the caller must not close it again.
+    ///
+    /// # Safety
+    /// `fd` must be an open, owned descriptor (e.g. from Kotlin `detachFd()`)
+    /// that nothing else will close.
+    pub unsafe fn from_owned_fd(fd: RawFd) -> Result<Self> {
+        set_nonblocking(fd)?;
+        // SAFETY: caller guarantees `fd` is a valid, owned descriptor; wrap it so
+        // it closes exactly once on drop.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(Self {
-            fd: AsyncFd::new(dup_nonblocking(fd)?)?,
+            fd: AsyncFd::new(owned)?,
         })
     }
 }
