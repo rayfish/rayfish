@@ -506,7 +506,12 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 pub fn config_dir() -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     let dir = PathBuf::from("/etc/rayfish");
-    #[cfg(not(target_os = "linux"))]
+    // Android: an app-private path. This placeholder keeps the library compiling;
+    // the real per-app path (`Context.getFilesDir()`) is injected from Kotlin and
+    // wired through in a later milestone.
+    #[cfg(target_os = "android")]
+    let dir = PathBuf::from("/data/local/tmp/rayfish");
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let dir = dirs::config_dir()
         .context("could not determine config directory")?
         .join("rayfish");

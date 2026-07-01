@@ -6,7 +6,11 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Context, Result, bail};
+// The desktop TUN device (the `tun` crate) and its async I/O helpers only exist
+// off Android, where the packet interface is a `VpnService` fd instead.
+#[cfg(not(target_os = "android"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(not(target_os = "android"))]
 use tun::{Configuration, DeviceReader, DeviceWriter};
 
 /// Read side of a packet interface. Fills the spare capacity of `buf` with one
@@ -42,14 +46,17 @@ pub trait TunWrite: Send + 'static {
 /// `route_peer_range` fail with `EINVAL`). 1280 is also the value WireGuard and
 /// Tailscale use for their TUN interfaces for the same reason, and it still
 /// fits within QUIC datagram limits.
+#[cfg(not(target_os = "android"))]
 const TUN_MTU: u16 = 1280;
 
 /// Read half of the TUN device. Owned by [`forward::run_mesh`].
+#[cfg(not(target_os = "android"))]
 pub struct TunReader {
     reader: DeviceReader,
 }
 
 /// Write half of the TUN device. Owned by [`forward::spawn_tun_writer`].
+#[cfg(not(target_os = "android"))]
 pub struct TunWriter {
     writer: DeviceWriter,
 }
@@ -59,6 +66,7 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
     octets[0] == 100 && (octets[1] & 0xC0) == 64
 }
 
+#[cfg(not(target_os = "android"))]
 pub fn check_cgnat_conflict() -> Result<()> {
     let output = std::process::Command::new("ifconfig").output();
 
@@ -102,6 +110,7 @@ pub fn check_cgnat_conflict() -> Result<()> {
 /// independent read/write halves. IPv4 gets a /10 netmask (100.64.0.0/10);
 /// IPv6 gets a /7 prefix (`200::/7`) so the kernel installs the connected
 /// route for the whole peer range, mirroring how the IPv4 /10 netmask works.
+#[cfg(not(target_os = "android"))]
 pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
     let gateway = Ipv4Addr::new(100, 64, 0, 1);
     let mut config = Configuration::default();
@@ -322,7 +331,10 @@ pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    not(any(target_os = "linux", target_os = "macos")),
+    not(target_os = "android")
+))]
 pub async fn route_magic_dns(_tun_name: &str) -> Result<()> {
     Ok(())
 }
@@ -359,7 +371,7 @@ pub async fn route_self_loopback(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 pub async fn route_self_loopback(_v4: Ipv4Addr, _v6: Ipv6Addr) -> Result<()> {
     // Linux installs the loopback `local` route automatically on address
     // assignment; self-traffic already works without an explicit route.
@@ -367,6 +379,7 @@ pub async fn route_self_loopback(_v4: Ipv4Addr, _v6: Ipv6Addr) -> Result<()> {
 }
 
 /// Bring the TUN interface administratively up (used when activating the VPN).
+#[cfg(not(target_os = "android"))]
 pub fn set_link_up(tun_name: &str) -> Result<()> {
     set_link_state(tun_name, true)
 }
@@ -374,10 +387,12 @@ pub fn set_link_up(tun_name: &str) -> Result<()> {
 /// Bring the TUN interface administratively down (standby). The underlying file
 /// descriptor stays open, so the device can be brought back up without
 /// recreating it.
+#[cfg(not(target_os = "android"))]
 pub fn set_link_down(tun_name: &str) -> Result<()> {
     set_link_state(tun_name, false)
 }
 
+#[cfg(not(target_os = "android"))]
 fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -400,6 +415,7 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 impl TunRead for TunReader {
     /// Reads one packet from the TUN device, appending into the spare capacity
     /// of `buf` without zeroing or reallocating. The caller MUST ensure `buf`
@@ -410,6 +426,7 @@ impl TunRead for TunReader {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl TunWrite for TunWriter {
     async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
         self.writer.write_all(packet).await?;

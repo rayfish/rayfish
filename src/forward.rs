@@ -33,8 +33,20 @@ const MAX_PEER_DATAGRAM: usize = 1500;
 /// quinn and is freed as those datagrams are sent).
 const TX_POOL_CHUNK: usize = 64 * 1024;
 
+/// The port a stock `ssh` client targets (`ssh user@host.ray`). Defined here in
+/// the always-compiled forward core because the userspace SSH NAT below rewrites
+/// it on every platform, including Android, where the desktop-only `crate::ssh`
+/// module (which re-exports this) is gated out.
+pub(crate) const SSH_PORT: u16 = 22;
+
+/// Internal port the embedded SSH server binds. Mesh `:22` is translated
+/// to/from this port by the userspace NAT below. Chosen below the ephemeral
+/// source-port ranges so the outbound NAT (which matches `src_port == this`)
+/// can't collide with a kernel-assigned ephemeral port. See `crate::ssh`.
+pub(crate) const SSH_LISTEN_PORT: u16 = 30022;
+
 /// Userspace NAT that maps this node's mesh `:22` to/from the embedded SSH
-/// server's internal listen port ([`crate::ssh::SSH_LISTEN_PORT`]). The kernel
+/// server's internal listen port ([`SSH_LISTEN_PORT`]). The kernel
 /// won't let us bind `<mesh-ip>:22` alongside a host sshd on `0.0.0.0:22`, so
 /// instead of an OS-firewall redirect (which would be Linux-only) we translate
 /// the port inside our own forwarding path — portable across every platform the
@@ -114,15 +126,15 @@ fn rewrite_ssh_port(pkt: &mut [u8], info: &firewall::PacketInfo, inbound: bool) 
         return false;
     }
     let (port_off, old, new) = if inbound {
-        if !nat.is_ours(info.dst_ip) || info.dst_port != crate::ssh::SSH_PORT {
+        if !nat.is_ours(info.dst_ip) || info.dst_port != SSH_PORT {
             return false;
         }
-        (ihl + 2, crate::ssh::SSH_PORT, nat.listen_port)
+        (ihl + 2, SSH_PORT, nat.listen_port)
     } else {
         if !nat.is_ours(info.src_ip) || info.src_port != nat.listen_port {
             return false;
         }
-        (ihl, nat.listen_port, crate::ssh::SSH_PORT)
+        (ihl, nat.listen_port, SSH_PORT)
     };
     pkt[port_off..port_off + 2].copy_from_slice(&new.to_be_bytes());
     let ck_off = ihl + 16;
@@ -398,7 +410,7 @@ pub fn spawn_peer_reader(
                     // ordinary traffic.
                     let datagram = match ssh_nat() {
                         Some(_) => match firewall::parse_packet_info(&datagram) {
-                            Some(info) if info.protocol == 6 && info.dst_port == crate::ssh::SSH_PORT => {
+                            Some(info) if info.protocol == 6 && info.dst_port == SSH_PORT => {
                                 let mut v = datagram.to_vec();
                                 rewrite_ssh_port(&mut v, &info, true);
                                 Bytes::from(v)
