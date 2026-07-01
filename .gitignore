@@ -3,6 +3,14 @@
 /docs
 .superpowers
 
+# Android build outputs / local config
+android/.gradle/
+android/build/
+android/app/build/
+**/jniLibs/**
+android/local.properties
+**/.cxx/
+
 # OS / editor cruft
 .DS_Store
 *.swp
