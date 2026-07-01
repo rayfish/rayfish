@@ -719,7 +719,7 @@ mod tests {
         authz.store(Arc::new(map));
 
         let authorized = |u, nets: &[&str]| {
-            let nets: Vec<SmolStr> = nets.iter().map(|n| SmolStr::new(n)).collect();
+            let nets: Vec<SmolStr> = nets.iter().map(SmolStr::new).collect();
             resolve_user_policy(&authz, u, &nets).authorized()
         };
         // alice on net1 → allowed; bob on net1 → denied.
