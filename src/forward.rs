@@ -20,7 +20,6 @@ use tokio_util::sync::CancellationToken;
 use crate::firewall::{self, Direction, SharedFirewall};
 use crate::peers::{DeviceUserMap, PeerTable};
 use crate::stats::{DropReason, ForwardMetrics};
-use crate::tun::{TunRead, TunReader};
 
 /// Maximum datagram size accepted from a peer. Anything larger is dropped before
 /// being parsed or written to the TUN device, bounding memory use under a flood
@@ -234,8 +233,8 @@ pub(crate) fn is_magic_dns(info: &firewall::PacketInfo) -> bool {
 /// looks up the peer in [`PeerTable`], and sends the packet as a QUIC datagram.
 /// Packets with no matching peer are silently dropped.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_mesh(
-    mut tun: TunReader,
+pub async fn run_mesh<R: crate::tun::TunRead>(
+    mut tun: R,
     peers: PeerTable,
     firewall: SharedFirewall,
     token: CancellationToken,
