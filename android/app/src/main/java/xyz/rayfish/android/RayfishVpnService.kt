@@ -53,8 +53,10 @@ class RayfishVpnService : VpnService() {
         tunnel = pfd
 
         // Node.up drives the blocking-ish bring-up (endpoint bind, forward loop
-        // spawn) so keep it off the main thread. The fd is detached: the Rust
-        // side dups it and owns its copy, we still close our pfd on stop.
+        // spawn) so keep it off the main thread. detachFd() transfers ownership
+        // of the tunnel fd to the Rust side, which closes it on Node.down; our
+        // ParcelFileDescriptor no longer owns an fd, so tunnel?.close() on stop
+        // is a harmless no-op kept only to clear the reference.
         thread(name = "rayfish-node-up") {
             try {
                 NodeHolder.get(applicationContext).up(pfd.detachFd())

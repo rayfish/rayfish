@@ -125,8 +125,11 @@ impl Node {
     /// iroh endpoint, and spawn the forward loop + TUN writer over the fd. Mirrors
     /// `build_daemon` steps 1-6 (identity, endpoint, forward wire-up, resolver).
     pub fn up(&self, tun_fd: i32) -> Result<(), RayError> {
-        let mut guard = self.running.lock().unwrap();
-        if guard.is_some() {
+        // Reject a double-`up` up front, but do NOT hold the lock across the
+        // async bring-up below: a concurrent `status()`/`down()` would otherwise
+        // block for the whole endpoint bind. We build everything first, then take
+        // the lock only briefly to commit (re-checking for a racing `up`).
+        if self.running.lock().unwrap().is_some() {
             return Err(RayError::InvalidState("node already up".into()));
         }
 
@@ -176,8 +179,14 @@ impl Node {
                 dns::new_reverse_table(),
             ));
 
-            let reader = AndroidTunReader::new(tun_fd).map_err(RayError::internal)?;
+            // The writer owns a single `dup` of the fd; the reader takes
+            // ownership of the detached fd itself. Build the writer's dup first so
+            // that if it fails we have not yet consumed the original fd.
             let writer = AndroidTunWriter::new(tun_fd).map_err(RayError::internal)?;
+            // SAFETY: `tun_fd` is the fd Kotlin transferred to us via `detachFd()`;
+            // nothing else owns or closes it, so the reader may take ownership.
+            let reader =
+                unsafe { AndroidTunReader::from_owned_fd(tun_fd) }.map_err(RayError::internal)?;
 
             let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
             forward::spawn_tun_writer(writer, tun_rx, active.clone());
@@ -202,6 +211,15 @@ impl Node {
             })
         })?;
 
+        // Commit under the lock, re-checking for a racing `up` that won while we
+        // were building. If one did, drop `running` here (cancelling its token /
+        // closing its fds via Drop) and report the same double-`up` error.
+        let mut guard = self.running.lock().unwrap();
+        if guard.is_some() {
+            running.active.store(false, Ordering::Relaxed);
+            running.token.cancel();
+            return Err(RayError::InvalidState("node already up".into()));
+        }
         *guard = Some(running);
         Ok(())
     }
