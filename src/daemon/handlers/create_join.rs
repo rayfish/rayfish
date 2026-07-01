@@ -230,6 +230,7 @@ impl DaemonState {
             auto_accept_firewall: false,
             admins: vec![],
             direct,
+            ssh_allow: vec![],
         })?;
 
         let cancel = self.shutdown_token.child_token();

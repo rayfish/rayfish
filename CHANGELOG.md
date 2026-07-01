@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Mesh SSH (`ray firewall ssh`)** — Tailscale-style SSH with no SSH keys to
+  manage. `ray firewall ssh on` runs an embedded SSH server on this node's mesh
+  IPs (port 22); `ray firewall ssh allow <network> <peer>` authorizes a peer
+  (hostname, mesh IP, short id, or `*` for any peer on the network) to log in.
+  Connect with a stock client: `ssh user@host.ray`. The connecting peer is
+  identified by its mesh identity (already proven by the encrypted mesh link), so
+  there are no `authorized_keys` to distribute. Each grant restricts which local
+  unix users the peer may log in as: `ray firewall ssh allow <net> <peer>` permits
+  any **non-root** user by default, `--user alice,deploy` limits it to named
+  accounts, and `--user '*'` permits any user including root. The check is by uid,
+  so a uid-0 account under any name is blocked unless root is explicitly granted.
+  `ray firewall ssh deny` revokes a peer; `ray firewall ssh show` lists state and
+  per-network allow lists with their permitted users. As a security prerequisite,
+  inbound mesh packets whose source IP is not the sending peer's assigned mesh
+  address are now dropped (ingress anti-spoofing), so no peer can forge another's
+  mesh IP.
 - **Aliases and groups in `ray apply`** — a spec can now define optional
   top-level `aliases:` (a friendly name → a user's identity string) and
   `groups:` (a name → a list of aliases and/or hostnames), then reference them

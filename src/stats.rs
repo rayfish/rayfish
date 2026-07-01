@@ -19,14 +19,19 @@ pub enum DropReason {
     SendFailure,
     NoPeer,
     Malformed,
+    /// Inbound datagram whose source IP did not match the sending peer's
+    /// assigned mesh address (ingress anti-spoofing). A peer may only inject
+    /// packets sourced from its own mesh IP.
+    Spoof,
 }
 
 impl DropReason {
-    const ALL: [DropReason; 4] = [
+    const ALL: [DropReason; 5] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
         DropReason::Malformed,
+        DropReason::Spoof,
     ];
 }
 

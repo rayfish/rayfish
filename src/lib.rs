@@ -75,6 +75,7 @@ pub mod progress;
 pub mod ratelimit;
 pub mod reject;
 pub mod shutdown;
+pub mod ssh;
 pub mod stats;
 pub mod style;
 pub mod transport;

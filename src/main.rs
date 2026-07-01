@@ -535,6 +535,49 @@ pub(crate) enum FirewallAction {
         /// `on` or `off`
         state: String,
     },
+    /// Embedded mesh SSH server (Tailscale-style): SSH into this node by mesh
+    /// identity, no SSH keys. `ssh on` starts the server; `ssh allow <net> <peer>`
+    /// authorizes a peer to log in. Connect with a stock client: `ssh user@host.ray`.
+    Ssh {
+        #[command(subcommand)]
+        action: SshAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SshAction {
+    /// Start the embedded mesh SSH server on this node (listens on the mesh IPs'
+    /// port 22; opens tcp:22 in the local firewall).
+    On,
+    /// Stop the mesh SSH server (removes the tcp:22 passthrough).
+    Off,
+    /// Authorize a peer to SSH into this node over a network. `peer` is a
+    /// hostname, mesh IP, short id, or `*` (any peer on the network).
+    #[command(visible_alias = "ok")]
+    Allow {
+        /// Network name
+        network: String,
+        /// Peer (hostname / mesh IP / short id) or `*`
+        peer: String,
+        /// Local unix users this peer may log in as (comma-separated). Omit for
+        /// any non-root user; pass `*` for any user including root.
+        #[arg(long = "user", short = 'u', value_delimiter = ',')]
+        user: Vec<String>,
+    },
+    /// Revoke a peer's SSH authorization on a network.
+    #[command(visible_aliases = ["rm", "del"])]
+    Deny {
+        /// Network name
+        network: String,
+        /// Peer (hostname / mesh IP / short id) or `*`
+        peer: String,
+    },
+    /// Show the mesh SSH server state and per-network allow lists.
+    #[command(visible_aliases = ["ls", "list"])]
+    Show {
+        /// Optional network to filter to
+        network: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

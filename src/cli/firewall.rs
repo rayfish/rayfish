@@ -15,6 +15,9 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
     if let FirewallAction::Pending { network } = action {
         return ipc_firewall_pending(&network).await;
     }
+    if let FirewallAction::Ssh { action } = action {
+        return ipc_firewall_ssh(action).await;
+    }
     let mut stream = ipc::connect().await?;
     let req = match action {
         FirewallAction::Add {
@@ -56,7 +59,9 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
             ipc::IpcMessage::FirewallAutoAccept { network, enabled }
         }
         // Handled above by early return (need extra round trips / interaction).
-        FirewallAction::Suggest { .. } | FirewallAction::Pending { .. } => unreachable!(),
+        FirewallAction::Suggest { .. }
+        | FirewallAction::Pending { .. }
+        | FirewallAction::Ssh { .. } => unreachable!(),
     };
     ipc::send(&mut stream, req).await?;
     let resp = ipc::recv(&mut stream).await?;
@@ -86,6 +91,101 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
+}
+
+/// `ray firewall ssh ...`: toggle the embedded mesh SSH server and manage
+/// per-network allow lists.
+async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
+    let mut filter: Option<String> = None;
+    let req = match action {
+        SshAction::On => ipc::IpcMessage::FirewallSshSet { enabled: true },
+        SshAction::Off => ipc::IpcMessage::FirewallSshSet { enabled: false },
+        SshAction::Allow {
+            network,
+            peer,
+            user,
+        } => ipc::IpcMessage::FirewallSshAllow {
+            network,
+            peer,
+            users: user,
+            allow: true,
+        },
+        SshAction::Deny { network, peer } => ipc::IpcMessage::FirewallSshAllow {
+            network,
+            peer,
+            users: vec![],
+            allow: false,
+        },
+        SshAction::Show { network } => {
+            filter = network;
+            ipc::IpcMessage::FirewallSshShow
+        }
+    };
+    let mut stream = ipc::connect().await?;
+    ipc::send(&mut stream, req).await?;
+    let resp = ipc::recv(&mut stream).await?;
+    match resp {
+        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::FirewallSshState { enabled, networks } => {
+            render_ssh_state(enabled, networks, filter.as_deref())
+        }
+        ipc::IpcMessage::Error { message } => print_error("firewall ssh", &message, None),
+        other => eprintln!("Unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Render `ray firewall ssh show` output (or JSON), optionally filtered to one
+/// network.
+fn render_ssh_state(
+    enabled: bool,
+    networks: Vec<(String, Vec<ipc::SshAllowView>)>,
+    filter: Option<&str>,
+) {
+    let networks: Vec<(String, Vec<ipc::SshAllowView>)> = networks
+        .into_iter()
+        .filter(|(n, _)| filter.is_none_or(|f| f == n))
+        .collect();
+    if json_enabled() {
+        print_json(&serde_json::json!({
+            "enabled": enabled,
+            "networks": networks.iter().map(|(n, a)| serde_json::json!({
+                "network": n,
+                "allow": a.iter().map(|r| serde_json::json!({
+                    "peer": r.peer,
+                    "users": r.users,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }));
+        return;
+    }
+    println!("mesh SSH: {}", if enabled { "on" } else { "off" });
+    if networks.is_empty() {
+        println!("  (no SSH allow rules)");
+        return;
+    }
+    for (net, allow) in &networks {
+        let entries: Vec<String> = allow
+            .iter()
+            .map(|r| {
+                let peer = if r.peer == "*" || r.peer.len() <= 12 {
+                    r.peer.clone()
+                } else {
+                    format!("{}…", &r.peer[..12])
+                };
+                // Empty users = the non-root default; `*` = any user incl. root.
+                let users = if r.users.is_empty() {
+                    "any non-root user".to_string()
+                } else if r.users.iter().any(|u| u == "*") {
+                    "any user".to_string()
+                } else {
+                    r.users.join(",")
+                };
+                format!("{peer} → {users}")
+            })
+            .collect();
+        println!("  {net}: {}", entries.join("; "));
+    }
 }
 
 /// Print a JSON value as one compact line to stdout (jq-friendly).

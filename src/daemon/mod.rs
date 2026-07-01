@@ -1290,6 +1290,13 @@ pub struct DaemonState {
     resolver: std::sync::Arc<crate::dns_resolver::Resolver>,
     /// Cancellation token for the `run_resolv_reassert` task (Linux direct mode).
     dns_reassert_token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    /// Live per-network SSH allow lists for the embedded mesh SSH server. Swapped
+    /// atomically on `ray firewall ssh allow/deny`, so a running listener picks up
+    /// changes without restart. See [`crate::ssh`].
+    ssh_authz: crate::ssh::SshAuthz,
+    /// Cancellation token for the running SSH listeners (`None` when off / on
+    /// standby). Set by [`DaemonState::start_ssh`], cleared by `stop_ssh`.
+    ssh_token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
     /// Promotion signal: a co-coordinator's per-peer control reader sends the
     /// network name here after persisting an `AdminGrant` key, and the main
     /// daemon loop ([`serve_ipc`]) drains it into
@@ -1451,6 +1458,7 @@ impl DaemonState {
                 | IpcMessage::FirewallShow
                 | IpcMessage::FirewallSuggestions { .. }
                 | IpcMessage::FirewallPending { .. }
+                | IpcMessage::FirewallSshShow
                 | IpcMessage::ListFiles
                 | IpcMessage::Connections
                 | IpcMessage::ContactId
@@ -1592,6 +1600,14 @@ impl DaemonState {
             IpcMessage::FirewallAutoAccept { network, enabled } => {
                 self.firewall_auto_accept(&network, enabled)
             }
+            IpcMessage::FirewallSshSet { enabled } => self.firewall_ssh_set(enabled),
+            IpcMessage::FirewallSshAllow {
+                network,
+                peer,
+                users,
+                allow,
+            } => self.firewall_ssh_allow(&network, &peer, users, allow).await,
+            IpcMessage::FirewallSshShow => self.firewall_ssh_show(),
             IpcMessage::SetHostname { network, hostname } => {
                 self.set_hostname(&network, &hostname).await
             }
@@ -1965,6 +1981,13 @@ async fn build_daemon(
     let collision_index = identity::load_collision_index()?;
     let identity = IrohIdentityProvider::new(public_key, collision_index);
     let my_ip = identity.local_ip();
+    // Register our mesh addresses for the userspace SSH port NAT (mesh `:22`
+    // <-> the embedded server's listen port). Stays inactive until `ssh on`.
+    forward::init_ssh_nat(
+        my_ip,
+        derive_ipv6(&identity.local_identity()),
+        crate::ssh::SSH_LISTEN_PORT,
+    );
 
     // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
     let mut app_config = config::load()?;
@@ -2082,6 +2105,8 @@ async fn build_daemon(
         dns_configurator: Arc::new(std::sync::Mutex::new(None)),
         resolver: dns_resolver.clone(),
         dns_reassert_token: std::sync::Mutex::new(None),
+        ssh_authz: crate::ssh::new_authz(),
+        ssh_token: std::sync::Mutex::new(None),
         promote_tx,
     });
 
@@ -3561,9 +3586,9 @@ async fn join_mesh_shared(
     // Preserve a queued rename intent across reconnects/restores: the blob we
     // just fetched won't carry it yet, so persisting it here keeps the drain
     // alive until a coordinator confirms the new name.
-    let (direct, pending_hostname) = config::load_network(network_name)?
-        .map(|n| (n.direct, n.pending_hostname))
-        .unwrap_or((false, None));
+    let (direct, pending_hostname, ssh_allow) = config::load_network(network_name)?
+        .map(|n| (n.direct, n.pending_hostname, n.ssh_allow))
+        .unwrap_or((false, None, vec![]));
     config::save_network(&config::NetworkConfig {
         name: network_name.to_string(),
         group_mode: GroupMode::Restricted,
@@ -3578,6 +3603,7 @@ async fn join_mesh_shared(
         auto_accept_firewall,
         admins: vec![],
         direct,
+        ssh_allow,
     })?;
 
     // On reconnect/restore the coordinator hasn't seen our hostname this session,

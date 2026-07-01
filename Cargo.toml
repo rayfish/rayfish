@@ -114,6 +114,17 @@ self-replace = "1"
 sha2 = "0.10"
 # Semantic version comparison for `ray update` (only upgrade when newer).
 semver = "1"
+# Embedded mesh SSH server (`ray firewall ssh on`): pure-Rust async SSH on tokio.
+# Use the `ring` crypto backend (already in the tree via iroh) instead of the
+# default `aws-lc-rs`, whose C build breaks cross-compilation (`just cross`).
+russh = { version = "0.54", default-features = false, features = ["ring", "flate2"] }
+# PTY allocation + login-shell spawning for SSH sessions (async/tokio).
+pty-process = { version = "0.5", features = ["async"] }
+# getpwnam-style passwd lookup to resolve the requested SSH unix user.
+uzers = "0.12"
+# Build the mesh SSH listener socket with SO_REUSEADDR/SO_REUSEPORT so binding
+# a specific mesh IP's port 22 coexists with a host sshd on 0.0.0.0:22.
+socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
 tempfile = "3"

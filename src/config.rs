@@ -138,6 +138,25 @@ pub struct NetworkConfig {
     /// and suppress its (non-shareable) room id.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub direct: bool,
+    /// Peers authorized to SSH into this node over this network's mesh link
+    /// (`ray firewall ssh allow <net> <peer>`). Only consulted when the global
+    /// `ssh_enabled` toggle is on. Empty = no peer may SSH in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_allow: Vec<SshRule>,
+}
+
+/// One mesh-SSH authorization entry: a peer and the local unix users it may log
+/// in as. `peer` is a peer's user-identity (hex [`EndpointId`]) or `"*"` (any
+/// peer on the network). `users` lists the permitted login accounts; an **empty
+/// list means any non-root user** (the secure default), and `"*"` in the list
+/// means any user including root. Setting a peer's rule replaces its `users`
+/// (last write wins); the SSH server folds rules across shared networks at
+/// login (see [`crate::ssh`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshRule {
+    pub peer: String,
+    #[serde(default)]
+    pub users: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -247,7 +266,10 @@ pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) ->
                 for e in &entries {
                     resolve_url_entry(e, RELAY_PRESET_RAYFISH)?;
                 }
-                cfg.relay = ServerOverride { servers: entries, replace };
+                cfg.relay = ServerOverride {
+                    servers: entries,
+                    replace,
+                };
             }
         }
         "discovery-dns" => {
@@ -257,7 +279,10 @@ pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) ->
                 for e in &entries {
                     resolve_url_entry(e, DISCOVERY_PRESET_RAYFISH)?;
                 }
-                cfg.discovery_dns = ServerOverride { servers: entries, replace };
+                cfg.discovery_dns = ServerOverride {
+                    servers: entries,
+                    replace,
+                };
             }
         }
         "dns-upstreams" => {
@@ -268,7 +293,10 @@ pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) ->
                     e.parse::<Ipv4Addr>()
                         .with_context(|| format!("invalid IPv4 address: {e}"))?;
                 }
-                cfg.dns_upstreams = ServerOverride { servers: entries, replace };
+                cfg.dns_upstreams = ServerOverride {
+                    servers: entries,
+                    replace,
+                };
             }
         }
         other => anyhow::bail!(
@@ -340,6 +368,11 @@ pub struct AppConfig {
     /// Custom Magic DNS upstream forwarders for non-`.ray` queries (IPv4 only).
     #[serde(default)]
     pub dns_upstreams: ServerOverride,
+    /// Global toggle for the embedded mesh SSH server (`ray firewall ssh on`).
+    /// When on, the daemon listens on each mesh IP's port 22 and admits peers
+    /// authorized in a network's [`NetworkConfig::ssh_allow`] list. Off by default.
+    #[serde(default)]
+    pub ssh_enabled: bool,
     #[serde(default)]
     pub networks: Vec<NetworkConfig>,
 }
@@ -354,6 +387,7 @@ impl Default for AppConfig {
             relay: ServerOverride::default(),
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
+            ssh_enabled: false,
             networks: Vec::new(),
         }
     }
@@ -419,6 +453,8 @@ struct Settings {
     discovery_dns: ServerOverride,
     #[serde(default)]
     dns_upstreams: ServerOverride,
+    #[serde(default)]
+    ssh_enabled: bool,
 }
 
 /// Look up the `rayfish` group's gid (Linux), if the group exists.
@@ -644,6 +680,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
             relay: ServerOverride::default(),
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
+            ssh_enabled: false,
         }
     };
 
@@ -679,6 +716,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         relay: settings.relay,
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
+        ssh_enabled: settings.ssh_enabled,
         networks,
     })
 }
@@ -697,6 +735,7 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         relay: config.relay.clone(),
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
+        ssh_enabled: config.ssh_enabled,
     };
     let path = dir.join(SETTINGS_FILE);
     let contents = toml::to_string_pretty(&settings).context("serializing settings")?;
@@ -732,9 +771,9 @@ fn load_network_in(dir: &Path, name: &str) -> Result<Option<NetworkConfig>> {
     }
     let s =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(Some(toml::from_str(&s).with_context(|| {
-        format!("parsing {}", path.display())
-    })?))
+    Ok(Some(
+        toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?,
+    ))
 }
 
 /// Delete a single network's config file. Returns true if it existed.
@@ -806,11 +845,12 @@ mod tests {
                     network_secret_key: None,
                     network_public_key: None,
                     my_hostname: None,
-            pending_hostname: None,
+                    pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
                     admins: vec![],
                     direct: false,
+                    ssh_allow: vec![],
                 },
                 NetworkConfig {
                     name: "work".to_string(),
@@ -821,11 +861,12 @@ mod tests {
                     network_secret_key: None,
                     network_public_key: None,
                     my_hostname: None,
-            pending_hostname: None,
+                    pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
                     admins: vec![],
                     direct: false,
+                    ssh_allow: vec![],
                 },
             ],
             ..Default::default()
@@ -862,6 +903,7 @@ mod tests {
             auto_accept_firewall: false,
             admins: vec![],
             direct: false,
+            ssh_allow: vec![],
         };
         upsert_network(&mut config, net);
         assert_eq!(config.networks.len(), 1);
@@ -881,11 +923,12 @@ mod tests {
                 network_secret_key: None,
                 network_public_key: None,
                 my_hostname: None,
-            pending_hostname: None,
+                pending_hostname: None,
                 transport: None,
                 auto_accept_firewall: false,
                 admins: vec![],
                 direct: false,
+                ssh_allow: vec![],
             }],
             ..Default::default()
         };
@@ -903,6 +946,7 @@ mod tests {
             auto_accept_firewall: false,
             admins: vec![],
             direct: false,
+            ssh_allow: vec![],
         };
         upsert_network(&mut config, updated.clone());
         assert_eq!(config.networks.len(), 1);
@@ -926,11 +970,12 @@ mod tests {
                     network_secret_key: None,
                     network_public_key: None,
                     my_hostname: None,
-            pending_hostname: None,
+                    pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
                     admins: vec![],
                     direct: false,
+                    ssh_allow: vec![],
                 },
                 NetworkConfig {
                     name: "remove-me".to_string(),
@@ -941,11 +986,12 @@ mod tests {
                     network_secret_key: None,
                     network_public_key: None,
                     my_hostname: None,
-            pending_hostname: None,
+                    pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
                     admins: vec![],
                     direct: false,
+                    ssh_allow: vec![],
                 },
             ],
             ..Default::default()
@@ -984,11 +1030,12 @@ mod tests {
                 network_secret_key: None,
                 network_public_key: None,
                 my_hostname: None,
-            pending_hostname: None,
+                pending_hostname: None,
                 transport: None,
                 auto_accept_firewall: false,
                 admins: vec![],
                 direct: false,
+                ssh_allow: vec![],
             }],
             ..Default::default()
         };
@@ -1012,11 +1059,12 @@ mod tests {
                 network_secret_key: Some(secret.clone()),
                 network_public_key: Some(public),
                 my_hostname: None,
-            pending_hostname: None,
+                pending_hostname: None,
                 transport: None,
                 auto_accept_firewall: false,
                 admins: vec![],
                 direct: false,
+                ssh_allow: vec![],
             }],
             ..Default::default()
         };
@@ -1087,6 +1135,7 @@ name = "test"
             auto_accept_firewall: false,
             admins: vec![],
             direct: false,
+            ssh_allow: vec![],
         }
     }
 
@@ -1154,18 +1203,45 @@ name = "test"
 
     #[test]
     fn relay_urls_expands_rayfish_preset() {
-        let o = ServerOverride { servers: vec!["rayfish".into()], replace: false };
-        assert_eq!(relay_urls(&o).unwrap(), vec![RELAY_PRESET_RAYFISH.to_string()]);
-        let d = ServerOverride { servers: vec!["rayfish".into()], replace: false };
-        assert_eq!(discovery_urls(&d).unwrap(), vec![DISCOVERY_PRESET_RAYFISH.to_string()]);
+        let o = ServerOverride {
+            servers: vec!["rayfish".into()],
+            replace: false,
+        };
+        assert_eq!(
+            relay_urls(&o).unwrap(),
+            vec![RELAY_PRESET_RAYFISH.to_string()]
+        );
+        let d = ServerOverride {
+            servers: vec!["rayfish".into()],
+            replace: false,
+        };
+        assert_eq!(
+            discovery_urls(&d).unwrap(),
+            vec![DISCOVERY_PRESET_RAYFISH.to_string()]
+        );
     }
 
     #[test]
     fn url_entry_rejects_bad() {
-        assert!(relay_urls(&ServerOverride { servers: vec!["ftp://x".into()], replace: false }).is_err());
-        assert!(relay_urls(&ServerOverride { servers: vec!["not a url".into()], replace: false }).is_err());
+        assert!(
+            relay_urls(&ServerOverride {
+                servers: vec!["ftp://x".into()],
+                replace: false
+            })
+            .is_err()
+        );
+        assert!(
+            relay_urls(&ServerOverride {
+                servers: vec!["not a url".into()],
+                replace: false
+            })
+            .is_err()
+        );
         // A real http URL passes through unchanged.
-        let ok = ServerOverride { servers: vec!["http://r:1".into()], replace: false };
+        let ok = ServerOverride {
+            servers: vec!["http://r:1".into()],
+            replace: false,
+        };
         assert_eq!(relay_urls(&ok).unwrap(), vec!["http://r:1".to_string()]);
     }
 
@@ -1175,14 +1251,26 @@ name = "test"
         let one = Ipv4Addr::new(1, 1, 1, 1);
 
         // Unset: captured unchanged.
-        assert_eq!(resolve_upstreams(&ServerOverride::default(), captured.clone()), captured);
+        assert_eq!(
+            resolve_upstreams(&ServerOverride::default(), captured.clone()),
+            captured
+        );
 
         // Augment: custom first, then captured.
-        let aug = ServerOverride { servers: vec!["1.1.1.1".into()], replace: false };
-        assert_eq!(resolve_upstreams(&aug, captured.clone()), vec![one, captured[0]]);
+        let aug = ServerOverride {
+            servers: vec!["1.1.1.1".into()],
+            replace: false,
+        };
+        assert_eq!(
+            resolve_upstreams(&aug, captured.clone()),
+            vec![one, captured[0]]
+        );
 
         // Replace: custom only.
-        let rep = ServerOverride { servers: vec!["1.1.1.1".into()], replace: true };
+        let rep = ServerOverride {
+            servers: vec!["1.1.1.1".into()],
+            replace: true,
+        };
         assert_eq!(resolve_upstreams(&rep, captured.clone()), vec![one]);
     }
 
@@ -1230,7 +1318,11 @@ name = "test"
         });
 
         let loaded = load_in(&dir).unwrap();
-        assert_eq!(loaded.networks.len(), N, "all concurrent saves must survive");
+        assert_eq!(
+            loaded.networks.len(),
+            N,
+            "all concurrent saves must survive"
+        );
     }
 
     #[test]

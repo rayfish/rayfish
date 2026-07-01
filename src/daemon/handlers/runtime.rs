@@ -182,6 +182,9 @@ impl DaemonState {
                 .unwrap_or(false),
             admins: net_config.map(|nc| nc.admins.clone()).unwrap_or_default(),
             direct: net_config.map(|nc| nc.direct).unwrap_or(false),
+            ssh_allow: net_config
+                .map(|nc| nc.ssh_allow.clone())
+                .unwrap_or_default(),
         })?;
 
         let cancel = self.shutdown_token.child_token();
@@ -431,6 +434,56 @@ impl DaemonState {
         tracing::info!(networks = count, "control plane connected");
     }
 
+    /// Rebuild the live per-network SSH allow-list snapshot from persisted
+    /// config, so a running listener authorizes against current rules. Cheap and
+    /// only called on SSH config changes / activation (not the hot path).
+    pub(crate) fn rebuild_ssh_authz(&self) {
+        let mut map = std::collections::HashMap::new();
+        if let Ok(cfg) = config::load() {
+            for n in &cfg.networks {
+                if !n.ssh_allow.is_empty() {
+                    map.insert(n.name.clone(), n.ssh_allow.clone());
+                }
+            }
+        }
+        self.ssh_authz.store(std::sync::Arc::new(map));
+    }
+
+    /// Start the embedded mesh SSH listeners on this node's mesh addresses, if
+    /// not already running. Idempotent. Bound to the data plane: called from
+    /// `activate` when `ssh_enabled`, and from the `ssh on` IPC while active.
+    pub(crate) fn start_ssh(self: &Arc<Self>) {
+        let mut guard = self.ssh_token.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let token = tokio_util::sync::CancellationToken::new();
+        *guard = Some(token.clone());
+        drop(guard);
+        self.rebuild_ssh_authz();
+        let my_v4 = self.identity.local_ip();
+        let my_v6 = derive_ipv6(&self.identity.local_identity());
+        let server = crate::ssh::SshServer::new(
+            self.peers.clone(),
+            self.device_user_map.clone(),
+            self.ssh_authz.clone(),
+        );
+        server.spawn(
+            vec![std::net::IpAddr::V4(my_v4), std::net::IpAddr::V6(my_v6)],
+            token,
+        );
+        // Turn on the userspace port NAT so mesh `:22` reaches the listener.
+        crate::forward::set_ssh_nat_active(true);
+    }
+
+    /// Stop the SSH listeners if running. Idempotent.
+    pub(crate) fn stop_ssh(&self) {
+        crate::forward::set_ssh_nat_active(false);
+        if let Some(t) = self.ssh_token.lock().unwrap().take() {
+            t.cancel();
+        }
+    }
+
     /// Activate the VPN: bring the TUN interface up, configure system DNS.
     /// Idempotent — a no-op if already active. Runs entirely inside the
     /// (root) daemon, so the IPC client needs no privileges.
@@ -500,6 +553,12 @@ impl DaemonState {
         }
 
         self.configure_magic_dns(&mut warnings).await;
+
+        // Start the embedded mesh SSH server if enabled. It binds the mesh IPs'
+        // port 22, so it follows the data plane (mesh addresses must be up).
+        if config::load().map(|c| c.ssh_enabled).unwrap_or(false) {
+            self.start_ssh();
+        }
 
         tracing::info!("data plane activated");
         if warnings.is_empty() {
@@ -571,6 +630,9 @@ impl DaemonState {
         if let Some(rt) = self.dns_reassert_token.lock().unwrap().take() {
             rt.cancel();
         }
+
+        // The SSH listeners bind the mesh IPs, which go down with the data plane.
+        self.stop_ssh();
 
         // Revert system DNS (extract the configurator before reverting so the
         // mutex guard isn't held across the call).
