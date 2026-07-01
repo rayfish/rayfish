@@ -554,6 +554,7 @@ impl DaemonState {
     /// Rebuild the live per-network SSH allow-list snapshot from persisted
     /// config, so a running listener authorizes against current rules. Cheap and
     /// only called on SSH config changes / activation (not the hot path).
+    #[cfg(feature = "desktop")]
     pub(crate) fn rebuild_ssh_authz(&self) {
         let mut map = std::collections::HashMap::new();
         if let Ok(cfg) = config::load() {
@@ -569,6 +570,7 @@ impl DaemonState {
     /// Start the embedded mesh SSH listeners on this node's mesh addresses, if
     /// not already running. Idempotent. Bound to the data plane: called from
     /// `activate` when `ssh_enabled`, and from the `ssh on` IPC while active.
+    #[cfg(feature = "desktop")]
     pub(crate) fn start_ssh(self: &Arc<Self>) {
         let mut guard = self.ssh_token.lock().unwrap();
         if guard.is_some() {
@@ -594,6 +596,7 @@ impl DaemonState {
     }
 
     /// Stop the SSH listeners if running. Idempotent.
+    #[cfg(feature = "desktop")]
     pub(crate) fn stop_ssh(&self) {
         crate::forward::set_ssh_nat_active(false);
         if let Some(t) = self.ssh_token.lock().unwrap().take() {
@@ -641,38 +644,47 @@ impl DaemonState {
         // wrong instead of silently reporting success on a degraded VPN.
         let mut warnings: Vec<String> = Vec::new();
 
-        if let Err(e) = tun::set_link_up(&self.tun_name) {
-            tracing::warn!(error = %e, "failed to bring TUN interface up");
-            warnings.push(format!("failed to bring TUN interface up: {e}"));
-        }
+        // The TUN device/routes are managed by the OS on desktop. On Android the
+        // packet interface is a `VpnService` fd whose routes are configured on the
+        // Kotlin side, so these desktop route calls don't apply.
+        #[cfg(not(target_os = "android"))]
+        {
+            if let Err(e) = tun::set_link_up(&self.tun_name) {
+                tracing::warn!(error = %e, "failed to bring TUN interface up");
+                warnings.push(format!("failed to bring TUN interface up: {e}"));
+            }
 
-        // Route the 200::/7 peer range into the TUN. Must happen after link-up:
-        // on Linux the kernel won't install an IPv6 connected route while the
-        // link is down, so without this peer traffic leaks out the default route.
-        if let Err(e) = tun::route_peer_range(&self.tun_name).await {
-            tracing::warn!(error = %e, "failed to route 200::/7 into TUN");
-            warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
-        }
+            // Route the 200::/7 peer range into the TUN. Must happen after
+            // link-up: on Linux the kernel won't install an IPv6 connected route
+            // while the link is down, so without this peer traffic leaks out the
+            // default route.
+            if let Err(e) = tun::route_peer_range(&self.tun_name).await {
+                tracing::warn!(error = %e, "failed to route 200::/7 into TUN");
+                warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
+            }
 
-        if let Err(e) = tun::route_magic_dns(&self.tun_name).await {
-            tracing::warn!(error = %e, "failed to route magic DNS IP into TUN");
-        }
+            if let Err(e) = tun::route_magic_dns(&self.tun_name).await {
+                tracing::warn!(error = %e, "failed to route magic DNS IP into TUN");
+            }
 
-        // Loop our own addresses back through lo0 so self-traffic (e.g. pinging
-        // our own hostname) is answered locally instead of leaving via the TUN,
-        // where the forwarding loop would drop it as "no peer for dst". No-op on
-        // Linux (kernel installs the `local` route automatically).
-        let my_v4 = self.identity.local_ip();
-        let my_v6 = derive_ipv6(&self.identity.local_identity());
-        if let Err(e) = tun::route_self_loopback(my_v4, my_v6).await {
-            tracing::warn!(error = %e, "failed to install loopback self-route");
-            warnings.push(format!("failed to install loopback self-route: {e}"));
+            // Loop our own addresses back through lo0 so self-traffic (e.g.
+            // pinging our own hostname) is answered locally instead of leaving via
+            // the TUN, where the forwarding loop would drop it as "no peer for
+            // dst". No-op on Linux (kernel installs the `local` route
+            // automatically).
+            let my_v4 = self.identity.local_ip();
+            let my_v6 = derive_ipv6(&self.identity.local_identity());
+            if let Err(e) = tun::route_self_loopback(my_v4, my_v6).await {
+                tracing::warn!(error = %e, "failed to install loopback self-route");
+                warnings.push(format!("failed to install loopback self-route: {e}"));
+            }
         }
 
         self.configure_magic_dns(&mut warnings).await;
 
         // Start the embedded mesh SSH server if enabled. It binds the mesh IPs'
         // port 22, so it follows the data plane (mesh addresses must be up).
+        #[cfg(feature = "desktop")]
         if config::load().map(|c| c.ssh_enabled).unwrap_or(false) {
             self.start_ssh();
         }
@@ -749,6 +761,7 @@ impl DaemonState {
         }
 
         // The SSH listeners bind the mesh IPs, which go down with the data plane.
+        #[cfg(feature = "desktop")]
         self.stop_ssh();
 
         // Revert system DNS (extract the configurator before reverting so the
@@ -761,6 +774,7 @@ impl DaemonState {
         }
         dns_config::clear_search_domains(&self.tun_name).await;
 
+        #[cfg(not(target_os = "android"))]
         if let Err(e) = tun::set_link_down(&self.tun_name) {
             tracing::warn!(error = %e, "failed to bring TUN interface down");
         }

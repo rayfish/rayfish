@@ -20,7 +20,6 @@ use tokio_util::sync::CancellationToken;
 use crate::firewall::{self, Direction, SharedFirewall};
 use crate::peers::{DeviceUserMap, PeerTable};
 use crate::stats::{DropReason, ForwardMetrics};
-use crate::tun::{TunReader, TunWriter};
 
 /// Maximum datagram size accepted from a peer. Anything larger is dropped before
 /// being parsed or written to the TUN device, bounding memory use under a flood
@@ -34,8 +33,20 @@ const MAX_PEER_DATAGRAM: usize = 1500;
 /// quinn and is freed as those datagrams are sent).
 const TX_POOL_CHUNK: usize = 64 * 1024;
 
+/// The port a stock `ssh` client targets (`ssh user@host.ray`). Defined here in
+/// the always-compiled forward core because the userspace SSH NAT below rewrites
+/// it on every platform, including Android, where the desktop-only `crate::ssh`
+/// module (which re-exports this) is gated out.
+pub(crate) const SSH_PORT: u16 = 22;
+
+/// Internal port the embedded SSH server binds. Mesh `:22` is translated
+/// to/from this port by the userspace NAT below. Chosen below the ephemeral
+/// source-port ranges so the outbound NAT (which matches `src_port == this`)
+/// can't collide with a kernel-assigned ephemeral port. See `crate::ssh`.
+pub(crate) const SSH_LISTEN_PORT: u16 = 30022;
+
 /// Userspace NAT that maps this node's mesh `:22` to/from the embedded SSH
-/// server's internal listen port ([`crate::ssh::SSH_LISTEN_PORT`]). The kernel
+/// server's internal listen port ([`SSH_LISTEN_PORT`]). The kernel
 /// won't let us bind `<mesh-ip>:22` alongside a host sshd on `0.0.0.0:22`, so
 /// instead of an OS-firewall redirect (which would be Linux-only) we translate
 /// the port inside our own forwarding path — portable across every platform the
@@ -115,15 +126,15 @@ fn rewrite_ssh_port(pkt: &mut [u8], info: &firewall::PacketInfo, inbound: bool) 
         return false;
     }
     let (port_off, old, new) = if inbound {
-        if !nat.is_ours(info.dst_ip) || info.dst_port != crate::ssh::SSH_PORT {
+        if !nat.is_ours(info.dst_ip) || info.dst_port != SSH_PORT {
             return false;
         }
-        (ihl + 2, crate::ssh::SSH_PORT, nat.listen_port)
+        (ihl + 2, SSH_PORT, nat.listen_port)
     } else {
         if !nat.is_ours(info.src_ip) || info.src_port != nat.listen_port {
             return false;
         }
-        (ihl, nat.listen_port, crate::ssh::SSH_PORT)
+        (ihl, nat.listen_port, SSH_PORT)
     };
     pkt[port_off..port_off + 2].copy_from_slice(&new.to_be_bytes());
     let ck_off = ihl + 16;
@@ -243,8 +254,8 @@ pub(crate) fn is_magic_dns(info: &firewall::PacketInfo) -> bool {
 /// looks up the peer in [`PeerTable`], and sends the packet as a QUIC datagram.
 /// Packets with no matching peer are silently dropped.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_mesh(
-    mut tun: TunReader,
+pub async fn run_mesh<R: crate::tun::TunRead>(
+    mut tun: R,
     peers: PeerTable,
     firewall: SharedFirewall,
     token: CancellationToken,
@@ -409,7 +420,7 @@ pub fn spawn_peer_reader(
                     // ordinary traffic.
                     let datagram = match ssh_nat() {
                         Some(_) => match firewall::parse_packet_info(&datagram) {
-                            Some(info) if info.protocol == 6 && info.dst_port == crate::ssh::SSH_PORT => {
+                            Some(info) if info.protocol == 6 && info.dst_port == SSH_PORT => {
                                 let mut v = datagram.to_vec();
                                 rewrite_ssh_port(&mut v, &info, true);
                                 Bytes::from(v)
@@ -455,8 +466,8 @@ pub fn spawn_peer_reader(
 /// `active` is the data-plane gate: while it is false (standby, after `ray
 /// down`) inbound datagrams are dropped instead of written, so a node that
 /// stays connected to peers still carries no traffic.
-pub fn spawn_tun_writer(
-    mut tun: TunWriter,
+pub fn spawn_tun_writer<W: crate::tun::TunWrite>(
+    mut tun: W,
     mut tun_rx: mpsc::Receiver<Bytes>,
     active: Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -479,6 +490,47 @@ pub fn spawn_tun_writer(
 mod tests {
     use super::*;
     use crate::firewall::Action;
+
+    #[derive(Default)]
+    struct FakeTunWriter {
+        written: std::sync::Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl crate::tun::TunWrite for FakeTunWriter {
+        async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
+            self.written.lock().await.push(packet.to_vec());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tun_writer_writes_when_active() {
+        use std::sync::atomic::AtomicBool;
+        let writer = FakeTunWriter::default();
+        let sink = writer.written.clone();
+        let (tx, rx) = mpsc::channel::<Bytes>(8);
+        let active = std::sync::Arc::new(AtomicBool::new(true));
+        let handle = spawn_tun_writer(writer, rx, active);
+        tx.send(Bytes::from_static(b"kept")).await.unwrap();
+        drop(tx); // close channel so the writer task exits
+        handle.await.unwrap();
+        let got = sink.lock().await;
+        assert_eq!(got.as_slice(), &[b"kept".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn tun_writer_drops_when_inactive() {
+        use std::sync::atomic::AtomicBool;
+        let writer = FakeTunWriter::default();
+        let sink = writer.written.clone();
+        let (tx, rx) = mpsc::channel::<Bytes>(8);
+        let active = std::sync::Arc::new(AtomicBool::new(false));
+        let handle = spawn_tun_writer(writer, rx, active);
+        tx.send(Bytes::from_static(b"dropped")).await.unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        assert!(sink.lock().await.is_empty());
+    }
 
     #[test]
     fn test_parse_packet_valid_ipv4() {

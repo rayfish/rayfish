@@ -75,6 +75,9 @@ use crate::network_name;
 use crate::peers::{self, PeerTable};
 use crate::stats::ForwardMetrics;
 use crate::transport;
+// The desktop TUN device and its CGNAT pre-flight check don't exist on Android,
+// where the packet interface is a `VpnService` fd supplied from Kotlin.
+#[cfg(not(target_os = "android"))]
 use crate::tun::{self, check_cgnat_conflict};
 use ray_proto::SuggestedFirewall;
 
@@ -1302,10 +1305,16 @@ pub struct DaemonState {
     dns_reassert_token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
     /// Live per-network SSH allow lists for the embedded mesh SSH server. Swapped
     /// atomically on `ray firewall ssh allow/deny`, so a running listener picks up
-    /// changes without restart. See [`crate::ssh`].
+    /// changes without restart. See [`crate::ssh`]. Desktop-only: the embedded
+    /// mesh SSH server isn't part of the Android build.
+    #[cfg(feature = "desktop")]
     ssh_authz: crate::ssh::SshAuthz,
     /// Cancellation token for the running SSH listeners (`None` when off / on
     /// standby). Set by [`DaemonState::start_ssh`], cleared by `stop_ssh`.
+    // The only readers/writers (`start_ssh`/`stop_ssh`) are desktop-only, so on a
+    // `--no-default-features` (Android) build the field is inert; silence the
+    // resulting dead-code warning there rather than dropping the field.
+    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
     ssh_token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
     /// Promotion signal: a co-coordinator's per-peer control reader sends the
     /// network name here after persisting an `AdminGrant` key, and the main
@@ -1930,6 +1939,7 @@ fn write_bundle(path: &std::path::Path, files: &[(String, Vec<u8>)]) -> std::io:
 
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
     // Bail early on a CGNAT clash (e.g. Tailscale) before touching anything.
+    #[cfg(not(target_os = "android"))]
     check_cgnat_conflict()?;
 
     let (daemon, _metrics_server, promote_rx) = build_daemon(token.clone(), stats).await?;
@@ -2006,7 +2016,7 @@ async fn build_daemon(
     forward::init_ssh_nat(
         my_ip,
         derive_ipv6(&identity.local_identity()),
-        crate::ssh::SSH_LISTEN_PORT,
+        crate::forward::SSH_LISTEN_PORT,
     );
 
     // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
@@ -2043,10 +2053,19 @@ async fn build_daemon(
     let blobs_proto = BlobsProtocol::new(&blob_store, None);
 
     // --- Single TUN device + the forwarding loop, shared across networks ---
-    let my_ipv6 = derive_ipv6(&identity.local_identity());
-    let (tun_reader, tun_writer, tun_name) = tun::create(my_ip, my_ipv6)
-        .await
-        .context("failed to create TUN device")?;
+    // On Android the packet interface is a `VpnService` fd wired up by
+    // `ray-mobile` in a later milestone, not an OS TUN device, so device
+    // creation and the desktop forwarding loop below are skipped and `tun_name`
+    // is a placeholder.
+    #[cfg(not(target_os = "android"))]
+    let (tun_reader, tun_writer, tun_name) = {
+        let my_ipv6 = derive_ipv6(&identity.local_identity());
+        tun::create(my_ip, my_ipv6)
+            .await
+            .context("failed to create TUN device")?
+    };
+    #[cfg(target_os = "android")]
+    let tun_name = String::from("rayfish-android");
     // Append-only audit log of peer connect/disconnect events. If it can't be
     // opened (e.g. unwritable config dir) the daemon still runs without auditing.
     let peers = match audit::AuditLog::open() {
@@ -2064,7 +2083,10 @@ async fn build_daemon(
     shared_firewall.clone().spawn_evictor(token.clone());
     let active = Arc::new(AtomicBool::new(false));
     let (tun_tx, tun_rx) = mpsc::channel::<Bytes>(256);
+    #[cfg(not(target_os = "android"))]
     forward::spawn_tun_writer(tun_writer, tun_rx, active.clone());
+    #[cfg(target_os = "android")]
+    drop(tun_rx);
     let device_user_map = peers::DeviceUserMap::new();
 
     // --- Magic DNS resolver + optional mDNS local discovery ---
@@ -2074,6 +2096,7 @@ async fn build_daemon(
         hostname_table.clone(),
         reverse_table.clone(),
     ));
+    #[cfg(not(target_os = "android"))]
     tokio::spawn(forward::run_mesh(
         tun_reader,
         peers.clone(),
@@ -2126,6 +2149,7 @@ async fn build_daemon(
         dns_configurator: Arc::new(std::sync::Mutex::new(None)),
         resolver: dns_resolver.clone(),
         dns_reassert_token: std::sync::Mutex::new(None),
+        #[cfg(feature = "desktop")]
         ssh_authz: crate::ssh::new_authz(),
         ssh_token: std::sync::Mutex::new(None),
         promote_tx,

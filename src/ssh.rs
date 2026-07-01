@@ -39,23 +39,15 @@ use tracing::{debug, info, warn};
 
 use crate::peers::{DeviceUserMap, PeerTable};
 
-/// The port a stock `ssh` client targets (`ssh user@host.ray`). We can't bind it
-/// directly: when a host sshd already holds `0.0.0.0:22`, the kernel rejects a
-/// more-specific `<mesh-ip>:22` bind over the wildcard listener (EADDRINUSE,
-/// regardless of SO_REUSEADDR/REUSEPORT). So the daemon binds [`SSH_LISTEN_PORT`]
-/// and rewrites mesh `:22` <-> that port in its own forwarding path
-/// ([`crate::forward`]), entirely in userspace — no OS firewall rules, portable
-/// across the platforms rayfish's TUN runs on (Linux and macOS; the session
-/// teardown uses Unix-only privilege-drop syscalls). The host sshd keeps `:22`
-/// on every other interface untouched.
-pub const SSH_PORT: u16 = 22;
-
-/// Internal port the embedded SSH server binds (all platforms). Mesh `:22` is
-/// translated to/from this port by the userspace NAT in `forward.rs`. Chosen
-/// *below* the ephemeral source-port ranges (Linux 32768-60999, macOS
-/// 49152-65535) so the outbound NAT (which matches `src_port == this`) can never
-/// collide with a kernel-assigned ephemeral port on an unrelated local flow.
-pub const SSH_LISTEN_PORT: u16 = 30022;
+// The port a stock `ssh` client targets (`ssh user@host.ray`) and the internal
+// port the embedded server actually binds. Both live in `crate::forward` (the
+// always-compiled core) because the userspace SSH NAT there rewrites mesh `:22`
+// <-> the listen port on every platform, including Android where this module is
+// gated out. We can't bind `:22` directly: a host sshd on `0.0.0.0:22` makes the
+// kernel reject a more-specific `<mesh-ip>:22` bind (EADDRINUSE), so the daemon
+// binds `SSH_LISTEN_PORT` and translates the port in the forwarding path instead
+// of an OS-firewall redirect. Re-exported here so the public path stays stable.
+pub(crate) use crate::forward::SSH_LISTEN_PORT;
 
 /// Per-network SSH authorization snapshot: network name -> the network's SSH
 /// allow rules (peer + permitted login users). Held in an [`ArcSwap`] so

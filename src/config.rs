@@ -513,7 +513,14 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 pub fn config_dir() -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     let dir = PathBuf::from("/etc/rayfish");
-    #[cfg(not(target_os = "linux"))]
+    // Android: an app-private path. `ray-mobile`'s `Node::new` sets
+    // `RAYFISH_CONFIG_DIR` to the app's `Context.getFilesDir()`; fall back to a
+    // fixed path if it is unset so the library still compiles/runs standalone.
+    #[cfg(target_os = "android")]
+    let dir = std::env::var_os("RAYFISH_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/data/local/tmp/rayfish"));
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let dir = dirs::config_dir()
         .context("could not determine config directory")?
         .join("rayfish");

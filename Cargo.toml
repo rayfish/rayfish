@@ -15,14 +15,31 @@ categories = ["network-programming", "command-line-utilities"]
 # The repo root is both the `rayfish` package (binary `ray`) and the workspace
 # root. `ray-proto` is a member crate holding the shared IPC wire protocol.
 [workspace]
-members = ["ray-proto"]
+members = ["ray-proto", "ray-mobile"]
 
 [[bin]]
 name = "ray"
 path = "src/main.rs"
+# The `ray` CLI/daemon binary is desktop-only: it drives the TUN device, the
+# embedded SSH server, 1Password backup, and self-replace update, none of which
+# exist on Android. Gating it on the `desktop` feature means a
+# `--no-default-features` build (the Android library build) compiles only the
+# library and skips this target instead of failing on desktop-only code.
+required-features = ["desktop"]
 
 [features]
-default = []
+default = ["desktop"]
+# Desktop-only surface: the TUN-backed daemon binary, the embedded mesh SSH
+# server (russh/pty-process/uzers), interactive password prompts (rpassword),
+# and in-place self-update (self-replace). Off for the Android library build,
+# which reuses only the mesh/forward core.
+desktop = [
+    "dep:russh",
+    "dep:pty-process",
+    "dep:uzers",
+    "dep:rpassword",
+    "dep:self-replace",
+]
 tor = ["dep:iroh-tor-transport"]
 # Export tracing spans to an OpenTelemetry collector over OTLP/HTTP. Activated at
 # runtime only when an OTEL endpoint is configured (standard OTEL_* env vars).
@@ -76,7 +93,6 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
 tracing-opentelemetry = { version = "0.33", optional = true }
 tar = "0.4"
 flate2 = "1"
-tun = { version = "0.8.13", features = ["async"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = "0.0.13"
@@ -93,7 +109,7 @@ qr2term = "0.3.3"
 bs58 = "0.5.1"
 chacha20poly1305 = "0.10.1"
 argon2 = "0.5.3"
-rpassword = "7.5.4"
+rpassword = { version = "7.5.4", optional = true }
 async-trait = "0.1"
 bytesize = "2.4.0"
 # `ray update`: query the GitHub releases API and download the new binary.
@@ -109,7 +125,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 # process default before reqwest builds its client (reqwest pulls no provider).
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Atomically replace the running executable during `ray update`.
-self-replace = "1"
+self-replace = { version = "1", optional = true }
 # SHA-256 verification of the downloaded release asset against its .sha256 file.
 sha2 = "0.10"
 # Semantic version comparison for `ray update` (only upgrade when newer).
@@ -117,11 +133,11 @@ semver = "1"
 # Embedded mesh SSH server (`ray firewall ssh on`): pure-Rust async SSH on tokio.
 # Use the `ring` crypto backend (already in the tree via iroh) instead of the
 # default `aws-lc-rs`, whose C build breaks cross-compilation (`just cross`).
-russh = { version = "0.54", default-features = false, features = ["ring", "flate2"] }
+russh = { version = "0.54", default-features = false, features = ["ring", "flate2"], optional = true }
 # PTY allocation + login-shell spawning for SSH sessions (async/tokio).
-pty-process = { version = "0.5", features = ["async"] }
+pty-process = { version = "0.5", features = ["async"], optional = true }
 # getpwnam-style passwd lookup to resolve the requested SSH unix user.
-uzers = "0.12"
+uzers = { version = "0.12", optional = true }
 # Build the mesh SSH listener socket with SO_REUSEADDR/SO_REUSEPORT so binding
 # a specific mesh IP's port 22 coexists with a host sshd on 0.0.0.0:22.
 socket2 = { version = "0.5", features = ["all"] }
@@ -136,6 +152,14 @@ criterion = "0.5"
 [[bench]]
 name = "forward"
 harness = false
+
+# The `tun` crate wraps the OS TUN device and is inherently desktop: on Android
+# the packet interface is a `VpnService` fd handed in from Kotlin, not an OS
+# device. Gating it out of the Android build keeps the library free of a
+# dependency that can't cross-compile there. The desktop TUN code in `src/tun.rs`
+# is likewise `#[cfg(not(target_os = "android"))]`.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tun = { version = "0.8.13", features = ["async"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.21.0"

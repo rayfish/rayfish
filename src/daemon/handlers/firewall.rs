@@ -417,6 +417,7 @@ impl DaemonState {
             tracing::warn!(error = %e, "failed to persist firewall config");
         }
         // Reflect immediately if the data plane is up (else activate() starts it).
+        #[cfg(feature = "desktop")]
         if self.active.load(Ordering::SeqCst) {
             if enabled {
                 self.start_ssh();
@@ -498,6 +499,7 @@ impl DaemonState {
             };
         }
         // Push the change to any live listener.
+        #[cfg(feature = "desktop")]
         self.rebuild_ssh_authz();
         let detail = if allow {
             let r = net.ssh_allow.iter().find(|r| r.peer == entry);
