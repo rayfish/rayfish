@@ -9,6 +9,27 @@ use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tun::{Configuration, DeviceReader, DeviceWriter};
 
+/// Read side of a packet interface. Fills the spare capacity of `buf` with one
+/// IP packet and returns the number of bytes read. Abstracts the concrete TUN
+/// device so the forwarding loop can run over any packet source: the desktop
+/// TUN, an Android `VpnService` fd, an iOS `NEPacketTunnelFlow`, or an in-memory
+/// fake in tests. Reading into caller-owned spare capacity keeps the forward
+/// loop's zero-copy `split_to(n).freeze()` hand-off.
+pub trait TunRead: Send + 'static {
+    fn read_into(
+        &mut self,
+        buf: &mut bytes::BytesMut,
+    ) -> impl core::future::Future<Output = anyhow::Result<usize>> + Send;
+}
+
+/// Write side of a packet interface. Writes one IP packet to the device.
+pub trait TunWrite: Send + 'static {
+    fn write_packet(
+        &mut self,
+        packet: &[u8],
+    ) -> impl core::future::Future<Output = anyhow::Result<()>> + Send;
+}
+
 /// MTU for the TUN device. IPv6 mandates a minimum link MTU of 1280 bytes
 /// (RFC 8200 §5); Linux refuses to enable IPv6 on a device with a smaller MTU,
 /// which silently breaks IPv6 address/route installation (`configure_ipv6` /
@@ -373,23 +394,18 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     Ok(())
 }
 
-impl TunReader {
-    /// Reads one packet from the TUN device, appending it into the spare
-    /// capacity of `buf` without zeroing or reallocating. The caller MUST ensure
-    /// `buf` has at least one MTU of spare capacity before calling — a short
-    /// buffer truncates the packet. Returns the number of bytes read.
-    ///
-    /// Reading straight into a [`BytesMut`] lets the forward loop hand the
-    /// packet to quinn as a zero-copy `split_to(n).freeze()`, avoiding the
-    /// per-packet allocate-and-copy a `Bytes::copy_from_slice` would cost.
-    pub async fn read_into(&mut self, buf: &mut bytes::BytesMut) -> Result<usize> {
+impl TunRead for TunReader {
+    /// Reads one packet from the TUN device, appending into the spare capacity
+    /// of `buf` without zeroing or reallocating. The caller MUST ensure `buf`
+    /// has at least one MTU of spare capacity. Returns the number of bytes read.
+    async fn read_into(&mut self, buf: &mut bytes::BytesMut) -> anyhow::Result<usize> {
         let n = self.reader.read_buf(buf).await?;
         Ok(n)
     }
 }
 
-impl TunWriter {
-    pub async fn write_packet(&mut self, packet: &[u8]) -> Result<()> {
+impl TunWrite for TunWriter {
+    async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
         self.writer.write_all(packet).await?;
         Ok(())
     }

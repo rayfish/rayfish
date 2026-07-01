@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::firewall::{self, Direction, SharedFirewall};
 use crate::peers::{DeviceUserMap, PeerTable};
 use crate::stats::{DropReason, ForwardMetrics};
-use crate::tun::{TunReader, TunWriter};
+use crate::tun::{TunRead, TunReader};
 
 /// Maximum datagram size accepted from a peer. Anything larger is dropped before
 /// being parsed or written to the TUN device, bounding memory use under a flood
@@ -445,8 +445,8 @@ pub fn spawn_peer_reader(
 /// `active` is the data-plane gate: while it is false (standby, after `ray
 /// down`) inbound datagrams are dropped instead of written, so a node that
 /// stays connected to peers still carries no traffic.
-pub fn spawn_tun_writer(
-    mut tun: TunWriter,
+pub fn spawn_tun_writer<W: crate::tun::TunWrite>(
+    mut tun: W,
     mut tun_rx: mpsc::Receiver<Bytes>,
     active: Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -469,6 +469,47 @@ pub fn spawn_tun_writer(
 mod tests {
     use super::*;
     use crate::firewall::Action;
+
+    #[derive(Default)]
+    struct FakeTunWriter {
+        written: std::sync::Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl crate::tun::TunWrite for FakeTunWriter {
+        async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
+            self.written.lock().await.push(packet.to_vec());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tun_writer_writes_when_active() {
+        use std::sync::atomic::AtomicBool;
+        let writer = FakeTunWriter::default();
+        let sink = writer.written.clone();
+        let (tx, rx) = mpsc::channel::<Bytes>(8);
+        let active = std::sync::Arc::new(AtomicBool::new(true));
+        let handle = spawn_tun_writer(writer, rx, active);
+        tx.send(Bytes::from_static(b"kept")).await.unwrap();
+        drop(tx); // close channel so the writer task exits
+        handle.await.unwrap();
+        let got = sink.lock().await;
+        assert_eq!(got.as_slice(), &[b"kept".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn tun_writer_drops_when_inactive() {
+        use std::sync::atomic::AtomicBool;
+        let writer = FakeTunWriter::default();
+        let sink = writer.written.clone();
+        let (tx, rx) = mpsc::channel::<Bytes>(8);
+        let active = std::sync::Arc::new(AtomicBool::new(false));
+        let handle = spawn_tun_writer(writer, rx, active);
+        tx.send(Bytes::from_static(b"dropped")).await.unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        assert!(sink.lock().await.is_empty());
+    }
 
     #[test]
     fn test_parse_packet_valid_ipv4() {
