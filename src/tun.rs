@@ -15,6 +15,12 @@ use tun::{Configuration, DeviceReader, DeviceWriter};
 /// TUN, an Android `VpnService` fd, an iOS `NEPacketTunnelFlow`, or an in-memory
 /// fake in tests. Reading into caller-owned spare capacity keeps the forward
 /// loop's zero-copy `split_to(n).freeze()` hand-off.
+///
+/// Contract: `Ok(0)` means "no packet this time, retry" — the forwarding loop
+/// treats it as a spurious wakeup and loops again. End-of-stream (e.g. an
+/// Android `VpnService` fd whose descriptor is revoked/closed) MUST surface as
+/// `Err`, never as a perpetual `Ok(0)`, or `run_mesh` would busy-spin at 100%
+/// CPU. The desktop TUN never returns 0, so this only binds future impls.
 pub trait TunRead: Send + 'static {
     fn read_into(
         &mut self,
