@@ -15,7 +15,7 @@ categories = ["network-programming", "command-line-utilities"]
 # The repo root is both the `rayfish` package (binary `ray`) and the workspace
 # root. `ray-proto` is a member crate holding the shared IPC wire protocol.
 [workspace]
-members = ["ray-proto"]
+members = ["ray-proto", "ray-mobile"]
 
 [[bin]]
 name = "ray"
