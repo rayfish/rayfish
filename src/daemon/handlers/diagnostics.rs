@@ -56,6 +56,13 @@ impl DaemonState {
         } else {
             h.role.clone()
         };
+        // Node-local aliases (display-only) come straight from config; status is
+        // not a hot path, so a per-network read is fine.
+        let aliases = config::load_network(&h.name)
+            .ok()
+            .flatten()
+            .map(|n| n.aliases)
+            .unwrap_or_default();
         // Resolve a mesh IPv4 back to its `.ray` hostname via the DNS snapshot.
         let lookup_hostname = |ip| {
             hostname_snapshot.and_then(|table| {
@@ -80,6 +87,7 @@ impl DaemonState {
                         peers: vec![],
                         pending_suggestions: 0,
                         pending_requests: 0,
+                        aliases,
                     };
                 }
             };
@@ -122,6 +130,7 @@ impl DaemonState {
             peers,
             pending_suggestions,
             pending_requests,
+            aliases,
         }
     }
 

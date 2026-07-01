@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -143,6 +144,12 @@ pub struct NetworkConfig {
     /// `ssh_enabled` toggle is on. Empty = no peer may SSH in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ssh_allow: Vec<SshRule>,
+    /// Node-local, per-network aliases (`alias name -> identity string`), set via
+    /// `ray alias`. Display-only convenience: shown inline in `ray status` and
+    /// used to seed `ray apply`'s `aliases:` map. Never published in the
+    /// GroupBlob.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, String>,
 }
 
 /// One mesh-SSH authorization entry: a peer and the local unix users it may log
@@ -851,6 +858,7 @@ mod tests {
                     admins: vec![],
                     direct: false,
                     ssh_allow: vec![],
+                    aliases: BTreeMap::new(),
                 },
                 NetworkConfig {
                     name: "work".to_string(),
@@ -867,6 +875,7 @@ mod tests {
                     admins: vec![],
                     direct: false,
                     ssh_allow: vec![],
+                    aliases: BTreeMap::new(),
                 },
             ],
             ..Default::default()
@@ -904,6 +913,7 @@ mod tests {
             admins: vec![],
             direct: false,
             ssh_allow: vec![],
+            aliases: BTreeMap::new(),
         };
         upsert_network(&mut config, net);
         assert_eq!(config.networks.len(), 1);
@@ -929,6 +939,7 @@ mod tests {
                 admins: vec![],
                 direct: false,
                 ssh_allow: vec![],
+                aliases: BTreeMap::new(),
             }],
             ..Default::default()
         };
@@ -947,6 +958,7 @@ mod tests {
             admins: vec![],
             direct: false,
             ssh_allow: vec![],
+            aliases: BTreeMap::new(),
         };
         upsert_network(&mut config, updated.clone());
         assert_eq!(config.networks.len(), 1);
@@ -976,6 +988,7 @@ mod tests {
                     admins: vec![],
                     direct: false,
                     ssh_allow: vec![],
+                    aliases: BTreeMap::new(),
                 },
                 NetworkConfig {
                     name: "remove-me".to_string(),
@@ -992,6 +1005,7 @@ mod tests {
                     admins: vec![],
                     direct: false,
                     ssh_allow: vec![],
+                    aliases: BTreeMap::new(),
                 },
             ],
             ..Default::default()
@@ -1036,6 +1050,7 @@ mod tests {
                 admins: vec![],
                 direct: false,
                 ssh_allow: vec![],
+                aliases: BTreeMap::new(),
             }],
             ..Default::default()
         };
@@ -1065,6 +1080,7 @@ mod tests {
                 admins: vec![],
                 direct: false,
                 ssh_allow: vec![],
+                aliases: BTreeMap::new(),
             }],
             ..Default::default()
         };
@@ -1136,6 +1152,7 @@ name = "test"
             admins: vec![],
             direct: false,
             ssh_allow: vec![],
+            aliases: BTreeMap::new(),
         }
     }
 
@@ -1169,6 +1186,30 @@ name = "test"
         let after = load_in(dir).unwrap();
         assert_eq!(after.networks.len(), 1);
         assert_eq!(after.networks[0].name, "genesis");
+    }
+
+    #[test]
+    fn network_aliases_roundtrip_and_default_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // A network with aliases persists them across a save/load cycle.
+        let mut n = net("homelab");
+        n.aliases.insert("alice".into(), "id-alice".into());
+        n.aliases.insert("bob".into(), "id-bob".into());
+        save_network_in(dir, &n).unwrap();
+        let loaded = load_network_in(dir, "homelab").unwrap().unwrap();
+        assert_eq!(loaded.aliases.get("alice").map(String::as_str), Some("id-alice"));
+        assert_eq!(loaded.aliases.get("bob").map(String::as_str), Some("id-bob"));
+
+        // A network with no aliases omits the key; loading a toml without it
+        // defaults to an empty map (backward compatible with pre-alias configs).
+        let plain = net("genesis");
+        assert!(plain.aliases.is_empty());
+        let toml = ::toml::to_string(&plain).unwrap();
+        assert!(!toml.contains("aliases"), "empty aliases must not be serialized");
+        let back: NetworkConfig = ::toml::from_str(&toml).unwrap();
+        assert!(back.aliases.is_empty());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
@@ -153,6 +154,27 @@ pub enum IpcMessage {
     SetHostname {
         network: String,
         hostname: String,
+    },
+    /// Bind a local, per-network alias to a user/device identity (`ray alias set`).
+    /// Node-local only: never rides the signed blob. `identity` is already
+    /// canonicalized to the string `ray identityof` prints. Mutating (root/operator).
+    AliasSet {
+        network: String,
+        identity: String,
+        alias: String,
+    },
+    /// Remove a local alias by its name (`ray alias rm`). Mutating.
+    AliasRemove {
+        network: String,
+        alias: String,
+    },
+    /// List a network's local aliases (`ray alias list`). Open read.
+    AliasList {
+        network: String,
+    },
+    /// Response to `AliasList`: `alias name -> identity string`.
+    AliasListResponse {
+        aliases: BTreeMap<String, String>,
     },
     SendFile {
         path: String,
@@ -491,6 +513,11 @@ pub struct NetworkStatus {
     /// (`ray requests <net>` / `ray accept`). Surfaced in the status summary.
     #[serde(default)]
     pub pending_requests: usize,
+    /// Node-local aliases for this network (`alias name -> identity string`,
+    /// set via `ray alias`). Display-only and never in the signed blob; also
+    /// seeds `ray apply`'s `aliases:` map.
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
 }
 
 #[derive(
@@ -891,6 +918,7 @@ mod tests {
                 }],
                 pending_suggestions: 0,
                 pending_requests: 0,
+                aliases: BTreeMap::new(),
             }],
             packets_rx: 0,
             packets_tx: 0,

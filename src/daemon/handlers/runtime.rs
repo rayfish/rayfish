@@ -185,6 +185,7 @@ impl DaemonState {
             ssh_allow: net_config
                 .map(|nc| nc.ssh_allow.clone())
                 .unwrap_or_default(),
+            aliases: net_config.map(|nc| nc.aliases.clone()).unwrap_or_default(),
         })?;
 
         let cancel = self.shutdown_token.child_token();

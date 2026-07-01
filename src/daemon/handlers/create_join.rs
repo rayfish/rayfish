@@ -231,6 +231,7 @@ impl DaemonState {
             admins: vec![],
             direct,
             ssh_allow: vec![],
+            aliases: BTreeMap::new(),
         })?;
 
         let cancel = self.shutdown_token.child_token();

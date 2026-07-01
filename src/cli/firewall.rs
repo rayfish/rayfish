@@ -489,11 +489,20 @@ pub(crate) async fn ipc_apply(
     // Expand groups/aliases against live status into a pure hostname-keyed spec.
     let mut expanded = apply::DeploySpec::default();
     for (net_name, fw) in &spec.networks {
+        // Seed from the network's stored `ray alias` map (already canonical), then
+        // let the spec's own `aliases:` override on name conflict. Stored aliases
+        // are node-local and never reach the blob.
+        let stored_aliases = status_networks
+            .iter()
+            .find(|n| &n.name == net_name)
+            .map(|n| n.aliases.clone())
+            .unwrap_or_default();
+        let net_aliases = apply::merge_aliases(&stored_aliases, &aliases);
         let resolve = |identity: &str| -> Vec<String> {
             resolve_identity_hosts(&status_networks, net_name, &self_id, identity)
         };
         let (efw, empty_aliases) =
-            apply::expand_firewall(fw, &aliases, &spec.groups, &resolve);
+            apply::expand_firewall(fw, &net_aliases, &spec.groups, &resolve);
         for a in empty_aliases {
             eprintln!(
                 "{}  {net_name}: alias '{a}' has no joined devices yet; its rules are skipped",
@@ -627,21 +636,7 @@ pub(crate) async fn cmd_identityof(network: &str, hostname: &str, json: bool) ->
         .find(|n| n.name == network)
         .ok_or_else(|| anyhow::anyhow!("network '{network}' not found (is it active?)"))?;
 
-    // (identity, paired) for the matching host: self matches by device identity;
-    // a peer prefers its user identity when paired.
-    let found: Option<(String, bool)> = if net.my_hostname.as_deref() == Some(hostname) {
-        Some((self_id, false))
-    } else {
-        net.peers
-            .iter()
-            .find(|p| p.hostname.as_deref() == Some(hostname))
-            .map(|p| match p.user_identity {
-                Some(u) => (u.to_string(), true),
-                None => (p.endpoint_id.to_string(), false),
-            })
-    };
-
-    let Some((identity, paired)) = found else {
+    let Some((identity, paired)) = resolve_host_identity(net, &self_id, hostname) else {
         anyhow::bail!(
             "host '{hostname}' is not currently joined on '{network}' \
              (an alias can only name an already-joined member)"
@@ -659,6 +654,27 @@ pub(crate) async fn cmd_identityof(network: &str, hostname: &str, json: bool) ->
         println!("{identity}");
     }
     Ok(())
+}
+
+/// Resolve a joined hostname to `(identity, paired)` on one network: self matches
+/// by device identity; a peer prefers its user identity when paired, else its
+/// device endpoint id. Shared by `ray identityof` and `ray alias set`.
+pub(crate) fn resolve_host_identity(
+    net: &ipc::NetworkStatus,
+    self_id: &str,
+    hostname: &str,
+) -> Option<(String, bool)> {
+    if net.my_hostname.as_deref() == Some(hostname) {
+        Some((self_id.to_string(), false))
+    } else {
+        net.peers
+            .iter()
+            .find(|p| p.hostname.as_deref() == Some(hostname))
+            .map(|p| match p.user_identity {
+                Some(u) => (u.to_string(), true),
+                None => (p.endpoint_id.to_string(), false),
+            })
+    }
 }
 
 /// Fetch live status: this node's own device identity (as a canonical string)
@@ -805,3 +821,66 @@ pub(crate) async fn ipc_invite_mint(network: &str, hostname: Option<String>) -> 
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn peer(hostname: &str, user: Option<iroh::EndpointId>) -> ipc::PeerStatus {
+        ipc::PeerStatus {
+            endpoint_id: iroh::SecretKey::generate().public(),
+            ip: Ipv4Addr::new(100, 64, 0, 2),
+            ipv6: None,
+            hostname: Some(hostname.to_string()),
+            user_identity: user,
+            connection: None,
+        }
+    }
+
+    fn net(my_hostname: Option<&str>, peers: Vec<ipc::PeerStatus>) -> ipc::NetworkStatus {
+        ipc::NetworkStatus {
+            name: "n".to_string(),
+            role: ipc::NetworkRole::Member,
+            my_ip: Ipv4Addr::new(100, 64, 0, 1),
+            my_ipv6: None,
+            my_hostname: my_hostname.map(|s| s.to_string()),
+            network_key: None,
+            member_count: 0,
+            peers,
+            pending_suggestions: 0,
+            pending_requests: 0,
+            aliases: Default::default(),
+        }
+    }
+
+    #[test]
+    fn resolve_self_hostname_returns_self_id() {
+        let n = net(Some("me"), vec![]);
+        let got = resolve_host_identity(&n, "self-id", "me");
+        assert_eq!(got, Some(("self-id".to_string(), false)));
+    }
+
+    #[test]
+    fn resolve_paired_peer_prefers_user_identity() {
+        let user = iroh::SecretKey::generate().public();
+        let n = net(Some("me"), vec![peer("alice", Some(user))]);
+        let got = resolve_host_identity(&n, "self-id", "alice");
+        assert_eq!(got, Some((user.to_string(), true)));
+    }
+
+    #[test]
+    fn resolve_unpaired_peer_uses_endpoint_id() {
+        let p = peer("bob", None);
+        let want = p.endpoint_id.to_string();
+        let n = net(Some("me"), vec![p]);
+        let got = resolve_host_identity(&n, "self-id", "bob");
+        assert_eq!(got, Some((want, false)));
+    }
+
+    #[test]
+    fn resolve_unknown_hostname_is_none() {
+        let n = net(Some("me"), vec![peer("alice", None)]);
+        assert_eq!(resolve_host_identity(&n, "self-id", "ghost"), None);
+    }
+}

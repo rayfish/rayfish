@@ -1475,6 +1475,7 @@ impl DaemonState {
                 | IpcMessage::ContactId
                 | IpcMessage::Ping { .. }
                 | IpcMessage::Netcheck
+                | IpcMessage::AliasList { .. }
         ) {
             return None;
         }
@@ -1623,6 +1624,13 @@ impl DaemonState {
             IpcMessage::SetHostname { network, hostname } => {
                 self.set_hostname(&network, &hostname).await
             }
+            IpcMessage::AliasSet {
+                network,
+                identity,
+                alias,
+            } => self.set_alias(&network, &identity, &alias),
+            IpcMessage::AliasRemove { network, alias } => self.remove_alias(&network, &alias),
+            IpcMessage::AliasList { network } => self.list_aliases(&network),
             IpcMessage::SendFile { path, peer } => self.send_file(&path, &peer).await,
             IpcMessage::ListFiles => self.list_files(),
             IpcMessage::AcceptFile { id, output } => self.accept_file(id, output, peer_cred).await,
@@ -3646,9 +3654,9 @@ async fn join_mesh_shared(
     // Preserve a queued rename intent across reconnects/restores: the blob we
     // just fetched won't carry it yet, so persisting it here keeps the drain
     // alive until a coordinator confirms the new name.
-    let (direct, pending_hostname, ssh_allow) = config::load_network(network_name)?
-        .map(|n| (n.direct, n.pending_hostname, n.ssh_allow))
-        .unwrap_or((false, None, vec![]));
+    let (direct, pending_hostname, ssh_allow, aliases) = config::load_network(network_name)?
+        .map(|n| (n.direct, n.pending_hostname, n.ssh_allow, n.aliases))
+        .unwrap_or((false, None, vec![], BTreeMap::new()));
     config::save_network(&config::NetworkConfig {
         name: network_name.to_string(),
         group_mode: GroupMode::Restricted,
@@ -3664,6 +3672,7 @@ async fn join_mesh_shared(
         admins: vec![],
         direct,
         ssh_allow,
+        aliases,
     })?;
 
     // On reconnect/restore the coordinator hasn't seen our hostname this session,

@@ -2,8 +2,8 @@
 // integration tests and benchmarks can reach them; this binary is the CLI/IPC
 // client built on top.
 use rayfish::{
-    DNS_DOMAIN, apply, config, daemon, firewall, identity, invite, ipc, layout, logdir, membership,
-    onepassword, picker, progress, shutdown, stats, style,
+    DNS_DOMAIN, apply, config, daemon, firewall, hostname, identity, invite, ipc, layout, logdir,
+    membership, onepassword, picker, progress, shutdown, stats, style,
 };
 
 use std::sync::{Arc, atomic};
@@ -214,6 +214,15 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: AdminAction,
     },
+    /// Manage local, per-network aliases (a friendly name for a user identity).
+    /// Node-local and display-only: shown inline in `ray status` and used to seed
+    /// a `ray apply` spec's `aliases:` map. Never published to the network.
+    Alias {
+        /// Network name
+        network: String,
+        #[command(subcommand)]
+        action: AliasAction,
+    },
     /// Manage local device firewall rules
     Firewall {
         #[command(subcommand)]
@@ -396,6 +405,27 @@ pub(crate) enum AdminAction {
     /// List this network's key-holders (the local node + granted members)
     #[command(visible_alias = "ls")]
     List,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AliasAction {
+    /// Bind an alias to a user. `key` is an identity string (from `ray
+    /// identityof`) or a currently-joined hostname, resolved to its identity.
+    Set {
+        /// Identity string or a joined hostname
+        key: String,
+        /// The alias to assign
+        alias: String,
+    },
+    /// List this network's aliases
+    #[command(visible_alias = "ls")]
+    List,
+    /// Remove an alias by name
+    #[command(visible_aliases = ["rm", "del"])]
+    Remove {
+        /// The alias to remove
+        alias: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -931,6 +961,7 @@ async fn main() -> Result<()> {
         Command::Identityof { network, hostname } => {
             cmd_identityof(&network, &hostname, cli.json).await
         }
+        Command::Alias { network, action } => cmd_alias(&network, action, cli.json).await,
         Command::Mdns { state } => cmd_mdns(&state),
         Command::Config { action } => cmd_config(action, cli.json),
         Command::SetOperator { user } => cmd_set_operator(&user).await,

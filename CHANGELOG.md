@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ray alias <network> <key> <alias>`**: give a peer a friendly, node-local
+  name. `ray alias <net> set <key> <name>` binds an alias to a user, where `key`
+  is either an identity string (from `ray identityof`) or a currently-joined
+  hostname. The alias then shows inline in `ray status` (as `host.net.ray
+  [name]`) and seeds `ray apply`'s `aliases:` map, so a spec can reference the
+  name without re-declaring it (the spec still wins on a name conflict).
+  `ray alias <net> list` and `ray alias <net> rm <name>` manage the set. Aliases
+  are local and display-only: they are never published to the network.
 - **`ray kick <network> <peer>`**: coordinators can now remove a member from a
   closed network. Identify the peer by hostname, mesh IP, or short id. The member
   is dropped from the network's roster, and every node disconnects from it: the

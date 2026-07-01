@@ -269,9 +269,20 @@ fn print_network(net: &ipc::NetworkStatus) {
         style::value(&format!("{online}/{}", net.peers.len())),
     );
 
+    // Invert the local alias map (alias -> identity) for identity -> alias
+    // lookups when rendering peers.
+    let alias_by_identity: std::collections::HashMap<&str, &str> = net
+        .aliases
+        .iter()
+        .map(|(alias, identity)| (identity.as_str(), alias.as_str()))
+        .collect();
+
     // Peer rows as aligned columns: glyph · host · ipv4 · via · rtt · traffic
-    let rows: Vec<Vec<layout::Cell>> =
-        net.peers.iter().map(|p| render_peer_row(&net.name, p)).collect();
+    let rows: Vec<Vec<layout::Cell>> = net
+        .peers
+        .iter()
+        .map(|p| render_peer_row(&net.name, p, peer_alias(p, &alias_by_identity)))
+        .collect();
     if rows.is_empty() {
         println!("    {}", style::faint("(no other members)"));
     } else {
@@ -290,13 +301,31 @@ fn print_network(net: &ipc::NetworkStatus) {
     }
 }
 
-/// Build one peer's status row (glyph · host · ipv4 · via · rtt · traffic).
-fn render_peer_row(net_name: &str, peer: &ipc::PeerStatus) -> Vec<layout::Cell> {
-    let host = peer
+/// Resolve a peer's local alias, if any: match its identity (user identity when
+/// paired, else device endpoint id) against the inverted alias map.
+fn peer_alias<'a>(
+    peer: &ipc::PeerStatus,
+    alias_by_identity: &std::collections::HashMap<&str, &'a str>,
+) -> Option<&'a str> {
+    let identity = peer
+        .user_identity
+        .unwrap_or(peer.endpoint_id)
+        .to_string();
+    alias_by_identity.get(identity.as_str()).copied()
+}
+
+/// Build one peer's status row (glyph · host · ipv4 · via · rtt · traffic). A
+/// local alias, when set, is shown inline after the host as `host.net.ray [alias]`.
+fn render_peer_row(net_name: &str, peer: &ipc::PeerStatus, alias: Option<&str>) -> Vec<layout::Cell> {
+    let base = peer
         .hostname
         .as_ref()
         .map(|h| format!("{h}.{}.{}", net_name, DNS_DOMAIN))
         .unwrap_or_else(|| peer.ip.to_string());
+    let host = match alias {
+        Some(a) => format!("{base} [{a}]"),
+        None => base,
+    };
     match &peer.connection {
         Some(ci) => {
             let via = match ci.conn_type {
