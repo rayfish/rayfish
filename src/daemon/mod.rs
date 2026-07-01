@@ -1301,6 +1301,10 @@ pub struct DaemonState {
     ssh_authz: crate::ssh::SshAuthz,
     /// Cancellation token for the running SSH listeners (`None` when off / on
     /// standby). Set by [`DaemonState::start_ssh`], cleared by `stop_ssh`.
+    // The only readers/writers (`start_ssh`/`stop_ssh`) are desktop-only, so on a
+    // `--no-default-features` (Android) build the field is inert; silence the
+    // resulting dead-code warning there rather than dropping the field.
+    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
     ssh_token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
     /// Promotion signal: a co-coordinator's per-peer control reader sends the
     /// network name here after persisting an `AdminGrant` key, and the main
