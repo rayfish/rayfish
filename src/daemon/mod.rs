@@ -109,6 +109,13 @@ pub(crate) struct MeshCtx {
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
     device_user_map: peers::DeviceUserMap,
+    /// Peers removed from a network's roster (via `ray kick` or a stale-entry
+    /// prune during reconverge), keyed by `(network, transport id)`. A member
+    /// closes such a peer's connection but can't see its own close code, so its
+    /// reconnect loop would re-dial the removed peer (which still lists it) and
+    /// re-form the link. The reconnect loop consumes an entry here to skip that
+    /// one reconnect. Populated in [`reconverge_and_apply`] and the kick handler.
+    pruned_peers: Arc<DashSet<(String, EndpointId)>>,
 }
 
 impl MeshCtx {
@@ -1276,6 +1283,9 @@ pub struct DaemonState {
     pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
     device_cert: Option<control::DeviceCert>,
     device_user_map: peers::DeviceUserMap,
+    /// Peers removed from a roster whose reconnect should be suppressed once.
+    /// Shared into [`MeshCtx::pruned_peers`]; see that field for the mechanism.
+    pruned_peers: Arc<DashSet<(String, EndpointId)>>,
     /// This node's contact id (`ray connect`): the public half of the rotatable
     /// contact key. The secret lives in config (read fresh by the publisher and
     /// `rotate_contact` so rotation needs no restart); only the public id is
@@ -1353,6 +1363,7 @@ impl DaemonState {
             hostname_table: self.hostname_table.clone(),
             reverse_table: self.reverse_table.clone(),
             device_user_map: self.device_user_map.clone(),
+            pruned_peers: self.pruned_peers.clone(),
         }
     }
 
@@ -1555,6 +1566,7 @@ impl DaemonState {
             }
             IpcMessage::Leave { name } => self.leave_network(&name).await,
             IpcMessage::Nuke { name, force } => self.nuke_network(&name, force).await,
+            IpcMessage::Kick { network, peer } => self.kick_member(&network, &peer).await,
             IpcMessage::Status => self.status(),
             IpcMessage::Report => self.build_report(peer_cred),
             IpcMessage::Up { hostname } => self.activate(hostname).await,
@@ -2100,6 +2112,7 @@ async fn build_daemon(
         pairing_secret,
         device_cert,
         device_user_map,
+        pruned_peers: Arc::new(DashSet::new()),
         contact_public,
         active: active.clone(),
         dns_configurator: Arc::new(std::sync::Mutex::new(None)),
@@ -2578,6 +2591,8 @@ async fn reconverge_and_apply(
         firewall,
         hostname_table,
         reverse_table,
+        device_user_map,
+        pruned_peers,
         ..
     } = ctx;
     let current = state.read().unwrap().snapshot.as_ref().map(|s| s.hash);
@@ -2633,6 +2648,20 @@ async fn reconverge_and_apply(
         reverse_table,
     )
     .await;
+    // Drop any live connection to a peer the signed roster no longer lists (it was
+    // kicked, or left while we were offline). Removing it from the roster alone
+    // stops us *routing* to it, but the peer reader keeps injecting its inbound
+    // datagrams until the connection closes — so close it. We record the peer in
+    // `pruned_peers` first: closing wakes our own reconnect loop, which would
+    // otherwise re-dial the peer (it still lists us) and re-form the link.
+    prune_departed_peers(
+        peers,
+        device_user_map,
+        pruned_peers,
+        state,
+        network_name,
+        my_identity,
+    );
     apply_suggested_firewall(firewall, my_identity, network_name, state);
     // If a local rename is still unconfirmed by this just-applied blob, keep
     // delivering it to the coordinator set until it lands.
@@ -2647,6 +2676,37 @@ async fn reconverge_and_apply(
     )
     .await;
     tracing::info!(network = %network_name, "reconverged from signed record");
+}
+
+/// Close and drop every connection to a peer that `network`'s current roster no
+/// longer contains. Runs on every node after it applies a verified roster, so a
+/// kicked (or departed) peer is severed mesh-wide, not just by the coordinator
+/// that removed it. Each pruned peer is recorded in `pruned_peers` so this node's
+/// reconnect loop skips the re-dial that closing the connection would trigger.
+fn prune_departed_peers(
+    peers: &PeerTable,
+    device_user_map: &peers::DeviceUserMap,
+    pruned_peers: &Arc<DashSet<(String, EndpointId)>>,
+    state: &SharedNetworkState,
+    network_name: &str,
+    my_identity: EndpointId,
+) {
+    for (peer_id, ip, conn) in peers.peers_for_network_with_conn(network_name) {
+        // Membership is by roster identity, which for a paired peer is its user
+        // identity, not the transport id the PeerTable is keyed on. Check both.
+        let user_id = device_user_map.resolve(&peer_id);
+        let still_member = {
+            let s = state.read().unwrap();
+            s.members.is_member(&peer_id) || s.members.is_member(&user_id)
+        };
+        if still_member || peer_id == my_identity || user_id == my_identity {
+            continue;
+        }
+        tracing::info!(peer = %peer_id.fmt_short(), network = %network_name, "pruning peer no longer in roster");
+        pruned_peers.insert((network_name.to_string(), peer_id));
+        conn.close(VarInt::from_u32(forward::KICK_CODE), b"removed from network");
+        peers.remove_peer_from_network(&ip, &derive_ipv6(&peer_id), network_name);
+    }
 }
 
 /// Compute the order in which a joiner should dial coordinators.
@@ -3973,6 +4033,7 @@ fn spawn_reconnect_loop(
         stats,
         firewall,
         device_user_map,
+        pruned_peers,
         ..
     } = ctx;
     use tracing::Instrument as _;
@@ -3999,6 +4060,14 @@ fn spawn_reconnect_loop(
             // The coordinator's MemberSync will prune it from our roster.
             if event.intentional {
                 tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "peer left, not reconnecting");
+                continue;
+            }
+            // We just pruned this peer from the roster (it was kicked or departed)
+            // and closed the connection ourselves — that close is what woke this
+            // loop. The peer still lists us, so re-dialing would re-form the link.
+            // Consume the one-shot suppression entry and skip.
+            if pruned_peers.remove(&(network_name.clone(), peer_id)).is_some() {
+                tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "peer removed from roster, not reconnecting");
                 continue;
             }
             tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "peer disconnected, will reconnect");
@@ -4199,6 +4268,7 @@ mod accept_handler_tests {
             hostname_table: dns::new_hostname_table(),
             reverse_table: dns::new_reverse_table(),
             device_user_map: peers::DeviceUserMap::new(),
+            pruned_peers: Arc::new(DashSet::new()),
         }
     }
 

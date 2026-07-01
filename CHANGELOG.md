@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`ray kick <network> <peer>`**: coordinators can now remove a member from a
+  closed network. Identify the peer by hostname, mesh IP, or short id. The member
+  is dropped from the network's roster, and every node disconnects from it: the
+  kicked peer is severed mesh-wide, not just from the coordinator. It cannot
+  re-join the closed network without a fresh invite or approval (to bar it
+  permanently, also revoke its invite or reusable key). Kicking is refused on open
+  networks (where the peer could immediately re-join) and against another
+  coordinator or yourself.
+
 ## [0.1.4]
 
 ### Added

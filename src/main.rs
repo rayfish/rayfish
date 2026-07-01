@@ -103,6 +103,14 @@ pub(crate) enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Remove a member from a closed network (coordinator only)
+    #[command(visible_alias = "boot")]
+    Kick {
+        /// Network name
+        network: String,
+        /// Member to remove: hostname, mesh IP, or short id
+        peer: String,
+    },
     /// Show status of all networks (active + saved)
     #[command(visible_aliases = ["st", "ls"])]
     Status,
@@ -872,6 +880,7 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
+        Command::Kick { network, peer } => ipc_kick(&network, &peer).await,
         Command::Status => ipc_status().await,
         Command::Report => ipc_report().await,
         Command::Daemon => {

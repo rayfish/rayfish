@@ -44,6 +44,13 @@ pub enum IpcMessage {
         name: String,
         force: bool,
     },
+    /// Coordinator-only: remove a member from a closed network. Prunes it from the
+    /// roster + approved list, republishes the signed blob, and disconnects it
+    /// mesh-wide. `peer` is a hostname / mesh IP / short id of a current member.
+    Kick {
+        network: String,
+        peer: String,
+    },
     Status,
     /// Build a diagnostic bundle (logs + metrics + sanitized status) on disk and
     /// return its path plus a pre-filled GitHub issue title/body. Open to any

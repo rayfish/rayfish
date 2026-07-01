@@ -198,6 +198,15 @@ pub const LEAVE_CODE: u32 = 0x1ea5e;
 /// treated as a non-intentional disconnect (the peer may reconnect; no quarantine).
 pub const ABUSE_CODE: u32 = 0xab05e;
 
+/// Application close code a coordinator (or any member pruning a stale roster
+/// entry) sends when it removes a peer from the network (`ray kick`). On the
+/// receiving (kicked) side it is treated like [`LEAVE_CODE`] — an intentional
+/// disconnect — so the kicked node stops reconnecting instead of churning back
+/// into the coordinator's pending queue. The pruning side does not observe its
+/// own close code (that read is a local close), so it relies on the shared
+/// `pruned_peers` set to suppress its reconnect loop.
+pub const KICK_CODE: u32 = 0x14ced;
+
 /// Sent by [`spawn_peer_reader`] when a peer connection drops,
 /// consumed by the reconnect loop (joiner) or cleanup task (coordinator).
 pub struct DisconnectEvent {
@@ -370,6 +379,7 @@ pub fn spawn_peer_reader(
                             &e,
                             ConnectionError::ApplicationClosed(ac)
                                 if ac.error_code == VarInt::from_u32(LEAVE_CODE)
+                                    || ac.error_code == VarInt::from_u32(KICK_CODE)
                         );
                         tracing::warn!(peer = %peer_id.fmt_short(), ip = %peer_ip, error = %e, intentional, "peer connection lost");
                         let _ = disconnect_tx

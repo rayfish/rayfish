@@ -120,6 +120,7 @@ latency, your public addresses, and whether UDP is getting through.
 
 ```bash
 ray leave gaming         # leave a network
+ray kick gaming alice    # coordinator only: remove a member from a closed network (disconnects them mesh-wide)
 ray down                 # standby: data plane (TUN + DNS) off, still connected to peers
 ray up                   # reactivate (no root needed, near-instant: connections were kept)
 sudo ray stop            # fully offline: daemon exits, peer connections close
