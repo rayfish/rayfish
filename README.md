@@ -206,6 +206,10 @@ Rayfish sits closest to [Tailscale](https://tailscale.com), but without a coordi
 
 Rayfish is experimental, pre-1.0 software and has not had an independent security audit. The wire format and on-disk config may still change between releases. Please [file issues](https://github.com/rayfish/rayfish/issues), but don't rely on it for anything critical yet.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the full history, or the [releases page](https://github.com/rayfish/rayfish/releases) for per-version notes. `ray update --list` shows available releases and `ray update --check` reports what a pending upgrade brings.
+
 ## Building
 
 ```bash

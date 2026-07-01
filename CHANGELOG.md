@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.4]
+
 ### Added
 
 - **Mesh SSH (`ray firewall ssh`)**: Tailscale-style SSH with no SSH keys to
@@ -25,8 +27,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   address are now dropped (ingress anti-spoofing), so no peer can forge another's
   mesh IP.
 - **Aliases and groups in `ray apply`**: a spec can now define optional
-  top-level `aliases:` (a friendly name → a user's identity string) and
-  `groups:` (a name → a list of aliases and/or hostnames), then reference them
+  top-level `aliases:` (a friendly name to a user's identity string) and
+  `groups:` (a name to a list of aliases and/or hostnames), then reference them
   as firewall subjects or peers instead of listing every hostname. An alias
   names a person and expands to all of that person's currently-joined devices;
   a group expands to the union of its members. Expansion happens client-side at
@@ -37,6 +39,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`ray identityof <net> <host>`**: print a host's identity string (the value
   to paste into a spec's `aliases:`). Resolves to the user identity if the
   device is paired, else the device's transport identity. `--json` supported.
+
+### Fixed
+
+- **Accepted firewall suggestions no longer pile up duplicates.** Any change to a
+  network's signed blob (a join, a rename, a new reusable key) re-materialized the
+  whole suggested-firewall set and re-queued it for review, even the rules this
+  node had already accepted. Accepting one of those repeats via the picker then
+  appended a second identical rule. Already-installed suggestions are now kept out
+  of the pending queue, and the picker merges by selector (newest wins), so a
+  re-suggested rule replaces its predecessor instead of stacking.
+- **`ray update` no longer bricks the system service.** After swapping its own
+  binary, `ray update` rewrote the service unit using the path of the running
+  executable, which Linux reports with a trailing `" (deleted)"` once the old
+  binary is unlinked. The unit ended up as `ExecStart=/usr/local/bin/ray (deleted)
+  daemon`, so the daemon crash-looped with `unrecognized subcommand '(deleted)'`
+  and the node went offline until a manual reinstall. The path is now sanitized,
+  making remote self-update safe.
+
+## [0.1.3]
+
+### Added
+
+- **Custom relay, discovery, and DNS-upstream servers (`ray config`)**: override
+  the default iroh relay and discovery servers, or the upstream resolvers used for
+  non-`.ray` queries, with `ray config set relay|discovery-dns|dns-upstreams
+  <value>`. Values are a comma list of presets (`rayfish`/`n0`), URLs, or IPv4s;
+  the default augments the n0 defaults, `--replace` swaps them out, and `n0`/empty
+  resets. `ray config get`/`unset` read and clear overrides. Applied on
+  `sudo ray restart`.
 - **`ray ping <peer>`**: active mesh diagnostics: sends live echo probes to a
   peer (by hostname, mesh IP, or short id) and reports per-probe round-trip
   latency, packet loss, and whether the path is direct or relayed. `-c/--count`
@@ -84,20 +115,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Accepted firewall suggestions no longer pile up duplicates.** Any change to a
-  network's signed blob (a join, a rename, a new reusable key) re-materialized the
-  whole suggested-firewall set and re-queued it for review, even the rules this
-  node had already accepted. Accepting one of those repeats via the picker then
-  appended a second identical rule. Already-installed suggestions are now kept out
-  of the pending queue, and the picker merges by selector (newest wins), so a
-  re-suggested rule replaces its predecessor instead of stacking.
-- **`ray update` no longer bricks the system service.** After swapping its own
-  binary, `ray update` rewrote the service unit using the path of the running
-  executable, which Linux reports with a trailing `" (deleted)"` once the old
-  binary is unlinked. The unit ended up as `ExecStart=/usr/local/bin/ray (deleted)
-  daemon`, so the daemon crash-looped with `unrecognized subcommand '(deleted)'`
-  and the node went offline until a manual reinstall. The path is now sanitized,
-  making remote self-update safe.
 - **`ray hostname` rename now reliably propagates.** A member's rename is kept as
   a durable pending intent and re-delivered to a coordinator on every reconnect
   and reconverge until the signed roster confirms it, so the new name reaches the
@@ -252,7 +269,9 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/rayfish/rayfish/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/rayfish/rayfish/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/rayfish/rayfish/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/rayfish/rayfish/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/rayfish/rayfish/releases/tag/v0.1.0
