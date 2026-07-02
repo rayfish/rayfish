@@ -56,7 +56,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val initialUri = intent?.data?.toString()
+        // Only treat the launch intent's data as a NEW deep link on first creation.
+        // On recreation (e.g. rotation) the same Intent is redelivered, but it was
+        // already consumed by the first instance, so skip it here.
+        val initialUri = if (savedInstanceState == null) intent?.data?.toString() else null
+        if (initialUri != null) {
+            intent?.data = null
+        }
         setContent {
             MaterialTheme {
                 RayfishScreen(
@@ -70,8 +76,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        setIntent(intent)
         val uri = intent.data?.toString()
+        setIntent(intent.apply { data = null })
         if (uri != null && uri != handledIntentUri) {
             handledIntentUri = uri
             pendingLinkUri.value = uri
@@ -105,16 +111,12 @@ private fun RayfishScreen(
     var status by remember { mutableStateOf<Status?>(null) }
     var lastNetwork by remember { mutableStateOf<NetworkInfo?>(null) }
     var starting by remember { mutableStateOf(true) }
-    var started by remember { mutableStateOf(false) }
 
-    // Node.start() is idempotent, but only needs to run once per process; this
-    // suspends until it has, and everything else awaits it before touching Node.
+    // NodeHolder.ensureStarted() is itself concurrency-safe (a Mutex converges
+    // concurrent callers onto a single Node.start()), so this just delegates and
+    // survives Activity recreation since NodeHolder is a process-wide singleton.
     suspend fun ensureStarted() {
-        if (started) return
-        withContext(Dispatchers.IO) {
-            NodeHolder.get(context).start()
-        }
-        started = true
+        NodeHolder.ensureStarted(context)
     }
 
     LaunchedEffect(Unit) {

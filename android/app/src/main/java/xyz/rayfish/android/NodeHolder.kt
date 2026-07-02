@@ -1,6 +1,10 @@
 package xyz.rayfish.android
 
 import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.Node
 
 /**
@@ -17,6 +21,27 @@ object NodeHolder {
         if (existing != null) return existing
         return synchronized(this) {
             node ?: Node(context.applicationContext.filesDir.path).also { node = it }
+        }
+    }
+
+    private val startMutex = Mutex()
+
+    @Volatile
+    private var started = false
+
+    /**
+     * Starts the node exactly once for the process, however many callers race to
+     * invoke this concurrently (e.g. the initial UI launch and a cold-start deep
+     * link firing at the same time). Later callers just await the first start.
+     */
+    suspend fun ensureStarted(context: Context) {
+        if (started) return
+        startMutex.withLock {
+            if (started) return@withLock
+            withContext(Dispatchers.IO) {
+                get(context).start()
+            }
+            started = true
         }
     }
 }
