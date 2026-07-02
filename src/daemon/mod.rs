@@ -4560,15 +4560,51 @@ mod headless_tests {
     /// the builder awaits, matching the daemon binary's `#[tokio::main]` runtime.
     /// The `timeout` guard turns a future startup regression into a fast failure
     /// instead of a hung test.
+    /// Process-wide lock serializing tests that mutate `RAYFISH_CONFIG_DIR` (or
+    /// any other env var read by `config::config_dir()`), since lib tests share
+    /// one process and run on parallel threads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that restores a previous env var value (or removes it if it
+    /// was unset) on drop, so the var is restored even if the test body panics.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn build_headless_returns_usable_state_without_ipc_socket() {
+        // Serialize against any other test that touches env vars read by
+        // `config::config_dir()`, so no concurrent test observes a bled-through
+        // `RAYFISH_CONFIG_DIR`.
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let tmp = tempfile::tempdir().unwrap();
-        // Isolate identity/config/blobs from the system config dir. Safe here: this
-        // is the only test that drives config through the `RAYFISH_CONFIG_DIR` env
-        // var, so there is no cross-test races over the process-global variable.
-        unsafe {
-            std::env::set_var("RAYFISH_CONFIG_DIR", tmp.path());
-        }
+        // Isolate identity/config/blobs from the system config dir. The guard
+        // restores the previous value (or removes the var) on drop, including
+        // on panic, so this can't poison later tests.
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
         let daemon = tokio::time::timeout(std::time::Duration::from_secs(30), build_headless())
             .await
@@ -4580,9 +4616,5 @@ mod headless_tests {
 
         // The embedding `status()` API answers without a socket ever being bound.
         assert!(matches!(daemon.status(), IpcMessage::StatusResponse { .. }));
-
-        unsafe {
-            std::env::remove_var("RAYFISH_CONFIG_DIR");
-        }
     }
 }
