@@ -53,6 +53,7 @@ pub mod audit;
 pub mod config;
 pub mod control;
 pub mod daemon;
+pub mod deeplink;
 pub mod dht;
 pub mod dns;
 pub mod dns_config;
