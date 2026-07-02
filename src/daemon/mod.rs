@@ -867,6 +867,10 @@ struct ProtocolRouter {
     handlers: DashMap<Vec<u8>, Arc<MeshProtocol>>,
     pending_files: Arc<std::sync::Mutex<Vec<PendingFile>>>,
     file_id_counter: Arc<AtomicU64>,
+    /// Nudge sent after each newly-queued `PendingFile` (carrying its id) so the
+    /// auto-accept worker can evaluate it against the own-devices policy. The
+    /// router stays policy-free; all trust logic lives on `DaemonState`.
+    new_file_tx: mpsc::UnboundedSender<u64>,
     pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
     secret_key: SecretKey,
     /// `ray connect` requests received on `CONNECT_ALPN`, awaiting approval.
@@ -891,12 +895,14 @@ impl ProtocolRouter {
         blobs: BlobsProtocol,
         secret_key: SecretKey,
         pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+        new_file_tx: mpsc::UnboundedSender<u64>,
     ) -> Self {
         Self {
             blobs,
             handlers: DashMap::new(),
             pending_files: Arc::new(std::sync::Mutex::new(Vec::new())),
             file_id_counter: Arc::new(AtomicU64::new(1)),
+            new_file_tx,
             pairing_secret,
             secret_key,
             pending_connects: Arc::new(DashMap::new()),
@@ -938,6 +944,9 @@ impl ProtocolRouter {
                             let id = counter.fetch_add(1, Ordering::Relaxed);
                             tracing::info!(from = %from.fmt_short(), filename = %filename, size, "file offer received");
                             pending.lock().unwrap().push(PendingFile { id, from, filename, size, mime_type, blob_hash });
+                            // Nudge the auto-accept worker; it decides whether the
+                            // sender is one of our own devices on an enabled network.
+                            let _ = self.new_file_tx.send(id);
                         } else {
                             tracing::warn!(claimed = %from.fmt_short(), actual = %remote_id.fmt_short(), "file offer identity mismatch");
                         }
@@ -1555,6 +1564,7 @@ impl DaemonState {
                 invite,
                 coordinator,
                 auto_accept_firewall,
+                auto_accept_files,
             } => {
                 self.join_network(
                     &network_key,
@@ -1563,6 +1573,7 @@ impl DaemonState {
                     invite,
                     coordinator,
                     auto_accept_firewall,
+                    auto_accept_files,
                 )
                 .await
             }
@@ -1613,6 +1624,9 @@ impl DaemonState {
             } => self.firewall_resolve_suggestions(&network, &accept, &deny),
             IpcMessage::FirewallAutoAccept { network, enabled } => {
                 self.firewall_auto_accept(&network, enabled)
+            }
+            IpcMessage::FilesAutoAccept { network, enabled } => {
+                self.files_auto_accept(&network, enabled).await
             }
             IpcMessage::FirewallSshSet { enabled } => self.firewall_ssh_set(enabled),
             IpcMessage::FirewallSshAllow {
@@ -2094,10 +2108,14 @@ async fn build_daemon(
     // --- Protocol router + the shared DaemonState ---
     let pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>> =
         Arc::new(std::sync::Mutex::new(None));
+    // Auto-accept worker channel: the router nudges this with each newly-queued
+    // file offer id; the worker (spawned once the daemon exists) evaluates it.
+    let (new_file_tx, new_file_rx) = mpsc::unbounded_channel::<u64>();
     let protocol_router = Arc::new(ProtocolRouter::new(
         blobs_proto,
         key.clone(),
         pairing_secret.clone(),
+        new_file_tx,
     ));
     // Promotion channel: a co-coordinator's control reader signals the main
     // daemon loop to swap in the coordinator accept handler on `AdminGrant`.
@@ -2134,6 +2152,9 @@ async fn build_daemon(
 
     // --- Accept loop (ALPN dispatch) + Prometheus metrics ---
     protocol_router.spawn_accept_loop(daemon.endpoint.clone(), token.clone());
+
+    // --- File auto-accept worker (own-devices offers) ---
+    spawn_file_auto_accept(daemon.clone(), new_file_rx, token.clone());
 
     // --- Contact record publisher (ray connect) ---
     if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
@@ -2977,6 +2998,27 @@ struct CoordinatorCleanup {
     network_name: String,
 }
 
+/// Drain newly-queued file-offer ids and hand each to the own-devices
+/// auto-accept policy. Runs for the daemon's lifetime; a nudge that arrives
+/// before the flag is on is a no-op (the offer stays queued for manual accept).
+fn spawn_file_auto_accept(
+    daemon: Arc<DaemonState>,
+    mut rx: mpsc::UnboundedReceiver<u64>,
+    token: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                id = rx.recv() => match id {
+                    Some(id) => daemon.try_auto_accept_file(id).await,
+                    None => return,
+                },
+            }
+        }
+    })
+}
+
 fn spawn_peer_cleanup(
     mut disconnect_rx: mpsc::Receiver<forward::DisconnectEvent>,
     peers: PeerTable,
@@ -3494,6 +3536,10 @@ struct JoinParams {
     reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
     /// Consent: auto-install suggested rules without a manual review queue.
     auto_accept_firewall: bool,
+    /// Seed for per-network auto-accept of file offers from our own devices
+    /// (`--auto-accept-files`). Only applied on a first join; the persisted
+    /// config value wins on reconnect/restore (see `join_mesh_shared`).
+    auto_accept_files: bool,
     /// Fresh join (send `JoinRequest` first) vs reconnect/restore (coordinator
     /// speaks first).
     initial: bool,
@@ -3539,6 +3585,7 @@ async fn join_mesh_shared(
         suggested_firewall,
         reusable_keys,
         auto_accept_firewall,
+        auto_accept_files,
         initial,
     } = params;
     let my_identity = identity.local_identity();
@@ -3655,9 +3702,22 @@ async fn join_mesh_shared(
     // Preserve a queued rename intent across reconnects/restores: the blob we
     // just fetched won't carry it yet, so persisting it here keeps the drain
     // alive until a coordinator confirms the new name.
-    let (direct, pending_hostname, ssh_allow, aliases) = config::load_network(network_name)?
-        .map(|n| (n.direct, n.pending_hostname, n.ssh_allow, n.aliases))
-        .unwrap_or((false, None, vec![], BTreeMap::new()));
+    let (direct, pending_hostname, ssh_allow, aliases, prev_auto_accept_files) =
+        config::load_network(network_name)?
+            .map(|n| {
+                (
+                    n.direct,
+                    n.pending_hostname,
+                    n.ssh_allow,
+                    n.aliases,
+                    n.auto_accept_files,
+                )
+            })
+            .unwrap_or((false, None, vec![], BTreeMap::new(), false));
+    // The toggle command (`ray files auto-accept`) is authoritative, so preserve
+    // a previously-persisted value; the join-time `--auto-accept-files` seed only
+    // needs to take effect on the first join (no prior config).
+    let auto_accept_files = prev_auto_accept_files || auto_accept_files;
     config::save_network(&config::NetworkConfig {
         name: network_name.to_string(),
         group_mode: GroupMode::Restricted,
@@ -3670,6 +3730,7 @@ async fn join_mesh_shared(
         network_public_key: Some(net_pubkey),
         transport: None,
         auto_accept_firewall,
+        auto_accept_files,
         admins: vec![],
         direct,
         ssh_allow,

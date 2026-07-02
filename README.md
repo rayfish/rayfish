@@ -41,7 +41,7 @@ Each machine runs a small daemon (comparable to Tailscale's `tailscaled`) that c
 - 🤝 **Coordinator firewall suggestions.** On any network the coordinator can suggest firewall rules that ride the signed network record (`*` targets all hosts); each node reviews them or opts into auto-install with `--auto-accept-firewall`.
 - 📜 **Declarative provisioning.** `ray apply deploy.yaml` stands up networks and firewall rules from a YAML spec. Define `aliases:` (a name for a user, expanding to all their devices) and `groups:` (a set of users/hosts) once, then reference them in firewall rules instead of repeating hostnames. `ray identityof <net> <host>` prints the identity string to alias. `ray alias <net> set <host> <name>` saves an alias on the node itself: it shows inline in `ray status` and seeds a spec's `aliases:` so you don't have to re-declare it.
 - 👥 **Multi-device identity.** Pair your laptop and phone under one identity; encrypted key backup (optionally to 1Password).
-- 📁 **File sharing.** `ray send file.zip bob`.
+- 📁 **File sharing.** `ray send file.zip bob`. Opt into `ray files auto-accept <net> on` to have transfers from your own paired devices land automatically; point them anywhere with `ray files download-dir <path>` or `download-user <user>`.
 - 📡 **mDNS** local discovery, and optional **Tor** transport.
 - 🛠 **Operator model.** Like Tailscale, run day-to-day commands without `sudo`.
 

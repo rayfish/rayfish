@@ -88,6 +88,11 @@ pub(crate) enum Command {
         /// it, suggestions queue for `ray firewall accept`.
         #[arg(long)]
         auto_accept_firewall: bool,
+        /// Auto-accept incoming file transfers from your own paired devices on
+        /// this network (no manual `ray files accept`). Only offers whose sender
+        /// is one of your own devices are accepted.
+        #[arg(long)]
+        auto_accept_files: bool,
     },
     /// Leave a network (remove from saved config)
     #[command(visible_alias = "rm")]
@@ -628,6 +633,33 @@ pub(crate) enum FilesAction {
         #[arg(long, short)]
         output: Option<String>,
     },
+    /// Toggle auto-accepting file transfers from your own paired devices on a
+    /// network (`on` also drains any already-queued offers from your devices;
+    /// `off` stops future auto-accept). Only your own devices are auto-accepted.
+    AutoAccept {
+        /// Network name
+        network: String,
+        /// `on` or `off`
+        state: String,
+    },
+    /// Set/show/clear the directory where auto-accepted files are written
+    /// (absolute path). With no argument, prints the current value.
+    DownloadDir {
+        /// Absolute path (omit to show current)
+        path: Option<String>,
+        /// Clear the setting (revert to download-user / operator fallback)
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Set/show/clear the unix user that owns auto-accepted files (and whose
+    /// ~/Downloads receives them when no download-dir is set).
+    DownloadUser {
+        /// Username or numeric uid (omit to show current)
+        user: Option<String>,
+        /// Clear the setting
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 fn check_root() {
@@ -899,6 +931,7 @@ async fn main() -> Result<()> {
             hostname,
             tor,
             auto_accept_firewall,
+            auto_accept_files,
         } => {
             ipc_join(
                 &network_key,
@@ -906,6 +939,7 @@ async fn main() -> Result<()> {
                 hostname,
                 tor,
                 auto_accept_firewall,
+                auto_accept_files,
             )
             .await
         }
@@ -1043,7 +1077,7 @@ fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
 }
 
 /// Resolve a username to its UID, falling back to parsing a numeric UID.
-fn uid_for_user(user: &str) -> Option<u32> {
+pub(crate) fn uid_for_user(user: &str) -> Option<u32> {
     use std::ffi::CString;
     let cname = CString::new(user).ok()?;
     let pw = unsafe { libc::getpwnam(cname.as_ptr()) };

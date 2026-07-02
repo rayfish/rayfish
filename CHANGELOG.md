@@ -8,6 +8,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Auto-accept files from your own devices**: turn on
+  `ray files auto-accept <network> on` (or join with
+  `ray join <net> --auto-accept-files`) and incoming file transfers from your
+  own paired devices land automatically in your `~/Downloads`, with no manual
+  `ray files accept`. Only offers whose sender is one of your own devices (same
+  paired identity) on that network are accepted; files from anyone else still
+  queue for review. Turning it on also accepts any offers already waiting from
+  your devices. Off by default; `ray files auto-accept <net> off` disables it.
+- **Configurable auto-accept download location**: `ray files download-dir <path>`
+  sends auto-accepted files to an absolute directory (owned by the dir's owner or
+  `download-user`); `ray files download-user <user>` routes them to that user's
+  `~/Downloads`, owned by them. With neither set, the operator's `~/Downloads` is
+  used; if nothing resolves the offer stays queued rather than being written as
+  root. `--clear` unsets; no argument shows the current value.
 - **`ray alias <network> <key> <alias>`**: give a peer a friendly, node-local
   name. `ray alias <net> set <key> <name>` binds an alias to a user, where `key`
   is either an identity string (from `ray identityof`) or a currently-joined

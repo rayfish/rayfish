@@ -229,6 +229,7 @@ impl DaemonState {
             network_public_key: Some(net_public_key),
             transport: None,
             auto_accept_firewall: false,
+            auto_accept_files: false,
             admins: vec![],
             direct,
             ssh_allow: vec![],
@@ -279,6 +280,7 @@ impl DaemonState {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, hostname), fields(net = name.unwrap_or(network_key)))]
     pub(crate) async fn join_network(
         self: &Arc<Self>,
@@ -288,6 +290,7 @@ impl DaemonState {
         invite: Option<Vec<u8>>,
         coordinator: Option<EndpointId>,
         auto_accept_firewall: bool,
+        auto_accept_files: bool,
     ) -> IpcMessage {
         match self
             .join_network_inner(
@@ -297,6 +300,7 @@ impl DaemonState {
                 invite.clone(),
                 coordinator,
                 auto_accept_firewall,
+                auto_accept_files,
                 true,
             )
             .await
@@ -324,6 +328,7 @@ impl DaemonState {
                                 invite.clone(),
                                 coordinator,
                                 auto_accept_firewall,
+                                auto_accept_files,
                                 true,
                             )
                             .await
@@ -361,6 +366,9 @@ impl DaemonState {
         // Auto-install coordinator-suggested firewall rules on this network
         // (`--auto-accept-firewall`); persisted so it survives restarts.
         auto_accept_firewall: bool,
+        // Seed for per-network auto-accept of file offers from own devices
+        // (`--auto-accept-files`); persisted, config wins on reconnect/restore.
+        auto_accept_files: bool,
         // True for a fresh join (we send a JoinRequest first); false when
         // restoring a network we're already a member of (legacy handshake where
         // the coordinator speaks first).
@@ -532,6 +540,7 @@ impl DaemonState {
                         suggested_firewall: data.suggested_firewall.clone(),
                         reusable_keys: data.reusable_keys.clone(),
                         auto_accept_firewall,
+                        auto_accept_files,
                         initial: true,
                     },
                     disconnect_tx.clone(),
@@ -652,6 +661,7 @@ impl DaemonState {
                         suggested_firewall: data.suggested_firewall.clone(),
                         reusable_keys: data.reusable_keys.clone(),
                         auto_accept_firewall,
+                        auto_accept_files,
                         initial: false,
                     },
                     disconnect_tx.clone(),

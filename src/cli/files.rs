@@ -22,6 +22,57 @@ pub(crate) async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
 }
 
 pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
+    // These subcommands only touch settings.toml (no daemon needed).
+    match &action {
+        Some(FilesAction::DownloadDir { path, clear }) => {
+            let mut cfg = config::load()?;
+            if *clear {
+                cfg.download_dir = None;
+                config::save_settings(&cfg)?;
+                println!("  {} download-dir cleared", style::check());
+            } else if let Some(p) = path {
+                if !std::path::Path::new(p).is_absolute() {
+                    anyhow::bail!("download-dir must be an absolute path: {p}");
+                }
+                cfg.download_dir = Some(p.clone());
+                config::save_settings(&cfg)?;
+                println!("  {} download-dir = {}", style::check(), style::value(p));
+            } else {
+                println!(
+                    "download-dir = {}",
+                    cfg.download_dir.as_deref().unwrap_or("<unset>")
+                );
+            }
+            return Ok(());
+        }
+        Some(FilesAction::DownloadUser { user, clear }) => {
+            let mut cfg = config::load()?;
+            if *clear {
+                cfg.download_user = None;
+                config::save_settings(&cfg)?;
+                println!("  {} download-user cleared", style::check());
+            } else if let Some(u) = user {
+                let uid = crate::uid_for_user(u).ok_or_else(|| {
+                    anyhow::anyhow!("unknown user '{u}' (pass a valid username or uid)")
+                })?;
+                cfg.download_user = Some(uid);
+                config::save_settings(&cfg)?;
+                println!(
+                    "  {} download-user = {} (uid {uid})",
+                    style::check(),
+                    style::value(u)
+                );
+            } else {
+                match cfg.download_user {
+                    Some(uid) => println!("download-user = uid {uid}"),
+                    None => println!("download-user = <unset>"),
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let mut stream = ipc::connect().await?;
     match action {
         None => {
@@ -93,6 +144,26 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 ipc::IpcMessage::Error { message } => print_error("error", &message, None),
                 other => eprintln!("Unexpected response: {:?}", other),
             }
+        }
+        Some(FilesAction::AutoAccept { network, state }) => {
+            let enabled = match state.to_ascii_lowercase().as_str() {
+                "on" | "true" | "yes" => true,
+                "off" | "false" | "no" => false,
+                other => anyhow::bail!("expected `on` or `off`, got '{other}'"),
+            };
+            ipc::send(&mut stream, ipc::IpcMessage::FilesAutoAccept { network, enabled }).await?;
+            let resp = ipc::recv(&mut stream).await?;
+            match resp {
+                ipc::IpcMessage::Ok { message } => {
+                    println!("  {} {}", style::check(), style::value(&message));
+                }
+                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+                other => eprintln!("Unexpected response: {:?}", other),
+            }
+        }
+        // Config-only subcommands are handled above and return early.
+        Some(FilesAction::DownloadDir { .. }) | Some(FilesAction::DownloadUser { .. }) => {
+            unreachable!("download-dir/download-user handled before daemon connect")
         }
     }
     Ok(())

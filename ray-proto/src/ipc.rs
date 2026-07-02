@@ -37,6 +37,10 @@ pub enum IpcMessage {
         /// without a manual review queue (`--auto-accept-firewall`).
         #[serde(default, alias = "allow_trusted")]
         auto_accept_firewall: bool,
+        /// Auto-accept incoming file offers from our own paired devices on this
+        /// network (`--auto-accept-files`).
+        #[serde(default)]
+        auto_accept_files: bool,
     },
     Leave {
         name: String,
@@ -111,6 +115,13 @@ pub enum IpcMessage {
     /// Toggle per-network auto-accept of coordinator-suggested firewall rules.
     /// `on` immediately installs the queued set; `off` stops future auto-install.
     FirewallAutoAccept {
+        network: String,
+        enabled: bool,
+    },
+    /// Toggle per-network auto-accept of incoming file offers from our own
+    /// paired devices. `on` also drains any already-queued offers from own
+    /// devices; `off` stops future auto-accept.
+    FilesAutoAccept {
         network: String,
         enabled: bool,
     },
@@ -841,6 +852,7 @@ mod tests {
             invite: Some(vec![1, 2, 3]),
             coordinator: Some(coord),
             auto_accept_firewall: false,
+            auto_accept_files: false,
         };
         let bytes = rmp_serde::to_vec(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();

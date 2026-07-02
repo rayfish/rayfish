@@ -181,6 +181,9 @@ impl DaemonState {
             auto_accept_firewall: net_config
                 .map(|nc| nc.auto_accept_firewall)
                 .unwrap_or(false),
+            auto_accept_files: net_config
+                .map(|nc| nc.auto_accept_files)
+                .unwrap_or(false),
             admins: net_config.map(|nc| nc.admins.clone()).unwrap_or_default(),
             direct: net_config.map(|nc| nc.direct).unwrap_or(false),
             ssh_allow: net_config
@@ -502,6 +505,7 @@ impl DaemonState {
                 let name = net.name.clone();
                 let persisted_hostname = net.my_hostname.clone();
                 let net_auto_accept = net.auto_accept_firewall;
+                let net_auto_accept_files = net.auto_accept_files;
                 let net_pubkey = match &net.network_public_key {
                     Some(k) => k.to_string(),
                     None => {
@@ -519,6 +523,7 @@ impl DaemonState {
                             None,
                             None,
                             net_auto_accept,
+                            net_auto_accept_files,
                             false,
                         )
                         .await
