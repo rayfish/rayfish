@@ -19,6 +19,7 @@
 //! peers; an empty subject suggests nothing. There is no `default` field.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -192,7 +193,7 @@ networks:
 /// expects to exist; it is diffed against the joined hosts. The `*` wildcard
 /// (subject or peer) is not a real host and is excluded.
 pub fn expected_hosts(spec: &DeploySpec) -> Vec<String> {
-    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut set: BTreeSet<String> = BTreeSet::new();
     for firewall in spec.networks.values() {
         for (subject, rules) in firewall {
             if subject != "*" {
@@ -241,7 +242,7 @@ pub fn expand_firewall(
     groups: &BTreeMap<String, Vec<String>>,
     resolve_alias: &dyn Fn(&str) -> Vec<String>,
 ) -> (SuggestedFirewall, Vec<String>) {
-    let mut empty_aliases: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut empty_aliases: BTreeSet<String> = BTreeSet::new();
 
     // Resolve one alias name to its joined hostnames, recording it if empty.
     let mut resolve_one_alias = |name: &str, ident: &str| -> Vec<String> {
@@ -312,7 +313,7 @@ pub fn expand_firewall(
 /// of tokens sorted and deduplicated (canonical, so repeated expansions are
 /// idempotent). An empty existing value just adopts the new tokens.
 fn merge_spec(existing: &mut String, new: &str) {
-    let mut tokens: std::collections::BTreeSet<&str> = existing
+    let mut tokens: BTreeSet<&str> = existing
         .split(',')
         .chain(new.split(','))
         .map(str::trim)

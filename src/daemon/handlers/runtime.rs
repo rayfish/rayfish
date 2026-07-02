@@ -2,6 +2,7 @@
 //! connect-all, activate/deactivate (data plane), teardown, leave. Split out of `daemon/mod.rs`.
 
 use super::super::*;
+use std::net::IpAddr;
 use std::sync::RwLock;
 
 /// The membership a coordinator restores at startup, sourced from the signed
@@ -561,7 +562,7 @@ impl DaemonState {
     /// config, so a running listener authorizes against current rules. Cheap and
     /// only called on SSH config changes / activation (not the hot path).
     pub(crate) fn rebuild_ssh_authz(&self) {
-        let mut map = std::collections::HashMap::new();
+        let mut map = HashMap::new();
         if let Ok(cfg) = config::load() {
             for n in &cfg.networks {
                 if !n.ssh_allow.is_empty() {
@@ -569,7 +570,7 @@ impl DaemonState {
                 }
             }
         }
-        self.ssh_authz.store(std::sync::Arc::new(map));
+        self.ssh_authz.store(Arc::new(map));
     }
 
     /// Start the embedded mesh SSH listeners on this node's mesh addresses, if
@@ -580,7 +581,7 @@ impl DaemonState {
         if guard.is_some() {
             return;
         }
-        let token = tokio_util::sync::CancellationToken::new();
+        let token = CancellationToken::new();
         *guard = Some(token.clone());
         drop(guard);
         self.rebuild_ssh_authz();
@@ -592,7 +593,7 @@ impl DaemonState {
             self.ssh_authz.clone(),
         );
         server.spawn(
-            vec![std::net::IpAddr::V4(my_v4), std::net::IpAddr::V6(my_v6)],
+            vec![IpAddr::V4(my_v4), IpAddr::V6(my_v6)],
             token,
         );
         // Turn on the userspace port NAT so mesh `:22` reaches the listener.
@@ -722,7 +723,7 @@ impl DaemonState {
                 // program (NetworkManager, dhclient) overwrites it (inotify watch).
                 #[cfg(target_os = "linux")]
                 if is_direct {
-                    let rt = tokio_util::sync::CancellationToken::new();
+                    let rt = CancellationToken::new();
                     *self.dns_reassert_token.lock().unwrap() = Some(rt.clone());
                     tokio::spawn(dns_config::run_resolv_reassert(search, rt));
                 }

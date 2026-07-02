@@ -18,6 +18,7 @@
 //! already-established session is not torn down by a later `deny`.
 
 use std::collections::HashMap;
+use std::io::Error;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -27,12 +28,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use iroh::EndpointId;
+use pty_process::Size;
 use russh::CryptoVec;
-use russh::keys::PrivateKey;
-use russh::server::{Auth, Handle, Handler, Msg, Session};
+use russh::keys::{Algorithm, PrivateKey};
+use russh::server::{Auth, Config, Handle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use smol_str::SmolStr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -159,7 +162,7 @@ impl SshServer {
                     return;
                 }
             };
-            let config = Arc::new(russh::server::Config {
+            let config = Arc::new(Config {
                 keys: vec![key],
                 // Identity is proven by the mesh link, so the `none` method is
                 // the only one offered; our `auth_none` is the authorization gate.
@@ -211,7 +214,7 @@ impl SshServer {
 /// Bind a TCP listener on a specific mesh IP's port 22 with SO_REUSEADDR (and
 /// SO_REUSEPORT on Unix) so it can coexist with a host sshd bound on the wildcard
 /// address. Returns a tokio listener ready to accept.
-fn bind_listener(ip: IpAddr, port: u16) -> Result<tokio::net::TcpListener> {
+fn bind_listener(ip: IpAddr, port: u16) -> Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if ip.is_ipv4() {
         Domain::IPV4
@@ -227,14 +230,14 @@ fn bind_listener(ip: IpAddr, port: u16) -> Result<tokio::net::TcpListener> {
     sock.bind(&addr.into())?;
     sock.listen(128)?;
     let std_listener: std::net::TcpListener = sock.into();
-    Ok(tokio::net::TcpListener::from_std(std_listener)?)
+    Ok(TcpListener::from_std(std_listener)?)
 }
 
 /// Resolve the connecting peer, decide authorization, and run the SSH session.
 async fn handle_conn(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
-    config: Arc<russh::server::Config>,
+    config: Arc<Config>,
     peers: PeerTable,
     device_user_map: DeviceUserMap,
     authz: SshAuthz,
@@ -280,7 +283,7 @@ struct SshHandler {
     channel: Option<Channel<Msg>>,
     /// Set once a shell/exec session starts; forwards window-resize events to
     /// the task that owns the PTY.
-    resize_tx: Option<mpsc::UnboundedSender<pty_process::Size>>,
+    resize_tx: Option<mpsc::UnboundedSender<Size>>,
 }
 
 impl SshHandler {
@@ -431,7 +434,7 @@ impl Handler for SshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         if let Some(tx) = &self.resize_tx {
-            let _ = tx.send(pty_process::Size::new(row_height as u16, col_width as u16));
+            let _ = tx.send(Size::new(row_height as u16, col_width as u16));
         }
         session.channel_success(channel)?;
         Ok(())
@@ -481,13 +484,13 @@ fn drop_privs(
             #[cfg(not(target_os = "macos"))]
             let basegroup = gid as libc::gid_t;
             if libc::initgroups(cname.as_ptr(), basegroup) != 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(Error::last_os_error());
             }
             if libc::setgid(gid as libc::gid_t) != 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(Error::last_os_error());
             }
             if libc::setuid(uid as libc::uid_t) != 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(Error::last_os_error());
             }
         }
         Ok(())
@@ -516,12 +519,12 @@ async fn run_pty_session(
     info: LoginInfo,
     command: Option<String>,
     pty_req: PtyReq,
-    mut resize_rx: mpsc::UnboundedReceiver<pty_process::Size>,
+    mut resize_rx: mpsc::UnboundedReceiver<Size>,
 ) -> Result<u32> {
     let drop = drop_privs(info.uid, info.gid, &info.name)?;
 
     let (pty, pts) = pty_process::open().context("opening pty")?;
-    let _ = pty.resize(pty_process::Size::new(pty_req.row, pty_req.col));
+    let _ = pty.resize(Size::new(pty_req.row, pty_req.col));
 
     let mut cmd = pty_process::Command::new(&info.shell);
     match &command {
@@ -701,7 +704,7 @@ fn discover_host_ed25519_key() -> Option<(PathBuf, PrivateKey)> {
         match PrivateKey::from_openssh(&pem) {
             Ok(key)
                 if !key.is_encrypted()
-                    && key.algorithm() == russh::keys::Algorithm::Ed25519 =>
+                    && key.algorithm() == Algorithm::Ed25519 =>
             {
                 return Some((path, key));
             }
@@ -753,7 +756,7 @@ fn load_or_generate_host_key() -> Result<PrivateKey> {
         let pem = std::fs::read_to_string(&path).context("reading ssh host key")?;
         return PrivateKey::from_openssh(&pem).context("parsing ssh host key");
     }
-    let key = PrivateKey::random(&mut OsRng, russh::keys::Algorithm::Ed25519)
+    let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
         .context("generating ssh host key")?;
     let pem = key
         .to_openssh(LineEnding::LF)

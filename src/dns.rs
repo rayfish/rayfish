@@ -26,7 +26,7 @@ use crate::DNS_DOMAIN;
 /// address — it is reachable only by being routed into the TUN, which is what
 /// lets us answer DNS without competing for the host's port 53. Distinct from
 /// Tailscale's 100.100.100.100 so both can coexist.
-pub const MAGIC_DNS_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 100, 100, 53);
+pub const MAGIC_DNS_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 53);
 
 /// Per-network hostname → (IPv4, IPv6) mapping.
 pub type HostnameEntry = (Ipv4Addr, Ipv6Addr);

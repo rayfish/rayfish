@@ -9,7 +9,7 @@ impl DaemonState {
         let my_id = self.endpoint.id();
         // Direct-connection networks are flagged in config; collect their names
         // so each NetworkStatus can be tagged `[direct]` in the CLI.
-        let direct_names: std::collections::HashSet<String> = config::load()
+        let direct_names: HashSet<String> = config::load()
             .map(|c| {
                 c.networks
                     .iter()
@@ -48,7 +48,7 @@ impl DaemonState {
         h: &NetworkHandle,
         my_id: EndpointId,
         hostname_snapshot: Option<&HashMap<String, HashMap<String, dns::HostnameEntry>>>,
-        direct_names: &std::collections::HashSet<String>,
+        direct_names: &HashSet<String>,
     ) -> NetworkStatus {
         // Direct-connection networks are tagged `[direct]` regardless of role.
         let role = if direct_names.contains(&h.name) {

@@ -8,7 +8,7 @@ impl DaemonState {
     // Firewall handlers
     // -----------------------------------------------------------------------
 
-    pub(crate) fn firewall_add(
+    pub(crate) async fn firewall_add(
         &self,
         direction: firewall::Direction,
         action: firewall::Action,
@@ -32,12 +32,28 @@ impl DaemonState {
             },
             None => vec![None],
         };
+        // Resolve the peer to its **device** endpoint id (accepts hostname, mesh
+        // IPv4/IPv6, short id, full endpoint id, or a paired user identity), then
+        // normalize to the value the data plane actually compares against, which
+        // differs by direction: inbound matches `device_user_map.resolve(...)`
+        // (the peer's user identity for a paired/multi-device peer, else its
+        // device id — so an `in` rule keyed on the user id matches every one of
+        // that user's devices), while outbound matches the raw device id. Same
+        // reasoning as the SSH-allow handler below.
         let peer = match peer {
-            Some(s) => match self.resolve_short_id_any_network(s) {
-                Some(id) => firewall::PeerFilter::Identity(id),
+            Some(s) => match self.resolve_peer_flexible(s).await {
+                Some(device_id) => {
+                    let id = match direction {
+                        firewall::Direction::In => self.device_user_map.resolve(&device_id),
+                        firewall::Direction::Out => device_id,
+                    };
+                    firewall::PeerFilter::Identity(id)
+                }
                 None => {
                     return IpcMessage::Error {
-                        message: format!("unknown peer '{s}'"),
+                        message: format!(
+                            "unknown peer '{s}' (try a hostname, mesh IP, short id, or identity)"
+                        ),
                     };
                 }
             },
@@ -216,8 +232,8 @@ impl DaemonState {
                 };
             }
         };
-        let accept_set: std::collections::HashSet<&FirewallRuleView> = accept.iter().collect();
-        let deny_set: std::collections::HashSet<&FirewallRuleView> = deny.iter().collect();
+        let accept_set: HashSet<&FirewallRuleView> = accept.iter().collect();
+        let deny_set: HashSet<&FirewallRuleView> = deny.iter().collect();
 
         // Partition the queue: keep the still-undecided rules; collect accepted.
         let mut accepted_rules = Vec::new();

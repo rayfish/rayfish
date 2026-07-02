@@ -41,6 +41,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ray firewall add --peer` now accepts any peer identifier**: previously it
+  only matched a short id / endpoint-id prefix, so the natural things to type
+  (`--peer alice`, `--peer alice.homenet.ray`, `--peer 100.x.y.z`) failed with
+  "unknown peer". It now resolves a hostname, mesh IPv4/IPv6, short id, full
+  endpoint id, or a paired user identity, the same way `ray ping`, `ray send`,
+  and `ray firewall ssh allow` already do. It also fixes a case where an
+  **inbound** rule scoped to a paired (multi-device) peer never matched: the rule
+  is now keyed on the peer's user identity, so `allow in ... --peer alice` covers
+  every one of that user's devices (an outbound rule stays scoped to the named
+  device).
 - **Member network vanished when the coordinator was offline at startup**: a
   member (non-coordinator) whose daemon restarted while its coordinator was
   unreachable would silently drop the network from its running state. `ray

@@ -37,8 +37,9 @@
 
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::fs::File;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -48,13 +49,17 @@ use dashmap::{DashMap, DashSet};
 
 use anyhow::{Context, Result};
 use iroh::address_lookup::PkarrRelayClient;
-use iroh::endpoint::{Connection, Endpoint, VarInt};
+use iroh::endpoint::{Connection, Endpoint, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{EndpointId, SecretKey};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, HashAndFormat};
+use iroh_mdns_address_lookup::DiscoveryEvent;
+use iroh_metrics::service::MetricsServer;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -175,11 +180,11 @@ struct CoordinatorAcceptState {
     state: SharedNetworkState,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
-    dht_notify: Option<Arc<tokio::sync::Notify>>,
+    dht_notify: Option<Arc<Notify>>,
     /// Shared with this network's [`NetworkHandle`]; see its `invite_lock`.
     invite_lock: Arc<tokio::sync::Mutex<()>>,
     /// Shared with the router; lets the control reader resolve `ray ping` Pongs.
-    pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
+    pending_pongs: Arc<DashMap<u64, oneshot::Sender<()>>>,
 }
 
 impl CoordinatorAcceptState {
@@ -367,7 +372,7 @@ impl CoordinatorAcceptState {
     async fn redeem_invite_and_admit(
         &self,
         conn: Connection,
-        send: iroh::endpoint::SendStream,
+        send: SendStream,
         remote_id: EndpointId,
         peer_ip: Ipv4Addr,
         hostname: Option<String>,
@@ -457,7 +462,7 @@ impl CoordinatorAcceptState {
 
     /// Reply on the joiner's stream that the join was refused, then wait for the
     /// joiner to close so the JoinDenied flushes before `conn` is dropped.
-    async fn deny(&self, conn: &Connection, mut send: iroh::endpoint::SendStream, reason: String) {
+    async fn deny(&self, conn: &Connection, mut send: SendStream, reason: String) {
         let _ = control::send_msg(&mut send, &ControlMsg::JoinDenied { reason }).await;
         let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
     }
@@ -473,7 +478,7 @@ impl CoordinatorAcceptState {
     async fn admit_peer(
         &self,
         conn: Connection,
-        mut send: iroh::endpoint::SendStream,
+        mut send: SendStream,
         remote_id: EndpointId,
         _suggested_ip: Ipv4Addr,
         hostname: Option<String>,
@@ -887,7 +892,7 @@ struct ProtocolRouter {
     /// In-flight `ray ping` probes, keyed by nonce. The control reader fires the
     /// oneshot when the matching `Pong` arrives so the ping handler can measure
     /// round-trip time. Cloned into both control readers.
-    pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
+    pending_pongs: Arc<DashMap<u64, oneshot::Sender<()>>>,
 }
 
 impl ProtocolRouter {
@@ -1108,7 +1113,7 @@ impl ProtocolRouter {
         self: &Arc<Self>,
         endpoint: Endpoint,
         cancel: CancellationToken,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> JoinHandle<()> {
         let router = self.clone();
         tokio::spawn(async move {
             loop {
@@ -1252,7 +1257,7 @@ pub struct NetworkHandle {
     state: SharedNetworkState,
     /// DHT republish trigger; `Some` only on the coordinator (the sole publisher).
     /// Lets `set_hostname` re-publish the group blob on a coordinator self-rename.
-    dht_notify: Option<Arc<tokio::sync::Notify>>,
+    dht_notify: Option<Arc<Notify>>,
     /// Child of the daemon `shutdown_token`. Cancelling it stops this network's
     /// background tasks (reconnect loop, group poller, publisher, peer readers)
     /// without affecting the rest of the daemon.
@@ -1307,16 +1312,16 @@ pub struct DaemonState {
     /// The system-DNS configurator owned while active, so `Down` can revert it.
     dns_configurator: Arc<std::sync::Mutex<Option<Box<dyn dns_config::DnsConfigurator>>>>,
     /// In-daemon Magic DNS resolver (answers `.ray` queries intercepted via TUN).
-    resolver: std::sync::Arc<crate::dns_resolver::Resolver>,
+    resolver: Arc<crate::dns_resolver::Resolver>,
     /// Cancellation token for the `run_resolv_reassert` task (Linux direct mode).
-    dns_reassert_token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    dns_reassert_token: std::sync::Mutex<Option<CancellationToken>>,
     /// Live per-network SSH allow lists for the embedded mesh SSH server. Swapped
     /// atomically on `ray firewall ssh allow/deny`, so a running listener picks up
     /// changes without restart. See [`crate::ssh`].
     ssh_authz: crate::ssh::SshAuthz,
     /// Cancellation token for the running SSH listeners (`None` when off / on
     /// standby). Set by [`DaemonState::start_ssh`], cleared by `stop_ssh`.
-    ssh_token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    ssh_token: std::sync::Mutex<Option<CancellationToken>>,
     /// Promotion signal: a co-coordinator's per-peer control reader sends the
     /// network name here after persisting an `AdminGrant` key, and the main
     /// daemon loop ([`serve_ipc`]) drains it into
@@ -1405,7 +1410,7 @@ impl DaemonState {
         network: &str,
         state: SharedNetworkState,
         invite_lock: Arc<tokio::sync::Mutex<()>>,
-        dht_notify: Option<Arc<tokio::sync::Notify>>,
+        dht_notify: Option<Arc<Notify>>,
         network_key: EndpointId,
         disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
         cancel: CancellationToken,
@@ -1597,14 +1602,17 @@ impl DaemonState {
                 port,
                 peer,
                 network,
-            } => self.firewall_add(
-                direction,
-                action,
-                protocol,
-                port.as_deref(),
-                peer.as_deref(),
-                network.as_deref(),
-            ),
+            } => {
+                self.firewall_add(
+                    direction,
+                    action,
+                    protocol,
+                    port.as_deref(),
+                    peer.as_deref(),
+                    network.as_deref(),
+                )
+                .await
+            }
             IpcMessage::FirewallRemove { index } => self.firewall_remove(index),
             IpcMessage::FirewallShow => self.firewall_show(),
             IpcMessage::FirewallDefault { action } => self.firewall_default(action),
@@ -1893,7 +1901,7 @@ fn collect_recent_logs() -> Vec<(String, Vec<u8>)> {
     const MAX_TOTAL: u64 = 3 * 1024 * 1024;
 
     let dir = crate::logdir::log_dir();
-    let mut entries: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
+    let mut entries: Vec<PathBuf> = match std::fs::read_dir(&dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -1928,8 +1936,8 @@ fn collect_recent_logs() -> Vec<(String, Vec<u8>)> {
 }
 
 /// Write `files` as a gzipped tar archive at `path`. Each entry is `(name, bytes)`.
-fn write_bundle(path: &std::path::Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
-    let file = std::fs::File::create(path)?;
+fn write_bundle(path: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
+    let file = File::create(path)?;
     let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     let mut builder = tar::Builder::new(enc);
     for (name, data) in files {
@@ -1999,7 +2007,7 @@ async fn build_daemon(
     stats: Arc<ForwardMetrics>,
 ) -> Result<(
     Arc<DaemonState>,
-    Option<iroh_metrics::service::MetricsServer>,
+    Option<MetricsServer>,
     mpsc::Receiver<String>,
 )> {
     // Relocate a pre-/etc config tree into /etc/rayfish (Linux upgrade path)
@@ -2085,7 +2093,7 @@ async fn build_daemon(
     // --- Magic DNS resolver + optional mDNS local discovery ---
     let hostname_table = dns::new_hostname_table();
     let reverse_table = dns::new_reverse_table();
-    let dns_resolver = std::sync::Arc::new(crate::dns_resolver::Resolver::new(
+    let dns_resolver = Arc::new(crate::dns_resolver::Resolver::new(
         hostname_table.clone(),
         reverse_table.clone(),
     ));
@@ -2199,13 +2207,13 @@ fn spawn_mdns_discovery(ep: &Endpoint, token: CancellationToken) {
             tokio::select! {
                 _ = token.cancelled() => break,
                 event = events.next() => match event {
-                    Some(iroh_mdns_address_lookup::DiscoveryEvent::Discovered { endpoint_info, .. }) => {
+                    Some(DiscoveryEvent::Discovered { endpoint_info, .. }) => {
                         tracing::info!(
                             peer = %endpoint_info.endpoint_id.fmt_short(),
                             "mDNS: peer discovered on LAN"
                         );
                     }
-                    Some(iroh_mdns_address_lookup::DiscoveryEvent::Expired { endpoint_id }) => {
+                    Some(DiscoveryEvent::Expired { endpoint_id }) => {
                         tracing::info!(
                             peer = %endpoint_id.fmt_short(),
                             "mDNS: peer left LAN"
@@ -2227,7 +2235,7 @@ async fn spawn_metrics_server(
     peers: PeerTable,
     endpoint: &Endpoint,
     token: CancellationToken,
-) -> Option<iroh_metrics::service::MetricsServer> {
+) -> Option<MetricsServer> {
     let mut registry = iroh_metrics::Registry::default();
     registry.register(stats);
     let peer_metrics = Arc::new(crate::stats::PeerMetrics::default());
@@ -2236,7 +2244,7 @@ async fn spawn_metrics_server(
     registry.register_all(endpoint.metrics());
 
     let metrics_addr: SocketAddr = ([0, 0, 0, 0], 9090).into();
-    match iroh_metrics::service::MetricsServer::spawn(metrics_addr, Arc::new(registry)).await {
+    match MetricsServer::spawn(metrics_addr, Arc::new(registry)).await {
         Ok(server) => {
             tracing::info!(addr = %server.local_addr(), "metrics server started");
             Some(server)
@@ -2302,7 +2310,7 @@ async fn serve_ipc(
 /// by reaching the socket — every mutating request is authorized per-connection
 /// in `check_authorized` via `SO_PEERCRED` (root or the configured operator
 /// UID), Tailscale's model — so the file mode only has to permit the connect().
-fn set_socket_permissions(path: &std::path::Path) {
+fn set_socket_permissions(path: &Path) {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -2333,7 +2341,7 @@ fn spawn_network_publisher(
     endpoint_id: EndpointId,
     peers: PeerTable,
     network_name: String,
-    notify: Arc<tokio::sync::Notify>,
+    notify: Arc<Notify>,
     token: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -2949,7 +2957,7 @@ fn spawn_group_poller(
                 let s = state.read().unwrap();
                 s.members.all().iter().map(|m| m.identity).collect()
             };
-            let new_member_ids: std::collections::HashSet<EndpointId> =
+            let new_member_ids: HashSet<EndpointId> =
                 data.members.iter().map(|m| m.identity).collect();
 
             for old_id in &old_members {
@@ -2991,7 +2999,7 @@ fn spawn_group_poller(
 struct CoordinatorCleanup {
     state: SharedNetworkState,
     blob_store: FsStore,
-    dht_notify: Option<Arc<tokio::sync::Notify>>,
+    dht_notify: Option<Arc<Notify>>,
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
     device_user_map: peers::DeviceUserMap,
@@ -3081,12 +3089,12 @@ fn spawn_coordinator_control_reader(
     network_name: String,
     state: SharedNetworkState,
     ctx: MeshCtx,
-    dht_notify: Option<Arc<tokio::sync::Notify>>,
+    dht_notify: Option<Arc<Notify>>,
     token: CancellationToken,
     // Serializes single-use invite ledger access for the invite-gossip arms.
     invite_lock: Arc<tokio::sync::Mutex<()>>,
     // Fires the waiting `ray ping` handler when a matching `Pong` arrives.
-    pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
+    pending_pongs: Arc<DashMap<u64, oneshot::Sender<()>>>,
 ) {
     let MeshCtx {
         peers,
@@ -3406,7 +3414,7 @@ async fn apply_roster_to_dns(
     hostname_table: &dns::HostnameTable,
     reverse_table: &dns::ReverseLookupTable,
 ) {
-    let mut entries: Vec<(String, Ipv4Addr, std::net::Ipv6Addr)> = members
+    let mut entries: Vec<(String, Ipv4Addr, Ipv6Addr)> = members
         .iter()
         .filter_map(|m| {
             m.hostname
@@ -3487,7 +3495,7 @@ fn now_secs() -> u64 {
 async fn update_snapshot_and_publish(
     state: &SharedNetworkState,
     blob_store: &FsStore,
-    dht_notify: &Option<Arc<tokio::sync::Notify>>,
+    dht_notify: &Option<Arc<Notify>>,
 ) {
     let snap_bytes = {
         let mut s = state.write().unwrap();
@@ -3565,7 +3573,7 @@ async fn join_mesh_shared(
     invite_lock: Arc<tokio::sync::Mutex<()>>,
     // Shared with the router; lets the member control reader resolve `ray ping`
     // Pongs back to the waiting handler.
-    pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
+    pending_pongs: Arc<DashMap<u64, oneshot::Sender<()>>>,
 ) -> Result<JoinResult> {
     // A whole-bundle clone for the debounced reconverge worker, which forwards
     // the ctx straight to `reconverge_and_apply`.
@@ -3850,7 +3858,7 @@ async fn join_mesh_shared(
     // change) collapses into one pkarr resolve + reconverge, and a slow
     // reconverge never blocks the control listener's accept loop. The signed
     // record stays the source of truth, so converging once per burst suffices.
-    let reconverge_notify = Arc::new(tokio::sync::Notify::new());
+    let reconverge_notify = Arc::new(Notify::new());
     tokio::spawn({
         let notify = reconverge_notify.clone();
         let token = token.clone();
@@ -3868,7 +3876,7 @@ async fn join_mesh_shared(
             // network that sends no `MemberSync`/`BlobUpdated` triggers. It does
             // a reconverge only while a rename is outstanding, so steady state
             // stays trigger-driven (no extra pkarr traffic).
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
@@ -3891,7 +3899,7 @@ async fn join_mesh_shared(
                 // retained by `Notify` and handled on the next iteration.
                 tokio::select! {
                     _ = token.cancelled() => return,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(300)) => {}
                 }
                 reconverge_and_apply(
                     &endpoint_w, &ctx_w, net_pubkey_w,
@@ -4308,7 +4316,7 @@ mod accept_handler_tests {
 
     // Build a minimal NetworkState for use in test AcceptHandler construction.
     fn make_network_state() -> SharedNetworkState {
-        let net_secret = iroh::SecretKey::from_bytes(&[1u8; 32]);
+        let net_secret = SecretKey::from_bytes(&[1u8; 32]);
         let net_pub = net_secret.public();
         Arc::new(RwLock::new(NetworkState {
             members: MemberList::new(),
@@ -4347,14 +4355,14 @@ mod accept_handler_tests {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
         let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
-        let my_key = iroh::SecretKey::from_bytes(&[2u8; 32]);
+        let my_key = SecretKey::from_bytes(&[2u8; 32]);
         let my_id = my_key.public();
         AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
             ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store),
             network_name: "test-net".to_string(),
             state: make_network_state(),
             disconnect_tx,
-            token: tokio_util::sync::CancellationToken::new(),
+            token: CancellationToken::new(),
             dht_notify: None,
             invite_lock: Arc::new(tokio::sync::Mutex::new(())),
             pending_pongs: Arc::new(DashMap::new()),
@@ -4365,13 +4373,13 @@ mod accept_handler_tests {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
         let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
-        let my_key = iroh::SecretKey::from_bytes(&[3u8; 32]);
+        let my_key = SecretKey::from_bytes(&[3u8; 32]);
         AcceptHandler::Member(Arc::new(MemberAcceptState {
             ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_key.public(), 0), blob_store),
             network_name: "test-net".to_string(),
             state: make_network_state(),
             disconnect_tx,
-            token: tokio_util::sync::CancellationToken::new(),
+            token: CancellationToken::new(),
         }))
     }
 
@@ -4446,7 +4454,7 @@ mod coordinator_dial_order_tests {
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
         key_bytes[0] = seed;
-        let key = iroh::SecretKey::from(key_bytes);
+        let key = SecretKey::from(key_bytes);
         key.public()
     }
 
@@ -4470,7 +4478,7 @@ mod coordinator_dial_order_tests {
     #[test]
     fn admin_grant_key_accepted_only_when_public_matches_network() {
         // The real network key: its public half is the network pubkey.
-        let net_secret = iroh::SecretKey::from({
+        let net_secret = SecretKey::from({
             let mut b = [0u8; 32];
             b[0] = 42;
             b
@@ -4485,7 +4493,7 @@ mod coordinator_dial_order_tests {
 
         // A forged grant carries an attacker-chosen key whose public half does
         // not match the network pubkey → rejected (no roster lookup needed).
-        let forged = iroh::SecretKey::from({
+        let forged = SecretKey::from({
             let mut b = [0u8; 32];
             b[0] = 7;
             b

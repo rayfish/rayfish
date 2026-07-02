@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fs::Permissions;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ pub use ray_proto::TransportMode;
 #[allow(dead_code)]
 mod secret_key_hex {
     use iroh::SecretKey;
+    use serde::de::Error;
     use serde::{self, Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S>(key: &SecretKey, serializer: S) -> Result<S::Ok, S::Error>
@@ -31,15 +33,16 @@ mod secret_key_hex {
     {
         let s = String::deserialize(deserializer)?;
         let bytes: [u8; 32] = hex::decode(&s)
-            .map_err(serde::de::Error::custom)?
+            .map_err(Error::custom)?
             .try_into()
-            .map_err(|_| serde::de::Error::custom("secret key must be 32 bytes"))?;
+            .map_err(|_| Error::custom("secret key must be 32 bytes"))?;
         Ok(SecretKey::from(bytes))
     }
 }
 
 mod option_secret_key_hex {
     use iroh::SecretKey;
+    use serde::de::Error;
     use serde::{self, Deserializer, Serializer};
 
     pub fn serialize<S>(key: &Option<SecretKey>, serializer: S) -> Result<S::Ok, S::Error>
@@ -60,9 +63,9 @@ mod option_secret_key_hex {
         match opt {
             Some(s) => {
                 let bytes: [u8; 32] = hex::decode(&s)
-                    .map_err(serde::de::Error::custom)?
+                    .map_err(Error::custom)?
                     .try_into()
-                    .map_err(|_| serde::de::Error::custom("secret key must be 32 bytes"))?;
+                    .map_err(|_| Error::custom("secret key must be 32 bytes"))?;
                 Ok(Some(SecretKey::from(bytes)))
             }
             None => Ok(None),
@@ -522,7 +525,7 @@ fn ensure_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     #[cfg(target_os = "linux")]
     {
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750));
+        let _ = std::fs::set_permissions(dir, Permissions::from_mode(0o750));
         set_owner(dir, false);
     }
     Ok(())
@@ -581,7 +584,7 @@ pub fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
         f.sync_all().ok();
     }
     let mode = if secret { 0o600 } else { 0o640 };
-    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+    let _ = std::fs::set_permissions(&tmp, Permissions::from_mode(mode));
     #[cfg(target_os = "linux")]
     set_owner(&tmp, secret);
     let renamed = std::fs::rename(&tmp, path);
@@ -602,7 +605,7 @@ fn write_atomic(path: &Path, contents: &str, secret: bool) -> Result<()> {
 /// [`write_file`]. Best-effort.
 pub fn restrict_perms(path: &Path, secret: bool) {
     let mode = if secret { 0o600 } else { 0o640 };
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    let _ = std::fs::set_permissions(path, Permissions::from_mode(mode));
     #[cfg(target_os = "linux")]
     set_owner(path, secret);
 }
@@ -851,7 +854,7 @@ mod tests {
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
         key_bytes[0] = seed;
-        iroh::SecretKey::from(key_bytes).public()
+        SecretKey::from(key_bytes).public()
     }
 
     #[test]
@@ -1098,7 +1101,7 @@ mod tests {
 
     #[test]
     fn test_serialize_with_network_key() {
-        let secret = iroh::SecretKey::generate();
+        let secret = SecretKey::generate();
         let public = secret.public();
         let config = AppConfig {
             networks: vec![NetworkConfig {
@@ -1182,7 +1185,7 @@ name = "test"
             pending_hostname: None,
             members: vec![],
             approved: vec![],
-            network_secret_key: Some(iroh::SecretKey::generate()),
+            network_secret_key: Some(SecretKey::generate()),
             network_public_key: None,
             transport: None,
             auto_accept_firewall: false,

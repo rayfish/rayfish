@@ -1,6 +1,8 @@
 //! CLI status & diagnostics output plus shared presentation helpers
 //! (`table`, `print_error`, …): status, down, report, set-hostname.
 
+use std::collections::HashMap;
+
 use crate::*;
 
 /// Human-readable byte size (GiB/MiB/KiB/B) for traffic and transfer counters.
@@ -271,7 +273,7 @@ fn print_network(net: &ipc::NetworkStatus) {
 
     // Invert the local alias map (alias -> identity) for identity -> alias
     // lookups when rendering peers.
-    let alias_by_identity: std::collections::HashMap<&str, &str> = net
+    let alias_by_identity: HashMap<&str, &str> = net
         .aliases
         .iter()
         .map(|(alias, identity)| (identity.as_str(), alias.as_str()))
@@ -305,7 +307,7 @@ fn print_network(net: &ipc::NetworkStatus) {
 /// paired, else device endpoint id) against the inverted alias map.
 fn peer_alias<'a>(
     peer: &ipc::PeerStatus,
-    alias_by_identity: &std::collections::HashMap<&str, &'a str>,
+    alias_by_identity: &HashMap<&str, &'a str>,
 ) -> Option<&'a str> {
     let identity = peer
         .user_identity

@@ -1,5 +1,13 @@
 //! CLI self-update + GitHub release plumbing and small process helpers.
 
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use anyhow::Error;
+use reqwest::{Client, RequestBuilder};
+use semver::Version;
+
 use crate::*;
 
 /// Map the host OS/arch to the release asset name CI publishes
@@ -32,8 +40,8 @@ pub(crate) fn normalize_version(tag: &str) -> &str {
 /// still triggers an update rather than being silently ignored.
 pub(crate) fn version_is_newer(latest: &str, current: &str) -> bool {
     match (
-        semver::Version::parse(latest),
-        semver::Version::parse(current),
+        Version::parse(latest),
+        Version::parse(current),
     ) {
         (Ok(l), Ok(c)) => l > c,
         _ => latest != current,
@@ -43,7 +51,7 @@ pub(crate) fn version_is_newer(latest: &str, current: &str) -> bool {
 /// Whether a sibling temp file can be created in `dir` (i.e. it is writable by
 /// us). `self_replace` writes a temp next to the running binary then renames, so
 /// directory write permission is what decides if we need root.
-pub(crate) fn dir_writable(dir: &std::path::Path) -> bool {
+pub(crate) fn dir_writable(dir: &Path) -> bool {
     let probe = dir.join(".ray-update-probe");
     match std::fs::File::create(&probe) {
         Ok(_) => {
@@ -90,7 +98,7 @@ pub(crate) fn print_release_notes(tag: &str, body: Option<&str>) {
 /// release's body. Best-effort: any failure (network, missing notes) prints
 /// nothing rather than blocking the update.
 pub(crate) async fn print_pending_changelog(
-    client: &reqwest::Client,
+    client: &Client,
     token: &Option<String>,
     current: &str,
     latest: &str,
@@ -116,7 +124,7 @@ pub(crate) async fn print_pending_changelog(
     let api = format!("https://api.github.com/repos/{REPO_SLUG}/releases?per_page=100");
     // Bound the whole request so a slow/unreachable API can't freeze the update;
     // on timeout (or any error) we just skip the notes.
-    let req = authed(client.get(&api), token).timeout(std::time::Duration::from_secs(5));
+    let req = authed(client.get(&api), token).timeout(Duration::from_secs(5));
     let releases: Vec<GhRelease> = match req.send().await {
         Ok(resp) => match resp.error_for_status() {
             Ok(resp) => resp.json().await.unwrap_or_default(),
@@ -167,7 +175,7 @@ pub(crate) fn github_token() -> Option<String> {
     }
     // `gh auth token` prints the active token to stdout (and exits non-zero if
     // `gh` is unauthenticated). A missing `gh` makes `output()` error → `None`.
-    let out = std::process::Command::new("gh")
+    let out = Command::new("gh")
         .args(["auth", "token"])
         .output()
         .ok()?;
@@ -182,7 +190,7 @@ pub(crate) fn github_token() -> Option<String> {
 /// is present; otherwise leave the request anonymous. Only used for the
 /// api.github.com calls — the release-asset downloads on github.com aren't
 /// subject to the API rate limit and are left unauthenticated.
-pub(crate) fn authed(req: reqwest::RequestBuilder, token: &Option<String>) -> reqwest::RequestBuilder {
+pub(crate) fn authed(req: RequestBuilder, token: &Option<String>) -> RequestBuilder {
     match token {
         Some(t) => req.bearer_auth(t),
         None => req,
@@ -217,7 +225,7 @@ pub(crate) async fn cmd_update(
     // harmless here, so ignore it.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let client = reqwest::Client::builder()
+    let client = Client::builder()
         .user_agent(concat!("ray/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("failed to build HTTP client")?;
@@ -292,7 +300,7 @@ pub(crate) async fn cmd_update(
             .with_context(|| format!("no checksum at {sha_url}"))?
             .text()
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(Error::from)
     })
     .await
     .context("failed to fetch the published checksum")?;
@@ -383,7 +391,7 @@ pub(crate) async fn cmd_update(
 /// `ray update --list`: enumerate published releases (newest first) and exit.
 /// No root, no install.
 async fn cmd_update_list(
-    client: &reqwest::Client,
+    client: &Client,
     token: &Option<String>,
     current: &str,
 ) -> Result<()> {
@@ -422,7 +430,7 @@ async fn cmd_update_list(
 /// the new binary if one is installed. Acquires root up front (the swap +
 /// restart need it) so we fail with a clean sudo hint before downloading.
 async fn download_verify_and_install(
-    client: &reqwest::Client,
+    client: &Client,
     bin_url: &str,
     expected: &str,
     asset: &str,
@@ -452,7 +460,7 @@ async fn download_verify_and_install(
             .with_context(|| format!("no release asset at {bin_url}"))?
             .bytes()
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(Error::from)
     })
     .await;
     spinner.finish_and_clear();
@@ -518,19 +526,19 @@ pub(crate) async fn daemon_version() -> Option<String> {
 /// shorter than an ungraceful shutdown could take, so a healthy daemon was
 /// reported as "never became reachable" and a re-run would kill the one that
 /// had just come up.
-pub(crate) const DAEMON_REACHABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const DAEMON_REACHABLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Poll the IPC socket until the daemon answers or the deadline passes.
-pub(crate) async fn wait_for_daemon(timeout: std::time::Duration) -> Option<ipc::IpcFramed> {
-    let deadline = std::time::Instant::now() + timeout;
+pub(crate) async fn wait_for_daemon(timeout: Duration) -> Option<ipc::IpcFramed> {
+    let deadline = Instant::now() + timeout;
     loop {
         if let Ok(stream) = ipc::connect().await {
             return Some(stream);
         }
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             return None;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -564,7 +572,7 @@ pub(crate) fn print_daemon_log_tail() {
 
 #[allow(dead_code)]
 pub(crate) fn run_cmd(program: &str, args: &[&str]) {
-    match std::process::Command::new(program).args(args).status() {
+    match Command::new(program).args(args).status() {
         Ok(status) if status.success() => {}
         Ok(status) => eprintln!("warning: `{program}` exited with {status}"),
         Err(e) => eprintln!("warning: failed to run `{program}`: {e}"),
@@ -574,17 +582,17 @@ pub(crate) fn run_cmd(program: &str, args: &[&str]) {
 /// Run a command, ignoring its exit status (used for best-effort teardown).
 #[allow(dead_code)]
 pub(crate) fn run_cmd_quiet(program: &str, args: &[&str]) {
-    let _ = std::process::Command::new(program)
+    let _ = Command::new(program)
         .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 }
 
 pub(crate) fn cmd_uninstall_service() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let path = std::path::Path::new("/etc/systemd/system/rayfish.service");
+        let path = Path::new("/etc/systemd/system/rayfish.service");
         if path.exists() {
             run_cmd("systemctl", &["disable", "--now", "rayfish"]);
             std::fs::remove_file(path)?;
@@ -598,7 +606,7 @@ pub(crate) fn cmd_uninstall_service() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        let path = std::path::Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist");
+        let path = Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist");
         if path.exists() {
             run_cmd("launchctl", &["unload", "-w", &path.to_string_lossy()]);
             std::fs::remove_file(path)?;
