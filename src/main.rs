@@ -500,7 +500,8 @@ pub(crate) enum FirewallAction {
         /// A comma list adds one rule per item.
         #[arg(long, short = 'P')]
         port: Option<String>,
-        /// Peer short ID (omit for any peer)
+        /// Peer: hostname, mesh IP, short id, endpoint id, or user identity
+        /// (omit for any peer)
         #[arg(long)]
         peer: Option<String>,
         /// Restrict to a network (omit to match any network the peer is reached through)

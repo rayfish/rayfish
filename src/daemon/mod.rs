@@ -1597,14 +1597,17 @@ impl DaemonState {
                 port,
                 peer,
                 network,
-            } => self.firewall_add(
-                direction,
-                action,
-                protocol,
-                port.as_deref(),
-                peer.as_deref(),
-                network.as_deref(),
-            ),
+            } => {
+                self.firewall_add(
+                    direction,
+                    action,
+                    protocol,
+                    port.as_deref(),
+                    peer.as_deref(),
+                    network.as_deref(),
+                )
+                .await
+            }
             IpcMessage::FirewallRemove { index } => self.firewall_remove(index),
             IpcMessage::FirewallShow => self.firewall_show(),
             IpcMessage::FirewallDefault { action } => self.firewall_default(action),
