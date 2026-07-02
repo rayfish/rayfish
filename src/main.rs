@@ -88,6 +88,11 @@ pub(crate) enum Command {
         /// it, suggestions queue for `ray firewall accept`.
         #[arg(long)]
         auto_accept_firewall: bool,
+        /// Auto-accept incoming file transfers from your own paired devices on
+        /// this network (no manual `ray files accept`). Only offers whose sender
+        /// is one of your own devices are accepted.
+        #[arg(long)]
+        auto_accept_files: bool,
     },
     /// Leave a network (remove from saved config)
     #[command(visible_alias = "rm")]
@@ -628,6 +633,15 @@ pub(crate) enum FilesAction {
         #[arg(long, short)]
         output: Option<String>,
     },
+    /// Toggle auto-accepting file transfers from your own paired devices on a
+    /// network (`on` also drains any already-queued offers from your devices;
+    /// `off` stops future auto-accept). Only your own devices are auto-accepted.
+    AutoAccept {
+        /// Network name
+        network: String,
+        /// `on` or `off`
+        state: String,
+    },
 }
 
 fn check_root() {
@@ -899,6 +913,7 @@ async fn main() -> Result<()> {
             hostname,
             tor,
             auto_accept_firewall,
+            auto_accept_files,
         } => {
             ipc_join(
                 &network_key,
@@ -906,6 +921,7 @@ async fn main() -> Result<()> {
                 hostname,
                 tor,
                 auto_accept_firewall,
+                auto_accept_files,
             )
             .await
         }

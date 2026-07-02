@@ -209,6 +209,138 @@ impl DaemonState {
         }
     }
 
+    /// Evaluate a newly-queued (or already-pending) file offer against the
+    /// own-devices auto-accept policy and, if it qualifies, accept it without
+    /// user action. A no-op (offer stays queued) unless: the sender resolves to
+    /// *our own* user identity (a paired device) **and** it is a member of at
+    /// least one network with `auto_accept_files` enabled. Never removes the
+    /// pending entry unless it actually accepts (via `accept_file`).
+    pub(crate) async fn try_auto_accept_file(&self, id: u64) {
+        // Peek the offer's sender without consuming the queue entry.
+        let from = {
+            let pending = self.protocol_router.pending_files.lock().unwrap();
+            match pending.iter().find(|f| f.id == id) {
+                Some(f) => f.from,
+                None => return,
+            }
+        };
+
+        // Own-device gate: the sender's resolved user identity must match ours.
+        // Our identity is our device cert's user_identity, or (on the primary,
+        // which has no cert) our own endpoint id. A non-paired peer resolves to
+        // its own transport id and so can never match.
+        let own_user = self
+            .device_cert
+            .as_ref()
+            .map(|c| c.user_identity)
+            .unwrap_or_else(|| self.endpoint.id());
+        let sender_user = self.device_user_map.resolve(&from);
+        if sender_user != own_user {
+            return;
+        }
+
+        // Network gate: the sender must be a member of a network we've enabled.
+        let mut on_enabled_network = false;
+        for entry in self.networks.iter() {
+            let enabled = config::load_network(entry.key())
+                .ok()
+                .flatten()
+                .map(|nc| nc.auto_accept_files)
+                .unwrap_or(false);
+            if !enabled {
+                continue;
+            }
+            let is_member = entry
+                .value()
+                .state
+                .read()
+                .map(|s| s.members.all().iter().any(|m| m.identity == from))
+                .unwrap_or(false);
+            if is_member {
+                on_enabled_network = true;
+                break;
+            }
+        }
+        if !on_enabled_network {
+            return;
+        }
+
+        // Save to the operator's Downloads (the daemon runs as root, so its own
+        // ~/Downloads is the wrong target). Fall back to the daemon default when
+        // no operator is configured.
+        let (output, cred) = match resolve_operator_target() {
+            Some((uid, gid, dir)) => (Some(dir.to_string_lossy().into_owned()), Some((uid, gid))),
+            None => {
+                tracing::warn!(
+                    "auto-accept: no operator configured; saving to daemon default (no chown)"
+                );
+                (None, None)
+            }
+        };
+
+        match self.accept_file(id, output, cred).await {
+            IpcMessage::Ok { message } => {
+                tracing::info!(from = %from.fmt_short(), %message, "file auto-accepted from own device");
+            }
+            IpcMessage::Error { message } => {
+                tracing::warn!(from = %from.fmt_short(), %message, "file auto-accept failed");
+            }
+            _ => {}
+        }
+    }
+
+    /// Toggle this node's per-network auto-accept of file offers from our own
+    /// paired devices (persisted in config). Turning it on also drains any
+    /// already-queued offers that now qualify.
+    pub(crate) async fn files_auto_accept(&self, network: &str, enabled: bool) -> IpcMessage {
+        if !self.networks.contains_key(network) {
+            return IpcMessage::Error {
+                message: format!("network '{network}' not found"),
+            };
+        }
+        match config::load_network(network) {
+            Ok(Some(mut nc)) => {
+                nc.auto_accept_files = enabled;
+                if let Err(e) = config::save_network(&nc) {
+                    return IpcMessage::Error {
+                        message: format!("failed to persist auto-accept setting: {e}"),
+                    };
+                }
+            }
+            Ok(None) => {
+                return IpcMessage::Error {
+                    message: format!("network '{network}' not found in config"),
+                };
+            }
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to load config: {e}"),
+                };
+            }
+        }
+        // On enable, sweep any already-queued offers so a file that arrived
+        // before the toggle still lands.
+        if enabled {
+            let ids: Vec<u64> = self
+                .protocol_router
+                .pending_files
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|f| f.id)
+                .collect();
+            for id in ids {
+                self.try_auto_accept_file(id).await;
+            }
+        }
+        IpcMessage::Ok {
+            message: format!(
+                "auto-accept files from your own devices {} for '{network}'",
+                if enabled { "enabled" } else { "disabled" }
+            ),
+        }
+    }
+
     pub(crate) fn start_pairing(&self) -> IpcMessage {
         let secret: [u8; 32] = rand::random();
 
@@ -318,5 +450,30 @@ impl DaemonState {
                 message: "unexpected pairing response".to_string(),
             },
         }
+    }
+}
+
+/// Resolve the target for an auto-accepted file: the configured operator's
+/// uid, gid, and `~/Downloads`. The daemon runs as root, so its own home is the
+/// wrong place; auto-accepted files should land in the operator's Downloads and
+/// be owned by them. Returns `None` when no operator is configured or the uid
+/// can't be resolved to a passwd entry.
+fn resolve_operator_target() -> Option<(u32, u32, PathBuf)> {
+    let uid = config::load().ok()?.operator_uid?;
+    // SAFETY: getpwuid returns a pointer into a static buffer; we copy the
+    // fields out immediately before any other libc call can clobber it.
+    unsafe {
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() {
+            return None;
+        }
+        let gid = (*pw).pw_gid;
+        if (*pw).pw_dir.is_null() {
+            return None;
+        }
+        let home = std::ffi::CStr::from_ptr((*pw).pw_dir)
+            .to_string_lossy()
+            .into_owned();
+        Some((uid, gid, PathBuf::from(home).join("Downloads")))
     }
 }

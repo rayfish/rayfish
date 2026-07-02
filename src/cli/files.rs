@@ -94,6 +94,22 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 other => eprintln!("Unexpected response: {:?}", other),
             }
         }
+        Some(FilesAction::AutoAccept { network, state }) => {
+            let enabled = match state.to_ascii_lowercase().as_str() {
+                "on" | "true" | "yes" => true,
+                "off" | "false" | "no" => false,
+                other => anyhow::bail!("expected `on` or `off`, got '{other}'"),
+            };
+            ipc::send(&mut stream, ipc::IpcMessage::FilesAutoAccept { network, enabled }).await?;
+            let resp = ipc::recv(&mut stream).await?;
+            match resp {
+                ipc::IpcMessage::Ok { message } => {
+                    println!("  {} {}", style::check(), style::value(&message));
+                }
+                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+                other => eprintln!("Unexpected response: {:?}", other),
+            }
+        }
     }
     Ok(())
 }

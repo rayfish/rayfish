@@ -72,6 +72,7 @@ pub(crate) async fn ipc_join(
     hostname: Option<String>,
     tor: bool,
     auto_accept_firewall: bool,
+    auto_accept_files: bool,
 ) -> Result<()> {
     let transport = if tor {
         Some(config::TransportMode::Tor)
@@ -96,6 +97,7 @@ pub(crate) async fn ipc_join(
             invite,
             coordinator,
             auto_accept_firewall,
+            auto_accept_files,
         },
     )
     .await?;
