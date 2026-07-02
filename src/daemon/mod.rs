@@ -40,6 +40,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -1159,7 +1160,7 @@ struct GroupSnapshot {
 
 /// A per-network state cell shared (read-mostly) across the accept handlers,
 /// publisher, poller, and cleanup tasks for that network.
-pub(crate) type SharedNetworkState = Arc<std::sync::RwLock<NetworkState>>;
+pub(crate) type SharedNetworkState = Arc<RwLock<NetworkState>>;
 
 pub(crate) struct NetworkState {
     members: MemberList,
@@ -2479,7 +2480,7 @@ fn apply_suggested_firewall(
     firewall: &SharedFirewall,
     my_identity: EndpointId,
     network_name: &str,
-    state: &std::sync::RwLock<NetworkState>,
+    state: &RwLock<NetworkState>,
 ) {
     let (suggestions, members): (SuggestedFirewall, Vec<Member>) = {
         let s = state.read().unwrap();
@@ -3836,7 +3837,7 @@ async fn join_mesh_shared(
         if let Some(snap) = &ns.snapshot {
             let _ = blob_store.blobs().add_slice(&snap.msgpack_bytes).await;
         }
-        Arc::new(std::sync::RwLock::new(ns))
+        Arc::new(RwLock::new(ns))
     };
 
     // Materialize this node's suggested rules from the blob we just joined with.
@@ -4309,7 +4310,7 @@ mod accept_handler_tests {
     fn make_network_state() -> SharedNetworkState {
         let net_secret = iroh::SecretKey::from_bytes(&[1u8; 32]);
         let net_pub = net_secret.public();
-        Arc::new(std::sync::RwLock::new(NetworkState {
+        Arc::new(RwLock::new(NetworkState {
             members: MemberList::new(),
             approved: ApprovedList::new(),
             snapshot: None,

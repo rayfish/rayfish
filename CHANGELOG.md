@@ -35,6 +35,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Member network vanished when the coordinator was offline at startup**: a
+  member (non-coordinator) whose daemon restarted while its coordinator was
+  unreachable would silently drop the network from its running state. `ray
+  status` showed "no active networks" and the node rejected inbound mesh
+  connections, and it stayed that way until it happened to restart again while
+  the coordinator was online (its config was never lost). Restore now registers
+  the network immediately from the verified group blob it already holds, whether
+  or not the coordinator answers, and hands off to the reconnect loop to dial the
+  coordinator back with backoff. The network stays visible in `ray status`
+  (peers show offline) and reconnects on its own when the coordinator returns. As
+  a side effect, a network no longer takes ~30s to appear in `ray status` after a
+  member restart.
 - **Mesh SSH host-key mismatch**: enabling `ray firewall ssh on` no longer makes
   `ssh <host>.ray` fail with a "REMOTE HOST IDENTIFICATION HAS CHANGED" warning.
   The embedded SSH server now presents the machine's existing OpenSSH ed25519
