@@ -128,6 +128,13 @@ pub struct NetworkConfig {
     /// or toggled later with `ray firewall auto-accept <net> on|off`.
     #[serde(default, alias = "allow_trusted")]
     pub auto_accept_firewall: bool,
+    /// Auto-accept incoming file offers from our own paired devices on this
+    /// network (no manual `ray files accept`). Own-devices-only (the sender's
+    /// user identity must match ours); secure default off. Set per-network by
+    /// `ray join --auto-accept-files` or toggled with
+    /// `ray files auto-accept <net> on|off`.
+    #[serde(default)]
+    pub auto_accept_files: bool,
     /// Identities this coordinator has granted the per-network secret key to
     /// (`ray admin add`). Local tracking only — the key is shared and not
     /// attributable, so this is the coordinator's record of grants, not a
@@ -855,6 +862,7 @@ mod tests {
                     pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
+                    auto_accept_files: false,
                     admins: vec![],
                     direct: false,
                     ssh_allow: vec![],
@@ -872,6 +880,7 @@ mod tests {
                     pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
+                    auto_accept_files: false,
                     admins: vec![],
                     direct: false,
                     ssh_allow: vec![],
@@ -910,6 +919,7 @@ mod tests {
             pending_hostname: None,
             transport: None,
             auto_accept_firewall: false,
+            auto_accept_files: false,
             admins: vec![],
             direct: false,
             ssh_allow: vec![],
@@ -936,6 +946,7 @@ mod tests {
                 pending_hostname: None,
                 transport: None,
                 auto_accept_firewall: false,
+                auto_accept_files: false,
                 admins: vec![],
                 direct: false,
                 ssh_allow: vec![],
@@ -955,6 +966,7 @@ mod tests {
             pending_hostname: None,
             transport: None,
             auto_accept_firewall: false,
+            auto_accept_files: false,
             admins: vec![],
             direct: false,
             ssh_allow: vec![],
@@ -985,6 +997,7 @@ mod tests {
                     pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
+                    auto_accept_files: false,
                     admins: vec![],
                     direct: false,
                     ssh_allow: vec![],
@@ -1002,6 +1015,7 @@ mod tests {
                     pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
+                    auto_accept_files: false,
                     admins: vec![],
                     direct: false,
                     ssh_allow: vec![],
@@ -1047,6 +1061,7 @@ mod tests {
                 pending_hostname: None,
                 transport: None,
                 auto_accept_firewall: false,
+                auto_accept_files: false,
                 admins: vec![],
                 direct: false,
                 ssh_allow: vec![],
@@ -1077,6 +1092,7 @@ mod tests {
                 pending_hostname: None,
                 transport: None,
                 auto_accept_firewall: false,
+                auto_accept_files: false,
                 admins: vec![],
                 direct: false,
                 ssh_allow: vec![],
@@ -1149,6 +1165,7 @@ name = "test"
             network_public_key: None,
             transport: None,
             auto_accept_firewall: false,
+            auto_accept_files: false,
             admins: vec![],
             direct: false,
             ssh_allow: vec![],

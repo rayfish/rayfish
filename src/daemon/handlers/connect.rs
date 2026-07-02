@@ -66,6 +66,7 @@ impl DaemonState {
                 None,
                 Some(coordinator),
                 false,
+                false,
             )
             .await;
         if let IpcMessage::Joined { name, .. } = &resp
