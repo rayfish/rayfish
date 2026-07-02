@@ -45,9 +45,6 @@ pub enum RayError {
     /// unexpected protocol response.
     #[error("{0}")]
     Network(String),
-    /// The node is already up (or already down) for the requested transition.
-    #[error("invalid state: {0}")]
-    InvalidState(String),
 }
 
 impl RayError {

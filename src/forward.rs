@@ -229,7 +229,13 @@ pub struct DisconnectEvent {
 /// daemon's `MeshCtx` via `MeshCtx::forward_ctx`.
 pub struct ForwardCtx {
     pub firewall: SharedFirewall,
-    pub tun_tx: mpsc::Sender<Bytes>,
+    /// Swappable sender cell for the TUN writer. Peer readers outlive TUN
+    /// attach/detach cycles (the control plane stays up across a VPN toggle), so
+    /// they resolve the current writer per packet via `tun_tx.load_full()` rather
+    /// than capturing one sender. After a detach + re-attach the cell points at
+    /// the new writer, so a reader spawned during the first `up()` keeps
+    /// forwarding after the next one. See [`DaemonState::attach_tun`].
+    pub tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
     pub disconnect_tx: mpsc::Sender<DisconnectEvent>,
     pub token: CancellationToken,
     pub stats: Arc<ForwardMetrics>,
@@ -419,9 +425,12 @@ pub fn spawn_peer_reader(
                         },
                         None => datagram,
                     };
-                    if tun_tx.send(datagram).await.is_err() {
-                        return;
-                    }
+                    // Resolve the live writer for each packet: the sender is
+                    // swapped on every TUN re-attach (VPN toggle). A send error
+                    // means the writer is currently down (standby between a
+                    // detach and the next attach); drop the packet and keep the
+                    // reader alive so it forwards again once a new TUN attaches.
+                    let _ = tun_tx.load_full().send(datagram).await;
                 }
                 InboundDecision::DropFirewall(info) => {
                     stats.record_drop(DropReason::Firewall);

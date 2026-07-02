@@ -105,7 +105,7 @@ const PAIR_ALPN: &[u8] = b"rayfish/pair/1";
 pub(crate) struct MeshCtx {
     identity: IrohIdentityProvider,
     peers: PeerTable,
-    tun_tx: mpsc::Sender<Bytes>,
+    tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
     stats: Arc<ForwardMetrics>,
     blob_store: FsStore,
     firewall: SharedFirewall,
@@ -1279,7 +1279,15 @@ pub struct DaemonState {
     stats: Arc<ForwardMetrics>,
     /// When the daemon process started, used for uptime in diagnostics.
     start: Instant,
-    tun_tx: mpsc::Sender<Bytes>,
+    /// Sender half of the current TUN write channel, in a swappable cell.
+    /// [`DaemonState::attach_tun`] creates a fresh channel on every attach and
+    /// stores the new sender here, so incoming send-sites (peer readers, DNS
+    /// injection) always resolve the live writer via `tun_tx.load()`. This is
+    /// what makes the VPN off/on toggle work: `detach_tun` stops the writer, and
+    /// the next `attach_tun` swaps in a new sender feeding a fresh writer. On
+    /// desktop the daemon attaches exactly once, so the cell holds one sender for
+    /// its whole life and is never swapped.
+    tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
     networks: Arc<DashMap<String, NetworkHandle>>,
     shutdown_token: CancellationToken,
     blob_store: FsStore,
@@ -1293,10 +1301,6 @@ pub struct DaemonState {
     /// interface is attached after construction via [`DaemonState::attach_tun`],
     /// while on desktop it is set once at boot.
     tun_name: std::sync::Mutex<String>,
-    /// Receiver half of the TUN write channel. Held here after construction until
-    /// [`DaemonState::attach_tun`] takes it to spawn the writer task; `None` once a
-    /// packet interface has been attached (or on a build that never attaches one).
-    tun_rx: std::sync::Mutex<Option<mpsc::Receiver<Bytes>>>,
     /// Handles for the packet-forwarding tasks spawned by
     /// [`DaemonState::attach_tun`], kept so a future `down()`/detach can stop them.
     tun_tasks: std::sync::Mutex<Option<TunTasks>>,
@@ -1411,46 +1415,46 @@ impl DaemonState {
     }
 
     /// Attach a packet interface to a headless [`DaemonState`] and start the data
-    /// plane's forwarding tasks: the TUN writer (`spawn_tun_writer`, draining the
-    /// state's own `tun_rx` channel) and the mesh forwarding loop (`run_mesh`,
-    /// reading `reader` and using the state's peers/firewall/stats/resolver and the
-    /// `tun_tx` sender the rest of the daemon already holds).
+    /// plane's forwarding tasks: the TUN writer (`spawn_tun_writer`) and the mesh
+    /// forwarding loop (`run_mesh`, reading `reader` and using the state's
+    /// peers/firewall/stats/resolver).
+    ///
+    /// A fresh `tun_tx`/`tun_rx` channel is created on every call: the new
+    /// receiver feeds the writer, and the new sender is stored in the `tun_tx`
+    /// cell so incoming send-sites (peer readers, DNS injection) resolve the live
+    /// writer via `tun_tx.load()`. This makes re-attach work: after a
+    /// [`detach_tun`] the next `attach_tun` swaps in a new sender and a new writer,
+    /// so forwarding resumes. This is the exact VPN off/on toggle path on Android.
     ///
     /// This is the embedding API (used by `ray-mobile` and future embedders) and
     /// is also how `run_daemon` wires the desktop OS TUN device. The forwarding
     /// loop runs under a child of `shutdown_token`, and its handles are stored so a
     /// later `down()`/detach can stop the data plane without tearing down the whole
-    /// daemon. Calling it a second time is a no-op (the writer's receiver was
-    /// already taken); it will not spawn a duplicate writer.
+    /// daemon. Desktop attaches exactly once, so the cell is never swapped there.
     pub async fn attach_tun<R: crate::tun::TunRead, W: crate::tun::TunWrite>(
         self: &Arc<Self>,
         reader: R,
         writer: W,
     ) {
-        // The receiver is present exactly once. If it's already been taken, a TUN
-        // is attached, so keep the running forwarder rather than spawning a second.
-        let tun_rx = match self.tun_rx.lock().unwrap().take() {
-            Some(rx) => rx,
-            None => {
-                tracing::warn!("attach_tun called but a packet interface is already attached");
-                return;
-            }
-        };
+        // Fresh channel per attach. The previous writer (if any) was torn down by
+        // `detach_tun`, which dropped the old receiver; swapping in the new sender
+        // reconnects every incoming send-site to this writer.
+        let (new_tx, new_rx) = mpsc::channel::<Bytes>(256);
+        self.tun_tx.store(Arc::new(new_tx.clone()));
 
         // A dedicated child token so the data plane can be stopped independently
         // of a full daemon shutdown; it still cancels when `shutdown_token` does.
         let cancel = self.shutdown_token.child_token();
-        let writer_handle = forward::spawn_tun_writer(writer, tun_rx, self.active.clone());
+        let writer_handle = forward::spawn_tun_writer(writer, new_rx, self.active.clone());
         let mesh_handle = {
             let peers = self.peers.clone();
             let firewall = self.firewall.clone();
             let cancel = cancel.clone();
             let stats = self.stats.clone();
             let resolver = self.resolver.clone();
-            let tun_tx = self.tun_tx.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    forward::run_mesh(reader, peers, firewall, cancel, stats, resolver, tun_tx).await
+                    forward::run_mesh(reader, peers, firewall, cancel, stats, resolver, new_tx).await
                 {
                     tracing::warn!(error = %e, "mesh forwarding loop exited with error");
                 }
@@ -2207,11 +2211,16 @@ async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> R
     let shared_firewall = SharedFirewall::new(fw_config);
     shared_firewall.clone().spawn_evictor(token.clone());
     let active = Arc::new(AtomicBool::new(false));
-    // The TUN write channel is created here (the sender is needed by DNS injection
-    // and every peer reader), but the receiver is held on the state until
-    // `attach_tun` takes it to spawn the writer. The forwarding loop (`run_mesh`)
-    // is likewise deferred to `attach_tun`.
-    let (tun_tx, tun_rx) = mpsc::channel::<Bytes>(256);
+    // The `tun_tx` cell starts with a placeholder sender whose receiver is
+    // dropped immediately: no real channel exists until `attach_tun` creates one
+    // and swaps it in. Any send before the first attach (there are none in
+    // practice) is a harmless dropped packet. `attach_tun` (desktop: once at
+    // boot; mobile: on each `up()`) recreates the channel and stores the live
+    // sender here.
+    let tun_tx = {
+        let (placeholder_tx, _placeholder_rx) = mpsc::channel::<Bytes>(1);
+        Arc::new(arc_swap::ArcSwap::from_pointee(placeholder_tx))
+    };
     let device_user_map = peers::DeviceUserMap::new();
 
     // --- Magic DNS resolver + optional mDNS local discovery ---
@@ -2255,7 +2264,6 @@ async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> R
         reverse_table,
         mdns_enabled,
         tun_name: std::sync::Mutex::new(tun_name),
-        tun_rx: std::sync::Mutex::new(Some(tun_rx)),
         tun_tasks: std::sync::Mutex::new(None),
         promote_rx: std::sync::Mutex::new(Some(promote_rx)),
         _metrics_server: std::sync::Mutex::new(None),
@@ -4357,7 +4365,7 @@ mod accept_handler_tests {
         MeshCtx {
             identity,
             peers: PeerTable::new(),
-            tun_tx,
+            tun_tx: Arc::new(arc_swap::ArcSwap::from_pointee(tun_tx)),
             stats: Arc::new(ForwardMetrics::default()),
             blob_store,
             firewall: SharedFirewall::new(crate::firewall::FirewallConfig::default()),

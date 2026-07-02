@@ -1915,17 +1915,6 @@ sealed class RayException: kotlin.Exception() {
             get() = "v1=${ v1 }"
     }
     
-    /**
-     * The node is already up (or already down) for the requested transition.
-     */
-    class InvalidState(
-        
-        val v1: kotlin.String
-        ) : RayException() {
-        override val message
-            get() = "v1=${ v1 }"
-    }
-    
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<RayException> {
         override fun lift(error_buf: RustBuffer.ByValue): RayException = FfiConverterTypeRayError.lift(error_buf)
@@ -1953,9 +1942,6 @@ public object FfiConverterTypeRayError : FfiConverterRustBuffer<RayException> {
                 FfiConverterString.read(buf),
                 )
             5 -> RayException.Network(
-                FfiConverterString.read(buf),
-                )
-            6 -> RayException.InvalidState(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
@@ -1988,11 +1974,6 @@ public object FfiConverterTypeRayError : FfiConverterRustBuffer<RayException> {
                 4UL
                 + FfiConverterString.allocationSize(value.v1)
             )
-            is RayException.InvalidState -> (
-                // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL
-                + FfiConverterString.allocationSize(value.v1)
-            )
         }
     }
 
@@ -2019,11 +2000,6 @@ public object FfiConverterTypeRayError : FfiConverterRustBuffer<RayException> {
             }
             is RayException.Network -> {
                 buf.putInt(5)
-                FfiConverterString.write(value.v1, buf)
-                Unit
-            }
-            is RayException.InvalidState -> {
-                buf.putInt(6)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
