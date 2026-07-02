@@ -2,6 +2,7 @@
 //! handshake (`join_network*`, dial/fetch/restore-roster helpers). Split out of `daemon/mod.rs`.
 
 use super::super::*;
+use std::sync::RwLock;
 
 impl DaemonState {
     /// Refresh the network's blob snapshot, store its bytes in the local blob
@@ -235,7 +236,7 @@ impl DaemonState {
         })?;
 
         let cancel = self.shutdown_token.child_token();
-        let state = Arc::new(std::sync::RwLock::new(net_state));
+        let state = Arc::new(RwLock::new(net_state));
         let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
         let dht_notify = Arc::new(tokio::sync::Notify::new());
         let (tasks, disconnect_tx) =
@@ -625,7 +626,7 @@ impl DaemonState {
                     pending: HashMap::new(),
                 };
                 ns.refresh_snapshot();
-                Arc::new(std::sync::RwLock::new(ns))
+                Arc::new(RwLock::new(ns))
             };
 
             tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
@@ -1021,7 +1022,7 @@ impl DaemonState {
                 pending: HashMap::new(),
             };
             ns.refresh_snapshot();
-            let live_state = Arc::new(std::sync::RwLock::new(ns));
+            let live_state = Arc::new(RwLock::new(ns));
 
             let handle = NetworkHandle {
                 name: network_name.to_string(),
