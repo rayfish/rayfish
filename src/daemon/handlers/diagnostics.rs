@@ -4,7 +4,9 @@
 use super::super::*;
 
 impl DaemonState {
-    pub(crate) fn status(&self) -> IpcMessage {
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    /// snapshot the daemon's status (identity, networks, peers).
+    pub fn status(&self) -> IpcMessage {
         let hostname_snapshot = self.hostname_table.try_read().ok();
         let my_id = self.endpoint.id();
         // Direct-connection networks are flagged in config; collect their names

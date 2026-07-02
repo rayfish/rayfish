@@ -1259,6 +1259,23 @@ pub struct NetworkHandle {
 /// and background task. Holds both the infrastructure that lives for the whole
 /// process and the handles for the currently-active networks. See the
 /// module-level docs for the two-lifecycle model.
+/// Handles for the packet-forwarding tasks a [`DaemonState::attach_tun`] call
+/// spawns (the TUN writer and the `run_mesh` reader loop), plus a dedicated
+/// cancellation token so the data plane can be stopped independently of a full
+/// daemon shutdown (used by `down()` in a later milestone).
+// The fields are populated by `attach_tun` and consumed by `down()`/detach in a
+// later milestone (M3); silence the interim dead-code warning rather than drop
+// the handles the data-plane teardown will need.
+#[allow(dead_code)]
+struct TunTasks {
+    /// Cancels the `run_mesh` reader loop without touching `shutdown_token`.
+    cancel: CancellationToken,
+    /// The TUN writer task (`spawn_tun_writer`).
+    writer: JoinHandle<()>,
+    /// The `run_mesh` reader loop task.
+    mesh: JoinHandle<()>,
+}
+
 pub struct DaemonState {
     endpoint: Endpoint,
     identity: IrohIdentityProvider,
@@ -1275,7 +1292,25 @@ pub struct DaemonState {
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
     mdns_enabled: bool,
-    tun_name: String,
+    /// Name of the OS TUN device (desktop) or a placeholder until a packet
+    /// interface is attached. Interior-mutable because on embedders (mobile) the
+    /// interface is attached after construction via [`DaemonState::attach_tun`],
+    /// while on desktop it is set once at boot.
+    tun_name: std::sync::Mutex<String>,
+    /// Receiver half of the TUN write channel. Held here after construction until
+    /// [`DaemonState::attach_tun`] takes it to spawn the writer task; `None` once a
+    /// packet interface has been attached (or on a build that never attaches one).
+    tun_rx: std::sync::Mutex<Option<mpsc::Receiver<Bytes>>>,
+    /// Handles for the packet-forwarding tasks spawned by
+    /// [`DaemonState::attach_tun`], kept so a future `down()`/detach can stop them.
+    tun_tasks: std::sync::Mutex<Option<TunTasks>>,
+    /// Promotion-channel receiver drained by [`serve_ipc`]. Stored here so the
+    /// headless builder can construct the daemon and hand the receiver back to
+    /// [`run_daemon`] afterwards.
+    promote_rx: std::sync::Mutex<Option<mpsc::Receiver<String>>>,
+    /// Prometheus metrics-server guard. Kept alive for the daemon's whole lifetime
+    /// (dropping it stops the export); `None` if the server failed to bind.
+    _metrics_server: std::sync::Mutex<Option<iroh_metrics::service::MetricsServer>>,
     pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
     device_cert: Option<control::DeviceCert>,
     device_user_map: peers::DeviceUserMap,
@@ -1375,7 +1410,62 @@ impl DaemonState {
         self.endpoint.set_alpns(alpns);
 
         let network_names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
-        dns_config::update_search_domains(&network_names, &self.tun_name).await;
+        let tun_name = self.tun_name.lock().unwrap().clone();
+        dns_config::update_search_domains(&network_names, &tun_name).await;
+    }
+
+    /// Attach a packet interface to a headless [`DaemonState`] and start the data
+    /// plane's forwarding tasks: the TUN writer (`spawn_tun_writer`, draining the
+    /// state's own `tun_rx` channel) and the mesh forwarding loop (`run_mesh`,
+    /// reading `reader` and using the state's peers/firewall/stats/resolver and the
+    /// `tun_tx` sender the rest of the daemon already holds).
+    ///
+    /// This is the embedding API (used by `ray-mobile` and future embedders) and
+    /// is also how `run_daemon` wires the desktop OS TUN device. The forwarding
+    /// loop runs under a child of `shutdown_token`, and its handles are stored so a
+    /// later `down()`/detach can stop the data plane without tearing down the whole
+    /// daemon. Calling it a second time is a no-op (the writer's receiver was
+    /// already taken); it will not spawn a duplicate writer.
+    pub async fn attach_tun<R: crate::tun::TunRead, W: crate::tun::TunWrite>(
+        self: &Arc<Self>,
+        reader: R,
+        writer: W,
+    ) {
+        // The receiver is present exactly once. If it's already been taken, a TUN
+        // is attached, so keep the running forwarder rather than spawning a second.
+        let tun_rx = match self.tun_rx.lock().unwrap().take() {
+            Some(rx) => rx,
+            None => {
+                tracing::warn!("attach_tun called but a packet interface is already attached");
+                return;
+            }
+        };
+
+        // A dedicated child token so the data plane can be stopped independently
+        // of a full daemon shutdown; it still cancels when `shutdown_token` does.
+        let cancel = self.shutdown_token.child_token();
+        let writer_handle = forward::spawn_tun_writer(writer, tun_rx, self.active.clone());
+        let mesh_handle = {
+            let peers = self.peers.clone();
+            let firewall = self.firewall.clone();
+            let cancel = cancel.clone();
+            let stats = self.stats.clone();
+            let resolver = self.resolver.clone();
+            let tun_tx = self.tun_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    forward::run_mesh(reader, peers, firewall, cancel, stats, resolver, tun_tx).await
+                {
+                    tracing::warn!(error = %e, "mesh forwarding loop exited with error");
+                }
+            })
+        };
+
+        *self.tun_tasks.lock().unwrap() = Some(TunTasks {
+            cancel,
+            writer: writer_handle,
+            mesh: mesh_handle,
+        });
     }
 
     /// Register a [`CoordinatorAcceptState`] handler for `network` and update
@@ -1922,7 +2012,25 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     #[cfg(not(target_os = "android"))]
     check_cgnat_conflict()?;
 
-    let (daemon, _metrics_server, promote_rx) = build_daemon(token.clone(), stats).await?;
+    // Build the always-on infrastructure without a packet interface, then attach
+    // the desktop OS TUN device below. The headless builder is the same one
+    // `build_headless()` exposes to embedders (mobile), so both paths share
+    // identical construction.
+    let daemon = build_daemon(token.clone(), stats).await?;
+
+    // Attach the real OS TUN device: create it, record its name, and spawn the
+    // writer + `run_mesh` forwarding loop. On Android the packet interface is a
+    // `VpnService` fd attached later by `ray-mobile` via `attach_tun`, so this is
+    // skipped here.
+    #[cfg(not(target_os = "android"))]
+    {
+        let my_ipv6 = derive_ipv6(&daemon.identity.local_identity());
+        let (tun_reader, tun_writer, tun_name) = tun::create(daemon.identity.local_ip(), my_ipv6)
+            .await
+            .context("failed to create TUN device")?;
+        *daemon.tun_name.lock().unwrap() = tun_name;
+        daemon.attach_tun(tun_reader, tun_writer).await;
+    }
 
     // Connect the control plane (mesh connections) once, for the daemon's
     // whole lifetime, then bring the data plane up. `ray up`/`ray down` toggle
@@ -1931,6 +2039,14 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     daemon.connect_all_networks().await;
     daemon.activate(None).await;
 
+    // The promotion receiver was stashed on the daemon by the builder; take it
+    // back to drive the IPC loop.
+    let promote_rx = daemon
+        .promote_rx
+        .lock()
+        .unwrap()
+        .take()
+        .expect("promote_rx present after build");
     let result = serve_ipc(&daemon, promote_rx, token).await;
 
     // Close the iroh endpoint before returning. Dropping it on return logs
@@ -1969,14 +2085,37 @@ fn initial_alpns(app_config: &config::AppConfig) -> Vec<Vec<u8>> {
     alpns
 }
 
-async fn build_daemon(
-    token: CancellationToken,
-    stats: Arc<ForwardMetrics>,
-) -> Result<(
-    Arc<DaemonState>,
-    Option<iroh_metrics::service::MetricsServer>,
-    mpsc::Receiver<String>,
-)> {
+/// Construct a headless [`DaemonState`] for an embedder (used by `ray-mobile`
+/// and future embedders). Builds the identity, iroh endpoint, blob store, Magic
+/// DNS resolver + membership pollers, protocol router/accept loop, contact
+/// publisher, and metrics server, then connects saved networks. It does NOT open
+/// the Unix-socket IPC server and does NOT create a real OS TUN device or spawn a
+/// forwarding loop; the caller supplies a packet interface via
+/// [`DaemonState::attach_tun`]. The returned daemon is on standby (no data
+/// plane), so bring it up with [`DaemonState::activate`].
+///
+/// This is the same construction path `run_daemon` uses on desktop, so desktop
+/// and embedder builds stay in lock-step.
+pub async fn build_headless() -> Result<Arc<DaemonState>> {
+    let token = CancellationToken::new();
+    let stats = Arc::new(ForwardMetrics::default());
+    let daemon = build_daemon(token, stats).await?;
+    // Bring the saved networks' control plane up, matching `run_daemon`.
+    daemon.connect_all_networks().await;
+    Ok(daemon)
+}
+
+/// Build all always-on daemon infrastructure WITHOUT a packet interface or the
+/// Unix-socket IPC server: identity, iroh endpoint, blob store, firewall, Magic
+/// DNS resolver, mDNS discovery, protocol router/accept loop, contact publisher,
+/// and metrics server. The returned [`DaemonState`] is on standby (no data
+/// plane). Attach a TUN with [`DaemonState::attach_tun`], connect saved networks
+/// with [`DaemonState::connect_all_networks`], then bring the data plane up with
+/// [`DaemonState::activate`]. The TUN write channel's receiver and the promotion
+/// receiver are stashed on the state for the caller to consume.
+///
+/// Shared by [`run_daemon`] (desktop) and [`build_headless`] (embedders).
+async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<Arc<DaemonState>> {
     // Relocate a pre-/etc config tree into /etc/rayfish (Linux upgrade path)
     // before anything reads identity or config. No-op on macOS / once migrated.
     config::migrate_location();
@@ -2032,20 +2171,12 @@ async fn build_daemon(
         .context("failed to open blob store")?;
     let blobs_proto = BlobsProtocol::new(&blob_store, None);
 
-    // --- Single TUN device + the forwarding loop, shared across networks ---
-    // On Android the packet interface is a `VpnService` fd wired up by
-    // `ray-mobile` in a later milestone, not an OS TUN device, so device
-    // creation and the desktop forwarding loop below are skipped and `tun_name`
-    // is a placeholder.
-    #[cfg(not(target_os = "android"))]
-    let (tun_reader, tun_writer, tun_name) = {
-        let my_ipv6 = derive_ipv6(&identity.local_identity());
-        tun::create(my_ip, my_ipv6)
-            .await
-            .context("failed to create TUN device")?
-    };
-    #[cfg(target_os = "android")]
-    let tun_name = String::from("rayfish-android");
+    // --- Packet interface: deferred to `attach_tun` ---
+    // No OS TUN device is created here. On desktop `run_daemon` creates the real
+    // device and calls `attach_tun`; on embedders (mobile) the `VpnService` fd is
+    // attached the same way. `tun_name` starts as a placeholder and is overwritten
+    // when a real interface is attached.
+    let tun_name = String::from("rayfish");
     // Append-only audit log of peer connect/disconnect events. If it can't be
     // opened (e.g. unwritable config dir) the daemon still runs without auditing.
     let peers = match audit::AuditLog::open() {
@@ -2062,11 +2193,11 @@ async fn build_daemon(
     let shared_firewall = SharedFirewall::new(fw_config);
     shared_firewall.clone().spawn_evictor(token.clone());
     let active = Arc::new(AtomicBool::new(false));
+    // The TUN write channel is created here (the sender is needed by DNS injection
+    // and every peer reader), but the receiver is held on the state until
+    // `attach_tun` takes it to spawn the writer. The forwarding loop (`run_mesh`)
+    // is likewise deferred to `attach_tun`.
     let (tun_tx, tun_rx) = mpsc::channel::<Bytes>(256);
-    #[cfg(not(target_os = "android"))]
-    forward::spawn_tun_writer(tun_writer, tun_rx, active.clone());
-    #[cfg(target_os = "android")]
-    drop(tun_rx);
     let device_user_map = peers::DeviceUserMap::new();
 
     // --- Magic DNS resolver + optional mDNS local discovery ---
@@ -2075,16 +2206,6 @@ async fn build_daemon(
     let dns_resolver = std::sync::Arc::new(crate::dns_resolver::Resolver::new(
         hostname_table.clone(),
         reverse_table.clone(),
-    ));
-    #[cfg(not(target_os = "android"))]
-    tokio::spawn(forward::run_mesh(
-        tun_reader,
-        peers.clone(),
-        shared_firewall.clone(),
-        token.clone(),
-        stats.clone(),
-        dns_resolver.clone(),
-        tun_tx.clone(),
     ));
     let mdns_enabled = app_config.mdns_enabled;
     if mdns_enabled {
@@ -2119,7 +2240,11 @@ async fn build_daemon(
         hostname_table,
         reverse_table,
         mdns_enabled,
-        tun_name,
+        tun_name: std::sync::Mutex::new(tun_name),
+        tun_rx: std::sync::Mutex::new(Some(tun_rx)),
+        tun_tasks: std::sync::Mutex::new(None),
+        promote_rx: std::sync::Mutex::new(Some(promote_rx)),
+        _metrics_server: std::sync::Mutex::new(None),
         pairing_secret,
         device_cert,
         device_user_map,
@@ -2147,9 +2272,11 @@ async fn build_daemon(
     }
     let metrics_server =
         spawn_metrics_server(stats, daemon.peers.clone(), &daemon.endpoint, token).await;
+    // Keep the metrics-server guard alive for the daemon's whole lifetime.
+    *daemon._metrics_server.lock().unwrap() = metrics_server;
 
     tracing::info!(ip = %my_ip, id = %daemon.endpoint.id().fmt_short(), "daemon started");
-    Ok((daemon, metrics_server, promote_rx))
+    Ok(daemon)
 }
 
 /// Advertise this endpoint over mDNS (`_rayfish._udp.local`) and log LAN peer
@@ -4416,5 +4543,46 @@ mod dial_fallback_tests {
         let outcomes = vec![DialOutcome::Unreachable, DialOutcome::Denied];
         let (_idx, welcomed) = pick_first_welcome(&outcomes);
         assert!(!welcomed);
+    }
+}
+
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+
+    /// `build_headless()` constructs a usable `Arc<DaemonState>` (identity,
+    /// endpoint, blob store, DNS, pollers) in an isolated config dir and answers a
+    /// `status()` call, all without binding the Unix-socket IPC server that
+    /// `run_daemon`/`serve_ipc` would.
+    ///
+    /// Multi-threaded flavor: `build_headless` builds an iroh endpoint and an
+    /// iroh-blobs `FsStore` whose background actor tasks must make progress while
+    /// the builder awaits, matching the daemon binary's `#[tokio::main]` runtime.
+    /// The `timeout` guard turns a future startup regression into a fast failure
+    /// instead of a hung test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_headless_returns_usable_state_without_ipc_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Isolate identity/config/blobs from the system config dir. Safe here: this
+        // is the only test that drives config through the `RAYFISH_CONFIG_DIR` env
+        // var, so there is no cross-test races over the process-global variable.
+        unsafe {
+            std::env::set_var("RAYFISH_CONFIG_DIR", tmp.path());
+        }
+
+        let daemon = tokio::time::timeout(std::time::Duration::from_secs(30), build_headless())
+            .await
+            .expect("build_headless should not hang")
+            .expect("build_headless should succeed");
+
+        // It returns a shared `Arc<DaemonState>`.
+        assert!(Arc::strong_count(&daemon) >= 1);
+
+        // The embedding `status()` API answers without a socket ever being bound.
+        assert!(matches!(daemon.status(), IpcMessage::StatusResponse { .. }));
+
+        unsafe {
+            std::env::remove_var("RAYFISH_CONFIG_DIR");
+        }
     }
 }

@@ -532,7 +532,8 @@ impl DaemonState {
         // Kotlin side, so these desktop route calls don't apply.
         #[cfg(not(target_os = "android"))]
         {
-            if let Err(e) = tun::set_link_up(&self.tun_name) {
+            let tun_name = self.tun_name.lock().unwrap().clone();
+            if let Err(e) = tun::set_link_up(&tun_name) {
                 tracing::warn!(error = %e, "failed to bring TUN interface up");
                 warnings.push(format!("failed to bring TUN interface up: {e}"));
             }
@@ -541,12 +542,12 @@ impl DaemonState {
             // link-up: on Linux the kernel won't install an IPv6 connected route
             // while the link is down, so without this peer traffic leaks out the
             // default route.
-            if let Err(e) = tun::route_peer_range(&self.tun_name).await {
+            if let Err(e) = tun::route_peer_range(&tun_name).await {
                 tracing::warn!(error = %e, "failed to route 200::/7 into TUN");
                 warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
             }
 
-            if let Err(e) = tun::route_magic_dns(&self.tun_name).await {
+            if let Err(e) = tun::route_magic_dns(&tun_name).await {
                 tracing::warn!(error = %e, "failed to route magic DNS IP into TUN");
             }
 
@@ -594,7 +595,8 @@ impl DaemonState {
     async fn configure_magic_dns(&self, warnings: &mut Vec<String>) {
         // Configure system DNS to route .ray queries to our in-daemon resolver.
         dns_config::restore_stale_backups();
-        match dns_config::detect_and_configure(&self.tun_name).await {
+        let tun_name = self.tun_name.lock().unwrap().clone();
+        match dns_config::detect_and_configure(&tun_name).await {
             Ok(c) => {
                 let captured = c.captured_upstreams();
                 // Merge any user-configured DNS upstreams over the system-captured
@@ -655,10 +657,11 @@ impl DaemonState {
         {
             tracing::warn!(error = %e, "failed to revert DNS configuration");
         }
-        dns_config::clear_search_domains(&self.tun_name).await;
+        let tun_name = self.tun_name.lock().unwrap().clone();
+        dns_config::clear_search_domains(&tun_name).await;
 
         #[cfg(not(target_os = "android"))]
-        if let Err(e) = tun::set_link_down(&self.tun_name) {
+        if let Err(e) = tun::set_link_down(&tun_name) {
             tracing::warn!(error = %e, "failed to bring TUN interface down");
         }
 

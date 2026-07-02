@@ -83,8 +83,10 @@ impl DaemonState {
         (tasks, disconnect_tx)
     }
 
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    /// create a new network and register this node as its coordinator.
     #[tracing::instrument(skip(self, hostname), fields(mode = ?mode))]
-    pub(crate) async fn create_network(
+    pub async fn create_network(
         &self,
         mode: GroupMode,
         name: Option<String>,
@@ -277,8 +279,10 @@ impl DaemonState {
         })
     }
 
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    /// join an existing network by key (optionally with an invite/coordinator).
     #[tracing::instrument(skip(self, hostname), fields(net = name.unwrap_or(network_key)))]
-    pub(crate) async fn join_network(
+    pub async fn join_network(
         self: &Arc<Self>,
         network_key: &str,
         name: Option<&str>,

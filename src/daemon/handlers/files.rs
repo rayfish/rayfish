@@ -209,7 +209,9 @@ impl DaemonState {
         }
     }
 
-    pub(crate) fn start_pairing(&self) -> IpcMessage {
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    /// mint a pairing ticket for this device.
+    pub fn start_pairing(&self) -> IpcMessage {
         let secret: [u8; 32] = rand::random();
 
         let endpoint_id = self.endpoint.id();
@@ -223,7 +225,9 @@ impl DaemonState {
         IpcMessage::PairingTicket { ticket }
     }
 
-    pub(crate) async fn pair_with_device(&self, endpoint_id: EndpointId, secret: Vec<u8>) -> IpcMessage {
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    /// pair this device with a primary device using a scanned ticket.
+    pub async fn pair_with_device(&self, endpoint_id: EndpointId, secret: Vec<u8>) -> IpcMessage {
         let addr: iroh::EndpointAddr = endpoint_id.into();
         let conn = match self.endpoint.connect(addr, PAIR_ALPN).await {
             Ok(c) => c,
