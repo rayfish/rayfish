@@ -1461,11 +1461,23 @@ impl DaemonState {
             })
         };
 
-        *self.tun_tasks.lock().unwrap() = Some(TunTasks {
+        // Self-healing: if `attach_tun` is called twice without an intervening
+        // `detach_tun`, stop the previous data plane before installing the new
+        // one. `JoinHandle::drop` detaches rather than aborts, so without this
+        // the old writer + `run_mesh` loop would keep running forever on the old
+        // fds (a leak of two live mesh loops). On the normal detach->attach path
+        // `detach_tun` already took the old tasks, so `replace` returns `None`.
+        let new_tasks = TunTasks {
             cancel,
             writer: writer_handle,
             mesh: mesh_handle,
-        });
+        };
+        let old = self.tun_tasks.lock().unwrap().replace(new_tasks);
+        if let Some(old) = old {
+            old.cancel.cancel();
+            old.writer.abort();
+            old.mesh.abort();
+        }
     }
 
     /// Part of the embedding API (used by `ray-mobile`'s `down`): stop the
@@ -4638,5 +4650,148 @@ mod headless_tests {
 
         // The embedding `status()` API answers without a socket ever being bound.
         assert!(matches!(daemon.status(), IpcMessage::StatusResponse { .. }));
+    }
+
+    /// In-memory TUN writer that records every written packet into a shared
+    /// buffer, so a test can observe which writer the data plane routed to.
+    #[derive(Clone, Default)]
+    struct FakeTunWriter {
+        written: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl crate::tun::TunWrite for FakeTunWriter {
+        async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
+            self.written.lock().unwrap().push(packet.to_vec());
+            Ok(())
+        }
+    }
+
+    /// In-memory TUN reader that never yields a packet, so `run_mesh` parks in
+    /// its read and only exits when its task is cancelled/aborted. It carries an
+    /// `Arc<()>` liveness token: the reader is owned solely by the spawned
+    /// `run_mesh` future, so the token's strong count drops back to the caller's
+    /// single reference the moment that task's future is dropped on abort. That
+    /// makes "the old data plane was torn down" directly observable.
+    struct FakeTunReader {
+        _alive: Arc<()>,
+    }
+
+    impl crate::tun::TunRead for FakeTunReader {
+        async fn read_into(&mut self, _buf: &mut bytes::BytesMut) -> anyhow::Result<usize> {
+            std::future::pending::<()>().await;
+            unreachable!("FakeTunReader never returns");
+        }
+    }
+
+    /// Poll `sink` until it holds `want` packets. Bounded (~2s total) so a real
+    /// failure fails fast instead of hanging; the short poll interval leaves room
+    /// for the cross-thread wakeup of the writer task without a fixed sleep that
+    /// would either flake (too short) or slow the suite (too long).
+    async fn wait_for_len(sink: &Arc<std::sync::Mutex<Vec<Vec<u8>>>>, want: usize) -> bool {
+        for _ in 0..400 {
+            if sink.lock().unwrap().len() >= want {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// Re-attaching the TUN after a `detach_tun` must resume forwarding to the
+    /// new writer (the VPN off/on toggle path), and a second `attach_tun`
+    /// WITHOUT an intervening detach must stop the previous writer instead of
+    /// leaking it (two live writers on two fds).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_tun_is_self_healing_on_reattach_and_double_attach() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+
+        let daemon = tokio::time::timeout(std::time::Duration::from_secs(30), build_headless())
+            .await
+            .expect("build_headless should not hang")
+            .expect("build_headless should succeed");
+
+        use std::sync::atomic::Ordering;
+
+        // Helper: send one packet through the same `tun_tx` cell the peer-reader
+        // and DNS-injection paths use, then wait for the given writer to see it.
+        async fn send_pkt(daemon: &Arc<DaemonState>, pkt: &'static [u8]) {
+            daemon
+                .tun_tx
+                .load_full()
+                .send(Bytes::from_static(pkt))
+                .await
+                .expect("tun_tx send should reach the live writer");
+        }
+
+        // Poll until `token`'s strong count falls back to 1 (only this test
+        // holds it), i.e. the `run_mesh` task that owned the matching reader was
+        // dropped. Bounded so a leak fails fast instead of hanging.
+        async fn wait_for_reader_dropped(token: &Arc<()>) -> bool {
+            for _ in 0..400 {
+                if Arc::strong_count(token) == 1 {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            false
+        }
+
+        // 1. First attach: reader1 + writer1, forwarding active.
+        let writer1 = FakeTunWriter::default();
+        let sink1 = writer1.written.clone();
+        daemon
+            .attach_tun(FakeTunReader { _alive: Arc::new(()) }, writer1)
+            .await;
+        daemon.active.store(true, Ordering::SeqCst);
+
+        send_pkt(&daemon, b"packet-1").await;
+        assert!(
+            wait_for_len(&sink1, 1).await,
+            "writer1 should receive the first packet"
+        );
+
+        // 2. Toggle: detach, then re-attach reader2 + writer2. This is the path
+        //    that used to silently break before the fresh-channel-per-attach fix.
+        daemon.detach_tun();
+        let writer2 = FakeTunWriter::default();
+        let sink2 = writer2.written.clone();
+        let alive2 = Arc::new(());
+        daemon
+            .attach_tun(FakeTunReader { _alive: alive2.clone() }, writer2)
+            .await;
+        daemon.active.store(true, Ordering::SeqCst);
+
+        send_pkt(&daemon, b"packet-2").await;
+        assert!(
+            wait_for_len(&sink2, 1).await,
+            "writer2 should receive the packet after a detach->attach toggle"
+        );
+
+        // 3. Double-attach guard: attach writer3 WITHOUT detaching first. The
+        //    previous data plane (writer2's mesh loop + writer) must be aborted,
+        //    not leaked. Observe both halves of "no two live data planes":
+        //    - writer3 receives the packet (the cell now routes to writer3), and
+        //    - reader2's `run_mesh` task was dropped (`alive2` count back to 1),
+        //      which without the self-healing guard would leak and stay at 2.
+        let writer3 = FakeTunWriter::default();
+        let sink3 = writer3.written.clone();
+        daemon
+            .attach_tun(FakeTunReader { _alive: Arc::new(()) }, writer3)
+            .await;
+        daemon.active.store(true, Ordering::SeqCst);
+
+        send_pkt(&daemon, b"packet-3").await;
+        assert!(
+            wait_for_len(&sink3, 1).await,
+            "writer3 should receive the packet after a double-attach"
+        );
+        assert!(
+            wait_for_reader_dropped(&alive2).await,
+            "the prior mesh loop must be aborted on a second attach without detach (no leak)"
+        );
+
+        daemon.detach_tun();
     }
 }
