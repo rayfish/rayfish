@@ -29,6 +29,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -44,29 +45,134 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import uniffi.ray_mobile.RayException
+import uniffi.ray_mobile.LinkAction
+import uniffi.ray_mobile.NetworkInfo
 import uniffi.ray_mobile.Status
 
 class MainActivity : ComponentActivity() {
+
+    /** Guards against handling the same launch intent twice (config change, recomposition). */
+    private var handledIntentUri: String? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val initialUri = intent?.data?.toString()
         setContent {
             MaterialTheme {
-                RayfishScreen()
+                RayfishScreen(
+                    initialLinkUri = initialUri,
+                    alreadyHandled = { uri -> uri == handledIntentUri },
+                    markHandled = { uri -> handledIntentUri = uri },
+                )
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val uri = intent.data?.toString()
+        if (uri != null && uri != handledIntentUri) {
+            handledIntentUri = uri
+            pendingLinkUri.value = uri
+        }
+    }
+
+    companion object {
+        /**
+         * Bridges [onNewIntent] (no Compose context) to the running [RayfishScreen]:
+         * a fresh deep link while the activity is alive is dropped in here and the
+         * Compose side observes it via [LaunchedEffect].
+         */
+        val pendingLinkUri = androidx.compose.runtime.mutableStateOf<String?>(null)
     }
 }
 
 @Composable
-private fun RayfishScreen() {
+private fun RayfishScreen(
+    initialLinkUri: String?,
+    alreadyHandled: (String) -> Boolean,
+    markHandled: (String) -> Unit,
+) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
 
     var vpnOn by remember { mutableStateOf(false) }
     var invite by remember { mutableStateOf("") }
+    var networkName by remember { mutableStateOf("") }
+    var ticket by remember { mutableStateOf("") }
     var status by remember { mutableStateOf<Status?>(null) }
+    var lastNetwork by remember { mutableStateOf<NetworkInfo?>(null) }
+    var starting by remember { mutableStateOf(true) }
+    var started by remember { mutableStateOf(false) }
+
+    // Node.start() is idempotent, but only needs to run once per process; this
+    // suspends until it has, and everything else awaits it before touching Node.
+    suspend fun ensureStarted() {
+        if (started) return
+        withContext(Dispatchers.IO) {
+            NodeHolder.get(context).start()
+        }
+        started = true
+    }
+
+    LaunchedEffect(Unit) {
+        try {
+            ensureStarted()
+        } catch (t: Throwable) {
+            snackbar.showSnackbar("Failed to start: ${t.message}")
+        } finally {
+            starting = false
+        }
+    }
+
+    fun rayExceptionMessage(prefix: String, t: Throwable): String = "$prefix: ${t.message}"
+
+    fun handleLinkAction(action: LinkAction) {
+        when (action) {
+            is LinkAction.Joined -> {
+                lastNetwork = action.v1
+                scope.launch { snackbar.showSnackbar("Joined ${action.v1.name}") }
+            }
+            is LinkAction.Paired -> {
+                scope.launch { snackbar.showSnackbar("Paired") }
+            }
+        }
+    }
+
+    fun followLink(uri: String) {
+        scope.launch {
+            try {
+                ensureStarted()
+                val action = withContext(Dispatchers.IO) {
+                    NodeHolder.get(context).handleLink(uri)
+                }
+                handleLinkAction(action)
+            } catch (t: Throwable) {
+                snackbar.showSnackbar(rayExceptionMessage("Link failed", t))
+            }
+        }
+    }
+
+    // Handle the intent the activity was created with, once.
+    LaunchedEffect(initialLinkUri) {
+        val uri = initialLinkUri
+        if (uri != null && !alreadyHandled(uri)) {
+            markHandled(uri)
+            followLink(uri)
+        }
+    }
+
+    // Handle deep links delivered to an already-running activity via onNewIntent.
+    val pendingLinkUri = MainActivity.pendingLinkUri.value
+    LaunchedEffect(pendingLinkUri) {
+        val uri = pendingLinkUri
+        if (uri != null) {
+            followLink(uri)
+            MainActivity.pendingLinkUri.value = null
+        }
+    }
 
     fun startService() {
         val intent = Intent(context, RayfishVpnService::class.java)
@@ -103,8 +209,13 @@ private fun RayfishScreen() {
 
     fun refreshStatus() {
         scope.launch {
-            status = withContext(Dispatchers.IO) {
-                NodeHolder.get(context).status()
+            try {
+                ensureStarted()
+                status = withContext(Dispatchers.IO) {
+                    NodeHolder.get(context).status()
+                }
+            } catch (t: Throwable) {
+                snackbar.showSnackbar(rayExceptionMessage("Status failed", t))
             }
         }
     }
@@ -116,17 +227,51 @@ private fun RayfishScreen() {
             return
         }
         scope.launch {
-            val message = withContext(Dispatchers.IO) {
-                try {
-                    val info = NodeHolder.get(context).join(code)
-                    "Joined ${info.name}"
-                } catch (e: RayException) {
-                    "Join failed: ${e.message}"
-                } catch (t: Throwable) {
-                    "Join failed: ${t.message}"
+            try {
+                ensureStarted()
+                val info = withContext(Dispatchers.IO) {
+                    NodeHolder.get(context).join(code)
                 }
+                lastNetwork = info
+                snackbar.showSnackbar("Joined ${info.name}")
+            } catch (t: Throwable) {
+                snackbar.showSnackbar(rayExceptionMessage("Join failed", t))
             }
-            snackbar.showSnackbar(message)
+        }
+    }
+
+    fun createNetwork() {
+        val name = networkName.trim().ifEmpty { null }
+        scope.launch {
+            try {
+                ensureStarted()
+                val info = withContext(Dispatchers.IO) {
+                    NodeHolder.get(context).create(name)
+                }
+                lastNetwork = info
+                snackbar.showSnackbar("Created ${info.name}")
+            } catch (t: Throwable) {
+                snackbar.showSnackbar(rayExceptionMessage("Create failed", t))
+            }
+        }
+    }
+
+    fun pairDevice() {
+        val code = ticket.trim()
+        if (code.isEmpty()) {
+            scope.launch { snackbar.showSnackbar("Enter a pairing ticket first") }
+            return
+        }
+        scope.launch {
+            try {
+                ensureStarted()
+                withContext(Dispatchers.IO) {
+                    NodeHolder.get(context).pair(code)
+                }
+                snackbar.showSnackbar("Paired")
+            } catch (t: Throwable) {
+                snackbar.showSnackbar(rayExceptionMessage("Pair failed", t))
+            }
         }
     }
 
@@ -148,7 +293,7 @@ private fun RayfishScreen() {
                 color = MaterialTheme.colorScheme.primary,
             )
             Text(
-                text = "Mesh node",
+                text = if (starting) "Starting…" else "Mesh node",
                 fontSize = 15.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -180,6 +325,31 @@ private fun RayfishScreen() {
                         .padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
+                    Text("Create a network", fontWeight = FontWeight.SemiBold)
+                    OutlinedTextField(
+                        value = networkName,
+                        onValueChange = { networkName = it },
+                        label = { Text("Name (optional)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Button(
+                        onClick = { createNetwork() },
+                        enabled = !starting,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Create network")
+                    }
+                }
+            }
+
+            Card {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
                     Text("Join a network", fontWeight = FontWeight.SemiBold)
                     OutlinedTextField(
                         value = invite,
@@ -188,8 +358,37 @@ private fun RayfishScreen() {
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
-                    Button(onClick = { join() }, modifier = Modifier.fillMaxWidth()) {
+                    Button(
+                        onClick = { join() },
+                        enabled = !starting,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
                         Text("Join")
+                    }
+                }
+            }
+
+            Card {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text("Pair a device", fontWeight = FontWeight.SemiBold)
+                    OutlinedTextField(
+                        value = ticket,
+                        onValueChange = { ticket = it },
+                        label = { Text("Pairing ticket") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Button(
+                        onClick = { pairDevice() },
+                        enabled = !starting,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Pair device")
                     }
                 }
             }
@@ -207,7 +406,14 @@ private fun RayfishScreen() {
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text("Status", fontWeight = FontWeight.SemiBold)
-                        OutlinedButton(onClick = { refreshStatus() }) { Text("Refresh") }
+                        OutlinedButton(onClick = { refreshStatus() }, enabled = !starting) {
+                            Text("Refresh")
+                        }
+                    }
+                    val net = lastNetwork
+                    if (net != null) {
+                        StatusRow("Network", net.name)
+                        StatusRow("Address", "${net.nodeId}.${net.name}.ray")
                     }
                     val s = status
                     if (s == null) {
