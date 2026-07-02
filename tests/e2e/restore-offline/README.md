@@ -10,8 +10,13 @@ Background: PR #60 / issue #59.
 
 ```
 srv-a  coordinator of a closed network `priv`
-srv-b  member (admitted with an invite)
+srv-b  member (admitted with an invite)   <- restarted mid-test
+srv-c  member (admitted with an invite)   <- stays up, the peer srv-b must find
 ```
+
+The third host is what makes the core claim testable: with the coordinator
+stopped, the restarted member has to re-mesh with the *other* member on its own,
+proving the fix connects to any available peer rather than just the coordinator.
 
 ## The bug this guards against
 
@@ -26,17 +31,20 @@ never lost). One member was observed stuck for ~13 hours.
 
 ## What it proves
 
-1. `srv-a` creates a closed network; `srv-b` joins with an invite and they mesh.
+1. `srv-a` creates a closed network; `srv-b` and `srv-c` join with invites and
+   the three full-mesh.
 2. `srv-a`'s daemon is stopped entirely (`systemctl stop`, not `ray down` standby),
-   so the coordinator endpoint is genuinely unreachable; `srv-b` sees it go offline.
+   so the coordinator endpoint is genuinely unreachable; `srv-b` and `srv-c` see it
+   go offline but stay linked to each other.
 3. `srv-b`'s daemon is restarted while the coordinator is offline (the exact
    failure path).
-4. **The fix:** `srv-b` still has `priv` after the restart and still lists the
-   coordinator as an (offline) peer. Pre-fix, this step fails with "no active
-   networks".
-5. **Recovery:** the coordinator is brought back and `srv-b` reconnects on its own
-   (the reconnect loop seeded at restore keeps dialing with backoff), with no
-   manual step on the member.
+4. **The fix:** `srv-b` still has `priv` after the restart, **reconnects to
+   `srv-c` while the coordinator is still down** (connect to any available peer,
+   not just the coordinator), and lists the coordinator as an offline peer.
+   Pre-fix, this step fails with "no active networks".
+5. **Recovery:** the coordinator is brought back and the full mesh reconverges on
+   its own (the reconnect loop seeded at restore keeps dialing with backoff), with
+   no manual step on the members.
 
 Running this scenario against a pre-fix binary fails at step 4; against the fixed
 binary it passes end to end.
