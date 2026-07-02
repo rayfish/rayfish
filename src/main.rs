@@ -642,6 +642,24 @@ pub(crate) enum FilesAction {
         /// `on` or `off`
         state: String,
     },
+    /// Set/show/clear the directory where auto-accepted files are written
+    /// (absolute path). With no argument, prints the current value.
+    DownloadDir {
+        /// Absolute path (omit to show current)
+        path: Option<String>,
+        /// Clear the setting (revert to download-user / operator fallback)
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Set/show/clear the unix user that owns auto-accepted files (and whose
+    /// ~/Downloads receives them when no download-dir is set).
+    DownloadUser {
+        /// Username or numeric uid (omit to show current)
+        user: Option<String>,
+        /// Clear the setting
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 fn check_root() {
@@ -1059,7 +1077,7 @@ fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
 }
 
 /// Resolve a username to its UID, falling back to parsing a numeric UID.
-fn uid_for_user(user: &str) -> Option<u32> {
+pub(crate) fn uid_for_user(user: &str) -> Option<u32> {
     use std::ffi::CString;
     let cname = CString::new(user).ok()?;
     let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
