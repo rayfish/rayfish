@@ -387,6 +387,15 @@ pub struct AppConfig {
     /// authorized in a network's [`NetworkConfig::ssh_allow`] list. Off by default.
     #[serde(default)]
     pub ssh_enabled: bool,
+    /// Absolute directory where auto-accepted (own-device) files are written.
+    /// `None` falls back to `download_user`, then the operator's ~/Downloads.
+    /// Set via `ray files download-dir <path>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_dir: Option<String>,
+    /// Unix uid that owns auto-accepted files (and whose ~/Downloads receives
+    /// them when `download_dir` is unset). Set via `ray files download-user`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_user: Option<u32>,
     #[serde(default)]
     pub networks: Vec<NetworkConfig>,
 }
@@ -402,6 +411,8 @@ impl Default for AppConfig {
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
             ssh_enabled: false,
+            download_dir: None,
+            download_user: None,
             networks: Vec::new(),
         }
     }
@@ -469,6 +480,10 @@ struct Settings {
     dns_upstreams: ServerOverride,
     #[serde(default)]
     ssh_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    download_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    download_user: Option<u32>,
 }
 
 /// Look up the `rayfish` group's gid (Linux), if the group exists.
@@ -695,6 +710,8 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
             ssh_enabled: false,
+            download_dir: None,
+            download_user: None,
         }
     };
 
@@ -731,6 +748,8 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
         ssh_enabled: settings.ssh_enabled,
+        download_dir: settings.download_dir,
+        download_user: settings.download_user,
         networks,
     })
 }
@@ -750,6 +769,8 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
         ssh_enabled: config.ssh_enabled,
+        download_dir: config.download_dir.clone(),
+        download_user: config.download_user,
     };
     let path = dir.join(SETTINGS_FILE);
     let contents = toml::to_string_pretty(&settings).context("serializing settings")?;
@@ -1203,6 +1224,31 @@ name = "test"
         let after = load_in(dir).unwrap();
         assert_eq!(after.networks.len(), 1);
         assert_eq!(after.networks[0].name, "genesis");
+    }
+
+    #[test]
+    fn settings_download_fields_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let cfg = AppConfig {
+            download_dir: Some("/srv/incoming".to_string()),
+            download_user: Some(1000),
+            ..Default::default()
+        };
+        save_settings_in(dir, &cfg).unwrap();
+
+        let loaded = load_in(dir).unwrap();
+        assert_eq!(loaded.download_dir.as_deref(), Some("/srv/incoming"));
+        assert_eq!(loaded.download_user, Some(1000));
+    }
+
+    #[test]
+    fn settings_download_fields_default_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No settings.toml written: fields default to None.
+        let loaded = load_in(tmp.path()).unwrap();
+        assert_eq!(loaded.download_dir, None);
+        assert_eq!(loaded.download_user, None);
     }
 
     #[test]
