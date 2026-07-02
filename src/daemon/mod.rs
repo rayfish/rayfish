@@ -1617,6 +1617,7 @@ impl DaemonState {
             IpcMessage::FirewallShow => self.firewall_show(),
             IpcMessage::FirewallDefault { action } => self.firewall_default(action),
             IpcMessage::FirewallReject { enabled } => self.firewall_reject(enabled),
+            IpcMessage::FirewallSetEnabled { enabled } => self.firewall_set_enabled(enabled),
             IpcMessage::FirewallSuggest {
                 network,
                 suggestions,
