@@ -504,11 +504,12 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// Linux: `/etc/rayfish` (system service location, root:rayfish). macOS: the
 /// daemon's `~/.config/rayfish` (root-only under `/var/root`).
 pub fn config_dir() -> Result<PathBuf> {
-    // An explicit `RAYFISH_CONFIG_DIR` override wins on every platform. Embedders
+    // An explicit `RAYFISH_CONFIG_DIR` override is honored only on Android
     // (`ray-mobile`'s `Node::new` points it at the app's `Context.getFilesDir()`)
-    // and headless/test harnesses use it to run against an isolated config tree
-    // instead of the system location. Production desktop/service installs never
-    // set it, so their resolved path is unchanged.
+    // and in `cfg(test)` (headless/test harnesses run against an isolated config
+    // tree). Desktop/service production builds never check this var, so their
+    // resolved path is byte-for-byte unchanged from before the override existed.
+    #[cfg(any(target_os = "android", test))]
     if let Some(dir) = std::env::var_os("RAYFISH_CONFIG_DIR") {
         let dir = PathBuf::from(dir);
         ensure_dir(&dir)?;
