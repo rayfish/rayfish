@@ -48,6 +48,8 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
             };
             ipc::IpcMessage::FirewallReject { enabled }
         }
+        FirewallAction::On => ipc::IpcMessage::FirewallSetEnabled { enabled: true },
+        FirewallAction::Off => ipc::IpcMessage::FirewallSetEnabled { enabled: false },
         FirewallAction::Accept { network } => ipc::IpcMessage::FirewallAccept { network },
         FirewallAction::Deny { network } => ipc::IpcMessage::FirewallDeny { network },
         FirewallAction::AutoAccept { network, state } => {
@@ -71,6 +73,7 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
             default_inbound,
             default_outbound,
             reject,
+            disabled,
             rules,
         } => {
             if json_enabled() {
@@ -78,12 +81,18 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
                     "default_inbound": default_inbound,
                     "default_outbound": default_outbound,
                     "reject": reject,
+                    "disabled": disabled,
                     "rules": rules,
                 }));
             } else {
                 print!(
                     "{}",
-                    render_firewall_rules(Some((default_inbound, default_outbound)), reject, &rules)
+                    render_firewall_rules(
+                        Some((default_inbound, default_outbound)),
+                        reject,
+                        disabled,
+                        &rules
+                    )
                 );
             }
         }
@@ -198,9 +207,25 @@ pub(crate) fn print_json(value: &serde_json::Value) {
 pub(crate) fn render_firewall_rules(
     default: Option<(firewall::Action, firewall::Action)>,
     reject: bool,
+    disabled: bool,
     rules: &[ipc::FirewallRuleView],
 ) -> String {
     let mut out = String::from("\n");
+    if default.is_some() {
+        // The rayfish firewall is separate from (and applies on top of) the host
+        // OS / kernel firewall; both must allow a packet for it to pass.
+        out.push_str(&format!(
+            "  {}\n\n",
+            style::faint("mesh firewall (separate from your host/kernel firewall)")
+        ));
+    }
+    if disabled && default.is_some() {
+        out.push_str(&format!(
+            "  {}  {}\n\n",
+            style::label("status     "),
+            style::red("disabled (all packets allowed; ray firewall on to re-enable)")
+        ));
+    }
     if let Some((inbound, outbound)) = default {
         let styled = |a: firewall::Action| {
             let s = a.to_string();
@@ -311,7 +336,7 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
     }
     // Non-interactive (piped / NO_COLOR): print the static table and stop.
     if !style::is_enabled() {
-        print!("{}", render_firewall_rules(None, false, &rules));
+        print!("{}", render_firewall_rules(None, false, false, &rules));
         return Ok(());
     }
 

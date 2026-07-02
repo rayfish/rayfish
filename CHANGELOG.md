@@ -38,6 +38,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   permanently, also revoke its invite or reusable key). Kicking is refused on open
   networks (where the peer could immediately re-join) and against another
   coordinator or yourself.
+- **`ray firewall off` / `ray firewall on`**: a global switch to disable the
+  userspace firewall on a device. `off` allows every mesh packet (rules and the
+  secure default are bypassed; mesh membership still gates who can reach you, and
+  spoofed source addresses are still dropped), for simple setups that don't want a
+  second firewall layered on top of the host/kernel firewall. `on` restores
+  enforcement. The disabled state is shown in `ray firewall show`.
+
+### Changed
+
+- **`ray firewall show` clarifies the firewall is separate from your host
+  firewall**: the output now notes that this is a mesh firewall applied on top of
+  your host/kernel firewall (both must allow a packet), so it is not forgotten
+  when auditing an OS firewall. Enabling mesh SSH with `ray firewall ssh on` now
+  reminds you to authorize a peer with `ray firewall ssh allow` when none is set
+  yet (the server rejects all logins until a peer is on the allow list).
 
 ### Fixed
 
