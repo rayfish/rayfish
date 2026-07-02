@@ -477,3 +477,87 @@ fn resolve_operator_target() -> Option<(u32, u32, PathBuf)> {
         Some((uid, gid, PathBuf::from(home).join("Downloads")))
     }
 }
+
+/// Decide the auto-accept target `(dir, owner)` from resolved inputs. Pure so
+/// the precedence is unit-tested without touching the filesystem. First match:
+/// 1. `dir` set -> that dir; owner = `user`'s cred if set, else the dir's owner.
+/// 2. `user` set -> that user's ~/Downloads, owned by them.
+/// 3. `operator` set -> operator's ~/Downloads, owned by them.
+/// 4. otherwise None (caller must not write).
+fn pick_download_target(
+    dir: Option<PathBuf>,
+    dir_owner: Option<(u32, u32)>,
+    user: Option<(PathBuf, (u32, u32))>,
+    operator: Option<(PathBuf, (u32, u32))>,
+) -> Option<(PathBuf, Option<(u32, u32)>)> {
+    if let Some(d) = dir {
+        let owner = user.map(|(_, cred)| cred).or(dir_owner);
+        return Some((d, owner));
+    }
+    if let Some((home, cred)) = user {
+        return Some((home, Some(cred)));
+    }
+    if let Some((home, cred)) = operator {
+        return Some((home, Some(cred)));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_download_target;
+    use std::path::PathBuf;
+
+    fn dl(p: &str) -> PathBuf {
+        PathBuf::from(p)
+    }
+
+    #[test]
+    fn dir_with_user_owns_as_user() {
+        let got = pick_download_target(
+            Some(dl("/srv/in")),
+            Some((5, 5)),
+            Some((dl("/home/bob/Downloads"), (1000, 1000))),
+            Some((dl("/home/op/Downloads"), (1001, 1001))),
+        );
+        assert_eq!(got, Some((dl("/srv/in"), Some((1000, 1000)))));
+    }
+
+    #[test]
+    fn dir_without_user_inherits_dir_owner() {
+        let got = pick_download_target(
+            Some(dl("/srv/in")),
+            Some((5, 5)),
+            None,
+            Some((dl("/home/op/Downloads"), (1001, 1001))),
+        );
+        assert_eq!(got, Some((dl("/srv/in"), Some((5, 5)))));
+    }
+
+    #[test]
+    fn user_downloads_when_no_dir() {
+        let got = pick_download_target(
+            None,
+            None,
+            Some((dl("/home/bob/Downloads"), (1000, 1000))),
+            Some((dl("/home/op/Downloads"), (1001, 1001))),
+        );
+        assert_eq!(got, Some((dl("/home/bob/Downloads"), Some((1000, 1000)))));
+    }
+
+    #[test]
+    fn operator_fallback_when_no_dir_or_user() {
+        let got = pick_download_target(
+            None,
+            None,
+            None,
+            Some((dl("/home/op/Downloads"), (1001, 1001))),
+        );
+        assert_eq!(got, Some((dl("/home/op/Downloads"), Some((1001, 1001)))));
+    }
+
+    #[test]
+    fn none_when_nothing_resolves() {
+        assert_eq!(pick_download_target(None, None, None, None), None);
+    }
+}
