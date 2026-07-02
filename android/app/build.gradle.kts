@@ -1,4 +1,5 @@
 import org.gradle.internal.os.OperatingSystem
+import java.io.File
 
 plugins {
     id("com.android.application")
@@ -90,7 +91,16 @@ val cargoNdkBuild = tasks.register<Exec>("cargoNdkBuild") {
         ?: "${System.getenv("ANDROID_HOME") ?: "${System.getProperty("user.home")}/Library/Android/sdk"}/ndk/27.2.12479018"
     environment("ANDROID_NDK_HOME", ndkHome)
 
-    val cargo = if (OperatingSystem.current().isWindows) "cargo.exe" else "cargo"
+    // Android Studio launched from the Dock/Finder does not inherit the shell
+    // PATH, so `cargo` / `cargo-ndk` in ~/.cargo/bin aren't found. Invoke cargo
+    // by absolute path when present, and prepend ~/.cargo/bin to the task's PATH
+    // so cargo can locate its `cargo-ndk` subcommand too.
+    val cargoBin = File(System.getProperty("user.home"), ".cargo/bin")
+    val cargoExe = if (OperatingSystem.current().isWindows) "cargo.exe" else "cargo"
+    val cargo = File(cargoBin, cargoExe).let { if (it.exists()) it.absolutePath else cargoExe }
+    val sep = File.pathSeparator
+    environment("PATH", "${cargoBin.absolutePath}$sep${System.getenv("PATH") ?: ""}")
+
     commandLine(
         cargo, "ndk",
         "-t", "arm64-v8a",
