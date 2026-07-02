@@ -213,7 +213,7 @@ pub(crate) fn render_firewall_rules(
     let mut out = String::from("\n");
     if default.is_some() {
         // The rayfish firewall is separate from (and applies on top of) the host
-        // OS / kernel firewall — both must allow a packet for it to pass.
+        // OS / kernel firewall; both must allow a packet for it to pass.
         out.push_str(&format!(
             "  {}\n\n",
             style::faint("mesh firewall (separate from your host/kernel firewall)")
@@ -223,7 +223,7 @@ pub(crate) fn render_firewall_rules(
         out.push_str(&format!(
             "  {}  {}\n\n",
             style::label("status     "),
-            style::red("disabled — all packets allowed (ray firewall on to re-enable)")
+            style::red("disabled (all packets allowed; ray firewall on to re-enable)")
         ));
     }
     if let Some((inbound, outbound)) = default {

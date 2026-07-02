@@ -405,7 +405,7 @@ impl DaemonState {
         }
     }
 
-    /// `ray firewall on|off` — the global kill switch. `off` sets
+    /// `ray firewall on|off`: the global kill switch. `off` sets
     /// `config.disabled = true` so `evaluate_packet` allows every packet
     /// (rules and defaults are bypassed; the anti-spoof check upstream still
     /// runs). Hot-swaps the live `ArcSwap`, so the effect is immediate.
@@ -465,7 +465,7 @@ impl DaemonState {
         // no network has any `ssh_allow` entry yet, tell the user the next step.
         let has_allow = app_config.networks.iter().any(|n| !n.ssh_allow.is_empty());
         let message = if enabled && !has_allow {
-            "mesh SSH on. No peer is authorized yet — grant access with \
+            "mesh SSH on. No peer is authorized yet. Grant access with \
              `ray firewall ssh allow <network> <peer>` (peer = hostname / mesh IP / \
              short id, or `*` for any peer on the network)."
                 .to_string()
