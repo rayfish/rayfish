@@ -265,18 +265,20 @@ impl DaemonState {
             return;
         }
 
-        // Save to the operator's Downloads (the daemon runs as root, so its own
-        // ~/Downloads is the wrong target). Fall back to the daemon default when
-        // no operator is configured.
-        let (output, cred) = match resolve_operator_target() {
-            Some((uid, gid, dir)) => (Some(dir.to_string_lossy().into_owned()), Some((uid, gid))),
+        // Placement must be explicitly resolvable (download-dir / download-user /
+        // operator). With none configured we do not write as root: leave the
+        // offer queued for manual `ray files accept`.
+        let (dir, cred) = match resolve_download_target() {
+            Some((dir, cred)) => (dir, cred),
             None => {
                 tracing::warn!(
-                    "auto-accept: no operator configured; saving to daemon default (no chown)"
+                    from = %from.fmt_short(),
+                    "auto-accept: no download target configured (set `ray files download-dir` or `download-user`); leaving offer queued"
                 );
-                (None, None)
+                return;
             }
         };
+        let output = Some(dir.to_string_lossy().into_owned());
 
         match self.accept_file(id, output, cred).await {
             IpcMessage::Ok { message } => {
@@ -453,29 +455,47 @@ impl DaemonState {
     }
 }
 
-/// Resolve the target for an auto-accepted file: the configured operator's
-/// uid, gid, and `~/Downloads`. The daemon runs as root, so its own home is the
-/// wrong place; auto-accepted files should land in the operator's Downloads and
-/// be owned by them. Returns `None` when no operator is configured or the uid
-/// can't be resolved to a passwd entry.
-fn resolve_operator_target() -> Option<(u32, u32, PathBuf)> {
-    let uid = config::load().ok()?.operator_uid?;
-    // SAFETY: getpwuid returns a pointer into a static buffer; we copy the
-    // fields out immediately before any other libc call can clobber it.
+/// (gid, home) for a uid via the passwd db, or None if it can't be resolved.
+fn pw_gid_home(uid: u32) -> Option<(u32, PathBuf)> {
+    // SAFETY: getpwuid returns a pointer into a static buffer; copy fields out
+    // immediately before any other libc call can clobber it.
     unsafe {
         let pw = libc::getpwuid(uid);
-        if pw.is_null() {
+        if pw.is_null() || (*pw).pw_dir.is_null() {
             return None;
         }
         let gid = (*pw).pw_gid;
-        if (*pw).pw_dir.is_null() {
-            return None;
-        }
         let home = std::ffi::CStr::from_ptr((*pw).pw_dir)
             .to_string_lossy()
             .into_owned();
-        Some((uid, gid, PathBuf::from(home).join("Downloads")))
+        Some((gid, PathBuf::from(home)))
     }
+}
+
+/// A uid's ~/Downloads plus its (uid, gid) owner, if the uid resolves.
+fn user_downloads(uid: u32) -> Option<(PathBuf, (u32, u32))> {
+    let (gid, home) = pw_gid_home(uid)?;
+    Some((home.join("Downloads"), (uid, gid)))
+}
+
+/// (uid, gid) that currently owns `path`, if it exists.
+fn dir_owner(path: &std::path::Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.uid(), m.gid()))
+}
+
+/// Resolve the auto-accept target from live config, applying the precedence in
+/// [`pick_download_target`]. `None` means "no configured target": the caller
+/// must leave the offer queued rather than writing as root. The daemon runs as
+/// root, so its own `~/Downloads` is never a valid fallback.
+fn resolve_download_target() -> Option<(PathBuf, Option<(u32, u32)>)> {
+    let cfg = config::load().ok()?;
+    let dir = cfg.download_dir.map(PathBuf::from);
+    let dir_owned = dir.as_deref().and_then(dir_owner);
+    let user = cfg.download_user.and_then(user_downloads);
+    let operator = cfg.operator_uid.and_then(user_downloads);
+    pick_download_target(dir, dir_owned, user, operator)
 }
 
 /// Decide the auto-accept target `(dir, owner)` from resolved inputs. Pure so
