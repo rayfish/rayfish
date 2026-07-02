@@ -310,6 +310,11 @@ pub enum IpcMessage {
     StatusResponse {
         endpoint_id: EndpointId,
         mdns_enabled: bool,
+        /// Whether this node opted into automatic stable updates. Reflects the
+        /// running daemon's setting (which can differ from on-disk config until a
+        /// restart). Defaulted so an older CLI/daemon pair still deserializes.
+        #[serde(default)]
+        auto_update: bool,
         /// Whether the VPN is active (TUN up, networks connected) or on standby.
         active: bool,
         /// This node's contact id (`ray connect`), shown at the top of status.
@@ -918,6 +923,7 @@ mod tests {
         let resp = IpcMessage::StatusResponse {
             endpoint_id: ep_id,
             mdns_enabled: true,
+            auto_update: false,
             active: true,
             contact_id: Some("contact123".to_string()),
             daemon_version: "0.1.0".to_string(),

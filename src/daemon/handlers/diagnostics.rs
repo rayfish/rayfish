@@ -27,6 +27,7 @@ impl DaemonState {
         IpcMessage::StatusResponse {
             endpoint_id: self.endpoint.id(),
             mdns_enabled: self.mdns_enabled,
+            auto_update: self.auto_update,
             active: self.active.load(Ordering::SeqCst),
             contact_id: Some(self.contact_public.to_string()),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -67,7 +68,10 @@ impl DaemonState {
         let lookup_hostname = |ip| {
             hostname_snapshot.and_then(|table| {
                 table.get(&h.name).and_then(|hosts| {
-                    hosts.iter().find(|(_, v)| v.0 == ip).map(|(k, _)| k.clone())
+                    hosts
+                        .iter()
+                        .find(|(_, v)| v.0 == ip)
+                        .map(|(k, _)| k.clone())
                 })
             })
         };
@@ -92,7 +96,12 @@ impl DaemonState {
                 }
             };
             let count = s.members.all().len();
-            (s.roster(), count, s.pending_suggestions.len(), s.pending.len())
+            (
+                s.roster(),
+                count,
+                s.pending_suggestions.len(),
+                s.pending.len(),
+            )
         };
         // Index live connections by endpoint id for a fast lookup.
         let connected: HashMap<EndpointId, Connection> = self
@@ -339,9 +348,7 @@ impl DaemonState {
             Some(r) => r,
             None => {
                 return IpcMessage::Error {
-                    message: format!(
-                        "{display} is not connected (no live mesh link to {ip})"
-                    ),
+                    message: format!("{display} is not connected (no live mesh link to {ip})"),
                 };
             }
         };
@@ -449,5 +456,4 @@ impl DaemonState {
             udp,
         }
     }
-
 }

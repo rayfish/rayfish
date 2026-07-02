@@ -396,7 +396,11 @@ impl DaemonState {
         IpcMessage::PairingTicket { ticket }
     }
 
-    pub(crate) async fn pair_with_device(&self, endpoint_id: EndpointId, secret: Vec<u8>) -> IpcMessage {
+    pub(crate) async fn pair_with_device(
+        &self,
+        endpoint_id: EndpointId,
+        secret: Vec<u8>,
+    ) -> IpcMessage {
         let addr: iroh::EndpointAddr = endpoint_id.into();
         let conn = match self.endpoint.connect(addr, PAIR_ALPN).await {
             Ok(c) => c,

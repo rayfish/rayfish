@@ -82,6 +82,7 @@ use crate::peers::{self, PeerTable};
 use crate::stats::ForwardMetrics;
 use crate::transport;
 use crate::tun::{self, check_cgnat_conflict};
+use crate::update;
 use ray_proto::SuggestedFirewall;
 
 // `DaemonState`'s IPC handlers are split by domain into the `handlers/`
@@ -200,9 +201,13 @@ impl CoordinatorAcceptState {
         tracing::info!(ip = %peer_ip, "known member reconnecting");
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
         let peer_ipv6 = derive_ipv6(&remote_id);
-        self.ctx
-            .peers
-            .add(peer_ip, peer_ipv6, conn.clone(), remote_id, &self.network_name);
+        self.ctx.peers.add(
+            peer_ip,
+            peer_ipv6,
+            conn.clone(),
+            remote_id,
+            &self.network_name,
+        );
         let token = self.token.clone();
         let disconnect_tx = self.disconnect_tx.clone();
         let network = self.network_name.clone();
@@ -288,7 +293,9 @@ impl CoordinatorAcceptState {
                 tracing::warn!(peer = %remote_id.fmt_short(), "invalid device certificate");
                 return;
             }
-            self.ctx.device_user_map.insert(remote_id, cert.user_identity);
+            self.ctx
+                .device_user_map
+                .insert(remote_id, cert.user_identity);
         }
 
         // A peer pre-approved via `ray accept` is admitted directly.
@@ -312,7 +319,13 @@ impl CoordinatorAcceptState {
         // Unknown peer presenting an invite secret: verify and burn it.
         if let Some(secret) = invite_secret {
             self.redeem_invite_and_admit(
-                conn, send, remote_id, peer_ip, hostname, device_cert, secret,
+                conn,
+                send,
+                remote_id,
+                peer_ip,
+                hostname,
+                device_cert,
+                secret,
             )
             .await;
             return;
@@ -448,7 +461,14 @@ impl CoordinatorAcceptState {
                     // Reusable joins are non-authoritative: joiner-chosen name,
                     // collision → suffix.
                     self.admit_peer(
-                        conn, send, remote_id, peer_ip, hostname, device_cert, false, false,
+                        conn,
+                        send,
+                        remote_id,
+                        peer_ip,
+                        hostname,
+                        device_cert,
+                        false,
+                        false,
                     )
                     .await;
                 } else {
@@ -665,9 +685,13 @@ impl MemberAcceptState {
     /// branches of `handle_connection`.
     fn register_peer(&self, conn: Connection, peer_identity: EndpointId, ip: Ipv4Addr) {
         let peer_ipv6 = derive_ipv6(&peer_identity);
-        self.ctx
-            .peers
-            .add(ip, peer_ipv6, conn.clone(), peer_identity, &self.network_name);
+        self.ctx.peers.add(
+            ip,
+            peer_ipv6,
+            conn.clone(),
+            peer_identity,
+            &self.network_name,
+        );
         forward::spawn_peer_reader(
             conn,
             peer_identity,
@@ -710,7 +734,8 @@ impl MemberAcceptState {
             return;
         };
         if let Some(ref cert) = device_cert {
-            self.ctx.device_user_map
+            self.ctx
+                .device_user_map
                 .insert(transport_id, cert.user_identity);
         }
         let _ = effective_user_id;
@@ -944,11 +969,24 @@ impl ProtocolRouter {
         match conn.accept_bi().await {
             Ok((_send, mut recv)) => {
                 match control::recv_msg(&mut recv).await {
-                    Ok(control::ControlMsg::FileOffer { from, filename, size, mime_type, blob_hash }) => {
+                    Ok(control::ControlMsg::FileOffer {
+                        from,
+                        filename,
+                        size,
+                        mime_type,
+                        blob_hash,
+                    }) => {
                         if from == remote_id {
                             let id = counter.fetch_add(1, Ordering::Relaxed);
                             tracing::info!(from = %from.fmt_short(), filename = %filename, size, "file offer received");
-                            pending.lock().unwrap().push(PendingFile { id, from, filename, size, mime_type, blob_hash });
+                            pending.lock().unwrap().push(PendingFile {
+                                id,
+                                from,
+                                filename,
+                                size,
+                                mime_type,
+                                blob_hash,
+                            });
                             // Nudge the auto-accept worker; it decides whether the
                             // sender is one of our own devices on an enabled network.
                             let _ = self.new_file_tx.send(id);
@@ -999,7 +1037,10 @@ impl ProtocolRouter {
                     }
                 };
                 match request {
-                    control::PairMsg::Request { secret, device_pubkey } => {
+                    control::PairMsg::Request {
+                        secret,
+                        device_pubkey,
+                    } => {
                         // Verify the secret matches the stored pairing secret
                         let stored = pairing_secret.lock().unwrap().take();
                         match stored {
@@ -1029,11 +1070,8 @@ impl ProtocolRouter {
                                 // "connection lost" and never receives the cert even though we
                                 // logged success below.
                                 let _ = send.finish();
-                                let _ = tokio::time::timeout(
-                                    Duration::from_secs(5),
-                                    conn.closed(),
-                                )
-                                .await;
+                                let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+                                    .await;
                                 tracing::info!(device = %device_pubkey.fmt_short(), "device paired successfully");
                             }
                             Some(_) => {
@@ -1071,26 +1109,43 @@ impl ProtocolRouter {
                         return;
                     }
                 };
-                if let control::ConnectMsg::Request { from_contact_id, from_endpoint, hostname } = request {
+                if let control::ConnectMsg::Request {
+                    from_contact_id,
+                    from_endpoint,
+                    hostname,
+                } = request
+                {
                     // Bind the request to the dialing identity: the
                     // endpoint we pre-approve must be the one that dialed.
                     if from_endpoint != remote_id {
                         tracing::warn!(claimed = %from_endpoint.fmt_short(), actual = %remote_id.fmt_short(), "connect request endpoint mismatch");
-                        let _ = control::send_framed(&mut send, &control::ConnectMsg::Denied { reason: "endpoint mismatch".to_string() }).await;
+                        let _ = control::send_framed(
+                            &mut send,
+                            &control::ConnectMsg::Denied {
+                                reason: "endpoint mismatch".to_string(),
+                            },
+                        )
+                        .await;
                         return;
                     }
                     // Already approved? Reply with the minted room id so
                     // a re-dialing requester joins it (idempotent).
                     let already = approved.get(&from_endpoint).map(|r| *r.value());
                     let reply = if let Some((room_id, coordinator)) = already {
-                        control::ConnectMsg::Approved { room_id, coordinator }
+                        control::ConnectMsg::Approved {
+                            room_id,
+                            coordinator,
+                        }
                     } else {
-                        pending.insert(from_endpoint, PendingConnect {
-                            from_contact_id,
+                        pending.insert(
                             from_endpoint,
-                            hostname,
-                            requested_at: Instant::now(),
-                        });
+                            PendingConnect {
+                                from_contact_id,
+                                from_endpoint,
+                                hostname,
+                                requested_at: Instant::now(),
+                            },
+                        );
                         tracing::info!(from = %from_contact_id.fmt_short(), endpoint = %from_endpoint.fmt_short(), "connect request received");
                         control::ConnectMsg::Pending
                     };
@@ -1294,6 +1349,10 @@ pub struct DaemonState {
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
     mdns_enabled: bool,
+    /// Whether this node opted into automatic stable updates (`ray auto-update
+    /// on` / `ray install --auto-update`). Read at startup; when set, `run_daemon`
+    /// spawns the periodic update task. Echoed back in `ray status`.
+    auto_update: bool,
     tun_name: String,
     pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
     device_cert: Option<control::DeviceCert>,
@@ -1475,7 +1534,10 @@ impl DaemonState {
     /// Identity is taken from the connecting socket's `SO_PEERCRED` (the kernel
     /// vouches for it — it can't be forged by the client), so the socket file
     /// mode only has to permit the connection, not gate authority.
-    pub(crate) fn check_authorized(req: &IpcMessage, peer_cred: Option<(u32, u32)>) -> Option<IpcMessage> {
+    pub(crate) fn check_authorized(
+        req: &IpcMessage,
+        peer_cred: Option<(u32, u32)>,
+    ) -> Option<IpcMessage> {
         // Reads are available to everyone.
         if matches!(
             req,
@@ -1878,7 +1940,6 @@ impl DaemonState {
         }
         Ok((handle.network_key, handle.invite_lock.clone()))
     }
-
 }
 
 fn guess_mime_type(filename: &str) -> String {
@@ -1964,6 +2025,12 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // node stays online to peers.
     daemon.connect_all_networks().await;
     daemon.activate(None).await;
+
+    // Opt-in automatic updates: a single daemon-wide task that periodically
+    // checks for a newer stable release and swaps + restarts onto it.
+    if daemon.auto_update {
+        spawn_auto_update(daemon.shutdown_token.clone());
+    }
 
     let result = serve_ipc(&daemon, promote_rx, token).await;
 
@@ -2113,6 +2180,7 @@ async fn build_daemon(
     } else {
         tracing::info!("mDNS discovery disabled");
     }
+    let auto_update = app_config.auto_update;
 
     // --- Protocol router + the shared DaemonState ---
     let pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>> =
@@ -2144,6 +2212,7 @@ async fn build_daemon(
         hostname_table,
         reverse_table,
         mdns_enabled,
+        auto_update,
         tun_name,
         pairing_secret,
         device_cert,
@@ -2167,11 +2236,7 @@ async fn build_daemon(
 
     // --- Contact record publisher (ray connect) ---
     if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
-        spawn_contact_publisher(
-            pkarr_client,
-            daemon.endpoint.id(),
-            token.clone(),
-        );
+        spawn_contact_publisher(pkarr_client, daemon.endpoint.id(), token.clone());
     }
     let metrics_server =
         spawn_metrics_server(stats, daemon.peers.clone(), &daemon.endpoint, token).await;
@@ -2743,7 +2808,10 @@ fn prune_departed_peers(
         }
         tracing::info!(peer = %peer_id.fmt_short(), network = %network_name, "pruning peer no longer in roster");
         pruned_peers.insert((network_name.to_string(), peer_id));
-        conn.close(VarInt::from_u32(forward::KICK_CODE), b"removed from network");
+        conn.close(
+            VarInt::from_u32(forward::KICK_CODE),
+            b"removed from network",
+        );
         peers.remove_peer_from_network(&ip, &derive_ipv6(&peer_id), network_name);
     }
 }
@@ -2865,6 +2933,103 @@ fn persisted_roster(network_name: &str) -> Vec<Member> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// How long after boot the first auto-update check runs (avoids racing startup
+/// and lets a just-restarted daemon settle before it may restart again).
+const AUTO_UPDATE_INITIAL_DELAY: Duration = Duration::from_secs(300);
+/// Base interval between auto-update checks.
+const AUTO_UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Don't retry the *same* target release within this window (restart-loop guard).
+const AUTO_UPDATE_BACKOFF_SECS: i64 = 24 * 60 * 60;
+
+/// Opt-in auto-updater (`ray auto-update on` / `ray install --auto-update`): a
+/// single daemon-wide task that periodically resolves the latest **stable**
+/// release and, when it is newer than this build, downloads + verifies + swaps
+/// the binary and restarts the service onto it. Errors are logged and never
+/// propagated — this task must never crash the daemon. Nightlies are never
+/// auto-installed.
+fn spawn_auto_update(token: CancellationToken) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // Jitter each tick so a fleet upgraded together doesn't hit the GitHub
+        // API in lockstep (anonymous limit is 60/hr per IP).
+        let first = AUTO_UPDATE_INITIAL_DELAY + Duration::from_secs(rand::random::<u64>() % 300);
+        tokio::select! {
+            _ = token.cancelled() => return,
+            _ = tokio::time::sleep(first) => {}
+        }
+        loop {
+            if let Err(e) = auto_update_once().await {
+                tracing::warn!(error = %e, "auto-update check failed");
+            }
+            let next = AUTO_UPDATE_INTERVAL + Duration::from_secs(rand::random::<u64>() % 300);
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = tokio::time::sleep(next) => {}
+            }
+        }
+    })
+}
+
+/// One auto-update cycle: check for a newer stable release and, if found and not
+/// backed off, swap the binary and trigger a self-restart. `Ok(())` means nothing
+/// needed doing (or the swap+restart was scheduled — the daemon is torn down and
+/// relaunched onto the new binary shortly after).
+async fn auto_update_once() -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let asset = update::release_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
+    let client = update::build_http_client()?;
+    let token = update::github_token();
+
+    let release = update::resolve_stable_release(&client, &token).await?;
+    let tag = release.tag_name.clone();
+    let latest = update::normalize_version(&tag).to_string();
+    if !update::version_is_newer(&latest, current) {
+        tracing::debug!(current, latest = %latest, "auto-update: already on latest stable");
+        return Ok(());
+    }
+
+    // Restart-loop guard: refuse a repeat of the same target inside the backoff
+    // window so a bad build that keeps mis-reporting its version can't tight-loop
+    // download + restart.
+    let mut cfg = config::load()?;
+    let now = unix_now();
+    if !update::should_attempt_target(
+        &tag,
+        cfg.auto_update_last_target.as_deref(),
+        cfg.auto_update_last_attempt,
+        now,
+        AUTO_UPDATE_BACKOFF_SECS,
+    ) {
+        tracing::warn!(target = %tag, "auto-update: recently attempted this target, backing off");
+        return Ok(());
+    }
+
+    // Record the attempt *before* swapping so a crash mid-swap still counts
+    // against the backoff; it survives the restart via settings.toml.
+    cfg.auto_update_last_target = Some(tag.clone());
+    cfg.auto_update_last_attempt = Some(now);
+    if let Err(e) = config::save_settings(&cfg) {
+        tracing::warn!(error = %e, "auto-update: failed to persist attempt marker");
+    }
+
+    tracing::info!(current, target = %tag, "auto-update: found newer stable release, swapping");
+    let expected = update::fetch_checksum(&client, &tag, &asset).await?;
+    let bin_url = update::asset_download_url(&tag, &asset);
+    update::download_and_swap(&client, &bin_url, &expected, &asset).await?;
+
+    tracing::info!(target = %tag, "auto-update: binary swapped, restarting service onto it");
+    update::trigger_detached_restart();
+    Ok(())
+}
+
+/// Current unix time in whole seconds (best-effort; 0 before the epoch, which
+/// never happens in practice).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn spawn_group_poller(
@@ -3903,10 +4068,17 @@ async fn join_mesh_shared(
                     _ = tokio::time::sleep(Duration::from_millis(300)) => {}
                 }
                 reconverge_and_apply(
-                    &endpoint_w, &ctx_w, net_pubkey_w,
-                    &network_name, &live_state, my_identity_w,
-                    &alpn_w, my_ip_w, &device_cert_w,
-                ).await;
+                    &endpoint_w,
+                    &ctx_w,
+                    net_pubkey_w,
+                    &network_name,
+                    &live_state,
+                    my_identity_w,
+                    &alpn_w,
+                    my_ip_w,
+                    &device_cert_w,
+                )
+                .await;
             }
         }
     });
@@ -4146,7 +4318,10 @@ fn spawn_reconnect_loop(
             // and closed the connection ourselves — that close is what woke this
             // loop. The peer still lists us, so re-dialing would re-form the link.
             // Consume the one-shot suppression entry and skip.
-            if pruned_peers.remove(&(network_name.clone(), peer_id)).is_some() {
+            if pruned_peers
+                .remove(&(network_name.clone(), peer_id))
+                .is_some()
+            {
                 tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "peer removed from roster, not reconnecting");
                 continue;
             }

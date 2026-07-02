@@ -151,7 +151,11 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 "off" | "false" | "no" => false,
                 other => anyhow::bail!("expected `on` or `off`, got '{other}'"),
             };
-            ipc::send(&mut stream, ipc::IpcMessage::FilesAutoAccept { network, enabled }).await?;
+            ipc::send(
+                &mut stream,
+                ipc::IpcMessage::FilesAutoAccept { network, enabled },
+            )
+            .await?;
             let resp = ipc::recv(&mut stream).await?;
             match resp {
                 ipc::IpcMessage::Ok { message } => {
@@ -176,4 +180,3 @@ pub(crate) fn format_size(bytes: u64) -> String {
 // ---------------------------------------------------------------------------
 // Device pairing
 // ---------------------------------------------------------------------------
-

@@ -1144,10 +1144,7 @@ mod tests {
         // Mesh IPv4 literal -> the member's device id.
         assert_eq!(list.resolve_peer_literal(&ip.to_string()), Some(device));
         // Full device identity -> itself.
-        assert_eq!(
-            list.resolve_peer_literal(&device.to_string()),
-            Some(device)
-        );
+        assert_eq!(list.resolve_peer_literal(&device.to_string()), Some(device));
         // Paired user identity -> the user's joined device id (not the user id).
         assert_eq!(list.resolve_peer_literal(&user.to_string()), Some(device));
 

@@ -105,7 +105,11 @@ impl DaemonState {
     }
 
     /// Restores a coordinator network from saved config (uses the existing name).
-    pub(crate) async fn restore_coordinator_network(&self, name: &str, mode: GroupMode) -> Result<IpcMessage> {
+    pub(crate) async fn restore_coordinator_network(
+        &self,
+        name: &str,
+        mode: GroupMode,
+    ) -> Result<IpcMessage> {
         {
             if self.networks.contains_key(name) {
                 return Ok(IpcMessage::Error {
@@ -182,9 +186,7 @@ impl DaemonState {
             auto_accept_firewall: net_config
                 .map(|nc| nc.auto_accept_firewall)
                 .unwrap_or(false),
-            auto_accept_files: net_config
-                .map(|nc| nc.auto_accept_files)
-                .unwrap_or(false),
+            auto_accept_files: net_config.map(|nc| nc.auto_accept_files).unwrap_or(false),
             admins: net_config.map(|nc| nc.admins.clone()).unwrap_or_default(),
             direct: net_config.map(|nc| nc.direct).unwrap_or(false),
             ssh_allow: net_config
@@ -197,8 +199,13 @@ impl DaemonState {
         let state = Arc::new(RwLock::new(net_state));
         let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
         let dht_notify = Arc::new(tokio::sync::Notify::new());
-        let (tasks, disconnect_tx) =
-            self.spawn_coordinator_background_tasks(name, &net_secret_key, &state, &dht_notify, &cancel);
+        let (tasks, disconnect_tx) = self.spawn_coordinator_background_tasks(
+            name,
+            &net_secret_key,
+            &state,
+            &dht_notify,
+            &cancel,
+        );
 
         self.register_coordinator_handler(
             name,
@@ -410,7 +417,9 @@ impl DaemonState {
                     m.identity,
                     m.ip,
                     m.is_coordinator,
-                    m.hostname.clone().unwrap_or_else(|| m.identity.fmt_short().to_string()),
+                    m.hostname
+                        .clone()
+                        .unwrap_or_else(|| m.identity.fmt_short().to_string()),
                 ),
                 None => {
                     return IpcMessage::Error {
@@ -592,10 +601,7 @@ impl DaemonState {
             self.device_user_map.clone(),
             self.ssh_authz.clone(),
         );
-        server.spawn(
-            vec![IpAddr::V4(my_v4), IpAddr::V6(my_v6)],
-            token,
-        );
+        server.spawn(vec![IpAddr::V4(my_v4), IpAddr::V6(my_v6)], token);
         // Turn on the userspace port NAT so mesh `:22` reaches the listener.
         crate::forward::set_ssh_nat_active(true);
     }
@@ -825,5 +831,4 @@ impl DaemonState {
             }
         }
     }
-
 }

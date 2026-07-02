@@ -1,52 +1,20 @@
-//! CLI self-update + GitHub release plumbing and small process helpers.
+//! CLI self-update: presentation + release-selection wrapper over the shared
+//! [`rayfish::update`] engine, plus small process helpers. The pure GitHub-release
+//! plumbing (asset naming, version compare, checksum fetch, download + swap)
+//! lives in the library so the daemon's auto-updater can reuse it; this file
+//! adds spinners, changelog printing, root checks, and the service restart.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::Error;
-use reqwest::{Client, RequestBuilder};
-use semver::Version;
+use reqwest::Client;
 
 use crate::*;
-
-/// Map the host OS/arch to the release asset name CI publishes
-/// (`ray-{os}-{arch}`, e.g. `ray-linux-x86_64`). Errors on platforms we don't
-/// build binaries for, so the user falls back to building from source.
-pub(crate) fn release_asset_name(os: &str, arch: &str) -> Result<String> {
-    let os = match os {
-        "linux" => "linux",
-        "macos" => "macos",
-        other => anyhow::bail!("no rayfish release binary for OS '{other}'; build from source"),
-    };
-    let arch = match arch {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
-        other => {
-            anyhow::bail!("no rayfish release binary for architecture '{other}'; build from source")
-        }
-    };
-    Ok(format!("ray-{os}-{arch}"))
-}
-
-/// Strip a leading `v` from a release tag for comparison with
-/// `CARGO_PKG_VERSION` (`v0.1.0` → `0.1.0`).
-pub(crate) fn normalize_version(tag: &str) -> &str {
-    tag.strip_prefix('v').unwrap_or(tag)
-}
-
-/// Whether `latest` is a strictly newer semver than `current`. Falls back to a
-/// plain string inequality if either side fails to parse, so an unusual tag
-/// still triggers an update rather than being silently ignored.
-pub(crate) fn version_is_newer(latest: &str, current: &str) -> bool {
-    match (
-        Version::parse(latest),
-        Version::parse(current),
-    ) {
-        (Ok(l), Ok(c)) => l > c,
-        _ => latest != current,
-    }
-}
+use rayfish::update::{
+    GhRelease, REPO_SLUG, authed, download_and_swap, fetch_checksum, github_token,
+    normalize_version, release_asset_name, sha256_hex, version_is_newer,
+};
 
 /// Whether a sibling temp file can be created in `dir` (i.e. it is writable by
 /// us). `self_replace` writes a temp next to the running binary then renames, so
@@ -60,25 +28,6 @@ pub(crate) fn dir_writable(dir: &Path) -> bool {
         }
         Err(_) => false,
     }
-}
-
-#[derive(serde::Deserialize)]
-pub(crate) struct GhRelease {
-    tag_name: String,
-    /// The release's display name. For the rolling nightly this carries the
-    /// source commit (`nightly (abc12345)`), so we surface it instead of the
-    /// bare `nightly` tag.
-    #[serde(default)]
-    name: Option<String>,
-    /// Whether GitHub marks this a pre-release (nightlies and `-rc`/`-` tags),
-    /// used to annotate `ray update --list`.
-    #[serde(default)]
-    prerelease: bool,
-    /// The release notes (git-cliff renders these from conventional commits in
-    /// `release.yml`). Printed by `ray update` so the user sees what each pending
-    /// version changes; `None`/empty for releases without notes.
-    #[serde(default)]
-    body: Option<String>,
 }
 
 /// Print one release's notes, indented under its tag. A blank or missing body
@@ -110,7 +59,13 @@ pub(crate) async fn print_pending_changelog(
     // surface its body. (A semver walk doesn't apply: nightlies share a version,
     // and a pinned target may be a downgrade.)
     if nightly || pinned {
-        if release.body.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        if release
+            .body
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
             return;
         }
         println!("\nRelease notes for {}:", release.tag_name);
@@ -148,53 +103,6 @@ pub(crate) async fn print_pending_changelog(
         print_release_notes(&r.tag_name, r.body.as_deref());
     }
     println!();
-}
-
-/// SHA-256 of a byte slice as lowercase hex — used both to verify a download
-/// and to fingerprint the running binary on the nightly channel.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
-
-/// A GitHub token for authenticating REST API calls, which lifts the
-/// unauthenticated 60-request/hour-per-IP rate limit to 5000/hour. Prefers an
-/// explicit env var (the same `GH_TOKEN`/`GITHUB_TOKEN` precedence `gh` uses),
-/// then falls back to the `gh` CLI's stored credential when it is installed and
-/// logged in. Returns `None` if no token is available, leaving calls anonymous.
-pub(crate) fn github_token() -> Option<String> {
-    for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
-        if let Ok(v) = std::env::var(var) {
-            let v = v.trim().to_string();
-            if !v.is_empty() {
-                return Some(v);
-            }
-        }
-    }
-    // `gh auth token` prints the active token to stdout (and exits non-zero if
-    // `gh` is unauthenticated). A missing `gh` makes `output()` error → `None`.
-    let out = Command::new("gh")
-        .args(["auth", "token"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let token = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    (!token.is_empty()).then_some(token)
-}
-
-/// Attach `Authorization: Bearer <token>` to a GitHub REST request when a token
-/// is present; otherwise leave the request anonymous. Only used for the
-/// api.github.com calls — the release-asset downloads on github.com aren't
-/// subject to the API rate limit and are left unauthenticated.
-pub(crate) fn authed(req: RequestBuilder, token: &Option<String>) -> RequestBuilder {
-    match token {
-        Some(t) => req.bearer_auth(t),
-        None => req,
-    }
 }
 
 /// `ray update`: replace this binary with a GitHub release and, if the system
@@ -279,7 +187,10 @@ pub(crate) async fn cmd_update(
     let latest = normalize_version(&tag);
     // Human label for messages: nightly carries its commit in the release name.
     let remote_label = if nightly {
-        release.name.clone().unwrap_or_else(|| "nightly".to_string())
+        release
+            .name
+            .clone()
+            .unwrap_or_else(|| "nightly".to_string())
     } else {
         format!("v{latest}")
     };
@@ -289,32 +200,9 @@ pub(crate) async fn cmd_update(
     // downloading the whole binary.
     let base = format!("https://github.com/{REPO_SLUG}/releases/download/{tag}");
     let bin_url = format!("{base}/{asset}");
-    let sha_url = format!("{bin_url}.sha256");
     let spinner = progress::spinner("checking for updates…");
-    let sha_text = (async {
-        client
-            .get(&sha_url)
-            .send()
-            .await?
-            .error_for_status()
-            .with_context(|| format!("no checksum at {sha_url}"))?
-            .text()
-            .await
-            .map_err(Error::from)
-    })
-    .await
-    .context("failed to fetch the published checksum")?;
+    let expected = fetch_checksum(&client, &tag, &asset).await?;
     spinner.finish_and_clear();
-
-    // The first whitespace field of the `.sha256` is the digest.
-    let expected = sha_text
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
-    if expected.is_empty() {
-        anyhow::bail!("no checksum published for {asset}; aborting for safety");
-    }
 
     // "Up to date?" — a pinned version is "current" only if it equals what we
     // run (so `--version` can downgrade); nightly compares the running binary's
@@ -390,11 +278,7 @@ pub(crate) async fn cmd_update(
 
 /// `ray update --list`: enumerate published releases (newest first) and exit.
 /// No root, no install.
-async fn cmd_update_list(
-    client: &Client,
-    token: &Option<String>,
-    current: &str,
-) -> Result<()> {
+async fn cmd_update_list(client: &Client, token: &Option<String>, current: &str) -> Result<()> {
     let spinner = progress::spinner("fetching releases…");
     let api = format!("https://api.github.com/repos/{REPO_SLUG}/releases?per_page=30");
     let releases: Vec<GhRelease> = (async {
@@ -448,45 +332,12 @@ async fn download_verify_and_install(
         require_root()?;
     }
 
-    // Download the binary from the same tagged release (the checksum was already
-    // fetched above to make the up-to-date decision).
+    // Download, verify against the (already-fetched) checksum, and atomically
+    // swap the running binary — the shared engine handles all three.
     let spinner = progress::spinner(format!("downloading {asset} ({remote_label})…"));
-    let bytes = (async {
-        client
-            .get(bin_url)
-            .send()
-            .await?
-            .error_for_status()
-            .with_context(|| format!("no release asset at {bin_url}"))?
-            .bytes()
-            .await
-            .map_err(Error::from)
-    })
-    .await;
+    let res = download_and_swap(client, bin_url, expected, asset).await;
     spinner.finish_and_clear();
-    let bytes = bytes.context("download failed")?;
-
-    // Verify the download against the checksum we already fetched and validated.
-    let actual = sha256_hex(&bytes);
-    if actual != expected {
-        anyhow::bail!(
-            "checksum mismatch for {asset}\n  expected: {expected}\n  got:      {actual}"
-        );
-    }
-
-    // Stage the new binary in a temp file, make it executable, then atomically
-    // swap it in for the running binary (handles the "can't overwrite a running
-    // executable" problem via rename).
-    let tmp = std::env::temp_dir().join(format!("{asset}.new"));
-    std::fs::write(&tmp, &bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-            .context("failed to set executable permissions on the downloaded binary")?;
-    }
-    self_replace::self_replace(&tmp).context("failed to replace the running binary")?;
-    let _ = std::fs::remove_file(&tmp);
+    res?;
 
     println!("updated rayfish v{current} → {remote_label}");
 
@@ -622,4 +473,3 @@ pub(crate) fn cmd_uninstall_service() -> Result<()> {
         anyhow::bail!("service uninstallation not supported on this platform");
     }
 }
-

@@ -140,7 +140,12 @@ pub(crate) enum Command {
     /// Uninstall system service
     Uninstall,
     /// Install or refresh the system service and start it (requires root)
-    Install,
+    Install {
+        /// Opt this node into automatic stable updates: the daemon periodically
+        /// checks for a newer stable release and swaps + restarts onto it
+        #[arg(long)]
+        auto_update: bool,
+    },
     /// Restart the system service (requires root)
     Restart,
     /// Generate shell completions
@@ -273,6 +278,12 @@ pub(crate) enum Command {
     },
     /// Enable or disable mDNS local peer discovery
     Mdns {
+        /// "on" or "off"
+        state: String,
+    },
+    /// Enable or disable automatic stable updates (applied by the daemon)
+    #[command(name = "auto-update")]
+    AutoUpdate {
         /// "on" or "off"
         state: String,
     },
@@ -972,7 +983,7 @@ async fn main() -> Result<()> {
         Command::Stop => cmd_stop().await,
         Command::Start => cmd_start().await,
         Command::Uninstall => cmd_uninstall_service(),
-        Command::Install => cmd_install().await,
+        Command::Install { auto_update } => cmd_install(auto_update).await,
         Command::Restart => cmd_restart().await,
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "ray", &mut std::io::stdout());
@@ -1009,6 +1020,7 @@ async fn main() -> Result<()> {
         }
         Command::Alias { network, action } => cmd_alias(&network, action, cli.json).await,
         Command::Mdns { state } => cmd_mdns(&state),
+        Command::AutoUpdate { state } => cmd_auto_update(&state),
         Command::Config { action } => cmd_config(action, cli.json),
         Command::SetOperator { user } => cmd_set_operator(&user).await,
         Command::Send { file, peer } => ipc_send_file(&file, &peer).await,
@@ -1051,6 +1063,28 @@ fn cmd_mdns(state: &str) -> Result<()> {
     Ok(())
 }
 
+/// `ray auto-update on|off`: toggle opt-in automatic stable updates. Writes
+/// `settings.toml` directly (like `cmd_mdns`); the daemon reads it at startup, so
+/// the change takes effect on the next daemon restart.
+fn cmd_auto_update(state: &str) -> Result<()> {
+    let enabled = match state {
+        "on" => true,
+        "off" => false,
+        _ => {
+            eprintln!("Usage: ray auto-update <on|off>");
+            std::process::exit(1);
+        }
+    };
+    let mut app_config = config::load()?;
+    app_config.auto_update = enabled;
+    config::save_settings(&app_config)?;
+    println!(
+        "automatic updates {}. Restart the daemon for changes to take effect.",
+        if enabled { "enabled" } else { "disabled" }
+    );
+    Ok(())
+}
+
 /// `ray config get/set/unset`: view or change global daemon settings. Writes
 /// `settings.toml` directly (like `cmd_mdns`); relay/discovery/dns-upstreams all
 /// take effect on the next daemon restart. On Linux the config tree is root-
@@ -1072,7 +1106,11 @@ fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
                 }
             }
         }
-        ConfigAction::Set { key, value, replace } => {
+        ConfigAction::Set {
+            key,
+            value,
+            replace,
+        } => {
             let mut cfg = config::load()?;
             config::config_set(&mut cfg, &key, &value, replace)?;
             config::save_settings(&cfg)?;
@@ -1128,6 +1166,7 @@ async fn cmd_set_operator(user: &str) -> Result<()> {
 mod tests {
     use super::*;
     use ipc::FirewallRuleView;
+    use rayfish::update::{normalize_version, release_asset_name, version_is_newer};
 
     #[test]
     fn strip_deleted_suffix_sanitizes_replaced_binary_path() {
@@ -1300,8 +1339,12 @@ mod tests {
     #[test]
     fn empty_firewall_says_no_rules() {
         style::set_plain(true);
-        let out =
-            render_firewall_rules(Some((firewall::Action::Deny, firewall::Action::Allow)), false, false, &[]);
+        let out = render_firewall_rules(
+            Some((firewall::Action::Deny, firewall::Action::Allow)),
+            false,
+            false,
+            &[],
+        );
         assert!(out.contains("default in   deny"));
         assert!(out.contains("default out  allow"));
         assert!(out.contains("(no rules)"));
@@ -1312,8 +1355,12 @@ mod tests {
     #[test]
     fn disabled_firewall_shows_banner() {
         style::set_plain(true);
-        let out =
-            render_firewall_rules(Some((firewall::Action::Deny, firewall::Action::Allow)), false, true, &[]);
+        let out = render_firewall_rules(
+            Some((firewall::Action::Deny, firewall::Action::Allow)),
+            false,
+            true,
+            &[],
+        );
         assert!(out.contains("disabled"));
         assert!(out.contains("all packets allowed"));
     }

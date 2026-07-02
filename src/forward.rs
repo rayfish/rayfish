@@ -72,9 +72,7 @@ pub fn set_ssh_nat_active(on: bool) {
 
 /// The NAT config, or `None` when unset or inactive.
 fn ssh_nat() -> Option<&'static SshNat> {
-    SSH_NAT
-        .get()
-        .filter(|n| n.active.load(Ordering::Relaxed))
+    SSH_NAT.get().filter(|n| n.active.load(Ordering::Relaxed))
 }
 
 impl SshNat {
@@ -410,7 +408,9 @@ pub fn spawn_peer_reader(
                     // ordinary traffic.
                     let datagram = match ssh_nat() {
                         Some(_) => match firewall::parse_packet_info(&datagram) {
-                            Some(info) if info.protocol == 6 && info.dst_port == crate::ssh::SSH_PORT => {
+                            Some(info)
+                                if info.protocol == 6 && info.dst_port == crate::ssh::SSH_PORT =>
+                            {
                                 let mut v = datagram.to_vec();
                                 rewrite_ssh_port(&mut v, &info, true);
                                 Bytes::from(v)
@@ -670,7 +670,11 @@ mod tests {
         assert_eq!(info2.dst_port, 41384, "dest port rewritten 22 -> listen");
         // The incrementally-updated checksum must equal a freshly computed one.
         let field = u16::from_be_bytes([pkt[36], pkt[37]]);
-        assert_eq!(field, tcp_csum_v4(&pkt), "checksum stays valid after rewrite");
+        assert_eq!(
+            field,
+            tcp_csum_v4(&pkt),
+            "checksum stays valid after rewrite"
+        );
 
         // Inactive -> no rewrite.
         set_ssh_nat_active(false);
@@ -725,14 +729,8 @@ mod tests {
             icmp_type: 0,
             icmp_id: 0,
         };
-        assert!(is_magic_dns(&mk(
-            IpAddr::V4(crate::dns::MAGIC_DNS_V4),
-            53
-        )));
-        assert!(!is_magic_dns(&mk(
-            IpAddr::V4(crate::dns::MAGIC_DNS_V4),
-            80
-        )));
+        assert!(is_magic_dns(&mk(IpAddr::V4(crate::dns::MAGIC_DNS_V4), 53)));
+        assert!(!is_magic_dns(&mk(IpAddr::V4(crate::dns::MAGIC_DNS_V4), 80)));
         assert!(!is_magic_dns(&mk("100.64.0.9".parse().unwrap(), 53)));
     }
 

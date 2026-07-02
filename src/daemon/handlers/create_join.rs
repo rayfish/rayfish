@@ -2,8 +2,8 @@
 //! handshake (`join_network*`, dial/fetch/restore-roster helpers). Split out of `daemon/mod.rs`.
 
 use super::super::*;
-use std::sync::RwLock;
 use iroh_blobs::Hash;
+use std::sync::RwLock;
 use tokio::sync::{Mutex, Notify};
 
 impl DaemonState {
@@ -26,9 +26,13 @@ impl DaemonState {
                 .as_ref()
                 .map(|s| s.hash)
                 .expect("snapshot set");
-            if let Err(e) =
-                dht::publish_network(&pkarr_client, net_secret_key, &blob_hash, &[self.endpoint.id()])
-                    .await
+            if let Err(e) = dht::publish_network(
+                &pkarr_client,
+                net_secret_key,
+                &blob_hash,
+                &[self.endpoint.id()],
+            )
+            .await
             {
                 tracing::warn!(error = %e, "failed to publish network record");
             }
@@ -46,10 +50,7 @@ impl DaemonState {
         state: &SharedNetworkState,
         dht_notify: &Arc<Notify>,
         cancel: &CancellationToken,
-    ) -> (
-        Vec<JoinHandle<()>>,
-        mpsc::Sender<forward::DisconnectEvent>,
-    ) {
+    ) -> (Vec<JoinHandle<()>>, mpsc::Sender<forward::DisconnectEvent>) {
         let mut tasks = Vec::new();
 
         // Network publisher (single pkarr record: blob hash + seed peers)
@@ -242,8 +243,13 @@ impl DaemonState {
         let state = Arc::new(RwLock::new(net_state));
         let invite_lock = Arc::new(Mutex::new(()));
         let dht_notify = Arc::new(Notify::new());
-        let (tasks, disconnect_tx) =
-            self.spawn_coordinator_background_tasks(&name, &net_secret_key, &state, &dht_notify, &cancel);
+        let (tasks, disconnect_tx) = self.spawn_coordinator_background_tasks(
+            &name,
+            &net_secret_key,
+            &state,
+            &dht_notify,
+            &cancel,
+        );
 
         // Insert the handle first so register_coordinator_handler can update the role.
         let handle = NetworkHandle {
@@ -1141,5 +1147,4 @@ impl DaemonState {
             }
         }
     }
-
 }

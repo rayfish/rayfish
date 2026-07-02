@@ -702,10 +702,7 @@ fn discover_host_ed25519_key() -> Option<(PathBuf, PrivateKey)> {
             continue;
         };
         match PrivateKey::from_openssh(&pem) {
-            Ok(key)
-                if !key.is_encrypted()
-                    && key.algorithm() == Algorithm::Ed25519 =>
-            {
+            Ok(key) if !key.is_encrypted() && key.algorithm() == Algorithm::Ed25519 => {
                 return Some((path, key));
             }
             _ => continue,
@@ -756,8 +753,8 @@ fn load_or_generate_host_key() -> Result<PrivateKey> {
         let pem = std::fs::read_to_string(&path).context("reading ssh host key")?;
         return PrivateKey::from_openssh(&pem).context("parsing ssh host key");
     }
-    let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
-        .context("generating ssh host key")?;
+    let key =
+        PrivateKey::random(&mut OsRng, Algorithm::Ed25519).context("generating ssh host key")?;
     let pem = key
         .to_openssh(LineEnding::LF)
         .context("encoding ssh host key")?;
@@ -848,7 +845,10 @@ mod tests {
         let p = resolve_user_policy(&authz, &alice, &[SmolStr::new("net")]);
         assert!(p.permits("deploy", 1000), "non-root user allowed");
         assert!(!p.permits("root", 0), "root (uid 0) blocked by default");
-        assert!(!p.permits("toor", 0), "any uid-0 account blocked, not just 'root'");
+        assert!(
+            !p.permits("toor", 0),
+            "any uid-0 account blocked, not just 'root'"
+        );
     }
 
     #[test]
@@ -857,7 +857,10 @@ mod tests {
         let authz = new_authz();
         // net1: alice may only be `deploy`; net2: alice may be any user (`*`).
         authz.store(Arc::new(HashMap::from([
-            ("net1".to_string(), vec![rule(&alice.to_string(), &["deploy"])]),
+            (
+                "net1".to_string(),
+                vec![rule(&alice.to_string(), &["deploy"])],
+            ),
             ("net2".to_string(), vec![rule(&alice.to_string(), &["*"])]),
         ])));
 
@@ -872,7 +875,11 @@ mod tests {
         assert!(p.permits("root", 0));
 
         // Union: explicit `deploy` (net1) + `*` (net2) → `*` dominates.
-        let p = resolve_user_policy(&authz, &alice, &[SmolStr::new("net1"), SmolStr::new("net2")]);
+        let p = resolve_user_policy(
+            &authz,
+            &alice,
+            &[SmolStr::new("net1"), SmolStr::new("net2")],
+        );
         assert!(p.permits("root", 0));
         assert!(p.permits("anyone", 1234));
     }

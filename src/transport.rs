@@ -244,18 +244,28 @@ mod tests {
     #[test]
     fn relay_mode_augment_vs_replace() {
         // Unset: keep the preset default (None).
-        assert!(build_relay_mode(&ServerOverride::default()).unwrap().is_none());
+        assert!(
+            build_relay_mode(&ServerOverride::default())
+                .unwrap()
+                .is_none()
+        );
 
         // A parseable relay URL (iroh RelayUrl requires a host).
         let custom = "https://relay.example.com".to_string();
 
         // Replace: only the custom relay.
-        let rep = ServerOverride { servers: vec![custom.clone()], replace: true };
+        let rep = ServerOverride {
+            servers: vec![custom.clone()],
+            replace: true,
+        };
         let mode = build_relay_mode(&rep).unwrap().expect("some mode");
         assert_eq!(mode.relay_map().urls::<Vec<RelayUrl>>().len(), 1);
 
         // Augment: custom + n0 defaults (more than one).
-        let aug = ServerOverride { servers: vec![custom], replace: false };
+        let aug = ServerOverride {
+            servers: vec![custom],
+            replace: false,
+        };
         let mode = build_relay_mode(&aug).unwrap().expect("some mode");
         assert!(mode.relay_map().urls::<Vec<RelayUrl>>().len() > 1);
     }

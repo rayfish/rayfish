@@ -526,8 +526,7 @@ pub(crate) async fn ipc_apply(
         let resolve = |identity: &str| -> Vec<String> {
             resolve_identity_hosts(&status_networks, net_name, &self_id, identity)
         };
-        let (efw, empty_aliases) =
-            apply::expand_firewall(fw, &net_aliases, &spec.groups, &resolve);
+        let (efw, empty_aliases) = apply::expand_firewall(fw, &net_aliases, &spec.groups, &resolve);
         for a in empty_aliases {
             eprintln!(
                 "{}  {net_name}: alias '{a}' has no joined devices yet; its rules are skipped",
@@ -791,7 +790,9 @@ pub(crate) async fn ipc_apply_create(name: &str) -> Result<()> {
     }
 }
 
-pub(crate) async fn ipc_firewall_suggestions_get(network: &str) -> Result<ray_proto::SuggestedFirewall> {
+pub(crate) async fn ipc_firewall_suggestions_get(
+    network: &str,
+) -> Result<ray_proto::SuggestedFirewall> {
     let mut stream = ipc::connect().await?;
     ipc::send(
         &mut stream,
@@ -845,7 +846,6 @@ pub(crate) async fn ipc_invite_mint(network: &str, hostname: Option<String>) -> 
         other => anyhow::bail!("unexpected invite response: {other:?}"),
     }
 }
-
 
 #[cfg(test)]
 mod tests {

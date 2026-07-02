@@ -390,6 +390,20 @@ pub struct AppConfig {
     /// authorized in a network's [`NetworkConfig::ssh_allow`] list. Off by default.
     #[serde(default)]
     pub ssh_enabled: bool,
+    /// Opt-in automatic updates: when on, the daemon periodically checks for a
+    /// newer stable release, swaps the binary, and restarts itself onto it. Off
+    /// by default; enable via `ray install --auto-update` or `ray auto-update on`.
+    #[serde(default)]
+    pub auto_update: bool,
+    /// Last release tag the auto-updater attempted (e.g. `v0.2.0`). Persisted so a
+    /// swapped binary that keeps mis-reporting its version can't tight-loop: the
+    /// same target is retried at most once per backoff window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update_last_target: Option<String>,
+    /// Unix seconds of the last auto-update attempt, paired with
+    /// `auto_update_last_target` for the backoff guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update_last_attempt: Option<i64>,
     /// Absolute directory where auto-accepted (own-device) files are written.
     /// `None` falls back to `download_user`, then the operator's ~/Downloads.
     /// Set via `ray files download-dir <path>`.
@@ -414,6 +428,9 @@ impl Default for AppConfig {
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
             ssh_enabled: false,
+            auto_update: false,
+            auto_update_last_target: None,
+            auto_update_last_attempt: None,
             download_dir: None,
             download_user: None,
             networks: Vec::new(),
@@ -483,6 +500,12 @@ struct Settings {
     dns_upstreams: ServerOverride,
     #[serde(default)]
     ssh_enabled: bool,
+    #[serde(default)]
+    auto_update: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_update_last_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_update_last_attempt: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     download_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -713,6 +736,9 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
             ssh_enabled: false,
+            auto_update: false,
+            auto_update_last_target: None,
+            auto_update_last_attempt: None,
             download_dir: None,
             download_user: None,
         }
@@ -751,6 +777,9 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
         ssh_enabled: settings.ssh_enabled,
+        auto_update: settings.auto_update,
+        auto_update_last_target: settings.auto_update_last_target,
+        auto_update_last_attempt: settings.auto_update_last_attempt,
         download_dir: settings.download_dir,
         download_user: settings.download_user,
         networks,
@@ -772,6 +801,9 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
         ssh_enabled: config.ssh_enabled,
+        auto_update: config.auto_update,
+        auto_update_last_target: config.auto_update_last_target.clone(),
+        auto_update_last_attempt: config.auto_update_last_attempt,
         download_dir: config.download_dir.clone(),
         download_user: config.download_user,
     };
@@ -1265,15 +1297,24 @@ name = "test"
         n.aliases.insert("bob".into(), "id-bob".into());
         save_network_in(dir, &n).unwrap();
         let loaded = load_network_in(dir, "homelab").unwrap().unwrap();
-        assert_eq!(loaded.aliases.get("alice").map(String::as_str), Some("id-alice"));
-        assert_eq!(loaded.aliases.get("bob").map(String::as_str), Some("id-bob"));
+        assert_eq!(
+            loaded.aliases.get("alice").map(String::as_str),
+            Some("id-alice")
+        );
+        assert_eq!(
+            loaded.aliases.get("bob").map(String::as_str),
+            Some("id-bob")
+        );
 
         // A network with no aliases omits the key; loading a toml without it
         // defaults to an empty map (backward compatible with pre-alias configs).
         let plain = net("genesis");
         assert!(plain.aliases.is_empty());
         let toml = ::toml::to_string(&plain).unwrap();
-        assert!(!toml.contains("aliases"), "empty aliases must not be serialized");
+        assert!(
+            !toml.contains("aliases"),
+            "empty aliases must not be serialized"
+        );
         let back: NetworkConfig = ::toml::from_str(&toml).unwrap();
         assert!(back.aliases.is_empty());
     }

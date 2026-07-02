@@ -144,7 +144,11 @@ impl DaemonState {
     /// republish the signed blob. Authority comes from holding the per-network
     /// secret key (so any admin granted the key can suggest). Suggestions are
     /// advisory on every network; each node queues or auto-accepts them.
-    pub(crate) async fn firewall_suggest(&self, network: &str, suggestions: SuggestedFirewall) -> IpcMessage {
+    pub(crate) async fn firewall_suggest(
+        &self,
+        network: &str,
+        suggestions: SuggestedFirewall,
+    ) -> IpcMessage {
         let (state, dht_notify, has_key) = match self.networks.get(network) {
             Some(h) => {
                 let has_key = h.state.read().unwrap().network_secret_key.is_some();
@@ -398,10 +402,7 @@ impl DaemonState {
             tracing::warn!(error = %e, "failed to persist firewall config");
         }
         IpcMessage::Ok {
-            message: format!(
-                "fail-fast reject {}",
-                if enabled { "on" } else { "off" }
-            ),
+            message: format!("fail-fast reject {}", if enabled { "on" } else { "off" }),
         }
     }
 

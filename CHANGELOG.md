@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Opt-in automatic updates**: enable with `sudo ray install --auto-update` or
+  `ray auto-update on`, and the daemon checks GitHub about every 6 hours for a
+  newer **stable** release, then downloads, verifies (SHA-256), swaps the binary,
+  and restarts itself onto the new version — no manual `sudo ray update`. Off by
+  default; nightlies are never auto-installed. Applying an update restarts the
+  daemon, which briefly drops the VPN (peers reconnect automatically), so it stays
+  opt-in. A backoff guard means a bad release is retried at most once a day
+  instead of looping. `ray status` shows when auto-update is on.
 - **Auto-accept files from your own devices**: turn on
   `ray files auto-accept <network> on` (or join with
   `ray join <net> --auto-accept-files`) and incoming file transfers from your

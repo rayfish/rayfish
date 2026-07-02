@@ -204,8 +204,20 @@ pub(crate) fn require_root() -> Result<()> {
 
 /// `ray install`: install the system service if needed (or refresh an existing
 /// install), then start it and verify the daemon comes up. Requires root.
-pub(crate) async fn cmd_install() -> Result<()> {
+///
+/// `--auto-update` opts this node into automatic stable updates: it is persisted
+/// to `settings.toml` *before* the (re)start so the freshly launched daemon
+/// reads it at boot and spawns the periodic update task.
+pub(crate) async fn cmd_install(auto_update: bool) -> Result<()> {
     require_root()?;
+    if auto_update {
+        let mut cfg = config::load()?;
+        if !cfg.auto_update {
+            cfg.auto_update = true;
+            config::save_settings(&cfg)?;
+        }
+        println!("automatic stable updates enabled for this node");
+    }
     install_and_start_service(None).await
 }
 
@@ -324,12 +336,3 @@ pub(crate) async fn cmd_start() -> Result<()> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Self-update (`ray update`)
-// ---------------------------------------------------------------------------
-
-/// owner/repo slug for the GitHub releases this binary updates from. Matches
-/// `REPORT_REPO_URL` and the `install.sh` bootstrap installer.
-pub(crate) const REPO_SLUG: &str = "rayfish/rayfish";
-

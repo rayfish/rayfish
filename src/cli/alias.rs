@@ -17,7 +17,9 @@ pub(crate) async fn cmd_alias(network: &str, action: AliasAction, json: bool) ->
 /// identity locally.
 async fn alias_set(network: &str, key: &str, alias: &str) -> Result<()> {
     if !hostname::is_valid_hostname(alias) {
-        anyhow::bail!("invalid alias '{alias}' (lowercase ASCII letters, digits, and '-', 1-63 chars)");
+        anyhow::bail!(
+            "invalid alias '{alias}' (lowercase ASCII letters, digits, and '-', 1-63 chars)"
+        );
     }
 
     // An identity string is used verbatim (canonicalized); anything else is

@@ -198,4 +198,3 @@ pub(crate) async fn ipc_leave(name: &str) -> Result<()> {
     }
     Ok(())
 }
-

@@ -231,7 +231,10 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
             .args(["-n", "add", family, "-net", net, "-interface", tun_name])
             .status()
             .with_context(|| format!("run route add {family} {net}"))?;
-        anyhow::ensure!(status.success(), "route add {family} {net} failed with {status}");
+        anyhow::ensure!(
+            status.success(),
+            "route add {family} {net} failed with {status}"
+        );
     }
     Ok(())
 }
@@ -286,7 +289,15 @@ pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
 pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
     let ip = crate::dns::MAGIC_DNS_V4.to_string();
     let _ = Command::new("route")
-        .args(["-n", "delete", "-inet", "-host", &ip, "-interface", tun_name])
+        .args([
+            "-n",
+            "delete",
+            "-inet",
+            "-host",
+            &ip,
+            "-interface",
+            tun_name,
+        ])
         .status();
     let status = Command::new("route")
         .args(["-n", "add", "-inet", "-host", &ip, "-interface", tun_name])

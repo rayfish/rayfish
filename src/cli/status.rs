@@ -134,6 +134,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
         ipc::IpcMessage::StatusResponse {
             endpoint_id,
             mdns_enabled,
+            auto_update,
             active,
             contact_id,
             daemon_version,
@@ -149,6 +150,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 print_json(&serde_json::json!({
                     "endpoint": endpoint_id.to_string(),
                     "mdns": mdns_enabled,
+                    "auto_update": auto_update,
                     "active": active,
                     "contact_id": contact_id,
                     "daemon_version": daemon_version,
@@ -176,12 +178,24 @@ pub(crate) async fn ipc_status() -> Result<()> {
             } else {
                 format!("{} {}", style::label("mDNS"), style::faint("off"))
             };
+            // Only surface auto-update in the header when it is on (opt-in), so the
+            // default line stays uncluttered.
+            let auto = if auto_update {
+                format!(
+                    "      {} {}",
+                    style::label("auto-update"),
+                    style::green("on")
+                )
+            } else {
+                String::new()
+            };
             println!();
             println!(
-                "  {}  {}      {}      {} {}",
+                "  {}  {}      {}{}      {} {}",
                 style::bold("rayfish"),
                 state,
                 mdns,
+                auto,
                 style::label("endpoint"),
                 style::value(&endpoint_id.fmt_short().to_string()),
             );
@@ -309,16 +323,17 @@ fn peer_alias<'a>(
     peer: &ipc::PeerStatus,
     alias_by_identity: &HashMap<&str, &'a str>,
 ) -> Option<&'a str> {
-    let identity = peer
-        .user_identity
-        .unwrap_or(peer.endpoint_id)
-        .to_string();
+    let identity = peer.user_identity.unwrap_or(peer.endpoint_id).to_string();
     alias_by_identity.get(identity.as_str()).copied()
 }
 
 /// Build one peer's status row (glyph · host · ipv4 · via · rtt · traffic). A
 /// local alias, when set, is shown inline after the host as `host.net.ray [alias]`.
-fn render_peer_row(net_name: &str, peer: &ipc::PeerStatus, alias: Option<&str>) -> Vec<layout::Cell> {
+fn render_peer_row(
+    net_name: &str,
+    peer: &ipc::PeerStatus,
+    alias: Option<&str>,
+) -> Vec<layout::Cell> {
     let base = peer
         .hostname
         .as_ref()
@@ -511,4 +526,3 @@ pub(crate) async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()
     }
     Ok(())
 }
-

@@ -80,3 +80,4 @@ pub mod stats;
 pub mod style;
 pub mod transport;
 pub mod tun;
+pub mod update;

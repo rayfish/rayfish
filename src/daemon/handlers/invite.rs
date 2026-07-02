@@ -371,5 +371,4 @@ impl DaemonState {
             },
         }
     }
-
 }
