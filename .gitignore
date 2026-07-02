@@ -23,3 +23,7 @@ android/local.properties
 .env.local
 *.key
 secrets/
+
+# Android Studio / IntelliJ project settings
+android/.idea/
+*.iml
