@@ -534,6 +534,17 @@ pub(crate) enum FirewallAction {
         /// on or off
         state: String,
     },
+    /// Turn the firewall back on (resume enforcing rules and defaults). Undoes
+    /// `ray firewall off`.
+    #[command(visible_alias = "enable")]
+    On,
+    /// Disable the firewall entirely on this device: every packet is allowed,
+    /// bypassing all rules and defaults (mesh membership still gates who can reach
+    /// you; the anti-spoof check still runs). For simple setups that don't want a
+    /// second firewall on top of the host/kernel one. Re-enable with
+    /// `ray firewall on`.
+    #[command(visible_alias = "disable")]
+    Off,
     /// Coordinator-only: suggest firewall rules for a subject host on a network.
     /// Distributed in the signed blob; each node takes them per its own consent.
     Suggest {
@@ -1269,6 +1280,7 @@ mod tests {
         let out = render_firewall_rules(
             Some((firewall::Action::Allow, firewall::Action::Allow)),
             false,
+            false,
             &rules,
         );
         assert!(out.contains("default in   allow"));
@@ -1289,9 +1301,20 @@ mod tests {
     fn empty_firewall_says_no_rules() {
         style::set_plain(true);
         let out =
-            render_firewall_rules(Some((firewall::Action::Deny, firewall::Action::Allow)), false, &[]);
+            render_firewall_rules(Some((firewall::Action::Deny, firewall::Action::Allow)), false, false, &[]);
         assert!(out.contains("default in   deny"));
         assert!(out.contains("default out  allow"));
         assert!(out.contains("(no rules)"));
+        // The posture header notes the firewall is separate from the host one.
+        assert!(out.contains("separate from your host/kernel firewall"));
+    }
+
+    #[test]
+    fn disabled_firewall_shows_banner() {
+        style::set_plain(true);
+        let out =
+            render_firewall_rules(Some((firewall::Action::Deny, firewall::Action::Allow)), false, true, &[]);
+        assert!(out.contains("disabled"));
+        assert!(out.contains("all packets allowed"));
     }
 }

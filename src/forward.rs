@@ -536,6 +536,7 @@ mod tests {
             default_inbound: default,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules,
         })
     }

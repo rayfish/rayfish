@@ -95,6 +95,11 @@ pub enum IpcMessage {
     FirewallReject {
         enabled: bool,
     },
+    /// Global firewall kill switch (`ray firewall on|off`). When `enabled` is
+    /// false the firewall stops enforcing and allows every packet.
+    FirewallSetEnabled {
+        enabled: bool,
+    },
     /// Coordinator-only: replace the network's suggested firewall rules and
     /// republish the signed blob. Authority comes from holding the network's
     /// secret key; works on any network (suggestions are advisory).
@@ -374,6 +379,10 @@ pub enum IpcMessage {
         /// get a TCP RST / ICMP-unreachable reply instead of a silent drop.
         #[serde(default)]
         reject: bool,
+        /// Global kill switch (`ray firewall off`). When true the firewall is not
+        /// enforcing: every packet is allowed regardless of rules/defaults.
+        #[serde(default)]
+        disabled: bool,
         rules: Vec<FirewallRuleView>,
     },
     /// Current suggested firewall rules for a network (reply to

@@ -210,6 +210,13 @@ pub struct FirewallConfig {
     /// `firewall.toml` files on the silent-drop posture.
     #[serde(default)]
     pub reject: bool,
+    /// Global kill switch. When `true`, the firewall stops enforcing: every packet
+    /// is allowed regardless of rules or defaults (the ingress anti-spoof check in
+    /// [`crate::forward::evaluate_inbound`] still runs, it is upstream of this).
+    /// Set via `ray firewall off`; `#[serde(default)]` keeps existing
+    /// `firewall.toml` files enforcing on upgrade.
+    #[serde(default)]
+    pub disabled: bool,
     pub rules: Vec<FirewallRule>,
 }
 
@@ -243,6 +250,7 @@ impl Default for FirewallConfig {
             default_inbound: default_inbound_action(),
             default_outbound: default_outbound_action(),
             reject: false,
+            disabled: false,
             // Ship inbound TCP/UDP denied but inbound ICMP allowed — as a visible,
             // removable rule rather than a hard-coded special case.
             rules: vec![default_icmp_rule()],
@@ -362,6 +370,12 @@ impl SharedFirewall {
         self.inner.load().reject
     }
 
+    /// Whether the firewall is globally disabled (`ray firewall off`). When true,
+    /// `evaluate_packet` allows every packet.
+    pub fn disabled(&self) -> bool {
+        self.inner.load().disabled
+    }
+
     /// Stateful evaluation of a fully-parsed packet. This is what the data plane
     /// (`forward.rs`) calls. See the module docs for the full semantics.
     ///
@@ -379,6 +393,12 @@ impl SharedFirewall {
         peer: &EndpointId,
         network: Option<&str>,
     ) -> Action {
+        // Global kill switch (`ray firewall off`): allow everything, skip rules,
+        // defaults, and conntrack. The ingress anti-spoof check runs upstream in
+        // `forward::evaluate_inbound`, so spoofed sources are still dropped.
+        if self.inner.load().disabled {
+            return Action::Allow;
+        }
         let proto = info.protocol;
         let (local_ip, local_port, peer_ip, peer_port) = match direction {
             Direction::Out => (info.src_ip, info.src_port, info.dst_ip, info.dst_port),
@@ -1207,11 +1227,62 @@ mod tests {
     }
 
     #[test]
+    fn disabled_allows_everything_both_directions() {
+        // `ray firewall off`: the kill switch allows every packet regardless of
+        // the deny-inbound default, bypassing rules entirely.
+        let fw = SharedFirewall::new(FirewallConfig {
+            disabled: true,
+            ..FirewallConfig::default()
+        });
+        let me = Ipv4Addr::new(100, 64, 0, 2);
+        let peer = Ipv4Addr::new(100, 64, 0, 3);
+        let peer_id = test_id(1);
+        // Unsolicited inbound TCP would be denied when enforcing; here it passes.
+        let unsolicited = tcp_pkt(peer, 51000, me, 8080, SYN);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &unsolicited, &peer_id, None),
+            Action::Allow
+        );
+        // Outbound also allowed (trivially, but confirms the short-circuit path).
+        let out = tcp_pkt(me, 50000, peer, 443, SYN);
+        assert_eq!(
+            fw.evaluate_packet(Direction::Out, &out, &peer_id, None),
+            Action::Allow
+        );
+    }
+
+    #[test]
+    fn disabled_ignores_explicit_deny_rule() {
+        // An explicit deny is bypassed while disabled.
+        let fw = SharedFirewall::new(FirewallConfig {
+            disabled: true,
+            rules: vec![FirewallRule {
+                direction: Direction::In,
+                action: Action::Deny,
+                protocol: Protocol::Tcp,
+                port: Some(PortRange { start: 22, end: 22 }),
+                peer: PeerFilter::Any,
+                network: None,
+                origin: RuleOrigin::Local,
+            }],
+            ..FirewallConfig::default()
+        });
+        let me = Ipv4Addr::new(100, 64, 0, 2);
+        let peer = Ipv4Addr::new(100, 64, 0, 3);
+        let ssh = tcp_pkt(peer, 51000, me, 22, SYN);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &ssh, &test_id(1), None),
+            Action::Allow
+        );
+    }
+
+    #[test]
     fn evaluate_default_deny() {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![],
         });
         assert_eq!(fw.evaluate(Direction::In, 6, 22, &test_id(1)), Action::Deny);
@@ -1223,6 +1294,7 @@ mod tests {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Deny,
@@ -1253,6 +1325,7 @@ mod tests {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Deny,
@@ -1297,6 +1370,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Allow,
@@ -1327,6 +1401,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Allow,
@@ -1350,6 +1425,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![
                 FirewallRule {
                     direction: Direction::In,
@@ -1448,6 +1524,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Allow,
@@ -1518,6 +1595,7 @@ mod tests {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Deny,
@@ -1562,6 +1640,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::Out,
                 action: Action::Allow,
@@ -1621,6 +1700,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::Out,
                 action: Action::Allow,
@@ -1671,6 +1751,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::Out,
                 action: Action::Allow,
@@ -1715,6 +1796,7 @@ mod tests {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Deny,
@@ -1757,6 +1839,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::Out,
                 action: Action::Allow,
@@ -1843,6 +1926,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![], // seeded allow-icmp removed
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1873,6 +1957,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1900,6 +1985,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1924,6 +2010,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1951,6 +2038,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![],
         });
         let me = Ipv6Addr::new(0x2, 0, 0, 0, 0, 0, 0, 2);
@@ -2284,6 +2372,7 @@ mod tests {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![local_rule.clone(), stale_net, other_net.clone()],
         };
         let fw = SharedFirewall::new(config);
