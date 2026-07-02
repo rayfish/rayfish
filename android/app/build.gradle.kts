@@ -101,14 +101,28 @@ val cargoNdkBuild = tasks.register<Exec>("cargoNdkBuild") {
     val sep = File.pathSeparator
     environment("PATH", "${cargoBin.absolutePath}$sep${System.getenv("PATH") ?: ""}")
 
+    // Built in release so the shipped .so is stripped and small (see the
+    // root Cargo.toml `[profile.release]` strip setting). For a debug native
+    // build with symbols, run `cargo ndk ... build` by hand without `--release`.
     commandLine(
         cargo, "ndk",
         "-t", "arm64-v8a",
         "-t", "x86_64",
         "-o", jniLibsDir.asFile.absolutePath,
         "build",
+        "--release",
         "-p", "ray-mobile",
     )
+
+    // ray-mobile statically links iroh/irpc into libray_mobile.so; cargo-ndk
+    // still drops their standalone cdylib artifacts (libiroh*.so, libirpc*.so)
+    // into jniLibs alongside it. Nothing loads those at runtime, so prune
+    // everything except our own lib to keep them out of the APK.
+    doLast {
+        jniLibsDir.asFile.walkBottomUp()
+            .filter { it.isFile && it.name.endsWith(".so") && it.name != "libray_mobile.so" }
+            .forEach { it.delete() }
+    }
 }
 
 tasks.named("preBuild").configure {
