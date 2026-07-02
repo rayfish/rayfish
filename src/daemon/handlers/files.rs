@@ -1,6 +1,9 @@
 //! File-sharing and device-pairing handlers for `DaemonState`: `send_file`,
 //! `list_files`, `accept_file`, pairing. Split out of `daemon/mod.rs`.
 
+use std::ffi::CString;
+use std::path::Path;
+
 use super::super::*;
 
 impl DaemonState {
@@ -27,6 +30,42 @@ impl DaemonState {
         self.resolve_short_id_any_network(name)
     }
 
+    /// Resolve a firewall `--peer` argument to a peer's **device** endpoint id,
+    /// accepting far more forms than [`resolve_peer_name`]: hostname (bare or
+    /// `host.net.ray`), mesh IPv4 (also for offline members, since the roster
+    /// stores v4), mesh IPv6 (connected peers only — the roster carries no v6),
+    /// short id / full endpoint id, or a paired **user identity** (resolved to
+    /// that user's joined device). Returns the device id `D`; `firewall_add`
+    /// normalizes it to the user identity for inbound rules. Kept separate from
+    /// `resolve_peer_name` so `ping`/`send` behaviour is unchanged; the extra
+    /// cases could later back those commands too.
+    pub(crate) async fn resolve_peer_flexible(&self, name: &str) -> Option<EndpointId> {
+        // Hostname (Magic DNS) + short-id / endpoint-id-prefix fallback.
+        if let Some(id) = self.resolve_peer_name(name).await {
+            return Some(id);
+        }
+        // Mesh IP literal of a *connected* peer (fast path; also the only way to
+        // reach a peer by IPv6, since the roster carries no v6 address).
+        if let Ok(v4) = name.parse::<Ipv4Addr>()
+            && let Some(route) = self.peers.lookup_v4(&v4)
+        {
+            return Some(route.endpoint_id);
+        }
+        if let Ok(v6) = name.parse::<std::net::Ipv6Addr>()
+            && let Some(route) = self.peers.lookup_v6(&v6)
+        {
+            return Some(route.endpoint_id);
+        }
+        // Roster scan: an offline peer's mesh IPv4, or a paired user identity.
+        for entry in self.networks.iter() {
+            let state = entry.value().state.read().unwrap();
+            if let Some(id) = state.members.resolve_peer_literal(name) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     pub(crate) async fn send_file(&self, path: &str, peer: &str) -> IpcMessage {
         let peer_id = match self.resolve_peer_name(peer).await {
             Some(id) => id,
@@ -37,7 +76,7 @@ impl DaemonState {
             }
         };
 
-        let file_path = std::path::Path::new(path);
+        let file_path = Path::new(path);
         let file_bytes = match std::fs::read(file_path) {
             Ok(b) => b,
             Err(e) => {
@@ -196,10 +235,10 @@ impl DaemonState {
 
         if let Some((uid, gid)) = peer_cred {
             use std::os::unix::ffi::OsStrExt;
-            if let Ok(c) = std::ffi::CString::new(dest.as_os_str().as_bytes()) {
+            if let Ok(c) = CString::new(dest.as_os_str().as_bytes()) {
                 unsafe { libc::chown(c.as_ptr(), uid, gid) };
             }
-            if let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) {
+            if let Ok(c) = CString::new(dir.as_os_str().as_bytes()) {
                 unsafe { libc::chown(c.as_ptr(), uid, gid) };
             }
         }

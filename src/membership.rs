@@ -119,6 +119,30 @@ impl MemberList {
         self.members.values().collect()
     }
 
+    /// Resolve a firewall `--peer` **literal** against this roster: a mesh IPv4
+    /// to the member holding that address, or a full identity string to a member
+    /// by its device id or its paired `user_identity`. Returns the member's
+    /// **device** endpoint id (the caller normalizes to the user identity for
+    /// inbound rules). Hostname and short-id-prefix forms are resolved upstream
+    /// (Magic DNS / `resolve_short_id_any_network`); this is the literal-IP and
+    /// full-identity fallback used by `DaemonState::resolve_peer_flexible`.
+    pub fn resolve_peer_literal(&self, name: &str) -> Option<EndpointId> {
+        if let Ok(v4) = name.parse::<Ipv4Addr>()
+            && let Some(m) = self.get_by_ip(v4)
+        {
+            return Some(m.identity);
+        }
+        if let Ok(id) = name.parse::<EndpointId>()
+            && let Some(m) = self
+                .members
+                .values()
+                .find(|m| m.identity == id || m.user_identity == Some(id))
+        {
+            return Some(m.identity);
+        }
+        None
+    }
+
     pub fn from_members(members: Vec<Member>) -> Self {
         let mut list = Self::new();
         for m in members {
@@ -306,7 +330,7 @@ pub fn derive_ip_with_index(identity: &EndpointId, index: u32) -> Ipv4Addr {
 
 /// True if `ip` is reserved and must never be assigned to a member
 /// (currently the Magic DNS resolver address).
-fn is_reserved_ipv4(ip: std::net::Ipv4Addr) -> bool {
+fn is_reserved_ipv4(ip: Ipv4Addr) -> bool {
     ip == crate::dns::MAGIC_DNS_V4
 }
 
@@ -1101,6 +1125,39 @@ mod tests {
     }
 
     #[test]
+    fn resolve_peer_literal_by_ip_and_identity() {
+        let device = test_id(11);
+        let user = test_id(22);
+        let ip = derive_ip(&device);
+        let mut list = MemberList::new();
+        list.add(Member {
+            identity: device,
+            ip,
+            is_coordinator: false,
+            hostname: Some("alice-laptop".to_string()),
+            user_identity: Some(user),
+            device_cert: None,
+            collision_index: 0,
+        })
+        .unwrap();
+
+        // Mesh IPv4 literal -> the member's device id.
+        assert_eq!(list.resolve_peer_literal(&ip.to_string()), Some(device));
+        // Full device identity -> itself.
+        assert_eq!(
+            list.resolve_peer_literal(&device.to_string()),
+            Some(device)
+        );
+        // Paired user identity -> the user's joined device id (not the user id).
+        assert_eq!(list.resolve_peer_literal(&user.to_string()), Some(device));
+
+        // Non-member IP, an unrelated identity, and junk all miss.
+        assert_eq!(list.resolve_peer_literal("100.64.0.1"), None);
+        assert_eq!(list.resolve_peer_literal(&test_id(99).to_string()), None);
+        assert_eq!(list.resolve_peer_literal("not-a-peer"), None);
+    }
+
+    #[test]
     fn test_canonical_bytes_deterministic() {
         let members = make_member_list(&[1, 2, 3]);
         let approved = ApprovedList::new();
@@ -1653,8 +1710,7 @@ mod tests {
     /// index-0 IPv4 collides. The 22-bit space makes this likely within ~a few
     /// thousand iterations. Bounded at 200_000 to avoid a runaway test.
     fn find_colliding_pair() -> Option<(EndpointId, EndpointId)> {
-        let mut seen: std::collections::HashMap<std::net::Ipv4Addr, EndpointId> =
-            std::collections::HashMap::new();
+        let mut seen: HashMap<Ipv4Addr, EndpointId> = HashMap::new();
         for i in 0u32..200_000 {
             // Vary bytes across the whole 32-byte key to get good hash dispersion.
             let mut key_bytes = [0u8; 32];
