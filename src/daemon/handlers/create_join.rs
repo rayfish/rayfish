@@ -584,13 +584,14 @@ impl DaemonState {
                         .map(|m| m.identity)
                 })
                 .context("no coordinator found in network record")?;
-            tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
-            let conn = transport::connect_to_peer_with_alpn(&self.endpoint, coordinator_id, &alpn)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("coordinator offline; cannot join this network right now: {e}")
-                })?;
 
+            // The reconnect loop is spawned unconditionally and up front. A
+            // member already holds the verified blob, so being *in* the network
+            // does not depend on the coordinator answering right now: if it is
+            // offline at restore we still register the network from the blob and
+            // let this loop dial it back when it returns. Without this a member
+            // that reboots while its coordinator is down silently drops the
+            // network from its running state until a lucky restart.
             let cancel = self.shutdown_token.child_token();
             let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
             let tasks = vec![spawn_reconnect_loop(
@@ -606,39 +607,113 @@ impl DaemonState {
                 self.device_cert.clone(),
             )];
 
-            let state = match join_mesh_shared(
-                conn,
-                &self.endpoint,
-                display_name,
-                &alpn,
-                self.mesh_ctx(),
-                JoinParams {
-                    my_hostname: Some(my_hostname.clone()),
-                    net_pubkey,
-                    device_cert: self.device_cert.clone(),
-                    invite_secret: invite,
+            // Fallback state built straight from the verified blob so
+            // registration never blocks on (or dies with) the coordinator
+            // handshake.
+            let state_from_blob = || {
+                let mut ns = NetworkState {
+                    members: MemberList::from_members(data.members.clone()),
+                    approved: ApprovedList::from_entries(data.approved.clone()),
+                    snapshot: None,
+                    network_secret_key: None,
+                    network_public_key: net_pubkey,
+                    network_name: Some(display_name.to_string()),
+                    mode: GroupMode::Restricted,
                     suggested_firewall: data.suggested_firewall.clone(),
                     reusable_keys: data.reusable_keys.clone(),
-                    auto_accept_firewall,
-                    initial: false,
-                },
-                disconnect_tx.clone(),
-                cancel.clone(),
-                self.promote_tx.clone(),
-                invite_lock.clone(),
-                self.protocol_router.pending_pongs.clone(),
+                    pending_suggestions: Vec::new(),
+                    pending: HashMap::new(),
+                };
+                ns.refresh_snapshot();
+                Arc::new(std::sync::RwLock::new(ns))
+            };
+
+            tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
+            let mut seed_from_blob = false;
+            let state = match transport::connect_to_peer_with_alpn(
+                &self.endpoint,
+                coordinator_id,
+                &alpn,
             )
-            .await?
+            .await
             {
-                JoinResult::Joined(state) => state,
-                JoinResult::Pending => {
-                    // Closed network: we've been queued for live approval. Stop the
-                    // just-spawned reconnect loop (nothing is connected yet) and let
-                    // the caller retry on a backoff until `ray accept` lets us in.
-                    cancel.cancel();
-                    return Ok(TryJoin::Pending);
+                Ok(conn) => match join_mesh_shared(
+                    conn,
+                    &self.endpoint,
+                    display_name,
+                    &alpn,
+                    self.mesh_ctx(),
+                    JoinParams {
+                        my_hostname: Some(my_hostname.clone()),
+                        net_pubkey,
+                        device_cert: self.device_cert.clone(),
+                        invite_secret: invite,
+                        suggested_firewall: data.suggested_firewall.clone(),
+                        reusable_keys: data.reusable_keys.clone(),
+                        auto_accept_firewall,
+                        initial: false,
+                    },
+                    disconnect_tx.clone(),
+                    cancel.clone(),
+                    self.promote_tx.clone(),
+                    invite_lock.clone(),
+                    self.protocol_router.pending_pongs.clone(),
+                )
+                .await
+                {
+                    Ok(JoinResult::Joined(state)) => state,
+                    Ok(JoinResult::Pending) => {
+                        // Closed network: we've been queued for live approval.
+                        // Stop the just-spawned reconnect loop (nothing is
+                        // connected yet) and let the caller retry on a backoff
+                        // until `ray accept` lets us in.
+                        cancel.cancel();
+                        for t in tasks {
+                            t.abort();
+                        }
+                        return Ok(TryJoin::Pending);
+                    }
+                    Err(e) => {
+                        // Dialed the coordinator but the handshake failed. We
+                        // still hold the verified blob, so register from it and
+                        // let the reconnect loop recover rather than dropping the
+                        // network entirely.
+                        tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator handshake failed on restore; registering from blob, reconnect loop will retry");
+                        seed_from_blob = true;
+                        state_from_blob()
+                    }
+                },
+                Err(e) => {
+                    // Coordinator offline at restore: register from the blob so
+                    // the network stays live; the reconnect loop dials it back
+                    // once it returns.
+                    tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator offline on restore; registering from blob, reconnect loop will retry");
+                    seed_from_blob = true;
+                    state_from_blob()
                 }
             };
+
+            // The reconnect loop is edge-triggered on disconnect events, so a
+            // cold registration (no live connection yet) needs a synthetic kick
+            // per member to start the backoff-retry dial. Only fires when we
+            // registered from the blob without a live handshake.
+            if seed_from_blob {
+                let me = self.identity.local_identity();
+                for m in &data.members {
+                    if m.identity == me {
+                        continue;
+                    }
+                    let _ = disconnect_tx
+                        .send(forward::DisconnectEvent {
+                            endpoint_id: m.identity,
+                            ip: m.ip,
+                            ipv6: derive_ipv6(&m.identity),
+                            network: display_name.to_string(),
+                            intentional: false,
+                        })
+                        .await;
+                }
+            }
             (state, cancel, disconnect_tx, tasks)
         };
         let state = state;
