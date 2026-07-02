@@ -330,7 +330,7 @@ pub fn derive_ip_with_index(identity: &EndpointId, index: u32) -> Ipv4Addr {
 
 /// True if `ip` is reserved and must never be assigned to a member
 /// (currently the Magic DNS resolver address).
-fn is_reserved_ipv4(ip: std::net::Ipv4Addr) -> bool {
+fn is_reserved_ipv4(ip: Ipv4Addr) -> bool {
     ip == crate::dns::MAGIC_DNS_V4
 }
 
@@ -1710,8 +1710,7 @@ mod tests {
     /// index-0 IPv4 collides. The 22-bit space makes this likely within ~a few
     /// thousand iterations. Bounded at 200_000 to avoid a runaway test.
     fn find_colliding_pair() -> Option<(EndpointId, EndpointId)> {
-        let mut seen: std::collections::HashMap<std::net::Ipv4Addr, EndpointId> =
-            std::collections::HashMap::new();
+        let mut seen: HashMap<Ipv4Addr, EndpointId> = HashMap::new();
         for i in 0u32..200_000 {
             // Vary bytes across the whole 32-byte key to get good hash dispersion.
             let mut key_bytes = [0u8; 32];

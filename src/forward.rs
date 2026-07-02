@@ -15,6 +15,7 @@ use bytes::{Bytes, BytesMut};
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, ConnectionError, VarInt};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::firewall::{self, Direction, SharedFirewall};
@@ -158,7 +159,7 @@ pub(crate) fn evaluate_inbound(
     firewall: &SharedFirewall,
     peer_id: &EndpointId,
     peer_ip: Ipv4Addr,
-    peer_ipv6: std::net::Ipv6Addr,
+    peer_ipv6: Ipv6Addr,
     network: &str,
 ) -> InboundDecision {
     if packet.len() > MAX_PEER_DATAGRAM {
@@ -212,7 +213,7 @@ pub const KICK_CODE: u32 = 0x14ced;
 pub struct DisconnectEvent {
     pub endpoint_id: EndpointId,
     pub ip: Ipv4Addr,
-    pub ipv6: std::net::Ipv6Addr,
+    pub ipv6: Ipv6Addr,
     /// The network whose connection dropped. A multi-homed peer keeps its routes
     /// in the other networks; only this network's connection is torn down.
     pub network: String,
@@ -349,10 +350,10 @@ pub fn spawn_peer_reader(
     conn: Connection,
     peer_id: EndpointId,
     peer_ip: Ipv4Addr,
-    peer_ipv6: std::net::Ipv6Addr,
+    peer_ipv6: Ipv6Addr,
     network: String,
     ctx: ForwardCtx,
-) -> tokio::task::JoinHandle<()> {
+) -> JoinHandle<()> {
     let ForwardCtx {
         firewall,
         tun_tx,
@@ -458,8 +459,8 @@ pub fn spawn_peer_reader(
 pub fn spawn_tun_writer(
     mut tun: TunWriter,
     mut tun_rx: mpsc::Receiver<Bytes>,
-    active: Arc<std::sync::atomic::AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
+    active: Arc<AtomicBool>,
+) -> JoinHandle<()> {
     use std::sync::atomic::Ordering;
     tokio::spawn(async move {
         while let Some(packet) = tun_rx.recv().await {
@@ -515,7 +516,7 @@ mod tests {
     /// `evaluate_inbound` as the sending peer's assigned IP so the ingress
     /// anti-spoof check passes.
     const TEST_V4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 5);
-    const TEST_V6: std::net::Ipv6Addr = std::net::Ipv6Addr::UNSPECIFIED;
+    const TEST_V6: Ipv6Addr = Ipv6Addr::UNSPECIFIED;
 
     fn make_tcp_packet(dst_port: u16) -> Vec<u8> {
         let mut p = vec![0u8; 24];
@@ -713,7 +714,7 @@ mod tests {
 
     #[test]
     fn magic_dns_predicate_matches_only_magic_ip_port_53() {
-        let mk = |ip: std::net::IpAddr, port: u16| firewall::PacketInfo {
+        let mk = |ip: IpAddr, port: u16| firewall::PacketInfo {
             src_ip: "100.64.0.5".parse().unwrap(),
             dst_ip: ip,
             protocol: 17,
@@ -724,11 +725,11 @@ mod tests {
             icmp_id: 0,
         };
         assert!(is_magic_dns(&mk(
-            std::net::IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            IpAddr::V4(crate::dns::MAGIC_DNS_V4),
             53
         )));
         assert!(!is_magic_dns(&mk(
-            std::net::IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            IpAddr::V4(crate::dns::MAGIC_DNS_V4),
             80
         )));
         assert!(!is_magic_dns(&mk("100.64.0.9".parse().unwrap(), 53)));

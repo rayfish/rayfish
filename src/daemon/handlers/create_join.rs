@@ -3,6 +3,8 @@
 
 use super::super::*;
 use std::sync::RwLock;
+use iroh_blobs::Hash;
+use tokio::sync::{Mutex, Notify};
 
 impl DaemonState {
     /// Refresh the network's blob snapshot, store its bytes in the local blob
@@ -42,10 +44,10 @@ impl DaemonState {
         name: &str,
         net_secret_key: &SecretKey,
         state: &SharedNetworkState,
-        dht_notify: &Arc<tokio::sync::Notify>,
+        dht_notify: &Arc<Notify>,
         cancel: &CancellationToken,
     ) -> (
-        Vec<tokio::task::JoinHandle<()>>,
+        Vec<JoinHandle<()>>,
         mpsc::Sender<forward::DisconnectEvent>,
     ) {
         let mut tasks = Vec::new();
@@ -238,8 +240,8 @@ impl DaemonState {
 
         let cancel = self.shutdown_token.child_token();
         let state = Arc::new(RwLock::new(net_state));
-        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let dht_notify = Arc::new(tokio::sync::Notify::new());
+        let invite_lock = Arc::new(Mutex::new(()));
+        let dht_notify = Arc::new(Notify::new());
         let (tasks, disconnect_tx) =
             self.spawn_coordinator_background_tasks(&name, &net_secret_key, &state, &dht_notify, &cancel);
 
@@ -410,7 +412,7 @@ impl DaemonState {
             anyhow::bail!("no peers found in network record");
         }
 
-        let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
+        let blob_hash = Hash::from_bytes(*expected_hash.as_bytes());
 
         let mut group_blob = None;
         for peer_id in &peer_ids {
@@ -467,7 +469,7 @@ impl DaemonState {
         // control listener (which may handle InviteShare/InviteUsed once this
         // node is promoted to co-coordinator) and the coordinator handler we may
         // register below — so all ledger access stays serialized.
-        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let invite_lock = Arc::new(Mutex::new(()));
 
         let (state, cancel, disconnect_tx, tasks) = if initial {
             let my_id = self.identity.local_identity();
@@ -485,7 +487,7 @@ impl DaemonState {
                 SharedNetworkState,
                 CancellationToken,
                 mpsc::Sender<forward::DisconnectEvent>,
-                Vec<tokio::task::JoinHandle<()>>,
+                Vec<JoinHandle<()>>,
             );
             let mut last_err = anyhow::anyhow!("no coordinators tried");
             let mut found: Option<JoinResources> = None;
@@ -864,7 +866,7 @@ impl DaemonState {
         let (expected_hash, seed_peers) = dht::resolve_network(&pkarr_client, net_pubkey)
             .await
             .context("resolve pkarr record for roster restore")?;
-        let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
+        let blob_hash = Hash::from_bytes(*expected_hash.as_bytes());
 
         // Local blob store first: the coordinator stored these bytes before
         // publishing, so they're on disk.
@@ -910,7 +912,7 @@ impl DaemonState {
     pub(crate) async fn try_fetch_group_blob(
         &self,
         peer_id: EndpointId,
-        blob_hash: iroh_blobs::Hash,
+        blob_hash: Hash,
     ) -> Result<crate::membership::GroupBlob> {
         let conn = transport::connect_to_peer_with_alpn(
             &self.endpoint,
@@ -945,7 +947,7 @@ impl DaemonState {
         let (expected_hash, _peer_ids) = dht::resolve_network(&pkarr_client, net_pubkey).await?;
 
         let my_identity = self.identity.local_identity();
-        let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
+        let blob_hash = Hash::from_bytes(*expected_hash.as_bytes());
 
         let app_config = config::load()?;
         let net_config = app_config
@@ -1043,7 +1045,7 @@ impl DaemonState {
                 dht_notify: None,
                 cancel,
                 tasks,
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                invite_lock: Arc::new(Mutex::new(())),
                 disconnect_tx,
             };
             self.networks.insert(network_name.to_string(), handle);

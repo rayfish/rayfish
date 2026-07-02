@@ -232,8 +232,8 @@ impl DaemonState {
                 };
             }
         };
-        let accept_set: std::collections::HashSet<&FirewallRuleView> = accept.iter().collect();
-        let deny_set: std::collections::HashSet<&FirewallRuleView> = deny.iter().collect();
+        let accept_set: HashSet<&FirewallRuleView> = accept.iter().collect();
+        let deny_set: HashSet<&FirewallRuleView> = deny.iter().collect();
 
         // Partition the queue: keep the still-undecided rules; collect accepted.
         let mut accepted_rules = Vec::new();

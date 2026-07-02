@@ -1,6 +1,9 @@
 //! File-sharing and device-pairing handlers for `DaemonState`: `send_file`,
 //! `list_files`, `accept_file`, pairing. Split out of `daemon/mod.rs`.
 
+use std::ffi::CString;
+use std::path::Path;
+
 use super::super::*;
 
 impl DaemonState {
@@ -73,7 +76,7 @@ impl DaemonState {
             }
         };
 
-        let file_path = std::path::Path::new(path);
+        let file_path = Path::new(path);
         let file_bytes = match std::fs::read(file_path) {
             Ok(b) => b,
             Err(e) => {
@@ -232,10 +235,10 @@ impl DaemonState {
 
         if let Some((uid, gid)) = peer_cred {
             use std::os::unix::ffi::OsStrExt;
-            if let Ok(c) = std::ffi::CString::new(dest.as_os_str().as_bytes()) {
+            if let Ok(c) = CString::new(dest.as_os_str().as_bytes()) {
                 unsafe { libc::chown(c.as_ptr(), uid, gid) };
             }
-            if let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) {
+            if let Ok(c) = CString::new(dir.as_os_str().as_bytes()) {
                 unsafe { libc::chown(c.as_ptr(), uid, gid) };
             }
         }
