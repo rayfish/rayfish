@@ -1,42 +1,58 @@
 //! `ray-mobile`: a UniFFI cdylib that drives the `rayfish` mesh core on Android.
 //!
-//! The Kotlin app owns a `VpnService` and hands its packet fd to [`Node::up`],
-//! which brings up an iroh endpoint (reusing the desktop `build_daemon` bring-up
-//! path) and runs the zero-copy forward loop over the fd via
-//! [`android_tun::AndroidTunReader`] / [`android_tun::AndroidTunWriter`]. No
-//! protocol logic is reimplemented here; everything calls into `rayfish::`.
+//! The `Node` wraps a real headless [`rayfish::daemon::DaemonState`]
+//! (`build_headless`), reusing the desktop daemon's create/join/pair/status
+//! logic instead of reimplementing any protocol. The control plane (endpoint,
+//! network connections) comes up on [`Node::start`]; the data plane (the
+//! zero-copy forward loop over the `VpnService` fd) is attached on [`Node::up`]
+//! and stopped on [`Node::down`], leaving the control plane connected.
+//!
+//! No platform specifics leak into the core: the fd handling lives in
+//! [`android_tun`], and everything else is a thin map from the core's
+//! `IpcMessage` results to the UniFFI records below.
 
 mod android_tun;
 
 use std::sync::{Arc, Mutex};
 
 use android_tun::{AndroidTunReader, AndroidTunWriter};
-use rayfish::membership::{IdentityProvider, IrohIdentityProvider, derive_ipv6};
-use rayfish::{config, dns, dns_resolver, firewall, forward, identity, peers, stats, transport};
-use std::sync::atomic::{AtomicBool, Ordering};
+use rayfish::control;
+use rayfish::daemon::{DaemonState, build_headless};
+use rayfish::deeplink::{self, RayfishLink};
+use rayfish::invite;
+use rayfish::ipc::IpcMessage;
+use rayfish::membership::GroupMode;
 use tokio::runtime::Runtime;
-use tokio_util::sync::CancellationToken;
 
 uniffi::setup_scaffolding!();
 
 /// Structured error surfaced across the FFI boundary.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum RayError {
-    /// A verb whose full wiring needs desktop-only membership persistence that
-    /// M2 does not reach yet.
-    #[error("not yet wired: {0}")]
-    NotWired(String),
+    /// A method that needs the daemon was called before [`Node::start`].
+    #[error("node not started")]
+    NotStarted,
+    /// The supplied invite/pairing code could not be decoded.
+    #[error("bad code: {0}")]
+    BadCode(String),
+    /// Joining a network failed (dial, handshake, or admission).
+    #[error("join failed: {0}")]
+    JoinFailed(String),
+    /// Pairing with a primary device failed.
+    #[error("pair failed: {0}")]
+    PairFailed(String),
+    /// Any other core error: identity load, endpoint bind, create, or an
+    /// unexpected protocol response.
+    #[error("{0}")]
+    Network(String),
     /// The node is already up (or already down) for the requested transition.
     #[error("invalid state: {0}")]
     InvalidState(String),
-    /// Anything from the core: identity load, endpoint bind, fd setup.
-    #[error("{0}")]
-    Internal(String),
 }
 
 impl RayError {
-    fn internal(e: impl std::fmt::Display) -> Self {
-        RayError::Internal(e.to_string())
+    fn network(e: impl std::fmt::Display) -> Self {
+        RayError::Network(e.to_string())
     }
 }
 
@@ -66,23 +82,42 @@ pub struct Status {
     pub peers: Vec<PeerInfo>,
 }
 
-/// Live handles for a running data plane, torn down by [`Node::down`].
-struct Running {
-    token: CancellationToken,
-    endpoint: iroh::Endpoint,
-    peers: peers::PeerTable,
-    active: Arc<AtomicBool>,
-    node_id: String,
-    ipv4: String,
-    ipv6: String,
+/// The outcome of following a `rayfish://` deep link, reflected in the UI.
+#[derive(uniffi::Enum)]
+pub enum LinkAction {
+    Joined(NetworkInfo),
+    Paired,
 }
 
-/// The FFI object. Owns a multi-thread tokio runtime and, while up, the forward
-/// path over the Android fd.
+/// The FFI object. Owns a multi-thread tokio runtime and, once started, an
+/// `Arc<DaemonState>` shared with the core's background tasks.
 #[derive(uniffi::Object)]
 pub struct Node {
     runtime: Runtime,
-    running: Mutex<Option<Running>>,
+    // Never held across a `runtime.block_on(...)`: lock briefly to read/clone the
+    // `Arc<DaemonState>` or to commit `start`, release, then run async work.
+    state: Mutex<Option<Arc<DaemonState>>>,
+}
+
+impl Node {
+    /// Clone out the started `DaemonState`, or `NotStarted`. Releases the lock
+    /// before returning so callers never hold it across `block_on`.
+    fn state(&self) -> Result<Arc<DaemonState>, RayError> {
+        self.state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or(RayError::NotStarted)
+    }
+
+    /// This node's endpoint id, read from a fresh `status()` snapshot.
+    fn node_id(state: &Arc<DaemonState>) -> String {
+        match state.status() {
+            IpcMessage::StatusResponse { endpoint_id, .. } => endpoint_id.to_string(),
+            _ => String::new(),
+        }
+    }
 }
 
 #[uniffi::export]
@@ -101,169 +136,234 @@ impl Node {
             .expect("failed to build tokio runtime");
         Arc::new(Self {
             runtime,
-            running: Mutex::new(None),
+            state: Mutex::new(None),
         })
     }
 
-    /// STUB (M2): creating a network needs coordinator/membership persistence
-    /// that the desktop daemon owns and M2 does not wire. Returns `NotWired`.
-    pub fn create(&self, _name: String) -> Result<NetworkInfo, RayError> {
-        Err(RayError::NotWired(
-            "create: membership persistence not wired in M2".into(),
-        ))
-    }
-
-    /// STUB (M2): joining via invite code needs the join handshake + membership
-    /// persistence. Returns `NotWired`.
-    pub fn join(&self, _invite_code: String) -> Result<NetworkInfo, RayError> {
-        Err(RayError::NotWired(
-            "join: invite handshake not wired in M2".into(),
-        ))
-    }
-
-    /// Bring the data plane up over the `VpnService` fd: load identity, bind the
-    /// iroh endpoint, and spawn the forward loop + TUN writer over the fd. Mirrors
-    /// `build_daemon` steps 1-6 (identity, endpoint, forward wire-up, resolver).
-    pub fn up(&self, tun_fd: i32) -> Result<(), RayError> {
-        // Reject a double-`up` up front, but do NOT hold the lock across the
-        // async bring-up below: a concurrent `status()`/`down()` would otherwise
-        // block for the whole endpoint bind. We build everything first, then take
-        // the lock only briefly to commit (re-checking for a racing `up`).
-        if self.running.lock().unwrap().is_some() {
-            return Err(RayError::InvalidState("node already up".into()));
+    /// Build the headless daemon (identity, endpoint, blob store, resolver) and
+    /// bring the saved networks' control plane up. Idempotent: a second call is a
+    /// no-op success. Must run before `join`/`create`/`pair`/`up`.
+    pub fn start(&self) -> Result<(), RayError> {
+        // Fast path: already started. Check briefly, then release the lock.
+        if self.state.lock().unwrap().is_some() {
+            return Ok(());
         }
 
-        let running = self.runtime.block_on(async move {
-            // --- Identity (step 1) ---
-            let key = identity::load_or_create().map_err(RayError::internal)?;
-            let public_key = key.public();
-            let collision_index = identity::load_collision_index().map_err(RayError::internal)?;
-            let id = IrohIdentityProvider::new(public_key, collision_index);
-            let my_ip = id.local_ip();
-            let my_ipv6 = derive_ipv6(&id.local_identity());
+        let state = self
+            .runtime
+            .block_on(build_headless())
+            .map_err(RayError::network)?;
 
-            // --- iroh endpoint (step 2) ---
-            let app_config = config::load().map_err(RayError::internal)?;
-            let mut alpns: Vec<Vec<u8>> = app_config
-                .networks
-                .iter()
-                .filter_map(|net| net.network_public_key.as_ref().map(transport::network_alpn))
-                .collect();
-            // iroh-blobs ALPN (`iroh_blobs::protocol::ALPN`), matching
-            // `build_daemon`'s `initial_alpns` so the node accepts the same
-            // network-independent protocols.
-            alpns.push(b"/iroh-bytes/4".to_vec());
-            alpns.push(transport::FILES_ALPN.to_vec());
-            alpns.push(transport::CONNECT_ALPN.to_vec());
-            let endpoint = transport::create_endpoint_with_alpns(
-                key.clone(),
-                alpns,
-                false,
-                &app_config.relay,
-                &app_config.discovery_dns,
-            )
-            .await
-            .map_err(RayError::internal)?;
-
-            // --- Forward path over the Android fd (steps 3-6) ---
-            let token = CancellationToken::new();
-            let metrics = Arc::new(stats::ForwardMetrics::default());
-            let peer_table = peers::PeerTable::new();
-            let shared_firewall =
-                firewall::SharedFirewall::new(firewall::FirewallConfig::default());
-            shared_firewall.clone().spawn_evictor(token.clone());
-            let active = Arc::new(AtomicBool::new(true));
-
-            let resolver = Arc::new(dns_resolver::Resolver::new(
-                dns::new_hostname_table(),
-                dns::new_reverse_table(),
-            ));
-
-            // The writer owns a single `dup` of the fd; the reader takes
-            // ownership of the detached fd itself. Build the writer's dup first so
-            // that if it fails we have not yet consumed the original fd.
-            let writer = AndroidTunWriter::new(tun_fd).map_err(RayError::internal)?;
-            // SAFETY: `tun_fd` is the fd Kotlin transferred to us via `detachFd()`;
-            // nothing else owns or closes it, so the reader may take ownership.
-            let reader =
-                unsafe { AndroidTunReader::from_owned_fd(tun_fd) }.map_err(RayError::internal)?;
-
-            let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
-            forward::spawn_tun_writer(writer, tun_rx, active.clone());
-            self.runtime.spawn(forward::run_mesh(
-                reader,
-                peer_table.clone(),
-                shared_firewall.clone(),
-                token.clone(),
-                metrics.clone(),
-                resolver.clone(),
-                tun_tx.clone(),
-            ));
-
-            Ok::<Running, RayError>(Running {
-                token,
-                node_id: endpoint.id().to_string(),
-                endpoint,
-                peers: peer_table,
-                active,
-                ipv4: my_ip.to_string(),
-                ipv6: my_ipv6.to_string(),
-            })
-        })?;
-
-        // Commit under the lock, re-checking for a racing `up` that won while we
-        // were building. If one did, drop `running` here (cancelling its token /
-        // closing its fds via Drop) and report the same double-`up` error.
-        let mut guard = self.running.lock().unwrap();
-        if guard.is_some() {
-            running.active.store(false, Ordering::Relaxed);
-            running.token.cancel();
-            return Err(RayError::InvalidState("node already up".into()));
+        // Commit under the lock, re-checking for a racing `start` that won while
+        // we were building. If one did, keep the winner and drop ours.
+        let mut guard = self.state.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(state);
         }
-        *guard = Some(running);
         Ok(())
     }
 
+    /// Join an existing network by invite code (or a bare room id / network
+    /// pubkey). Maps the core's `IpcMessage` result to a [`NetworkInfo`].
+    pub fn join(&self, code: String) -> Result<NetworkInfo, RayError> {
+        let state = self.state()?;
 
-    /// Tear the data plane down: cancel the forward loop and close the endpoint.
-    pub fn down(&self) -> Result<(), RayError> {
-        let running = self.running.lock().unwrap().take();
-        let Some(running) = running else {
-            return Err(RayError::InvalidState("node not up".into()));
+        // `code` is either a self-contained invite (network key + coordinator +
+        // secret) or a bare room id (the network pubkey). Mirrors the CLI's
+        // `ipc_join` fallback: on decode failure, treat the input as a room id.
+        let (network_key, invite, coordinator) = match invite::decode_invite_code(&code) {
+            Ok((net_pubkey, coord, secret)) => {
+                (net_pubkey.to_string(), Some(secret), Some(coord))
+            }
+            Err(_) => (code.clone(), None, None),
         };
-        running.active.store(false, Ordering::Relaxed);
-        running.token.cancel();
-        let endpoint = running.endpoint;
-        self.runtime.block_on(async move { endpoint.close().await });
+
+        let result = self.runtime.block_on(state.join_network(
+            &network_key,
+            None,
+            None,
+            invite,
+            coordinator,
+            false,
+        ));
+
+        match result {
+            IpcMessage::Joined {
+                name,
+                my_ip,
+                my_ipv6,
+            } => Ok(NetworkInfo {
+                name,
+                node_id: Self::node_id(&state),
+                ipv4: my_ip.to_string(),
+                ipv6: my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
+            }),
+            // Closed network without a valid invite: queued for coordinator
+            // approval and retried in the background. Report it as a successful
+            // join-in-progress; the mesh IP is assigned once approved, so the UI
+            // polls `status()` for it.
+            IpcMessage::Ok { .. } => Ok(NetworkInfo {
+                name: network_key,
+                node_id: Self::node_id(&state),
+                ipv4: String::new(),
+                ipv6: String::new(),
+            }),
+            IpcMessage::Error { message } => Err(RayError::JoinFailed(message)),
+            other => Err(RayError::JoinFailed(format!(
+                "unexpected join response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Create a new network (default CLOSED membership) and register this node as
+    /// its coordinator. `name` is optional; the core generates one if absent.
+    pub fn create(&self, name: Option<String>) -> Result<NetworkInfo, RayError> {
+        let state = self.state()?;
+
+        // Default (CLOSED) membership: `GroupMode::Restricted`. No `--open`
+        // affordance on mobile.
+        let result = self
+            .runtime
+            .block_on(state.create_network(GroupMode::default(), name, None));
+
+        match result {
+            IpcMessage::Created {
+                name,
+                my_ip,
+                my_ipv6,
+                ..
+            } => Ok(NetworkInfo {
+                name,
+                node_id: Self::node_id(&state),
+                ipv4: my_ip.to_string(),
+                ipv6: my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
+            }),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!(
+                "unexpected create response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Pair this device with a primary device using a scanned/pasted pairing
+    /// ticket (`bs58(endpoint_id[32] || secret[32])`).
+    pub fn pair(&self, ticket: String) -> Result<(), RayError> {
+        let state = self.state()?;
+
+        let (endpoint, secret) =
+            control::decode_pairing_ticket(&ticket).map_err(|e| RayError::BadCode(e.to_string()))?;
+
+        let result = self
+            .runtime
+            .block_on(state.pair_with_device(endpoint, secret.to_vec()));
+
+        match result {
+            IpcMessage::PairingComplete { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::PairFailed(message)),
+            other => Err(RayError::PairFailed(format!(
+                "unexpected pair response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Bring the data plane up over the `VpnService` fd: attach the fd's
+    /// reader/writer to the running daemon and mark the data plane active.
+    /// Requires [`Node::start`] first.
+    pub fn up(&self, tun_fd: i32) -> Result<(), RayError> {
+        let state = self.state()?;
+
+        // The writer owns a single `dup` of the fd; the reader takes ownership of
+        // the detached fd itself. Build the writer's dup first so that if it fails
+        // we have not yet consumed the original fd. Two owned fds, each closed
+        // exactly once on drop (when `detach_tun`/`Drop` tears the tasks down).
+        let writer = AndroidTunWriter::new(tun_fd).map_err(RayError::network)?;
+        // SAFETY: `tun_fd` is the fd Kotlin transferred to us via `detachFd()`;
+        // nothing else owns or closes it, so the reader may take ownership.
+        let reader =
+            unsafe { AndroidTunReader::from_owned_fd(tun_fd) }.map_err(RayError::network)?;
+
+        self.runtime.block_on(async {
+            state.attach_tun(reader, writer).await;
+            // Mark the data plane active (and configure Magic DNS) the same way
+            // `run_daemon` does after attaching the desktop TUN.
+            state.activate(None).await;
+        });
         Ok(())
     }
 
-    /// Peers + addresses + running flag for the UI.
+    /// Tear the data plane down (stop the forward loop, close the fds) while
+    /// keeping the control plane connected. Requires [`Node::start`] first.
+    pub fn down(&self) -> Result<(), RayError> {
+        let state = self.state()?;
+        state.detach_tun();
+        Ok(())
+    }
+
+    /// Peers + addresses + running flag for the UI. Empty snapshot before
+    /// [`Node::start`].
     pub fn status(&self) -> Status {
-        let guard = self.running.lock().unwrap();
-        match guard.as_ref() {
-            None => Status {
+        let Some(state) = self.state.lock().unwrap().as_ref().cloned() else {
+            return Status {
+                running: false,
+                node_id: String::new(),
+                ipv4: String::new(),
+                ipv6: String::new(),
+                peers: Vec::new(),
+            };
+        };
+
+        match state.status() {
+            IpcMessage::StatusResponse {
+                endpoint_id,
+                active,
+                networks,
+                ..
+            } => {
+                // The node's own mesh IPs are the same across networks (derived
+                // from its identity); take them from the first network if any.
+                let (ipv4, ipv6) = networks
+                    .first()
+                    .map(|n| {
+                        (
+                            n.my_ip.to_string(),
+                            n.my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
+                        )
+                    })
+                    .unwrap_or_default();
+                let peers = networks
+                    .iter()
+                    .flat_map(|n| &n.peers)
+                    .map(|p| PeerInfo {
+                        ipv4: p.ip.to_string(),
+                        node_id: p.endpoint_id.to_string(),
+                    })
+                    .collect();
+                Status {
+                    running: active,
+                    node_id: endpoint_id.to_string(),
+                    ipv4,
+                    ipv6,
+                    peers,
+                }
+            }
+            _ => Status {
                 running: false,
                 node_id: String::new(),
                 ipv4: String::new(),
                 ipv6: String::new(),
                 peers: Vec::new(),
             },
-            Some(r) => Status {
-                running: true,
-                node_id: r.node_id.clone(),
-                ipv4: r.ipv4.clone(),
-                ipv6: r.ipv6.clone(),
-                peers: r
-                    .peers
-                    .all_connections()
-                    .into_iter()
-                    .map(|(ip, conn)| PeerInfo {
-                        ipv4: ip.to_string(),
-                        node_id: conn.remote_id().to_string(),
-                    })
-                    .collect(),
-            },
+        }
+    }
+
+    /// Follow a `rayfish://join/<code>` or `rayfish://pair/<ticket>` deep link,
+    /// dispatching to [`Node::join`] / [`Node::pair`]. Requires [`Node::start`].
+    pub fn handle_link(&self, uri: String) -> Result<LinkAction, RayError> {
+        let link =
+            deeplink::parse_rayfish_uri(&uri).map_err(|e| RayError::BadCode(e.to_string()))?;
+        match link {
+            RayfishLink::Join(code) => self.join(code).map(LinkAction::Joined),
+            RayfishLink::Pair(ticket) => self.pair(ticket).map(|()| LinkAction::Paired),
         }
     }
 }

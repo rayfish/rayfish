@@ -490,7 +490,11 @@ impl DaemonState {
     /// Activate the VPN: bring the TUN interface up, configure system DNS.
     /// Idempotent — a no-op if already active. Runs entirely inside the
     /// (root) daemon, so the IPC client needs no privileges.
-    pub(crate) async fn activate(self: &Arc<Self>, hostname: Option<String>) -> IpcMessage {
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    /// bring the data plane up (mark active, configure Magic DNS). On Android the
+    /// packet interface + routes are the `VpnService`'s job, so those desktop
+    /// route calls are skipped.
+    pub async fn activate(self: &Arc<Self>, hostname: Option<String>) -> IpcMessage {
         // Persist the personal default hostname first (before the already-active
         // short-circuit) so `ray up --hostname X` records the new default even
         // when the VPN is already up. Used as the fallback for future

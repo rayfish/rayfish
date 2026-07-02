@@ -1262,11 +1262,7 @@ pub struct NetworkHandle {
 /// Handles for the packet-forwarding tasks a [`DaemonState::attach_tun`] call
 /// spawns (the TUN writer and the `run_mesh` reader loop), plus a dedicated
 /// cancellation token so the data plane can be stopped independently of a full
-/// daemon shutdown (used by `down()` in a later milestone).
-// The fields are populated by `attach_tun` and consumed by `down()`/detach in a
-// later milestone (M3); silence the interim dead-code warning rather than drop
-// the handles the data-plane teardown will need.
-#[allow(dead_code)]
+/// daemon shutdown (used by [`DaemonState::detach_tun`] / `ray-mobile`'s `down`).
 struct TunTasks {
     /// Cancels the `run_mesh` reader loop without touching `shutdown_token`.
     cancel: CancellationToken,
@@ -1466,6 +1462,24 @@ impl DaemonState {
             writer: writer_handle,
             mesh: mesh_handle,
         });
+    }
+
+    /// Part of the embedding API (used by `ray-mobile`'s `down`): stop the
+    /// packet-forwarding data plane started by [`attach_tun`] (the TUN writer and
+    /// the `run_mesh` reader loop) WITHOUT tearing down the control plane. The
+    /// iroh endpoint and every network connection stay live, so the node remains
+    /// reachable to peers and keeps receiving roster/blob updates; only local
+    /// packet forwarding over the attached interface stops. Cancelling the loop's
+    /// child token and aborting the tasks drops the reader/writer, closing the
+    /// underlying fds. Idempotent: a no-op if no interface is attached.
+    pub fn detach_tun(&self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some(tasks) = self.tun_tasks.lock().unwrap().take() {
+            tasks.cancel.cancel();
+            tasks.writer.abort();
+            tasks.mesh.abort();
+        }
     }
 
     /// Register a [`CoordinatorAcceptState`] handler for `network` and update

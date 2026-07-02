@@ -726,6 +726,12 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -745,7 +751,13 @@ internal interface IntegrityCheckingUniffiLib : Library {
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_down(
 ): Short
+fun uniffi_ray_mobile_checksum_method_node_handle_link(
+): Short
 fun uniffi_ray_mobile_checksum_method_node_join(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_pair(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_start(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_status(
 ): Short
@@ -812,8 +824,14 @@ fun uniffi_ray_mobile_fn_method_node_create(`ptr`: Pointer,`name`: RustBuffer.By
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_down(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-fun uniffi_ray_mobile_fn_method_node_join(`ptr`: Pointer,`inviteCode`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+fun uniffi_ray_mobile_fn_method_node_handle_link(`ptr`: Pointer,`uri`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_join(`ptr`: Pointer,`code`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_pair(`ptr`: Pointer,`ticket`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_ray_mobile_fn_method_node_start(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_ray_mobile_fn_method_node_status(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_up(`ptr`: Pointer,`tunFd`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -944,19 +962,28 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_ray_mobile_checksum_method_node_create() != 30155.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_create() != 50208.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_down() != 31317.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_down() != 54510.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_join() != 28711.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_handle_link() != 17267.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_status() != 23403.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_join() != 21543.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_up() != 2988.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_pair() != 22172.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_start() != 25989.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_status() != 38384.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_up() != 62370.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_constructor_node_new() != 39092.toShort()) {
@@ -1308,37 +1335,58 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
 
 
 /**
- * The FFI object. Owns a multi-thread tokio runtime and, while up, the forward
- * path over the Android fd.
+ * The FFI object. Owns a multi-thread tokio runtime and, once started, an
+ * `Arc<DaemonState>` shared with the core's background tasks.
  */
 public interface NodeInterface {
     
     /**
-     * STUB (M2): creating a network needs coordinator/membership persistence
-     * that the desktop daemon owns and M2 does not wire. Returns `NotWired`.
+     * Create a new network (default CLOSED membership) and register this node as
+     * its coordinator. `name` is optional; the core generates one if absent.
      */
-    fun `create`(`name`: kotlin.String): NetworkInfo
+    fun `create`(`name`: kotlin.String?): NetworkInfo
     
     /**
-     * Tear the data plane down: cancel the forward loop and close the endpoint.
+     * Tear the data plane down (stop the forward loop, close the fds) while
+     * keeping the control plane connected. Requires [`Node::start`] first.
      */
     fun `down`()
     
     /**
-     * STUB (M2): joining via invite code needs the join handshake + membership
-     * persistence. Returns `NotWired`.
+     * Follow a `rayfish://join/<code>` or `rayfish://pair/<ticket>` deep link,
+     * dispatching to [`Node::join`] / [`Node::pair`]. Requires [`Node::start`].
      */
-    fun `join`(`inviteCode`: kotlin.String): NetworkInfo
+    fun `handleLink`(`uri`: kotlin.String): LinkAction
     
     /**
-     * Peers + addresses + running flag for the UI.
+     * Join an existing network by invite code (or a bare room id / network
+     * pubkey). Maps the core's `IpcMessage` result to a [`NetworkInfo`].
+     */
+    fun `join`(`code`: kotlin.String): NetworkInfo
+    
+    /**
+     * Pair this device with a primary device using a scanned/pasted pairing
+     * ticket (`bs58(endpoint_id[32] || secret[32])`).
+     */
+    fun `pair`(`ticket`: kotlin.String)
+    
+    /**
+     * Build the headless daemon (identity, endpoint, blob store, resolver) and
+     * bring the saved networks' control plane up. Idempotent: a second call is a
+     * no-op success. Must run before `join`/`create`/`pair`/`up`.
+     */
+    fun `start`()
+    
+    /**
+     * Peers + addresses + running flag for the UI. Empty snapshot before
+     * [`Node::start`].
      */
     fun `status`(): Status
     
     /**
-     * Bring the data plane up over the `VpnService` fd: load identity, bind the
-     * iroh endpoint, and spawn the forward loop + TUN writer over the fd. Mirrors
-     * `build_daemon` steps 1-6 (identity, endpoint, forward wire-up, resolver).
+     * Bring the data plane up over the `VpnService` fd: attach the fd's
+     * reader/writer to the running daemon and mark the data plane active.
+     * Requires [`Node::start`] first.
      */
     fun `up`(`tunFd`: kotlin.Int)
     
@@ -1346,8 +1394,8 @@ public interface NodeInterface {
 }
 
 /**
- * The FFI object. Owns a multi-thread tokio runtime and, while up, the forward
- * path over the Android fd.
+ * The FFI object. Owns a multi-thread tokio runtime and, once started, an
+ * `Arc<DaemonState>` shared with the core's background tasks.
  */
 open class Node: Disposable, AutoCloseable, NodeInterface
 {
@@ -1445,15 +1493,15 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
-     * STUB (M2): creating a network needs coordinator/membership persistence
-     * that the desktop daemon owns and M2 does not wire. Returns `NotWired`.
+     * Create a new network (default CLOSED membership) and register this node as
+     * its coordinator. `name` is optional; the core generates one if absent.
      */
-    @Throws(RayException::class)override fun `create`(`name`: kotlin.String): NetworkInfo {
+    @Throws(RayException::class)override fun `create`(`name`: kotlin.String?): NetworkInfo {
             return FfiConverterTypeNetworkInfo.lift(
     callWithPointer {
     uniffiRustCallWithError(RayException) { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_create(
-        it, FfiConverterString.lower(`name`),_status)
+        it, FfiConverterOptionalString.lower(`name`),_status)
 }
     }
     )
@@ -1462,7 +1510,8 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
-     * Tear the data plane down: cancel the forward loop and close the endpoint.
+     * Tear the data plane down (stop the forward loop, close the fds) while
+     * keeping the control plane connected. Requires [`Node::start`] first.
      */
     @Throws(RayException::class)override fun `down`()
         = 
@@ -1477,15 +1526,15 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
-     * STUB (M2): joining via invite code needs the join handshake + membership
-     * persistence. Returns `NotWired`.
+     * Follow a `rayfish://join/<code>` or `rayfish://pair/<ticket>` deep link,
+     * dispatching to [`Node::join`] / [`Node::pair`]. Requires [`Node::start`].
      */
-    @Throws(RayException::class)override fun `join`(`inviteCode`: kotlin.String): NetworkInfo {
-            return FfiConverterTypeNetworkInfo.lift(
+    @Throws(RayException::class)override fun `handleLink`(`uri`: kotlin.String): LinkAction {
+            return FfiConverterTypeLinkAction.lift(
     callWithPointer {
     uniffiRustCallWithError(RayException) { _status ->
-    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_join(
-        it, FfiConverterString.lower(`inviteCode`),_status)
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_handle_link(
+        it, FfiConverterString.lower(`uri`),_status)
 }
     }
     )
@@ -1494,7 +1543,58 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
-     * Peers + addresses + running flag for the UI.
+     * Join an existing network by invite code (or a bare room id / network
+     * pubkey). Maps the core's `IpcMessage` result to a [`NetworkInfo`].
+     */
+    @Throws(RayException::class)override fun `join`(`code`: kotlin.String): NetworkInfo {
+            return FfiConverterTypeNetworkInfo.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_join(
+        it, FfiConverterString.lower(`code`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Pair this device with a primary device using a scanned/pasted pairing
+     * ticket (`bs58(endpoint_id[32] || secret[32])`).
+     */
+    @Throws(RayException::class)override fun `pair`(`ticket`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_pair(
+        it, FfiConverterString.lower(`ticket`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Build the headless daemon (identity, endpoint, blob store, resolver) and
+     * bring the saved networks' control plane up. Idempotent: a second call is a
+     * no-op success. Must run before `join`/`create`/`pair`/`up`.
+     */
+    @Throws(RayException::class)override fun `start`()
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_start(
+        it, _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Peers + addresses + running flag for the UI. Empty snapshot before
+     * [`Node::start`].
      */override fun `status`(): Status {
             return FfiConverterTypeStatus.lift(
     callWithPointer {
@@ -1509,9 +1609,9 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
-     * Bring the data plane up over the `VpnService` fd: load identity, bind the
-     * iroh endpoint, and spawn the forward loop + TUN writer over the fd. Mirrors
-     * `build_daemon` steps 1-6 (identity, endpoint, forward wire-up, resolver).
+     * Bring the data plane up over the `VpnService` fd: attach the fd's
+     * reader/writer to the running daemon and mark the data plane active.
+     * Requires [`Node::start`] first.
      */
     @Throws(RayException::class)override fun `up`(`tunFd`: kotlin.Int)
         = 
@@ -1687,6 +1787,73 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
 
 
 
+/**
+ * The outcome of following a `rayfish://` deep link, reflected in the UI.
+ */
+sealed class LinkAction {
+    
+    data class Joined(
+        val v1: NetworkInfo) : LinkAction() {
+        companion object
+    }
+    
+    object Paired : LinkAction()
+    
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeLinkAction : FfiConverterRustBuffer<LinkAction>{
+    override fun read(buf: ByteBuffer): LinkAction {
+        return when(buf.getInt()) {
+            1 -> LinkAction.Joined(
+                FfiConverterTypeNetworkInfo.read(buf),
+                )
+            2 -> LinkAction.Paired
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: LinkAction) = when(value) {
+        is LinkAction.Joined -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterTypeNetworkInfo.allocationSize(value.v1)
+            )
+        }
+        is LinkAction.Paired -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+    }
+
+    override fun write(value: LinkAction, buf: ByteBuffer) {
+        when(value) {
+            is LinkAction.Joined -> {
+                buf.putInt(1)
+                FfiConverterTypeNetworkInfo.write(value.v1, buf)
+                Unit
+            }
+            is LinkAction.Paired -> {
+                buf.putInt(2)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
 
 
 /**
@@ -1695,10 +1862,52 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
 sealed class RayException: kotlin.Exception() {
     
     /**
-     * A verb whose full wiring needs desktop-only membership persistence that
-     * M2 does not reach yet.
+     * A method that needs the daemon was called before [`Node::start`].
      */
-    class NotWired(
+    class NotStarted(
+        ) : RayException() {
+        override val message
+            get() = ""
+    }
+    
+    /**
+     * The supplied invite/pairing code could not be decoded.
+     */
+    class BadCode(
+        
+        val v1: kotlin.String
+        ) : RayException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
+    /**
+     * Joining a network failed (dial, handshake, or admission).
+     */
+    class JoinFailed(
+        
+        val v1: kotlin.String
+        ) : RayException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
+    /**
+     * Pairing with a primary device failed.
+     */
+    class PairFailed(
+        
+        val v1: kotlin.String
+        ) : RayException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
+    /**
+     * Any other core error: identity load, endpoint bind, create, or an
+     * unexpected protocol response.
+     */
+    class Network(
         
         val v1: kotlin.String
         ) : RayException() {
@@ -1710,17 +1919,6 @@ sealed class RayException: kotlin.Exception() {
      * The node is already up (or already down) for the requested transition.
      */
     class InvalidState(
-        
-        val v1: kotlin.String
-        ) : RayException() {
-        override val message
-            get() = "v1=${ v1 }"
-    }
-    
-    /**
-     * Anything from the core: identity load, endpoint bind, fd setup.
-     */
-    class Internal(
         
         val v1: kotlin.String
         ) : RayException() {
@@ -1744,13 +1942,20 @@ public object FfiConverterTypeRayError : FfiConverterRustBuffer<RayException> {
         
 
         return when(buf.getInt()) {
-            1 -> RayException.NotWired(
+            1 -> RayException.NotStarted()
+            2 -> RayException.BadCode(
                 FfiConverterString.read(buf),
                 )
-            2 -> RayException.InvalidState(
+            3 -> RayException.JoinFailed(
                 FfiConverterString.read(buf),
                 )
-            3 -> RayException.Internal(
+            4 -> RayException.PairFailed(
+                FfiConverterString.read(buf),
+                )
+            5 -> RayException.Network(
+                FfiConverterString.read(buf),
+                )
+            6 -> RayException.InvalidState(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
@@ -1759,7 +1964,26 @@ public object FfiConverterTypeRayError : FfiConverterRustBuffer<RayException> {
 
     override fun allocationSize(value: RayException): ULong {
         return when(value) {
-            is RayException.NotWired -> (
+            is RayException.NotStarted -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
+            is RayException.BadCode -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
+            is RayException.JoinFailed -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
+            is RayException.PairFailed -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
+            is RayException.Network -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
                 + FfiConverterString.allocationSize(value.v1)
@@ -1769,34 +1993,75 @@ public object FfiConverterTypeRayError : FfiConverterRustBuffer<RayException> {
                 4UL
                 + FfiConverterString.allocationSize(value.v1)
             )
-            is RayException.Internal -> (
-                // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL
-                + FfiConverterString.allocationSize(value.v1)
-            )
         }
     }
 
     override fun write(value: RayException, buf: ByteBuffer) {
         when(value) {
-            is RayException.NotWired -> {
+            is RayException.NotStarted -> {
                 buf.putInt(1)
-                FfiConverterString.write(value.v1, buf)
                 Unit
             }
-            is RayException.InvalidState -> {
+            is RayException.BadCode -> {
                 buf.putInt(2)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
-            is RayException.Internal -> {
+            is RayException.JoinFailed -> {
                 buf.putInt(3)
+                FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+            is RayException.PairFailed -> {
+                buf.putInt(4)
+                FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+            is RayException.Network -> {
+                buf.putInt(5)
+                FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+            is RayException.InvalidState -> {
+                buf.putInt(6)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
+    override fun read(buf: ByteBuffer): kotlin.String? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterString.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.String?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterString.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.String?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterString.write(value, buf)
+        }
+    }
 }
 
 
