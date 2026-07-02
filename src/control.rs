@@ -238,6 +238,25 @@ pub async fn recv_framed<T: serde::de::DeserializeOwned>(stream: &mut RecvStream
     rmp_serde::from_slice(&body).context("decode framed message")
 }
 
+/// A pairing ticket is `bs58(endpoint_id[32] || secret[32])`, minted by the
+/// primary device's `start_pairing` and presented by the joining device.
+pub fn encode_pairing_ticket(endpoint: EndpointId, secret: &[u8; 32]) -> String {
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(endpoint.as_bytes());
+    buf.extend_from_slice(secret);
+    bs58::encode(buf).into_string()
+}
+
+pub fn decode_pairing_ticket(s: &str) -> Result<(EndpointId, [u8; 32])> {
+    let raw = bs58::decode(s.trim()).into_vec().context("ticket is not base58")?;
+    anyhow::ensure!(raw.len() == 64, "pairing ticket must be 64 bytes, got {}", raw.len());
+    let endpoint = EndpointId::from_bytes(&raw[..32].try_into().unwrap())
+        .context("ticket endpoint id invalid")?;
+    let mut secret = [0u8; 32];
+    secret.copy_from_slice(&raw[32..]);
+    Ok((endpoint, secret))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,5 +532,23 @@ mod tests {
             let bytes = encode_msg(&msg);
             assert_eq!(decode_msg(&bytes).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn pairing_ticket_roundtrips() {
+        let endpoint = iroh::SecretKey::generate().public();
+        let secret = [7u8; 32];
+        let ticket = encode_pairing_ticket(endpoint, &secret);
+        let (got_endpoint, got_secret) = decode_pairing_ticket(&ticket).unwrap();
+        assert_eq!(got_endpoint, endpoint);
+        assert_eq!(got_secret, secret);
+    }
+
+    #[test]
+    fn decode_pairing_ticket_rejects_wrong_length() {
+        // 64-byte payload is required (32 + 32); an invite code (80 bytes) must not parse.
+        let eighty = bs58::encode(vec![0u8; 80]).into_string();
+        assert!(decode_pairing_ticket(&eighty).is_err());
+        assert!(decode_pairing_ticket("not-base58!!").is_err());
     }
 }

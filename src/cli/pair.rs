@@ -57,18 +57,8 @@ pub(crate) async fn ipc_pair_start() -> Result<()> {
 }
 
 pub(crate) async fn ipc_pair_accept(ticket: &str) -> Result<()> {
-    let ticket_bytes = bs58::decode(ticket)
-        .into_vec()
-        .map_err(|e| anyhow::anyhow!("invalid pairing ticket: {e}"))?;
-    if ticket_bytes.len() != 64 {
-        anyhow::bail!(
-            "invalid pairing ticket: expected 64 bytes, got {}",
-            ticket_bytes.len()
-        );
-    }
-    let endpoint_id = iroh::EndpointId::from_bytes(&ticket_bytes[..32].try_into().unwrap())
-        .map_err(|e| anyhow::anyhow!("invalid endpoint ID in ticket: {e}"))?;
-    let secret = ticket_bytes[32..].to_vec();
+    let (endpoint_id, secret) = rayfish::control::decode_pairing_ticket(ticket)?;
+    let secret = secret.to_vec();
 
     let mut stream = ipc::connect().await?;
     ipc::send(
