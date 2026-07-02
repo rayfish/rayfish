@@ -135,6 +135,7 @@ impl DaemonState {
             default_inbound: config.default_inbound,
             default_outbound: config.default_outbound,
             reject: config.reject,
+            disabled: config.disabled,
             rules: firewall::rule_views(&config.rules, &short_id),
         }
     }
@@ -404,6 +405,26 @@ impl DaemonState {
         }
     }
 
+    /// `ray firewall on|off`: the global kill switch. `off` sets
+    /// `config.disabled = true` so `evaluate_packet` allows every packet
+    /// (rules and defaults are bypassed; the anti-spoof check upstream still
+    /// runs). Hot-swaps the live `ArcSwap`, so the effect is immediate.
+    pub(crate) fn firewall_set_enabled(&self, enabled: bool) -> IpcMessage {
+        let mut config = (*self.firewall.get_config()).clone();
+        config.disabled = !enabled;
+        self.firewall.update(config.clone());
+        if let Err(e) = firewall::save_firewall(&config) {
+            tracing::warn!(error = %e, "failed to persist firewall config");
+        }
+        IpcMessage::Ok {
+            message: if enabled {
+                "firewall on (enforcing rules and defaults)".to_string()
+            } else {
+                "firewall off (all packets allowed on this device)".to_string()
+            },
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Mesh SSH (`ray firewall ssh ...`)
     // -----------------------------------------------------------------------
@@ -440,9 +461,18 @@ impl DaemonState {
                 self.stop_ssh();
             }
         }
-        IpcMessage::Ok {
-            message: format!("mesh SSH {}", if enabled { "on" } else { "off" }),
-        }
+        // Nudge: enabling the server does nothing until a peer is authorized. If
+        // no network has any `ssh_allow` entry yet, tell the user the next step.
+        let has_allow = app_config.networks.iter().any(|n| !n.ssh_allow.is_empty());
+        let message = if enabled && !has_allow {
+            "mesh SSH on. No peer is authorized yet. Grant access with \
+             `ray firewall ssh allow <network> <peer>` (peer = hostname / mesh IP / \
+             short id, or `*` for any peer on the network)."
+                .to_string()
+        } else {
+            format!("mesh SSH {}", if enabled { "on" } else { "off" })
+        };
+        IpcMessage::Ok { message }
     }
 
     /// Add or remove a peer from a network's SSH allow list. `peer` is `*` (any
