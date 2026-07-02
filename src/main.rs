@@ -283,6 +283,11 @@ pub(crate) enum Command {
         /// Pairing ticket from the primary device (shorthand for `rayfish pair accept <ticket>`)
         ticket: Option<String>,
     },
+    /// Handle a rayfish:// deep link (join or pair)
+    Open {
+        /// The rayfish:// URI, e.g. rayfish://join/<code> or rayfish://pair/<ticket>
+        uri: String,
+    },
     /// Print the rayfish version
     #[command(visible_alias = "ver")]
     Version,
@@ -928,6 +933,7 @@ async fn main() -> Result<()> {
         Command::Send { file, peer } => ipc_send_file(&file, &peer).await,
         Command::Files { action } => ipc_files(action).await,
         Command::Pair { action, ticket } => cmd_pair(action, ticket).await,
+        Command::Open { uri } => cmd_open(&uri).await,
         Command::Version => {
             println!("ray {FULL_VERSION}");
             Ok(())
