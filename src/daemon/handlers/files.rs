@@ -476,7 +476,7 @@ impl DaemonState {
         };
 
         match response {
-            control::PairMsg::Response { cert } => {
+            control::PairMsg::Response { cert, .. } => {
                 if !cert.verify() {
                     return IpcMessage::Error {
                         message: "received invalid device certificate".to_string(),

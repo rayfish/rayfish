@@ -40,6 +40,15 @@ impl DeviceCert {
     }
 }
 
+/// One of the primary's networks, shared during pairing so the new device can
+/// auto-join it. `network_key` is the network public key (bare room id) as a
+/// hex string; no secret is shared because the device cert is the credential.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairNetwork {
+    pub name: String,
+    pub network_key: String,
+}
+
 /// Messages for the device pairing protocol (ALPN `rayfish/pair/1`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PairMsg {
@@ -49,6 +58,8 @@ pub enum PairMsg {
     },
     Response {
         cert: DeviceCert,
+        #[serde(default)]
+        networks: Vec<PairNetwork>,
     },
 }
 
@@ -548,5 +559,25 @@ mod tests {
         let eighty = bs58::encode(vec![0u8; 80]).into_string();
         assert!(decode_pairing_ticket(&eighty).is_err());
         assert!(decode_pairing_ticket("not-base58!!").is_err());
+    }
+
+    #[test]
+    fn pair_response_networks_defaults_when_absent() {
+        // An old Response encoded without the networks field must still decode,
+        // with an empty list.
+        #[derive(serde::Serialize)]
+        enum OldPairMsg {
+            Response { cert: DeviceCert },
+        }
+        let user = SecretKey::generate();
+        let device = SecretKey::generate().public();
+        let cert = DeviceCert::create(&user, &device);
+        let bytes = rmp_serde::to_vec_named(&OldPairMsg::Response { cert: cert.clone() }).unwrap();
+
+        let decoded: PairMsg = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded {
+            PairMsg::Response { networks, .. } => assert!(networks.is_empty()),
+            _ => panic!("expected Response"),
+        }
     }
 }

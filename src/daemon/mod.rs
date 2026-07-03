@@ -1068,8 +1068,23 @@ impl ProtocolRouter {
                         match stored {
                             Some(expected) if expected == secret => {
                                 // Sign the device's public key
+                                // Share our saved networks so the new device can auto-join them. Only
+                                // networks with a known public key (skips freshly created, unsynced ones).
+                                let networks: Vec<control::PairNetwork> = match config::load() {
+                                    Ok(cfg) => cfg
+                                        .networks
+                                        .into_iter()
+                                        .filter_map(|n| {
+                                            n.network_public_key.map(|k| control::PairNetwork {
+                                                name: n.name,
+                                                network_key: k.to_string(),
+                                            })
+                                        })
+                                        .collect(),
+                                    Err(_) => Vec::new(),
+                                };
                                 let cert = control::DeviceCert::create(&secret_key, &device_pubkey);
-                                let response = control::PairMsg::Response { cert };
+                                let response = control::PairMsg::Response { cert, networks };
                                 let response_bytes = match rmp_serde::to_vec_named(&response) {
                                     Ok(b) => b,
                                     Err(e) => {
