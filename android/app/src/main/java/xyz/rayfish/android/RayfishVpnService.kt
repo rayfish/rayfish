@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import kotlin.concurrent.thread
+import kotlinx.coroutines.runBlocking
 
 /**
  * Foreground [VpnService] that captures the phone's packets and hands the tunnel
@@ -57,12 +58,19 @@ class RayfishVpnService : VpnService() {
         // of the tunnel fd to the Rust side, which closes it on Node.down; our
         // ParcelFileDescriptor no longer owns an fd, so tunnel?.close() on stop
         // is a harmless no-op kept only to clear the reference.
+        //
+        // ensureStarted() MUST run before up(): the node needs start() (which
+        // builds the headless daemon and reconnects saved networks) or up()
+        // returns NotStarted. The service is START_STICKY, so the system can
+        // restart it with no Activity ever created and the UI's ensureStarted
+        // never running; starting it here makes the service self-sufficient.
         thread(name = "rayfish-node-up") {
             try {
+                runBlocking { NodeHolder.ensureStarted(applicationContext) }
                 NodeHolder.get(applicationContext).up(pfd.detachFd())
                 Log.i(TAG, "Node.up succeeded")
             } catch (t: Throwable) {
-                Log.e(TAG, "Node.up failed", t)
+                Log.e(TAG, "Node bring-up failed", t)
             }
         }
     }
