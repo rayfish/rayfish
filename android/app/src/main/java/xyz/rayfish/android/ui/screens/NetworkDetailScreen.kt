@@ -37,6 +37,10 @@ fun NetworkDetailScreen(
     var editing by remember { mutableStateOf(false) }
     var hostnameInput by remember { mutableStateOf("") }
     var firewall by remember { mutableStateOf<uniffi.ray_mobile.FirewallStateInfo?>(null) }
+    var showAddRule by remember { mutableStateOf(false) }
+    suspend fun reloadFirewall() {
+        firewall = try { withContext(Dispatchers.IO) { NodeHolder.get(context).firewallShow() } } catch (t: Throwable) { firewall }
+    }
     LaunchedEffect(detail.name) {
         firewall = try { withContext(Dispatchers.IO) { NodeHolder.get(context).firewallShow() } }
         catch (t: Throwable) { null }
@@ -91,18 +95,30 @@ fun NetworkDetailScreen(
                 SectionLabel("Firewall")
                 KeyValueRow("Inbound default", fw.defaultInbound)
                 KeyValueRow("Outbound default", fw.defaultOutbound)
-                val inbound = fw.rules.filter { it.direction == "in" }
-                if (inbound.isEmpty()) {
+                if (fw.rules.none { it.direction == "in" }) {
                     Text("No inbound rules", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Faint,
                         modifier = Modifier.padding(top = 6.dp))
                 }
-                inbound.forEach { r ->
+                fw.rules.forEachIndexed { globalIndex, r ->
+                    if (r.direction != "in") return@forEachIndexed
                     Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text("${r.action} ${r.protocol}${if (r.port != "*") ":" + r.port else ""}",
                             fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Body)
                         Spacer(Modifier.weight(1f))
                         Text(r.peer, fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Faint)
+                        Spacer(Modifier.width(8.dp))
+                        TextButton(onClick = {
+                            scope.launch {
+                                try {
+                                    withContext(Dispatchers.IO) { NodeHolder.get(context).firewallRemove(globalIndex.toUInt()) }
+                                    reloadFirewall(); onToast("Rule removed")
+                                } catch (t: Throwable) { onToast("Remove failed: ${t.message}") }
+                            }
+                        }) { Text("remove", fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Rose400) }
                     }
+                }
+                TextButton(onClick = { showAddRule = true }) {
+                    Text("+ Allow inbound", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Rose400)
                 }
             }
         }
@@ -145,6 +161,37 @@ fun NetworkDetailScreen(
                 }) { Text("Save", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
             },
             dismissButton = { TextButton(onClick = { editing = false }) { Text("Cancel", color = Rf.Body, fontFamily = Chakra) } },
+        )
+    }
+    if (showAddRule) {
+        var proto by remember { mutableStateOf("tcp") }
+        var port by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { showAddRule = false },
+            containerColor = Rf.Sheet,
+            title = { Text("Allow inbound", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    RayfishTextField(proto, { proto = it.trim().lowercase() }, "protocol: tcp, udp, icmp, any")
+                    RayfishTextField(port, { port = it.trim() }, "port (blank for any), e.g. 22")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    scope.launch {
+                        try {
+                            withContext(Dispatchers.IO) {
+                                NodeHolder.get(context).firewallAdd(
+                                    "in", "allow", proto,
+                                    port.ifBlank { null }, null, detail.name,
+                                )
+                            }
+                            reloadFirewall(); onToast("Rule added"); showAddRule = false
+                        } catch (t: Throwable) { onToast("Add failed: ${t.message}") }
+                    }
+                }) { Text("Add", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = { TextButton(onClick = { showAddRule = false }) { Text("Cancel", color = Rf.Body, fontFamily = Chakra) } },
         )
     }
     inviteCode?.let { code -> QrCodeSheet("Invite to share", code, context, onToast) { inviteCode = null } }
