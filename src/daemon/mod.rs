@@ -179,6 +179,13 @@ pub(crate) fn to_approved_entries<'a>(
         .collect()
 }
 
+/// A paired device is auto-admitted into a closed network only when its device
+/// cert is signed by this coordinator's own owner identity. The cert's
+/// signature is verified by the caller before this check.
+fn owner_admits(device_cert: Option<&control::DeviceCert>, own_identity: EndpointId) -> bool {
+    device_cert.map(|c| c.user_identity) == Some(own_identity)
+}
+
 struct CoordinatorAcceptState {
     ctx: MeshCtx,
     network_name: String,
@@ -354,6 +361,17 @@ impl CoordinatorAcceptState {
                 .await;
             }
             GroupMode::Restricted => {
+                // A device cert signed by this coordinator's own owner identity
+                // is one of our own paired devices: admit directly, same as an
+                // open network, with no manual approval step. Must run before
+                // `device_cert` is moved into the pending-join queue below.
+                if owner_admits(device_cert.as_ref(), self.ctx.identity.local_identity()) {
+                    self.admit_peer(
+                        conn, send, remote_id, peer_ip, hostname, device_cert, false, false,
+                    )
+                    .await;
+                    return;
+                }
                 // TODO(abuse-hardening): the pending-join queue is unbounded and
                 // has no TTL — a peer could open many join streams to grow it. Out
                 // of scope for the control-flood rate limiter (see
@@ -4825,6 +4843,22 @@ mod accept_handler_tests {
         // Re-registering an already-coordinator network is a no-op decision.
         assert!(should_promote(NetworkRole::Member));
         assert!(!should_promote(NetworkRole::Coordinator));
+    }
+
+    #[test]
+    fn owner_admits_only_matching_user_identity() {
+        let owner = SecretKey::generate();
+        let owner_id = owner.public();
+        let device = SecretKey::generate().public();
+        let cert = control::DeviceCert::create(&owner, &device);
+
+        // Cert signed by this owner -> admit.
+        assert!(owner_admits(Some(&cert), owner_id));
+        // No cert -> do not auto-admit.
+        assert!(!owner_admits(None, owner_id));
+        // Cert signed by a different user -> do not auto-admit.
+        let other = SecretKey::generate().public();
+        assert!(!owner_admits(Some(&cert), other));
     }
 }
 
