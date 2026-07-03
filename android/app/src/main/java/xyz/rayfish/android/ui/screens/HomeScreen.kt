@@ -21,13 +21,23 @@ import xyz.rayfish.android.ui.components.*
 fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     val context = LocalContext.current
     var vpnOn by remember { mutableStateOf(false) }
+    var pendingVpn by remember { mutableStateOf<Boolean?>(null) }
 
-    // Reflect the real data-plane state when status arrives.
-    LaunchedEffect(status?.running) { status?.let { vpnOn = it.running } }
+    // Reflect the real data-plane state when status arrives, without stomping an in-flight toggle.
+    LaunchedEffect(status?.running) {
+        val running = status?.running ?: return@LaunchedEffect
+        val pending = pendingVpn
+        when {
+            pending == null -> vpnOn = running          // no user action in flight: follow the truth
+            running == pending -> { vpnOn = running; pendingVpn = null }  // reached desired state: adopt and clear
+            // else: still transitioning toward the user's choice - keep the optimistic vpnOn, do not stomp it
+        }
+    }
 
     fun startService() {
         ContextCompat.startForegroundService(context, Intent(context, RayfishVpnService::class.java))
         vpnOn = true
+        pendingVpn = true
     }
     val consent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         if (r.resultCode == Activity.RESULT_OK) startService() else onToast("VPN permission denied")
@@ -39,6 +49,7 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
         } else {
             context.startService(Intent(context, RayfishVpnService::class.java).apply { action = RayfishVpnService.ACTION_STOP })
             vpnOn = false
+            pendingVpn = false
         }
     }
 

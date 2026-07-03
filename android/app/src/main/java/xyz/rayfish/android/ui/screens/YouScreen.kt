@@ -26,7 +26,7 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
     val scope = rememberCoroutineScope()
     val firstNet = status?.networks?.firstOrNull()
     var editing by remember { mutableStateOf(false) }
-    var hostnameInput by remember(firstNet?.hostname) { mutableStateOf(firstNet?.hostname ?: "") }
+    var hostnameInput by remember { mutableStateOf("") }
     var pairingTicket by remember { mutableStateOf<String?>(null) }
     val version = remember {
         runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull() ?: "-"
@@ -34,7 +34,7 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
 
     val scan = rememberQrScanner { result ->
         if (result != null) scope.launch {
-            try { withContext(Dispatchers.IO) { NodeHolder.get(context).pair(result) }; onToast("Paired"); onChanged() }
+            try { withContext(Dispatchers.IO) { NodeHolder.get(context).pair(result.trim()) }; onToast("Paired"); onChanged() }
             catch (t: Throwable) { onToast("Pair failed: ${t.message}") }
         }
     }
@@ -45,7 +45,7 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             SectionLabel("This device")
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("Hostname", fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-                if (firstNet != null) TextButton(onClick = { editing = true }) {
+                if (firstNet != null) TextButton(onClick = { hostnameInput = firstNet.hostname; editing = true }) {
                     Text(firstNet.hostname.ifEmpty { "set" } + " ✎", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Rose400)
                 } else Text("join a network first", fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint)
             }
@@ -85,10 +85,11 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             confirmButton = {
                 TextButton(onClick = {
                     val h = hostnameInput.trim()
-                    editing = false
                     scope.launch {
-                        try { withContext(Dispatchers.IO) { NodeHolder.get(context).setHostname(firstNet.name, h) }; onToast("Hostname set"); onChanged() }
-                        catch (t: Throwable) { onToast("Invalid hostname: ${t.message}") }
+                        try {
+                            withContext(Dispatchers.IO) { NodeHolder.get(context).setHostname(firstNet.name, h) }
+                            onToast("Hostname set"); onChanged(); editing = false
+                        } catch (t: Throwable) { onToast("Invalid hostname: ${t.message}") }
                     }
                 }) { Text("Save", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
             },

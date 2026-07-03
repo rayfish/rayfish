@@ -99,7 +99,7 @@ private fun AddNetworkSheet(
 ) {
     var name by remember { mutableStateOf("") }
     var code by remember { mutableStateOf("") }
-    val scan = rememberQrScanner { result -> if (result != null) onJoin(result) }
+    val scan = rememberQrScanner { result -> if (result != null) onJoin(result.trim()) }
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Rf.Sheet) {
         Column(Modifier.padding(20.dp).padding(bottom = 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             SectionLabel("Join a network")
