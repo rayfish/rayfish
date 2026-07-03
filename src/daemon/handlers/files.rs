@@ -400,7 +400,7 @@ impl DaemonState {
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// pair this device with a primary device using a scanned ticket.
-    pub async fn pair_with_device(&self, endpoint_id: EndpointId, secret: Vec<u8>) -> IpcMessage {
+    pub async fn pair_with_device(self: &Arc<Self>, endpoint_id: EndpointId, secret: Vec<u8>) -> IpcMessage {
         let addr: iroh::EndpointAddr = endpoint_id.into();
         let conn = match self.endpoint.connect(addr, PAIR_ALPN).await {
             Ok(c) => c,
@@ -476,7 +476,7 @@ impl DaemonState {
         };
 
         match response {
-            control::PairMsg::Response { cert, .. } => {
+            control::PairMsg::Response { cert, networks } => {
                 if !cert.verify() {
                     return IpcMessage::Error {
                         message: "received invalid device certificate".to_string(),
@@ -486,6 +486,20 @@ impl DaemonState {
                     return IpcMessage::Error {
                         message: format!("failed to store device certificate: {e}"),
                     };
+                }
+                // Auto-join every network the primary shared. Each join attaches the
+                // freshly stored cert (see current_device_cert) so the coordinator,
+                // which owns this device, admits it without manual approval.
+                for net in networks {
+                    if self.networks.contains_key(&net.network_key) {
+                        continue;
+                    }
+                    let me = Arc::clone(self);
+                    tokio::spawn(async move {
+                        let _ = me
+                            .join_network(&net.network_key, Some(&net.name), None, None, None, false, false)
+                            .await;
+                    });
                 }
                 IpcMessage::PairingComplete {
                     user_identity: cert.user_identity,
