@@ -1,13 +1,93 @@
 package xyz.rayfish.android.ui.screens
 
-import androidx.compose.runtime.Composable
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.NetworkDetail
+import xyz.rayfish.android.NodeHolder
+import xyz.rayfish.android.ui.components.*
+import xyz.rayfish.android.ui.theme.*
 
 @Composable
 fun NetworkDetailScreen(
-    detail: NetworkDetail,
-    onBack: () -> Unit,
-    onToast: (String) -> Unit,
-    onChanged: () -> Unit,
-    onLeft: () -> Unit,
-) {}
+    detail: NetworkDetail, onBack: () -> Unit, onToast: (String) -> Unit,
+    onChanged: () -> Unit, onLeft: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var confirmLeave by remember { mutableStateOf(false) }
+    var inviteCode by remember { mutableStateOf<String?>(null) }
+
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Rf.Muted) }
+            Text(detail.name, fontFamily = Chakra, fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Rf.Heading)
+            Spacer(Modifier.weight(1f))
+            OverflowMenu(listOf(
+                MenuItem("Invite to share") {
+                    scope.launch {
+                        try { inviteCode = withContext(Dispatchers.IO) { NodeHolder.get(context).invite(detail.name) } }
+                        catch (t: Throwable) { onToast("Invite failed: ${t.message}") }
+                    }
+                },
+                MenuItem("Copy address") { copyToClipboard(context, detail.name, detail.ipv4); onToast("Address copied") },
+                MenuItem("Leave network", destructive = true) { confirmLeave = true },
+            ))
+        }
+        SectionCard {
+            KeyValueRow("Your address", "${detail.hostname.ifEmpty { "-" }}.${detail.name}.ray")
+            KeyValueRow("IPv4", detail.ipv4.ifEmpty { "-" })
+            KeyValueRow("Role", if (detail.isCoordinator) "coordinator" else "member")
+        }
+        SectionCard {
+            SectionLabel("Peers · ${detail.peers.count { it.online }} online")
+            if (detail.peers.isEmpty()) Text("No peers yet", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Faint)
+            detail.peers.forEach { p ->
+                Row(Modifier.fillMaxWidth().padding(top = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(6.dp).clip(RoundedCornerShape(3.dp)).background(if (p.online) Rf.Emerald else Rf.Faint))
+                    Spacer(Modifier.width(8.dp))
+                    Text(p.ipv4, fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Body)
+                    Spacer(Modifier.weight(1f))
+                    Text("${p.hostname.ifEmpty { "?" }} · ${p.nodeId.take(4)}", fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Faint)
+                }
+            }
+        }
+    }
+
+    if (confirmLeave) {
+        AlertDialog(
+            onDismissRequest = { confirmLeave = false },
+            containerColor = Rf.Sheet,
+            title = { Text("Leave ${detail.name}?", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
+            text = { Text("You'll lose your address and stop reaching its peers. You can rejoin later with an invite.",
+                fontFamily = Chakra, fontSize = 13.sp, color = Rf.Muted) },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmLeave = false
+                    scope.launch {
+                        try { withContext(Dispatchers.IO) { NodeHolder.get(context).leave(detail.name) }; onToast("Left ${detail.name}"); onLeft() }
+                        catch (t: Throwable) { onToast("Leave failed: ${t.message}") }
+                    }
+                }) { Text("Leave", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = { TextButton(onClick = { confirmLeave = false }) { Text("Cancel", color = Rf.Body, fontFamily = Chakra) } },
+        )
+    }
+    inviteCode?.let { code -> QrCodeSheet("Invite to share", code, context, onToast) { inviteCode = null } }
+}
