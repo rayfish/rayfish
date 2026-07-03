@@ -4,7 +4,8 @@
 use super::super::*;
 
 impl DaemonState {
-    pub(crate) async fn invite_create(
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    pub async fn invite_create(
         &self,
         network: &str,
         expires_secs: u64,

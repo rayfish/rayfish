@@ -1898,7 +1898,8 @@ impl DaemonState {
     // Hostname
     // -----------------------------------------------------------------------
 
-    pub(crate) async fn set_hostname(&self, network: &str, hostname: &str) -> IpcMessage {
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    pub async fn set_hostname(&self, network: &str, hostname: &str) -> IpcMessage {
         use crate::hostname;
 
         if !hostname::is_valid_hostname(hostname) {

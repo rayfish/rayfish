@@ -828,8 +828,9 @@ impl DaemonState {
         true
     }
 
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
     #[tracing::instrument(skip(self), fields(net = name))]
-    pub(crate) async fn leave_network(&self, name: &str) -> IpcMessage {
+    pub async fn leave_network(&self, name: &str) -> IpcMessage {
         // Gracefully close our connections with the leave code BEFORE teardown
         // drops them, so each peer's reader sees an intentional close and the
         // coordinator prunes us from the roster (rather than waiting for an
