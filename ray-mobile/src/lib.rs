@@ -65,6 +65,7 @@ use android_tun::{AndroidTunReader, AndroidTunWriter};
 use rayfish::control;
 use rayfish::daemon::{DaemonState, build_headless};
 use rayfish::deeplink::{self, RayfishLink};
+use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::invite;
 use rayfish::ipc::IpcMessage;
 use rayfish::membership::GroupMode;
@@ -140,6 +141,26 @@ pub struct Status {
     pub peers: Vec<PeerInfo>,
     pub networks: Vec<NetworkDetail>,
     pub pending_networks: Vec<String>,
+}
+
+/// One firewall rule as shown in the UI.
+#[derive(uniffi::Record)]
+pub struct FirewallRuleInfo {
+    pub direction: String,
+    pub action: String,
+    pub protocol: String,
+    pub port: String,
+    pub peer: String,
+    pub network: String,
+}
+
+/// Current firewall posture and rules, for the UI.
+#[derive(uniffi::Record)]
+pub struct FirewallStateInfo {
+    pub default_inbound: String,
+    pub default_outbound: String,
+    pub disabled: bool,
+    pub rules: Vec<FirewallRuleInfo>,
 }
 
 /// The outcome of following a `rayfish://` deep link, reflected in the UI.
@@ -338,6 +359,76 @@ impl Node {
             IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(RayError::BadCode(message)),
             other => Err(RayError::Network(format!("unexpected set_hostname response: {other:?}"))),
+        }
+    }
+
+    /// Current firewall posture and rules.
+    pub fn firewall_show(&self) -> Result<FirewallStateInfo, RayError> {
+        let state = self.state()?;
+        let IpcMessage::FirewallState {
+            default_inbound,
+            default_outbound,
+            disabled,
+            rules,
+            ..
+        } = state.firewall_show()
+        else {
+            return Err(RayError::Network("unexpected firewall response".to_string()));
+        };
+        Ok(FirewallStateInfo {
+            default_inbound: default_inbound.to_string(),
+            default_outbound: default_outbound.to_string(),
+            disabled,
+            rules: rules
+                .into_iter()
+                .map(|v| FirewallRuleInfo {
+                    direction: v.direction.to_string(),
+                    action: v.action.to_string(),
+                    protocol: v.protocol.to_string(),
+                    port: v.port,
+                    peer: v.peer,
+                    network: v.network,
+                })
+                .collect(),
+        })
+    }
+
+    /// Add a firewall rule. `port`/`peer`/`network` are optional.
+    pub fn firewall_add(
+        &self,
+        direction: String,
+        action: String,
+        protocol: String,
+        port: Option<String>,
+        peer: Option<String>,
+        network: Option<String>,
+    ) -> Result<(), RayError> {
+        let state = self.state()?;
+        let direction: Direction = direction.parse().map_err(RayError::Network)?;
+        let action: Action = action.parse().map_err(RayError::Network)?;
+        let protocol: Protocol = protocol.parse().map_err(RayError::Network)?;
+        let result = self.runtime.block_on(state.firewall_add(
+            direction,
+            action,
+            protocol,
+            port.as_deref(),
+            peer.as_deref(),
+            network.as_deref(),
+        ));
+        match result {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!("unexpected firewall response: {other:?}"))),
+        }
+    }
+
+    /// Remove the rule at the given index (as shown by firewall_show).
+    pub fn firewall_remove(&self, index: u32) -> Result<(), RayError> {
+        let state = self.state()?;
+        match state.firewall_remove(index as usize) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!("unexpected firewall response: {other:?}"))),
         }
     }
 

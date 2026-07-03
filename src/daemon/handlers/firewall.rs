@@ -8,7 +8,7 @@ impl DaemonState {
     // Firewall handlers
     // -----------------------------------------------------------------------
 
-    pub(crate) async fn firewall_add(
+    pub async fn firewall_add(
         &self,
         direction: firewall::Direction,
         action: firewall::Action,
@@ -107,7 +107,7 @@ impl DaemonState {
         IpcMessage::Ok { message }
     }
 
-    pub(crate) fn firewall_remove(&self, index: usize) -> IpcMessage {
+    pub fn firewall_remove(&self, index: usize) -> IpcMessage {
         let current = self.firewall.get_config();
         if index >= current.rules.len() {
             return IpcMessage::Error {
@@ -128,7 +128,7 @@ impl DaemonState {
         }
     }
 
-    pub(crate) fn firewall_show(&self) -> IpcMessage {
+    pub fn firewall_show(&self) -> IpcMessage {
         let config = self.firewall.get_config();
         let short_id = |id: &EndpointId| -> String { id.fmt_short().to_string() };
         IpcMessage::FirewallState {

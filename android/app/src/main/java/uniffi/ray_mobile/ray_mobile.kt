@@ -742,6 +742,12 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -760,6 +766,12 @@ internal interface IntegrityCheckingUniffiLib : Library {
     fun uniffi_ray_mobile_checksum_method_node_create(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_down(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_firewall_add(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_firewall_remove(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_firewall_show(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_handle_link(
 ): Short
@@ -844,6 +856,12 @@ fun uniffi_ray_mobile_fn_method_node_create(`ptr`: Pointer,`name`: RustBuffer.By
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_down(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_ray_mobile_fn_method_node_firewall_add(`ptr`: Pointer,`direction`: RustBuffer.ByValue,`action`: RustBuffer.ByValue,`protocol`: RustBuffer.ByValue,`port`: RustBuffer.ByValue,`peer`: RustBuffer.ByValue,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_ray_mobile_fn_method_node_firewall_remove(`ptr`: Pointer,`index`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_ray_mobile_fn_method_node_firewall_show(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_handle_link(`ptr`: Pointer,`uri`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_invite(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -996,6 +1014,15 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_down() != 54510.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_firewall_add() != 24154.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_firewall_remove() != 54283.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_firewall_show() != 46519.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_handle_link() != 17267.toShort()) {
@@ -1175,6 +1202,29 @@ private class JavaLangRefCleanable(
     val cleanable: java.lang.ref.Cleaner.Cleanable
 ) : UniffiCleaner.Cleanable {
     override fun clean() = cleanable.clean()
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterUInt: FfiConverter<UInt, Int> {
+    override fun lift(value: Int): UInt {
+        return value.toUInt()
+    }
+
+    override fun read(buf: ByteBuffer): UInt {
+        return lift(buf.getInt())
+    }
+
+    override fun lower(value: UInt): Int {
+        return value.toInt()
+    }
+
+    override fun allocationSize(value: UInt) = 4UL
+
+    override fun write(value: UInt, buf: ByteBuffer) {
+        buf.putInt(value.toInt())
+    }
 }
 
 /**
@@ -1398,6 +1448,21 @@ public interface NodeInterface {
     fun `down`()
     
     /**
+     * Add a firewall rule. `port`/`peer`/`network` are optional.
+     */
+    fun `firewallAdd`(`direction`: kotlin.String, `action`: kotlin.String, `protocol`: kotlin.String, `port`: kotlin.String?, `peer`: kotlin.String?, `network`: kotlin.String?)
+    
+    /**
+     * Remove the rule at the given index (as shown by firewall_show).
+     */
+    fun `firewallRemove`(`index`: kotlin.UInt)
+    
+    /**
+     * Current firewall posture and rules.
+     */
+    fun `firewallShow`(): FirewallStateInfo
+    
+    /**
      * Follow a `rayfish://join/<code>` or `rayfish://pair/<ticket>` deep link,
      * dispatching to [`Node::join`] / [`Node::pair`]. Requires [`Node::start`].
      */
@@ -1599,6 +1664,52 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 }
     }
     
+    
+
+    
+    /**
+     * Add a firewall rule. `port`/`peer`/`network` are optional.
+     */
+    @Throws(RayException::class)override fun `firewallAdd`(`direction`: kotlin.String, `action`: kotlin.String, `protocol`: kotlin.String, `port`: kotlin.String?, `peer`: kotlin.String?, `network`: kotlin.String?)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_add(
+        it, FfiConverterString.lower(`direction`),FfiConverterString.lower(`action`),FfiConverterString.lower(`protocol`),FfiConverterOptionalString.lower(`port`),FfiConverterOptionalString.lower(`peer`),FfiConverterOptionalString.lower(`network`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Remove the rule at the given index (as shown by firewall_show).
+     */
+    @Throws(RayException::class)override fun `firewallRemove`(`index`: kotlin.UInt)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_remove(
+        it, FfiConverterUInt.lower(`index`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Current firewall posture and rules.
+     */
+    @Throws(RayException::class)override fun `firewallShow`(): FirewallStateInfo {
+            return FfiConverterTypeFirewallStateInfo.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_show(
+        it, _status)
+}
+    }
+    )
+    }
     
 
     
@@ -1819,6 +1930,100 @@ public object FfiConverterTypeNode: FfiConverter<Node, Pointer> {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
+    }
+}
+
+
+
+/**
+ * One firewall rule as shown in the UI.
+ */
+data class FirewallRuleInfo (
+    var `direction`: kotlin.String, 
+    var `action`: kotlin.String, 
+    var `protocol`: kotlin.String, 
+    var `port`: kotlin.String, 
+    var `peer`: kotlin.String, 
+    var `network`: kotlin.String
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFirewallRuleInfo: FfiConverterRustBuffer<FirewallRuleInfo> {
+    override fun read(buf: ByteBuffer): FirewallRuleInfo {
+        return FirewallRuleInfo(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FirewallRuleInfo) = (
+            FfiConverterString.allocationSize(value.`direction`) +
+            FfiConverterString.allocationSize(value.`action`) +
+            FfiConverterString.allocationSize(value.`protocol`) +
+            FfiConverterString.allocationSize(value.`port`) +
+            FfiConverterString.allocationSize(value.`peer`) +
+            FfiConverterString.allocationSize(value.`network`)
+    )
+
+    override fun write(value: FirewallRuleInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`direction`, buf)
+            FfiConverterString.write(value.`action`, buf)
+            FfiConverterString.write(value.`protocol`, buf)
+            FfiConverterString.write(value.`port`, buf)
+            FfiConverterString.write(value.`peer`, buf)
+            FfiConverterString.write(value.`network`, buf)
+    }
+}
+
+
+
+/**
+ * Current firewall posture and rules, for the UI.
+ */
+data class FirewallStateInfo (
+    var `defaultInbound`: kotlin.String, 
+    var `defaultOutbound`: kotlin.String, 
+    var `disabled`: kotlin.Boolean, 
+    var `rules`: List<FirewallRuleInfo>
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFirewallStateInfo: FfiConverterRustBuffer<FirewallStateInfo> {
+    override fun read(buf: ByteBuffer): FirewallStateInfo {
+        return FirewallStateInfo(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterSequenceTypeFirewallRuleInfo.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FirewallStateInfo) = (
+            FfiConverterString.allocationSize(value.`defaultInbound`) +
+            FfiConverterString.allocationSize(value.`defaultOutbound`) +
+            FfiConverterBoolean.allocationSize(value.`disabled`) +
+            FfiConverterSequenceTypeFirewallRuleInfo.allocationSize(value.`rules`)
+    )
+
+    override fun write(value: FirewallStateInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`defaultInbound`, buf)
+            FfiConverterString.write(value.`defaultOutbound`, buf)
+            FfiConverterBoolean.write(value.`disabled`, buf)
+            FfiConverterSequenceTypeFirewallRuleInfo.write(value.`rules`, buf)
     }
 }
 
@@ -2300,6 +2505,34 @@ public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.Str
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterString.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFirewallRuleInfo: FfiConverterRustBuffer<List<FirewallRuleInfo>> {
+    override fun read(buf: ByteBuffer): List<FirewallRuleInfo> {
+        val len = buf.getInt()
+        return List<FirewallRuleInfo>(len) {
+            FfiConverterTypeFirewallRuleInfo.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FirewallRuleInfo>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFirewallRuleInfo.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FirewallRuleInfo>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFirewallRuleInfo.write(it, buf)
         }
     }
 }
