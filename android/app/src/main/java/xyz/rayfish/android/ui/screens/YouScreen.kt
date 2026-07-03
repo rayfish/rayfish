@@ -34,8 +34,14 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
 
     val scan = rememberQrScanner { result ->
         if (result != null) scope.launch {
-            try { withContext(Dispatchers.IO) { NodeHolder.get(context).pair(result.trim()) }; onToast("Paired"); onChanged() }
-            catch (t: Throwable) { onToast("Pair failed: ${t.message}") }
+            try {
+                val action = withContext(Dispatchers.IO) { NodeHolder.get(context).submitCode(result.trim()) }
+                onToast(when (action) {
+                    is uniffi.ray_mobile.LinkAction.Joined -> "Joined ${action.v1.name}"
+                    is uniffi.ray_mobile.LinkAction.Paired -> "Device paired"
+                })
+                onChanged()
+            } catch (t: Throwable) { onToast("Failed: ${t.message}") }
         }
     }
 
