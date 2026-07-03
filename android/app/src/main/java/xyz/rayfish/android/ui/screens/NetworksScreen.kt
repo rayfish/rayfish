@@ -77,6 +77,19 @@ fun NetworksScreen(
                 }
             }
         }
+        val pending = status?.pendingNetworks ?: emptyList()
+        pending.forEach { name ->
+            SectionCard {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(8.dp).clip(RoundedCornerShape(4.dp)).background(Rf.Faint))
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(name, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
+                        Text("waiting for approval", fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Muted)
+                    }
+                }
+            }
+        }
     }
 
     if (showAdd) {

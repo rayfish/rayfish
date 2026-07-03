@@ -88,7 +88,7 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
 private fun HomePreview() {
     xyz.rayfish.android.ui.theme.RayfishTheme {
         HomeScreen(
-            status = Status(true, "7f3ac2e1", "100.88.0.3", "fd00::7f3a", emptyList(), emptyList()),
+            status = Status(true, "7f3ac2e1", "100.88.0.3", "fd00::7f3a", emptyList(), emptyList(), emptyList()),
             starting = false, onToast = {},
         )
     }

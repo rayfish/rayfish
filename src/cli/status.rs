@@ -145,6 +145,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
             bytes_tx,
             pending_files,
             pending_connects,
+            ..
         } => {
             if json_enabled() {
                 print_json(&serde_json::json!({

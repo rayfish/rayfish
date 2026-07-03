@@ -139,6 +139,7 @@ pub struct Status {
     pub ipv6: String,
     pub peers: Vec<PeerInfo>,
     pub networks: Vec<NetworkDetail>,
+    pub pending_networks: Vec<String>,
 }
 
 /// The outcome of following a `rayfish://` deep link, reflected in the UI.
@@ -421,6 +422,7 @@ impl Node {
             ipv6: String::new(),
             peers: Vec::new(),
             networks: Vec::new(),
+            pending_networks: Vec::new(),
         };
         let Some(state) = self.state.lock().unwrap().as_ref().cloned() else {
             return empty();
@@ -430,6 +432,7 @@ impl Node {
             endpoint_id,
             active,
             networks,
+            pending_networks,
             ..
         } = state.status()
         else {
@@ -483,6 +486,7 @@ impl Node {
             ipv6,
             peers: flat_peers,
             networks: detail,
+            pending_networks,
         }
     }
 

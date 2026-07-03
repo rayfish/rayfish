@@ -1977,7 +1977,8 @@ data class Status (
     var `ipv4`: kotlin.String, 
     var `ipv6`: kotlin.String, 
     var `peers`: List<PeerInfo>, 
-    var `networks`: List<NetworkDetail>
+    var `networks`: List<NetworkDetail>, 
+    var `pendingNetworks`: List<kotlin.String>
 ) {
     
     companion object
@@ -1995,6 +1996,7 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterString.read(buf),
             FfiConverterSequenceTypePeerInfo.read(buf),
             FfiConverterSequenceTypeNetworkDetail.read(buf),
+            FfiConverterSequenceString.read(buf),
         )
     }
 
@@ -2004,7 +2006,8 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterString.allocationSize(value.`ipv4`) +
             FfiConverterString.allocationSize(value.`ipv6`) +
             FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`) +
-            FfiConverterSequenceTypeNetworkDetail.allocationSize(value.`networks`)
+            FfiConverterSequenceTypeNetworkDetail.allocationSize(value.`networks`) +
+            FfiConverterSequenceString.allocationSize(value.`pendingNetworks`)
     )
 
     override fun write(value: Status, buf: ByteBuffer) {
@@ -2014,6 +2017,7 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterString.write(value.`ipv6`, buf)
             FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
             FfiConverterSequenceTypeNetworkDetail.write(value.`networks`, buf)
+            FfiConverterSequenceString.write(value.`pendingNetworks`, buf)
     }
 }
 
@@ -2268,6 +2272,34 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         } else {
             buf.put(1)
             FfiConverterString.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.String>> {
+    override fun read(buf: ByteBuffer): List<kotlin.String> {
+        val len = buf.getInt()
+        return List<kotlin.String>(len) {
+            FfiConverterString.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<kotlin.String>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterString.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<kotlin.String>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterString.write(it, buf)
         }
     }
 }
