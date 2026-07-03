@@ -39,10 +39,27 @@ class RayfishVpnService : VpnService() {
         if (tunnel != null) return
         startForegroundNotification()
 
+        // Bring the control plane up before building the tunnel so status() can
+        // report our real mesh IP. ensureStarted is idempotent.
+        val meshIp = try {
+            runBlocking {
+                NodeHolder.ensureStarted(applicationContext)
+                NodeHolder.get(applicationContext).status().ipv4
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "could not read mesh IP before tunnel build", t)
+            ""
+        }
+        // Fall back to the CGNAT base if we have no networks yet, so the tunnel
+        // still establishes.
+        val tunnelAddr = meshIp.ifBlank { "100.64.0.2" }
+
         val builder = Builder()
             .setSession("Rayfish")
-            .addAddress("100.64.0.2", 32)
+            .addAddress(tunnelAddr, 32)
             .addRoute("100.64.0.0", 10)
+            .addDnsServer("100.100.100.53")
+            .addSearchDomain("ray")
             .setMtu(1280)
 
         val pfd = builder.establish()
@@ -66,7 +83,6 @@ class RayfishVpnService : VpnService() {
         // never running; starting it here makes the service self-sufficient.
         thread(name = "rayfish-node-up") {
             try {
-                runBlocking { NodeHolder.ensureStarted(applicationContext) }
                 NodeHolder.get(applicationContext).up(pfd.detachFd())
                 Log.i(TAG, "Node.up succeeded")
             } catch (t: Throwable) {
