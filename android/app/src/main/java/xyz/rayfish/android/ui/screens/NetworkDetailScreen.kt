@@ -36,6 +36,11 @@ fun NetworkDetailScreen(
     var inviteCode by remember { mutableStateOf<String?>(null) }
     var editing by remember { mutableStateOf(false) }
     var hostnameInput by remember { mutableStateOf("") }
+    var firewall by remember { mutableStateOf<uniffi.ray_mobile.FirewallStateInfo?>(null) }
+    LaunchedEffect(detail.name) {
+        firewall = try { withContext(Dispatchers.IO) { NodeHolder.get(context).firewallShow() } }
+        catch (t: Throwable) { null }
+    }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -78,6 +83,26 @@ fun NetworkDetailScreen(
                     Text(p.ipv4, fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Body)
                     Spacer(Modifier.weight(1f))
                     Text("${p.hostname.ifEmpty { "?" }} · ${p.nodeId.take(4)}", fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Faint)
+                }
+            }
+        }
+        firewall?.let { fw ->
+            SectionCard {
+                SectionLabel("Firewall")
+                KeyValueRow("Inbound default", fw.defaultInbound)
+                KeyValueRow("Outbound default", fw.defaultOutbound)
+                val inbound = fw.rules.filter { it.direction == "in" }
+                if (inbound.isEmpty()) {
+                    Text("No inbound rules", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Faint,
+                        modifier = Modifier.padding(top = 6.dp))
+                }
+                inbound.forEach { r ->
+                    Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("${r.action} ${r.protocol}${if (r.port != "*") ":" + r.port else ""}",
+                            fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Body)
+                        Spacer(Modifier.weight(1f))
+                        Text(r.peer, fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Faint)
+                    }
                 }
             }
         }
