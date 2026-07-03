@@ -2,6 +2,8 @@
 //! connect-all, activate/deactivate (data plane), teardown, leave. Split out of `daemon/mod.rs`.
 
 use super::super::*;
+// Only the desktop-gated `start_ssh` binds SSH listeners on concrete IPs.
+#[cfg(feature = "desktop")]
 use std::net::IpAddr;
 use std::sync::RwLock;
 

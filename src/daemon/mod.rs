@@ -4962,6 +4962,10 @@ mod headless_tests {
         }
     }
 
+    // `ENV_LOCK` is a `Mutex<()>` used only to serialize whole tests against each
+    // other; it guards no data mutated across the awaits, so holding it across
+    // them is intentional (that is the point) and safe.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn build_headless_returns_usable_state_without_ipc_socket() {
         // Serialize against any other test that touches env vars read by
@@ -5036,6 +5040,9 @@ mod headless_tests {
     /// new writer (the VPN off/on toggle path), and a second `attach_tun`
     /// WITHOUT an intervening detach must stop the previous writer instead of
     /// leaking it (two live writers on two fds).
+    // See `build_headless_returns_usable_state_without_ipc_socket`: `ENV_LOCK`
+    // only serializes tests and guards no data across the awaits.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn attach_tun_is_self_healing_on_reattach_and_double_attach() {
         let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
