@@ -32,6 +32,21 @@ libc = "0.2"
 thiserror = "2"
 tracing = "0.1"
 
+# Android JNI bridges the Rust core needs at startup (see `android_jni`). Our
+# `.so` is loaded by JNA (not System.loadLibrary), so nothing registers the
+# app's JavaVM + Context on its own; Kotlin calls our JNI init once, which wires
+# up both consumers below. Versions match what iroh already pulls in, so cargo
+# unifies to a single instance of each.
+#   - ndk-context: iroh-dns reads Android's system DNS servers over JNI through
+#     it; without it `build_headless` panics with "android context was not
+#     initialized".
+#   - rustls-platform-verifier: iroh's relay/discovery HTTPS verifies certs with
+#     Android's trust store through it.
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-context = "0.1"
+rustls-platform-verifier = "0.7"
+jni = "0.22"
+
 [[bin]]
 # Library-mode bindgen entry point: `cargo run -p ray-mobile --bin uniffi-bindgen
 # -- generate --library <path to cdylib> --language kotlin --out-dir <dir>`.

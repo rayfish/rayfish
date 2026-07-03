@@ -39,6 +39,9 @@ object NodeHolder {
         startMutex.withLock {
             if (started) return@withLock
             withContext(Dispatchers.IO) {
+                // Register Android's trust store before start(): building the
+                // iroh endpoint sets up TLS, which fails without it.
+                RustlsInit.ensureInitialized(context)
                 get(context).start()
             }
             started = true

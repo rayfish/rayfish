@@ -13,6 +13,52 @@
 
 mod android_tun;
 
+/// JNI bridge that hands the Android `JavaVM` + app `Context` to the two Rust
+/// dependencies that need them: `ndk-context` (so iroh-dns can read the system
+/// DNS servers) and `rustls-platform-verifier` (so relay/discovery TLS can reach
+/// Android's trust store). Kotlin calls `RustlsInit.nativeInit(context)` once
+/// (after `System.loadLibrary("ray_mobile")`) before starting the node; without
+/// it, `build_headless` panics with "android context was not initialized".
+#[cfg(target_os = "android")]
+mod android_jni {
+    use std::ffi::c_void;
+
+    use jni::EnvUnowned;
+    use jni::objects::{JClass, JObject};
+
+    /// Backs `external fun nativeInit(context: Context)` on `RustlsInit` in the
+    /// `xyz.rayfish.android` package. The JVM hands us an `EnvUnowned`;
+    /// `with_env` upgrades it to the `&mut Env` the JNI calls need. Must run
+    /// exactly once per process: `ndk_context::initialize_android_context`
+    /// asserts it has not been set before. `RustlsInit` guards that on the
+    /// Kotlin side.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_xyz_rayfish_android_RustlsInit_nativeInit<'local>(
+        mut env: EnvUnowned<'local>,
+        _class: JClass<'local>,
+        context: JObject<'local>,
+    ) {
+        let _ = env.with_env(|env| -> Result<(), jni::errors::Error> {
+            // Register the JavaVM + a process-lived global Context ref so
+            // iroh-dns's system-DNS reader can call into the JVM. The global ref
+            // is leaked on purpose: ndk-context stores the raw pointer and reads
+            // it for the life of the process, so it must never be deleted.
+            let vm_ptr = env.get_java_vm()?.get_raw() as *mut c_void;
+            let global_ctx = env.new_global_ref(&context)?;
+            let ctx_ptr = global_ctx.as_obj().as_raw() as *mut c_void;
+            std::mem::forget(global_ctx);
+            // SAFETY: pointers are valid for the process lifetime, and this runs
+            // once (RustlsInit.done), so the crate's single-init assert holds.
+            unsafe { ndk_context::initialize_android_context(vm_ptr, ctx_ptr) };
+
+            if let Err(e) = rustls_platform_verifier::android::init_with_env(env, context) {
+                eprintln!("rayfish: rustls-platform-verifier init failed: {e:?}");
+            }
+            Ok(())
+        });
+    }
+}
+
 use std::sync::{Arc, Mutex};
 
 use android_tun::{AndroidTunReader, AndroidTunWriter};
@@ -328,6 +374,12 @@ impl Node {
     /// Requires [`Node::start`] first.
     pub fn up(&self, tun_fd: i32) -> Result<(), RayError> {
         let state = self.state()?;
+
+        // `AndroidTunReader`/`AndroidTunWriter` wrap the fd in a `tokio` `AsyncFd`,
+        // which registers with the reactor and must be built inside the runtime
+        // context. `up` runs on a plain service thread, so enter the runtime for
+        // the duration of this call before constructing them.
+        let _guard = self.runtime.enter();
 
         // The writer owns a single `dup` of the fd; the reader takes ownership of
         // the detached fd itself. Build the writer's dup first so that if it fails

@@ -76,6 +76,11 @@ dependencies {
     // UniFFI-generated Kotlin bindings use JNA to load libray_mobile.so.
     implementation("net.java.dev.jna:jna:5.15.0@aar")
 
+    // Kotlin AAR that backs rustls-platform-verifier on Android (the Rust core's
+    // TLS trust store). Served from the crate-bundled Maven repo wired up in
+    // settings.gradle.kts; version tracks the rustls-platform-verifier-android crate.
+    implementation("rustls:rustls-platform-verifier:0.1.1@aar")
+
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("com.google.zxing:core:3.5.3")
