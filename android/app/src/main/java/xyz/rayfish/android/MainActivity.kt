@@ -48,6 +48,7 @@ import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.LinkAction
 import uniffi.ray_mobile.NetworkInfo
 import uniffi.ray_mobile.Status
+import xyz.rayfish.android.ui.theme.RayfishTheme
 
 class MainActivity : ComponentActivity() {
 
@@ -64,7 +65,7 @@ class MainActivity : ComponentActivity() {
             intent?.data = null
         }
         setContent {
-            MaterialTheme {
+            RayfishTheme {
                 RayfishScreen(
                     initialLinkUri = initialUri,
                     alreadyHandled = { uri -> uri == handledIntentUri },
