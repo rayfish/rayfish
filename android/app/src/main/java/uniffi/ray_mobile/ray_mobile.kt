@@ -980,7 +980,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_start() != 25989.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_status() != 38384.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_status() != 47392.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_up() != 62370.toShort()) {
@@ -1378,8 +1378,8 @@ public interface NodeInterface {
     fun `start`()
     
     /**
-     * Peers + addresses + running flag for the UI. Empty snapshot before
-     * [`Node::start`].
+     * Peers + addresses + running flag + per-network detail for the UI.
+     * Empty snapshot before [`Node::start`].
      */
     fun `status`(): Status
     
@@ -1593,8 +1593,8 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
-     * Peers + addresses + running flag for the UI. Empty snapshot before
-     * [`Node::start`].
+     * Peers + addresses + running flag + per-network detail for the UI.
+     * Empty snapshot before [`Node::start`].
      */override fun `status`(): Status {
             return FfiConverterTypeStatus.lift(
     callWithPointer {
@@ -1663,6 +1663,57 @@ public object FfiConverterTypeNode: FfiConverter<Node, Pointer> {
 
 
 /**
+ * One network this node belongs to, with its peers.
+ */
+data class NetworkDetail (
+    var `name`: kotlin.String, 
+    var `ipv4`: kotlin.String, 
+    var `ipv6`: kotlin.String, 
+    var `hostname`: kotlin.String, 
+    var `isCoordinator`: kotlin.Boolean, 
+    var `peers`: List<PeerInfo>
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetail> {
+    override fun read(buf: ByteBuffer): NetworkDetail {
+        return NetworkDetail(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterSequenceTypePeerInfo.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: NetworkDetail) = (
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterString.allocationSize(value.`ipv4`) +
+            FfiConverterString.allocationSize(value.`ipv6`) +
+            FfiConverterString.allocationSize(value.`hostname`) +
+            FfiConverterBoolean.allocationSize(value.`isCoordinator`) +
+            FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`)
+    )
+
+    override fun write(value: NetworkDetail, buf: ByteBuffer) {
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterString.write(value.`ipv4`, buf)
+            FfiConverterString.write(value.`ipv6`, buf)
+            FfiConverterString.write(value.`hostname`, buf)
+            FfiConverterBoolean.write(value.`isCoordinator`, buf)
+            FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
+    }
+}
+
+
+
+/**
  * Snapshot returned by `create` / `join`.
  */
 data class NetworkInfo (
@@ -1706,11 +1757,13 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
 
 
 /**
- * One connected peer in a [`Status`] snapshot.
+ * One peer in a network snapshot. `online` reflects a live connection.
  */
 data class PeerInfo (
     var `ipv4`: kotlin.String, 
-    var `nodeId`: kotlin.String
+    var `nodeId`: kotlin.String, 
+    var `hostname`: kotlin.String, 
+    var `online`: kotlin.Boolean
 ) {
     
     companion object
@@ -1724,31 +1777,38 @@ public object FfiConverterTypePeerInfo: FfiConverterRustBuffer<PeerInfo> {
         return PeerInfo(
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
     override fun allocationSize(value: PeerInfo) = (
             FfiConverterString.allocationSize(value.`ipv4`) +
-            FfiConverterString.allocationSize(value.`nodeId`)
+            FfiConverterString.allocationSize(value.`nodeId`) +
+            FfiConverterString.allocationSize(value.`hostname`) +
+            FfiConverterBoolean.allocationSize(value.`online`)
     )
 
     override fun write(value: PeerInfo, buf: ByteBuffer) {
             FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`nodeId`, buf)
+            FfiConverterString.write(value.`hostname`, buf)
+            FfiConverterBoolean.write(value.`online`, buf)
     }
 }
 
 
 
 /**
- * Health/peers/addresses snapshot for the UI.
+ * Health/addresses/networks snapshot for the UI.
  */
 data class Status (
     var `running`: kotlin.Boolean, 
     var `nodeId`: kotlin.String, 
     var `ipv4`: kotlin.String, 
     var `ipv6`: kotlin.String, 
-    var `peers`: List<PeerInfo>
+    var `peers`: List<PeerInfo>, 
+    var `networks`: List<NetworkDetail>
 ) {
     
     companion object
@@ -1765,6 +1825,7 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterSequenceTypePeerInfo.read(buf),
+            FfiConverterSequenceTypeNetworkDetail.read(buf),
         )
     }
 
@@ -1773,7 +1834,8 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterString.allocationSize(value.`nodeId`) +
             FfiConverterString.allocationSize(value.`ipv4`) +
             FfiConverterString.allocationSize(value.`ipv6`) +
-            FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`)
+            FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`) +
+            FfiConverterSequenceTypeNetworkDetail.allocationSize(value.`networks`)
     )
 
     override fun write(value: Status, buf: ByteBuffer) {
@@ -1782,6 +1844,7 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`ipv6`, buf)
             FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
+            FfiConverterSequenceTypeNetworkDetail.write(value.`networks`, buf)
     }
 }
 
@@ -2036,6 +2099,34 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         } else {
             buf.put(1)
             FfiConverterString.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeNetworkDetail: FfiConverterRustBuffer<List<NetworkDetail>> {
+    override fun read(buf: ByteBuffer): List<NetworkDetail> {
+        val len = buf.getInt()
+        return List<NetworkDetail>(len) {
+            FfiConverterTypeNetworkDetail.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<NetworkDetail>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeNetworkDetail.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<NetworkDetail>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeNetworkDetail.write(it, buf)
         }
     }
 }

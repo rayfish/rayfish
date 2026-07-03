@@ -62,14 +62,27 @@ pub struct NetworkInfo {
     pub ipv6: String,
 }
 
-/// One connected peer in a [`Status`] snapshot.
+/// One peer in a network snapshot. `online` reflects a live connection.
 #[derive(uniffi::Record)]
 pub struct PeerInfo {
     pub ipv4: String,
     pub node_id: String,
+    pub hostname: String,
+    pub online: bool,
 }
 
-/// Health/peers/addresses snapshot for the UI.
+/// One network this node belongs to, with its peers.
+#[derive(uniffi::Record)]
+pub struct NetworkDetail {
+    pub name: String,
+    pub ipv4: String,
+    pub ipv6: String,
+    pub hostname: String,
+    pub is_coordinator: bool,
+    pub peers: Vec<PeerInfo>,
+}
+
+/// Health/addresses/networks snapshot for the UI.
 #[derive(uniffi::Record)]
 pub struct Status {
     pub running: bool,
@@ -77,6 +90,7 @@ pub struct Status {
     pub ipv4: String,
     pub ipv6: String,
     pub peers: Vec<PeerInfo>,
+    pub networks: Vec<NetworkDetail>,
 }
 
 /// The outcome of following a `rayfish://` deep link, reflected in the UI.
@@ -297,60 +311,78 @@ impl Node {
         Ok(())
     }
 
-    /// Peers + addresses + running flag for the UI. Empty snapshot before
-    /// [`Node::start`].
+    /// Peers + addresses + running flag + per-network detail for the UI.
+    /// Empty snapshot before [`Node::start`].
     pub fn status(&self) -> Status {
+        let empty = || Status {
+            running: false,
+            node_id: String::new(),
+            ipv4: String::new(),
+            ipv6: String::new(),
+            peers: Vec::new(),
+            networks: Vec::new(),
+        };
         let Some(state) = self.state.lock().unwrap().as_ref().cloned() else {
-            return Status {
-                running: false,
-                node_id: String::new(),
-                ipv4: String::new(),
-                ipv6: String::new(),
-                peers: Vec::new(),
-            };
+            return empty();
         };
 
-        match state.status() {
-            IpcMessage::StatusResponse {
-                endpoint_id,
-                active,
-                networks,
-                ..
-            } => {
-                // The node's own mesh IPs are the same across networks (derived
-                // from its identity); take them from the first network if any.
-                let (ipv4, ipv6) = networks
-                    .first()
-                    .map(|n| {
-                        (
-                            n.my_ip.to_string(),
-                            n.my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
-                        )
-                    })
-                    .unwrap_or_default();
-                let peers = networks
-                    .iter()
-                    .flat_map(|n| &n.peers)
-                    .map(|p| PeerInfo {
-                        ipv4: p.ip.to_string(),
-                        node_id: p.endpoint_id.to_string(),
-                    })
-                    .collect();
-                Status {
-                    running: active,
-                    node_id: endpoint_id.to_string(),
-                    ipv4,
-                    ipv6,
-                    peers,
-                }
-            }
-            _ => Status {
-                running: false,
-                node_id: String::new(),
-                ipv4: String::new(),
-                ipv6: String::new(),
-                peers: Vec::new(),
-            },
+        let IpcMessage::StatusResponse {
+            endpoint_id,
+            active,
+            networks,
+            ..
+        } = state.status()
+        else {
+            return empty();
+        };
+
+        let mut detail = Vec::with_capacity(networks.len());
+        let mut flat_peers = Vec::new();
+        for n in &networks {
+            let peers: Vec<PeerInfo> = n
+                .peers
+                .iter()
+                .map(|p| PeerInfo {
+                    ipv4: p.ip.to_string(),
+                    node_id: p.endpoint_id.to_string(),
+                    hostname: p.hostname.clone().unwrap_or_default(),
+                    online: p.connection.is_some(),
+                })
+                .collect();
+            flat_peers.extend(peers.iter().map(|p| PeerInfo {
+                ipv4: p.ipv4.clone(),
+                node_id: p.node_id.clone(),
+                hostname: p.hostname.clone(),
+                online: p.online,
+            }));
+            detail.push(NetworkDetail {
+                name: n.name.clone(),
+                ipv4: n.my_ip.to_string(),
+                ipv6: n.my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
+                hostname: n.my_hostname.clone().unwrap_or_default(),
+                is_coordinator: n.role.is_coordinator(),
+                peers,
+            });
+        }
+        // The node's own mesh IPs are the same across networks (derived
+        // from its identity); take them from the first network if any.
+        let (ipv4, ipv6) = networks
+            .first()
+            .map(|n| {
+                (
+                    n.my_ip.to_string(),
+                    n.my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+
+        Status {
+            running: active,
+            node_id: endpoint_id.to_string(),
+            ipv4,
+            ipv6,
+            peers: flat_peers,
+            networks: detail,
         }
     }
 
