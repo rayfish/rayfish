@@ -356,6 +356,17 @@ pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, Str
     }
 }
 
+/// A closed-network join that was queued for coordinator approval and has not
+/// yet been admitted. Persisted so the background retry survives a restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingJoinEntry {
+    /// The network public key (bare room id) we asked to join.
+    pub network_key: String,
+    /// The local display name to use once admitted, if the user gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_true")]
@@ -415,6 +426,10 @@ pub struct AppConfig {
     pub download_user: Option<u32>,
     #[serde(default)]
     pub networks: Vec<NetworkConfig>,
+    /// Closed-network joins queued for coordinator approval, awaiting
+    /// admission. See [`PendingJoinEntry`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_joins: Vec<PendingJoinEntry>,
 }
 
 impl Default for AppConfig {
@@ -434,6 +449,7 @@ impl Default for AppConfig {
             download_dir: None,
             download_user: None,
             networks: Vec::new(),
+            pending_joins: Vec::new(),
         }
     }
 }
@@ -510,6 +526,8 @@ struct Settings {
     download_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     download_user: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_joins: Vec<PendingJoinEntry>,
 }
 
 /// Look up the `rayfish` group's gid (Linux), if the group exists.
@@ -756,6 +774,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
             auto_update_last_attempt: None,
             download_dir: None,
             download_user: None,
+            pending_joins: Vec::new(),
         }
     };
 
@@ -798,6 +817,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         download_dir: settings.download_dir,
         download_user: settings.download_user,
         networks,
+        pending_joins: settings.pending_joins,
     })
 }
 
@@ -821,11 +841,48 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         auto_update_last_attempt: config.auto_update_last_attempt,
         download_dir: config.download_dir.clone(),
         download_user: config.download_user,
+        pending_joins: config.pending_joins.clone(),
     };
     let path = dir.join(SETTINGS_FILE);
     let contents = toml::to_string_pretty(&settings).context("serializing settings")?;
     // Secret-bearing: holds the contact key.
     write_atomic(&path, &contents, true)
+}
+
+/// Record a queued join so its background retry survives a daemon restart.
+/// Idempotent: a second call with the same key updates the stored name but
+/// does not duplicate the entry.
+pub fn add_pending_join(entry: PendingJoinEntry) -> Result<()> {
+    add_pending_join_in(&config_dir()?, entry)
+}
+
+fn add_pending_join_in(dir: &Path, entry: PendingJoinEntry) -> Result<()> {
+    let mut cfg = load_in(dir)?;
+    if let Some(existing) = cfg
+        .pending_joins
+        .iter_mut()
+        .find(|e| e.network_key == entry.network_key)
+    {
+        existing.name = entry.name;
+    } else {
+        cfg.pending_joins.push(entry);
+    }
+    save_settings_in(dir, &cfg)
+}
+
+/// Drop a pending-join marker once the network is admitted (or abandoned).
+pub fn remove_pending_join(network_key: &str) -> Result<()> {
+    remove_pending_join_in(&config_dir()?, network_key)
+}
+
+fn remove_pending_join_in(dir: &Path, network_key: &str) -> Result<()> {
+    let mut cfg = load_in(dir)?;
+    let before = cfg.pending_joins.len();
+    cfg.pending_joins.retain(|e| e.network_key != network_key);
+    if cfg.pending_joins.len() != before {
+        save_settings_in(dir, &cfg)?;
+    }
+    Ok(())
 }
 
 /// Persist a single network to `networks/<name>.toml`. Touches only that file,
@@ -1527,5 +1584,41 @@ name = "test"
         let dir = tmp.path();
         assert!(save_network_in(dir, &net("../escape")).is_err());
         assert!(load_network_in(dir, "a/b").is_err());
+    }
+
+    #[test]
+    fn pending_join_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Start from an empty settings file.
+        save_settings_in(dir, &AppConfig::default()).unwrap();
+
+        add_pending_join_in(
+            dir,
+            PendingJoinEntry {
+                network_key: "abc123".to_string(),
+                name: Some("homelab".to_string()),
+            },
+        )
+        .unwrap();
+
+        let loaded = load_in(dir).unwrap();
+        assert_eq!(loaded.pending_joins.len(), 1);
+        assert_eq!(loaded.pending_joins[0].network_key, "abc123");
+
+        // Adding the same key again does not duplicate it.
+        add_pending_join_in(
+            dir,
+            PendingJoinEntry {
+                network_key: "abc123".to_string(),
+                name: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(load_in(dir).unwrap().pending_joins.len(), 1);
+
+        remove_pending_join_in(dir, "abc123").unwrap();
+        assert!(load_in(dir).unwrap().pending_joins.is_empty());
     }
 }
