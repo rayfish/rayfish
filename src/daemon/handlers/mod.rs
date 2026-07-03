@@ -10,6 +10,7 @@
 //! methods attach to `DaemonState` and are called as `self.method()`.
 
 mod admin;
+mod alias;
 mod connect;
 mod create_join;
 mod diagnostics;

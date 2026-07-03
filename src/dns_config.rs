@@ -4,10 +4,21 @@
 //! macOS: SCDynamicStore with session keys (auto-cleanup on process exit).
 //! Linux: systemd-resolved / resolvconf / direct /etc/resolv.conf.
 
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
+
 #[allow(unused_imports)]
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
+#[cfg(target_os = "linux")]
+use zbus::Connection;
+#[cfg(target_os = "linux")]
+use zbus::zvariant::Value;
 
 use crate::DNS_DOMAIN;
 
@@ -22,7 +33,7 @@ pub trait DnsConfigurator: Send + Sync {
     /// Return the upstream DNS servers captured from the system before rayfish
     /// overwrote resolv.conf. Used by the resolver forwarder (Task 11).
     /// Default: empty (all other configurators use split-DNS and don't capture).
-    fn captured_upstreams(&self) -> Vec<std::net::Ipv4Addr> {
+    fn captured_upstreams(&self) -> Vec<Ipv4Addr> {
         Vec::new()
     }
     /// Search domains this configurator wrote into resolv.conf (direct mode
@@ -82,7 +93,6 @@ pub fn restore_stale_backups() {
     // SCDynamicStore session keys self-clean, so this is only needed once after upgrade.
     #[cfg(target_os = "macos")]
     {
-        use std::path::PathBuf;
         let resolver_file = PathBuf::from(format!("/etc/resolver/{DNS_DOMAIN}"));
         let backup = PathBuf::from(format!("/etc/resolver/{DNS_DOMAIN}.before-rayfish"));
         if backup.exists() {
@@ -102,7 +112,6 @@ pub fn restore_stale_backups() {
     // Linux: backup files may be left from a previous crash.
     #[cfg(target_os = "linux")]
     {
-        use std::path::PathBuf;
         let path = PathBuf::from("/etc/resolv.conf");
         let backup = backup_path(&path);
         if backup.exists() {
@@ -310,7 +319,7 @@ async fn set_search_domains_linux(
 
     // Try D-Bus first
     if let Some(idx) = ifindex
-        && let Ok(conn) = zbus::Connection::system().await
+        && let Ok(conn) = Connection::system().await
     {
         let mut domains: Vec<(String, bool)> = vec![(DNS_DOMAIN.to_string(), true)];
         // Each network name as a routing domain (~network)
@@ -382,7 +391,7 @@ struct SystemdResolvedDBus {
 #[cfg(target_os = "linux")]
 async fn try_systemd_resolved_dbus(tun_name: &str) -> Option<SystemdResolvedDBus> {
     let ifindex = linux::get_ifindex(tun_name)? as i32;
-    let conn = zbus::Connection::system().await.ok()?;
+    let conn = Connection::system().await.ok()?;
     // Check that resolved is available on the bus
     let reply = conn
         .call_method(
@@ -403,7 +412,7 @@ async fn try_systemd_resolved_dbus(tun_name: &str) -> Option<SystemdResolvedDBus
 #[async_trait]
 impl DnsConfigurator for SystemdResolvedDBus {
     async fn apply(&self) -> Result<()> {
-        let conn = zbus::Connection::system()
+        let conn = Connection::system()
             .await
             .context("failed to connect to system D-Bus")?;
 
@@ -441,7 +450,7 @@ impl DnsConfigurator for SystemdResolvedDBus {
     }
 
     async fn revert(&self) -> Result<()> {
-        if let Ok(conn) = zbus::Connection::system().await {
+        if let Ok(conn) = Connection::system().await {
             let _ = conn
                 .call_method(
                     Some("org.freedesktop.resolve1"),
@@ -482,7 +491,7 @@ fn nm_supports_split_dns(mode: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 async fn try_networkmanager_dbus(tun_name: &str) -> Option<NetworkManagerDns> {
-    let conn = zbus::Connection::system().await.ok()?;
+    let conn = Connection::system().await.ok()?;
 
     // Check that NetworkManager is on the bus
     conn.call_method(
@@ -511,7 +520,7 @@ async fn try_networkmanager_dbus(tun_name: &str) -> Option<NetworkManagerDns> {
     // return None — safer to fall through to direct /etc/resolv.conf than
     // to claim NM supports split-DNS when we can't confirm it.
     let body = dns_reply.body();
-    let mode_val = body.deserialize::<zbus::zvariant::Value>().ok()?;
+    let mode_val = body.deserialize::<Value>().ok()?;
     let mode = mode_val.downcast_ref::<String>().ok()?.to_string();
 
     // If NM delegates to systemd-resolved, skip — the resolved D-Bus path handles it.
@@ -534,10 +543,7 @@ async fn try_networkmanager_dbus(tun_name: &str) -> Option<NetworkManagerDns> {
 
 #[cfg(target_os = "linux")]
 impl NetworkManagerDns {
-    async fn get_device_path(
-        &self,
-        conn: &zbus::Connection,
-    ) -> Result<zbus::zvariant::OwnedObjectPath> {
+    async fn get_device_path(&self, conn: &Connection) -> Result<zbus::zvariant::OwnedObjectPath> {
         let reply = conn
             .call_method(
                 Some("org.freedesktop.NetworkManager"),
@@ -559,9 +565,7 @@ impl NetworkManagerDns {
 #[async_trait]
 impl DnsConfigurator for NetworkManagerDns {
     async fn apply(&self) -> Result<()> {
-        let conn = zbus::Connection::system()
-            .await
-            .context("D-Bus system bus")?;
+        let conn = Connection::system().await.context("D-Bus system bus")?;
 
         let device_path = self.get_device_path(&conn).await?;
 
@@ -596,7 +600,7 @@ impl DnsConfigurator for NetworkManagerDns {
                     &(
                         "org.freedesktop.NetworkManager.IP4Config",
                         "Nameservers",
-                        zbus::zvariant::Value::from(dns_servers),
+                        Value::from(dns_servers),
                     ),
                 )
                 .await;
@@ -609,14 +613,7 @@ impl DnsConfigurator for NetworkManagerDns {
                 device_path.as_str(),
                 Some("org.freedesktop.NetworkManager.Device"),
                 "Reapply",
-                &(
-                    std::collections::HashMap::<
-                        String,
-                        std::collections::HashMap<String, zbus::zvariant::Value>,
-                    >::new(),
-                    0u64,
-                    0u32,
-                ),
+                &(HashMap::<String, HashMap<String, Value>>::new(), 0u64, 0u32),
             )
             .await;
 
@@ -713,7 +710,6 @@ struct Resolvconf {
 
 #[cfg(target_os = "linux")]
 fn try_resolvconf() -> Option<Resolvconf> {
-    use std::path::Path;
     use std::process::Command;
     let paths = ["/sbin/resolvconf", "/usr/sbin/resolvconf"];
     if !paths.iter().any(|p| Path::new(p).exists()) {
@@ -803,11 +799,11 @@ impl DnsConfigurator for Resolvconf {
 /// Extract IPv4 `nameserver` entries from resolv.conf contents, excluding our
 /// own magic IP (so we never capture ourselves as an upstream → no forward loop).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn parse_resolv_nameservers(contents: &str) -> Vec<std::net::Ipv4Addr> {
+fn parse_resolv_nameservers(contents: &str) -> Vec<Ipv4Addr> {
     contents
         .lines()
         .filter_map(|l| l.trim().strip_prefix("nameserver "))
-        .filter_map(|s| s.trim().parse::<std::net::Ipv4Addr>().ok())
+        .filter_map(|s| s.trim().parse::<Ipv4Addr>().ok())
         .filter(|ip| *ip != crate::dns::MAGIC_DNS_V4)
         .collect()
 }
@@ -835,8 +831,8 @@ fn resolv_conf_is_ours(contents: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-async fn reassert_resolv_conf(search: &[String]) -> anyhow::Result<()> {
-    let path = std::path::Path::new("/etc/resolv.conf");
+async fn reassert_resolv_conf(search: &[String]) -> Result<()> {
+    let path = Path::new("/etc/resolv.conf");
     let current = tokio::fs::read_to_string(path).await.unwrap_or_default();
     if !resolv_conf_is_ours(&current) {
         tracing::warn!("/etc/resolv.conf was overwritten; re-asserting rayfish DNS");
@@ -857,10 +853,7 @@ async fn reassert_resolv_conf(search: &[String]) -> anyhow::Result<()> {
 /// in direct mode, so on an NM host this watch mostly fires for dhclient or
 /// other writers; it remains the catch-all repair either way.
 #[cfg(target_os = "linux")]
-pub async fn run_resolv_reassert(
-    search: Vec<String>,
-    token: tokio_util::sync::CancellationToken,
-) {
+pub async fn run_resolv_reassert(search: Vec<String>, token: tokio_util::sync::CancellationToken) {
     use futures::StreamExt;
 
     // Re-assert immediately: covers any trample between apply() and our arrival.
@@ -876,7 +869,7 @@ pub async fn run_resolv_reassert(
         use inotify::{Inotify, WatchMask};
         let inotify = Inotify::init()?;
         inotify.watches().add(
-            std::path::Path::new("/etc"),
+            Path::new("/etc"),
             WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO | WatchMask::CREATE,
         )?;
         inotify.into_event_stream([0u8; 1024])
@@ -950,7 +943,7 @@ fn nm_dns_none_dropin() -> String {
 /// gate so we only quiet NM on hosts that actually run it.
 #[cfg(target_os = "linux")]
 fn nm_present() -> bool {
-    std::path::Path::new(NM_CONF_DIR).is_dir()
+    Path::new(NM_CONF_DIR).is_dir()
 }
 
 /// Ask NetworkManager to reload its configuration so a conf.d change takes effect.
@@ -979,7 +972,7 @@ async fn nm_quiet_install() {
     if !nm_present() {
         return;
     }
-    let path = std::path::Path::new(NM_DROPIN);
+    let path = Path::new(NM_DROPIN);
     let already = tokio::fs::read_to_string(path)
         .await
         .map(|c| resolv_conf_is_ours(&c))
@@ -1000,7 +993,7 @@ async fn nm_quiet_install() {
 /// own NM config. Best-effort.
 #[cfg(target_os = "linux")]
 async fn nm_quiet_remove() {
-    let path = std::path::Path::new(NM_DROPIN);
+    let path = Path::new(NM_DROPIN);
     match tokio::fs::read_to_string(path).await {
         Ok(c) if resolv_conf_is_ours(&c) => {}
         _ => return, // absent or not ours — leave it
@@ -1009,19 +1002,21 @@ async fn nm_quiet_remove() {
         tracing::warn!(error = %e, "failed to remove NetworkManager dns=none drop-in");
         return;
     }
-    tracing::info!("restored NetworkManager DNS management (removed dns=none drop-in); reloading NM");
+    tracing::info!(
+        "restored NetworkManager DNS management (removed dns=none drop-in); reloading NM"
+    );
     nm_reload().await;
 }
 
 #[cfg(target_os = "linux")]
-fn backup_path(original: &std::path::Path) -> std::path::PathBuf {
+fn backup_path(original: &Path) -> PathBuf {
     let mut s = original.as_os_str().to_owned();
     s.push(BACKUP_SUFFIX);
-    std::path::PathBuf::from(s)
+    PathBuf::from(s)
 }
 
 #[cfg(target_os = "linux")]
-async fn backup_file(path: &std::path::Path) -> Result<()> {
+async fn backup_file(path: &Path) -> Result<()> {
     let backup = backup_path(path);
     if path.exists() && !backup.exists() {
         tokio::fs::copy(path, &backup)
@@ -1032,7 +1027,7 @@ async fn backup_file(path: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn restore_file(path: &std::path::Path) -> Result<()> {
+async fn restore_file(path: &Path) -> Result<()> {
     let backup = backup_path(path);
     if backup.exists() {
         tokio::fs::copy(&backup, path)
@@ -1058,7 +1053,7 @@ async fn restore_file(path: &std::path::Path) -> Result<()> {
 /// when no backup exists (split-DNS modes never overwrite resolv.conf).
 #[cfg(target_os = "linux")]
 pub fn emergency_restore_resolv_conf() {
-    let path = std::path::Path::new("/etc/resolv.conf");
+    let path = Path::new("/etc/resolv.conf");
     let backup = backup_path(path);
     if backup.exists() {
         let _ = std::fs::copy(&backup, path);
@@ -1080,7 +1075,7 @@ pub fn emergency_restore_resolv_conf() {}
 
 #[cfg(target_os = "linux")]
 struct DirectResolvConf {
-    captured_upstreams: Vec<std::net::Ipv4Addr>,
+    captured_upstreams: Vec<Ipv4Addr>,
     search: Vec<String>,
 }
 
@@ -1113,7 +1108,6 @@ impl DirectResolvConf {
 #[async_trait]
 impl DnsConfigurator for DirectResolvConf {
     async fn apply(&self) -> Result<()> {
-        use std::path::Path;
         let path = Path::new("/etc/resolv.conf");
         backup_file(path).await?;
         // Quiet NM first so it doesn't regenerate the file out from under the
@@ -1131,7 +1125,6 @@ impl DnsConfigurator for DirectResolvConf {
     }
 
     async fn revert(&self) -> Result<()> {
-        use std::path::Path;
         let path = Path::new("/etc/resolv.conf");
         restore_file(path).await?;
         // Hand resolv.conf back to NetworkManager before it regenerates one.
@@ -1144,7 +1137,7 @@ impl DnsConfigurator for DirectResolvConf {
         "direct-resolv.conf"
     }
 
-    fn captured_upstreams(&self) -> Vec<std::net::Ipv4Addr> {
+    fn captured_upstreams(&self) -> Vec<Ipv4Addr> {
         self.captured_upstreams.clone()
     }
 
@@ -1155,6 +1148,8 @@ impl DnsConfigurator for DirectResolvConf {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::{
         RESOLVER_IP, nm_dns_none_dropin, parse_resolv_nameservers, render_direct_resolv_conf,
         resolv_conf_is_ours,
@@ -1173,7 +1168,7 @@ mod tests {
     #[test]
     fn resolver_ip_matches_magic_dns_constant() {
         assert_eq!(
-            RESOLVER_IP.parse::<std::net::Ipv4Addr>().unwrap(),
+            RESOLVER_IP.parse::<Ipv4Addr>().unwrap(),
             crate::dns::MAGIC_DNS_V4
         );
     }
@@ -1184,8 +1179,8 @@ mod tests {
         assert_eq!(
             parse_resolv_nameservers(c),
             vec![
-                "192.168.1.1".parse::<std::net::Ipv4Addr>().unwrap(),
-                "8.8.8.8".parse::<std::net::Ipv4Addr>().unwrap()
+                "192.168.1.1".parse::<Ipv4Addr>().unwrap(),
+                "8.8.8.8".parse::<Ipv4Addr>().unwrap()
             ]
         ); // 100.100.100.53 (magic) excluded
     }

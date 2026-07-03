@@ -1,0 +1,76 @@
+name: Bug report
+description: Something in rayfish is broken or behaving unexpectedly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill in as much as you can.
+
+        If the daemon is running, `ray report` bundles your logs and metrics and
+        opens a pre-filled issue you can attach the bundle to. That is the fastest
+        way to give us what we need to debug.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you do, and what went wrong?
+      placeholder: I ran `ray join <id>` and the daemon...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What should have happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran, in order.
+      placeholder: |
+        1. sudo ray up
+        2. ray create --open
+        3. ray join <id> on the other host
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `ray version` (includes the git sha).
+      placeholder: 0.0.0 (abc1234)
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Other (note in "What happened")
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Relevant daemon logs, or attach the `ray report` bundle.
+        Logs live in `/var/log/rayfish` (Linux) or `/Library/Logs/rayfish` (macOS).
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I am on the latest release, or I noted my version above.
+          required: true

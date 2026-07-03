@@ -15,6 +15,7 @@ use bytes::{Bytes, BytesMut};
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, ConnectionError, VarInt};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::firewall::{self, Direction, SharedFirewall};
@@ -82,9 +83,7 @@ pub fn set_ssh_nat_active(on: bool) {
 
 /// The NAT config, or `None` when unset or inactive.
 fn ssh_nat() -> Option<&'static SshNat> {
-    SSH_NAT
-        .get()
-        .filter(|n| n.active.load(Ordering::Relaxed))
+    SSH_NAT.get().filter(|n| n.active.load(Ordering::Relaxed))
 }
 
 impl SshNat {
@@ -169,7 +168,7 @@ pub(crate) fn evaluate_inbound(
     firewall: &SharedFirewall,
     peer_id: &EndpointId,
     peer_ip: Ipv4Addr,
-    peer_ipv6: std::net::Ipv6Addr,
+    peer_ipv6: Ipv6Addr,
     network: &str,
 ) -> InboundDecision {
     if packet.len() > MAX_PEER_DATAGRAM {
@@ -209,12 +208,21 @@ pub const LEAVE_CODE: u32 = 0x1ea5e;
 /// treated as a non-intentional disconnect (the peer may reconnect; no quarantine).
 pub const ABUSE_CODE: u32 = 0xab05e;
 
+/// Application close code a coordinator (or any member pruning a stale roster
+/// entry) sends when it removes a peer from the network (`ray kick`). On the
+/// receiving (kicked) side it is treated like [`LEAVE_CODE`] — an intentional
+/// disconnect — so the kicked node stops reconnecting instead of churning back
+/// into the coordinator's pending queue. The pruning side does not observe its
+/// own close code (that read is a local close), so it relies on the shared
+/// `pruned_peers` set to suppress its reconnect loop.
+pub const KICK_CODE: u32 = 0x14ced;
+
 /// Sent by [`spawn_peer_reader`] when a peer connection drops,
 /// consumed by the reconnect loop (joiner) or cleanup task (coordinator).
 pub struct DisconnectEvent {
     pub endpoint_id: EndpointId,
     pub ip: Ipv4Addr,
-    pub ipv6: std::net::Ipv6Addr,
+    pub ipv6: Ipv6Addr,
     /// The network whose connection dropped. A multi-homed peer keeps its routes
     /// in the other networks; only this network's connection is torn down.
     pub network: String,
@@ -357,10 +365,10 @@ pub fn spawn_peer_reader(
     conn: Connection,
     peer_id: EndpointId,
     peer_ip: Ipv4Addr,
-    peer_ipv6: std::net::Ipv6Addr,
+    peer_ipv6: Ipv6Addr,
     network: String,
     ctx: ForwardCtx,
-) -> tokio::task::JoinHandle<()> {
+) -> JoinHandle<()> {
     let ForwardCtx {
         firewall,
         tun_tx,
@@ -387,6 +395,7 @@ pub fn spawn_peer_reader(
                             &e,
                             ConnectionError::ApplicationClosed(ac)
                                 if ac.error_code == VarInt::from_u32(LEAVE_CODE)
+                                    || ac.error_code == VarInt::from_u32(KICK_CODE)
                         );
                         tracing::warn!(peer = %peer_id.fmt_short(), ip = %peer_ip, error = %e, intentional, "peer connection lost");
                         let _ = disconnect_tx
@@ -468,8 +477,8 @@ pub fn spawn_peer_reader(
 pub fn spawn_tun_writer<W: crate::tun::TunWrite>(
     mut tun: W,
     mut tun_rx: mpsc::Receiver<Bytes>,
-    active: Arc<std::sync::atomic::AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
+    active: Arc<AtomicBool>,
+) -> JoinHandle<()> {
     use std::sync::atomic::Ordering;
     tokio::spawn(async move {
         while let Some(packet) = tun_rx.recv().await {
@@ -566,7 +575,7 @@ mod tests {
     /// `evaluate_inbound` as the sending peer's assigned IP so the ingress
     /// anti-spoof check passes.
     const TEST_V4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 5);
-    const TEST_V6: std::net::Ipv6Addr = std::net::Ipv6Addr::UNSPECIFIED;
+    const TEST_V6: Ipv6Addr = Ipv6Addr::UNSPECIFIED;
 
     fn make_tcp_packet(dst_port: u16) -> Vec<u8> {
         let mut p = vec![0u8; 24];
@@ -586,6 +595,7 @@ mod tests {
             default_inbound: default,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules,
         })
     }
@@ -697,16 +707,23 @@ mod tests {
 
     #[test]
     fn ssh_nat_rewrites_port_and_keeps_checksum_valid() {
-        let v4 = Ipv4Addr::new(100, 88, 0, 1);
-        init_ssh_nat(v4, Ipv6Addr::LOCALHOST, 41384);
+        // `SSH_NAT` is a process-global `OnceLock`, so another test in this binary
+        // (e.g. the headless daemon build) may seed it first, making our
+        // `init_ssh_nat` a no-op. Read the addresses the NAT actually holds and
+        // build the packet from those, so the test is independent of run order.
+        init_ssh_nat(Ipv4Addr::new(100, 88, 0, 1), Ipv6Addr::LOCALHOST, 41384);
         set_ssh_nat_active(true);
+        let (our_v4, listen_port) = {
+            let nat = ssh_nat().expect("nat active");
+            (nat.v4, nat.listen_port)
+        };
 
         // v4 TCP packet from a peer to our mesh :22, with a correct checksum.
         let mut pkt = vec![0u8; 40];
         pkt[0] = 0x45;
         pkt[9] = 6; // TCP
         pkt[12..16].copy_from_slice(&[100, 88, 0, 9]); // src (peer)
-        pkt[16..20].copy_from_slice(&v4.octets()); // dst (us)
+        pkt[16..20].copy_from_slice(&our_v4.octets()); // dst (us)
         pkt[20..22].copy_from_slice(&5000u16.to_be_bytes()); // src port
         pkt[22..24].copy_from_slice(&22u16.to_be_bytes()); // dst port 22
         pkt[32] = 0x50; // data offset = 5 (20-byte TCP header)
@@ -716,10 +733,14 @@ mod tests {
         let info = firewall::parse_packet_info(&pkt).unwrap();
         assert!(rewrite_ssh_port(&mut pkt, &info, true));
         let info2 = firewall::parse_packet_info(&pkt).unwrap();
-        assert_eq!(info2.dst_port, 41384, "dest port rewritten 22 -> listen");
+        assert_eq!(info2.dst_port, listen_port, "dest port rewritten 22 -> listen");
         // The incrementally-updated checksum must equal a freshly computed one.
         let field = u16::from_be_bytes([pkt[36], pkt[37]]);
-        assert_eq!(field, tcp_csum_v4(&pkt), "checksum stays valid after rewrite");
+        assert_eq!(
+            field,
+            tcp_csum_v4(&pkt),
+            "checksum stays valid after rewrite"
+        );
 
         // Inactive -> no rewrite.
         set_ssh_nat_active(false);
@@ -764,7 +785,7 @@ mod tests {
 
     #[test]
     fn magic_dns_predicate_matches_only_magic_ip_port_53() {
-        let mk = |ip: std::net::IpAddr, port: u16| firewall::PacketInfo {
+        let mk = |ip: IpAddr, port: u16| firewall::PacketInfo {
             src_ip: "100.64.0.5".parse().unwrap(),
             dst_ip: ip,
             protocol: 17,
@@ -774,14 +795,8 @@ mod tests {
             icmp_type: 0,
             icmp_id: 0,
         };
-        assert!(is_magic_dns(&mk(
-            std::net::IpAddr::V4(crate::dns::MAGIC_DNS_V4),
-            53
-        )));
-        assert!(!is_magic_dns(&mk(
-            std::net::IpAddr::V4(crate::dns::MAGIC_DNS_V4),
-            80
-        )));
+        assert!(is_magic_dns(&mk(IpAddr::V4(crate::dns::MAGIC_DNS_V4), 53)));
+        assert!(!is_magic_dns(&mk(IpAddr::V4(crate::dns::MAGIC_DNS_V4), 80)));
         assert!(!is_magic_dns(&mk("100.64.0.9".parse().unwrap(), 53)));
     }
 

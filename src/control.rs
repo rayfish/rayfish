@@ -522,9 +522,7 @@ mod tests {
     fn test_roundtrip_ping_pong() {
         for msg in [
             ControlMsg::Ping { nonce: 0 },
-            ControlMsg::Ping {
-                nonce: u64::MAX,
-            },
+            ControlMsg::Ping { nonce: u64::MAX },
             ControlMsg::Pong {
                 nonce: 0x0123_4567_89ab_cdef,
             },

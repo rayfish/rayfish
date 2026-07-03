@@ -12,6 +12,7 @@
 #   dns           2-peer Magic DNS resolution + resolv.conf takeover (tests/e2e/dns)
 #   ssh           2-peer mesh SSH (`ray firewall ssh`) allow/deny matrix (tests/e2e/ssh)
 #   reliability   4-peer full-mesh packet-loss test (ping + iperf3 UDP) (tests/e2e/reliability)
+#   restore-offline 3-peer member-restore-with-coordinator-offline test (tests/e2e/restore-offline)
 #   bench         throughput / latency benchmark        (tests/bench)
 #
 # Actions:
@@ -57,6 +58,9 @@ scenario_meta(){
     reliability) DIR="$ROOT/tests/e2e/reliability"
                  NAMES=(rayfish-reli-a rayfish-reli-b rayfish-reli-c rayfish-reli-d)
                  LABELS=(srv-a srv-b srv-c srv-d) ;;
+    restore-offline) DIR="$ROOT/tests/e2e/restore-offline"
+                 NAMES=(rayfish-restore-a rayfish-restore-b rayfish-restore-c)
+                 LABELS=(srv-a srv-b srv-c) ;;
     bench)       DIR="$ROOT/tests/bench"
                  NAMES=(rayfish-bench-a rayfish-bench-b)
                  LABELS=(srv-a srv-b) ;;

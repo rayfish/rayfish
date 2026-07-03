@@ -72,6 +72,7 @@ pub(crate) async fn ipc_join(
     hostname: Option<String>,
     tor: bool,
     auto_accept_firewall: bool,
+    auto_accept_files: bool,
 ) -> Result<()> {
     let transport = if tor {
         Some(config::TransportMode::Tor)
@@ -96,6 +97,7 @@ pub(crate) async fn ipc_join(
             invite,
             coordinator,
             auto_accept_firewall,
+            auto_accept_files,
         },
     )
     .await?;
@@ -160,6 +162,25 @@ pub(crate) async fn ipc_nuke(name: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+pub(crate) async fn ipc_kick(network: &str, peer: &str) -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::Kick {
+            network: network.to_string(),
+            peer: peer.to_string(),
+        },
+    )
+    .await?;
+    let resp = ipc::recv(&mut stream).await?;
+    match resp {
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
 pub(crate) async fn ipc_leave(name: &str) -> Result<()> {
     let mut stream = ipc::connect().await?;
     ipc::send(
@@ -177,4 +198,3 @@ pub(crate) async fn ipc_leave(name: &str) -> Result<()> {
     }
     Ok(())
 }
-

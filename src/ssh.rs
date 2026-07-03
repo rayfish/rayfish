@@ -18,6 +18,7 @@
 //! already-established session is not torn down by a later `deny`.
 
 use std::collections::HashMap;
+use std::io::Error;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -27,12 +28,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use iroh::EndpointId;
+use pty_process::Size;
 use russh::CryptoVec;
-use russh::keys::PrivateKey;
-use russh::server::{Auth, Handle, Handler, Msg, Session};
+use russh::keys::{Algorithm, PrivateKey};
+use russh::server::{Auth, Config, Handle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use smol_str::SmolStr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -144,14 +147,14 @@ impl SshServer {
     /// sshd keeps `:22` on every other interface.
     pub fn spawn(self, addrs: Vec<IpAddr>, token: CancellationToken) {
         tokio::spawn(async move {
-            let key = match load_or_generate_host_key() {
+            let key = match load_host_key() {
                 Ok(k) => k,
                 Err(e) => {
                     warn!(error = %e, "mesh SSH: could not load host key; SSH disabled");
                     return;
                 }
             };
-            let config = Arc::new(russh::server::Config {
+            let config = Arc::new(Config {
                 keys: vec![key],
                 // Identity is proven by the mesh link, so the `none` method is
                 // the only one offered; our `auth_none` is the authorization gate.
@@ -203,7 +206,7 @@ impl SshServer {
 /// Bind a TCP listener on a specific mesh IP's port 22 with SO_REUSEADDR (and
 /// SO_REUSEPORT on Unix) so it can coexist with a host sshd bound on the wildcard
 /// address. Returns a tokio listener ready to accept.
-fn bind_listener(ip: IpAddr, port: u16) -> Result<tokio::net::TcpListener> {
+fn bind_listener(ip: IpAddr, port: u16) -> Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if ip.is_ipv4() {
         Domain::IPV4
@@ -219,14 +222,14 @@ fn bind_listener(ip: IpAddr, port: u16) -> Result<tokio::net::TcpListener> {
     sock.bind(&addr.into())?;
     sock.listen(128)?;
     let std_listener: std::net::TcpListener = sock.into();
-    Ok(tokio::net::TcpListener::from_std(std_listener)?)
+    Ok(TcpListener::from_std(std_listener)?)
 }
 
 /// Resolve the connecting peer, decide authorization, and run the SSH session.
 async fn handle_conn(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
-    config: Arc<russh::server::Config>,
+    config: Arc<Config>,
     peers: PeerTable,
     device_user_map: DeviceUserMap,
     authz: SshAuthz,
@@ -272,7 +275,7 @@ struct SshHandler {
     channel: Option<Channel<Msg>>,
     /// Set once a shell/exec session starts; forwards window-resize events to
     /// the task that owns the PTY.
-    resize_tx: Option<mpsc::UnboundedSender<pty_process::Size>>,
+    resize_tx: Option<mpsc::UnboundedSender<Size>>,
 }
 
 impl SshHandler {
@@ -423,7 +426,7 @@ impl Handler for SshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         if let Some(tx) = &self.resize_tx {
-            let _ = tx.send(pty_process::Size::new(row_height as u16, col_width as u16));
+            let _ = tx.send(Size::new(row_height as u16, col_width as u16));
         }
         session.channel_success(channel)?;
         Ok(())
@@ -473,13 +476,13 @@ fn drop_privs(
             #[cfg(not(target_os = "macos"))]
             let basegroup = gid as libc::gid_t;
             if libc::initgroups(cname.as_ptr(), basegroup) != 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(Error::last_os_error());
             }
             if libc::setgid(gid as libc::gid_t) != 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(Error::last_os_error());
             }
             if libc::setuid(uid as libc::uid_t) != 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(Error::last_os_error());
             }
         }
         Ok(())
@@ -508,12 +511,12 @@ async fn run_pty_session(
     info: LoginInfo,
     command: Option<String>,
     pty_req: PtyReq,
-    mut resize_rx: mpsc::UnboundedReceiver<pty_process::Size>,
+    mut resize_rx: mpsc::UnboundedReceiver<Size>,
 ) -> Result<u32> {
     let drop = drop_privs(info.uid, info.gid, &info.name)?;
 
     let (pty, pts) = pty_process::open().context("opening pty")?;
-    let _ = pty.resize(pty_process::Size::new(pty_req.row, pty_req.col));
+    let _ = pty.resize(Size::new(pty_req.row, pty_req.col));
 
     let mut cmd = pty_process::Command::new(&info.shell);
     match &command {
@@ -663,6 +666,75 @@ async fn run_pipe_session(
     Ok(status.code().unwrap_or(0) as u32)
 }
 
+/// Load the SSH host key the embedded server presents.
+///
+/// Prefers the machine's real OpenSSH ed25519 host key so a stock client that
+/// already trusts the host keeps seeing the same fingerprint once the mesh SSH
+/// NAT takes over `:22` (no `known_hosts` mismatch). Falls back to a persisted
+/// generated key when no usable host key is found.
+fn load_host_key() -> Result<PrivateKey> {
+    if let Some((path, key)) = discover_host_ed25519_key() {
+        info!(path = %path.display(), "mesh SSH: reusing host ed25519 key");
+        return Ok(key);
+    }
+    let key = load_or_generate_host_key()?;
+    info!("mesh SSH: using generated host key");
+    Ok(key)
+}
+
+/// Run `sshd -T` and return the first configured ed25519 host key that loads
+/// unencrypted, together with its path. Best-effort: any failure (no `sshd`,
+/// dump error, no ed25519 key, unreadable or encrypted key) yields `None`, so
+/// the caller falls back to the generated key. The daemon is root, so it can
+/// read the `0600` host key files.
+fn discover_host_ed25519_key() -> Option<(PathBuf, PrivateKey)> {
+    let dump = run_sshd_dump()?;
+    for path in parse_hostkey_paths(&dump) {
+        let Ok(pem) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match PrivateKey::from_openssh(&pem) {
+            Ok(key) if !key.is_encrypted() && key.algorithm() == Algorithm::Ed25519 => {
+                return Some((path, key));
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// Dump the effective sshd config (`sshd -T`). Tries `sshd` on `PATH` then the
+/// common absolute locations, since the daemon's `PATH` may not include
+/// `/usr/sbin`. Returns `None` if none run successfully.
+fn run_sshd_dump() -> Option<String> {
+    for bin in ["sshd", "/usr/sbin/sshd", "/usr/local/sbin/sshd"] {
+        match std::process::Command::new(bin)
+            .arg("-T")
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(out) if out.status.success() => return String::from_utf8(out.stdout).ok(),
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// Extract the `hostkey <path>` entries from `sshd -T` output, in order. `sshd`
+/// prints one lowercase directive per line; other directives are ignored.
+fn parse_hostkey_paths(dump: &str) -> Vec<PathBuf> {
+    dump.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let directive = parts.next()?;
+            directive
+                .eq_ignore_ascii_case("hostkey")
+                .then(|| parts.next().map(PathBuf::from))
+                .flatten()
+        })
+        .collect()
+}
+
 /// Load the persisted SSH host key, generating and persisting one on first use.
 /// Stored as OpenSSH PEM at `<config_dir>/ssh_host_key`, mode 0600.
 fn load_or_generate_host_key() -> Result<PrivateKey> {
@@ -673,8 +745,8 @@ fn load_or_generate_host_key() -> Result<PrivateKey> {
         let pem = std::fs::read_to_string(&path).context("reading ssh host key")?;
         return PrivateKey::from_openssh(&pem).context("parsing ssh host key");
     }
-    let key = PrivateKey::random(&mut OsRng, russh::keys::Algorithm::Ed25519)
-        .context("generating ssh host key")?;
+    let key =
+        PrivateKey::random(&mut OsRng, Algorithm::Ed25519).context("generating ssh host key")?;
     let pem = key
         .to_openssh(LineEnding::LF)
         .context("encoding ssh host key")?;
@@ -726,6 +798,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_hostkey_paths_extracts_hostkey_lines() {
+        // `sshd -T` prints one lowercase directive per line; only `hostkey`
+        // lines carry a path, and there can be several. Other directives and
+        // blank lines are ignored.
+        let dump = "port 22\n\
+            hostkey /etc/ssh/ssh_host_rsa_key\n\
+            hostkey /etc/ssh/ssh_host_ecdsa_key\n\
+            HostKey /etc/ssh/ssh_host_ed25519_key\n\
+            hostkeyalgorithms ssh-ed25519\n\
+            permitrootlogin no\n";
+        let paths = parse_hostkey_paths(dump);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/etc/ssh/ssh_host_rsa_key"),
+                PathBuf::from("/etc/ssh/ssh_host_ecdsa_key"),
+                PathBuf::from("/etc/ssh/ssh_host_ed25519_key"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_hostkey_paths_empty_when_no_hostkey() {
+        assert!(parse_hostkey_paths("port 22\npermitrootlogin no\n").is_empty());
+    }
+
+    #[test]
     fn user_policy_default_is_nonroot() {
         // An allow rule with no explicit users grants any non-root user but not
         // root, enforced by uid (so a uid-0 account under any name is blocked).
@@ -738,7 +837,10 @@ mod tests {
         let p = resolve_user_policy(&authz, &alice, &[SmolStr::new("net")]);
         assert!(p.permits("deploy", 1000), "non-root user allowed");
         assert!(!p.permits("root", 0), "root (uid 0) blocked by default");
-        assert!(!p.permits("toor", 0), "any uid-0 account blocked, not just 'root'");
+        assert!(
+            !p.permits("toor", 0),
+            "any uid-0 account blocked, not just 'root'"
+        );
     }
 
     #[test]
@@ -747,7 +849,10 @@ mod tests {
         let authz = new_authz();
         // net1: alice may only be `deploy`; net2: alice may be any user (`*`).
         authz.store(Arc::new(HashMap::from([
-            ("net1".to_string(), vec![rule(&alice.to_string(), &["deploy"])]),
+            (
+                "net1".to_string(),
+                vec![rule(&alice.to_string(), &["deploy"])],
+            ),
             ("net2".to_string(), vec![rule(&alice.to_string(), &["*"])]),
         ])));
 
@@ -762,7 +867,11 @@ mod tests {
         assert!(p.permits("root", 0));
 
         // Union: explicit `deploy` (net1) + `*` (net2) → `*` dominates.
-        let p = resolve_user_policy(&authz, &alice, &[SmolStr::new("net1"), SmolStr::new("net2")]);
+        let p = resolve_user_policy(
+            &authz,
+            &alice,
+            &[SmolStr::new("net1"), SmolStr::new("net2")],
+        );
         assert!(p.permits("root", 0));
         assert!(p.permits("anyone", 1234));
     }

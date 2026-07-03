@@ -8,7 +8,7 @@ impl DaemonState {
     // Firewall handlers
     // -----------------------------------------------------------------------
 
-    pub(crate) fn firewall_add(
+    pub(crate) async fn firewall_add(
         &self,
         direction: firewall::Direction,
         action: firewall::Action,
@@ -32,12 +32,28 @@ impl DaemonState {
             },
             None => vec![None],
         };
+        // Resolve the peer to its **device** endpoint id (accepts hostname, mesh
+        // IPv4/IPv6, short id, full endpoint id, or a paired user identity), then
+        // normalize to the value the data plane actually compares against, which
+        // differs by direction: inbound matches `device_user_map.resolve(...)`
+        // (the peer's user identity for a paired/multi-device peer, else its
+        // device id — so an `in` rule keyed on the user id matches every one of
+        // that user's devices), while outbound matches the raw device id. Same
+        // reasoning as the SSH-allow handler below.
         let peer = match peer {
-            Some(s) => match self.resolve_short_id_any_network(s) {
-                Some(id) => firewall::PeerFilter::Identity(id),
+            Some(s) => match self.resolve_peer_flexible(s).await {
+                Some(device_id) => {
+                    let id = match direction {
+                        firewall::Direction::In => self.device_user_map.resolve(&device_id),
+                        firewall::Direction::Out => device_id,
+                    };
+                    firewall::PeerFilter::Identity(id)
+                }
                 None => {
                     return IpcMessage::Error {
-                        message: format!("unknown peer '{s}'"),
+                        message: format!(
+                            "unknown peer '{s}' (try a hostname, mesh IP, short id, or identity)"
+                        ),
                     };
                 }
             },
@@ -119,6 +135,7 @@ impl DaemonState {
             default_inbound: config.default_inbound,
             default_outbound: config.default_outbound,
             reject: config.reject,
+            disabled: config.disabled,
             rules: firewall::rule_views(&config.rules, &short_id),
         }
     }
@@ -127,7 +144,11 @@ impl DaemonState {
     /// republish the signed blob. Authority comes from holding the per-network
     /// secret key (so any admin granted the key can suggest). Suggestions are
     /// advisory on every network; each node queues or auto-accepts them.
-    pub(crate) async fn firewall_suggest(&self, network: &str, suggestions: SuggestedFirewall) -> IpcMessage {
+    pub(crate) async fn firewall_suggest(
+        &self,
+        network: &str,
+        suggestions: SuggestedFirewall,
+    ) -> IpcMessage {
         let (state, dht_notify, has_key) = match self.networks.get(network) {
             Some(h) => {
                 let has_key = h.state.read().unwrap().network_secret_key.is_some();
@@ -216,8 +237,8 @@ impl DaemonState {
                 };
             }
         };
-        let accept_set: std::collections::HashSet<&FirewallRuleView> = accept.iter().collect();
-        let deny_set: std::collections::HashSet<&FirewallRuleView> = deny.iter().collect();
+        let accept_set: HashSet<&FirewallRuleView> = accept.iter().collect();
+        let deny_set: HashSet<&FirewallRuleView> = deny.iter().collect();
 
         // Partition the queue: keep the still-undecided rules; collect accepted.
         let mut accepted_rules = Vec::new();
@@ -381,10 +402,27 @@ impl DaemonState {
             tracing::warn!(error = %e, "failed to persist firewall config");
         }
         IpcMessage::Ok {
-            message: format!(
-                "fail-fast reject {}",
-                if enabled { "on" } else { "off" }
-            ),
+            message: format!("fail-fast reject {}", if enabled { "on" } else { "off" }),
+        }
+    }
+
+    /// `ray firewall on|off`: the global kill switch. `off` sets
+    /// `config.disabled = true` so `evaluate_packet` allows every packet
+    /// (rules and defaults are bypassed; the anti-spoof check upstream still
+    /// runs). Hot-swaps the live `ArcSwap`, so the effect is immediate.
+    pub(crate) fn firewall_set_enabled(&self, enabled: bool) -> IpcMessage {
+        let mut config = (*self.firewall.get_config()).clone();
+        config.disabled = !enabled;
+        self.firewall.update(config.clone());
+        if let Err(e) = firewall::save_firewall(&config) {
+            tracing::warn!(error = %e, "failed to persist firewall config");
+        }
+        IpcMessage::Ok {
+            message: if enabled {
+                "firewall on (enforcing rules and defaults)".to_string()
+            } else {
+                "firewall off (all packets allowed on this device)".to_string()
+            },
         }
     }
 
@@ -425,9 +463,18 @@ impl DaemonState {
                 self.stop_ssh();
             }
         }
-        IpcMessage::Ok {
-            message: format!("mesh SSH {}", if enabled { "on" } else { "off" }),
-        }
+        // Nudge: enabling the server does nothing until a peer is authorized. If
+        // no network has any `ssh_allow` entry yet, tell the user the next step.
+        let has_allow = app_config.networks.iter().any(|n| !n.ssh_allow.is_empty());
+        let message = if enabled && !has_allow {
+            "mesh SSH on. No peer is authorized yet. Grant access with \
+             `ray firewall ssh allow <network> <peer>` (peer = hostname / mesh IP / \
+             short id, or `*` for any peer on the network)."
+                .to_string()
+        } else {
+            format!("mesh SSH {}", if enabled { "on" } else { "off" })
+        };
+        IpcMessage::Ok { message }
     }
 
     /// Add or remove a peer from a network's SSH allow list. `peer` is `*` (any

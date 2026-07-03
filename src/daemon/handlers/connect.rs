@@ -66,6 +66,7 @@ impl DaemonState {
                 None,
                 Some(coordinator),
                 false,
+                false,
             )
             .await;
         if let IpcMessage::Joined { name, .. } = &resp
@@ -79,7 +80,11 @@ impl DaemonState {
 
     /// Background retry loop for a connect request still `Pending`: re-dials the
     /// peer with backoff until it is `Approved` (then joins) or `Denied`.
-    pub(crate) fn spawn_connect_retry(self: &Arc<Self>, peer: EndpointId, hostname: Option<String>) {
+    pub(crate) fn spawn_connect_retry(
+        self: &Arc<Self>,
+        peer: EndpointId,
+        hostname: Option<String>,
+    ) {
         let me = Arc::clone(self);
         tokio::spawn(async move {
             let mut backoff = BACKOFF_INITIAL;
@@ -110,7 +115,11 @@ impl DaemonState {
     }
 
     /// `ray connect <contact-id>`: request a direct connection by contact id.
-    pub(crate) async fn connect(self: &Arc<Self>, contact_id: &str, hostname: Option<String>) -> IpcMessage {
+    pub(crate) async fn connect(
+        self: &Arc<Self>,
+        contact_id: &str,
+        hostname: Option<String>,
+    ) -> IpcMessage {
         let contact_pubkey = match contact_id.parse::<EndpointId>() {
             Ok(id) => id,
             Err(e) => {
@@ -353,9 +362,7 @@ impl DaemonState {
         }
     }
 
-
     // -----------------------------------------------------------------------
     // File sharing
     // -----------------------------------------------------------------------
-
 }

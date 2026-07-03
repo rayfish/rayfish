@@ -6,6 +6,94 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in automatic updates**: enable with `sudo ray install --auto-update` or
+  `ray auto-update on`, and the daemon checks GitHub about every 6 hours for a
+  newer **stable** release, then downloads, verifies (SHA-256), swaps the binary,
+  and restarts itself onto the new version — no manual `sudo ray update`. Off by
+  default; nightlies are never auto-installed. Applying an update restarts the
+  daemon, which briefly drops the VPN (peers reconnect automatically), so it stays
+  opt-in. A backoff guard means a bad release is retried at most once a day
+  instead of looping. `ray status` shows when auto-update is on.
+- **Auto-accept files from your own devices**: turn on
+  `ray files auto-accept <network> on` (or join with
+  `ray join <net> --auto-accept-files`) and incoming file transfers from your
+  own paired devices land automatically in your `~/Downloads`, with no manual
+  `ray files accept`. Only offers whose sender is one of your own devices (same
+  paired identity) on that network are accepted; files from anyone else still
+  queue for review. Turning it on also accepts any offers already waiting from
+  your devices. Off by default; `ray files auto-accept <net> off` disables it.
+- **Configurable auto-accept download location**: `ray files download-dir <path>`
+  sends auto-accepted files to an absolute directory (owned by the dir's owner or
+  `download-user`); `ray files download-user <user>` routes them to that user's
+  `~/Downloads`, owned by them. With neither set, the operator's `~/Downloads` is
+  used; if nothing resolves the offer stays queued rather than being written as
+  root. `--clear` unsets; no argument shows the current value.
+- **`ray alias <network> <key> <alias>`**: give a peer a friendly, node-local
+  name. `ray alias <net> set <key> <name>` binds an alias to a user, where `key`
+  is either an identity string (from `ray identityof`) or a currently-joined
+  hostname. The alias then shows inline in `ray status` (as `host.net.ray
+  [name]`) and seeds `ray apply`'s `aliases:` map, so a spec can reference the
+  name without re-declaring it (the spec still wins on a name conflict).
+  `ray alias <net> list` and `ray alias <net> rm <name>` manage the set. Aliases
+  are local and display-only: they are never published to the network.
+- **`ray kick <network> <peer>`**: coordinators can now remove a member from a
+  closed network. Identify the peer by hostname, mesh IP, or short id. The member
+  is dropped from the network's roster, and every node disconnects from it: the
+  kicked peer is severed mesh-wide, not just from the coordinator. It cannot
+  re-join the closed network without a fresh invite or approval (to bar it
+  permanently, also revoke its invite or reusable key). Kicking is refused on open
+  networks (where the peer could immediately re-join) and against another
+  coordinator or yourself.
+- **`ray firewall off` / `ray firewall on`**: a global switch to disable the
+  userspace firewall on a device. `off` allows every mesh packet (rules and the
+  secure default are bypassed; mesh membership still gates who can reach you, and
+  spoofed source addresses are still dropped), for simple setups that don't want a
+  second firewall layered on top of the host/kernel firewall. `on` restores
+  enforcement. The disabled state is shown in `ray firewall show`.
+
+### Changed
+
+- **`ray firewall show` clarifies the firewall is separate from your host
+  firewall**: the output now notes that this is a mesh firewall applied on top of
+  your host/kernel firewall (both must allow a packet), so it is not forgotten
+  when auditing an OS firewall. Enabling mesh SSH with `ray firewall ssh on` now
+  reminds you to authorize a peer with `ray firewall ssh allow` when none is set
+  yet (the server rejects all logins until a peer is on the allow list).
+
+### Fixed
+
+- **`ray firewall add --peer` now accepts any peer identifier**: previously it
+  only matched a short id / endpoint-id prefix, so the natural things to type
+  (`--peer alice`, `--peer alice.homenet.ray`, `--peer 100.x.y.z`) failed with
+  "unknown peer". It now resolves a hostname, mesh IPv4/IPv6, short id, full
+  endpoint id, or a paired user identity, the same way `ray ping`, `ray send`,
+  and `ray firewall ssh allow` already do. It also fixes a case where an
+  **inbound** rule scoped to a paired (multi-device) peer never matched: the rule
+  is now keyed on the peer's user identity, so `allow in ... --peer alice` covers
+  every one of that user's devices (an outbound rule stays scoped to the named
+  device).
+- **Member network vanished when the coordinator was offline at startup**: a
+  member (non-coordinator) whose daemon restarted while its coordinator was
+  unreachable would silently drop the network from its running state. `ray
+  status` showed "no active networks" and the node rejected inbound mesh
+  connections, and it stayed that way until it happened to restart again while
+  the coordinator was online (its config was never lost). Restore now registers
+  the network immediately from the verified group blob it already holds, whether
+  or not the coordinator answers, and hands off to the reconnect loop to dial the
+  coordinator back with backoff. The network stays visible in `ray status`
+  (peers show offline) and reconnects on its own when the coordinator returns. As
+  a side effect, a network no longer takes ~30s to appear in `ray status` after a
+  member restart.
+- **Mesh SSH host-key mismatch**: enabling `ray firewall ssh on` no longer makes
+  `ssh <host>.ray` fail with a "REMOTE HOST IDENTIFICATION HAS CHANGED" warning.
+  The embedded SSH server now presents the machine's existing OpenSSH ed25519
+  host key (discovered via `sshd -T`) instead of a separate generated key, so
+  clients that already trust the host keep matching the fingerprint pinned in
+  their `known_hosts`. Hosts without a usable OpenSSH key fall back to a
+  generated key as before.
+
 ## [0.1.4]
 
 ### Added

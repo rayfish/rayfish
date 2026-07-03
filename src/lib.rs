@@ -83,3 +83,7 @@ pub mod stats;
 pub mod style;
 pub mod transport;
 pub mod tun;
+// Self-replacing binary update relies on `self-replace` (a desktop-only dep) and
+// only ever runs from the desktop daemon/CLI; it is not part of the Android lib.
+#[cfg(feature = "desktop")]
+pub mod update;

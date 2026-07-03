@@ -2,8 +2,8 @@
 // integration tests and benchmarks can reach them; this binary is the CLI/IPC
 // client built on top.
 use rayfish::{
-    DNS_DOMAIN, apply, config, daemon, firewall, identity, invite, ipc, layout, logdir, membership,
-    onepassword, picker, progress, shutdown, stats, style,
+    DNS_DOMAIN, apply, config, daemon, firewall, hostname, identity, invite, ipc, layout, logdir,
+    membership, onepassword, picker, progress, shutdown, stats, style,
 };
 
 use std::sync::{Arc, atomic};
@@ -88,6 +88,11 @@ pub(crate) enum Command {
         /// it, suggestions queue for `ray firewall accept`.
         #[arg(long)]
         auto_accept_firewall: bool,
+        /// Auto-accept incoming file transfers from your own paired devices on
+        /// this network (no manual `ray files accept`). Only offers whose sender
+        /// is one of your own devices are accepted.
+        #[arg(long)]
+        auto_accept_files: bool,
     },
     /// Leave a network (remove from saved config)
     #[command(visible_alias = "rm")]
@@ -102,6 +107,14 @@ pub(crate) enum Command {
         /// Force destroy even if other members exist
         #[arg(long)]
         force: bool,
+    },
+    /// Remove a member from a closed network (coordinator only)
+    #[command(visible_alias = "boot")]
+    Kick {
+        /// Network name
+        network: String,
+        /// Member to remove: hostname, mesh IP, or short id
+        peer: String,
     },
     /// Show status of all networks (active + saved)
     #[command(visible_aliases = ["st", "ls"])]
@@ -127,7 +140,12 @@ pub(crate) enum Command {
     /// Uninstall system service
     Uninstall,
     /// Install or refresh the system service and start it (requires root)
-    Install,
+    Install {
+        /// Opt this node into automatic stable updates: the daemon periodically
+        /// checks for a newer stable release and swaps + restarts onto it
+        #[arg(long)]
+        auto_update: bool,
+    },
     /// Restart the system service (requires root)
     Restart,
     /// Generate shell completions
@@ -206,6 +224,15 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: AdminAction,
     },
+    /// Manage local, per-network aliases (a friendly name for a user identity).
+    /// Node-local and display-only: shown inline in `ray status` and used to seed
+    /// a `ray apply` spec's `aliases:` map. Never published to the network.
+    Alias {
+        /// Network name
+        network: String,
+        #[command(subcommand)]
+        action: AliasAction,
+    },
     /// Manage local device firewall rules
     Firewall {
         #[command(subcommand)]
@@ -251,6 +278,12 @@ pub(crate) enum Command {
     },
     /// Enable or disable mDNS local peer discovery
     Mdns {
+        /// "on" or "off"
+        state: String,
+    },
+    /// Enable or disable automatic stable updates (applied by the daemon)
+    #[command(name = "auto-update")]
+    AutoUpdate {
         /// "on" or "off"
         state: String,
     },
@@ -396,6 +429,27 @@ pub(crate) enum AdminAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum AliasAction {
+    /// Bind an alias to a user. `key` is an identity string (from `ray
+    /// identityof`) or a currently-joined hostname, resolved to its identity.
+    Set {
+        /// Identity string or a joined hostname
+        key: String,
+        /// The alias to assign
+        alias: String,
+    },
+    /// List this network's aliases
+    #[command(visible_alias = "ls")]
+    List,
+    /// Remove an alias by name
+    #[command(visible_aliases = ["rm", "del"])]
+    Remove {
+        /// The alias to remove
+        alias: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum ConnectionsAction {
     /// List pending incoming connection requests (default)
     #[command(visible_alias = "ls")]
@@ -462,7 +516,8 @@ pub(crate) enum FirewallAction {
         /// A comma list adds one rule per item.
         #[arg(long, short = 'P')]
         port: Option<String>,
-        /// Peer short ID (omit for any peer)
+        /// Peer: hostname, mesh IP, short id, endpoint id, or user identity
+        /// (omit for any peer)
         #[arg(long)]
         peer: Option<String>,
         /// Restrict to a network (omit to match any network the peer is reached through)
@@ -495,6 +550,17 @@ pub(crate) enum FirewallAction {
         /// on or off
         state: String,
     },
+    /// Turn the firewall back on (resume enforcing rules and defaults). Undoes
+    /// `ray firewall off`.
+    #[command(visible_alias = "enable")]
+    On,
+    /// Disable the firewall entirely on this device: every packet is allowed,
+    /// bypassing all rules and defaults (mesh membership still gates who can reach
+    /// you; the anti-spoof check still runs). For simple setups that don't want a
+    /// second firewall on top of the host/kernel one. Re-enable with
+    /// `ray firewall on`.
+    #[command(visible_alias = "disable")]
+    Off,
     /// Coordinator-only: suggest firewall rules for a subject host on a network.
     /// Distributed in the signed blob; each node takes them per its own consent.
     Suggest {
@@ -594,6 +660,33 @@ pub(crate) enum FilesAction {
         /// Output directory (default: ~/Downloads)
         #[arg(long, short)]
         output: Option<String>,
+    },
+    /// Toggle auto-accepting file transfers from your own paired devices on a
+    /// network (`on` also drains any already-queued offers from your devices;
+    /// `off` stops future auto-accept). Only your own devices are auto-accepted.
+    AutoAccept {
+        /// Network name
+        network: String,
+        /// `on` or `off`
+        state: String,
+    },
+    /// Set/show/clear the directory where auto-accepted files are written
+    /// (absolute path). With no argument, prints the current value.
+    DownloadDir {
+        /// Absolute path (omit to show current)
+        path: Option<String>,
+        /// Clear the setting (revert to download-user / operator fallback)
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Set/show/clear the unix user that owns auto-accepted files (and whose
+    /// ~/Downloads receives them when no download-dir is set).
+    DownloadUser {
+        /// Username or numeric uid (omit to show current)
+        user: Option<String>,
+        /// Clear the setting
+        #[arg(long)]
+        clear: bool,
     },
 }
 
@@ -866,6 +959,7 @@ async fn main() -> Result<()> {
             hostname,
             tor,
             auto_accept_firewall,
+            auto_accept_files,
         } => {
             ipc_join(
                 &network_key,
@@ -873,10 +967,12 @@ async fn main() -> Result<()> {
                 hostname,
                 tor,
                 auto_accept_firewall,
+                auto_accept_files,
             )
             .await
         }
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
+        Command::Kick { network, peer } => ipc_kick(&network, &peer).await,
         Command::Status => ipc_status().await,
         Command::Report => ipc_report().await,
         Command::Daemon => {
@@ -892,7 +988,7 @@ async fn main() -> Result<()> {
         Command::Stop => cmd_stop().await,
         Command::Start => cmd_start().await,
         Command::Uninstall => cmd_uninstall_service(),
-        Command::Install => cmd_install().await,
+        Command::Install { auto_update } => cmd_install(auto_update).await,
         Command::Restart => cmd_restart().await,
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "ray", &mut std::io::stdout());
@@ -927,7 +1023,9 @@ async fn main() -> Result<()> {
         Command::Identityof { network, hostname } => {
             cmd_identityof(&network, &hostname, cli.json).await
         }
+        Command::Alias { network, action } => cmd_alias(&network, action, cli.json).await,
         Command::Mdns { state } => cmd_mdns(&state),
+        Command::AutoUpdate { state } => cmd_auto_update(&state),
         Command::Config { action } => cmd_config(action, cli.json),
         Command::SetOperator { user } => cmd_set_operator(&user).await,
         Command::Send { file, peer } => ipc_send_file(&file, &peer).await,
@@ -971,6 +1069,28 @@ fn cmd_mdns(state: &str) -> Result<()> {
     Ok(())
 }
 
+/// `ray auto-update on|off`: toggle opt-in automatic stable updates. Writes
+/// `settings.toml` directly (like `cmd_mdns`); the daemon reads it at startup, so
+/// the change takes effect on the next daemon restart.
+fn cmd_auto_update(state: &str) -> Result<()> {
+    let enabled = match state {
+        "on" => true,
+        "off" => false,
+        _ => {
+            eprintln!("Usage: ray auto-update <on|off>");
+            std::process::exit(1);
+        }
+    };
+    let mut app_config = config::load()?;
+    app_config.auto_update = enabled;
+    config::save_settings(&app_config)?;
+    println!(
+        "automatic updates {}. Restart the daemon for changes to take effect.",
+        if enabled { "enabled" } else { "disabled" }
+    );
+    Ok(())
+}
+
 /// `ray config get/set/unset`: view or change global daemon settings. Writes
 /// `settings.toml` directly (like `cmd_mdns`); relay/discovery/dns-upstreams all
 /// take effect on the next daemon restart. On Linux the config tree is root-
@@ -992,7 +1112,11 @@ fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
                 }
             }
         }
-        ConfigAction::Set { key, value, replace } => {
+        ConfigAction::Set {
+            key,
+            value,
+            replace,
+        } => {
             let mut cfg = config::load()?;
             config::config_set(&mut cfg, &key, &value, replace)?;
             config::save_settings(&cfg)?;
@@ -1009,7 +1133,7 @@ fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
 }
 
 /// Resolve a username to its UID, falling back to parsing a numeric UID.
-fn uid_for_user(user: &str) -> Option<u32> {
+pub(crate) fn uid_for_user(user: &str) -> Option<u32> {
     use std::ffi::CString;
     let cname = CString::new(user).ok()?;
     let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
@@ -1048,6 +1172,7 @@ async fn cmd_set_operator(user: &str) -> Result<()> {
 mod tests {
     use super::*;
     use ipc::FirewallRuleView;
+    use rayfish::update::{normalize_version, release_asset_name, version_is_newer};
 
     #[test]
     fn strip_deleted_suffix_sanitizes_replaced_binary_path() {
@@ -1200,6 +1325,7 @@ mod tests {
         let out = render_firewall_rules(
             Some((firewall::Action::Allow, firewall::Action::Allow)),
             false,
+            false,
             &rules,
         );
         assert!(out.contains("default in   allow"));
@@ -1219,10 +1345,29 @@ mod tests {
     #[test]
     fn empty_firewall_says_no_rules() {
         style::set_plain(true);
-        let out =
-            render_firewall_rules(Some((firewall::Action::Deny, firewall::Action::Allow)), false, &[]);
+        let out = render_firewall_rules(
+            Some((firewall::Action::Deny, firewall::Action::Allow)),
+            false,
+            false,
+            &[],
+        );
         assert!(out.contains("default in   deny"));
         assert!(out.contains("default out  allow"));
         assert!(out.contains("(no rules)"));
+        // The posture header notes the firewall is separate from the host one.
+        assert!(out.contains("separate from your host/kernel firewall"));
+    }
+
+    #[test]
+    fn disabled_firewall_shows_banner() {
+        style::set_plain(true);
+        let out = render_firewall_rules(
+            Some((firewall::Action::Deny, firewall::Action::Allow)),
+            false,
+            true,
+            &[],
+        );
+        assert!(out.contains("disabled"));
+        assert!(out.contains("all packets allowed"));
     }
 }

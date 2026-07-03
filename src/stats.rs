@@ -5,7 +5,7 @@
 //! 30-second interval deltas and a session summary on shutdown.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use iroh_metrics::{Counter, EncodeLabelSet, EncodeLabelValue, Family, Gauge, MetricsGroup};
 use serde::Serialize;
@@ -130,7 +130,7 @@ impl ForwardMetrics {
 
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
                         let rx = stats.packets_rx.get();
                         let tx = stats.packets_tx.get();
                         let brx = stats.bytes_rx.get();
@@ -197,7 +197,7 @@ impl PeerMetrics {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {
                         for (ip, conn) in peers.all_connections() {
                             let label = PeerLabels {
                                 peer: ip.to_string(),

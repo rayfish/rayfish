@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
@@ -36,6 +37,10 @@ pub enum IpcMessage {
         /// without a manual review queue (`--auto-accept-firewall`).
         #[serde(default, alias = "allow_trusted")]
         auto_accept_firewall: bool,
+        /// Auto-accept incoming file offers from our own paired devices on this
+        /// network (`--auto-accept-files`).
+        #[serde(default)]
+        auto_accept_files: bool,
     },
     Leave {
         name: String,
@@ -43,6 +48,13 @@ pub enum IpcMessage {
     Nuke {
         name: String,
         force: bool,
+    },
+    /// Coordinator-only: remove a member from a closed network. Prunes it from the
+    /// roster + approved list, republishes the signed blob, and disconnects it
+    /// mesh-wide. `peer` is a hostname / mesh IP / short id of a current member.
+    Kick {
+        network: String,
+        peer: String,
     },
     Status,
     /// Build a diagnostic bundle (logs + metrics + sanitized status) on disk and
@@ -83,6 +95,11 @@ pub enum IpcMessage {
     FirewallReject {
         enabled: bool,
     },
+    /// Global firewall kill switch (`ray firewall on|off`). When `enabled` is
+    /// false the firewall stops enforcing and allows every packet.
+    FirewallSetEnabled {
+        enabled: bool,
+    },
     /// Coordinator-only: replace the network's suggested firewall rules and
     /// republish the signed blob. Authority comes from holding the network's
     /// secret key; works on any network (suggestions are advisory).
@@ -103,6 +120,13 @@ pub enum IpcMessage {
     /// Toggle per-network auto-accept of coordinator-suggested firewall rules.
     /// `on` immediately installs the queued set; `off` stops future auto-install.
     FirewallAutoAccept {
+        network: String,
+        enabled: bool,
+    },
+    /// Toggle per-network auto-accept of incoming file offers from our own
+    /// paired devices. `on` also drains any already-queued offers from own
+    /// devices; `off` stops future auto-accept.
+    FilesAutoAccept {
         network: String,
         enabled: bool,
     },
@@ -146,6 +170,27 @@ pub enum IpcMessage {
     SetHostname {
         network: String,
         hostname: String,
+    },
+    /// Bind a local, per-network alias to a user/device identity (`ray alias set`).
+    /// Node-local only: never rides the signed blob. `identity` is already
+    /// canonicalized to the string `ray identityof` prints. Mutating (root/operator).
+    AliasSet {
+        network: String,
+        identity: String,
+        alias: String,
+    },
+    /// Remove a local alias by its name (`ray alias rm`). Mutating.
+    AliasRemove {
+        network: String,
+        alias: String,
+    },
+    /// List a network's local aliases (`ray alias list`). Open read.
+    AliasList {
+        network: String,
+    },
+    /// Response to `AliasList`: `alias name -> identity string`.
+    AliasListResponse {
+        aliases: BTreeMap<String, String>,
     },
     SendFile {
         path: String,
@@ -265,6 +310,11 @@ pub enum IpcMessage {
     StatusResponse {
         endpoint_id: EndpointId,
         mdns_enabled: bool,
+        /// Whether this node opted into automatic stable updates. Reflects the
+        /// running daemon's setting (which can differ from on-disk config until a
+        /// restart). Defaulted so an older CLI/daemon pair still deserializes.
+        #[serde(default)]
+        auto_update: bool,
         /// Whether the VPN is active (TUN up, networks connected) or on standby.
         active: bool,
         /// This node's contact id (`ray connect`), shown at the top of status.
@@ -334,6 +384,10 @@ pub enum IpcMessage {
         /// get a TCP RST / ICMP-unreachable reply instead of a silent drop.
         #[serde(default)]
         reject: bool,
+        /// Global kill switch (`ray firewall off`). When true the firewall is not
+        /// enforcing: every packet is allowed regardless of rules/defaults.
+        #[serde(default)]
+        disabled: bool,
         rules: Vec<FirewallRuleView>,
     },
     /// Current suggested firewall rules for a network (reply to
@@ -484,6 +538,11 @@ pub struct NetworkStatus {
     /// (`ray requests <net>` / `ray accept`). Surfaced in the status summary.
     #[serde(default)]
     pub pending_requests: usize,
+    /// Node-local aliases for this network (`alias name -> identity string`,
+    /// set via `ray alias`). Display-only and never in the signed blob; also
+    /// seeds `ray apply`'s `aliases:` map.
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
 }
 
 #[derive(
@@ -807,6 +866,7 @@ mod tests {
             invite: Some(vec![1, 2, 3]),
             coordinator: Some(coord),
             auto_accept_firewall: false,
+            auto_accept_files: false,
         };
         let bytes = rmp_serde::to_vec(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
@@ -863,6 +923,7 @@ mod tests {
         let resp = IpcMessage::StatusResponse {
             endpoint_id: ep_id,
             mdns_enabled: true,
+            auto_update: false,
             active: true,
             contact_id: Some("contact123".to_string()),
             daemon_version: "0.1.0".to_string(),
@@ -884,6 +945,7 @@ mod tests {
                 }],
                 pending_suggestions: 0,
                 pending_requests: 0,
+                aliases: BTreeMap::new(),
             }],
             packets_rx: 0,
             packets_tx: 0,

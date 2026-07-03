@@ -4,6 +4,7 @@
 //! so that reads and writes can happen concurrently without locking.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 // The desktop TUN device (the `tun` crate) and its async I/O helpers only exist
@@ -68,7 +69,7 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
 
 #[cfg(not(target_os = "android"))]
 pub fn check_cgnat_conflict() -> Result<()> {
-    let output = std::process::Command::new("ifconfig").output();
+    let output = Command::new("ifconfig").output();
 
     let output = match output {
         Ok(o) => o,
@@ -192,7 +193,7 @@ async fn configure_ipv6(tun_name: &str, addr: Ipv6Addr) -> Result<()> {
 async fn configure_ipv6(tun_name: &str, addr: Ipv6Addr) -> Result<()> {
     // macOS has no netlink; assign the address via the BSD tools. The peer-range
     // route is added separately by `route_peer_range` after link-up.
-    let status = std::process::Command::new("ifconfig")
+    let status = Command::new("ifconfig")
         .args([tun_name, "inet6", &addr.to_string(), "prefixlen", "128"])
         .status()
         .context("run ifconfig")?;
@@ -259,14 +260,17 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     // IPv6 still works. `route add` fails if the route already exists (e.g. an
     // earlier `up`), so delete any stale entry first and ignore its result.
     for (family, net) in [("-inet", "100.64.0.0/10"), ("-inet6", "200::/7")] {
-        let _ = std::process::Command::new("route")
+        let _ = Command::new("route")
             .args(["-n", "delete", family, "-net", net, "-interface", tun_name])
             .status();
-        let status = std::process::Command::new("route")
+        let status = Command::new("route")
             .args(["-n", "add", family, "-net", net, "-interface", tun_name])
             .status()
             .with_context(|| format!("run route add {family} {net}"))?;
-        anyhow::ensure!(status.success(), "route add {family} {net} failed with {status}");
+        anyhow::ensure!(
+            status.success(),
+            "route add {family} {net} failed with {status}"
+        );
     }
     Ok(())
 }
@@ -320,10 +324,18 @@ pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
 #[cfg(target_os = "macos")]
 pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
     let ip = crate::dns::MAGIC_DNS_V4.to_string();
-    let _ = std::process::Command::new("route")
-        .args(["-n", "delete", "-inet", "-host", &ip, "-interface", tun_name])
+    let _ = Command::new("route")
+        .args([
+            "-n",
+            "delete",
+            "-inet",
+            "-host",
+            &ip,
+            "-interface",
+            tun_name,
+        ])
         .status();
-    let status = std::process::Command::new("route")
+    let status = Command::new("route")
         .args(["-n", "add", "-inet", "-host", &ip, "-interface", tun_name])
         .status()
         .context("run route add magic dns")?;
@@ -356,10 +368,10 @@ pub async fn route_magic_dns(_tun_name: &str) -> Result<()> {
 #[cfg(target_os = "macos")]
 pub async fn route_self_loopback(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<()> {
     for (family, addr) in [("-inet", v4.to_string()), ("-inet6", v6.to_string())] {
-        let _ = std::process::Command::new("route")
+        let _ = Command::new("route")
             .args(["-n", "delete", family, "-host", &addr, "-interface", "lo0"])
             .status();
-        let status = std::process::Command::new("route")
+        let status = Command::new("route")
             .args(["-n", "add", family, "-host", &addr, "-interface", "lo0"])
             .status()
             .context("run route add (loopback self-route)")?;
@@ -397,7 +409,7 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let state = if up { "up" } else { "down" };
-        let status = std::process::Command::new("ifconfig")
+        let status = Command::new("ifconfig")
             .args([tun_name, state])
             .status()
             .context("run ifconfig")?;
@@ -406,7 +418,7 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let state = if up { "up" } else { "down" };
-        let status = std::process::Command::new("ip")
+        let status = Command::new("ip")
             .args(["link", "set", tun_name, state])
             .status()
             .context("run ip link set")?;

@@ -36,12 +36,12 @@ Each machine runs a small daemon (comparable to Tailscale's `tailscaled`) that c
 - 🔒 **Closed-by-default networks** with one-time invites, reusable fleet keys, or live approval (`--open` for public ones)
 - 🤝 **Direct 2-peer connections.** `ray connect <contact-id>` links you to one person with no room id or invite, approved like a friend request
 - 🌐 **Magic DNS.** `name.network.ray`, updated live as peers join, leave, or rename
-- 🧱 **Per-device firewall.** Directional, per-port, per-network rules with stateful return traffic. Secure by default: out of the box, unsolicited inbound TCP/UDP is denied (no local service port is exposed when you join a public network), while inbound ICMP (ping) and all outbound traffic are allowed. `ray firewall add in allow -p tcp --port N` opens a port (`--port` also takes a range `80-443` or a comma list `80,443`); `ray firewall default allow` restores permissive inbound behavior. By default a denied packet is silently dropped (stealthy); `ray firewall reject on` switches to "fail fast" mode, replying with a TCP RST / ICMP-unreachable so a blocked connection fails immediately ("connection refused") instead of hanging.
+- 🧱 **Per-device firewall.** A userspace firewall for mesh traffic, **separate from and layered on top of your host/kernel firewall** (both must allow a packet). Directional, per-port, per-network rules with stateful return traffic. Secure by default: unsolicited inbound TCP/UDP is denied, while inbound ICMP and all outbound traffic are allowed. `ray firewall add in allow -p tcp --port N` opens a port for a service you run yourself (e.g. your own sshd on `--port 22`), `--peer` scopes it to one peer, and `ray firewall reject on` makes blocked connections fail fast instead of hanging. Don't want a second firewall? `ray firewall off` disables it entirely on that device. See `ray firewall --help` for the full model.
 - 🔑 **Mesh SSH, no keys.** `ray firewall ssh on` runs an embedded SSH server on your mesh IPs; `ray firewall ssh allow <network> <peer>` authorizes a peer to log in. Connect with a stock client (`ssh user@host.ray`) — the peer is authenticated by its mesh identity, so there are no `authorized_keys` to distribute (Tailscale-style). For now an authorized peer may log in as any local user.
 - 🤝 **Coordinator firewall suggestions.** On any network the coordinator can suggest firewall rules that ride the signed network record (`*` targets all hosts); each node reviews them or opts into auto-install with `--auto-accept-firewall`.
-- 📜 **Declarative provisioning.** `ray apply deploy.yaml` stands up networks and firewall rules from a YAML spec. Define `aliases:` (a name for a user, expanding to all their devices) and `groups:` (a set of users/hosts) once, then reference them in firewall rules instead of repeating hostnames. `ray identityof <net> <host>` prints the identity string to alias.
+- 📜 **Declarative provisioning.** `ray apply deploy.yaml` stands up networks and firewall rules from a YAML spec. Define `aliases:` (a name for a user, expanding to all their devices) and `groups:` (a set of users/hosts) once, then reference them in firewall rules instead of repeating hostnames. `ray identityof <net> <host>` prints the identity string to alias. `ray alias <net> set <host> <name>` saves an alias on the node itself: it shows inline in `ray status` and seeds a spec's `aliases:` so you don't have to re-declare it.
 - 👥 **Multi-device identity.** Pair your laptop and phone under one identity; encrypted key backup (optionally to 1Password).
-- 📁 **File sharing.** `ray send file.zip bob`.
+- 📁 **File sharing.** `ray send file.zip bob`. Opt into `ray files auto-accept <net> on` to have transfers from your own paired devices land automatically; point them anywhere with `ray files download-dir <path>` or `download-user <user>`.
 - 📡 **mDNS** local discovery, and optional **Tor** transport.
 - 🛠 **Operator model.** Like Tailscale, run day-to-day commands without `sudo`.
 
@@ -65,9 +65,14 @@ ray update --list        # list available releases (newest first)
 sudo ray update          # download + verify the latest stable release, swap the binary, restart the daemon
 sudo ray update --nightly        # track the rolling nightly (rebuilt on every commit to master)
 sudo ray update --version 0.1.0  # install a specific release (downgrades allowed)
+
+sudo ray install --auto-update   # enable automatic stable updates at install time
+ray auto-update on               # or toggle it any time (takes effect on `sudo ray restart`)
 ```
 
 `ray update` fetches a release from GitHub, verifies its SHA-256, atomically replaces the running `ray` binary, and (if the system service is installed) restarts the daemon onto the new version. By default it tracks the latest stable release; `--nightly` follows the rolling pre-release built from every commit, and `--version X` pins a specific release. There is no persisted channel: each run picks its target from the flag. It needs root when the installed binary lives in a system path (so use `sudo ray update`); `ray --version`, `ray update --check`, and `ray update --list` do not.
+
+**Automatic updates** are opt-in (off by default). Enable them with `sudo ray install --auto-update` or `ray auto-update on`: the daemon then checks for a newer **stable** release about every 6 hours and, when one exists, downloads + verifies + swaps the binary and restarts itself onto it. Nightlies are never auto-installed. Because applying an update restarts the daemon, it briefly drops the VPN (peers reconnect automatically), so it stays opt-in. `ray status` shows when auto-update is on.
 
 ### 2. Create a network
 
@@ -120,6 +125,7 @@ latency, your public addresses, and whether UDP is getting through.
 
 ```bash
 ray leave gaming         # leave a network
+ray kick gaming alice    # coordinator only: remove a member from a closed network (disconnects them mesh-wide)
 ray down                 # standby: data plane (TUN + DNS) off, still connected to peers
 ray up                   # reactivate (no root needed, near-instant: connections were kept)
 sudo ray stop            # fully offline: daemon exits, peer connections close

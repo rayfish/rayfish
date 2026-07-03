@@ -181,7 +181,8 @@ impl Node {
             None,
             invite,
             coordinator,
-            false,
+            false, // auto_accept_firewall
+            false, // auto_accept_files
         ));
 
         match result {

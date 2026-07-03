@@ -1,6 +1,8 @@
 //! CLI status & diagnostics output plus shared presentation helpers
 //! (`table`, `print_error`, …): status, down, report, set-hostname.
 
+use std::collections::HashMap;
+
 use crate::*;
 
 /// Human-readable byte size (GiB/MiB/KiB/B) for traffic and transfer counters.
@@ -132,6 +134,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
         ipc::IpcMessage::StatusResponse {
             endpoint_id,
             mdns_enabled,
+            auto_update,
             active,
             contact_id,
             daemon_version,
@@ -147,6 +150,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 print_json(&serde_json::json!({
                     "endpoint": endpoint_id.to_string(),
                     "mdns": mdns_enabled,
+                    "auto_update": auto_update,
                     "active": active,
                     "contact_id": contact_id,
                     "daemon_version": daemon_version,
@@ -174,12 +178,24 @@ pub(crate) async fn ipc_status() -> Result<()> {
             } else {
                 format!("{} {}", style::label("mDNS"), style::faint("off"))
             };
+            // Only surface auto-update in the header when it is on (opt-in), so the
+            // default line stays uncluttered.
+            let auto = if auto_update {
+                format!(
+                    "      {} {}",
+                    style::label("auto-update"),
+                    style::green("on")
+                )
+            } else {
+                String::new()
+            };
             println!();
             println!(
-                "  {}  {}      {}      {} {}",
+                "  {}  {}      {}{}      {} {}",
                 style::bold("rayfish"),
                 state,
                 mdns,
+                auto,
                 style::label("endpoint"),
                 style::value(&endpoint_id.fmt_short().to_string()),
             );
@@ -269,9 +285,20 @@ fn print_network(net: &ipc::NetworkStatus) {
         style::value(&format!("{online}/{}", net.peers.len())),
     );
 
+    // Invert the local alias map (alias -> identity) for identity -> alias
+    // lookups when rendering peers.
+    let alias_by_identity: HashMap<&str, &str> = net
+        .aliases
+        .iter()
+        .map(|(alias, identity)| (identity.as_str(), alias.as_str()))
+        .collect();
+
     // Peer rows as aligned columns: glyph · host · ipv4 · via · rtt · traffic
-    let rows: Vec<Vec<layout::Cell>> =
-        net.peers.iter().map(|p| render_peer_row(&net.name, p)).collect();
+    let rows: Vec<Vec<layout::Cell>> = net
+        .peers
+        .iter()
+        .map(|p| render_peer_row(&net.name, p, peer_alias(p, &alias_by_identity)))
+        .collect();
     if rows.is_empty() {
         println!("    {}", style::faint("(no other members)"));
     } else {
@@ -290,13 +317,32 @@ fn print_network(net: &ipc::NetworkStatus) {
     }
 }
 
-/// Build one peer's status row (glyph · host · ipv4 · via · rtt · traffic).
-fn render_peer_row(net_name: &str, peer: &ipc::PeerStatus) -> Vec<layout::Cell> {
-    let host = peer
+/// Resolve a peer's local alias, if any: match its identity (user identity when
+/// paired, else device endpoint id) against the inverted alias map.
+fn peer_alias<'a>(
+    peer: &ipc::PeerStatus,
+    alias_by_identity: &HashMap<&str, &'a str>,
+) -> Option<&'a str> {
+    let identity = peer.user_identity.unwrap_or(peer.endpoint_id).to_string();
+    alias_by_identity.get(identity.as_str()).copied()
+}
+
+/// Build one peer's status row (glyph · host · ipv4 · via · rtt · traffic). A
+/// local alias, when set, is shown inline after the host as `host.net.ray [alias]`.
+fn render_peer_row(
+    net_name: &str,
+    peer: &ipc::PeerStatus,
+    alias: Option<&str>,
+) -> Vec<layout::Cell> {
+    let base = peer
         .hostname
         .as_ref()
         .map(|h| format!("{h}.{}.{}", net_name, DNS_DOMAIN))
         .unwrap_or_else(|| peer.ip.to_string());
+    let host = match alias {
+        Some(a) => format!("{base} [{a}]"),
+        None => base,
+    };
     match &peer.connection {
         Some(ci) => {
             let via = match ci.conn_type {
@@ -480,4 +526,3 @@ pub(crate) async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()
     }
     Ok(())
 }
-
