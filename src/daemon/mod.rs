@@ -1469,6 +1469,16 @@ fn should_promote(current: NetworkRole) -> bool {
 }
 
 impl DaemonState {
+    /// The device cert to present when joining, preferring the on-disk copy so a
+    /// join issued right after pairing (same process, no restart) carries the
+    /// freshly stored cert rather than the value loaded at startup.
+    fn current_device_cert(&self) -> Option<control::DeviceCert> {
+        identity::load_device_cert()
+            .ok()
+            .flatten()
+            .or_else(|| self.device_cert.clone())
+    }
+
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
     /// handlers and background tasks. Every field is a cheap `Clone`.
     pub(crate) fn mesh_ctx(&self) -> MeshCtx {
@@ -2014,7 +2024,7 @@ impl DaemonState {
                     identity: my_identity,
                     ip: my_ip,
                     hostname: Some(new_hostname.to_string()),
-                    device_cert: self.device_cert.clone(),
+                    device_cert: self.current_device_cert(),
                 };
                 if control::send_msg(&mut send, &msg).await.is_ok() {
                     sent += 1;
@@ -4932,8 +4942,10 @@ mod headless_tests {
     /// instead of a hung test.
     /// Process-wide lock serializing tests that mutate `RAYFISH_CONFIG_DIR` (or
     /// any other env var read by `config::config_dir()`), since lib tests share
-    /// one process and run on parallel threads.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// one process and run on parallel threads. Shared with `identity::tests`
+    /// via `crate::config::CONFIG_ENV_LOCK` so neither module's tests observe a
+    /// `RAYFISH_CONFIG_DIR` bled through from the other.
+    use crate::config::CONFIG_ENV_LOCK as ENV_LOCK;
 
     /// RAII guard that restores a previous env var value (or removes it if it
     /// was unset) on drop, so the var is restored even if the test body panics.

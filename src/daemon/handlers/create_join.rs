@@ -524,7 +524,7 @@ impl DaemonState {
                     self.mesh_ctx(),
                     disconnect_tx.clone(),
                     cancel.clone(),
-                    self.device_cert.clone(),
+                    self.current_device_cert(),
                 )];
 
                 tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
@@ -556,7 +556,7 @@ impl DaemonState {
                     JoinParams {
                         my_hostname: Some(my_hostname.clone()),
                         net_pubkey,
-                        device_cert: self.device_cert.clone(),
+                        device_cert: self.current_device_cert(),
                         invite_secret: invite.clone(),
                         suggested_firewall: data.suggested_firewall.clone(),
                         reusable_keys: data.reusable_keys.clone(),
@@ -635,7 +635,7 @@ impl DaemonState {
                 self.mesh_ctx(),
                 disconnect_tx.clone(),
                 cancel.clone(),
-                self.device_cert.clone(),
+                self.current_device_cert(),
             )];
 
             // Fallback state built straight from the verified blob so
@@ -677,7 +677,7 @@ impl DaemonState {
                     JoinParams {
                         my_hostname: Some(my_hostname.clone()),
                         net_pubkey,
-                        device_cert: self.device_cert.clone(),
+                        device_cert: self.current_device_cert(),
                         invite_secret: invite,
                         suggested_firewall: data.suggested_firewall.clone(),
                         reusable_keys: data.reusable_keys.clone(),

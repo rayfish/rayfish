@@ -950,6 +950,13 @@ pub fn remove_network(config: &mut AppConfig, name: &str) -> bool {
     config.networks.len() < before
 }
 
+/// Process-wide lock serializing tests that mutate `RAYFISH_CONFIG_DIR` (or any
+/// other env var read by [`config_dir`]), since lib tests share one process and
+/// run on parallel threads. Shared across test modules (`identity`, `daemon`)
+/// so none of them observe a `RAYFISH_CONFIG_DIR` value set by a concurrent test.
+#[cfg(test)]
+pub(crate) static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
