@@ -9,6 +9,9 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 #[cfg(target_os = "linux")]
 use std::path::Path;
+// Only the macOS/Linux configurators build resolver/backup file paths; Android
+// does no OS-level DNS configuration.
+#[cfg(not(target_os = "android"))]
 use std::path::PathBuf;
 
 #[allow(unused_imports)]
@@ -51,6 +54,11 @@ pub async fn revert(configurator: &dyn DnsConfigurator) -> Result<()> {
 }
 
 pub async fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigurator>> {
+    // Only the macOS/Linux branches consume `tun_name`; on any other target
+    // (e.g. Android) the function falls through to the unsupported-platform bail.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = tun_name;
+
     #[cfg(target_os = "macos")]
     {
         let _ = tun_name;

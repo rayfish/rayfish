@@ -3,9 +3,15 @@
 //! The device is immediately split into [`TunReader`] and [`TunWriter`] halves
 //! so that reads and writes can happen concurrently without locking.
 
+// These support the desktop TUN setup (address/route/link configuration via
+// `ifconfig`/`ip`/netlink) and the CGNAT preflight, none of which compile on
+// Android where the packet interface is a `VpnService` fd.
+#[cfg(not(target_os = "android"))]
 use std::net::{Ipv4Addr, Ipv6Addr};
+#[cfg(not(target_os = "android"))]
 use std::process::Command;
 
+#[cfg(not(target_os = "android"))]
 use anyhow::{Context, Result, bail};
 // The desktop TUN device (the `tun` crate) and its async I/O helpers only exist
 // off Android, where the packet interface is a `VpnService` fd instead.
@@ -62,6 +68,7 @@ pub struct TunWriter {
     writer: DeviceWriter,
 }
 
+#[cfg(not(target_os = "android"))]
 fn is_cgnat(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     octets[0] == 100 && (octets[1] & 0xC0) == 64
