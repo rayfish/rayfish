@@ -110,6 +110,13 @@ impl DaemonState {
             .into_iter()
             .map(|(eid, _, conn)| (eid, conn))
             .collect();
+        // Our own user identity: the cert's user id on a paired device, else our
+        // own endpoint id (mirrors the `try_auto_accept_file` "own device" rule).
+        let own_user = self
+            .device_cert
+            .as_ref()
+            .map(|c| c.user_identity)
+            .unwrap_or(my_id);
         let peers = members
             .iter()
             .filter(|m| m.identity != my_id)
@@ -124,6 +131,7 @@ impl DaemonState {
                     ipv6: Some(derive_ipv6(&m.identity)),
                     hostname,
                     user_identity,
+                    is_own_device: user_id == own_user,
                     connection,
                 }
             })

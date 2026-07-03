@@ -567,6 +567,9 @@ pub struct PeerStatus {
     pub ipv6: Option<Ipv6Addr>,
     pub hostname: Option<String>,
     pub user_identity: Option<EndpointId>,
+    /// True when this peer is another of the local user's own paired devices
+    /// (its resolved user identity equals ours).
+    pub is_own_device: bool,
     pub connection: Option<ConnectionInfo>,
 }
 
@@ -941,6 +944,7 @@ mod tests {
                     ipv6: None,
                     hostname: None,
                     user_identity: None,
+                    is_own_device: false,
                     connection: None,
                 }],
                 pending_suggestions: 0,

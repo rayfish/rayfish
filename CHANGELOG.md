@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Device ownership in `ray status`**: peer rows that are your own paired
+  devices are now tagged `(your device)`, and a paired device belonging to
+  another user is labelled `(user <id>)` (or shows that user's alias when you
+  have set one) so it is clear which user each device belongs to. The `--json`
+  output gains an `is_own_device` flag on each peer.
 - **Opt-in automatic updates**: enable with `sudo ray install --auto-update` or
   `ray auto-update on`, and the daemon checks GitHub about every 6 hours for a
   newer **stable** release, then downloads, verifies (SHA-256), swaps the binary,
@@ -64,6 +69,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ray status` peer traffic counters now line up**: the per-peer up/down
+  columns were packed into a single field, so the `↓` counter drifted from row to
+  row and the block did not read as a table. Up and down are now their own
+  right-aligned columns, so the arrows and digits line up down the list.
 - **`ray firewall add --peer` now accepts any peer identifier**: previously it
   only matched a short id / endpoint-id prefix, so the natural things to type
   (`--peer alice`, `--peer alice.homenet.ray`, `--peer 100.x.y.z`) failed with
