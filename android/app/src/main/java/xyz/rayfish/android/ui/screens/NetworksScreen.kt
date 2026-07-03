@@ -87,7 +87,9 @@ fun NetworksScreen(
                 showAdd = false
                 run({ NodeHolder.get(context).submitCode(code) }, { action ->
                     onToast(when (action) {
-                        is uniffi.ray_mobile.LinkAction.Joined -> "Joined ${action.v1.name}"
+                        is uniffi.ray_mobile.LinkAction.Joined ->
+                            if (action.v1.pending) "Join requested for ${action.v1.name} - waiting for approval"
+                            else "Joined ${action.v1.name}"
                         is uniffi.ray_mobile.LinkAction.Paired -> "Device paired"
                     })
                 }, "Failed")

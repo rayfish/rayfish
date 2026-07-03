@@ -1882,7 +1882,11 @@ data class NetworkInfo (
     var `name`: kotlin.String, 
     var `nodeId`: kotlin.String, 
     var `ipv4`: kotlin.String, 
-    var `ipv6`: kotlin.String
+    var `ipv6`: kotlin.String, 
+    /**
+     * True when the join was queued for coordinator approval (no IP yet).
+     */
+    var `pending`: kotlin.Boolean
 ) {
     
     companion object
@@ -1898,6 +1902,7 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -1905,7 +1910,8 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
             FfiConverterString.allocationSize(value.`name`) +
             FfiConverterString.allocationSize(value.`nodeId`) +
             FfiConverterString.allocationSize(value.`ipv4`) +
-            FfiConverterString.allocationSize(value.`ipv6`)
+            FfiConverterString.allocationSize(value.`ipv6`) +
+            FfiConverterBoolean.allocationSize(value.`pending`)
     )
 
     override fun write(value: NetworkInfo, buf: ByteBuffer) {
@@ -1913,6 +1919,7 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
             FfiConverterString.write(value.`nodeId`, buf)
             FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`ipv6`, buf)
+            FfiConverterBoolean.write(value.`pending`, buf)
     }
 }
 

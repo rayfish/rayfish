@@ -106,6 +106,8 @@ pub struct NetworkInfo {
     pub node_id: String,
     pub ipv4: String,
     pub ipv6: String,
+    /// True when the join was queued for coordinator approval (no IP yet).
+    pub pending: bool,
 }
 
 /// One peer in a network snapshot. `online` reflects a live connection.
@@ -255,16 +257,16 @@ impl Node {
                 node_id: Self::node_id(&state),
                 ipv4: my_ip.to_string(),
                 ipv6: my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
+                pending: false,
             }),
-            // Closed network without a valid invite: queued for coordinator
-            // approval and retried in the background. Report it as a successful
-            // join-in-progress; the mesh IP is assigned once approved, so the UI
-            // polls `status()` for it.
+            // Closed network without a valid invite: queued for coordinator approval
+            // and retried in the background. Report it as pending so the UI can say so.
             IpcMessage::Ok { .. } => Ok(NetworkInfo {
                 name: network_key,
                 node_id: Self::node_id(&state),
                 ipv4: String::new(),
                 ipv6: String::new(),
+                pending: true,
             }),
             IpcMessage::Error { message } => Err(RayError::JoinFailed(message)),
             other => Err(RayError::JoinFailed(format!(
@@ -295,6 +297,7 @@ impl Node {
                 node_id: Self::node_id(&state),
                 ipv4: my_ip.to_string(),
                 ipv6: my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
+                pending: false,
             }),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
             other => Err(RayError::Network(format!(

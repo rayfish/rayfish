@@ -37,7 +37,9 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             try {
                 val action = withContext(Dispatchers.IO) { NodeHolder.get(context).submitCode(result.trim()) }
                 onToast(when (action) {
-                    is uniffi.ray_mobile.LinkAction.Joined -> "Joined ${action.v1.name}"
+                    is uniffi.ray_mobile.LinkAction.Joined ->
+                        if (action.v1.pending) "Join requested for ${action.v1.name} - waiting for approval"
+                        else "Joined ${action.v1.name}"
                     is uniffi.ray_mobile.LinkAction.Paired -> "Device paired"
                 })
                 onChanged()
