@@ -493,4 +493,22 @@ impl Node {
             RayfishLink::Pair(ticket) => self.pair(ticket).map(|()| LinkAction::Paired),
         }
     }
+
+    /// Accept any code the user pastes or scans and route it: a `rayfish://`
+    /// deep link, a bare invite code, or a bare pairing ticket. The two bare
+    /// forms are distinct encodings, so we can tell them apart. A pairing ticket
+    /// is checked before falling through to `join`, because otherwise it would
+    /// hit `join`'s bare-room-id fallback and fail with a confusing "invalid
+    /// network key" error. Everything that is not a pairing ticket goes to
+    /// `join`, which still handles both a full invite and a bare room id.
+    pub fn submit_code(&self, input: String) -> Result<LinkAction, RayError> {
+        let code = input.trim().to_string();
+        if code.starts_with("rayfish://") {
+            return self.handle_link(code);
+        }
+        if control::decode_pairing_ticket(&code).is_ok() {
+            return self.pair(code).map(|()| LinkAction::Paired);
+        }
+        self.join(code).map(LinkAction::Joined)
+    }
 }

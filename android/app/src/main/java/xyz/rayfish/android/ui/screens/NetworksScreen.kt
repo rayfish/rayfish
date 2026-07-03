@@ -83,7 +83,15 @@ fun NetworksScreen(
         AddNetworkSheet(
             onDismiss = { showAdd = false },
             onCreate = { name -> showAdd = false; run({ NodeHolder.get(context).create(name) }, { onToast("Created ${it.name}") }, "Create failed") },
-            onJoin = { code -> showAdd = false; run({ NodeHolder.get(context).join(code) }, { onToast("Joined ${it.name}") }, "Join failed") },
+            onSubmitCode = { code ->
+                showAdd = false
+                run({ NodeHolder.get(context).submitCode(code) }, { action ->
+                    onToast(when (action) {
+                        is uniffi.ray_mobile.LinkAction.Joined -> "Joined ${action.v1.name}"
+                        is uniffi.ray_mobile.LinkAction.Paired -> "Device paired"
+                    })
+                }, "Failed")
+            },
             onToast = onToast,
         )
     }
@@ -95,17 +103,17 @@ fun NetworksScreen(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AddNetworkSheet(
-    onDismiss: () -> Unit, onCreate: (String?) -> Unit, onJoin: (String) -> Unit, onToast: (String) -> Unit,
+    onDismiss: () -> Unit, onCreate: (String?) -> Unit, onSubmitCode: (String) -> Unit, onToast: (String) -> Unit,
 ) {
     var name by remember { mutableStateOf("") }
     var code by remember { mutableStateOf("") }
-    val scan = rememberQrScanner { result -> if (result != null) onJoin(result.trim()) }
+    val scan = rememberQrScanner { result -> if (result != null) onSubmitCode(result.trim()) }
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Rf.Sheet) {
         Column(Modifier.padding(20.dp).padding(bottom = 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            SectionLabel("Join a network")
-            RayfishTextField(code, { code = it }, "Invite code")
+            SectionLabel("Join or pair")
+            RayfishTextField(code, { code = it }, "Invite or pairing code")
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                PillButton("Join", onClick = { if (code.isNotBlank()) onJoin(code.trim()) else onToast("Enter a code") }, modifier = Modifier.weight(1f))
+                PillButton("Continue", onClick = { if (code.isNotBlank()) onSubmitCode(code.trim()) else onToast("Enter a code") }, modifier = Modifier.weight(1f))
                 OutlinePillButton("Scan", onClick = scan, modifier = Modifier.weight(1f))
             }
             Spacer(Modifier.height(6.dp))

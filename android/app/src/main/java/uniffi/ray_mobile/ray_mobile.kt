@@ -740,6 +740,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -776,6 +778,8 @@ fun uniffi_ray_mobile_checksum_method_node_start(
 fun uniffi_ray_mobile_checksum_method_node_start_pairing(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_status(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_submit_code(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_up(
 ): Short
@@ -857,6 +861,8 @@ fun uniffi_ray_mobile_fn_method_node_start(`ptr`: Pointer,uniffi_out_err: Uniffi
 fun uniffi_ray_mobile_fn_method_node_start_pairing(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_status(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_submit_code(`ptr`: Pointer,`input`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_up(`ptr`: Pointer,`tunFd`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1017,6 +1023,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_status() != 47392.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_submit_code() != 26371.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_up() != 62370.toShort()) {
@@ -1441,6 +1450,17 @@ public interface NodeInterface {
     fun `status`(): Status
     
     /**
+     * Accept any code the user pastes or scans and route it: a `rayfish://`
+     * deep link, a bare invite code, or a bare pairing ticket. The two bare
+     * forms are distinct encodings, so we can tell them apart. A pairing ticket
+     * is checked before falling through to `join`, because otherwise it would
+     * hit `join`'s bare-room-id fallback and fail with a confusing "invalid
+     * network key" error. Everything that is not a pairing ticket goes to
+     * `join`, which still handles both a full invite and a bare room id.
+     */
+    fun `submitCode`(`input`: kotlin.String): LinkAction
+    
+    /**
      * Bring the data plane up over the `VpnService` fd: attach the fd's
      * reader/writer to the running daemon and mark the data plane active.
      * Requires [`Node::start`] first.
@@ -1721,6 +1741,28 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_status(
         it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Accept any code the user pastes or scans and route it: a `rayfish://`
+     * deep link, a bare invite code, or a bare pairing ticket. The two bare
+     * forms are distinct encodings, so we can tell them apart. A pairing ticket
+     * is checked before falling through to `join`, because otherwise it would
+     * hit `join`'s bare-room-id fallback and fail with a confusing "invalid
+     * network key" error. Everything that is not a pairing ticket goes to
+     * `join`, which still handles both a full invite and a bare room id.
+     */
+    @Throws(RayException::class)override fun `submitCode`(`input`: kotlin.String): LinkAction {
+            return FfiConverterTypeLinkAction.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_submit_code(
+        it, FfiConverterString.lower(`input`),_status)
 }
     }
     )
