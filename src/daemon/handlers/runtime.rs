@@ -552,6 +552,21 @@ impl DaemonState {
             }
         }
 
+        // Resume closed-network joins that were still awaiting approval at shutdown.
+        for pending in &app_config.pending_joins {
+            if self.networks.contains_key(&pending.network_key) {
+                continue;
+            }
+            let me = Arc::clone(self);
+            let key = pending.network_key.clone();
+            let name = pending.name.clone();
+            tokio::spawn(async move {
+                let _ = me
+                    .join_network(&key, name.as_deref(), None, None, None, false, false)
+                    .await;
+            });
+        }
+
         // Publish the contact record immediately so `ray connect` works right
         // away, rather than waiting up to one publisher interval (the active-gated
         // `spawn_contact_publisher` only re-checks every TTL/2).

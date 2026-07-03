@@ -317,8 +317,16 @@ impl DaemonState {
             )
             .await
         {
-            Ok(TryJoin::Joined(resp)) => resp,
+            Ok(TryJoin::Joined(resp)) => {
+                let _ = config::remove_pending_join(network_key);
+                resp
+            }
             Ok(TryJoin::Pending) => {
+                // Persist so the retry resumes after a restart.
+                let _ = config::add_pending_join(config::PendingJoinEntry {
+                    network_key: network_key.to_string(),
+                    name: name.map(|s| s.to_string()),
+                });
                 // Closed network: queued for live approval. Retry in the
                 // background on a backoff until `ray accept` admits us.
                 let me = Arc::clone(self);
@@ -346,7 +354,8 @@ impl DaemonState {
                             .await
                         {
                             Ok(TryJoin::Joined(_)) => {
-                                tracing::info!(net = %nk, "approval granted — joined");
+                                let _ = config::remove_pending_join(&nk);
+                                tracing::info!(net = %nk, "approval granted - joined");
                                 return;
                             }
                             Ok(TryJoin::Pending) => continue,
