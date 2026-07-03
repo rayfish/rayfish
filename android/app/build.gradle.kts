@@ -75,6 +75,10 @@ dependencies {
 
     // UniFFI-generated Kotlin bindings use JNA to load libray_mobile.so.
     implementation("net.java.dev.jna:jna:5.15.0@aar")
+
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation("com.google.zxing:core:3.5.3")
 }
 
 // --- Rust / cargo-ndk integration -----------------------------------------
