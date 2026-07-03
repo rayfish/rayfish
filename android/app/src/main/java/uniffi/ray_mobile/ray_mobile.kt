@@ -732,6 +732,14 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -753,11 +761,19 @@ fun uniffi_ray_mobile_checksum_method_node_down(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_handle_link(
 ): Short
+fun uniffi_ray_mobile_checksum_method_node_invite(
+): Short
 fun uniffi_ray_mobile_checksum_method_node_join(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_leave(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_pair(
 ): Short
+fun uniffi_ray_mobile_checksum_method_node_set_hostname(
+): Short
 fun uniffi_ray_mobile_checksum_method_node_start(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_start_pairing(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_status(
 ): Short
@@ -826,12 +842,20 @@ fun uniffi_ray_mobile_fn_method_node_down(`ptr`: Pointer,uniffi_out_err: UniffiR
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_handle_link(`ptr`: Pointer,`uri`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_invite(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_join(`ptr`: Pointer,`code`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_leave(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_ray_mobile_fn_method_node_pair(`ptr`: Pointer,`ticket`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_ray_mobile_fn_method_node_set_hostname(`ptr`: Pointer,`network`: RustBuffer.ByValue,`hostname`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_start(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_ray_mobile_fn_method_node_start_pairing(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_status(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_up(`ptr`: Pointer,`tunFd`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -971,13 +995,25 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_handle_link() != 17267.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_invite() != 59156.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_join() != 21543.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_leave() != 29006.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_pair() != 22172.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_set_hostname() != 56819.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_start() != 25989.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_start_pairing() != 51955.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_status() != 47392.toShort()) {
@@ -1359,10 +1395,20 @@ public interface NodeInterface {
     fun `handleLink`(`uri`: kotlin.String): LinkAction
     
     /**
+     * Mint a single-use invite code for `network` (default 7d TTL), to share.
+     */
+    fun `invite`(`network`: kotlin.String): kotlin.String
+    
+    /**
      * Join an existing network by invite code (or a bare room id / network
      * pubkey). Maps the core's `IpcMessage` result to a [`NetworkInfo`].
      */
     fun `join`(`code`: kotlin.String): NetworkInfo
+    
+    /**
+     * Leave `network`: tears down its runtime and removes it from config.
+     */
+    fun `leave`(`network`: kotlin.String)
     
     /**
      * Pair this device with a primary device using a scanned/pasted pairing
@@ -1371,11 +1417,22 @@ public interface NodeInterface {
     fun `pair`(`ticket`: kotlin.String)
     
     /**
+     * Set this device's hostname on `network`. Validated by the core.
+     */
+    fun `setHostname`(`network`: kotlin.String, `hostname`: kotlin.String)
+    
+    /**
      * Build the headless daemon (identity, endpoint, blob store, resolver) and
      * bring the saved networks' control plane up. Idempotent: a second call is a
      * no-op success. Must run before `join`/`create`/`pair`/`up`.
      */
     fun `start`()
+    
+    /**
+     * Begin pairing: returns a ticket to show (as QR) to a device that will
+     * scan and call `pair`.
+     */
+    fun `startPairing`(): kotlin.String
     
     /**
      * Peers + addresses + running flag + per-network detail for the UI.
@@ -1543,6 +1600,22 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
+     * Mint a single-use invite code for `network` (default 7d TTL), to share.
+     */
+    @Throws(RayException::class)override fun `invite`(`network`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_invite(
+        it, FfiConverterString.lower(`network`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Join an existing network by invite code (or a bare room id / network
      * pubkey). Maps the core's `IpcMessage` result to a [`NetworkInfo`].
      */
@@ -1556,6 +1629,21 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     }
     )
     }
+    
+
+    
+    /**
+     * Leave `network`: tears down its runtime and removes it from config.
+     */
+    @Throws(RayException::class)override fun `leave`(`network`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_leave(
+        it, FfiConverterString.lower(`network`),_status)
+}
+    }
+    
     
 
     
@@ -1576,6 +1664,21 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
+     * Set this device's hostname on `network`. Validated by the core.
+     */
+    @Throws(RayException::class)override fun `setHostname`(`network`: kotlin.String, `hostname`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_set_hostname(
+        it, FfiConverterString.lower(`network`),FfiConverterString.lower(`hostname`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Build the headless daemon (identity, endpoint, blob store, resolver) and
      * bring the saved networks' control plane up. Idempotent: a second call is a
      * no-op success. Must run before `join`/`create`/`pair`/`up`.
@@ -1589,6 +1692,23 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 }
     }
     
+    
+
+    
+    /**
+     * Begin pairing: returns a ticket to show (as QR) to a device that will
+     * scan and call `pair`.
+     */
+    @Throws(RayException::class)override fun `startPairing`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_start_pairing(
+        it, _status)
+}
+    }
+    )
+    }
     
 
     

@@ -257,6 +257,51 @@ impl Node {
         }
     }
 
+    /// Mint a single-use invite code for `network` (default 7d TTL), to share.
+    pub fn invite(&self, network: String) -> Result<String, RayError> {
+        let state = self.state()?;
+        // 7 days, single-use, coordinator-picked hostname (None).
+        let result = self.runtime.block_on(
+            state.invite_create(&network, 7 * 24 * 60 * 60, None, false),
+        );
+        match result {
+            IpcMessage::InviteCreated { code, .. } => Ok(code),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!("unexpected invite response: {other:?}"))),
+        }
+    }
+
+    /// Leave `network`: tears down its runtime and removes it from config.
+    pub fn leave(&self, network: String) -> Result<(), RayError> {
+        let state = self.state()?;
+        match self.runtime.block_on(state.leave_network(&network)) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!("unexpected leave response: {other:?}"))),
+        }
+    }
+
+    /// Set this device's hostname on `network`. Validated by the core.
+    pub fn set_hostname(&self, network: String, hostname: String) -> Result<(), RayError> {
+        let state = self.state()?;
+        match self.runtime.block_on(state.set_hostname(&network, &hostname)) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::BadCode(message)),
+            other => Err(RayError::Network(format!("unexpected set_hostname response: {other:?}"))),
+        }
+    }
+
+    /// Begin pairing: returns a ticket to show (as QR) to a device that will
+    /// scan and call `pair`.
+    pub fn start_pairing(&self) -> Result<String, RayError> {
+        let state = self.state()?;
+        match state.start_pairing() {
+            IpcMessage::PairingTicket { ticket } => Ok(ticket),
+            IpcMessage::Error { message } => Err(RayError::PairFailed(message)),
+            other => Err(RayError::PairFailed(format!("unexpected pairing response: {other:?}"))),
+        }
+    }
+
     /// Pair this device with a primary device using a scanned/pasted pairing
     /// ticket (`bs58(endpoint_id[32] || secret[32])`).
     pub fn pair(&self, ticket: String) -> Result<(), RayError> {
