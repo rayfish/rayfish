@@ -2,9 +2,11 @@ package xyz.rayfish.android.ui.components
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -13,6 +15,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -74,13 +77,21 @@ fun SectionLabel(text: String) {
 }
 
 @Composable
-fun KeyValueRow(key: String, value: String) {
-    Row(
-        Modifier.fillMaxWidth().padding(top = 6.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-    ) {
+fun KeyValueRow(key: String, value: String, onClick: (() -> Unit)? = null) {
+    val base = Modifier.fillMaxWidth().padding(top = 6.dp)
+    val rowMod = if (onClick != null) base.clip(RoundedCornerShape(6.dp)).clickable(onClick = onClick) else base
+    Row(rowMod, verticalAlignment = Alignment.CenterVertically) {
         Text(key, fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
-        Text(value, fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Body, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Spacer(Modifier.width(12.dp))
+        Text(
+            value, fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Body,
+            maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.End,
+            modifier = Modifier.weight(1f),
+        )
+        if (onClick != null) {
+            Spacer(Modifier.width(6.dp))
+            Icon(Icons.Filled.ContentCopy, "Copy", tint = Rf.Faint, modifier = Modifier.size(13.dp))
+        }
     }
 }
 

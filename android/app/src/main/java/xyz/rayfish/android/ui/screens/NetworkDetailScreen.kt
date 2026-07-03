@@ -1,6 +1,7 @@
 package xyz.rayfish.android.ui.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -33,6 +34,8 @@ fun NetworkDetailScreen(
     val scope = rememberCoroutineScope()
     var confirmLeave by remember { mutableStateOf(false) }
     var inviteCode by remember { mutableStateOf<String?>(null) }
+    var editing by remember { mutableStateOf(false) }
+    var hostnameInput by remember { mutableStateOf("") }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -51,15 +54,25 @@ fun NetworkDetailScreen(
             ))
         }
         SectionCard {
-            KeyValueRow("Your address", "${detail.hostname.ifEmpty { "-" }}.${detail.name}.ray")
-            KeyValueRow("IPv4", detail.ipv4.ifEmpty { "-" })
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Hostname", fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
+                TextButton(onClick = { hostnameInput = detail.hostname; editing = true }) {
+                    Text(detail.hostname.ifEmpty { "set" } + " ✎", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Rose400)
+                }
+            }
+            val addr = "${detail.hostname.ifEmpty { "-" }}.${detail.name}.ray"
+            KeyValueRow("Your address", addr, onClick = { copyToClipboard(context, "address", addr); onToast("Copied $addr") })
+            val ip4 = detail.ipv4.takeIf { it.isNotEmpty() }
+            KeyValueRow("IPv4", ip4 ?: "-", onClick = ip4?.let { v -> { copyToClipboard(context, "IPv4", v); onToast("Copied $v") } })
             KeyValueRow("Role", if (detail.isCoordinator) "coordinator" else "member")
         }
         SectionCard {
             SectionLabel("Peers · ${detail.peers.count { it.online }} online")
             if (detail.peers.isEmpty()) Text("No peers yet", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Faint)
             detail.peers.forEach { p ->
-                Row(Modifier.fillMaxWidth().padding(top = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp))
+                    .clickable { copyToClipboard(context, p.hostname.ifEmpty { "peer" }, p.ipv4); onToast("Copied ${p.ipv4}") }
+                    .padding(top = 9.dp), verticalAlignment = Alignment.CenterVertically) {
                     Box(Modifier.size(6.dp).clip(RoundedCornerShape(3.dp)).background(if (p.online) Rf.Emerald else Rf.Faint))
                     Spacer(Modifier.width(8.dp))
                     Text(p.ipv4, fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Body)
@@ -87,6 +100,26 @@ fun NetworkDetailScreen(
                 }) { Text("Leave", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
             },
             dismissButton = { TextButton(onClick = { confirmLeave = false }) { Text("Cancel", color = Rf.Body, fontFamily = Chakra) } },
+        )
+    }
+    if (editing) {
+        AlertDialog(
+            onDismissRequest = { editing = false },
+            containerColor = Rf.Sheet,
+            title = { Text("Hostname on ${detail.name}", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
+            text = { RayfishTextField(hostnameInput, { hostnameInput = it }, "lowercase, 1-63 chars") },
+            confirmButton = {
+                TextButton(onClick = {
+                    val h = hostnameInput.trim()
+                    scope.launch {
+                        try {
+                            withContext(Dispatchers.IO) { NodeHolder.get(context).setHostname(detail.name, h) }
+                            onToast("Hostname set"); onChanged(); editing = false
+                        } catch (t: Throwable) { onToast("Invalid hostname: ${t.message}") }
+                    }
+                }) { Text("Save", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = { TextButton(onClick = { editing = false }) { Text("Cancel", color = Rf.Body, fontFamily = Chakra) } },
         )
     }
     inviteCode?.let { code -> QrCodeSheet("Invite to share", code, context, onToast) { inviteCode = null } }
