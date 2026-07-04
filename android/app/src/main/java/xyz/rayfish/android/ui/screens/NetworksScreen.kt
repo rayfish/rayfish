@@ -72,15 +72,23 @@ fun NetworksScreen(
                         Text("${net.hostname.ifEmpty { net.ipv4 }} · ${if (running) "${net.peers.count { it.online }} online" else "offline"}",
                             fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Muted)
                     }
-                    OverflowMenu(listOf(
-                        MenuItem("Invite to share") {
-                            run({ NodeHolder.get(context).invite(net.name) }, { inviteCode = it }, "Invite failed")
-                        },
-                        MenuItem("Copy address") {
-                            copyToClipboard(context, "${net.hostname.ifEmpty { "address" }}", "${net.ipv4}")
-                            onToast("Address copied")
-                        },
-                    ))
+                    // The device's stable .ray DNS name in this network. Prefer
+                    // it over the IP for "copy address": the hostname is what
+                    // peers use and it does not change if the IP is reassigned.
+                    val dns = net.hostname.takeIf { it.isNotEmpty() }?.let { "$it.${net.name}.ray" }
+                    OverflowMenu(
+                        header = dns,
+                        items = listOf(
+                            MenuItem("Invite to share") {
+                                run({ NodeHolder.get(context).invite(net.name) }, { inviteCode = it }, "Invite failed")
+                            },
+                            MenuItem("Copy address") {
+                                val address = dns ?: net.ipv4
+                                copyToClipboard(context, "address", address)
+                                onToast("Copied $address")
+                            },
+                        ),
+                    )
                 }
             }
         }

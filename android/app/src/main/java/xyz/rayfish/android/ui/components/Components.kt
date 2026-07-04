@@ -201,13 +201,20 @@ fun ToggleCard(title: String, subtitle: String, checked: Boolean, onCheckedChang
 data class MenuItem(val label: String, val destructive: Boolean = false, val onClick: () -> Unit)
 
 @Composable
-fun OverflowMenu(items: List<MenuItem>) {
+fun OverflowMenu(items: List<MenuItem>, header: String? = null) {
     var open by remember { mutableStateOf(false) }
     Box {
         IconButton(onClick = { open = true }) {
             Icon(Icons.Filled.MoreVert, contentDescription = "More", tint = Rf.Muted)
         }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }, containerColor = Color(0xFF27272A)) {
+            if (header != null) {
+                Text(
+                    header, fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Muted,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                )
+                HorizontalDivider(color = Rf.Faint.copy(alpha = 0.2f))
+            }
             items.forEach { item ->
                 DropdownMenuItem(
                     text = { Text(item.label, fontFamily = Chakra, fontSize = 13.sp, color = if (item.destructive) Rf.Rose400 else Rf.Body) },
