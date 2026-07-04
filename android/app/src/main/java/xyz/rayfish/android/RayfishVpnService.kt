@@ -30,6 +30,8 @@ class RayfishVpnService : VpnService() {
 
     @Volatile
     private var tunnel: ParcelFileDescriptor? = null
+    private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    private var heartbeat: java.util.concurrent.ScheduledExecutorService? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -115,9 +117,30 @@ class RayfishVpnService : VpnService() {
             try {
                 NodeHolder.get(applicationContext).up(pfd.detachFd())
                 Log.i(TAG, "Node.up succeeded")
+                Telemetry.sendHealth(applicationContext)
             } catch (t: Throwable) {
                 Log.e(TAG, "Node bring-up failed", t)
             }
+        }
+
+        // Re-report health when connectivity flips (e.g. cellular -> wifi), the
+        // trigger that surfaces a struggling mesh bring-up.
+        val cm = getSystemService(android.net.ConnectivityManager::class.java)
+        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                runCatching { Telemetry.sendHealth(applicationContext) }
+            }
+            override fun onLost(network: android.net.Network) {
+                runCatching { Telemetry.sendHealth(applicationContext) }
+            }
+        }
+        runCatching { cm?.registerDefaultNetworkCallback(cb); netCallback = cb }
+        // Slow heartbeat so a healthy device still checks in periodically.
+        heartbeat = java.util.concurrent.Executors.newSingleThreadScheduledExecutor().also { exec ->
+            exec.scheduleAtFixedRate(
+                { runCatching { Telemetry.sendHealth(applicationContext) } },
+                30, 30, java.util.concurrent.TimeUnit.MINUTES,
+            )
         }
     }
 
@@ -152,11 +175,20 @@ class RayfishVpnService : VpnService() {
         } catch (t: Throwable) {
             Log.w(TAG, "Node stop failed (may not have been up)", t)
         }
+        runCatching { Telemetry.sendHealth(applicationContext) }
         try {
             tunnel?.close()
         } catch (t: Throwable) {
             Log.w(TAG, "closing tunnel fd failed", t)
         }
+
+        netCallback?.let { cb ->
+            runCatching { getSystemService(android.net.ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) }
+        }
+        netCallback = null
+        heartbeat?.shutdownNow()
+        heartbeat = null
+
         tunnel = null
     }
 
