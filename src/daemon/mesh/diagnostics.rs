@@ -1,11 +1,11 @@
-//! Read-only diagnostics for `DaemonState`: `status`, `build_report`, `ping`,
+//! Read-only diagnostics for `MeshManager`: `status`, `build_report`, `ping`,
 //! `netcheck`, and connection-info helpers. Split out of `daemon/mod.rs`.
 
 use super::super::*;
 
-impl DaemonState {
+impl MeshManager {
     pub(crate) fn status(&self) -> IpcMessage {
-        let hostname_snapshot = self.hostname_table.try_read().ok();
+        let hostname_snapshot = self.dns.hostname_table.try_read().ok();
         let my_id = self.endpoint.id();
         // Direct-connection networks are flagged in config; collect their names
         // so each NetworkStatus can be tagged `[direct]` in the CLI.
@@ -36,8 +36,8 @@ impl DaemonState {
             packets_tx: self.stats.packets_tx.get(),
             bytes_rx: self.stats.bytes_rx.get(),
             bytes_tx: self.stats.bytes_tx.get(),
-            pending_files: self.protocol_router.pending_files.lock().unwrap().len(),
-            pending_connects: self.protocol_router.pending_connects.len(),
+            pending_files: self.files.pending_files.lock().unwrap().len(),
+            pending_connects: self.connect.pending_connects.len(),
         }
     }
 

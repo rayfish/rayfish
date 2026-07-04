@@ -1,9 +1,9 @@
-//! Direct-connection (`ray connect`) handlers for `DaemonState`, plus the shared
+//! Direct-connection (`ray connect`) handlers for `MeshManager`, plus the shared
 //! `store_and_publish_group` helper. Split out of `daemon/mod.rs`.
 
 use super::super::*;
 
-impl DaemonState {
+impl MeshManager {
     /// Name of a live direct (`ray connect`) network whose roster includes
     /// `peer`, if any — used to short-circuit duplicate connects.
     pub(crate) fn existing_direct_network_with(&self, peer: &EndpointId) -> Option<String> {
@@ -100,12 +100,12 @@ impl DaemonState {
                         coordinator,
                     }) => {
                         let _ = me.join_direct(room_id, coordinator, hostname.clone()).await;
-                        me.protocol_router.outgoing_connects.remove(&peer);
+                        me.connect.outgoing_connects.remove(&peer);
                         return;
                     }
                     Ok(control::ConnectMsg::Denied { reason }) => {
                         tracing::warn!(reason, peer = %peer.fmt_short(), "connect request denied");
-                        me.protocol_router.outgoing_connects.remove(&peer);
+                        me.connect.outgoing_connects.remove(&peer);
                         return;
                     }
                     _ => {} // Pending or transient error — keep retrying.
@@ -155,13 +155,13 @@ impl DaemonState {
                 message: format!("already connected to this peer on '{name}'"),
             };
         }
-        self.protocol_router.outgoing_connects.insert(peer);
+        self.connect.outgoing_connects.insert(peer);
         match self.send_connect_request(peer, hostname.clone()).await {
             Ok(control::ConnectMsg::Approved {
                 room_id,
                 coordinator,
             }) => {
-                self.protocol_router.outgoing_connects.remove(&peer);
+                self.connect.outgoing_connects.remove(&peer);
                 self.join_direct(room_id, coordinator, hostname).await
             }
             Ok(control::ConnectMsg::Pending) => {
@@ -171,7 +171,7 @@ impl DaemonState {
                 }
             }
             Ok(control::ConnectMsg::Denied { reason }) => {
-                self.protocol_router.outgoing_connects.remove(&peer);
+                self.connect.outgoing_connects.remove(&peer);
                 IpcMessage::Error {
                     message: format!("connection denied: {reason}"),
                 }
@@ -180,7 +180,7 @@ impl DaemonState {
                 message: "unexpected response from contact".to_string(),
             },
             Err(e) => {
-                self.protocol_router.outgoing_connects.remove(&peer);
+                self.connect.outgoing_connects.remove(&peer);
                 IpcMessage::Error {
                     message: format!("failed to reach contact: {e}"),
                 }
@@ -191,8 +191,7 @@ impl DaemonState {
     /// `ray connections`: list pending incoming connect requests.
     pub(crate) fn list_connections(&self) -> IpcMessage {
         let now = Instant::now();
-        let requests = self
-            .protocol_router
+        let requests = self.connect
             .pending_connects
             .iter()
             .map(|p| ipc::PendingRequestInfo {
@@ -226,8 +225,7 @@ impl DaemonState {
     /// `ray connections approve <id>`: approve a pending connect request, minting
     /// a 2-peer network with the requester pre-approved.
     pub(crate) async fn approve_connection(self: &Arc<Self>, id_prefix: &str) -> IpcMessage {
-        let found = self
-            .protocol_router
+        let found = self.connect
             .pending_connects
             .iter()
             .find(|p| {
@@ -247,7 +245,7 @@ impl DaemonState {
 
         // Idempotency: already linked on a direct network → reuse it.
         if let Some(name) = self.existing_direct_network_with(&peer) {
-            self.protocol_router.pending_connects.remove(&peer);
+            self.connect.pending_connects.remove(&peer);
             return IpcMessage::Ok {
                 message: format!("already connected to this peer on '{name}'"),
             };
@@ -256,9 +254,9 @@ impl DaemonState {
         // Concurrency tie-break: if we also initiated a connect to this peer and
         // our endpoint id is the lower one, let the higher-id peer mint the
         // network; our own connect retry loop will join it.
-        let we_initiated = self.protocol_router.outgoing_connects.contains(&peer);
+        let we_initiated = self.connect.outgoing_connects.contains(&peer);
         if we_initiated && self.endpoint.id().to_string() < peer.to_string() {
-            self.protocol_router.pending_connects.remove(&peer);
+            self.connect.pending_connects.remove(&peer);
             return IpcMessage::Ok {
                 message: "connection will be established by the other peer".to_string(),
             };
@@ -284,8 +282,8 @@ impl DaemonState {
             Ok(IpcMessage::Created {
                 name, network_key, ..
             }) => {
-                self.protocol_router.pending_connects.remove(&peer);
-                self.protocol_router
+                self.connect.pending_connects.remove(&peer);
+                self.connect
                     .approved_connects
                     .insert(peer, (network_key, self.endpoint.id()));
                 IpcMessage::Ok {

@@ -66,6 +66,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   when auditing an OS firewall. Enabling mesh SSH with `ray firewall ssh on` now
   reminds you to authorize a peer with `ray firewall ssh allow` when none is set
   yet (the server rejects all logins until a peer is on the allow list).
+- **Bounded pending-join queue** — on a closed network, the coordinator's queue
+  of join requests awaiting `ray accept` is now capped (oldest request evicted
+  when full), so a peer churning fresh identities can no longer grow it without
+  limit. Legitimate queues are far below the cap, so this is invisible in normal
+  use.
+
+### Performance
+
+- **Drop-newest under datagram backpressure** — when a peer's QUIC datagram send
+  buffer is momentarily full, the new packet is dropped at the application
+  boundary instead of letting QUIC evict an older already-queued one (drop-newest
+  beats drop-oldest for a VPN), and the QUIC transport is tuned for the one
+  datagram stream per peer shape. Keeps the send path non-blocking with no
+  cross-peer head-of-line blocking.
 
 ### Fixed
 

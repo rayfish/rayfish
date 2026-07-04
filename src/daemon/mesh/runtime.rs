@@ -1,4 +1,4 @@
-//! Network runtime handlers for `DaemonState`: coordinator restore, nuke,
+//! Network runtime handlers for `MeshManager`: coordinator restore, nuke,
 //! connect-all, activate/deactivate (data plane), teardown, leave. Split out of `daemon/mod.rs`.
 
 use super::super::*;
@@ -14,7 +14,7 @@ struct RestoredRoster {
     reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
 }
 
-impl DaemonState {
+impl MeshManager {
     /// Rebuild a network's roster for a coordinator restart. Prefers the
     /// published, network-key-signed `GroupBlob` (members + approved + suggested
     /// firewall + reusable keys); if the DHT is unreachable, falls back to the
@@ -233,8 +233,8 @@ impl DaemonState {
             };
             for (hostname, ip, ipv6) in members_snapshot {
                 dns::update_hostname(
-                    &self.hostname_table,
-                    &self.reverse_table,
+                    &self.dns.hostname_table,
+                    &self.dns.reverse_table,
                     name,
                     &hostname,
                     ip,
@@ -450,8 +450,8 @@ impl DaemonState {
             s.approved.remove(&member_id);
         }
         dns::remove_hostname_by_ip(
-            &self.hostname_table,
-            &self.reverse_table,
+            &self.dns.hostname_table,
+            &self.dns.reverse_table,
             network,
             member_ip,
         )
@@ -682,7 +682,7 @@ impl DaemonState {
             warnings.push(format!("failed to install loopback self-route: {e}"));
         }
 
-        self.configure_magic_dns(&mut warnings).await;
+        self.dns.configure(&self.tun_name, &mut warnings).await;
 
         // Start the embedded mesh SSH server if enabled. It binds the mesh IPs'
         // port 22, so it follows the data plane (mesh addresses must be up).
@@ -705,46 +705,6 @@ impl DaemonState {
         }
     }
 
-    /// Point system DNS at the in-daemon Magic DNS resolver: detect the OS DNS
-    /// backend, merge any user-configured upstreams over the captured ones, and
-    /// (Linux direct-resolv.conf mode) spawn the inotify re-assert watcher.
-    /// Failures are non-fatal — pushed to `warnings` so `ray up` can surface them.
-    async fn configure_magic_dns(&self, warnings: &mut Vec<String>) {
-        // Configure system DNS to route .ray queries to our in-daemon resolver.
-        dns_config::restore_stale_backups();
-        match dns_config::detect_and_configure(&self.tun_name).await {
-            Ok(c) => {
-                let captured = c.captured_upstreams();
-                // Merge any user-configured DNS upstreams over the system-captured
-                // set (replace drops the captured ones; augment tries custom first).
-                let dns_override = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
-                let upstreams = config::resolve_upstreams(&dns_override, captured);
-                let is_direct = c.name() == "direct-resolv.conf";
-                #[cfg(target_os = "linux")]
-                let search = c.search_domains();
-                tracing::info!(backend = c.name(), resolver_ip = %crate::dns::MAGIC_DNS_V4, upstreams = ?upstreams, "Magic DNS active");
-                self.resolver.set_upstreams(upstreams);
-                *self.dns_configurator.lock().unwrap() = Some(c);
-                // In direct mode, re-assert /etc/resolv.conf the instant another
-                // program (NetworkManager, dhclient) overwrites it (inotify watch).
-                #[cfg(target_os = "linux")]
-                if is_direct {
-                    let rt = CancellationToken::new();
-                    *self.dns_reassert_token.lock().unwrap() = Some(rt.clone());
-                    tokio::spawn(dns_config::run_resolv_reassert(search, rt));
-                }
-                #[cfg(not(target_os = "linux"))]
-                let _ = is_direct;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to configure system DNS (Magic DNS requires manual setup)");
-                warnings.push(format!(
-                    "failed to configure system DNS, so .ray names won't resolve: {e}"
-                ));
-            }
-        }
-    }
-
     /// Put the daemon on standby: take the data plane offline (revert system
     /// DNS, bring the TUN link down, stop forwarding) while keeping the control
     /// plane connected. Network connections, control readers, and pollers stay
@@ -757,22 +717,10 @@ impl DaemonState {
             };
         }
 
-        if let Some(rt) = self.dns_reassert_token.lock().unwrap().take() {
-            rt.cancel();
-        }
-
         // The SSH listeners bind the mesh IPs, which go down with the data plane.
         self.stop_ssh();
 
-        // Revert system DNS (extract the configurator before reverting so the
-        // mutex guard isn't held across the call).
-        let configurator = self.dns_configurator.lock().unwrap().take();
-        if let Some(configurator) = configurator
-            && let Err(e) = dns_config::revert(configurator.as_ref()).await
-        {
-            tracing::warn!(error = %e, "failed to revert DNS configuration");
-        }
-        dns_config::clear_search_domains(&self.tun_name).await;
+        self.dns.revert(&self.tun_name).await;
 
         if let Err(e) = tun::set_link_down(&self.tun_name) {
             tracing::warn!(error = %e, "failed to bring TUN interface down");
@@ -798,7 +746,7 @@ impl DaemonState {
         }
 
         self.peers.remove_by_network(name);
-        dns::remove_network(&self.hostname_table, &self.reverse_table, name).await;
+        dns::remove_network(&self.dns.hostname_table, &self.dns.reverse_table, name).await;
         self.protocol_router
             .unregister(&transport::network_alpn(&handle.network_key));
         self.refresh_alpns().await;

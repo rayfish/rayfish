@@ -319,6 +319,24 @@ pub async fn run_mesh(
             continue;
         }
         tracing::debug!(dst = %info.dst_ip, "routing to peer");
+        // Drop-newest at the application boundary: if the peer's QUIC datagram send
+        // buffer is too full to accept this packet without evicting an already-queued
+        // (older) one, drop the *new* packet here instead of calling `send_datagram`,
+        // which would drop the *oldest* queued packet (see N6 in the datagram audit).
+        // This keeps the send path non-blocking (no cross-peer head-of-line blocking
+        // in this single TUN read loop) while preferring drop-newest over drop-oldest.
+        // Full per-peer backpressure (`send_datagram_wait` in a per-peer writer task)
+        // is the sized follow-up that needs the e2e harness to land safely.
+        if route.conn.datagram_send_buffer_space() < n {
+            tracing::trace!(
+                dst = %info.dst_ip,
+                space = route.conn.datagram_send_buffer_space(),
+                len = n,
+                "datagram send buffer full; dropping newest",
+            );
+            stats.record_drop(DropReason::Backpressure);
+            continue;
+        }
         // SSH NAT: rewrite our reply's source port (listen -> 22) so the peer
         // sees it as coming from `:22`. The cheap pre-check (TCP + source port ==
         // listen port) gates the copy; `rewrite_ssh_port` still confirms the
