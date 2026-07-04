@@ -76,6 +76,28 @@ object NodeHolder {
         return id
     }
 
+    /** Seed the device's default hostname from the Android model on first run,
+     * so pairing auto-joins all use one consistent name. Idempotent: no-op once
+     * a name is set. Runs on the caller's (IO) context; touches config only. */
+    fun seedDeviceName(context: Context) {
+        val node = get(context)
+        val current = runCatching { node.defaultHostname() }.getOrDefault("")
+        if (current.isNotBlank()) return
+        val seed = sanitizeHostname(android.os.Build.MODEL ?: "")
+        runCatching { node.setDefaultHostname(seed) }
+    }
+
+    /** Lowercase, keep [a-z0-9-], collapse/trim hyphens, cap 63, fall back to
+     * "phone". Matches the core's is_valid_hostname rules. */
+    private fun sanitizeHostname(raw: String): String {
+        var s = raw.lowercase()
+            .replace(Regex("[^a-z0-9-]"), "-")
+            .replace(Regex("-+"), "-")
+            .trim('-')
+        if (s.length > 63) s = s.substring(0, 63).trim('-')
+        return s.ifEmpty { "phone" }
+    }
+
     /**
      * Starts the node exactly once for the process, however many callers race to
      * invoke this concurrently (e.g. the initial UI launch and a cold-start deep
@@ -90,6 +112,7 @@ object NodeHolder {
                 // iroh endpoint sets up TLS, which fails without it.
                 RustlsInit.ensureInitialized(context)
                 get(context).start()
+                seedDeviceName(context)
             }
             started = true
         }
