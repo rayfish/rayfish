@@ -113,10 +113,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Per-target key: the two macOS targets share a runner, so a single
+      # shared-key would make them overwrite each other's target dir cache.
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "release"
+          shared-key: "release-${{ matrix.target }}"
           cache-on-failure: true
 
       - name: Build binary
@@ -166,15 +168,32 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+          # Caches ~/.gradle/caches + ~/.gradle/wrapper (keyed on the Gradle
+          # build files) so downloaded dependencies survive between runs.
+          cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install NDK and cargo-ndk
+      # The NDK is ~1GB; cache it so we download it once per version instead of
+      # on every run. sdkmanager below is a no-op on a cache hit.
+      - name: Cache Android NDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
+          key: android-ndk-27.2.12479018
+
+      # Prebuilt binary via install-action instead of `cargo install`, which
+      # would compile cargo-ndk from source on every run.
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Install NDK
         run: |
           sdkmanager "ndk;27.2.12479018"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
-          cargo install cargo-ndk --locked
 
       # Gradle's cargoNdkBuild task only rebuilds the .so; the Kotlin bindings
       # are generated here so the checked-in copy can never drift from the APK.
