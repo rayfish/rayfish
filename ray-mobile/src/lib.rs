@@ -147,6 +147,29 @@ pub struct Status {
     pub pending_networks: Vec<String>,
 }
 
+/// One network's liveness, for the health snapshot.
+#[derive(uniffi::Record)]
+pub struct NetworkHealth {
+    pub name: String,
+    pub connected: bool,
+}
+
+/// Lightweight health vitals for auto-telemetry. Cheap to build (reads a status
+/// snapshot + the diagnostics counters); safe to call before `start`.
+#[derive(uniffi::Record)]
+pub struct HealthSnapshot {
+    pub running: bool,
+    pub network_count: u32,
+    pub peers_online: u32,
+    pub networks: Vec<NetworkHealth>,
+    pub mesh_up: bool,
+    pub node_id: String,
+    pub mesh_ipv4: String,
+    pub warn_count: u64,
+    pub error_count: u64,
+    pub recent_errors: Vec<String>,
+}
+
 /// One firewall rule as shown in the UI.
 #[derive(uniffi::Record)]
 pub struct FirewallRuleInfo {
@@ -312,6 +335,9 @@ impl Node {
     /// `RAYFISH_CONFIG_DIR`, which `config::config_dir()` honors on Android.
     #[uniffi::constructor]
     pub fn new(config_dir: String) -> Arc<Self> {
+        // Capture the core's tracing output for Android diagnostics. Idempotent;
+        // safe to call once per process (Node is a process singleton).
+        diag::install();
         // SAFETY-ish: set before any core call reads config. Single-threaded at
         // construction time.
         unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", &config_dir) };
@@ -910,6 +936,39 @@ impl Node {
             networks: detail,
             pending_networks,
         }
+    }
+
+    /// Lightweight health vitals for auto-telemetry. Reuses `status()` for mesh
+    /// state and reads the diagnostics counters. Cumulative WARN/ERROR counts
+    /// (since process start); reading does not reset them.
+    pub fn health_snapshot(&self) -> HealthSnapshot {
+        let s = self.status();
+        let networks: Vec<NetworkHealth> = s
+            .networks
+            .iter()
+            .map(|n| NetworkHealth {
+                name: n.name.clone(),
+                connected: n.peers.iter().any(|p| p.online),
+            })
+            .collect();
+        let peers_online = s.peers.iter().filter(|p| p.online).count() as u32;
+        HealthSnapshot {
+            running: s.running,
+            network_count: s.networks.len() as u32,
+            peers_online,
+            networks,
+            mesh_up: peers_online > 0,
+            node_id: s.node_id.chars().take(10).collect(),
+            mesh_ipv4: s.ipv4.clone(),
+            warn_count: diag::warn_count(),
+            error_count: diag::error_count(),
+            recent_errors: diag::recent_errors(),
+        }
+    }
+
+    /// The full buffered core log, for the "Send diagnostics" button.
+    pub fn log_snapshot(&self) -> String {
+        diag::snapshot()
     }
 
     /// Follow a `rayfish://join/<code>` or `rayfish://pair/<ticket>` deep link,
