@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
@@ -70,6 +71,12 @@ class RayfishVpnService : VpnService() {
         // still establishes.
         val tunnelAddr = meshIp.ifBlank { "100.64.0.2" }
 
+        val meshV6 = try {
+            runBlocking { NodeHolder.get(applicationContext).status().ipv6 }
+        } catch (t: Throwable) {
+            ""
+        }
+
         // Point the resolver at the phone's real DNS servers before the tunnel
         // captures all DNS on 100.100.100.53. Without this, non-.ray lookups are
         // refused and public browsing breaks while the VPN is up. Read them from
@@ -93,6 +100,22 @@ class RayfishVpnService : VpnService() {
             .addDnsServer("100.100.100.53")
             .addSearchDomain("ray")
             .setMtu(1280)
+
+        // Route the mesh IPv6 range through the tunnel (mirrors the desktop
+        // 200::/7 route). Skipped if we have no v6 address to bind.
+        if (meshV6.isNotBlank()) {
+            builder.addAddress(meshV6, 128)
+            builder.addRoute("200::", 7)
+        }
+        // Keep VPN-hostile apps (Android Auto, casting, RCS, Sonos) off the
+        // tunnel. Each add is guarded: an uninstalled package must not abort setup.
+        for (pkg in DISALLOWED_APPS) {
+            try {
+                builder.addDisallowedApplication(pkg)
+            } catch (e: PackageManager.NameNotFoundException) {
+                Log.i(TAG, "disallowed app not installed, skipping: $pkg")
+            }
+        }
 
         val pfd = builder.establish()
         if (pfd == null) {
@@ -235,5 +258,16 @@ class RayfishVpnService : VpnService() {
         private const val CHANNEL_ID = "rayfish_vpn"
         private const val NOTIF_ID = 1
         const val ACTION_STOP = "xyz.rayfish.android.STOP"
+
+        // Apps that misbehave behind a VPN (casting, RCS, local-device discovery).
+        // Mirrors Tailscale's default Android exclusions. Excluded so they never
+        // see the VPN interface; our tunnel is split (mesh routes only) anyway.
+        private val DISALLOWED_APPS = listOf(
+            "com.google.android.projection.gearhead", // Android Auto
+            "com.google.android.apps.chromecast.app", // Google Home / Chromecast
+            "com.google.android.apps.messaging",      // RCS / Jibe messaging
+            "com.gopro.smarty",                       // GoPro
+            "com.sonos.acr", "com.sonos.acr2",        // Sonos
+        )
     }
 }
