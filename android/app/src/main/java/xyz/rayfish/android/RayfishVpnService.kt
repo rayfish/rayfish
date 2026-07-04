@@ -29,8 +29,14 @@ class RayfishVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                stopTunnel()
-                stopSelf()
+                // stopTunnel now blocks on a graceful endpoint close (so peers
+                // see us drop cleanly and re-enable rebuilds without a stale
+                // session). Run it off the main thread to avoid an ANR, then
+                // stop the service.
+                thread(name = "rayfish-node-stop") {
+                    stopTunnel()
+                    stopSelf()
+                }
                 return START_NOT_STICKY
             }
             else -> startTunnel()

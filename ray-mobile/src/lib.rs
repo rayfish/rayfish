@@ -683,11 +683,13 @@ impl Node {
     /// This is the mobile "disable" semantics: unlike [`Node::down`] (standby,
     /// control plane stays connected), `stop` takes the node offline outright.
     pub fn stop(&self) {
-        // Take the Arc out under the lock, then drop it after cancelling so the
-        // next `start` sees `None` and rebuilds a fresh daemon.
+        // Take the Arc out under the lock so the next `start` sees `None` and
+        // rebuilds a fresh daemon. Block until the endpoint has closed so the
+        // rebuilt endpoint does not overlap the old one (which would leave a
+        // coordinator holding a stale session and the device showing offline).
         let state = self.state.lock().unwrap().take();
         if let Some(state) = state {
-            state.trigger_shutdown();
+            self.runtime.block_on(state.shutdown_and_close());
         }
     }
 

@@ -1512,13 +1512,20 @@ impl DaemonState {
             .or_else(|| self.device_cert.clone())
     }
 
-    /// Cancel the daemon-wide shutdown token, tearing down every network's run
-    /// loop, the accept loop, and the data-plane forward tasks. The iroh
-    /// endpoint closes once the last `Arc<DaemonState>` clone drops as those
-    /// tasks wind down. Same effect as the desktop `IpcMessage::Shutdown`; used
-    /// by mobile to go fully offline when the tunnel is disabled.
-    pub fn trigger_shutdown(&self) {
+    /// Gracefully take the whole node offline: cancel the daemon-wide shutdown
+    /// token (stopping every network run loop, the accept loop, and the
+    /// data-plane forward tasks) and then close the iroh endpoint so all QUIC
+    /// connections terminate cleanly and peers see us drop immediately, rather
+    /// than lingering until an idle timeout. Awaiting the close matters for
+    /// embedders (mobile) that rebuild a fresh daemon on re-enable: without it
+    /// the old endpoint's connections outlive `stop`, so a coordinator keeps the
+    /// stale session while the rebuilt endpoint (same node key) comes up and the
+    /// device shows offline until the race clears. Mirrors the shutdown tail of
+    /// `run_daemon`. After this the `DaemonState` is spent; build a new one to
+    /// come back online.
+    pub async fn shutdown_and_close(&self) {
         self.shutdown_token.cancel();
+        self.endpoint.close().await;
     }
 
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
