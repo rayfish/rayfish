@@ -99,7 +99,7 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         var crashReporting by remember { mutableStateOf(NodeHolder.isCrashReportingEnabled(context)) }
         ToggleCard(
             title = "Crash reporting",
-            subtitle = if (crashReporting) "on · anonymous diagnostics" else "off",
+            subtitle = if (crashReporting) "on · diagnostics" else "off",
             checked = crashReporting,
             onCheckedChange = { on ->
                 crashReporting = on
@@ -107,6 +107,16 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 if (on) Telemetry.enable(context) else Telemetry.disable()
             },
         )
+        if (crashReporting) {
+            PillButton("Send diagnostics", onClick = {
+                scope.launch {
+                    val id = withContext(Dispatchers.IO) {
+                        runCatching { Telemetry.sendDiagnostics(context) }.getOrNull()
+                    }
+                    onToast(if (id != null) "Diagnostics sent" else "Diagnostics unavailable")
+                }
+            }, modifier = Modifier.fillMaxWidth())
+        }
         SectionCard {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("About", fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
