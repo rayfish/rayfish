@@ -1,10 +1,24 @@
 import org.gradle.internal.os.OperatingSystem
 import java.io.File
+import java.io.FileInputStream
+import java.util.Properties
 
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+// Release signing is driven by a gitignored keystore.properties at the android/
+// project root (see keystore.properties.example). It is absent on CI and on any
+// checkout that only builds debug, so every use is guarded by exists(): without
+// it the release build stays unsigned and Play App Signing (or a later manual
+// sign) takes over.
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        FileInputStream(keystorePropertiesFile).use { load(it) }
+    }
 }
 
 android {
@@ -15,7 +29,7 @@ android {
     defaultConfig {
         applicationId = "xyz.rayfish.android"
         minSdk = 24
-        targetSdk = 34
+        targetSdk = 35
         versionCode = 2
         versionName = "0.1.4"
 
@@ -34,9 +48,26 @@ android {
         )
     }
 
+    signingConfigs {
+        create("release") {
+            if (keystorePropertiesFile.exists()) {
+                storeFile = file(keystoreProperties["storeFile"] as String)
+                storePassword = keystoreProperties["storePassword"] as String
+                keyAlias = keystoreProperties["keyAlias"] as String
+                keyPassword = keystoreProperties["keyPassword"] as String
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            isDebuggable = false
+            // Sign with the release keystore only when it is configured; otherwise
+            // leave the build unsigned for Play App Signing to handle.
+            if (keystorePropertiesFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",

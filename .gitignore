@@ -9,6 +9,9 @@ android/build/
 android/app/build/
 **/jniLibs/**
 android/local.properties
+android/keystore.properties
+*.jks
+*.keystore
 **/.cxx/
 
 # OS / editor cruft
