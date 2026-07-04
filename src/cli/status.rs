@@ -268,10 +268,9 @@ pub(crate) async fn ipc_status() -> Result<()> {
 /// `ray connect` networks).
 fn print_network(net: &ipc::NetworkStatus) {
     let role = net.role.to_string();
-    let dns_name = net
-        .my_hostname
-        .as_ref()
-        .map(|h| format!("{}.{}.{}", h, net.name, DNS_DOMAIN));
+    // Just the hostname: the network name is already the block header, so the
+    // `.{network}.ray` suffix would only repeat it.
+    let dns_name = net.my_hostname.clone();
     // member count (self excluded) belongs on the network header row
     let online = net.peers.iter().filter(|p| p.connection.is_some()).count();
     println!();
@@ -312,7 +311,6 @@ fn print_network(net: &ipc::NetworkStatus) {
         .iter()
         .map(|p| {
             render_peer_row(
-                &net.name,
                 p,
                 peer_alias(p, &alias_by_identity),
                 up_w,
@@ -349,9 +347,10 @@ fn peer_alias<'a>(
 }
 
 /// Build one peer's status row (glyph · host · ipv4 · via · rtt · ↑tx · ↓rx). A
-/// local alias, when set, is shown inline after the host as `host.net.ray [alias]`.
+/// local alias, when set, is shown inline after the host as `host [alias]`. The
+/// host is the bare hostname (no `.{network}.ray`): the network block header
+/// already names the network.
 fn render_peer_row(
-    net_name: &str,
     peer: &ipc::PeerStatus,
     alias: Option<&str>,
     up_w: usize,
@@ -359,8 +358,7 @@ fn render_peer_row(
 ) -> Vec<layout::Cell> {
     let base = peer
         .hostname
-        .as_ref()
-        .map(|h| format!("{h}.{}.{}", net_name, DNS_DOMAIN))
+        .clone()
         .unwrap_or_else(|| peer.ip.to_string());
     let host = match alias {
         Some(a) => format!("{base} [{a}]"),
