@@ -73,7 +73,11 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         }
         SectionCard {
             SectionLabel("Pairing")
-            if (paired) {
+            val running = status?.running == true
+            if (!running) {
+                Text("Start the tunnel to pair another device.",
+                    fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
+            } else if (paired) {
                 Text("This device is paired. Add new devices from your primary device.",
                     fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
             } else {

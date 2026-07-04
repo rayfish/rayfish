@@ -68,9 +68,10 @@ use rayfish::control;
 use rayfish::daemon::{DaemonState, build_headless};
 use rayfish::deeplink::{self, RayfishLink};
 use rayfish::firewall::{Action, Direction, Protocol};
+use rayfish::identity;
 use rayfish::invite;
 use rayfish::ipc::IpcMessage;
-use rayfish::membership::GroupMode;
+use rayfish::membership::{self, GroupMode};
 use tokio::runtime::Runtime;
 
 uniffi::setup_scaffolding!();
@@ -226,6 +227,10 @@ impl Node {
 /// is stopped so the UI can still show the user's saved networks. Everything is
 /// reported offline: `running` is false and every peer's `online` is false. The
 /// per-network address/hostname come straight from the saved membership.
+///
+/// The device's own node id and mesh addresses are derived from the persisted
+/// identity, so they stay populated while stopped (they never change with the
+/// tunnel state) instead of blanking to "-" in the UI.
 fn saved_networks_status() -> Status {
     let empty = Status {
         running: false,
@@ -238,6 +243,28 @@ fn saved_networks_status() -> Status {
     };
     let Ok(cfg) = config::load() else {
         return empty;
+    };
+    // Derive this device's stable identity-based fields off disk. Without a
+    // persisted identity there are no saved networks to show either, so fall
+    // back to the empty snapshot.
+    let (node_id, device_ipv4, device_ipv6) = match identity::load_or_create() {
+        Ok(secret) => {
+            let id = secret.public();
+            // Prefer the assigned per-network IPv4 (it accounts for any
+            // collision-avoidance offset); otherwise use the base derived
+            // address. IPv6 is always derived from the identity.
+            let ipv4 = cfg
+                .networks
+                .iter()
+                .find_map(|n| n.my_ip)
+                .unwrap_or_else(|| membership::derive_ip(&id));
+            (
+                id.to_string(),
+                ipv4.to_string(),
+                membership::derive_ipv6(&id).to_string(),
+            )
+        }
+        Err(_) => return empty,
     };
     let networks = cfg
         .networks
@@ -266,7 +293,13 @@ fn saved_networks_status() -> Status {
             }
         })
         .collect();
-    Status { networks, ..empty }
+    Status {
+        node_id,
+        ipv4: device_ipv4,
+        ipv6: device_ipv6,
+        networks,
+        ..empty
+    }
 }
 
 #[uniffi::export]
