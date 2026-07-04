@@ -37,6 +37,10 @@ topo_order = false
 sort_commits = "newest"
 # The numeric HTML-comment prefix orders groups; the template strips it.
 commit_parsers = [
+  # Drop merge commits: they carry no user-facing change of their own and their
+  # bodies (e.g. a git "Conflicts:" file list, or a long integration summary)
+  # would otherwise render in full and bloat the notes.
+  { message = "^Merge ", skip = true },
   { message = "^feat", group = "<!-- 0 -->Features" },
   { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
   { message = "^perf", group = "<!-- 2 -->Performance" },
