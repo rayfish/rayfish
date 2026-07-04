@@ -110,6 +110,27 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+step "5b. both peers are coordinators of the direct network"
+# A direct link is symmetric: the requester is granted the network key on
+# admission, so `ray admin list` on *each* side must show that node holding it.
+NET_A="$(status_json "$A" | jq -r '(.networks // [])[] | select((.role|ascii_downcase)=="direct") | .name' | head -1)"
+NET_B="$(status_json "$B" | jq -r '(.networks // [])[] | select((.role|ascii_downcase)=="direct") | .name' | head -1)"
+echo "   net-a=$NET_A  net-b=$NET_B"
+holds_key(){  # <ip> <net> : exit 0 if this node holds the network key
+  on "$1" "ray admin list $2 --json" 2>/dev/null | jq -e 'any(.[]; .self == true)' >/dev/null 2>&1
+}
+if [[ -n "$NET_A" ]] && retry_until 30 "holds_key '$A' '$NET_A'"; then
+  pass "srv-a holds the network key (co-coordinator)"
+else
+  fail "srv-a is not a coordinator of the direct network"
+fi
+if [[ -n "$NET_B" ]] && retry_until 30 "holds_key '$B' '$NET_B'"; then
+  pass "srv-b holds the network key (coordinator)"
+else
+  fail "srv-b is not a coordinator of the direct network"
+fi
+
+# ---------------------------------------------------------------------------
 step "6. reachability — ping over the TUN (both directions)"
 A_IP="$(own_ip "$SA")"; B_IP="$(own_ip "$SB")"
 echo "   A_IP=$A_IP  B_IP=$B_IP"

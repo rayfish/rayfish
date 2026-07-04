@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`ray connect` links are now symmetric**: when a direct 2-peer connection is
+  approved, both peers become coordinators of the auto-created network (the
+  requester is granted the network key on admission). Either side can now manage
+  the link (rename, re-invite, keep it alive) instead of only the peer who
+  approved it.
+
 ### Added
 
 - **Device ownership in `ray status`**: peer rows that are your own paired

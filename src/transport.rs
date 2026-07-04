@@ -40,18 +40,25 @@ pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/1";
 /// ephemeral port (see `create_endpoint_with_alpns`).
 pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 
-/// Mesh wire-protocol version, embedded in the per-network ALPN. Bump this on any
+/// Mesh wire-protocol version, embedded in the single mesh ALPN. Bump this on any
 /// breaking change to the mesh control/forwarding protocol. Because iroh negotiates
 /// the ALPN during the QUIC handshake, two peers on different mesh versions share no
 /// common ALPN and simply cannot connect — the version gate is enforced by the
-/// transport, with no in-band handshake. Per-network discovery still keys on the
-/// pubkey prefix; the version is an independent leading segment.
-pub const MESH_PROTOCOL_VERSION: u32 = 1;
+/// transport, with no in-band handshake.
+///
+/// Bumped to 2 for the single-connection-per-identity change: one mesh ALPN carries
+/// every shared network (network selection is now in-band — a `ControlFrame.net`
+/// per control message and a `u16` handle tag per datagram — not encoded in the
+/// ALPN as it was in v1's `rayfish/net/<v>/<prefix>`).
+pub const MESH_PROTOCOL_VERSION: u32 = 2;
 
-pub fn network_alpn(network_pubkey: &EndpointId) -> Vec<u8> {
-    let full = network_pubkey.to_string();
-    let prefix = &full[..full.len().min(16)];
-    format!("rayfish/net/{MESH_PROTOCOL_VERSION}/{prefix}").into_bytes()
+/// The single mesh ALPN. Unlike the old per-network `rayfish/net/<v>/<prefix>`,
+/// every mesh connection now negotiates this one ALPN regardless of network — a
+/// peer holds exactly one QUIC connection to us, carrying all networks we share.
+/// The accept loop dispatches every mesh connection to one connection handler,
+/// which routes each control message to the right network by its `ControlFrame.net`.
+pub fn mesh_alpn() -> Vec<u8> {
+    format!("rayfish/mesh/{MESH_PROTOCOL_VERSION}").into_bytes()
 }
 
 /// Creates an iroh endpoint with the N0 preset (NAT traversal + relay fallback).

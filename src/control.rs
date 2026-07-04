@@ -181,24 +181,71 @@ pub enum ControlMsg {
     Pong {
         nonce: u64,
     },
+    /// Connection-level announcement of *this sender's* per-connection network →
+    /// handle table. Since a single mesh connection now carries every network the
+    /// two peers share, each datagram is prefixed with a small `u16` handle
+    /// identifying its network; this message tells the peer which handle maps to
+    /// which network. Sender-authoritative: each side assigns handles in its own
+    /// namespace for the datagrams it sends, and the receiver caches this table to
+    /// decode inbound datagrams. Full snapshot, idempotent (replace on receipt),
+    /// re-sent whenever the shared-network set changes. Not scoped to a single
+    /// network (its frame carries `net = None`).
+    NetworkHandles {
+        entries: Vec<NetworkHandle>,
+    },
 }
 
-pub fn encode_msg(msg: &ControlMsg) -> Vec<u8> {
-    let body = rmp_serde::to_vec_named(msg).expect("serialize control message");
+/// One `network pubkey → u16 handle` binding in a [`ControlMsg::NetworkHandles`]
+/// announcement. `handle` is stamped on datagrams the announcer sends for
+/// `network`; `0` is reserved as invalid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkHandle {
+    /// The network's public key (stable, unambiguous identifier).
+    pub network: EndpointId,
+    pub handle: u16,
+}
+
+/// Envelope wrapping every mesh control message with the network it pertains to.
+///
+/// The mesh transport uses a single ALPN (`rayfish/mesh/<version>`), so a
+/// connection is no longer bound to one network — the network can't be inferred
+/// from the ALPN and must ride in-band. `net` is the network public key for
+/// network-scoped messages (join, hello, roster/firewall triggers, gossip,
+/// ping); it is `None` for connection-level messages ([`ControlMsg::NetworkHandles`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlFrame {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net: Option<EndpointId>,
+    pub msg: ControlMsg,
+}
+
+/// Encode a network-scoped mesh control message as a length-prefixed msgpack
+/// [`ControlFrame`]. `net` is the network public key the message pertains to
+/// (`None` for connection-level messages like [`ControlMsg::NetworkHandles`]).
+pub fn encode_msg(net: Option<EndpointId>, msg: &ControlMsg) -> Vec<u8> {
+    let frame = ControlFrame {
+        net,
+        msg: msg.clone(),
+    };
+    let body = rmp_serde::to_vec_named(&frame).expect("serialize control frame");
     let len = (body.len() as u32).to_be_bytes();
     [len.as_slice(), &body].concat()
 }
 
 #[cfg(test)]
-fn decode_msg(data: &[u8]) -> Result<ControlMsg> {
+fn decode_msg(data: &[u8]) -> Result<ControlFrame> {
     anyhow::ensure!(data.len() >= 4, "message too short");
     let len = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
     anyhow::ensure!(data.len() >= 4 + len, "incomplete message");
-    rmp_serde::from_slice(&data[4..4 + len]).context("invalid control message")
+    rmp_serde::from_slice(&data[4..4 + len]).context("invalid control frame")
 }
 
-pub async fn send_msg(stream: &mut SendStream, msg: &ControlMsg) -> Result<()> {
-    let data = encode_msg(msg);
+pub async fn send_msg(
+    stream: &mut SendStream,
+    net: Option<EndpointId>,
+    msg: &ControlMsg,
+) -> Result<()> {
+    let data = encode_msg(net, msg);
     stream
         .write_all(&data)
         .await
@@ -298,9 +345,9 @@ mod tests {
                 collision_index: 0,
             }],
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -311,9 +358,9 @@ mod tests {
             hostname: None,
             device_cert: None,
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -323,9 +370,9 @@ mod tests {
             hostname: Some("alice".to_string()),
             device_cert: None,
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -335,17 +382,17 @@ mod tests {
             hostname: None,
             device_cert: None,
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
     fn test_roundtrip_join_pending() {
         let msg = ControlMsg::JoinPending;
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -377,17 +424,17 @@ mod tests {
         let msg = ControlMsg::JoinDenied {
             reason: "not authorized".to_string(),
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
     fn test_roundtrip_member_sync() {
         let msg = ControlMsg::MemberSync;
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -398,9 +445,9 @@ mod tests {
             hostname: None,
             device_cert: None,
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -425,9 +472,9 @@ mod tests {
                 collision_index: 0,
             }],
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -439,17 +486,17 @@ mod tests {
             mime_type: "application/pdf".to_string(),
             blob_hash: blake3::hash(b"file contents"),
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
     fn test_roundtrip_blob_updated() {
         let msg = ControlMsg::BlobUpdated;
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -459,9 +506,9 @@ mod tests {
             network_pubkey: test_id(1),
             secret_key: key.to_bytes(),
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
         if let ControlMsg::AdminGrant { secret_key, .. } = decoded {
             assert_eq!(SecretKey::from(secret_key).public(), key.public());
         }
@@ -504,9 +551,9 @@ mod tests {
             hostname: Some("alice".to_string()),
             device_cert: Some(cert),
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
         if let ControlMsg::MeshHello {
             device_cert: Some(c),
             ..

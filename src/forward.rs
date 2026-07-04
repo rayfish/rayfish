@@ -22,10 +22,36 @@ use crate::firewall::{self, Direction, SharedFirewall};
 use crate::peers::{DeviceUserMap, PeerTable};
 use crate::stats::{DropReason, ForwardMetrics};
 
-/// Maximum datagram size accepted from a peer. Anything larger is dropped before
-/// being parsed or written to the TUN device, bounding memory use under a flood
-/// of oversized datagrams from a malicious or buggy peer.
-const MAX_PEER_DATAGRAM: usize = 1500;
+/// Maximum datagram size accepted from a peer, including the [`TAG_LEN`]-byte
+/// network handle prefix. Anything larger is dropped before being parsed or
+/// written to the TUN device, bounding memory use under a flood of oversized
+/// datagrams from a malicious or buggy peer.
+const MAX_PEER_DATAGRAM: usize = 1500 + TAG_LEN;
+
+/// Bytes of the per-datagram network handle tag: a big-endian `u16` prefixed to
+/// every mesh datagram. Since one connection now carries every network the two
+/// peers share, the receiver can no longer infer a datagram's network from the
+/// connection (ALPN) — this handle names it. `0` is reserved as invalid.
+pub(crate) const TAG_LEN: usize = 2;
+
+/// Prefix `payload` (a raw IP packet) with its outbound network `handle`,
+/// producing the on-wire mesh datagram `[handle:u16 BE][ip packet…]`.
+pub(crate) fn tag_datagram(handle: u16, payload: &[u8]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(TAG_LEN + payload.len());
+    buf.extend_from_slice(&handle.to_be_bytes());
+    buf.extend_from_slice(payload);
+    buf.freeze()
+}
+
+/// Split a received mesh datagram into its network `handle` and the IP-packet
+/// slice. `None` if it is too short to carry a tag.
+pub(crate) fn untag_datagram(datagram: &[u8]) -> Option<(u16, &[u8])> {
+    if datagram.len() < TAG_LEN {
+        return None;
+    }
+    let handle = u16::from_be_bytes([datagram[0], datagram[1]]);
+    Some((handle, &datagram[TAG_LEN..]))
+}
 
 /// Size of the TUN read pool. One allocation is amortized across the ~50
 /// datagrams that fit in a chunk: each packet is sliced off with a zero-copy
@@ -219,15 +245,19 @@ pub const KICK_CODE: u32 = 0x14ced;
 
 /// Sent by [`spawn_peer_reader`] when a peer connection drops,
 /// consumed by the reconnect loop (joiner) or cleanup task (coordinator).
+///
+/// Since a peer now has a single connection carrying every shared network, a
+/// drop tears down the peer across **all** its networks at once (there is no
+/// per-network connection). A graceful per-network departure (`ray leave` of one
+/// of several shared networks) does not close the connection — it rides an
+/// in-band control message and is handled by the control dispatcher, not here.
 pub struct DisconnectEvent {
     pub endpoint_id: EndpointId,
     pub ip: Ipv4Addr,
     pub ipv6: Ipv6Addr,
-    /// The network whose connection dropped. A multi-homed peer keeps its routes
-    /// in the other networks; only this network's connection is torn down.
-    pub network: String,
-    /// True when the peer closed gracefully with [`LEAVE_CODE`] (it ran
-    /// `ray leave`), as opposed to a timeout/reset.
+    /// True when the peer closed gracefully with [`LEAVE_CODE`]/[`KICK_CODE`] (it
+    /// departed the last network we shared, or was kicked), as opposed to a
+    /// timeout/reset.
     pub intentional: bool,
     /// [`Connection::stable_id`] of the connection that dropped, so a consumer
     /// can tell whether the connection currently stored for this peer is still
@@ -347,14 +377,15 @@ pub async fn run_mesh<R: crate::tun::TunRead>(
         }
         tracing::debug!(dst = %info.dst_ip, "routing to peer");
         // Drop-newest at the application boundary: if the peer's QUIC datagram send
-        // buffer is too full to accept this packet without evicting an already-queued
-        // (older) one, drop the *new* packet here instead of calling `send_datagram`,
-        // which would drop the *oldest* queued packet (see N6 in the datagram audit).
-        // This keeps the send path non-blocking (no cross-peer head-of-line blocking
-        // in this single TUN read loop) while preferring drop-newest over drop-oldest.
-        // Full per-peer backpressure (`send_datagram_wait` in a per-peer writer task)
-        // is the sized follow-up that needs the e2e harness to land safely.
-        if route.conn.datagram_send_buffer_space() < n {
+        // buffer is too full to accept this packet (plus its tag) without evicting
+        // an already-queued (older) one, drop the *new* packet here instead of
+        // calling `send_datagram`, which would drop the *oldest* queued packet (see
+        // N6 in the datagram audit). This keeps the send path non-blocking (no
+        // cross-peer head-of-line blocking in this single TUN read loop) while
+        // preferring drop-newest over drop-oldest. Full per-peer backpressure
+        // (`send_datagram_wait` in a per-peer writer task) is the sized follow-up
+        // that needs the e2e harness to land safely.
+        if route.conn.datagram_send_buffer_space() < n + TAG_LEN {
             tracing::trace!(
                 dst = %info.dst_ip,
                 space = route.conn.datagram_send_buffer_space(),
@@ -376,7 +407,17 @@ pub async fn run_mesh<R: crate::tun::TunRead>(
         } else {
             pkt
         };
-        match route.conn.send_datagram(pkt) {
+        // Prefix the network handle so the receiver, which shares one connection
+        // for all our networks, can recover which network this datagram belongs to
+        // (firewall scoping + reachability). `handle == 0` means we have no handle
+        // for the routed network yet (the peer hasn't been announced) — drop
+        // rather than send an undecodable datagram.
+        if route.handle == 0 {
+            stats.record_drop(DropReason::NoPeer);
+            continue;
+        }
+        let tagged = tag_datagram(route.handle, &pkt);
+        match route.conn.send_datagram(tagged) {
             Ok(()) => stats.record_tx(n),
             Err(e) => {
                 tracing::debug!(dst = %info.dst_ip, error = %e, "datagram send failed");
@@ -394,7 +435,7 @@ pub fn spawn_peer_reader(
     peer_id: EndpointId,
     peer_ip: Ipv4Addr,
     peer_ipv6: Ipv6Addr,
-    network: String,
+    peers: PeerTable,
     ctx: ForwardCtx,
 ) -> JoinHandle<()> {
     let ForwardCtx {
@@ -406,9 +447,10 @@ pub fn spawn_peer_reader(
         device_user_map,
     } = ctx;
     use tracing::Instrument as _;
-    // Tag every event from this reader (drops, connection-lost) with the peer
-    // and network so the report bundle's logs are correlatable per peer.
-    let span = tracing::info_span!("peer", peer = %peer_id.fmt_short(), net = %network);
+    // Tag every event from this reader (drops, connection-lost) with the peer so
+    // the report bundle's logs are correlatable per peer. The connection carries
+    // all the peer's shared networks, so the reader is per-identity, not per-net.
+    let span = tracing::info_span!("peer", peer = %peer_id.fmt_short());
     let reader = async move {
         loop {
             // Wait for the next datagram, exiting on cancellation or connection
@@ -431,7 +473,6 @@ pub fn spawn_peer_reader(
                                 endpoint_id: peer_id,
                                 ip: peer_ip,
                                 ipv6: peer_ipv6,
-                                network: network.clone(),
                                 intentional,
                                 conn_stable_id: Some(conn.stable_id()),
                             })
@@ -440,6 +481,31 @@ pub fn spawn_peer_reader(
                     }
                 },
             };
+
+            if datagram.len() > MAX_PEER_DATAGRAM {
+                stats.record_drop(DropReason::Malformed);
+                continue;
+            }
+            // Strip the network handle tag and resolve which network it names.
+            let Some((handle, _)) = untag_datagram(&datagram) else {
+                stats.record_drop(DropReason::Malformed);
+                continue;
+            };
+            // The peer's announced decode table maps the handle to a network.
+            let Some(network) = peers.inbound_network_v4(&peer_ip, handle) else {
+                stats.record_drop(DropReason::Malformed);
+                continue;
+            };
+            // In-band reachability wall: accept a datagram tagged for network `N`
+            // only if *we* currently share `N` with this peer per our own roster.
+            // The peer's handle table alone can't smuggle it into a network we
+            // don't agree it belongs to.
+            if !peers.shares_network_v4(&peer_ip, &network) {
+                stats.record_drop(DropReason::Spoof);
+                continue;
+            }
+            // Owned, zero-copy view of the IP packet (drops the 2-byte tag).
+            let datagram = datagram.slice(TAG_LEN..);
 
             let peer_user = device_user_map.resolve(&peer_id);
             match evaluate_inbound(
