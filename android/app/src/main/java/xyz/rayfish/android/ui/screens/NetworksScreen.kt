@@ -45,6 +45,7 @@ fun NetworksScreen(
     }
 
     val nets = status?.networks ?: emptyList()
+    val running = status?.running == true
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         BrandHeader(title = "Networks") {
@@ -57,12 +58,18 @@ fun NetworksScreen(
         nets.forEach { net ->
             SectionCard {
                 Row(Modifier.fillMaxWidth().clickable { onOpen(net) }, verticalAlignment = Alignment.CenterVertically) {
-                    val anyOnline = net.peers.any { it.online }
-                    Box(Modifier.size(8.dp).clip(RoundedCornerShape(4.dp)).background(if (anyOnline) Rf.Emerald else Rf.Faint))
+                    // Red when the node is offline (tunnel disabled), green when a
+                    // peer is reachable, grey when online but nobody's connected.
+                    val dot = when {
+                        !running -> Rf.Rose500
+                        net.peers.any { it.online } -> Rf.Emerald
+                        else -> Rf.Faint
+                    }
+                    Box(Modifier.size(8.dp).clip(RoundedCornerShape(4.dp)).background(dot))
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
                         Text(net.name, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-                        Text("${net.hostname.ifEmpty { net.ipv4 }} · ${net.peers.count { it.online }} online",
+                        Text("${net.hostname.ifEmpty { net.ipv4 }} · ${if (running) "${net.peers.count { it.online }} online" else "offline"}",
                             fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Muted)
                     }
                     OverflowMenu(listOf(

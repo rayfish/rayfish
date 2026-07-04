@@ -63,6 +63,7 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
 use android_tun::{AndroidTunReader, AndroidTunWriter};
+use rayfish::config;
 use rayfish::control;
 use rayfish::daemon::{DaemonState, build_headless};
 use rayfish::deeplink::{self, RayfishLink};
@@ -218,6 +219,56 @@ impl Node {
             IpcMessage::StatusResponse { endpoint_id, .. } => endpoint_id.to_string(),
             _ => String::new(),
         }
+    }
+}
+
+/// Build an offline status snapshot from the on-disk config, used when the node
+/// is stopped so the UI can still show the user's saved networks. Everything is
+/// reported offline: `running` is false and every peer's `online` is false. The
+/// per-network address/hostname come straight from the saved membership.
+fn saved_networks_status() -> Status {
+    let empty = Status {
+        running: false,
+        node_id: String::new(),
+        ipv4: String::new(),
+        ipv6: String::new(),
+        peers: Vec::new(),
+        networks: Vec::new(),
+        pending_networks: Vec::new(),
+    };
+    let Ok(cfg) = config::load() else {
+        return empty;
+    };
+    let networks = cfg
+        .networks
+        .iter()
+        .map(|net| {
+            // Exclude our own roster entry (matched by our IP) so the peer list
+            // mirrors the live snapshot, which lists only the other members.
+            let peers = net
+                .members
+                .iter()
+                .filter(|m| Some(m.ip) != net.my_ip)
+                .map(|m| PeerInfo {
+                    ipv4: m.ip.to_string(),
+                    node_id: m.identity.to_string(),
+                    hostname: m.hostname.clone().unwrap_or_default(),
+                    online: false,
+                })
+                .collect();
+            NetworkDetail {
+                name: net.name.clone(),
+                ipv4: net.my_ip.map(|ip| ip.to_string()).unwrap_or_default(),
+                ipv6: String::new(),
+                hostname: net.my_hostname.clone().unwrap_or_default(),
+                is_coordinator: net.network_secret_key.is_some(),
+                peers,
+            }
+        })
+        .collect();
+    Status {
+        networks,
+        ..empty
     }
 }
 
@@ -706,7 +757,11 @@ impl Node {
             pending_networks: Vec::new(),
         };
         let Some(state) = self.state.lock().unwrap().as_ref().cloned() else {
-            return empty();
+            // Stopped (the user disabled the tunnel): the control plane is gone,
+            // so there is no live snapshot. Read the saved networks off disk and
+            // present them offline (running: false, every peer offline) so the UI
+            // can still list the user's networks with a red status dot.
+            return saved_networks_status();
         };
 
         let IpcMessage::StatusResponse {
