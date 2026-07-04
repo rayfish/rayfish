@@ -229,6 +229,16 @@ pub struct DisconnectEvent {
     /// True when the peer closed gracefully with [`LEAVE_CODE`] (it ran
     /// `ray leave`), as opposed to a timeout/reset.
     pub intentional: bool,
+    /// [`Connection::stable_id`] of the connection that dropped, so a consumer
+    /// can tell whether the connection currently stored for this peer is still
+    /// the one that died. `None` for a synthetic kick that is not tied to a live
+    /// connection (the cold-restore reconnect seed), which always proceeds.
+    ///
+    /// Guards an ABA race: when a peer's process is killed and it re-dials with
+    /// the same identity, the coordinator registers the fresh connection before
+    /// the old one's idle timeout fires. Without this id, the stale connection's
+    /// delayed disconnect would evict the fresh connection and drop the peer.
+    pub conn_stable_id: Option<usize>,
 }
 
 /// Shared data-plane handles threaded into every per-peer reader. All fields are
@@ -423,6 +433,7 @@ pub fn spawn_peer_reader(
                                 ipv6: peer_ipv6,
                                 network: network.clone(),
                                 intentional,
+                                conn_stable_id: Some(conn.stable_id()),
                             })
                             .await;
                         return;

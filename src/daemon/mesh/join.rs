@@ -827,9 +827,24 @@ pub(crate) fn spawn_reconnect_loop(
             let peer_id = event.endpoint_id;
             let peer_ip = event.ip;
             let peer_ipv6 = event.ipv6;
-            // Drop only this network's route; other networks the peer shares with
-            // us stay live.
-            peers.remove_peer_from_network(&peer_ip, &peer_ipv6, &event.network);
+            // Drop only this network's route, and only if the stored connection
+            // is still the one that died. If the peer already re-dialed and a
+            // fresh connection is registered, this is a stale disconnect for the
+            // old connection: ignore it entirely rather than tearing down the
+            // live link and redialing on top of it (see conn_stable_id).
+            let removed = match event.conn_stable_id {
+                Some(id) => peers.remove_peer_from_network_if(&peer_ip, &peer_ipv6, &event.network, id),
+                None => {
+                    // Synthetic cold-restore kick: nothing is registered yet, so
+                    // force the reconnect dial below.
+                    peers.remove_peer_from_network(&peer_ip, &peer_ipv6, &event.network);
+                    true
+                }
+            };
+            if !removed {
+                tracing::debug!(peer = %peer_id.fmt_short(), ip = %peer_ip, "ignoring stale disconnect; peer already reconnected");
+                continue;
+            }
 
             // A deliberate `ray leave` (graceful close with the leave code) means
             // the peer is gone for good — don't spin a reconnect task against it.

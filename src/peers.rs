@@ -202,6 +202,37 @@ impl PeerTable {
         }
     }
 
+    /// Connection-aware variant of [`remove_peer_from_network`]: drops the
+    /// peer's connection in `network` only if the one currently stored is the
+    /// same connection identified by `stable_id`. Returns true when it removed a
+    /// matching connection, false when the stored connection is a different
+    /// (newer) one or the peer is already absent.
+    ///
+    /// This guards the ABA race described on [`forward::DisconnectEvent`]: a
+    /// stale connection's delayed disconnect must not evict the fresh connection
+    /// that already replaced it in the table after a peer re-dialed.
+    pub fn remove_peer_from_network_if(
+        &self,
+        ip: &Ipv4Addr,
+        ipv6: &Ipv6Addr,
+        network: &str,
+        stable_id: usize,
+    ) -> bool {
+        // Read-and-compare in its own statement so the DashMap read guard is
+        // dropped before remove_peer_from_network takes a write guard on the
+        // same shard.
+        let matches = self
+            .v4
+            .get(ip)
+            .and_then(|e| e.conns.get(network).map(|c| c.stable_id() == stable_id))
+            .unwrap_or(false);
+        if !matches {
+            return false;
+        }
+        self.remove_peer_from_network(ip, ipv6, network);
+        true
+    }
+
     /// One connection per peer (deterministic pick), for global broadcasts.
     pub fn all_connections(&self) -> Vec<(Ipv4Addr, Connection)> {
         self.v4

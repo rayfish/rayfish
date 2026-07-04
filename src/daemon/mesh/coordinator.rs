@@ -30,10 +30,24 @@ pub(crate) fn spawn_peer_cleanup(
                 event = disconnect_rx.recv() => {
                     match event {
                         Some(ev) => {
+                            // Drop only this network's route, and only if the
+                            // stored connection is still the one that died. A
+                            // peer that was killed and re-dialed with the same
+                            // identity already has a fresh connection registered;
+                            // the stale connection's delayed disconnect must not
+                            // evict it (see DisconnectEvent::conn_stable_id).
+                            let removed = match ev.conn_stable_id {
+                                Some(id) => peers.remove_peer_from_network_if(&ev.ip, &ev.ipv6, &ev.network, id),
+                                None => {
+                                    peers.remove_peer_from_network(&ev.ip, &ev.ipv6, &ev.network);
+                                    true
+                                }
+                            };
+                            if !removed {
+                                tracing::debug!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, network = %ev.network, "ignoring stale disconnect; peer already reconnected");
+                                continue;
+                            }
                             tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, network = %ev.network, intentional = ev.intentional, "removing dead peer");
-                            // Drop only this network's route; a multi-homed peer
-                            // stays reachable via its other networks.
-                            peers.remove_peer_from_network(&ev.ip, &ev.ipv6, &ev.network);
 
                             // A deliberate `ray leave` (graceful close with the
                             // leave code) prunes the member from the roster and

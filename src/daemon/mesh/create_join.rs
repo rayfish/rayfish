@@ -771,6 +771,9 @@ impl MeshManager {
                         ipv6: derive_ipv6(&m.identity),
                         network: ctx.display_name.to_string(),
                         intentional: false,
+                        // Synthetic cold-restore kick: no live connection backs
+                        // it, so it must always drive the reconnect dial.
+                        conn_stable_id: None,
                     })
                     .await;
             }
