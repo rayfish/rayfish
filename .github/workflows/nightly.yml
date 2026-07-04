@@ -131,7 +131,11 @@ jobs:
 
   android:
     needs: roll-tag
-    runs-on: ubuntu-22.04
+    # 24.04 (glibc 2.39): the prebuilt cargo-ndk from install-action is linked
+    # against glibc 2.39 and won't load on 22.04 (glibc 2.35). Safe here because
+    # this job's output is Android-target (bionic .so + APK), so the host glibc
+    # never becomes an end-user floor the way it does for the desktop binaries.
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
