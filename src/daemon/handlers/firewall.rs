@@ -382,7 +382,7 @@ impl DaemonState {
     /// outbound default stays `Allow` — you always initiate freely). `allow`
     /// restores the old permissive inbound posture; `deny` is the secure default.
     /// Inbound ICMP-allow is a separate built-in default and is unaffected.
-    pub(crate) fn firewall_default(&self, action: firewall::Action) -> IpcMessage {
+    pub fn firewall_default(&self, action: firewall::Action) -> IpcMessage {
         let mut config = (*self.firewall.get_config()).clone();
         config.default_inbound = action;
         self.firewall.update(config.clone());

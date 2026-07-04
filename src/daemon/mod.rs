@@ -1505,11 +1505,20 @@ impl DaemonState {
     /// The device cert to present when joining, preferring the on-disk copy so a
     /// join issued right after pairing (same process, no restart) carries the
     /// freshly stored cert rather than the value loaded at startup.
-    fn current_device_cert(&self) -> Option<control::DeviceCert> {
+    pub fn current_device_cert(&self) -> Option<control::DeviceCert> {
         identity::load_device_cert()
             .ok()
             .flatten()
             .or_else(|| self.device_cert.clone())
+    }
+
+    /// Cancel the daemon-wide shutdown token, tearing down every network's run
+    /// loop, the accept loop, and the data-plane forward tasks. The iroh
+    /// endpoint closes once the last `Arc<DaemonState>` clone drops as those
+    /// tasks wind down. Same effect as the desktop `IpcMessage::Shutdown`; used
+    /// by mobile to go fully offline when the tunnel is disabled.
+    pub fn trigger_shutdown(&self) {
+        self.shutdown_token.cancel();
     }
 
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept

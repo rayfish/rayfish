@@ -189,7 +189,7 @@ impl DaemonState {
     }
 
     /// `ray connections`: list pending incoming connect requests.
-    pub(crate) fn list_connections(&self) -> IpcMessage {
+    pub fn list_connections(&self) -> IpcMessage {
         let now = Instant::now();
         let requests = self
             .protocol_router
@@ -223,9 +223,37 @@ impl DaemonState {
         crate::hostname::resolve_collision(&base, &taken_refs)
     }
 
+    /// Decline a pending connect request: drop it without minting a network. The
+    /// requester's retry loop eventually times out.
+    pub fn reject_connect(&self, id_prefix: &str) -> IpcMessage {
+        let found = self
+            .protocol_router
+            .pending_connects
+            .iter()
+            .find(|p| {
+                p.from_contact_id
+                    .fmt_short()
+                    .to_string()
+                    .starts_with(id_prefix)
+                    || p.from_contact_id.to_string().starts_with(id_prefix)
+            })
+            .map(|p| *p.key());
+        match found {
+            Some(peer) => {
+                self.protocol_router.pending_connects.remove(&peer);
+                IpcMessage::Ok {
+                    message: format!("declined connection request '{id_prefix}'"),
+                }
+            }
+            None => IpcMessage::Error {
+                message: format!("no pending connection request matching '{id_prefix}'"),
+            },
+        }
+    }
+
     /// `ray connections approve <id>`: approve a pending connect request, minting
     /// a 2-peer network with the requester pre-approved.
-    pub(crate) async fn approve_connection(self: &Arc<Self>, id_prefix: &str) -> IpcMessage {
+    pub async fn approve_connection(self: &Arc<Self>, id_prefix: &str) -> IpcMessage {
         let found = self
             .protocol_router
             .pending_connects
