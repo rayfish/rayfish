@@ -1,9 +1,9 @@
-//! Invite + join-request handlers for `DaemonState`: mint/list/revoke invites and
+//! Invite + join-request handlers for `MeshManager`: mint/list/revoke invites and
 //! reusable keys, list/accept/deny pending join requests. Split out of `daemon/mod.rs`.
 
 use super::super::*;
 
-impl DaemonState {
+impl MeshManager {
     pub(crate) async fn invite_create(
         &self,
         network: &str,

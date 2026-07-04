@@ -1,12 +1,49 @@
-//! Network create + join handlers for `DaemonState`: `create_network*`, the join
+//! Network create + join handlers for `MeshManager`: `create_network*`, the join
 //! handshake (`join_network*`, dial/fetch/restore-roster helpers). Split out of `daemon/mod.rs`.
 
 use super::super::*;
-use iroh_blobs::Hash;
-use std::sync::RwLock;
-use tokio::sync::{Mutex, Notify};
 
-impl DaemonState {
+/// Borrowed bundle of the per-join inputs threaded through the dial + finalize
+/// phases of `join_network_inner`, so each phase takes one argument instead of a
+/// dozen. The references point at locals that live for the whole join.
+struct JoinContext<'a> {
+    display_name: &'a str,
+    my_hostname: &'a str,
+    alpn: &'a [u8],
+    my_ip: Ipv4Addr,
+    net_pubkey: EndpointId,
+    /// Single-use invite secret to redeem at admission, if any. Cloned per dial
+    /// attempt (a fresh join may try several coordinators).
+    invite: Option<Vec<u8>>,
+    auto_accept_firewall: bool,
+    /// Seed for per-network auto-accept of file offers from own devices
+    /// (`--auto-accept-files`); persisted, config wins on reconnect/restore.
+    auto_accept_files: bool,
+    invite_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Pinned coordinator to dial first (the invite minter), if known.
+    coordinator: Option<EndpointId>,
+}
+
+/// A live mesh connection produced by the dial phase: the per-network state cell
+/// plus the cancellation token, disconnect channel, and background tasks that
+/// `finalize_join` folds into the `NetworkHandle`.
+struct EstablishedMesh {
+    state: SharedNetworkState,
+    cancel: CancellationToken,
+    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Tear down a failed dial attempt: cancel the token and abort every spawned
+/// task. Used on each unreachable/denied coordinator before trying the next.
+fn abort_join_tasks(cancel: &CancellationToken, tasks: Vec<tokio::task::JoinHandle<()>>) {
+    cancel.cancel();
+    for t in tasks {
+        t.abort();
+    }
+}
+
+impl MeshManager {
     /// Refresh the network's blob snapshot, store its bytes in the local blob
     /// store, and publish the network-key-signed pkarr record (blob hash + this
     /// endpoint as the seed peer). Shared by network creation and coordinator
@@ -26,13 +63,9 @@ impl DaemonState {
                 .as_ref()
                 .map(|s| s.hash)
                 .expect("snapshot set");
-            if let Err(e) = dht::publish_network(
-                &pkarr_client,
-                net_secret_key,
-                &blob_hash,
-                &[self.endpoint.id()],
-            )
-            .await
+            if let Err(e) =
+                dht::publish_network(&pkarr_client, net_secret_key, &blob_hash, &[self.endpoint.id()])
+                    .await
             {
                 tracing::warn!(error = %e, "failed to publish network record");
             }
@@ -48,9 +81,12 @@ impl DaemonState {
         name: &str,
         net_secret_key: &SecretKey,
         state: &SharedNetworkState,
-        dht_notify: &Arc<Notify>,
+        dht_notify: &Arc<tokio::sync::Notify>,
         cancel: &CancellationToken,
-    ) -> (Vec<JoinHandle<()>>, mpsc::Sender<forward::DisconnectEvent>) {
+    ) -> (
+        Vec<tokio::task::JoinHandle<()>>,
+        mpsc::Sender<forward::DisconnectEvent>,
+    ) {
         let mut tasks = Vec::new();
 
         // Network publisher (single pkarr record: blob hash + seed peers)
@@ -77,8 +113,8 @@ impl DaemonState {
                 state: state.clone(),
                 blob_store: self.blob_store.clone(),
                 dht_notify: Some(dht_notify.clone()),
-                hostname_table: self.hostname_table.clone(),
-                reverse_table: self.reverse_table.clone(),
+                hostname_table: self.dns.hostname_table.clone(),
+                reverse_table: self.dns.reverse_table.clone(),
                 device_user_map: self.device_user_map.clone(),
                 network_name: name.to_string(),
             }),
@@ -111,6 +147,66 @@ impl DaemonState {
     /// `ray status` can tag it). `pre_approve` adds a peer to the `ApprovedList`
     /// before the blob is signed/published, so the named peer can be welcomed
     /// without a separate `ray accept` round-trip — used by `approve_connection`.
+    /// Build the initial [`NetworkState`] for a freshly created network: the
+    /// creator as sole coordinator, plus any `pre_approve` peer (a `ray connect`
+    /// requester) admitted up front so the published blob already carries the
+    /// approval and the peer is welcomed on its join without a separate
+    /// `ray accept`.
+    fn build_initial_roster(
+        &self,
+        name: &str,
+        my_ip: Ipv4Addr,
+        my_hostname: &str,
+        mode: GroupMode,
+        net_secret_key: &SecretKey,
+        pre_approve: Option<(EndpointId, Option<String>)>,
+    ) -> Result<NetworkState> {
+        let mut member_list = MemberList::new();
+        member_list
+            .add(Member {
+                identity: self.identity.local_identity(),
+                ip: my_ip,
+                is_coordinator: true,
+                hostname: Some(my_hostname.to_string()),
+                user_identity: None,
+                device_cert: None,
+                collision_index: 0,
+            })
+            .expect("self-add cannot collide");
+
+        let mut approved = ApprovedList::new();
+        if let Some((peer_id, peer_hostname)) = pre_approve {
+            let peer_ip = self.identity.derive_ip(&peer_id);
+            approved
+                .approve(
+                    ApprovedEntry {
+                        identity: peer_id,
+                        ip: peer_ip,
+                        hostname: peer_hostname,
+                        user_identity: None,
+                        device_cert: None,
+                        collision_index: 0,
+                    },
+                    &member_list,
+                )
+                .map_err(|e| anyhow::anyhow!("failed to pre-approve peer: {e:?}"))?;
+        }
+
+        Ok(NetworkState {
+            members: member_list,
+            approved,
+            snapshot: None,
+            network_secret_key: Some(net_secret_key.clone()),
+            network_public_key: net_secret_key.public(),
+            network_name: Some(name.to_string()),
+            mode,
+            suggested_firewall: SuggestedFirewall::default(),
+            reusable_keys: BTreeMap::new(),
+            pending_suggestions: Vec::new(),
+            pending: HashMap::new(),
+        })
+    }
+
     pub(crate) async fn create_network_inner(
         &self,
         mode: GroupMode,
@@ -156,64 +252,19 @@ impl DaemonState {
                 .unwrap_or_else(crate::hostname::generate_hostname),
         };
 
-        let mut member_list = MemberList::new();
-        member_list
-            .add(Member {
-                identity: self.identity.local_identity(),
-                ip: my_ip,
-                is_coordinator: true,
-                hostname: Some(my_hostname.clone()),
-                user_identity: None,
-                device_cert: None,
-                collision_index: 0,
-            })
-            .expect("self-add cannot collide");
+        let mut net_state =
+            self.build_initial_roster(&name, my_ip, &my_hostname, mode, &net_secret_key, pre_approve)?;
 
         // Register in DNS hostname table
         dns::update_hostname(
-            &self.hostname_table,
-            &self.reverse_table,
+            &self.dns.hostname_table,
+            &self.dns.reverse_table,
             &name,
             &my_hostname,
             my_ip,
             derive_ipv6(&self.identity.local_identity()),
         )
         .await;
-
-        let mut approved = ApprovedList::new();
-        // Pre-approve the requesting peer (ray connect), so the published blob
-        // already carries the approval and the peer is welcomed on its join
-        // without a separate `ray accept`.
-        if let Some((peer_id, peer_hostname)) = pre_approve {
-            let peer_ip = self.identity.derive_ip(&peer_id);
-            approved
-                .approve(
-                    ApprovedEntry {
-                        identity: peer_id,
-                        ip: peer_ip,
-                        hostname: peer_hostname,
-                        user_identity: None,
-                        device_cert: None,
-                        collision_index: 0,
-                    },
-                    &member_list,
-                )
-                .map_err(|e| anyhow::anyhow!("failed to pre-approve peer: {e:?}"))?;
-        }
-
-        let mut net_state = NetworkState {
-            members: member_list,
-            approved,
-            snapshot: None,
-            network_secret_key: Some(net_secret_key.clone()),
-            network_public_key: net_public_key,
-            network_name: Some(name.clone()),
-            mode,
-            suggested_firewall: SuggestedFirewall::default(),
-            reusable_keys: BTreeMap::new(),
-            pending_suggestions: Vec::new(),
-            pending: HashMap::new(),
-        };
 
         self.seal_and_publish(&mut net_state, &net_secret_key).await;
 
@@ -240,16 +291,11 @@ impl DaemonState {
         })?;
 
         let cancel = self.shutdown_token.child_token();
-        let state = Arc::new(RwLock::new(net_state));
-        let invite_lock = Arc::new(Mutex::new(()));
-        let dht_notify = Arc::new(Notify::new());
-        let (tasks, disconnect_tx) = self.spawn_coordinator_background_tasks(
-            &name,
-            &net_secret_key,
-            &state,
-            &dht_notify,
-            &cancel,
-        );
+        let state = Arc::new(std::sync::RwLock::new(net_state));
+        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let dht_notify = Arc::new(tokio::sync::Notify::new());
+        let (tasks, disconnect_tx) =
+            self.spawn_coordinator_background_tasks(&name, &net_secret_key, &state, &dht_notify, &cancel);
 
         // Insert the handle first so register_coordinator_handler can update the role.
         let handle = NetworkHandle {
@@ -390,51 +436,7 @@ impl DaemonState {
             anyhow::bail!("already in network '{a}'");
         }
 
-        // Resolve single pkarr record → (blob_hash, seed_peers)
-        let pkarr_client = dht::create_pkarr_client(&self.endpoint)?;
-        let record = dht::resolve_network_packet(&pkarr_client, net_pubkey)
-            .await
-            .context("failed to resolve network record")?;
-
-        // Pre-dial mesh-protocol compatibility check. The versioned ALPN is the
-        // hard gate, but it fails opaquely ("couldn't connect"). The record is
-        // network-key-signed and fetched before dialing, so comparing the
-        // coordinator's advertised mesh version here lets us surface a precise,
-        // actionable error instead. Absent version (older record) ⇒ skip and let
-        // the ALPN gate decide.
-        if let Some(net_ver) = dht::mesh_version_from_record(&record) {
-            let mine = transport::MESH_PROTOCOL_VERSION;
-            anyhow::ensure!(
-                net_ver == mine,
-                "incompatible mesh protocol: this network runs v{net_ver}, this build speaks v{mine} \
-                 — run `ray update` so both sides match"
-            );
-        }
-
-        let (expected_hash, peer_ids) =
-            dht::decode_network_record(&record).context("invalid network record")?;
-
-        if peer_ids.is_empty() {
-            anyhow::bail!("no peers found in network record");
-        }
-
-        let blob_hash = Hash::from_bytes(*expected_hash.as_bytes());
-
-        let mut group_blob = None;
-        for peer_id in &peer_ids {
-            match self.try_fetch_group_blob(*peer_id, blob_hash).await {
-                Ok(data) => {
-                    group_blob = Some(data);
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(peer = %peer_id.fmt_short(), error = %e, "failed to fetch blob");
-                    continue;
-                }
-            }
-        }
-
-        let data = group_blob.context("could not fetch group blob from any peer")?;
+        let data = self.resolve_and_fetch_blob(net_pubkey).await?;
 
         let alpn = transport::network_alpn(&net_pubkey);
         let my_ip = self.identity.local_ip();
@@ -464,286 +466,372 @@ impl DaemonState {
                 .unwrap_or_else(crate::hostname::generate_hostname),
         };
 
-        // Dial-fallback loop (fresh joins only): try each coordinator in order
-        // (minter first, then other coordinators from the blob) until one
-        // welcomes us. JoinPending means this coordinator accepted the request
-        // and queued it — stop here and let the caller retry with backoff.
-        // JoinDenied / unreachable → advance to the next coordinator.
-        // For reconnects/restores (initial=false) the coordinator speaks first,
-        // so we keep the existing single-coordinator path.
         // One invite-ledger lock for this network, shared between the join's
         // control listener (which may handle InviteShare/InviteUsed once this
         // node is promoted to co-coordinator) and the coordinator handler we may
         // register below — so all ledger access stays serialized.
-        let invite_lock = Arc::new(Mutex::new(()));
+        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
 
-        let (state, cancel, disconnect_tx, tasks) = if initial {
-            let my_id = self.identity.local_identity();
-            // When there is no invite, use my own id as the nominal minter;
-            // coordinator_dial_order filters it out (minter != me check), so we
-            // simply get all coordinators from the blob in order.
-            let minter = coordinator.unwrap_or(my_id);
-            let order = coordinator_dial_order(minter, &data.members, my_id);
-            if order.is_empty() {
-                anyhow::bail!("no coordinator found in network record");
-            }
+        let ctx = JoinContext {
+            display_name,
+            my_hostname: &my_hostname,
+            alpn: &alpn,
+            my_ip,
+            net_pubkey,
+            invite,
+            auto_accept_firewall,
+            auto_accept_files,
+            invite_lock: invite_lock.clone(),
+            coordinator,
+        };
 
-            // Resources produced by a successful coordinator handshake.
-            type JoinResources = (
-                SharedNetworkState,
-                CancellationToken,
-                mpsc::Sender<forward::DisconnectEvent>,
-                Vec<JoinHandle<()>>,
+        // Establish the mesh link. A fresh join tries each coordinator in the
+        // blob's dial order (minter first) until one welcomes us; a reconnect/
+        // restore uses the legacy single-coordinator handshake where the
+        // coordinator speaks first. Either may return `None` (closed network,
+        // queued for `ray accept`) — propagate that to the caller as `Pending`.
+        let established = if initial {
+            self.dial_fresh_join(&ctx, &data).await?
+        } else {
+            self.dial_reconnect(&ctx, &data).await?
+        };
+        let Some(mesh) = established else {
+            return Ok(TryJoin::Pending);
+        };
+
+        self.finalize_join(ctx, &data, mesh).await
+    }
+
+    /// Resolve a network's signed pkarr record, gate on mesh-protocol version,
+    /// and fetch + verify its `GroupBlob` from a seed peer. The version check is
+    /// a pre-dial courtesy: the versioned ALPN is the hard gate but fails
+    /// opaquely, so comparing the network-key-signed record up front yields a
+    /// precise, actionable error instead.
+    async fn resolve_and_fetch_blob(
+        &self,
+        net_pubkey: EndpointId,
+    ) -> Result<crate::membership::GroupBlob> {
+        let pkarr_client = dht::create_pkarr_client(&self.endpoint)?;
+        let record = dht::resolve_network_packet(&pkarr_client, net_pubkey)
+            .await
+            .context("failed to resolve network record")?;
+
+        // Absent version (older record) ⇒ skip and let the ALPN gate decide.
+        if let Some(net_ver) = dht::mesh_version_from_record(&record) {
+            let mine = transport::MESH_PROTOCOL_VERSION;
+            anyhow::ensure!(
+                net_ver == mine,
+                "incompatible mesh protocol: this network runs v{net_ver}, this build speaks v{mine} \
+                 — run `ray update` so both sides match"
             );
-            let mut last_err = anyhow::anyhow!("no coordinators tried");
-            let mut found: Option<JoinResources> = None;
+        }
 
-            for coordinator_id in &order {
-                let cancel = self.shutdown_token.child_token();
-                let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
-                let tasks = vec![spawn_reconnect_loop(
-                    disconnect_rx,
-                    self.endpoint.clone(),
-                    alpn.clone(),
-                    display_name.to_string(),
-                    my_id,
-                    my_ip,
-                    self.mesh_ctx(),
-                    disconnect_tx.clone(),
-                    cancel.clone(),
-                    self.device_cert.clone(),
-                )];
+        let (expected_hash, peer_ids) =
+            dht::decode_network_record(&record).context("invalid network record")?;
+        if peer_ids.is_empty() {
+            anyhow::bail!("no peers found in network record");
+        }
+        let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
 
-                tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
-                let conn = match transport::connect_to_peer_with_alpn(
-                    &self.endpoint,
-                    *coordinator_id,
-                    &alpn,
-                )
-                .await
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator unreachable, trying next");
-                        cancel.cancel();
-                        for t in tasks {
-                            t.abort();
-                        }
-                        last_err = anyhow::anyhow!("coordinator offline: {e}");
-                        continue;
-                    }
-                };
-
-                match join_mesh_shared(
-                    conn,
-                    &self.endpoint,
-                    display_name,
-                    &alpn,
-                    self.mesh_ctx(),
-                    JoinParams {
-                        my_hostname: Some(my_hostname.clone()),
-                        net_pubkey,
-                        device_cert: self.device_cert.clone(),
-                        invite_secret: invite.clone(),
-                        suggested_firewall: data.suggested_firewall.clone(),
-                        reusable_keys: data.reusable_keys.clone(),
-                        auto_accept_firewall,
-                        auto_accept_files,
-                        initial: true,
-                    },
-                    disconnect_tx.clone(),
-                    cancel.clone(),
-                    self.promote_tx.clone(),
-                    invite_lock.clone(),
-                    self.protocol_router.pending_pongs.clone(),
-                )
-                .await
-                {
-                    Ok(JoinResult::Joined(state)) => {
-                        found = Some((state, cancel, disconnect_tx, tasks));
-                        break;
-                    }
-                    Ok(JoinResult::Pending) => {
-                        // This coordinator queued the request — don't try the
-                        // next; let the caller retry with backoff until accepted.
-                        cancel.cancel();
-                        for t in tasks {
-                            t.abort();
-                        }
-                        return Ok(TryJoin::Pending);
-                    }
-                    Err(e) => {
-                        tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator denied or unreachable, trying next");
-                        cancel.cancel();
-                        for t in tasks {
-                            t.abort();
-                        }
-                        last_err = e;
-                        continue;
-                    }
+        for peer_id in &peer_ids {
+            match self.try_fetch_group_blob(*peer_id, blob_hash).await {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    tracing::warn!(peer = %peer_id.fmt_short(), error = %e, "failed to fetch blob");
                 }
             }
+        }
+        anyhow::bail!("could not fetch group blob from any peer")
+    }
 
-            match found {
-                Some(resources) => resources,
-                None => anyhow::bail!(
-                    "no coordinator admitted the join (tried {}): {last_err:#}",
-                    order.len()
-                ),
-            }
-        } else {
-            // Reconnect/restore: coordinator speaks first; pick the single
-            // coordinator from the blob (same as the original path).
-            let coordinator_id = coordinator
-                .or_else(|| {
-                    data.members
-                        .iter()
-                        .find(|m| m.is_coordinator)
-                        .map(|m| m.identity)
-                })
-                .context("no coordinator found in network record")?;
+    /// Fresh-join dial: try each coordinator in `coordinator_dial_order` (minter
+    /// first) until one welcomes us. `Ok(None)` means a coordinator queued the
+    /// request (`JoinPending`) and we stop there; the caller retries with backoff
+    /// until `ray accept` admits us.
+    async fn dial_fresh_join(
+        self: &Arc<Self>,
+        ctx: &JoinContext<'_>,
+        data: &crate::membership::GroupBlob,
+    ) -> Result<Option<EstablishedMesh>> {
+        let my_id = self.identity.local_identity();
+        // With no invite, use our own id as the nominal minter;
+        // coordinator_dial_order filters it out (minter != me), so we just get
+        // all blob coordinators in order.
+        let minter = ctx.coordinator.unwrap_or(my_id);
+        let order = coordinator_dial_order(minter, &data.members, my_id);
+        if order.is_empty() {
+            anyhow::bail!("no coordinator found in network record");
+        }
 
-            // The reconnect loop is spawned unconditionally and up front. A
-            // member already holds the verified blob, so being *in* the network
-            // does not depend on the coordinator answering right now: if it is
-            // offline at restore we still register the network from the blob and
-            // let this loop dial it back when it returns. Without this a member
-            // that reboots while its coordinator is down silently drops the
-            // network from its running state until a lucky restart.
+        let mut last_err = anyhow::anyhow!("no coordinators tried");
+        for coordinator_id in &order {
             let cancel = self.shutdown_token.child_token();
             let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
-            let tasks = vec![spawn_reconnect_loop(
-                disconnect_rx,
-                self.endpoint.clone(),
-                alpn.clone(),
-                display_name.to_string(),
-                self.identity.local_identity(),
-                my_ip,
-                self.mesh_ctx(),
-                disconnect_tx.clone(),
-                cancel.clone(),
-                self.device_cert.clone(),
-            )];
-
-            // Fallback state built straight from the verified blob so
-            // registration never blocks on (or dies with) the coordinator
-            // handshake.
-            let state_from_blob = || {
-                let mut ns = NetworkState {
-                    members: MemberList::from_members(data.members.clone()),
-                    approved: ApprovedList::from_entries(data.approved.clone()),
-                    snapshot: None,
-                    network_secret_key: None,
-                    network_public_key: net_pubkey,
-                    network_name: Some(display_name.to_string()),
-                    mode: GroupMode::Restricted,
-                    suggested_firewall: data.suggested_firewall.clone(),
-                    reusable_keys: data.reusable_keys.clone(),
-                    pending_suggestions: Vec::new(),
-                    pending: HashMap::new(),
-                };
-                ns.refresh_snapshot();
-                Arc::new(RwLock::new(ns))
-            };
+            let tasks = vec![self.spawn_join_reconnect(ctx, my_id, &disconnect_tx, disconnect_rx, &cancel)];
 
             tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
-            let mut seed_from_blob = false;
-            let state = match transport::connect_to_peer_with_alpn(
+            let conn = match transport::connect_to_peer_with_alpn(
                 &self.endpoint,
-                coordinator_id,
-                &alpn,
+                *coordinator_id,
+                ctx.alpn,
             )
             .await
             {
-                Ok(conn) => match join_mesh_shared(
-                    conn,
-                    &self.endpoint,
-                    display_name,
-                    &alpn,
-                    self.mesh_ctx(),
-                    JoinParams {
-                        my_hostname: Some(my_hostname.clone()),
-                        net_pubkey,
-                        device_cert: self.device_cert.clone(),
-                        invite_secret: invite,
-                        suggested_firewall: data.suggested_firewall.clone(),
-                        reusable_keys: data.reusable_keys.clone(),
-                        auto_accept_firewall,
-                        auto_accept_files,
-                        initial: false,
-                    },
-                    disconnect_tx.clone(),
-                    cancel.clone(),
-                    self.promote_tx.clone(),
-                    invite_lock.clone(),
-                    self.protocol_router.pending_pongs.clone(),
-                )
-                .await
-                {
-                    Ok(JoinResult::Joined(state)) => state,
-                    Ok(JoinResult::Pending) => {
-                        // Closed network: we've been queued for live approval.
-                        // Stop the just-spawned reconnect loop (nothing is
-                        // connected yet) and let the caller retry on a backoff
-                        // until `ray accept` lets us in.
-                        cancel.cancel();
-                        for t in tasks {
-                            t.abort();
-                        }
-                        return Ok(TryJoin::Pending);
-                    }
-                    Err(e) => {
-                        // Dialed the coordinator but the handshake failed. We
-                        // still hold the verified blob, so register from it and
-                        // let the reconnect loop recover rather than dropping the
-                        // network entirely.
-                        tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator handshake failed on restore; registering from blob, reconnect loop will retry");
-                        seed_from_blob = true;
-                        state_from_blob()
-                    }
-                },
+                Ok(c) => c,
                 Err(e) => {
-                    // Coordinator offline at restore: register from the blob so
-                    // the network stays live; the reconnect loop dials it back
-                    // once it returns.
-                    tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator offline on restore; registering from blob, reconnect loop will retry");
-                    seed_from_blob = true;
-                    state_from_blob()
+                    tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator unreachable, trying next");
+                    abort_join_tasks(&cancel, tasks);
+                    last_err = anyhow::anyhow!("coordinator offline: {e}");
+                    continue;
                 }
             };
 
-            // The reconnect loop is edge-triggered on disconnect events, so a
-            // cold registration (no live connection yet) needs a synthetic kick
-            // per member to start the backoff-retry dial. Only fires when we
-            // registered from the blob without a live handshake.
-            if seed_from_blob {
-                let me = self.identity.local_identity();
-                for m in &data.members {
-                    if m.identity == me {
-                        continue;
-                    }
-                    let _ = disconnect_tx
-                        .send(forward::DisconnectEvent {
-                            endpoint_id: m.identity,
-                            ip: m.ip,
-                            ipv6: derive_ipv6(&m.identity),
-                            network: display_name.to_string(),
-                            intentional: false,
-                        })
-                        .await;
+            match self
+                .run_join_handshake(ctx, data, conn, true, &disconnect_tx, &cancel, ctx.invite.clone())
+                .await
+            {
+                Ok(JoinResult::Joined(state)) => {
+                    return Ok(Some(EstablishedMesh {
+                        state,
+                        cancel,
+                        disconnect_tx,
+                        tasks,
+                    }));
+                }
+                Ok(JoinResult::Pending) => {
+                    // This coordinator queued the request — don't try the next;
+                    // let the caller retry with backoff until accepted.
+                    abort_join_tasks(&cancel, tasks);
+                    return Ok(None);
+                }
+                Err(e) => {
+                    tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator denied or unreachable, trying next");
+                    abort_join_tasks(&cancel, tasks);
+                    last_err = e;
                 }
             }
-            (state, cancel, disconnect_tx, tasks)
+        }
+
+        anyhow::bail!(
+            "no coordinator admitted the join (tried {}): {last_err:#}",
+            order.len()
+        )
+    }
+
+    /// Reconnect/restore dial: the coordinator speaks first, so pick the single
+    /// coordinator from the blob and run the legacy handshake. `Ok(None)` when
+    /// queued for live approval (caller retries on backoff).
+    async fn dial_reconnect(
+        self: &Arc<Self>,
+        ctx: &JoinContext<'_>,
+        data: &crate::membership::GroupBlob,
+    ) -> Result<Option<EstablishedMesh>> {
+        let coordinator_id = ctx
+            .coordinator
+            .or_else(|| {
+                data.members
+                    .iter()
+                    .find(|m| m.is_coordinator)
+                    .map(|m| m.identity)
+            })
+            .context("no coordinator found in network record")?;
+
+        // The reconnect loop is spawned unconditionally and up front. A member
+        // already holds the verified blob, so being *in* the network does not
+        // depend on the coordinator answering right now: if it is offline at
+        // restore we still register the network from the blob and let this loop
+        // dial it back when it returns. Without this a member that reboots while
+        // its coordinator is down silently drops the network from its running
+        // state until a lucky restart.
+        let cancel = self.shutdown_token.child_token();
+        let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
+        let my_id = self.identity.local_identity();
+        let tasks = vec![self.spawn_join_reconnect(ctx, my_id, &disconnect_tx, disconnect_rx, &cancel)];
+
+        // Fallback state built straight from the verified blob so registration
+        // never blocks on (or dies with) the coordinator handshake.
+        let state_from_blob = || {
+            let mut ns = NetworkState {
+                members: MemberList::from_members(data.members.clone()),
+                approved: ApprovedList::from_entries(data.approved.clone()),
+                snapshot: None,
+                network_secret_key: None,
+                network_public_key: ctx.net_pubkey,
+                network_name: Some(ctx.display_name.to_string()),
+                mode: GroupMode::Restricted,
+                suggested_firewall: data.suggested_firewall.clone(),
+                reusable_keys: data.reusable_keys.clone(),
+                pending_suggestions: Vec::new(),
+                pending: HashMap::new(),
+            };
+            ns.refresh_snapshot();
+            Arc::new(std::sync::RwLock::new(ns))
         };
-        let state = state;
+
+        tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
+        let mut seed_from_blob = false;
+        let state = match transport::connect_to_peer_with_alpn(
+            &self.endpoint,
+            coordinator_id,
+            ctx.alpn,
+        )
+        .await
+        {
+            Ok(conn) => match self
+                .run_join_handshake(ctx, data, conn, false, &disconnect_tx, &cancel, ctx.invite.clone())
+                .await
+            {
+                Ok(JoinResult::Joined(state)) => state,
+                Ok(JoinResult::Pending) => {
+                    // Closed network: queued for live approval. Stop the just-
+                    // spawned reconnect loop (nothing connected yet); caller
+                    // retries on a backoff until `ray accept` lets us in.
+                    abort_join_tasks(&cancel, tasks);
+                    return Ok(None);
+                }
+                Err(e) => {
+                    // Dialed the coordinator but the handshake failed. We still
+                    // hold the verified blob, so register from it and let the
+                    // reconnect loop recover rather than dropping the network.
+                    tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator handshake failed on restore; registering from blob, reconnect loop will retry");
+                    seed_from_blob = true;
+                    state_from_blob()
+                }
+            },
+            Err(e) => {
+                // Coordinator offline at restore: register from the blob so the
+                // network stays live; the reconnect loop dials it back once it
+                // returns.
+                tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator offline on restore; registering from blob, reconnect loop will retry");
+                seed_from_blob = true;
+                state_from_blob()
+            }
+        };
+
+        // The reconnect loop is edge-triggered on disconnect events, so a cold
+        // registration (no live connection yet) needs a synthetic kick per member
+        // to start the backoff-retry dial. Only fires when we registered from the
+        // blob without a live handshake.
+        if seed_from_blob {
+            let me = self.identity.local_identity();
+            for m in &data.members {
+                if m.identity == me {
+                    continue;
+                }
+                let _ = disconnect_tx
+                    .send(forward::DisconnectEvent {
+                        endpoint_id: m.identity,
+                        ip: m.ip,
+                        ipv6: derive_ipv6(&m.identity),
+                        network: ctx.display_name.to_string(),
+                        intentional: false,
+                    })
+                    .await;
+            }
+        }
+
+        Ok(Some(EstablishedMesh {
+            state,
+            cancel,
+            disconnect_tx,
+            tasks,
+        }))
+    }
+
+    /// Spawn the per-network reconnect loop used by both dial paths.
+    fn spawn_join_reconnect(
+        &self,
+        ctx: &JoinContext<'_>,
+        my_id: EndpointId,
+        disconnect_tx: &mpsc::Sender<forward::DisconnectEvent>,
+        disconnect_rx: mpsc::Receiver<forward::DisconnectEvent>,
+        cancel: &CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        spawn_reconnect_loop(
+            disconnect_rx,
+            self.endpoint.clone(),
+            ctx.alpn.to_vec(),
+            ctx.display_name.to_string(),
+            my_id,
+            ctx.my_ip,
+            self.mesh_ctx(),
+            disconnect_tx.clone(),
+            cancel.clone(),
+            self.device_cert.clone(),
+        )
+    }
+
+    /// Run the mesh handshake over an established connection (shared by both dial
+    /// paths). `initial` distinguishes a fresh join (we speak first) from a
+    /// reconnect/restore (coordinator speaks first).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_join_handshake(
+        &self,
+        ctx: &JoinContext<'_>,
+        data: &crate::membership::GroupBlob,
+        conn: iroh::endpoint::Connection,
+        initial: bool,
+        disconnect_tx: &mpsc::Sender<forward::DisconnectEvent>,
+        cancel: &CancellationToken,
+        invite_secret: Option<Vec<u8>>,
+    ) -> Result<JoinResult> {
+        join_mesh_shared(
+            conn,
+            &self.endpoint,
+            ctx.display_name,
+            ctx.alpn,
+            self.mesh_ctx(),
+            JoinParams {
+                my_hostname: Some(ctx.my_hostname.to_string()),
+                net_pubkey: ctx.net_pubkey,
+                device_cert: self.device_cert.clone(),
+                invite_secret,
+                suggested_firewall: data.suggested_firewall.clone(),
+                reusable_keys: data.reusable_keys.clone(),
+                auto_accept_firewall: ctx.auto_accept_firewall,
+                auto_accept_files: ctx.auto_accept_files,
+                initial,
+            },
+            disconnect_tx.clone(),
+            cancel.clone(),
+            self.promote_tx.clone(),
+            ctx.invite_lock.clone(),
+            self.protocol_router.pending_pongs.clone(),
+        )
+        .await
+    }
+
+    /// Register the accept handler, persist the network public key, seed the blob
+    /// store, spawn the membership poller, install the `NetworkHandle`, and sync
+    /// DNS. Runs once the dial phase produced a live mesh connection.
+    async fn finalize_join(
+        self: &Arc<Self>,
+        ctx: JoinContext<'_>,
+        data: &crate::membership::GroupBlob,
+        mesh: EstablishedMesh,
+    ) -> Result<TryJoin> {
+        let EstablishedMesh {
+            state,
+            cancel,
+            disconnect_tx,
+            mut tasks,
+        } = mesh;
+        let JoinContext {
+            display_name,
+            my_hostname,
+            alpn,
+            my_ip,
+            net_pubkey,
+            invite_lock,
+            ..
+        } = ctx;
 
         // A node that already holds the network secret key (e.g. a
         // co-coordinator joining after a config-only restore) should run as
         // Coordinator so it can admit future peers immediately — even though
         // it arrived here via join rather than restore.
         let held_key = state.read().unwrap().network_secret_key.clone();
-        let role = role_for_key_holder(held_key.is_some());
-        match role {
+        match role_for_key_holder(held_key.is_some()) {
             NetworkRole::Coordinator => {
                 let net_public_key = state.read().unwrap().network_public_key;
                 self.register_coordinator_handler(
@@ -760,7 +848,7 @@ impl DaemonState {
             // `role_for_key_holder`; a non-key-holder runs as a plain member.
             NetworkRole::Member | NetworkRole::Direct => {
                 self.protocol_router.register(
-                    alpn.clone(),
+                    alpn.to_vec(),
                     AcceptHandler::Member(Arc::new(MemberAcceptState {
                         ctx: self.mesh_ctx(),
                         network_name: display_name.to_string(),
@@ -795,7 +883,6 @@ impl DaemonState {
         }
 
         // Membership poller
-        let mut tasks = tasks;
         if let Ok(poller_client) = dht::create_pkarr_client(&self.endpoint) {
             tasks.push(spawn_group_poller(
                 poller_client,
@@ -825,10 +912,10 @@ impl DaemonState {
 
         // Register hostnames in DNS table
         dns::update_hostname(
-            &self.hostname_table,
-            &self.reverse_table,
+            &self.dns.hostname_table,
+            &self.dns.reverse_table,
             display_name,
-            &my_hostname,
+            my_hostname,
             my_ip,
             derive_ipv6(&self.identity.local_identity()),
         )
@@ -836,8 +923,8 @@ impl DaemonState {
         for member in &data.members {
             if let Some(ref h) = member.hostname {
                 dns::update_hostname(
-                    &self.hostname_table,
-                    &self.reverse_table,
+                    &self.dns.hostname_table,
+                    &self.dns.reverse_table,
                     display_name,
                     h,
                     member.ip,
@@ -847,7 +934,7 @@ impl DaemonState {
             }
         }
 
-        tracing::info!(network = %display_name, key = %network_key, ip = %my_ip, "joined network");
+        tracing::info!(network = %display_name, key = %net_pubkey, ip = %my_ip, "joined network");
 
         Ok(TryJoin::Joined(IpcMessage::Joined {
             name: display_name.to_string(),
@@ -872,7 +959,7 @@ impl DaemonState {
         let (expected_hash, seed_peers) = dht::resolve_network(&pkarr_client, net_pubkey)
             .await
             .context("resolve pkarr record for roster restore")?;
-        let blob_hash = Hash::from_bytes(*expected_hash.as_bytes());
+        let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
 
         // Local blob store first: the coordinator stored these bytes before
         // publishing, so they're on disk.
@@ -918,7 +1005,7 @@ impl DaemonState {
     pub(crate) async fn try_fetch_group_blob(
         &self,
         peer_id: EndpointId,
-        blob_hash: Hash,
+        blob_hash: iroh_blobs::Hash,
     ) -> Result<crate::membership::GroupBlob> {
         let conn = transport::connect_to_peer_with_alpn(
             &self.endpoint,
@@ -953,7 +1040,7 @@ impl DaemonState {
         let (expected_hash, _peer_ids) = dht::resolve_network(&pkarr_client, net_pubkey).await?;
 
         let my_identity = self.identity.local_identity();
-        let blob_hash = Hash::from_bytes(*expected_hash.as_bytes());
+        let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
 
         let app_config = config::load()?;
         let net_config = app_config
@@ -1040,7 +1127,7 @@ impl DaemonState {
                 pending: HashMap::new(),
             };
             ns.refresh_snapshot();
-            let live_state = Arc::new(RwLock::new(ns));
+            let live_state = Arc::new(std::sync::RwLock::new(ns));
 
             let handle = NetworkHandle {
                 name: network_name.to_string(),
@@ -1051,7 +1138,7 @@ impl DaemonState {
                 dht_notify: None,
                 cancel,
                 tasks,
-                invite_lock: Arc::new(Mutex::new(())),
+                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
                 disconnect_tx,
             };
             self.networks.insert(network_name.to_string(), handle);
@@ -1147,4 +1234,5 @@ impl DaemonState {
             }
         }
     }
+
 }

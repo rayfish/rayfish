@@ -1,9 +1,18 @@
-//! Firewall IPC handlers for [`DaemonState`]: per-device firewall rules and
+//! Firewall IPC handlers for [`MeshManager`]: per-device firewall rules and
 //! coordinator-suggested rules. Split out of `daemon/mod.rs`.
 
 use super::super::*;
 
-impl DaemonState {
+/// Persist firewall config to disk, logging (not failing) on a write error. The
+/// in-memory `ArcSwap` already holds the new rules; a failed write only means
+/// they won't survive a daemon restart.
+fn save_firewall_warn(config: &firewall::FirewallConfig) {
+    if let Err(e) = firewall::save_firewall(config) {
+        tracing::warn!(error = %e, "failed to persist firewall config");
+    }
+}
+
+impl MeshManager {
     // -----------------------------------------------------------------------
     // Firewall handlers
     // -----------------------------------------------------------------------
@@ -93,9 +102,7 @@ impl DaemonState {
             config.rules.insert(0, rule);
         }
         self.firewall.update(config.clone());
-        if let Err(e) = firewall::save_firewall(&config) {
-            tracing::warn!(error = %e, "failed to persist firewall config");
-        }
+        save_firewall_warn(&config);
         let count = ports.len();
         let plural = if count == 1 { "rule" } else { "rules" };
         let message = match unknown_network {
@@ -108,21 +115,15 @@ impl DaemonState {
     }
 
     pub(crate) fn firewall_remove(&self, index: usize) -> IpcMessage {
-        let current = self.firewall.get_config();
-        if index >= current.rules.len() {
+        let len = self.firewall.get_config().rules.len();
+        if index >= len {
             return IpcMessage::Error {
-                message: format!(
-                    "index {index} out of range (have {} rules)",
-                    current.rules.len()
-                ),
+                message: format!("index {index} out of range (have {len} rules)"),
             };
         }
-        let mut config = (*current).clone();
-        config.rules.remove(index);
-        self.firewall.update(config.clone());
-        if let Err(e) = firewall::save_firewall(&config) {
-            tracing::warn!(error = %e, "failed to persist firewall config");
-        }
+        self.edit_firewall(|c| {
+            c.rules.remove(index);
+        });
         IpcMessage::Ok {
             message: "rule removed".to_string(),
         }
@@ -277,9 +278,7 @@ impl DaemonState {
             // a duplicate (and a re-suggested action flip supersedes the old one).
             let deduped = firewall::dedup_by_selector(existing);
             let config = self.firewall.replace_network_rules(network, deduped);
-            if let Err(e) = firewall::save_firewall(&config) {
-                tracing::warn!(error = %e, "failed to persist firewall config");
-            }
+        save_firewall_warn(&config);
         }
         IpcMessage::Ok {
             message: format!(
@@ -309,9 +308,7 @@ impl DaemonState {
         }
         let count = rules.len();
         let config = self.firewall.replace_network_rules(network, rules);
-        if let Err(e) = firewall::save_firewall(&config) {
-            tracing::warn!(error = %e, "failed to persist firewall config");
-        }
+        save_firewall_warn(&config);
         IpcMessage::Ok {
             message: format!("accepted {count} suggested rules from '{network}'"),
         }
@@ -383,27 +380,27 @@ impl DaemonState {
     /// restores the old permissive inbound posture; `deny` is the secure default.
     /// Inbound ICMP-allow is a separate built-in default and is unaffected.
     pub(crate) fn firewall_default(&self, action: firewall::Action) -> IpcMessage {
-        let mut config = (*self.firewall.get_config()).clone();
-        config.default_inbound = action;
-        self.firewall.update(config.clone());
-        if let Err(e) = firewall::save_firewall(&config) {
-            tracing::warn!(error = %e, "failed to persist firewall config");
-        }
+        self.edit_firewall(|c| c.default_inbound = action);
         IpcMessage::Ok {
             message: format!("inbound default set to {action}"),
         }
     }
 
     pub(crate) fn firewall_reject(&self, enabled: bool) -> IpcMessage {
-        let mut config = (*self.firewall.get_config()).clone();
-        config.reject = enabled;
-        self.firewall.update(config.clone());
-        if let Err(e) = firewall::save_firewall(&config) {
-            tracing::warn!(error = %e, "failed to persist firewall config");
-        }
+        self.edit_firewall(|c| c.reject = enabled);
         IpcMessage::Ok {
             message: format!("fail-fast reject {}", if enabled { "on" } else { "off" }),
         }
+    }
+
+    /// Read-modify-write the live firewall config: clone the current snapshot,
+    /// apply `edit`, swap it into the lock-free `ArcSwap`, and persist (logging on
+    /// write error). Shared by the single-field toggles.
+    fn edit_firewall(&self, edit: impl FnOnce(&mut firewall::FirewallConfig)) {
+        let mut config = (*self.firewall.get_config()).clone();
+        edit(&mut config);
+        self.firewall.update(config.clone());
+        save_firewall_warn(&config);
     }
 
     /// `ray firewall on|off`: the global kill switch. `off` sets
