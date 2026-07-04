@@ -41,6 +41,7 @@ object NodeHolder {
     // Crash reporting is opt-out: on unless the user turns it off in You. See
     // [xyz.rayfish.android.Telemetry], which reads this to gate Sentry init.
     private const val KEY_CRASH_REPORTING = "crash_reporting"
+    private const val KEY_INSTALL_ID = "install_id"
 
     fun isEnabled(context: Context): Boolean =
         context.applicationContext
@@ -62,6 +63,17 @@ object NodeHolder {
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_CRASH_REPORTING, value).apply()
+    }
+
+    /** Stable random id for this install, minted once and persisted. Tags every
+     * diagnostics event so a device's events group together in Sentry. */
+    fun installId(context: Context): String {
+        val prefs = context.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.getString(KEY_INSTALL_ID, null)?.let { return it }
+        val id = java.util.UUID.randomUUID().toString()
+        prefs.edit().putString(KEY_INSTALL_ID, id).apply()
+        return id
     }
 
     /**
