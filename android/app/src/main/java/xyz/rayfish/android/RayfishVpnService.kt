@@ -132,10 +132,14 @@ class RayfishVpnService : VpnService() {
     }
 
     private fun stopTunnel() {
+        // Disable on mobile means go offline, not standby: tear the whole control
+        // plane down (cancels the daemon shutdown token, closes the endpoint) so
+        // the device drops out of the mesh immediately. stopNode also clears the
+        // started flag so a later enable rebuilds the daemon.
         try {
-            NodeHolder.get(applicationContext).down()
+            NodeHolder.stopNode(applicationContext)
         } catch (t: Throwable) {
-            Log.w(TAG, "Node.down failed (may not have been up)", t)
+            Log.w(TAG, "Node stop failed (may not have been up)", t)
         }
         try {
             tunnel?.close()

@@ -28,6 +28,12 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
     var editing by remember { mutableStateOf(false) }
     var hostnameInput by remember { mutableStateOf("") }
     var pairingTicket by remember { mutableStateOf<String?>(null) }
+    var paired by remember { mutableStateOf(false) }
+    // A device that already holds a cert cannot pair again (it must not mint new
+    // certs). Refresh whenever status changes so the card flips right after a pair.
+    LaunchedEffect(status?.nodeId) {
+        paired = withContext(Dispatchers.IO) { runCatching { NodeHolder.get(context).isPaired() }.getOrDefault(false) }
+    }
     val version = remember {
         runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull() ?: "-"
     }
@@ -67,17 +73,22 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         }
         SectionCard {
             SectionLabel("Pairing")
-            Text("Pair another of your devices: show it a code, or scan the code it shows.",
-                fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
-            Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                PillButton("Show my code", onClick = {
-                    scope.launch {
-                        try { pairingTicket = withContext(Dispatchers.IO) { NodeHolder.get(context).startPairing() } }
-                        catch (t: Throwable) { onToast("Pairing failed: ${t.message}") }
-                    }
-                }, modifier = Modifier.weight(1f))
-                OutlinePillButton("Scan a code", onClick = scan, modifier = Modifier.weight(1f))
+            if (paired) {
+                Text("This device is paired. Add new devices from your primary device.",
+                    fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
+            } else {
+                Text("Pair another of your devices: show it a code, or scan the code it shows.",
+                    fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    PillButton("Show my code", onClick = {
+                        scope.launch {
+                            try { pairingTicket = withContext(Dispatchers.IO) { NodeHolder.get(context).startPairing() } }
+                            catch (t: Throwable) { onToast("Pairing failed: ${t.message}") }
+                        }
+                    }, modifier = Modifier.weight(1f))
+                    OutlinePillButton("Scan a code", onClick = scan, modifier = Modifier.weight(1f))
+                }
             }
         }
         SectionCard {
@@ -92,14 +103,23 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         AlertDialog(
             onDismissRequest = { editing = false },
             containerColor = Rf.Sheet,
-            title = { Text("Hostname on ${firstNet.name}", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
-            text = { RayfishTextField(hostnameInput, { hostnameInput = it }, "lowercase, 1-63 chars") },
+            title = { Text("Hostname", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    RayfishTextField(hostnameInput, { hostnameInput = it }, "lowercase, 1-63 chars")
+                    Text("Applies to all your networks.", fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint)
+                }
+            },
             confirmButton = {
                 TextButton(onClick = {
                     val h = hostnameInput.trim()
+                    val nets = status?.networks.orEmpty()
                     scope.launch {
                         try {
-                            withContext(Dispatchers.IO) { NodeHolder.get(context).setHostname(firstNet.name, h) }
+                            withContext(Dispatchers.IO) {
+                                val node = NodeHolder.get(context)
+                                nets.forEach { node.setHostname(it.name, h) }
+                            }
                             onToast("Hostname set"); onChanged(); editing = false
                         } catch (t: Throwable) { onToast("Invalid hostname: ${t.message}") }
                     }

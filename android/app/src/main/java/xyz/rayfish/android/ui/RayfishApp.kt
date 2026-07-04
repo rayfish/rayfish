@@ -22,8 +22,8 @@ import xyz.rayfish.android.ui.screens.*
 import xyz.rayfish.android.ui.theme.Rf
 
 enum class Tab(val label: String, val icon: ImageVector) {
-    HOME("Home", Icons.Filled.Home),
     NETWORKS("Networks", Icons.Filled.Hub),
+    HOME("Home", Icons.Filled.Home),
     YOU("You", Icons.Filled.AccountCircle),
 }
 

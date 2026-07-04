@@ -1,10 +1,12 @@
 package xyz.rayfish.android.ui.components
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.res.painterResource
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.MoreVert
@@ -31,10 +33,11 @@ fun BrandHeader(title: String? = null, actions: @Composable RowScope.() -> Unit 
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (title == null) {
-            Box(
-                Modifier.size(24.dp).clip(RoundedCornerShape(7.dp)).background(Rf.Rose500),
-                contentAlignment = Alignment.Center,
-            ) { Text("R", fontFamily = PressStart, fontSize = 9.sp, color = Color.White) }
+            Image(
+                painter = painterResource(xyz.rayfish.android.R.mipmap.ic_brand),
+                contentDescription = "Rayfish",
+                modifier = Modifier.size(26.dp).clip(RoundedCornerShape(7.dp)),
+            )
             Spacer(Modifier.width(9.dp))
             Text("Rayfish", fontFamily = PressStart, fontSize = 12.sp, color = Rf.Heading)
         } else {
@@ -134,6 +137,45 @@ fun RayfishTextField(value: String, onValueChange: (String) -> Unit, label: Stri
             cursorColor = Rf.Rose500,
         ),
     )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun RayfishDropdown(
+    value: String,
+    options: List<String>,
+    onValueChange: (String) -> Unit,
+    label: String,
+    modifier: Modifier = Modifier,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }, modifier = modifier) {
+        OutlinedTextField(
+            value = value, onValueChange = {}, readOnly = true,
+            label = { Text(label, fontFamily = PlexMono, fontSize = 12.sp) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            singleLine = true,
+            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth(),
+            shape = RoundedCornerShape(11.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Rf.Rose500, unfocusedBorderColor = Rf.CardBorder,
+                focusedTextColor = Rf.Body, unfocusedTextColor = Rf.Body,
+                focusedLabelColor = Rf.Rose400, unfocusedLabelColor = Rf.Faint,
+                focusedTrailingIconColor = Rf.Rose400, unfocusedTrailingIconColor = Rf.Faint,
+            ),
+        )
+        ExposedDropdownMenu(
+            expanded = expanded, onDismissRequest = { expanded = false },
+            containerColor = Color(0xFF27272A),
+        ) {
+            options.forEach { opt ->
+                DropdownMenuItem(
+                    text = { Text(opt, fontFamily = PlexMono, fontSize = 13.sp, color = Rf.Body) },
+                    onClick = { onValueChange(opt); expanded = false },
+                )
+            }
+        }
+    }
 }
 
 @Composable
