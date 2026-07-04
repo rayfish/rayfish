@@ -433,8 +433,6 @@ pub async fn run_mesh<R: crate::tun::TunRead>(
 pub fn spawn_peer_reader(
     conn: Connection,
     peer_id: EndpointId,
-    peer_ip: Ipv4Addr,
-    peer_ipv6: Ipv6Addr,
     peers: PeerTable,
     ctx: ForwardCtx,
 ) -> JoinHandle<()> {
@@ -446,6 +444,13 @@ pub fn spawn_peer_reader(
         stats,
         device_user_map,
     } = ctx;
+    // A peer's v6 mesh address is the 120-bit blake3 of its identity and never
+    // collides, so it is fixed per-identity and derived once here. The v4 address
+    // can carry a collision suffix, so it is resolved per datagram from the peer's
+    // roster entry (see `resolve_inbound_by_id`) rather than captured at spawn —
+    // the reader starts when the connection opens, before the join handshake
+    // assigns the peer's collision-aware v4.
+    let peer_ipv6 = crate::membership::derive_ipv6(&peer_id);
     use tracing::Instrument as _;
     // Tag every event from this reader (drops, connection-lost) with the peer so
     // the report bundle's logs are correlatable per peer. The connection carries
@@ -467,6 +472,12 @@ pub fn spawn_peer_reader(
                                 if ac.error_code == VarInt::from_u32(LEAVE_CODE)
                                     || ac.error_code == VarInt::from_u32(KICK_CODE)
                         );
+                        // The peer's collision-aware v4 comes from its roster
+                        // entry; fall back to the index-0 derivation if the peer
+                        // was never fully registered (dropped mid-handshake).
+                        let peer_ip = peers
+                            .v4_for_id(&peer_id)
+                            .unwrap_or_else(|| crate::membership::derive_ip(&peer_id));
                         tracing::warn!(peer = %peer_id.fmt_short(), ip = %peer_ip, error = %e, intentional, "peer connection lost");
                         let _ = disconnect_tx
                             .send(DisconnectEvent {
@@ -491,19 +502,15 @@ pub fn spawn_peer_reader(
                 stats.record_drop(DropReason::Malformed);
                 continue;
             };
-            // The peer's announced decode table maps the handle to a network.
-            let Some(network) = peers.inbound_network_v4(&peer_ip, handle) else {
-                stats.record_drop(DropReason::Malformed);
-                continue;
-            };
-            // In-band reachability wall: accept a datagram tagged for network `N`
-            // only if *we* currently share `N` with this peer per our own roster.
-            // The peer's handle table alone can't smuggle it into a network we
-            // don't agree it belongs to.
-            if !peers.shares_network_v4(&peer_ip, &network) {
+            // Resolve the peer's mesh v4 + arrival network from the handle in one
+            // pass, which also enforces the in-band reachability wall: it returns
+            // `None` unless the handle maps to a network *we* currently share with
+            // this peer per our own roster. So the peer's handle table alone can't
+            // smuggle a datagram into a network we don't agree it belongs to.
+            let Some((peer_ip, network)) = peers.resolve_inbound_by_id(&peer_id, handle) else {
                 stats.record_drop(DropReason::Spoof);
                 continue;
-            }
+            };
             // Owned, zero-copy view of the IP packet (drops the 2-byte tag).
             let datagram = datagram.slice(TAG_LEN..);
 

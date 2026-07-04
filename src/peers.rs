@@ -41,6 +41,12 @@ pub struct PeerTable {
     /// IPv6 virtual address → peer (same peers as `v4`, keyed by their `200::/7`
     /// address so v6 packets resolve without a v4↔v6 translation step).
     v6: Arc<FastDashMap<Ipv6Addr, PeerEntry>>,
+    /// Endpoint id → the peer's mesh IPv4 (its `v4`/`v6` key). Lets the
+    /// per-connection data reader resolve a peer's mesh addresses from the QUIC
+    /// remote id alone — the reader is spawned when the connection opens, before
+    /// the join handshake assigns the peer's (possibly collision-suffixed) roster
+    /// IP, so it can't be handed the IP up front.
+    by_id: Arc<FastDashMap<EndpointId, Ipv4Addr>>,
     /// Optional append-only audit log. When present, registering a peer's first
     /// connection logs a `connect` event and dropping its last shared network
     /// logs a `disconnect` event. `None` in tests.
@@ -123,6 +129,7 @@ impl PeerTable {
         Self {
             v4: Arc::new(FastDashMap::default()),
             v6: Arc::new(FastDashMap::default()),
+            by_id: Arc::new(FastDashMap::default()),
             audit: None,
         }
     }
@@ -134,6 +141,7 @@ impl PeerTable {
         Self {
             v4: Arc::new(FastDashMap::default()),
             v6: Arc::new(FastDashMap::default()),
+            by_id: Arc::new(FastDashMap::default()),
             audit: Some(audit),
         }
     }
@@ -188,10 +196,36 @@ impl PeerTable {
                 e.out_handles.insert(net.clone(), h);
             }
         }
+        self.by_id.insert(endpoint_id, ip);
         if first_ever && let Some(audit) = &self.audit {
             audit.log_connect(ip, &endpoint_id.to_string());
         }
         conn_changed
+    }
+
+    /// The peer's mesh IPv4, resolved from its endpoint id. Used by the
+    /// per-connection data reader (which knows only the QUIC remote id) to find
+    /// the peer's routing entry. `None` until the peer is registered by the join
+    /// handshake.
+    pub fn v4_for_id(&self, peer_id: &EndpointId) -> Option<Ipv4Addr> {
+        self.by_id.get(peer_id).map(|e| *e.value())
+    }
+
+    /// Resolve an inbound datagram from `peer_id` tagged with `handle` to the
+    /// peer's mesh IPv4 and its arrival network, enforcing the in-band
+    /// reachability wall in one lock pass: returns `Some` only when the peer is
+    /// known, the handle maps to a network the peer announced, **and** our own
+    /// shared-network set with this peer currently contains that network. An
+    /// unknown peer/handle or a network we don't share drops the datagram
+    /// (`None`).
+    pub fn resolve_inbound_by_id(&self, peer_id: &EndpointId, handle: u16) -> Option<(Ipv4Addr, SmolStr)> {
+        let ip = *self.by_id.get(peer_id)?.value();
+        let e = self.v4.get(&ip)?;
+        let network = e.in_handles.get(&handle)?;
+        if !e.networks.contains(network) {
+            return None;
+        }
+        Some((ip, network.clone()))
     }
 
     /// Resolves an IPv4 destination to a [`PeerRoute`], or `None` if no peer with
@@ -245,6 +279,32 @@ impl PeerTable {
             .unwrap_or_default()
     }
 
+    /// The `u16` handle we stamp on datagrams to `ip` for `network`, if assigned.
+    /// Used to announce a single network's handle to the peer after we start
+    /// sharing it (the announcement is per-network, not a full snapshot, so
+    /// networks are added to the peer's decode table incrementally).
+    pub fn out_handle(&self, ip: &Ipv4Addr, network: &str) -> Option<u16> {
+        self.v4.get(ip).and_then(|e| e.out_handles.get(network).copied())
+    }
+
+    /// Merge one `(handle → network)` mapping into a peer's inbound decode table,
+    /// keyed by the peer's endpoint id. Upsert (not replace), so announcing one
+    /// network's handle doesn't clobber the decode entries for the peer's other
+    /// shared networks. A stale entry for a network we no longer share is harmless
+    /// (the reachability check in `resolve_inbound_by_id` drops its datagrams).
+    pub fn add_inbound_handle_by_id(&self, peer_id: &EndpointId, handle: u16, network: SmolStr) {
+        let Some(ip) = self.by_id.get(peer_id).map(|e| *e.value()) else {
+            return;
+        };
+        let ipv6 = crate::membership::derive_ipv6(peer_id);
+        if let Some(mut e) = self.v4.get_mut(&ip) {
+            e.in_handles.insert(handle, network.clone());
+        }
+        if let Some(mut e) = self.v6.get_mut(&ipv6) {
+            e.in_handles.insert(handle, network);
+        }
+    }
+
     /// Resolve a peer by its mesh source IP (v4 or v6) to its transport identity
     /// and the set of networks we currently share with it. Used by the embedded
     /// mesh SSH server to authorize an incoming session: the peer is identified by
@@ -292,6 +352,9 @@ impl PeerTable {
     pub fn remove(&self, ip: &Ipv4Addr, ipv6: &Ipv6Addr) {
         let removed = self.v4.remove(ip);
         self.v6.remove(ipv6);
+        if let Some((_, entry)) = &removed {
+            self.by_id.remove(&entry.endpoint_id);
+        }
         if let (Some((_, entry)), Some(audit)) = (removed, &self.audit) {
             audit.log_disconnect(*ip, &entry.endpoint_id.to_string());
         }
@@ -324,6 +387,9 @@ impl PeerTable {
             e.out_handles.remove(network);
         }
         self.v6.remove_if(ipv6, |_, e| e.networks.is_empty());
+        if let Some(endpoint_id) = dropped_id {
+            self.by_id.remove(&endpoint_id);
+        }
         if let (Some(endpoint_id), Some(audit)) = (dropped_id, &self.audit) {
             audit.log_disconnect(*ip, &endpoint_id.to_string());
         }
@@ -389,6 +455,7 @@ impl PeerTable {
             e.out_handles.remove(network);
             if e.networks.is_empty() {
                 removed.push((*ip, e.conn.clone()));
+                self.by_id.remove(&e.endpoint_id);
                 false
             } else {
                 true
