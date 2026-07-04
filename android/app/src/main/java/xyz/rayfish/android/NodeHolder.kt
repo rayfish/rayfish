@@ -29,6 +29,27 @@ object NodeHolder {
     @Volatile
     private var started = false
 
+    /** True once the daemon is built and not yet stopped. */
+    val isStarted: Boolean get() = started
+
+    // The user's persisted enable/disable intent. This is the authority for
+    // whether the device should be online: the status poll must never start the
+    // node on its own (that resurrects a node the user just disabled), so the
+    // toggle records intent here and only explicit enable brings the node up.
+    private const val PREFS_NAME = "rayfish_node"
+    private const val KEY_ENABLED = "enabled"
+
+    fun isEnabled(context: Context): Boolean =
+        context.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_ENABLED, false)
+
+    fun setEnabled(context: Context, value: Boolean) {
+        context.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_ENABLED, value).apply()
+    }
+
     /**
      * Starts the node exactly once for the process, however many callers race to
      * invoke this concurrently (e.g. the initial UI launch and a cold-start deep

@@ -58,6 +58,8 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     }
 
     fun startService() {
+        // Record the intent before starting so an app relaunch restores online.
+        NodeHolder.setEnabled(context, true)
         ContextCompat.startForegroundService(context, Intent(context, RayfishVpnService::class.java))
         vpnOn = true
         pendingVpn = true
@@ -70,6 +72,9 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
             val prep = VpnService.prepare(context)
             if (prep != null) consent.launch(prep) else startService()
         } else {
+            // Record disable intent so the launch-time restore and the status
+            // poll both keep the device offline until the user re-enables.
+            NodeHolder.setEnabled(context, false)
             context.startService(Intent(context, RayfishVpnService::class.java).apply { action = RayfishVpnService.ACTION_STOP })
             vpnOn = false
             pendingVpn = false

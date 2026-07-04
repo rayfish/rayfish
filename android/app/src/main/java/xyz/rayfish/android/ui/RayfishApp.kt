@@ -7,7 +7,10 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import android.content.Intent
+import android.net.VpnService
 import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
@@ -18,6 +21,7 @@ import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.NetworkDetail
 import uniffi.ray_mobile.Status
 import xyz.rayfish.android.NodeHolder
+import xyz.rayfish.android.RayfishVpnService
 import xyz.rayfish.android.ui.screens.*
 import xyz.rayfish.android.ui.theme.Rf
 
@@ -39,14 +43,25 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
     var status by remember { mutableStateOf<Status?>(null) }
     var starting by remember { mutableStateOf(true) }
 
+    // Observe only: never start the node here. The 2s poll used to call
+    // ensureStarted(), which resurrected the node moments after the user
+    // disabled it (it showed back online on the coordinator). The toggle is the
+    // sole authority for the node's lifecycle now.
     suspend fun readStatus() {
-        NodeHolder.ensureStarted(context)
         status = withContext(Dispatchers.IO) { NodeHolder.get(context).status() }
     }
 
-    // Start once, then poll every 2s while foregrounded; suspend in background.
+    // On launch restore the tunnel only if the user left it enabled; otherwise
+    // stay offline. Then poll every 2s while foregrounded; suspend in background.
     LaunchedEffect(Unit) {
-        try { readStatus() } catch (t: Throwable) { snackbar.showSnackbar("Failed to start: ${t.message}") }
+        try {
+            if (NodeHolder.isEnabled(context) && VpnService.prepare(context) == null) {
+                ContextCompat.startForegroundService(
+                    context, Intent(context, RayfishVpnService::class.java),
+                )
+            }
+            readStatus()
+        } catch (t: Throwable) { snackbar.showSnackbar("Failed to start: ${t.message}") }
         finally { starting = false }
     }
     LaunchedEffect(lifecycleOwner) {
