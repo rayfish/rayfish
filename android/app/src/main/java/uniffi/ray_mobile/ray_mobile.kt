@@ -778,6 +778,10 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -800,6 +804,8 @@ fun uniffi_ray_mobile_checksum_method_node_accept_join_request(
 fun uniffi_ray_mobile_checksum_method_node_approve_connect_request(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_create(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_default_hostname(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_deny_join_request(
 ): Short
@@ -838,6 +844,8 @@ fun uniffi_ray_mobile_checksum_method_node_pair(
 fun uniffi_ray_mobile_checksum_method_node_reject_connect_request(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_reject_file_offer(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_set_default_hostname(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_set_dns_upstreams(
 ): Short
@@ -920,6 +928,8 @@ fun uniffi_ray_mobile_fn_method_node_approve_connect_request(`ptr`: Pointer,`sho
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_create(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_default_hostname(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_deny_join_request(`ptr`: Pointer,`network`: RustBuffer.ByValue,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_down(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -957,6 +967,8 @@ fun uniffi_ray_mobile_fn_method_node_pair(`ptr`: Pointer,`ticket`: RustBuffer.By
 fun uniffi_ray_mobile_fn_method_node_reject_connect_request(`ptr`: Pointer,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_reject_file_offer(`ptr`: Pointer,`id`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_ray_mobile_fn_method_node_set_default_hostname(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_set_dns_upstreams(`ptr`: Pointer,`servers`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1112,6 +1124,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_create() != 50208.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_default_hostname() != 59357.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_deny_join_request() != 27631.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1167,6 +1182,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_reject_file_offer() != 10539.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_set_default_hostname() != 40200.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_set_dns_upstreams() != 50178.toShort()) {
@@ -1615,6 +1633,12 @@ public interface NodeInterface {
     fun `create`(`name`: kotlin.String?): NetworkInfo
     
     /**
+     * The device's default hostname (seeds every join, incl. pairing
+     * auto-joins). Empty when unset. Config-only; safe before `start`.
+     */
+    fun `defaultHostname`(): kotlin.String
+    
+    /**
      * Deny a pending join request on a network we coordinate.
      */
     fun `denyJoinRequest`(`network`: kotlin.String, `shortId`: kotlin.String)
@@ -1718,6 +1742,13 @@ public interface NodeInterface {
      * Decline a file offer without downloading it.
      */
     fun `rejectFileOffer`(`id`: kotlin.ULong)
+    
+    /**
+     * Set the device's default hostname. Validated with the core's hostname
+     * rules; rejected names leave the stored value untouched. Config-only;
+     * safe before `start`.
+     */
+    fun `setDefaultHostname`(`name`: kotlin.String)
     
     /**
      * Point the Magic DNS resolver at the phone's real DNS servers so
@@ -1940,6 +1971,22 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     uniffiRustCallWithError(RayException) { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_create(
         it, FfiConverterOptionalString.lower(`name`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * The device's default hostname (seeds every join, incl. pairing
+     * auto-joins). Empty when unset. Config-only; safe before `start`.
+     */override fun `defaultHostname`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_default_hostname(
+        it, _status)
 }
     }
     )
@@ -2243,6 +2290,23 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     uniffiRustCallWithError(RayException) { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_reject_file_offer(
         it, FfiConverterULong.lower(`id`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Set the device's default hostname. Validated with the core's hostname
+     * rules; rejected names leave the stored value untouched. Config-only;
+     * safe before `start`.
+     */
+    @Throws(RayException::class)override fun `setDefaultHostname`(`name`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_set_default_hostname(
+        it, FfiConverterString.lower(`name`),_status)
 }
     }
     

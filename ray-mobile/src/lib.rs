@@ -69,6 +69,7 @@ use rayfish::control;
 use rayfish::daemon::{DaemonState, build_headless};
 use rayfish::deeplink::{self, RayfishLink};
 use rayfish::firewall::{Action, Direction, Protocol};
+use rayfish::hostname;
 use rayfish::identity;
 use rayfish::invite;
 use rayfish::ipc::IpcMessage;
@@ -499,6 +500,30 @@ impl Node {
         }
     }
 
+    /// The device's default hostname (seeds every join, incl. pairing
+    /// auto-joins). Empty when unset. Config-only; safe before `start`.
+    pub fn default_hostname(&self) -> String {
+        config::load()
+            .ok()
+            .and_then(|c| c.default_hostname)
+            .unwrap_or_default()
+    }
+
+    /// Set the device's default hostname. Validated with the core's hostname
+    /// rules; rejected names leave the stored value untouched. Config-only;
+    /// safe before `start`.
+    pub fn set_default_hostname(&self, name: String) -> Result<(), RayError> {
+        if !hostname::is_valid_hostname(&name) {
+            return Err(RayError::BadCode(format!(
+                "invalid hostname '{name}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
+            )));
+        }
+        let mut cfg = config::load().map_err(RayError::network)?;
+        cfg.default_hostname = Some(name);
+        config::save_settings(&cfg).map_err(RayError::network)?;
+        Ok(())
+    }
+
     /// Current firewall posture and rules.
     pub fn firewall_show(&self) -> Result<FirewallStateInfo, RayError> {
         let state = self.state()?;
@@ -923,7 +948,7 @@ impl Node {
             .unwrap_or_else(|| {
                 (
                     rayfish::membership::derive_ip(&endpoint_id).to_string(),
-                    String::new(),
+                    rayfish::membership::derive_ipv6(&endpoint_id).to_string(),
                 )
             });
 
@@ -998,5 +1023,30 @@ impl Node {
             return self.pair(code).map(|()| LinkAction::Paired);
         }
         self.join(code).map(LinkAction::Joined)
+    }
+}
+
+#[cfg(test)]
+mod device_name_tests {
+    use super::*;
+
+    #[test]
+    fn set_default_hostname_persists_and_rejects_invalid() {
+        // Isolated config dir; Node::new points RAYFISH_CONFIG_DIR at it.
+        let dir = std::env::temp_dir().join(format!("rayfish-dn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = Node::new(dir.to_string_lossy().to_string());
+
+        node.set_default_hostname("my-phone".into()).unwrap();
+        assert_eq!(node.default_hostname(), "my-phone");
+        assert_eq!(
+            rayfish::config::load().unwrap().default_hostname.as_deref(),
+            Some("my-phone")
+        );
+
+        // Invalid name is rejected and does not overwrite the stored value.
+        assert!(node.set_default_hostname("BAD NAME".into()).is_err());
+        assert_eq!(node.default_hostname(), "my-phone");
     }
 }
