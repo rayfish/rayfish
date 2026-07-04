@@ -266,8 +266,10 @@ fn saved_networks_status() -> Status {
         }
         Err(_) => return empty,
     };
-    let networks = cfg
-        .networks
+    // Same stable alphabetical order as the live snapshot below.
+    let mut sorted = cfg.networks.clone();
+    sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    let networks = sorted
         .iter()
         .map(|net| {
             // Exclude our own roster entry (matched by our IP) so the peer list
@@ -875,6 +877,9 @@ impl Node {
                 peers,
             });
         }
+        // Present networks in a stable alphabetical order so the UI list does
+        // not shuffle between status refreshes with the core's iteration order.
+        detail.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         // The node's own mesh IPs are the same across networks (derived
         // from its identity); take them from the first network if any. With no
         // networks yet, derive the IPv4 from our identity so the tunnel still
