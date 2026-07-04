@@ -12,6 +12,7 @@
 //! `IpcMessage` results to the UniFFI records below.
 
 mod android_tun;
+mod diag;
 
 /// JNI bridge that hands the Android `JavaVM` + app `Context` to the two Rust
 /// dependencies that need them: `ndk-context` (so iroh-dns can read the system
