@@ -107,11 +107,34 @@ pub enum RuleOrigin {
     #[default]
     Local,
     Network(String),
+    /// Auto-seeded passthrough rule for the embedded mesh SSH server: when
+    /// `ray firewall ssh on` is set, the daemon installs an `allow in tcp:22`
+    /// rule with this origin so SSH packets reach the in-daemon listener under
+    /// the deny-inbound default. `ssh off` removes exactly this rule, and
+    /// reconvergence never touches it. The SSH allow-list (per-network) is the
+    /// real authorization gate; this only opens the port at the packet layer.
+    Ssh,
 }
 
 impl RuleOrigin {
     pub fn is_local(&self) -> bool {
         matches!(self, RuleOrigin::Local)
+    }
+}
+
+/// The auto-seeded `allow in tcp:22` passthrough rule installed while mesh SSH
+/// is enabled (see [`RuleOrigin::Ssh`]). Opens port 22 at the packet layer so
+/// the embedded SSH listener can receive connections; per-network `ssh_allow`
+/// is what actually authorizes a session.
+pub fn ssh_passthrough_rule() -> FirewallRule {
+    FirewallRule {
+        direction: Direction::In,
+        action: Action::Allow,
+        protocol: Protocol::Tcp,
+        port: Some(PortRange { start: 22, end: 22 }),
+        peer: PeerFilter::Any,
+        network: None,
+        origin: RuleOrigin::Ssh,
     }
 }
 
@@ -187,6 +210,13 @@ pub struct FirewallConfig {
     /// `firewall.toml` files on the silent-drop posture.
     #[serde(default)]
     pub reject: bool,
+    /// Global kill switch. When `true`, the firewall stops enforcing: every packet
+    /// is allowed regardless of rules or defaults (the ingress anti-spoof check in
+    /// [`crate::forward::evaluate_inbound`] still runs, it is upstream of this).
+    /// Set via `ray firewall off`; `#[serde(default)]` keeps existing
+    /// `firewall.toml` files enforcing on upgrade.
+    #[serde(default)]
+    pub disabled: bool,
     pub rules: Vec<FirewallRule>,
 }
 
@@ -220,6 +250,7 @@ impl Default for FirewallConfig {
             default_inbound: default_inbound_action(),
             default_outbound: default_outbound_action(),
             reject: false,
+            disabled: false,
             // Ship inbound TCP/UDP denied but inbound ICMP allowed — as a visible,
             // removable rule rather than a hard-coded special case.
             rules: vec![default_icmp_rule()],
@@ -339,6 +370,12 @@ impl SharedFirewall {
         self.inner.load().reject
     }
 
+    /// Whether the firewall is globally disabled (`ray firewall off`). When true,
+    /// `evaluate_packet` allows every packet.
+    pub fn disabled(&self) -> bool {
+        self.inner.load().disabled
+    }
+
     /// Stateful evaluation of a fully-parsed packet. This is what the data plane
     /// (`forward.rs`) calls. See the module docs for the full semantics.
     ///
@@ -356,6 +393,12 @@ impl SharedFirewall {
         peer: &EndpointId,
         network: Option<&str>,
     ) -> Action {
+        // Global kill switch (`ray firewall off`): allow everything, skip rules,
+        // defaults, and conntrack. The ingress anti-spoof check runs upstream in
+        // `forward::evaluate_inbound`, so spoofed sources are still dropped.
+        if self.inner.load().disabled {
+            return Action::Allow;
+        }
         let proto = info.protocol;
         let (local_ip, local_port, peer_ip, peer_port) = match direction {
             Direction::Out => (info.src_ip, info.src_port, info.dst_ip, info.dst_port),
@@ -482,6 +525,24 @@ impl SharedFirewall {
             .rules
             .retain(|r| !matches!(&r.origin, RuleOrigin::Network(n) if n == net));
         config.rules.extend(new_rules);
+        self.update(config.clone());
+        config
+    }
+
+    /// Install or remove the auto-seeded SSH passthrough rule (`allow in tcp:22`,
+    /// [`RuleOrigin::Ssh`]) so the embedded mesh SSH listener can receive
+    /// connections under the deny-inbound default. Idempotent: enabling twice
+    /// keeps a single rule, disabling removes exactly the seeded rule and leaves
+    /// any hand-added tcp:22 rules alone. Returns the updated config to persist.
+    pub fn set_ssh_passthrough(&self, enabled: bool) -> FirewallConfig {
+        let mut config = (*self.get_config()).clone();
+        config
+            .rules
+            .retain(|r| !matches!(&r.origin, RuleOrigin::Ssh));
+        if enabled {
+            // Front-insert so it wins over a stale deny, matching `firewall add`.
+            config.rules.insert(0, ssh_passthrough_rule());
+        }
         self.update(config.clone());
         config
     }
@@ -854,6 +915,7 @@ pub fn rule_view(
     let suggested_by = match &rule.origin {
         RuleOrigin::Local => None,
         RuleOrigin::Network(n) => Some(n.clone()),
+        RuleOrigin::Ssh => Some("ssh".to_string()),
     };
     FirewallRuleView {
         direction: rule.direction,
@@ -1061,7 +1123,10 @@ mod tests {
             origin: RuleOrigin::Network("homelab".into()),
         };
         let installed_80 = FirewallRule {
-            port: Some(PortRange { start: 80, end: 443 }),
+            port: Some(PortRange {
+                start: 80,
+                end: 443,
+            }),
             ..installed_22.clone()
         };
         // Same selector as installed_22 but flipped to deny (a re-suggested change).
@@ -1162,11 +1227,62 @@ mod tests {
     }
 
     #[test]
+    fn disabled_allows_everything_both_directions() {
+        // `ray firewall off`: the kill switch allows every packet regardless of
+        // the deny-inbound default, bypassing rules entirely.
+        let fw = SharedFirewall::new(FirewallConfig {
+            disabled: true,
+            ..FirewallConfig::default()
+        });
+        let me = Ipv4Addr::new(100, 64, 0, 2);
+        let peer = Ipv4Addr::new(100, 64, 0, 3);
+        let peer_id = test_id(1);
+        // Unsolicited inbound TCP would be denied when enforcing; here it passes.
+        let unsolicited = tcp_pkt(peer, 51000, me, 8080, SYN);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &unsolicited, &peer_id, None),
+            Action::Allow
+        );
+        // Outbound also allowed (trivially, but confirms the short-circuit path).
+        let out = tcp_pkt(me, 50000, peer, 443, SYN);
+        assert_eq!(
+            fw.evaluate_packet(Direction::Out, &out, &peer_id, None),
+            Action::Allow
+        );
+    }
+
+    #[test]
+    fn disabled_ignores_explicit_deny_rule() {
+        // An explicit deny is bypassed while disabled.
+        let fw = SharedFirewall::new(FirewallConfig {
+            disabled: true,
+            rules: vec![FirewallRule {
+                direction: Direction::In,
+                action: Action::Deny,
+                protocol: Protocol::Tcp,
+                port: Some(PortRange { start: 22, end: 22 }),
+                peer: PeerFilter::Any,
+                network: None,
+                origin: RuleOrigin::Local,
+            }],
+            ..FirewallConfig::default()
+        });
+        let me = Ipv4Addr::new(100, 64, 0, 2);
+        let peer = Ipv4Addr::new(100, 64, 0, 3);
+        let ssh = tcp_pkt(peer, 51000, me, 22, SYN);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &ssh, &test_id(1), None),
+            Action::Allow
+        );
+    }
+
+    #[test]
     fn evaluate_default_deny() {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![],
         });
         assert_eq!(fw.evaluate(Direction::In, 6, 22, &test_id(1)), Action::Deny);
@@ -1178,6 +1294,7 @@ mod tests {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Deny,
@@ -1208,6 +1325,7 @@ mod tests {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Deny,
@@ -1252,6 +1370,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Allow,
@@ -1282,6 +1401,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Allow,
@@ -1305,6 +1425,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![
                 FirewallRule {
                     direction: Direction::In,
@@ -1403,6 +1524,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Allow,
@@ -1473,6 +1595,7 @@ mod tests {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Deny,
@@ -1517,6 +1640,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::Out,
                 action: Action::Allow,
@@ -1576,6 +1700,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::Out,
                 action: Action::Allow,
@@ -1626,6 +1751,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::Out,
                 action: Action::Allow,
@@ -1670,6 +1796,7 @@ mod tests {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Deny,
@@ -1712,6 +1839,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
             reject: false,
+            disabled: false,
             rules: vec![FirewallRule {
                 direction: Direction::Out,
                 action: Action::Allow,
@@ -1798,6 +1926,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![], // seeded allow-icmp removed
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1828,6 +1957,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1855,6 +1985,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1879,6 +2010,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1906,6 +2038,7 @@ mod tests {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![],
         });
         let me = Ipv6Addr::new(0x2, 0, 0, 0, 0, 0, 0, 2);
@@ -2239,6 +2372,7 @@ mod tests {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules: vec![local_rule.clone(), stale_net, other_net.clone()],
         };
         let fw = SharedFirewall::new(config);
@@ -2270,5 +2404,43 @@ mod tests {
         assert_eq!(prod.len(), 1);
         assert_eq!(prod[0].action, Action::Deny);
         assert_eq!(prod[0].peer, PeerFilter::Any);
+    }
+
+    #[test]
+    fn ssh_passthrough_toggles_a_single_managed_rule() {
+        let fw = SharedFirewall::new(FirewallConfig::default());
+        // A hand-added tcp:22 deny that ssh on/off must never touch.
+        let local_22 = FirewallRule {
+            direction: Direction::In,
+            action: Action::Deny,
+            protocol: Protocol::Tcp,
+            port: Some(PortRange { start: 22, end: 22 }),
+            peer: PeerFilter::Any,
+            network: None,
+            origin: RuleOrigin::Local,
+        };
+        let mut cfg = (*fw.get_config()).clone();
+        cfg.rules.push(local_22.clone());
+        fw.update(cfg);
+
+        // Enabling twice keeps exactly one Ssh-origin rule (idempotent).
+        fw.set_ssh_passthrough(true);
+        let cfg = fw.set_ssh_passthrough(true);
+        let ssh_rules: Vec<_> = cfg
+            .rules
+            .iter()
+            .filter(|r| r.origin == RuleOrigin::Ssh)
+            .collect();
+        assert_eq!(ssh_rules.len(), 1);
+        assert_eq!(ssh_rules[0].action, Action::Allow);
+        assert_eq!(ssh_rules[0].port, Some(PortRange { start: 22, end: 22 }));
+        // The managed rule wins (front-inserted) and the Local rule survives.
+        assert_eq!(cfg.rules[0].origin, RuleOrigin::Ssh);
+        assert!(cfg.rules.contains(&local_22));
+
+        // Disabling removes the managed rule but keeps the Local one.
+        let cfg = fw.set_ssh_passthrough(false);
+        assert!(!cfg.rules.iter().any(|r| r.origin == RuleOrigin::Ssh));
+        assert!(cfg.rules.contains(&local_22));
     }
 }

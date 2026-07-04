@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::fs::Permissions;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,7 @@ pub use ray_proto::TransportMode;
 #[allow(dead_code)]
 mod secret_key_hex {
     use iroh::SecretKey;
+    use serde::de::Error;
     use serde::{self, Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S>(key: &SecretKey, serializer: S) -> Result<S::Ok, S::Error>
@@ -30,15 +33,16 @@ mod secret_key_hex {
     {
         let s = String::deserialize(deserializer)?;
         let bytes: [u8; 32] = hex::decode(&s)
-            .map_err(serde::de::Error::custom)?
+            .map_err(Error::custom)?
             .try_into()
-            .map_err(|_| serde::de::Error::custom("secret key must be 32 bytes"))?;
+            .map_err(|_| Error::custom("secret key must be 32 bytes"))?;
         Ok(SecretKey::from(bytes))
     }
 }
 
 mod option_secret_key_hex {
     use iroh::SecretKey;
+    use serde::de::Error;
     use serde::{self, Deserializer, Serializer};
 
     pub fn serialize<S>(key: &Option<SecretKey>, serializer: S) -> Result<S::Ok, S::Error>
@@ -59,9 +63,9 @@ mod option_secret_key_hex {
         match opt {
             Some(s) => {
                 let bytes: [u8; 32] = hex::decode(&s)
-                    .map_err(serde::de::Error::custom)?
+                    .map_err(Error::custom)?
                     .try_into()
-                    .map_err(|_| serde::de::Error::custom("secret key must be 32 bytes"))?;
+                    .map_err(|_| Error::custom("secret key must be 32 bytes"))?;
                 Ok(Some(SecretKey::from(bytes)))
             }
             None => Ok(None),
@@ -127,6 +131,13 @@ pub struct NetworkConfig {
     /// or toggled later with `ray firewall auto-accept <net> on|off`.
     #[serde(default, alias = "allow_trusted")]
     pub auto_accept_firewall: bool,
+    /// Auto-accept incoming file offers from our own paired devices on this
+    /// network (no manual `ray files accept`). Own-devices-only (the sender's
+    /// user identity must match ours); secure default off. Set per-network by
+    /// `ray join --auto-accept-files` or toggled with
+    /// `ray files auto-accept <net> on|off`.
+    #[serde(default)]
+    pub auto_accept_files: bool,
     /// Identities this coordinator has granted the per-network secret key to
     /// (`ray admin add`). Local tracking only — the key is shared and not
     /// attributable, so this is the coordinator's record of grants, not a
@@ -138,6 +149,31 @@ pub struct NetworkConfig {
     /// and suppress its (non-shareable) room id.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub direct: bool,
+    /// Peers authorized to SSH into this node over this network's mesh link
+    /// (`ray firewall ssh allow <net> <peer>`). Only consulted when the global
+    /// `ssh_enabled` toggle is on. Empty = no peer may SSH in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_allow: Vec<SshRule>,
+    /// Node-local, per-network aliases (`alias name -> identity string`), set via
+    /// `ray alias`. Display-only convenience: shown inline in `ray status` and
+    /// used to seed `ray apply`'s `aliases:` map. Never published in the
+    /// GroupBlob.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, String>,
+}
+
+/// One mesh-SSH authorization entry: a peer and the local unix users it may log
+/// in as. `peer` is a peer's user-identity (hex [`EndpointId`]) or `"*"` (any
+/// peer on the network). `users` lists the permitted login accounts; an **empty
+/// list means any non-root user** (the secure default), and `"*"` in the list
+/// means any user including root. Setting a peer's rule replaces its `users`
+/// (last write wins); the SSH server folds rules across shared networks at
+/// login (see [`crate::ssh`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshRule {
+    pub peer: String,
+    #[serde(default)]
+    pub users: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -247,7 +283,10 @@ pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) ->
                 for e in &entries {
                     resolve_url_entry(e, RELAY_PRESET_RAYFISH)?;
                 }
-                cfg.relay = ServerOverride { servers: entries, replace };
+                cfg.relay = ServerOverride {
+                    servers: entries,
+                    replace,
+                };
             }
         }
         "discovery-dns" => {
@@ -257,7 +296,10 @@ pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) ->
                 for e in &entries {
                     resolve_url_entry(e, DISCOVERY_PRESET_RAYFISH)?;
                 }
-                cfg.discovery_dns = ServerOverride { servers: entries, replace };
+                cfg.discovery_dns = ServerOverride {
+                    servers: entries,
+                    replace,
+                };
             }
         }
         "dns-upstreams" => {
@@ -268,7 +310,10 @@ pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) ->
                     e.parse::<Ipv4Addr>()
                         .with_context(|| format!("invalid IPv4 address: {e}"))?;
                 }
-                cfg.dns_upstreams = ServerOverride { servers: entries, replace };
+                cfg.dns_upstreams = ServerOverride {
+                    servers: entries,
+                    replace,
+                };
             }
         }
         other => anyhow::bail!(
@@ -340,6 +385,34 @@ pub struct AppConfig {
     /// Custom Magic DNS upstream forwarders for non-`.ray` queries (IPv4 only).
     #[serde(default)]
     pub dns_upstreams: ServerOverride,
+    /// Global toggle for the embedded mesh SSH server (`ray firewall ssh on`).
+    /// When on, the daemon listens on each mesh IP's port 22 and admits peers
+    /// authorized in a network's [`NetworkConfig::ssh_allow`] list. Off by default.
+    #[serde(default)]
+    pub ssh_enabled: bool,
+    /// Opt-in automatic updates: when on, the daemon periodically checks for a
+    /// newer stable release, swaps the binary, and restarts itself onto it. Off
+    /// by default; enable via `ray install --auto-update` or `ray auto-update on`.
+    #[serde(default)]
+    pub auto_update: bool,
+    /// Last release tag the auto-updater attempted (e.g. `v0.2.0`). Persisted so a
+    /// swapped binary that keeps mis-reporting its version can't tight-loop: the
+    /// same target is retried at most once per backoff window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update_last_target: Option<String>,
+    /// Unix seconds of the last auto-update attempt, paired with
+    /// `auto_update_last_target` for the backoff guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update_last_attempt: Option<i64>,
+    /// Absolute directory where auto-accepted (own-device) files are written.
+    /// `None` falls back to `download_user`, then the operator's ~/Downloads.
+    /// Set via `ray files download-dir <path>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_dir: Option<String>,
+    /// Unix uid that owns auto-accepted files (and whose ~/Downloads receives
+    /// them when `download_dir` is unset). Set via `ray files download-user`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_user: Option<u32>,
     #[serde(default)]
     pub networks: Vec<NetworkConfig>,
 }
@@ -354,6 +427,12 @@ impl Default for AppConfig {
             relay: ServerOverride::default(),
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
+            ssh_enabled: false,
+            auto_update: false,
+            auto_update_last_target: None,
+            auto_update_last_attempt: None,
+            download_dir: None,
+            download_user: None,
             networks: Vec::new(),
         }
     }
@@ -419,6 +498,18 @@ struct Settings {
     discovery_dns: ServerOverride,
     #[serde(default)]
     dns_upstreams: ServerOverride,
+    #[serde(default)]
+    ssh_enabled: bool,
+    #[serde(default)]
+    auto_update: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_update_last_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_update_last_attempt: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    download_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    download_user: Option<u32>,
 }
 
 /// Look up the `rayfish` group's gid (Linux), if the group exists.
@@ -457,7 +548,7 @@ fn ensure_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     #[cfg(target_os = "linux")]
     {
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750));
+        let _ = std::fs::set_permissions(dir, Permissions::from_mode(0o750));
         set_owner(dir, false);
     }
     Ok(())
@@ -516,7 +607,7 @@ pub fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
         f.sync_all().ok();
     }
     let mode = if secret { 0o600 } else { 0o640 };
-    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+    let _ = std::fs::set_permissions(&tmp, Permissions::from_mode(mode));
     #[cfg(target_os = "linux")]
     set_owner(&tmp, secret);
     let renamed = std::fs::rename(&tmp, path);
@@ -537,7 +628,7 @@ fn write_atomic(path: &Path, contents: &str, secret: bool) -> Result<()> {
 /// [`write_file`]. Best-effort.
 pub fn restrict_perms(path: &Path, secret: bool) {
     let mode = if secret { 0o600 } else { 0o640 };
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    let _ = std::fs::set_permissions(path, Permissions::from_mode(mode));
     #[cfg(target_os = "linux")]
     set_owner(path, secret);
 }
@@ -644,6 +735,12 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
             relay: ServerOverride::default(),
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
+            ssh_enabled: false,
+            auto_update: false,
+            auto_update_last_target: None,
+            auto_update_last_attempt: None,
+            download_dir: None,
+            download_user: None,
         }
     };
 
@@ -679,6 +776,12 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         relay: settings.relay,
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
+        ssh_enabled: settings.ssh_enabled,
+        auto_update: settings.auto_update,
+        auto_update_last_target: settings.auto_update_last_target,
+        auto_update_last_attempt: settings.auto_update_last_attempt,
+        download_dir: settings.download_dir,
+        download_user: settings.download_user,
         networks,
     })
 }
@@ -697,6 +800,12 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         relay: config.relay.clone(),
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
+        ssh_enabled: config.ssh_enabled,
+        auto_update: config.auto_update,
+        auto_update_last_target: config.auto_update_last_target.clone(),
+        auto_update_last_attempt: config.auto_update_last_attempt,
+        download_dir: config.download_dir.clone(),
+        download_user: config.download_user,
     };
     let path = dir.join(SETTINGS_FILE);
     let contents = toml::to_string_pretty(&settings).context("serializing settings")?;
@@ -732,9 +841,9 @@ fn load_network_in(dir: &Path, name: &str) -> Result<Option<NetworkConfig>> {
     }
     let s =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(Some(toml::from_str(&s).with_context(|| {
-        format!("parsing {}", path.display())
-    })?))
+    Ok(Some(
+        toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?,
+    ))
 }
 
 /// Delete a single network's config file. Returns true if it existed.
@@ -777,7 +886,7 @@ mod tests {
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
         key_bytes[0] = seed;
-        iroh::SecretKey::from(key_bytes).public()
+        SecretKey::from(key_bytes).public()
     }
 
     #[test]
@@ -806,11 +915,14 @@ mod tests {
                     network_secret_key: None,
                     network_public_key: None,
                     my_hostname: None,
-            pending_hostname: None,
+                    pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
+                    auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    ssh_allow: vec![],
+                    aliases: BTreeMap::new(),
                 },
                 NetworkConfig {
                     name: "work".to_string(),
@@ -821,11 +933,14 @@ mod tests {
                     network_secret_key: None,
                     network_public_key: None,
                     my_hostname: None,
-            pending_hostname: None,
+                    pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
+                    auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    ssh_allow: vec![],
+                    aliases: BTreeMap::new(),
                 },
             ],
             ..Default::default()
@@ -860,8 +975,11 @@ mod tests {
             pending_hostname: None,
             transport: None,
             auto_accept_firewall: false,
+            auto_accept_files: false,
             admins: vec![],
             direct: false,
+            ssh_allow: vec![],
+            aliases: BTreeMap::new(),
         };
         upsert_network(&mut config, net);
         assert_eq!(config.networks.len(), 1);
@@ -881,11 +999,14 @@ mod tests {
                 network_secret_key: None,
                 network_public_key: None,
                 my_hostname: None,
-            pending_hostname: None,
+                pending_hostname: None,
                 transport: None,
                 auto_accept_firewall: false,
+                auto_accept_files: false,
                 admins: vec![],
                 direct: false,
+                ssh_allow: vec![],
+                aliases: BTreeMap::new(),
             }],
             ..Default::default()
         };
@@ -901,8 +1022,11 @@ mod tests {
             pending_hostname: None,
             transport: None,
             auto_accept_firewall: false,
+            auto_accept_files: false,
             admins: vec![],
             direct: false,
+            ssh_allow: vec![],
+            aliases: BTreeMap::new(),
         };
         upsert_network(&mut config, updated.clone());
         assert_eq!(config.networks.len(), 1);
@@ -926,11 +1050,14 @@ mod tests {
                     network_secret_key: None,
                     network_public_key: None,
                     my_hostname: None,
-            pending_hostname: None,
+                    pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
+                    auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    ssh_allow: vec![],
+                    aliases: BTreeMap::new(),
                 },
                 NetworkConfig {
                     name: "remove-me".to_string(),
@@ -941,11 +1068,14 @@ mod tests {
                     network_secret_key: None,
                     network_public_key: None,
                     my_hostname: None,
-            pending_hostname: None,
+                    pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
+                    auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    ssh_allow: vec![],
+                    aliases: BTreeMap::new(),
                 },
             ],
             ..Default::default()
@@ -984,11 +1114,14 @@ mod tests {
                 network_secret_key: None,
                 network_public_key: None,
                 my_hostname: None,
-            pending_hostname: None,
+                pending_hostname: None,
                 transport: None,
                 auto_accept_firewall: false,
+                auto_accept_files: false,
                 admins: vec![],
                 direct: false,
+                ssh_allow: vec![],
+                aliases: BTreeMap::new(),
             }],
             ..Default::default()
         };
@@ -1000,7 +1133,7 @@ mod tests {
 
     #[test]
     fn test_serialize_with_network_key() {
-        let secret = iroh::SecretKey::generate();
+        let secret = SecretKey::generate();
         let public = secret.public();
         let config = AppConfig {
             networks: vec![NetworkConfig {
@@ -1012,11 +1145,14 @@ mod tests {
                 network_secret_key: Some(secret.clone()),
                 network_public_key: Some(public),
                 my_hostname: None,
-            pending_hostname: None,
+                pending_hostname: None,
                 transport: None,
                 auto_accept_firewall: false,
+                auto_accept_files: false,
                 admins: vec![],
                 direct: false,
+                ssh_allow: vec![],
+                aliases: BTreeMap::new(),
             }],
             ..Default::default()
         };
@@ -1081,12 +1217,15 @@ name = "test"
             pending_hostname: None,
             members: vec![],
             approved: vec![],
-            network_secret_key: Some(iroh::SecretKey::generate()),
+            network_secret_key: Some(SecretKey::generate()),
             network_public_key: None,
             transport: None,
             auto_accept_firewall: false,
+            auto_accept_files: false,
             admins: vec![],
             direct: false,
+            ssh_allow: vec![],
+            aliases: BTreeMap::new(),
         }
     }
 
@@ -1123,6 +1262,64 @@ name = "test"
     }
 
     #[test]
+    fn settings_download_fields_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let cfg = AppConfig {
+            download_dir: Some("/srv/incoming".to_string()),
+            download_user: Some(1000),
+            ..Default::default()
+        };
+        save_settings_in(dir, &cfg).unwrap();
+
+        let loaded = load_in(dir).unwrap();
+        assert_eq!(loaded.download_dir.as_deref(), Some("/srv/incoming"));
+        assert_eq!(loaded.download_user, Some(1000));
+    }
+
+    #[test]
+    fn settings_download_fields_default_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No settings.toml written: fields default to None.
+        let loaded = load_in(tmp.path()).unwrap();
+        assert_eq!(loaded.download_dir, None);
+        assert_eq!(loaded.download_user, None);
+    }
+
+    #[test]
+    fn network_aliases_roundtrip_and_default_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // A network with aliases persists them across a save/load cycle.
+        let mut n = net("homelab");
+        n.aliases.insert("alice".into(), "id-alice".into());
+        n.aliases.insert("bob".into(), "id-bob".into());
+        save_network_in(dir, &n).unwrap();
+        let loaded = load_network_in(dir, "homelab").unwrap().unwrap();
+        assert_eq!(
+            loaded.aliases.get("alice").map(String::as_str),
+            Some("id-alice")
+        );
+        assert_eq!(
+            loaded.aliases.get("bob").map(String::as_str),
+            Some("id-bob")
+        );
+
+        // A network with no aliases omits the key; loading a toml without it
+        // defaults to an empty map (backward compatible with pre-alias configs).
+        let plain = net("genesis");
+        assert!(plain.aliases.is_empty());
+        let toml = ::toml::to_string(&plain).unwrap();
+        assert!(
+            !toml.contains("aliases"),
+            "empty aliases must not be serialized"
+        );
+        let back: NetworkConfig = ::toml::from_str(&toml).unwrap();
+        assert!(back.aliases.is_empty());
+    }
+
+    #[test]
     fn settings_roundtrip_server_overrides() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
@@ -1154,18 +1351,45 @@ name = "test"
 
     #[test]
     fn relay_urls_expands_rayfish_preset() {
-        let o = ServerOverride { servers: vec!["rayfish".into()], replace: false };
-        assert_eq!(relay_urls(&o).unwrap(), vec![RELAY_PRESET_RAYFISH.to_string()]);
-        let d = ServerOverride { servers: vec!["rayfish".into()], replace: false };
-        assert_eq!(discovery_urls(&d).unwrap(), vec![DISCOVERY_PRESET_RAYFISH.to_string()]);
+        let o = ServerOverride {
+            servers: vec!["rayfish".into()],
+            replace: false,
+        };
+        assert_eq!(
+            relay_urls(&o).unwrap(),
+            vec![RELAY_PRESET_RAYFISH.to_string()]
+        );
+        let d = ServerOverride {
+            servers: vec!["rayfish".into()],
+            replace: false,
+        };
+        assert_eq!(
+            discovery_urls(&d).unwrap(),
+            vec![DISCOVERY_PRESET_RAYFISH.to_string()]
+        );
     }
 
     #[test]
     fn url_entry_rejects_bad() {
-        assert!(relay_urls(&ServerOverride { servers: vec!["ftp://x".into()], replace: false }).is_err());
-        assert!(relay_urls(&ServerOverride { servers: vec!["not a url".into()], replace: false }).is_err());
+        assert!(
+            relay_urls(&ServerOverride {
+                servers: vec!["ftp://x".into()],
+                replace: false
+            })
+            .is_err()
+        );
+        assert!(
+            relay_urls(&ServerOverride {
+                servers: vec!["not a url".into()],
+                replace: false
+            })
+            .is_err()
+        );
         // A real http URL passes through unchanged.
-        let ok = ServerOverride { servers: vec!["http://r:1".into()], replace: false };
+        let ok = ServerOverride {
+            servers: vec!["http://r:1".into()],
+            replace: false,
+        };
         assert_eq!(relay_urls(&ok).unwrap(), vec!["http://r:1".to_string()]);
     }
 
@@ -1175,14 +1399,26 @@ name = "test"
         let one = Ipv4Addr::new(1, 1, 1, 1);
 
         // Unset: captured unchanged.
-        assert_eq!(resolve_upstreams(&ServerOverride::default(), captured.clone()), captured);
+        assert_eq!(
+            resolve_upstreams(&ServerOverride::default(), captured.clone()),
+            captured
+        );
 
         // Augment: custom first, then captured.
-        let aug = ServerOverride { servers: vec!["1.1.1.1".into()], replace: false };
-        assert_eq!(resolve_upstreams(&aug, captured.clone()), vec![one, captured[0]]);
+        let aug = ServerOverride {
+            servers: vec!["1.1.1.1".into()],
+            replace: false,
+        };
+        assert_eq!(
+            resolve_upstreams(&aug, captured.clone()),
+            vec![one, captured[0]]
+        );
 
         // Replace: custom only.
-        let rep = ServerOverride { servers: vec!["1.1.1.1".into()], replace: true };
+        let rep = ServerOverride {
+            servers: vec!["1.1.1.1".into()],
+            replace: true,
+        };
         assert_eq!(resolve_upstreams(&rep, captured.clone()), vec![one]);
     }
 
@@ -1230,7 +1466,11 @@ name = "test"
         });
 
         let loaded = load_in(&dir).unwrap();
-        assert_eq!(loaded.networks.len(), N, "all concurrent saves must survive");
+        assert_eq!(
+            loaded.networks.len(),
+            N,
+            "all concurrent saves must survive"
+        );
     }
 
     #[test]

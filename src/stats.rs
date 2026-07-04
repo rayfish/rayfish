@@ -5,7 +5,7 @@
 //! 30-second interval deltas and a session summary on shutdown.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use iroh_metrics::{Counter, EncodeLabelSet, EncodeLabelValue, Family, Gauge, MetricsGroup};
 use serde::Serialize;
@@ -26,15 +26,20 @@ pub enum DropReason {
     /// oldest queued packet is more likely to be useful (already-accepted work)
     /// than a fresh one arriving into a saturated link.
     Backpressure,
+    /// Inbound datagram whose source IP did not match the sending peer's
+    /// assigned mesh address (ingress anti-spoofing). A peer may only inject
+    /// packets sourced from its own mesh IP.
+    Spoof,
 }
 
 impl DropReason {
-    const ALL: [DropReason; 5] = [
+    const ALL: [DropReason; 6] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
         DropReason::Malformed,
         DropReason::Backpressure,
+        DropReason::Spoof,
     ];
 }
 
@@ -133,7 +138,7 @@ impl ForwardMetrics {
 
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
                         let rx = stats.packets_rx.get();
                         let tx = stats.packets_tx.get();
                         let brx = stats.bytes_rx.get();
@@ -200,7 +205,7 @@ impl PeerMetrics {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {
                         for (ip, conn) in peers.all_connections() {
                             let label = PeerLabels {
                                 peer: ip.to_string(),

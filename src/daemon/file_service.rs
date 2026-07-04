@@ -29,15 +29,20 @@ pub(crate) struct FileService {
     pub(crate) pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
     /// This node's transport secret key, used to sign device certs on pairing.
     secret_key: SecretKey,
+    /// Auto-accept nudge: each newly-queued offer's id is sent here so the
+    /// daemon-wide worker (`spawn_file_auto_accept`) can evaluate it for
+    /// own-device auto-accept without waiting for a manual `ray files accept`.
+    new_file_tx: mpsc::UnboundedSender<u64>,
 }
 
 impl FileService {
-    pub(crate) fn new(secret_key: SecretKey) -> Self {
+    pub(crate) fn new(secret_key: SecretKey, new_file_tx: mpsc::UnboundedSender<u64>) -> Self {
         Self {
             pending_files: Arc::new(std::sync::Mutex::new(Vec::new())),
             file_id_counter: Arc::new(AtomicU64::new(1)),
             pairing_secret: Arc::new(std::sync::Mutex::new(None)),
             secret_key,
+            new_file_tx,
         }
     }
 
@@ -55,6 +60,11 @@ impl FileService {
                             let id = counter.fetch_add(1, Ordering::Relaxed);
                             tracing::info!(from = %from.fmt_short(), filename = %filename, size, "file offer received");
                             pending.lock().unwrap().push(PendingFile { id, from, filename, size, mime_type, blob_hash });
+                            // Nudge the auto-accept worker: it accepts only offers
+                            // from our own paired devices on an opted-in network,
+                            // and no-ops otherwise, so the offer stays queued for
+                            // `ray files accept` unless it qualifies.
+                            let _ = self.new_file_tx.send(id);
                         } else {
                             tracing::warn!(claimed = %from.fmt_short(), actual = %remote_id.fmt_short(), "file offer identity mismatch");
                         }

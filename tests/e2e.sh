@@ -10,7 +10,9 @@
 #   closed-net    3-peer admission + lifecycle commands (tests/e2e/closed-net)
 #   apply         3-peer declarative `ray apply` deploy       (tests/e2e/apply)
 #   dns           2-peer Magic DNS resolution + resolv.conf takeover (tests/e2e/dns)
+#   ssh           2-peer mesh SSH (`ray firewall ssh`) allow/deny matrix (tests/e2e/ssh)
 #   reliability   4-peer full-mesh packet-loss test (ping + iperf3 UDP) (tests/e2e/reliability)
+#   restore-offline 3-peer member-restore-with-coordinator-offline test (tests/e2e/restore-offline)
 #   bench         throughput / latency benchmark        (tests/bench)
 #
 # Actions:
@@ -27,7 +29,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-usage(){ sed -n '2,23p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
+usage(){ sed -n '2,26p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
 
 # scenario_meta <scenario> : set DIR / NAMES / LABELS for a scenario, or return 1.
 scenario_meta(){
@@ -50,9 +52,15 @@ scenario_meta(){
     dns)         DIR="$ROOT/tests/e2e/dns"
                  NAMES=(rayfish-dns-a rayfish-dns-b)
                  LABELS=(srv-a srv-b) ;;
+    ssh)         DIR="$ROOT/tests/e2e/ssh"
+                 NAMES=(rayfish-ssh-a rayfish-ssh-b)
+                 LABELS=(srv-a srv-b) ;;
     reliability) DIR="$ROOT/tests/e2e/reliability"
                  NAMES=(rayfish-reli-a rayfish-reli-b rayfish-reli-c rayfish-reli-d)
                  LABELS=(srv-a srv-b srv-c srv-d) ;;
+    restore-offline) DIR="$ROOT/tests/e2e/restore-offline"
+                 NAMES=(rayfish-restore-a rayfish-restore-b rayfish-restore-c)
+                 LABELS=(srv-a srv-b srv-c) ;;
     bench)       DIR="$ROOT/tests/bench"
                  NAMES=(rayfish-bench-a rayfish-bench-b)
                  LABELS=(srv-a srv-b) ;;

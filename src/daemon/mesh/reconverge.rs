@@ -161,6 +161,8 @@ pub(crate) async fn reconverge_and_apply(
         firewall,
         hostname_table,
         reverse_table,
+        device_user_map,
+        pruned_peers,
         ..
     } = ctx;
     let current = state.read().unwrap().snapshot.as_ref().map(|s| s.hash);
@@ -216,6 +218,20 @@ pub(crate) async fn reconverge_and_apply(
         reverse_table,
     )
     .await;
+    // Drop any live connection to a peer the signed roster no longer lists (it was
+    // kicked, or left while we were offline). Removing it from the roster alone
+    // stops us *routing* to it, but the peer reader keeps injecting its inbound
+    // datagrams until the connection closes — so close it. We record the peer in
+    // `pruned_peers` first: closing wakes our own reconnect loop, which would
+    // otherwise re-dial the peer (it still lists us) and re-form the link.
+    prune_departed_peers(
+        peers,
+        device_user_map,
+        pruned_peers,
+        state,
+        network_name,
+        my_identity,
+    );
     apply_suggested_firewall(firewall, my_identity, network_name, state);
     // If a local rename is still unconfirmed by this just-applied blob, keep
     // delivering it to the coordinator set until it lands.
@@ -232,6 +248,39 @@ pub(crate) async fn reconverge_and_apply(
     tracing::info!(network = %network_name, "reconverged from signed record");
 }
 
+/// Close and drop every connection to a peer that `network`'s current roster no
+/// longer contains. Runs on every node after it applies a verified roster, so a
+/// kicked (or departed) peer is severed mesh-wide, not just by the coordinator
+/// that removed it. Each pruned peer is recorded in `pruned_peers` so this node's
+/// reconnect loop skips the re-dial that closing the connection would trigger.
+pub(crate) fn prune_departed_peers(
+    peers: &PeerTable,
+    device_user_map: &peers::DeviceUserMap,
+    pruned_peers: &Arc<DashSet<(String, EndpointId)>>,
+    state: &SharedNetworkState,
+    network_name: &str,
+    my_identity: EndpointId,
+) {
+    for (peer_id, ip, conn) in peers.peers_for_network_with_conn(network_name) {
+        // Membership is by roster identity, which for a paired peer is its user
+        // identity, not the transport id the PeerTable is keyed on. Check both.
+        let user_id = device_user_map.resolve(&peer_id);
+        let still_member = {
+            let s = state.read().unwrap();
+            s.members.is_member(&peer_id) || s.members.is_member(&user_id)
+        };
+        if still_member || peer_id == my_identity || user_id == my_identity {
+            continue;
+        }
+        tracing::info!(peer = %peer_id.fmt_short(), network = %network_name, "pruning peer no longer in roster");
+        pruned_peers.insert((network_name.to_string(), peer_id));
+        conn.close(
+            VarInt::from_u32(forward::KICK_CODE),
+            b"removed from network",
+        );
+        peers.remove_peer_from_network(&ip, &derive_ipv6(&peer_id), network_name);
+    }
+}
 
 pub(crate) async fn apply_roster_to_dns(
     members: &[Member],

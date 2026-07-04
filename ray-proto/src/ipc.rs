@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
@@ -36,6 +37,10 @@ pub enum IpcMessage {
         /// without a manual review queue (`--auto-accept-firewall`).
         #[serde(default, alias = "allow_trusted")]
         auto_accept_firewall: bool,
+        /// Auto-accept incoming file offers from our own paired devices on this
+        /// network (`--auto-accept-files`).
+        #[serde(default)]
+        auto_accept_files: bool,
     },
     Leave {
         name: String,
@@ -43,6 +48,13 @@ pub enum IpcMessage {
     Nuke {
         name: String,
         force: bool,
+    },
+    /// Coordinator-only: remove a member from a closed network. Prunes it from the
+    /// roster + approved list, republishes the signed blob, and disconnects it
+    /// mesh-wide. `peer` is a hostname / mesh IP / short id of a current member.
+    Kick {
+        network: String,
+        peer: String,
     },
     Status,
     /// Build a diagnostic bundle (logs + metrics + sanitized status) on disk and
@@ -83,6 +95,11 @@ pub enum IpcMessage {
     FirewallReject {
         enabled: bool,
     },
+    /// Global firewall kill switch (`ray firewall on|off`). When `enabled` is
+    /// false the firewall stops enforcing and allows every packet.
+    FirewallSetEnabled {
+        enabled: bool,
+    },
     /// Coordinator-only: replace the network's suggested firewall rules and
     /// republish the signed blob. Authority comes from holding the network's
     /// secret key; works on any network (suggestions are advisory).
@@ -106,6 +123,13 @@ pub enum IpcMessage {
         network: String,
         enabled: bool,
     },
+    /// Toggle per-network auto-accept of incoming file offers from our own
+    /// paired devices. `on` also drains any already-queued offers from own
+    /// devices; `off` stops future auto-accept.
+    FilesAutoAccept {
+        network: String,
+        enabled: bool,
+    },
     /// Accept the queued suggested rules for a network: install them (replacing
     /// the prior `Network(net)` set) and clear the queue.
     FirewallAccept {
@@ -123,9 +147,50 @@ pub enum IpcMessage {
         accept: Vec<FirewallRuleView>,
         deny: Vec<FirewallRuleView>,
     },
+    /// Toggle the embedded mesh SSH server (`ray firewall ssh on|off`). When on,
+    /// the daemon listens on each mesh IP's port 22 and admits peers authorized
+    /// per-network; off stops the listeners and removes the tcp:22 passthrough.
+    FirewallSshSet {
+        enabled: bool,
+    },
+    /// Add (`allow=true`) or remove (`allow=false`) a peer from a network's SSH
+    /// allow list. `peer` is a resolved peer EndpointId (hex) or `"*"` (any peer
+    /// on the network). `users` are the local accounts the peer may log in as on
+    /// allow (empty = any non-root user, `"*"` = any incl. root); ignored on
+    /// deny, which drops the peer's rule. `ray firewall ssh allow|deny <net> <peer>`.
+    FirewallSshAllow {
+        network: String,
+        peer: String,
+        #[serde(default)]
+        users: Vec<String>,
+        allow: bool,
+    },
+    /// Read the SSH server state + per-network allow lists (open read).
+    FirewallSshShow,
     SetHostname {
         network: String,
         hostname: String,
+    },
+    /// Bind a local, per-network alias to a user/device identity (`ray alias set`).
+    /// Node-local only: never rides the signed blob. `identity` is already
+    /// canonicalized to the string `ray identityof` prints. Mutating (root/operator).
+    AliasSet {
+        network: String,
+        identity: String,
+        alias: String,
+    },
+    /// Remove a local alias by its name (`ray alias rm`). Mutating.
+    AliasRemove {
+        network: String,
+        alias: String,
+    },
+    /// List a network's local aliases (`ray alias list`). Open read.
+    AliasList {
+        network: String,
+    },
+    /// Response to `AliasList`: `alias name -> identity string`.
+    AliasListResponse {
+        aliases: BTreeMap<String, String>,
     },
     SendFile {
         path: String,
@@ -245,6 +310,11 @@ pub enum IpcMessage {
     StatusResponse {
         endpoint_id: EndpointId,
         mdns_enabled: bool,
+        /// Whether this node opted into automatic stable updates. Reflects the
+        /// running daemon's setting (which can differ from on-disk config until a
+        /// restart). Defaulted so an older CLI/daemon pair still deserializes.
+        #[serde(default)]
+        auto_update: bool,
         /// Whether the VPN is active (TUN up, networks connected) or on standby.
         active: bool,
         /// This node's contact id (`ray connect`), shown at the top of status.
@@ -314,6 +384,10 @@ pub enum IpcMessage {
         /// get a TCP RST / ICMP-unreachable reply instead of a silent drop.
         #[serde(default)]
         reject: bool,
+        /// Global kill switch (`ray firewall off`). When true the firewall is not
+        /// enforcing: every packet is allowed regardless of rules/defaults.
+        #[serde(default)]
+        disabled: bool,
         rules: Vec<FirewallRuleView>,
     },
     /// Current suggested firewall rules for a network (reply to
@@ -327,6 +401,13 @@ pub enum IpcMessage {
     FirewallPendingResponse {
         network: String,
         rules: Vec<FirewallRuleView>,
+    },
+    /// Embedded mesh SSH state (reply to `FirewallSshShow`): whether the server
+    /// is enabled, and each network's allow list.
+    FirewallSshState {
+        enabled: bool,
+        /// `(network, allow-entries)` for networks with at least one rule.
+        networks: Vec<(String, Vec<SshAllowView>)>,
     },
     FileList {
         files: Vec<PendingFileInfo>,
@@ -390,6 +471,15 @@ pub struct FirewallRuleView {
     pub suggested_by: Option<String>,
 }
 
+/// One mesh-SSH allow entry as shown by `ray firewall ssh show`. `peer` is `"*"`
+/// or a peer identity (hex); `users` is the permitted login accounts (empty =
+/// any non-root user, `"*"` = any incl. root).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshAllowView {
+    pub peer: String,
+    pub users: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AdminInfo {
     /// Short id of the key-holder.
@@ -448,6 +538,11 @@ pub struct NetworkStatus {
     /// (`ray requests <net>` / `ray accept`). Surfaced in the status summary.
     #[serde(default)]
     pub pending_requests: usize,
+    /// Node-local aliases for this network (`alias name -> identity string`,
+    /// set via `ray alias`). Display-only and never in the signed blob; also
+    /// seeds `ray apply`'s `aliases:` map.
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
 }
 
 #[derive(
@@ -472,6 +567,9 @@ pub struct PeerStatus {
     pub ipv6: Option<Ipv6Addr>,
     pub hostname: Option<String>,
     pub user_identity: Option<EndpointId>,
+    /// True when this peer is another of the local user's own paired devices
+    /// (its resolved user identity equals ours).
+    pub is_own_device: bool,
     pub connection: Option<ConnectionInfo>,
 }
 
@@ -494,7 +592,6 @@ pub enum ConnType {
     Tor,
     Unknown,
 }
-
 
 /// Maximum IPC frame size (body). Matches the previous hand-rolled guard;
 /// `LengthDelimitedCodec` rejects anything larger so a malformed/hostile peer
@@ -772,6 +869,7 @@ mod tests {
             invite: Some(vec![1, 2, 3]),
             coordinator: Some(coord),
             auto_accept_firewall: false,
+            auto_accept_files: false,
         };
         let bytes = rmp_serde::to_vec(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
@@ -828,6 +926,7 @@ mod tests {
         let resp = IpcMessage::StatusResponse {
             endpoint_id: ep_id,
             mdns_enabled: true,
+            auto_update: false,
             active: true,
             contact_id: Some("contact123".to_string()),
             daemon_version: "0.1.0".to_string(),
@@ -845,10 +944,12 @@ mod tests {
                     ipv6: None,
                     hostname: None,
                     user_identity: None,
+                    is_own_device: false,
                     connection: None,
                 }],
                 pending_suggestions: 0,
                 pending_requests: 0,
+                aliases: BTreeMap::new(),
             }],
             packets_rx: 0,
             packets_tx: 0,

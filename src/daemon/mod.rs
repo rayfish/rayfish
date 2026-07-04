@@ -37,9 +37,11 @@
 
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -53,6 +55,7 @@ use iroh::{EndpointId, SecretKey};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, HashAndFormat};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -127,6 +130,13 @@ pub(crate) struct MeshCtx {
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
     device_user_map: peers::DeviceUserMap,
+    /// Peers removed from a network's roster (via `ray kick` or a stale-entry
+    /// prune during reconverge), keyed by `(network, transport id)`. A member
+    /// closes such a peer's connection but can't see its own close code, so its
+    /// reconnect loop would re-dial the removed peer (which still lists it) and
+    /// re-form the link. The reconnect loop consumes an entry here to skip that
+    /// one reconnect. Populated in [`reconverge_and_apply`] and the kick handler.
+    pruned_peers: Arc<DashSet<(String, EndpointId)>>,
 }
 
 impl MeshCtx {
@@ -188,7 +198,7 @@ struct GroupSnapshot {
 
 /// A per-network state cell shared (read-mostly) across the accept handlers,
 /// publisher, poller, and cleanup tasks for that network.
-pub(crate) type SharedNetworkState = Arc<std::sync::RwLock<NetworkState>>;
+pub(crate) type SharedNetworkState = Arc<RwLock<NetworkState>>;
 
 pub(crate) struct NetworkState {
     members: MemberList,
@@ -280,7 +290,7 @@ pub struct NetworkHandle {
     state: SharedNetworkState,
     /// DHT republish trigger; `Some` only on the coordinator (the sole publisher).
     /// Lets `set_hostname` re-publish the group blob on a coordinator self-rename.
-    dht_notify: Option<Arc<tokio::sync::Notify>>,
+    dht_notify: Option<Arc<Notify>>,
     /// Child of the daemon `shutdown_token`. Cancelling it stops this network's
     /// background tasks (reconnect loop, group poller, publisher, peer readers)
     /// without affecting the rest of the daemon.
@@ -317,6 +327,10 @@ pub struct MeshManager {
     /// Magic DNS naming tables, resolver, and OS-DNS configurator (see [`DnsManager`]).
     dns: DnsManager,
     mdns_enabled: bool,
+    /// Whether this node opted into automatic stable updates (`ray auto-update
+    /// on` / `ray install --auto-update`). Read at startup; when set, `run_daemon`
+    /// spawns the periodic update task. Echoed back in `ray status`.
+    auto_update: bool,
     tun_name: String,
     /// File-transfer + pairing state and ALPN accept arms (see [`FileService`]).
     /// Shared with [`ProtocolRouter`], which runs the accept arms.
@@ -326,6 +340,9 @@ pub struct MeshManager {
     connect: Arc<ConnectService>,
     device_cert: Option<control::DeviceCert>,
     device_user_map: peers::DeviceUserMap,
+    /// Peers removed from a roster whose reconnect should be suppressed once.
+    /// Shared into [`MeshCtx::pruned_peers`]; see that field for the mechanism.
+    pruned_peers: Arc<DashSet<(String, EndpointId)>>,
     /// This node's contact id (`ray connect`): the public half of the rotatable
     /// contact key. The secret lives in config (read fresh by the publisher and
     /// `rotate_contact` so rotation needs no restart); only the public id is
@@ -334,6 +351,13 @@ pub struct MeshManager {
     /// Whether the VPN is currently active (TUN up, networks connected) or on
     /// standby. Toggled by the `Up`/`Down` IPC commands.
     active: Arc<AtomicBool>,
+    /// Live per-network SSH allow lists for the embedded mesh SSH server. Swapped
+    /// atomically on `ray firewall ssh allow/deny`, so a running listener picks up
+    /// changes without restart. See [`crate::ssh`].
+    ssh_authz: crate::ssh::SshAuthz,
+    /// Cancellation token for the running SSH listeners (`None` when off / on
+    /// standby). Set by [`MeshManager::start_ssh`], cleared by `stop_ssh`.
+    ssh_token: std::sync::Mutex<Option<CancellationToken>>,
     /// Promotion signal: a co-coordinator's per-peer control reader sends the
     /// network name here after persisting an `AdminGrant` key, and the main
     /// daemon loop ([`serve_ipc`]) drains it into
@@ -390,6 +414,7 @@ impl MeshManager {
             hostname_table: self.dns.hostname_table.clone(),
             reverse_table: self.dns.reverse_table.clone(),
             device_user_map: self.device_user_map.clone(),
+            pruned_peers: self.pruned_peers.clone(),
         }
     }
 
@@ -421,7 +446,7 @@ impl MeshManager {
         network: &str,
         state: SharedNetworkState,
         invite_lock: Arc<tokio::sync::Mutex<()>>,
-        dht_notify: Option<Arc<tokio::sync::Notify>>,
+        dht_notify: Option<Arc<Notify>>,
         network_key: EndpointId,
         disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
         cancel: CancellationToken,
@@ -486,7 +511,10 @@ impl MeshManager {
     /// Identity is taken from the connecting socket's `SO_PEERCRED` (the kernel
     /// vouches for it — it can't be forged by the client), so the socket file
     /// mode only has to permit the connection, not gate authority.
-    pub(crate) fn check_authorized(req: &IpcMessage, peer_cred: Option<(u32, u32)>) -> Option<IpcMessage> {
+    pub(crate) fn check_authorized(
+        req: &IpcMessage,
+        peer_cred: Option<(u32, u32)>,
+    ) -> Option<IpcMessage> {
         // Reads are available to everyone.
         if matches!(
             req,
@@ -495,11 +523,13 @@ impl MeshManager {
                 | IpcMessage::FirewallShow
                 | IpcMessage::FirewallSuggestions { .. }
                 | IpcMessage::FirewallPending { .. }
+                | IpcMessage::FirewallSshShow
                 | IpcMessage::ListFiles
                 | IpcMessage::Connections
                 | IpcMessage::ContactId
                 | IpcMessage::Ping { .. }
                 | IpcMessage::Netcheck
+                | IpcMessage::AliasList { .. }
         ) {
             return None;
         }
@@ -578,6 +608,7 @@ impl MeshManager {
                 invite,
                 coordinator,
                 auto_accept_firewall,
+                auto_accept_files,
             } => {
                 self.join_network(
                     &network_key,
@@ -586,11 +617,13 @@ impl MeshManager {
                     invite,
                     coordinator,
                     auto_accept_firewall,
+                    auto_accept_files,
                 )
                 .await
             }
             IpcMessage::Leave { name } => self.leave_network(&name).await,
             IpcMessage::Nuke { name, force } => self.nuke_network(&name, force).await,
+            IpcMessage::Kick { network, peer } => self.kick_member(&network, &peer).await,
             IpcMessage::Status => self.status(),
             IpcMessage::Report => self.build_report(peer_cred),
             IpcMessage::Up { hostname } => self.activate(hostname).await,
@@ -608,18 +641,22 @@ impl MeshManager {
                 port,
                 peer,
                 network,
-            } => self.firewall_add(
-                direction,
-                action,
-                protocol,
-                port.as_deref(),
-                peer.as_deref(),
-                network.as_deref(),
-            ),
+            } => {
+                self.firewall_add(
+                    direction,
+                    action,
+                    protocol,
+                    port.as_deref(),
+                    peer.as_deref(),
+                    network.as_deref(),
+                )
+                .await
+            }
             IpcMessage::FirewallRemove { index } => self.firewall_remove(index),
             IpcMessage::FirewallShow => self.firewall_show(),
             IpcMessage::FirewallDefault { action } => self.firewall_default(action),
             IpcMessage::FirewallReject { enabled } => self.firewall_reject(enabled),
+            IpcMessage::FirewallSetEnabled { enabled } => self.firewall_set_enabled(enabled),
             IpcMessage::FirewallSuggest {
                 network,
                 suggestions,
@@ -636,9 +673,27 @@ impl MeshManager {
             IpcMessage::FirewallAutoAccept { network, enabled } => {
                 self.firewall_auto_accept(&network, enabled)
             }
+            IpcMessage::FilesAutoAccept { network, enabled } => {
+                self.files_auto_accept(&network, enabled).await
+            }
+            IpcMessage::FirewallSshSet { enabled } => self.firewall_ssh_set(enabled),
+            IpcMessage::FirewallSshAllow {
+                network,
+                peer,
+                users,
+                allow,
+            } => self.firewall_ssh_allow(&network, &peer, users, allow).await,
+            IpcMessage::FirewallSshShow => self.firewall_ssh_show(),
             IpcMessage::SetHostname { network, hostname } => {
                 self.set_hostname(&network, &hostname).await
             }
+            IpcMessage::AliasSet {
+                network,
+                identity,
+                alias,
+            } => self.set_alias(&network, &identity, &alias),
+            IpcMessage::AliasRemove { network, alias } => self.remove_alias(&network, &alias),
+            IpcMessage::AliasList { network } => self.list_aliases(&network),
             IpcMessage::SendFile { path, peer } => self.send_file(&path, &peer).await,
             IpcMessage::ListFiles => self.list_files(),
             IpcMessage::AcceptFile { id, output } => self.accept_file(id, output, peer_cred).await,
@@ -863,7 +918,6 @@ impl MeshManager {
         }
         Ok((handle.network_key, handle.invite_lock.clone()))
     }
-
 }
 
 fn guess_mime_type(filename: &str) -> String {
@@ -887,7 +941,7 @@ fn collect_recent_logs() -> Vec<(String, Vec<u8>)> {
     const MAX_TOTAL: u64 = 3 * 1024 * 1024;
 
     let dir = crate::logdir::log_dir();
-    let mut entries: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
+    let mut entries: Vec<PathBuf> = match std::fs::read_dir(&dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -922,8 +976,8 @@ fn collect_recent_logs() -> Vec<(String, Vec<u8>)> {
 }
 
 /// Write `files` as a gzipped tar archive at `path`. Each entry is `(name, bytes)`.
-fn write_bundle(path: &std::path::Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
-    let file = std::fs::File::create(path)?;
+fn write_bundle(path: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
+    let file = File::create(path)?;
     let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     let mut builder = tar::Builder::new(enc);
     for (name, data) in files {
@@ -1027,9 +1081,9 @@ mod accept_handler_tests {
 
     // Build a minimal NetworkState for use in test AcceptHandler construction.
     fn make_network_state() -> SharedNetworkState {
-        let net_secret = iroh::SecretKey::from_bytes(&[1u8; 32]);
+        let net_secret = SecretKey::from_bytes(&[1u8; 32]);
         let net_pub = net_secret.public();
-        Arc::new(std::sync::RwLock::new(NetworkState {
+        Arc::new(RwLock::new(NetworkState {
             members: MemberList::new(),
             approved: ApprovedList::new(),
             snapshot: None,
@@ -1058,6 +1112,7 @@ mod accept_handler_tests {
             hostname_table: dns::new_hostname_table(),
             reverse_table: dns::new_reverse_table(),
             device_user_map: peers::DeviceUserMap::new(),
+            pruned_peers: Arc::new(DashSet::new()),
         }
     }
 
@@ -1065,14 +1120,14 @@ mod accept_handler_tests {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
         let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
-        let my_key = iroh::SecretKey::from_bytes(&[2u8; 32]);
+        let my_key = SecretKey::from_bytes(&[2u8; 32]);
         let my_id = my_key.public();
         AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
             ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store),
             network_name: "test-net".to_string(),
             state: make_network_state(),
             disconnect_tx,
-            token: tokio_util::sync::CancellationToken::new(),
+            token: CancellationToken::new(),
             dht_notify: None,
             invite_lock: Arc::new(tokio::sync::Mutex::new(())),
             pending_pongs: Arc::new(DashMap::new()),
@@ -1083,13 +1138,13 @@ mod accept_handler_tests {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
         let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
-        let my_key = iroh::SecretKey::from_bytes(&[3u8; 32]);
+        let my_key = SecretKey::from_bytes(&[3u8; 32]);
         AcceptHandler::Member(Arc::new(MemberAcceptState {
             ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_key.public(), 0), blob_store),
             network_name: "test-net".to_string(),
             state: make_network_state(),
             disconnect_tx,
-            token: tokio_util::sync::CancellationToken::new(),
+            token: CancellationToken::new(),
         }))
     }
 
@@ -1164,7 +1219,7 @@ mod coordinator_dial_order_tests {
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
         key_bytes[0] = seed;
-        let key = iroh::SecretKey::from(key_bytes);
+        let key = SecretKey::from(key_bytes);
         key.public()
     }
 
@@ -1221,7 +1276,7 @@ mod coordinator_dial_order_tests {
     #[test]
     fn admin_grant_key_accepted_only_when_public_matches_network() {
         // The real network key: its public half is the network pubkey.
-        let net_secret = iroh::SecretKey::from({
+        let net_secret = SecretKey::from({
             let mut b = [0u8; 32];
             b[0] = 42;
             b
@@ -1236,7 +1291,7 @@ mod coordinator_dial_order_tests {
 
         // A forged grant carries an attacker-chosen key whose public half does
         // not match the network pubkey → rejected (no roster lookup needed).
-        let forged = iroh::SecretKey::from({
+        let forged = SecretKey::from({
             let mut b = [0u8; 32];
             b[0] = 7;
             b

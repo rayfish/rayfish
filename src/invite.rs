@@ -238,10 +238,11 @@ impl InviteStore {
     pub fn restore(&mut self, secret: &[u8]) -> Result<()> {
         let hash = hash_secret(secret);
         if let Some(invite) = self.invites.iter_mut().find(|i| i.secret_hash == hash)
-            && matches!(invite.status, InviteStatus::Redeemed { .. }) {
-                invite.status = InviteStatus::Pending;
-                self.save()?;
-            }
+            && matches!(invite.status, InviteStatus::Redeemed { .. })
+        {
+            invite.status = InviteStatus::Pending;
+            self.save()?;
+        }
         Ok(())
     }
 

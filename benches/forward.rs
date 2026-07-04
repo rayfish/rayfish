@@ -123,6 +123,7 @@ fn bench_firewall(c: &mut Criterion) {
         default_inbound: Action::Allow,
         default_outbound: Action::Allow,
         reject: false,
+        disabled: false,
         rules: vec![
             rule(Direction::In, Action::Allow, Protocol::Tcp, Some((22, 22))),
             rule(Direction::In, Action::Allow, Protocol::Tcp, Some((80, 80))),

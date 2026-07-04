@@ -23,6 +23,12 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     daemon.connect_all_networks().await;
     daemon.activate(None).await;
 
+    // Opt-in automatic updates: a single daemon-wide task that periodically
+    // checks for a newer stable release and swaps + restarts onto it.
+    if daemon.auto_update {
+        spawn_auto_update(daemon.shutdown_token.clone());
+    }
+
     let result = serve_ipc(&daemon, promote_rx, token).await;
 
     // Close the iroh endpoint before returning. Dropping it on return logs
@@ -83,6 +89,13 @@ async fn build_daemon(
     let collision_index = identity::load_collision_index()?;
     let identity = IrohIdentityProvider::new(public_key, collision_index);
     let my_ip = identity.local_ip();
+    // Register our mesh addresses for the userspace SSH port NAT (mesh `:22`
+    // <-> the embedded server's listen port). Stays inactive until `ssh on`.
+    forward::init_ssh_nat(
+        my_ip,
+        derive_ipv6(&identity.local_identity()),
+        crate::ssh::SSH_LISTEN_PORT,
+    );
 
     // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
     let mut app_config = config::load()?;
@@ -166,13 +179,17 @@ async fn build_daemon(
     }
 
     // --- Protocol router + the shared MeshManager ---
-    let files = Arc::new(FileService::new(key.clone()));
+    // Auto-accept worker channel: the file service nudges this with each newly-
+    // queued offer id; the worker (spawned once the daemon exists) evaluates it.
+    let (new_file_tx, new_file_rx) = mpsc::unbounded_channel::<u64>();
+    let files = Arc::new(FileService::new(key.clone(), new_file_tx));
     let connect = Arc::new(ConnectService::new());
     let protocol_router = Arc::new(ProtocolRouter::new(
         blobs_proto,
         files.clone(),
         connect.clone(),
     ));
+    let auto_update = app_config.auto_update;
     // Promotion channel: a co-coordinator's control reader signals the main
     // daemon loop to swap in the coordinator accept handler on `AdminGrant`.
     let (promote_tx, promote_rx) = mpsc::channel::<String>(16);
@@ -190,18 +207,27 @@ async fn build_daemon(
         protocol_router: protocol_router.clone(),
         dns: DnsManager::new(hostname_table, reverse_table, dns_resolver.clone()),
         mdns_enabled,
+        auto_update,
         tun_name,
         files,
         connect,
         device_cert,
         device_user_map,
+        pruned_peers: Arc::new(DashSet::new()),
         contact_public,
         active: active.clone(),
+        ssh_authz: crate::ssh::new_authz(),
+        ssh_token: std::sync::Mutex::new(None),
         promote_tx,
     });
 
     // --- Accept loop (ALPN dispatch) + Prometheus metrics ---
     protocol_router.spawn_accept_loop(daemon.endpoint.clone(), token.clone());
+
+    // Auto-accept worker: evaluates each newly-queued file offer for own-device
+    // auto-accept (no-op unless the sender is our own paired device on an
+    // opted-in network).
+    spawn_file_auto_accept(daemon.clone(), new_file_rx, token.clone());
 
     // --- Contact record publisher (ray connect) ---
     if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
@@ -366,4 +392,118 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<MeshManager>) -> Res
     let resp = daemon.handle_request(req, peer_cred).await;
     ipc::send(&mut framed, resp).await?;
     Ok(())
+}
+
+/// Daemon-wide worker: drains newly-queued file-offer ids from the file service
+/// and evaluates each for own-device auto-accept (a no-op unless the sender is
+/// one of our own paired devices on a network with `auto_accept_files` on).
+fn spawn_file_auto_accept(
+    daemon: Arc<MeshManager>,
+    mut rx: mpsc::UnboundedReceiver<u64>,
+    token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                id = rx.recv() => match id {
+                    Some(id) => daemon.try_auto_accept_file(id).await,
+                    None => return,
+                },
+            }
+        }
+    })
+}
+
+/// First auto-update check runs ~5 min after boot (jittered), then every 6h.
+const AUTO_UPDATE_INITIAL_DELAY: Duration = Duration::from_secs(300);
+const AUTO_UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Restart-loop guard: refuse a repeat of the same target inside this window.
+const AUTO_UPDATE_BACKOFF_SECS: i64 = 24 * 60 * 60;
+
+/// Opt-in automatic updates: a single daemon-wide task that periodically checks
+/// GitHub for a newer stable release and, when found, swaps the binary and
+/// restarts the service onto it. All errors are logged and swallowed so the task
+/// never crashes the daemon.
+fn spawn_auto_update(token: CancellationToken) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Jitter each tick so a fleet upgraded together doesn't hit the GitHub
+        // API in lockstep (anonymous limit is 60/hr per IP).
+        let first = AUTO_UPDATE_INITIAL_DELAY + Duration::from_secs(rand::random::<u64>() % 300);
+        tokio::select! {
+            _ = token.cancelled() => return,
+            _ = tokio::time::sleep(first) => {}
+        }
+        loop {
+            if let Err(e) = auto_update_once().await {
+                tracing::warn!(error = %e, "auto-update check failed");
+            }
+            let next = AUTO_UPDATE_INTERVAL + Duration::from_secs(rand::random::<u64>() % 300);
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = tokio::time::sleep(next) => {}
+            }
+        }
+    })
+}
+
+/// One auto-update cycle: check for a newer stable release and, if found and not
+/// backed off, swap the binary and trigger a self-restart. `Ok(())` means nothing
+/// needed doing (or the swap+restart was scheduled — the daemon is torn down and
+/// relaunched onto the new binary shortly after).
+async fn auto_update_once() -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let asset = crate::update::release_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
+    let client = crate::update::build_http_client()?;
+    let token = crate::update::github_token();
+
+    let release = crate::update::resolve_stable_release(&client, &token).await?;
+    let tag = release.tag_name.clone();
+    let latest = crate::update::normalize_version(&tag).to_string();
+    if !crate::update::version_is_newer(&latest, current) {
+        tracing::debug!(current, latest = %latest, "auto-update: already on latest stable");
+        return Ok(());
+    }
+
+    // Restart-loop guard: refuse a repeat of the same target inside the backoff
+    // window so a bad build that keeps mis-reporting its version can't tight-loop
+    // download + restart.
+    let mut cfg = config::load()?;
+    let now = unix_now();
+    if !crate::update::should_attempt_target(
+        &tag,
+        cfg.auto_update_last_target.as_deref(),
+        cfg.auto_update_last_attempt,
+        now,
+        AUTO_UPDATE_BACKOFF_SECS,
+    ) {
+        tracing::warn!(target = %tag, "auto-update: recently attempted this target, backing off");
+        return Ok(());
+    }
+
+    // Record the attempt *before* swapping so a crash mid-swap still counts
+    // against the backoff; it survives the restart via settings.toml.
+    cfg.auto_update_last_target = Some(tag.clone());
+    cfg.auto_update_last_attempt = Some(now);
+    if let Err(e) = config::save_settings(&cfg) {
+        tracing::warn!(error = %e, "auto-update: failed to persist attempt marker");
+    }
+
+    tracing::info!(current, target = %tag, "auto-update: found newer stable release, swapping");
+    let expected = crate::update::fetch_checksum(&client, &tag, &asset).await?;
+    let bin_url = crate::update::asset_download_url(&tag, &asset);
+    crate::update::download_and_swap(&client, &bin_url, &expected, &asset).await?;
+
+    tracing::info!(target = %tag, "auto-update: binary swapped, restarting service onto it");
+    crate::update::trigger_detached_restart();
+    Ok(())
+}
+
+/// Current unix time in whole seconds (best-effort; 0 before the epoch, which
+/// never happens in practice).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
