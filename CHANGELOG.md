@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Consistent Android device name**: the phone now uses one device name across
+  every network instead of a different random name per network. It is seeded from
+  your device model on first run and can be changed in the You screen (the change
+  applies to all your networks and to any you join later).
+- **Android app exclusions and mesh IPv6 on the phone**: apps that break behind a
+  VPN (Android Auto, Chromecast/Google Home, RCS messaging, GoPro, Sonos) now
+  bypass the tunnel, so wireless Android Auto keeps working with Rayfish on. The
+  Android tunnel also routes mesh IPv6 (the `200::/7` range), which previously did
+  not work on mobile.
 - **Android diagnostics**: the app now captures the mesh core's recent logs and
   reports lightweight health (networks, peers online, transport, and a WARN/ERROR
   count) to crash reporting automatically when the tunnel goes up or down and when
