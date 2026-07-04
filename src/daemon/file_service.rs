@@ -55,11 +55,24 @@ impl FileService {
         match conn.accept_bi().await {
             Ok((_send, mut recv)) => {
                 match control::recv_msg(&mut recv).await {
-                    Ok(control::ControlMsg::FileOffer { from, filename, size, mime_type, blob_hash }) => {
+                    Ok(control::ControlMsg::FileOffer {
+                        from,
+                        filename,
+                        size,
+                        mime_type,
+                        blob_hash,
+                    }) => {
                         if from == remote_id {
                             let id = counter.fetch_add(1, Ordering::Relaxed);
                             tracing::info!(from = %from.fmt_short(), filename = %filename, size, "file offer received");
-                            pending.lock().unwrap().push(PendingFile { id, from, filename, size, mime_type, blob_hash });
+                            pending.lock().unwrap().push(PendingFile {
+                                id,
+                                from,
+                                filename,
+                                size,
+                                mime_type,
+                                blob_hash,
+                            });
                             // Nudge the auto-accept worker: it accepts only offers
                             // from our own paired devices on an opted-in network,
                             // and no-ops otherwise, so the offer stays queued for
@@ -112,7 +125,10 @@ impl FileService {
                     }
                 };
                 match request {
-                    control::PairMsg::Request { secret, device_pubkey } => {
+                    control::PairMsg::Request {
+                        secret,
+                        device_pubkey,
+                    } => {
                         // Verify the secret matches the stored pairing secret
                         let stored = pairing_secret.lock().unwrap().take();
                         match stored {
@@ -157,11 +173,8 @@ impl FileService {
                                 // "connection lost" and never receives the cert even though we
                                 // logged success below.
                                 let _ = send.finish();
-                                let _ = tokio::time::timeout(
-                                    Duration::from_secs(5),
-                                    conn.closed(),
-                                )
-                                .await;
+                                let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+                                    .await;
                                 tracing::info!(device = %device_pubkey.fmt_short(), "device paired successfully");
                             }
                             Some(_) => {

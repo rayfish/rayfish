@@ -5,7 +5,6 @@
 
 use super::super::*;
 
-
 /// Compute the order in which a joiner should dial coordinators.
 /// Returns the minter first (if present and not `me`), then every other
 /// `is_coordinator` member except `me`, de-duplicated, preserving order.
@@ -28,7 +27,6 @@ pub(crate) fn coordinator_dial_order(
     order
 }
 
-
 /// Pick the peers to gossip single-use invite state to: every other
 /// `is_coordinator` member, excluding ourselves. Only coordinators (network-key
 /// holders) can admit, so only they need the shared invite ledger; a
@@ -41,7 +39,6 @@ pub(crate) fn gossip_targets(members: &[Member], me: EndpointId) -> Vec<Endpoint
         .collect()
 }
 
-
 /// Outcome of a single coordinator dial attempt during the join fallback loop.
 /// Used as a unit-testable specification of the loop termination policy.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -51,7 +48,6 @@ pub(crate) enum DialOutcome {
     Denied,
     Unreachable,
 }
-
 
 /// Returns `(index_of_last_tried, welcomed)`.
 /// Iterates `outcomes` left-to-right and stops at the first `Welcomed`.
@@ -65,7 +61,6 @@ pub(crate) fn pick_first_welcome(outcomes: &[DialOutcome]) -> (usize, bool) {
     }
     (outcomes.len().saturating_sub(1), false)
 }
-
 
 /// Last-known roster from persisted config. Used only as a fallback when the
 /// signed pkarr record is briefly unreachable during a reconnect — never trusts
@@ -90,7 +85,6 @@ pub(crate) fn persisted_roster(network_name: &str) -> Vec<Member> {
         })
         .unwrap_or_default()
 }
-
 
 /// Rebuild a network's DNS entries from its member roster (the single source of
 /// truth) and persist our own — possibly coordinator-corrected — hostname. Called

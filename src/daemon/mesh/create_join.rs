@@ -63,9 +63,13 @@ impl MeshManager {
                 .as_ref()
                 .map(|s| s.hash)
                 .expect("snapshot set");
-            if let Err(e) =
-                dht::publish_network(&pkarr_client, net_secret_key, &blob_hash, &[self.endpoint.id()])
-                    .await
+            if let Err(e) = dht::publish_network(
+                &pkarr_client,
+                net_secret_key,
+                &blob_hash,
+                &[self.endpoint.id()],
+            )
+            .await
             {
                 tracing::warn!(error = %e, "failed to publish network record");
             }
@@ -254,8 +258,14 @@ impl MeshManager {
                 .unwrap_or_else(crate::hostname::generate_hostname),
         };
 
-        let mut net_state =
-            self.build_initial_roster(&name, my_ip, &my_hostname, mode, &net_secret_key, pre_approve)?;
+        let mut net_state = self.build_initial_roster(
+            &name,
+            my_ip,
+            &my_hostname,
+            mode,
+            &net_secret_key,
+            pre_approve,
+        )?;
 
         // Register in DNS hostname table
         dns::update_hostname(
@@ -296,8 +306,13 @@ impl MeshManager {
         let state = Arc::new(std::sync::RwLock::new(net_state));
         let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
         let dht_notify = Arc::new(tokio::sync::Notify::new());
-        let (tasks, disconnect_tx) =
-            self.spawn_coordinator_background_tasks(&name, &net_secret_key, &state, &dht_notify, &cancel);
+        let (tasks, disconnect_tx) = self.spawn_coordinator_background_tasks(
+            &name,
+            &net_secret_key,
+            &state,
+            &dht_notify,
+            &cancel,
+        );
 
         // Insert the handle first so register_coordinator_handler can update the role.
         let handle = NetworkHandle {
@@ -580,7 +595,8 @@ impl MeshManager {
         for coordinator_id in &order {
             let cancel = self.shutdown_token.child_token();
             let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
-            let tasks = vec![self.spawn_join_reconnect(ctx, my_id, &disconnect_tx, disconnect_rx, &cancel)];
+            let tasks =
+                vec![self.spawn_join_reconnect(ctx, my_id, &disconnect_tx, disconnect_rx, &cancel)];
 
             tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
             let conn = match transport::connect_to_peer_with_alpn(
@@ -600,7 +616,15 @@ impl MeshManager {
             };
 
             match self
-                .run_join_handshake(ctx, data, conn, true, &disconnect_tx, &cancel, ctx.invite.clone())
+                .run_join_handshake(
+                    ctx,
+                    data,
+                    conn,
+                    true,
+                    &disconnect_tx,
+                    &cancel,
+                    ctx.invite.clone(),
+                )
                 .await
             {
                 Ok(JoinResult::Joined(state)) => {
@@ -659,7 +683,8 @@ impl MeshManager {
         let cancel = self.shutdown_token.child_token();
         let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
         let my_id = self.identity.local_identity();
-        let tasks = vec![self.spawn_join_reconnect(ctx, my_id, &disconnect_tx, disconnect_rx, &cancel)];
+        let tasks =
+            vec![self.spawn_join_reconnect(ctx, my_id, &disconnect_tx, disconnect_rx, &cancel)];
 
         // Fallback state built straight from the verified blob so registration
         // never blocks on (or dies with) the coordinator handshake.
@@ -691,7 +716,15 @@ impl MeshManager {
         .await
         {
             Ok(conn) => match self
-                .run_join_handshake(ctx, data, conn, false, &disconnect_tx, &cancel, ctx.invite.clone())
+                .run_join_handshake(
+                    ctx,
+                    data,
+                    conn,
+                    false,
+                    &disconnect_tx,
+                    &cancel,
+                    ctx.invite.clone(),
+                )
                 .await
             {
                 Ok(JoinResult::Joined(state)) => state,
@@ -1247,5 +1280,4 @@ impl MeshManager {
             }
         }
     }
-
 }

@@ -259,8 +259,14 @@ pub fn encode_pairing_ticket(endpoint: EndpointId, secret: &[u8; 32]) -> String 
 }
 
 pub fn decode_pairing_ticket(s: &str) -> Result<(EndpointId, [u8; 32])> {
-    let raw = bs58::decode(s.trim()).into_vec().context("ticket is not base58")?;
-    anyhow::ensure!(raw.len() == 64, "pairing ticket must be 64 bytes, got {}", raw.len());
+    let raw = bs58::decode(s.trim())
+        .into_vec()
+        .context("ticket is not base58")?;
+    anyhow::ensure!(
+        raw.len() == 64,
+        "pairing ticket must be 64 bytes, got {}",
+        raw.len()
+    );
     let endpoint = EndpointId::from_bytes(&raw[..32].try_into().unwrap())
         .context("ticket endpoint id invalid")?;
     let mut secret = [0u8; 32];

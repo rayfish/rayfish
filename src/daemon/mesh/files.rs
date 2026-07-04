@@ -14,7 +14,8 @@ impl MeshManager {
         } else {
             format!("{name}{suffix}")
         };
-        if let Some((ip, _)) = dns::resolve_name(&qualified, &suffix, &self.dns.hostname_table).await
+        if let Some((ip, _)) =
+            dns::resolve_name(&qualified, &suffix, &self.dns.hostname_table).await
         {
             // Try connected peers first
             if let Some(route) = self.peers.lookup_v4(&ip) {
@@ -430,7 +431,11 @@ impl MeshManager {
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// pair this device with a primary device using a scanned ticket.
-    pub async fn pair_with_device(self: &Arc<Self>, endpoint_id: EndpointId, secret: Vec<u8>) -> IpcMessage {
+    pub async fn pair_with_device(
+        self: &Arc<Self>,
+        endpoint_id: EndpointId,
+        secret: Vec<u8>,
+    ) -> IpcMessage {
         let addr: iroh::EndpointAddr = endpoint_id.into();
         let conn = match self.endpoint.connect(addr, PAIR_ALPN).await {
             Ok(c) => c,
@@ -527,7 +532,15 @@ impl MeshManager {
                     let me = Arc::clone(self);
                     tokio::spawn(async move {
                         let _ = me
-                            .join_network(&net.network_key, Some(&net.name), None, None, None, false, false)
+                            .join_network(
+                                &net.network_key,
+                                Some(&net.name),
+                                None,
+                                None,
+                                None,
+                                false,
+                                false,
+                            )
                             .await;
                     });
                 }

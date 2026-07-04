@@ -751,7 +751,10 @@ mod tests {
         let info = firewall::parse_packet_info(&pkt).unwrap();
         assert!(rewrite_ssh_port(&mut pkt, &info, true));
         let info2 = firewall::parse_packet_info(&pkt).unwrap();
-        assert_eq!(info2.dst_port, listen_port, "dest port rewritten 22 -> listen");
+        assert_eq!(
+            info2.dst_port, listen_port,
+            "dest port rewritten 22 -> listen"
+        );
         // The incrementally-updated checksum must equal a freshly computed one.
         let field = u16::from_be_bytes([pkt[36], pkt[37]]);
         assert_eq!(

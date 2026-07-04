@@ -191,7 +191,8 @@ impl MeshManager {
     /// `ray connections`: list pending incoming connect requests.
     pub fn list_connections(&self) -> IpcMessage {
         let now = Instant::now();
-        let requests = self.connect
+        let requests = self
+            .connect
             .pending_connects
             .iter()
             .map(|p| ipc::PendingRequestInfo {
@@ -253,7 +254,8 @@ impl MeshManager {
     /// `ray connections approve <id>`: approve a pending connect request, minting
     /// a 2-peer network with the requester pre-approved.
     pub async fn approve_connection(self: &Arc<Self>, id_prefix: &str) -> IpcMessage {
-        let found = self.connect
+        let found = self
+            .connect
             .pending_connects
             .iter()
             .find(|p| {

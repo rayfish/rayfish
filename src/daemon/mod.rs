@@ -198,7 +198,6 @@ pub(crate) fn to_approved_entries<'a>(
         .collect()
 }
 
-
 #[derive(Clone)]
 struct GroupSnapshot {
     hash: blake3::Hash,
@@ -548,7 +547,8 @@ impl MeshManager {
             let resolver = self.dns.resolver.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    forward::run_mesh(reader, peers, firewall, cancel, stats, resolver, new_tx).await
+                    forward::run_mesh(reader, peers, firewall, cancel, stats, resolver, new_tx)
+                        .await
                 {
                     tracing::warn!(error = %e, "mesh forwarding loop exited with error");
                 }
@@ -959,8 +959,13 @@ impl MeshManager {
         }
 
         // Update DNS table: remove old entry for our IP, insert new one.
-        dns::remove_hostname_by_ip(&self.dns.hostname_table, &self.dns.reverse_table, network, my_ip)
-            .await;
+        dns::remove_hostname_by_ip(
+            &self.dns.hostname_table,
+            &self.dns.reverse_table,
+            network,
+            my_ip,
+        )
+        .await;
         dns::update_hostname(
             &self.dns.hostname_table,
             &self.dns.reverse_table,
@@ -1715,7 +1720,12 @@ mod headless_tests {
         let writer1 = FakeTunWriter::default();
         let sink1 = writer1.written.clone();
         daemon
-            .attach_tun(FakeTunReader { _alive: Arc::new(()) }, writer1)
+            .attach_tun(
+                FakeTunReader {
+                    _alive: Arc::new(()),
+                },
+                writer1,
+            )
             .await;
         daemon.active.store(true, Ordering::SeqCst);
 
@@ -1732,7 +1742,12 @@ mod headless_tests {
         let sink2 = writer2.written.clone();
         let alive2 = Arc::new(());
         daemon
-            .attach_tun(FakeTunReader { _alive: alive2.clone() }, writer2)
+            .attach_tun(
+                FakeTunReader {
+                    _alive: alive2.clone(),
+                },
+                writer2,
+            )
             .await;
         daemon.active.store(true, Ordering::SeqCst);
 
@@ -1751,7 +1766,12 @@ mod headless_tests {
         let writer3 = FakeTunWriter::default();
         let sink3 = writer3.written.clone();
         daemon
-            .attach_tun(FakeTunReader { _alive: Arc::new(()) }, writer3)
+            .attach_tun(
+                FakeTunReader {
+                    _alive: Arc::new(()),
+                },
+                writer3,
+            )
             .await;
         daemon.active.store(true, Ordering::SeqCst);
 

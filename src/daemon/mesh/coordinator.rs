@@ -4,7 +4,6 @@
 
 use super::super::*;
 
-
 /// Extra context a coordinator needs to prune the canonical member list when a
 /// peer leaves deliberately (`ray leave`). Members pass `None` and only ever
 /// drop the connection from the [`PeerTable`].
@@ -17,7 +16,6 @@ pub(crate) struct CoordinatorCleanup {
     pub(crate) device_user_map: peers::DeviceUserMap,
     pub(crate) network_name: String,
 }
-
 
 pub(crate) fn spawn_peer_cleanup(
     mut disconnect_rx: mpsc::Receiver<forward::DisconnectEvent>,
@@ -64,7 +62,6 @@ pub(crate) fn spawn_peer_cleanup(
         }
     })
 }
-
 
 /// Coordinator-side per-member control reader. Continuously accepts control
 /// streams from one member and processes `MeshHello`s as live create-or-update
@@ -261,7 +258,6 @@ pub(crate) fn spawn_coordinator_control_reader(
     });
 }
 
-
 /// Send `msg` to each coordinator peer (per [`gossip_targets`]) that has a live
 /// connection on `network`. Best-effort: a target without a live connection is
 /// skipped (it will reconverge invite state from a future share/redeem or, for
@@ -286,7 +282,6 @@ pub(crate) async fn gossip_to_coordinators(
         }
     }
 }
-
 
 /// Whether `peer` is a coordinator in our verified roster. Invite-gossip arms
 /// (`InviteShare`/`InviteUsed`) act only on messages from a coordinator peer, so

@@ -118,7 +118,10 @@ pub async fn build_headless() -> Result<Arc<MeshManager>> {
 /// receiver and metrics-server guard are stashed on the state for the caller.
 ///
 /// Shared by [`run_daemon`] (desktop) and [`build_headless`] (embedders).
-async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<Arc<MeshManager>> {
+async fn build_daemon(
+    token: CancellationToken,
+    stats: Arc<ForwardMetrics>,
+) -> Result<Arc<MeshManager>> {
     // Relocate a pre-/etc config tree into /etc/rayfish (Linux upgrade path)
     // before anything reads identity or config. No-op on macOS / once migrated.
     config::migrate_location();
@@ -277,11 +280,7 @@ async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> R
 
     // --- Contact record publisher (ray connect) ---
     if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
-        spawn_contact_publisher(
-            pkarr_client,
-            daemon.endpoint.id(),
-            token.clone(),
-        );
+        spawn_contact_publisher(pkarr_client, daemon.endpoint.id(), token.clone());
     }
     let metrics_server =
         spawn_metrics_server(stats, daemon.peers.clone(), &daemon.endpoint, token).await;

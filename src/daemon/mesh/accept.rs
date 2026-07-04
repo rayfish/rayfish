@@ -67,9 +67,13 @@ impl CoordinatorAcceptState {
         tracing::info!(ip = %peer_ip, "known member reconnecting");
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
         let peer_ipv6 = derive_ipv6(&remote_id);
-        self.ctx
-            .peers
-            .add(peer_ip, peer_ipv6, conn.clone(), remote_id, &self.network_name);
+        self.ctx.peers.add(
+            peer_ip,
+            peer_ipv6,
+            conn.clone(),
+            remote_id,
+            &self.network_name,
+        );
         let token = self.token.clone();
         let disconnect_tx = self.disconnect_tx.clone();
         let network = self.network_name.clone();
@@ -155,7 +159,9 @@ impl CoordinatorAcceptState {
                 tracing::warn!(peer = %remote_id.fmt_short(), "invalid device certificate");
                 return;
             }
-            self.ctx.device_user_map.insert(remote_id, cert.user_identity);
+            self.ctx
+                .device_user_map
+                .insert(remote_id, cert.user_identity);
         }
 
         // A peer pre-approved via `ray accept` is admitted directly.
@@ -179,7 +185,13 @@ impl CoordinatorAcceptState {
         // Unknown peer presenting an invite secret: verify and burn it.
         if let Some(secret) = invite_secret {
             self.redeem_invite_and_admit(
-                conn, send, remote_id, peer_ip, hostname, device_cert, secret,
+                conn,
+                send,
+                remote_id,
+                peer_ip,
+                hostname,
+                device_cert,
+                secret,
             )
             .await;
             return;
@@ -210,7 +222,14 @@ impl CoordinatorAcceptState {
                 // `device_cert`/`hostname` are moved into the pending-join queue.
                 if owner_admits(device_cert.as_ref(), self.ctx.identity.local_identity()) {
                     self.admit_peer(
-                        conn, send, remote_id, peer_ip, hostname, device_cert, false, false,
+                        conn,
+                        send,
+                        remote_id,
+                        peer_ip,
+                        hostname,
+                        device_cert,
+                        false,
+                        false,
                     )
                     .await;
                     return;
@@ -221,11 +240,9 @@ impl CoordinatorAcceptState {
                 // control-flood rate limiter covers sustained message floods.
                 {
                     let mut s = self.state.write().unwrap();
-                    if let Some(dropped) = evict_oldest_pending(
-                        &mut s.pending,
-                        remote_id,
-                        MAX_PENDING_JOINS,
-                    ) {
+                    if let Some(dropped) =
+                        evict_oldest_pending(&mut s.pending, remote_id, MAX_PENDING_JOINS)
+                    {
                         tracing::warn!(
                             evicted = %dropped.fmt_short(),
                             "pending-join queue full; evicted oldest request"
@@ -335,7 +352,14 @@ impl CoordinatorAcceptState {
                     // Reusable joins are non-authoritative: joiner-chosen name,
                     // collision → suffix.
                     self.admit_peer(
-                        conn, send, remote_id, peer_ip, hostname, device_cert, false, false,
+                        conn,
+                        send,
+                        remote_id,
+                        peer_ip,
+                        hostname,
+                        device_cert,
+                        false,
+                        false,
                     )
                     .await;
                 } else {
@@ -522,9 +546,13 @@ impl CoordinatorAcceptState {
     ) {
         let peer_ipv6 = derive_ipv6(&remote_id);
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
-        self.ctx
-            .peers
-            .add(peer_ip, peer_ipv6, conn.clone(), remote_id, &self.network_name);
+        self.ctx.peers.add(
+            peer_ip,
+            peer_ipv6,
+            conn.clone(),
+            remote_id,
+            &self.network_name,
+        );
         spawn_coordinator_control_reader(
             conn.clone(),
             remote_id,
@@ -563,9 +591,13 @@ impl MemberAcceptState {
     /// branches of `handle_connection`.
     fn register_peer(&self, conn: Connection, peer_identity: EndpointId, ip: Ipv4Addr) {
         let peer_ipv6 = derive_ipv6(&peer_identity);
-        self.ctx
-            .peers
-            .add(ip, peer_ipv6, conn.clone(), peer_identity, &self.network_name);
+        self.ctx.peers.add(
+            ip,
+            peer_ipv6,
+            conn.clone(),
+            peer_identity,
+            &self.network_name,
+        );
         forward::spawn_peer_reader(
             conn,
             peer_identity,
@@ -608,7 +640,8 @@ impl MemberAcceptState {
             return;
         };
         if let Some(ref cert) = device_cert {
-            self.ctx.device_user_map
+            self.ctx
+                .device_user_map
                 .insert(transport_id, cert.user_identity);
         }
         let _ = effective_user_id;
@@ -763,7 +796,11 @@ pub(crate) struct ProtocolRouter {
 }
 
 impl ProtocolRouter {
-    pub(crate) fn new(blobs: BlobsProtocol, files: Arc<FileService>, connect: Arc<ConnectService>) -> Self {
+    pub(crate) fn new(
+        blobs: BlobsProtocol,
+        files: Arc<FileService>,
+        connect: Arc<ConnectService>,
+    ) -> Self {
         Self {
             blobs,
             handlers: DashMap::new(),

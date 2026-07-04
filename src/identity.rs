@@ -97,7 +97,9 @@ mod tests {
 
         assert!(load_device_cert().unwrap().is_none());
         store_device_cert(&cert).unwrap();
-        let loaded = load_device_cert().unwrap().expect("cert present after store");
+        let loaded = load_device_cert()
+            .unwrap()
+            .expect("cert present after store");
         assert_eq!(loaded.user_identity, cert.user_identity);
         assert_eq!(loaded.device_key, cert.device_key);
         assert!(loaded.verify());

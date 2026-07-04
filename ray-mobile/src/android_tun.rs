@@ -135,9 +135,8 @@ impl TunWrite for AndroidTunWriter {
                 let raw = inner.get_ref().as_raw_fd();
                 let chunk = &packet[off..];
                 // SAFETY: writes at most `chunk.len()` bytes from a valid slice.
-                let n = unsafe {
-                    libc::write(raw, chunk.as_ptr().cast::<libc::c_void>(), chunk.len())
-                };
+                let n =
+                    unsafe { libc::write(raw, chunk.as_ptr().cast::<libc::c_void>(), chunk.len()) };
                 if n < 0 {
                     Err(io::Error::last_os_error())
                 } else {

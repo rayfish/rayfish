@@ -13,10 +13,12 @@ pub enum RayfishLink {
 /// reserved characters.
 pub fn parse_rayfish_uri(s: &str) -> anyhow::Result<RayfishLink> {
     let s = s.trim();
-    let rest = s.strip_prefix("rayfish://")
+    let rest = s
+        .strip_prefix("rayfish://")
         .ok_or_else(|| anyhow::anyhow!("not a rayfish:// URI"))?;
     let rest = rest.strip_suffix('/').unwrap_or(rest);
-    let (verb, code) = rest.split_once('/')
+    let (verb, code) = rest
+        .split_once('/')
         .ok_or_else(|| anyhow::anyhow!("missing code in {s}"))?;
     anyhow::ensure!(!code.is_empty(), "empty code in {s}");
     match verb {
@@ -32,13 +34,22 @@ mod tests {
 
     #[test]
     fn parses_join_and_pair() {
-        assert_eq!(parse_rayfish_uri("rayfish://join/ABC123").unwrap(), RayfishLink::Join("ABC123".into()));
-        assert_eq!(parse_rayfish_uri("rayfish://pair/XYZ789").unwrap(), RayfishLink::Pair("XYZ789".into()));
+        assert_eq!(
+            parse_rayfish_uri("rayfish://join/ABC123").unwrap(),
+            RayfishLink::Join("ABC123".into())
+        );
+        assert_eq!(
+            parse_rayfish_uri("rayfish://pair/XYZ789").unwrap(),
+            RayfishLink::Pair("XYZ789".into())
+        );
     }
 
     #[test]
     fn trailing_slash_and_whitespace_tolerated() {
-        assert_eq!(parse_rayfish_uri(" rayfish://join/CODE/ ").unwrap(), RayfishLink::Join("CODE".into()));
+        assert_eq!(
+            parse_rayfish_uri(" rayfish://join/CODE/ ").unwrap(),
+            RayfishLink::Join("CODE".into())
+        );
     }
 
     #[test]

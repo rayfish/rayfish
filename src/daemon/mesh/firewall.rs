@@ -278,7 +278,7 @@ impl MeshManager {
             // a duplicate (and a re-suggested action flip supersedes the old one).
             let deduped = firewall::dedup_by_selector(existing);
             let config = self.firewall.replace_network_rules(network, deduped);
-        save_firewall_warn(&config);
+            save_firewall_warn(&config);
         }
         IpcMessage::Ok {
             message: format!(

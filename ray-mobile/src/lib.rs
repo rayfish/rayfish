@@ -266,10 +266,7 @@ fn saved_networks_status() -> Status {
             }
         })
         .collect();
-    Status {
-        networks,
-        ..empty
-    }
+    Status { networks, ..empty }
 }
 
 #[uniffi::export]
@@ -324,9 +321,7 @@ impl Node {
         // secret) or a bare room id (the network pubkey). Mirrors the CLI's
         // `ipc_join` fallback: on decode failure, treat the input as a room id.
         let (network_key, invite, coordinator) = match invite::decode_invite_code(&code) {
-            Ok((net_pubkey, coord, secret)) => {
-                (net_pubkey.to_string(), Some(secret), Some(coord))
-            }
+            Ok((net_pubkey, coord, secret)) => (net_pubkey.to_string(), Some(secret), Some(coord)),
             Err(_) => (code.clone(), None, None),
         };
 
@@ -403,13 +398,15 @@ impl Node {
     pub fn invite(&self, network: String) -> Result<String, RayError> {
         let state = self.state()?;
         // 7 days, single-use, coordinator-picked hostname (None).
-        let result = self.runtime.block_on(
-            state.invite_create(&network, 7 * 24 * 60 * 60, None, false),
-        );
+        let result =
+            self.runtime
+                .block_on(state.invite_create(&network, 7 * 24 * 60 * 60, None, false));
         match result {
             IpcMessage::InviteCreated { code, .. } => Ok(code),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!("unexpected invite response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected invite response: {other:?}"
+            ))),
         }
     }
 
@@ -419,17 +416,24 @@ impl Node {
         match self.runtime.block_on(state.leave_network(&network)) {
             IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!("unexpected leave response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected leave response: {other:?}"
+            ))),
         }
     }
 
     /// Set this device's hostname on `network`. Validated by the core.
     pub fn set_hostname(&self, network: String, hostname: String) -> Result<(), RayError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.set_hostname(&network, &hostname)) {
+        match self
+            .runtime
+            .block_on(state.set_hostname(&network, &hostname))
+        {
             IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(RayError::BadCode(message)),
-            other => Err(RayError::Network(format!("unexpected set_hostname response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected set_hostname response: {other:?}"
+            ))),
         }
     }
 
@@ -444,7 +448,9 @@ impl Node {
             ..
         } = state.firewall_show()
         else {
-            return Err(RayError::Network("unexpected firewall response".to_string()));
+            return Err(RayError::Network(
+                "unexpected firewall response".to_string(),
+            ));
         };
         Ok(FirewallStateInfo {
             default_inbound: default_inbound.to_string(),
@@ -489,7 +495,9 @@ impl Node {
         match result {
             IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!("unexpected firewall response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected firewall response: {other:?}"
+            ))),
         }
     }
 
@@ -499,7 +507,9 @@ impl Node {
         match state.firewall_remove(index as usize) {
             IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!("unexpected firewall response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected firewall response: {other:?}"
+            ))),
         }
     }
 
@@ -511,7 +521,9 @@ impl Node {
         match state.firewall_default(action) {
             IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!("unexpected firewall response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected firewall response: {other:?}"
+            ))),
         }
     }
 
@@ -532,18 +544,26 @@ impl Node {
                 })
                 .collect()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!("unexpected files response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected files response: {other:?}"
+            ))),
         }
     }
 
     /// Accept a file offer, saving it under `output_dir` (an app-writable path).
     pub fn accept_file_offer(&self, id: u64, output_dir: String) -> Result<(), RayError> {
         let state = self.state()?;
-        let out = if output_dir.is_empty() { None } else { Some(output_dir) };
+        let out = if output_dir.is_empty() {
+            None
+        } else {
+            Some(output_dir)
+        };
         match self.runtime.block_on(state.accept_file(id, out, None)) {
             IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!("unexpected files response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected files response: {other:?}"
+            ))),
         }
     }
 
@@ -553,7 +573,9 @@ impl Node {
         match state.reject_file(id) {
             IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!("unexpected files response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected files response: {other:?}"
+            ))),
         }
     }
 
@@ -570,7 +592,9 @@ impl Node {
                 })
                 .collect()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!("unexpected connections response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected connections response: {other:?}"
+            ))),
         }
     }
 
@@ -580,7 +604,9 @@ impl Node {
         match self.runtime.block_on(state.approve_connection(&short_id)) {
             IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!("unexpected connections response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected connections response: {other:?}"
+            ))),
         }
     }
 
@@ -590,7 +616,9 @@ impl Node {
         match state.reject_connect(&short_id) {
             IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!("unexpected connections response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected connections response: {other:?}"
+            ))),
         }
     }
 
@@ -607,17 +635,24 @@ impl Node {
                 })
                 .collect()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!("unexpected requests response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected requests response: {other:?}"
+            ))),
         }
     }
 
     /// Approve a pending join request on a network we coordinate.
     pub fn accept_join_request(&self, network: String, short_id: String) -> Result<(), RayError> {
         let state = self.state()?;
-        match self.runtime.block_on(state.accept_request(&network, &short_id)) {
+        match self
+            .runtime
+            .block_on(state.accept_request(&network, &short_id))
+        {
             IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!("unexpected requests response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected requests response: {other:?}"
+            ))),
         }
     }
 
@@ -627,7 +662,9 @@ impl Node {
         match state.deny_request(&network, &short_id) {
             IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
-            other => Err(RayError::Network(format!("unexpected requests response: {other:?}"))),
+            other => Err(RayError::Network(format!(
+                "unexpected requests response: {other:?}"
+            ))),
         }
     }
 
@@ -648,7 +685,9 @@ impl Node {
         match state.start_pairing() {
             IpcMessage::PairingTicket { ticket } => Ok(ticket),
             IpcMessage::Error { message } => Err(RayError::PairFailed(message)),
-            other => Err(RayError::PairFailed(format!("unexpected pairing response: {other:?}"))),
+            other => Err(RayError::PairFailed(format!(
+                "unexpected pairing response: {other:?}"
+            ))),
         }
     }
 
@@ -657,8 +696,8 @@ impl Node {
     pub fn pair(&self, ticket: String) -> Result<(), RayError> {
         let state = self.state()?;
 
-        let (endpoint, secret) =
-            control::decode_pairing_ticket(&ticket).map_err(|e| RayError::BadCode(e.to_string()))?;
+        let (endpoint, secret) = control::decode_pairing_ticket(&ticket)
+            .map_err(|e| RayError::BadCode(e.to_string()))?;
 
         let result = self
             .runtime
