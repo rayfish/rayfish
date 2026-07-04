@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Android diagnostics**: the app now captures the mesh core's recent logs and
+  reports lightweight health (networks, peers online, transport, and a WARN/ERROR
+  count) to crash reporting automatically when the tunnel goes up or down and when
+  the connection changes between wifi and cellular. A new "Send diagnostics" button
+  in the You screen attaches the full recent log to a report so connection problems
+  can be diagnosed. All of this respects the existing crash-reporting toggle; the
+  toggle now reads "diagnostics".
 - **Device ownership in `ray status`**: peer rows that are your own paired
   devices are now tagged `(your device)`, and a paired device belonging to
   another user is labelled `(user <id>)` (or shows that user's alias when you
