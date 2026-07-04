@@ -164,6 +164,25 @@ pub struct FirewallStateInfo {
     pub rules: Vec<FirewallRuleInfo>,
 }
 
+/// A pending incoming file offer, for the notifications UI.
+#[derive(uniffi::Record)]
+pub struct FileOffer {
+    pub id: u64,
+    pub from: String,
+    pub filename: String,
+    pub size: u64,
+    pub mime_type: String,
+}
+
+/// A pending request awaiting the user's decision: an incoming `ray connect`
+/// friend request, or a network-join request on a network we coordinate.
+#[derive(uniffi::Record)]
+pub struct PendingRequest {
+    pub short_id: String,
+    pub hostname: Option<String>,
+    pub waiting_secs: u64,
+}
+
 /// The outcome of following a `rayfish://` deep link, reflected in the UI.
 #[derive(uniffi::Enum)]
 pub enum LinkAction {
@@ -433,6 +452,144 @@ impl Node {
         }
     }
 
+    /// Set the inbound default action ("allow" or "deny"). The outbound default
+    /// stays "allow"; inbound ICMP-allow is a separate built-in and is unaffected.
+    pub fn firewall_set_default_inbound(&self, action: String) -> Result<(), RayError> {
+        let state = self.state()?;
+        let action: Action = action.parse().map_err(RayError::Network)?;
+        match state.firewall_default(action) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!("unexpected firewall response: {other:?}"))),
+        }
+    }
+
+    // --- Notifications: pending file offers, connect requests, join requests ---
+
+    /// Incoming file offers waiting to be accepted or declined.
+    pub fn list_file_offers(&self) -> Result<Vec<FileOffer>, RayError> {
+        let state = self.state()?;
+        match state.list_files() {
+            IpcMessage::FileList { files } => Ok(files
+                .into_iter()
+                .map(|f| FileOffer {
+                    id: f.id,
+                    from: f.from,
+                    filename: f.filename,
+                    size: f.size,
+                    mime_type: f.mime_type,
+                })
+                .collect()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!("unexpected files response: {other:?}"))),
+        }
+    }
+
+    /// Accept a file offer, saving it under `output_dir` (an app-writable path).
+    pub fn accept_file_offer(&self, id: u64, output_dir: String) -> Result<(), RayError> {
+        let state = self.state()?;
+        let out = if output_dir.is_empty() { None } else { Some(output_dir) };
+        match self.runtime.block_on(state.accept_file(id, out, None)) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!("unexpected files response: {other:?}"))),
+        }
+    }
+
+    /// Decline a file offer without downloading it.
+    pub fn reject_file_offer(&self, id: u64) -> Result<(), RayError> {
+        let state = self.state()?;
+        match state.reject_file(id) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!("unexpected files response: {other:?}"))),
+        }
+    }
+
+    /// Incoming `ray connect` friend requests waiting for a decision.
+    pub fn list_connect_requests(&self) -> Result<Vec<PendingRequest>, RayError> {
+        let state = self.state()?;
+        match state.list_connections() {
+            IpcMessage::PendingRequests { requests } => Ok(requests
+                .into_iter()
+                .map(|r| PendingRequest {
+                    short_id: r.short_id,
+                    hostname: r.hostname,
+                    waiting_secs: r.waiting_secs,
+                })
+                .collect()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!("unexpected connections response: {other:?}"))),
+        }
+    }
+
+    /// Approve an incoming connect request (mints a direct 2-peer network).
+    pub fn approve_connect_request(&self, short_id: String) -> Result<(), RayError> {
+        let state = self.state()?;
+        match self.runtime.block_on(state.approve_connection(&short_id)) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!("unexpected connections response: {other:?}"))),
+        }
+    }
+
+    /// Decline an incoming connect request.
+    pub fn reject_connect_request(&self, short_id: String) -> Result<(), RayError> {
+        let state = self.state()?;
+        match state.reject_connect(&short_id) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!("unexpected connections response: {other:?}"))),
+        }
+    }
+
+    /// Join requests awaiting approval on a network we coordinate.
+    pub fn list_join_requests(&self, network: String) -> Result<Vec<PendingRequest>, RayError> {
+        let state = self.state()?;
+        match state.list_requests(&network) {
+            IpcMessage::PendingRequests { requests } => Ok(requests
+                .into_iter()
+                .map(|r| PendingRequest {
+                    short_id: r.short_id,
+                    hostname: r.hostname,
+                    waiting_secs: r.waiting_secs,
+                })
+                .collect()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!("unexpected requests response: {other:?}"))),
+        }
+    }
+
+    /// Approve a pending join request on a network we coordinate.
+    pub fn accept_join_request(&self, network: String, short_id: String) -> Result<(), RayError> {
+        let state = self.state()?;
+        match self.runtime.block_on(state.accept_request(&network, &short_id)) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!("unexpected requests response: {other:?}"))),
+        }
+    }
+
+    /// Deny a pending join request on a network we coordinate.
+    pub fn deny_join_request(&self, network: String, short_id: String) -> Result<(), RayError> {
+        let state = self.state()?;
+        match state.deny_request(&network, &short_id) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!("unexpected requests response: {other:?}"))),
+        }
+    }
+
+    /// Whether this device already holds a device cert (it was paired to a
+    /// primary). A paired device cannot start or accept further pairing, so the
+    /// UI hides the pairing controls when this is true. Returns false before
+    /// [`Node::start`] or when no cert is present.
+    pub fn is_paired(&self) -> bool {
+        self.state()
+            .map(|s| s.current_device_cert().is_some())
+            .unwrap_or(false)
+    }
+
     /// Begin pairing: returns a ticket to show (as QR) to a device that will
     /// scan and call `pair`.
     pub fn start_pairing(&self) -> Result<String, RayError> {
@@ -515,6 +672,23 @@ impl Node {
         let state = self.state()?;
         state.detach_tun();
         Ok(())
+    }
+
+    /// Fully tear down the control plane so the device goes offline: peers can
+    /// no longer reach it and it drops out of every network's membership view.
+    /// Cancels the daemon shutdown token and releases the shared state; the
+    /// endpoint closes once the background tasks wind down. A later
+    /// [`Node::start`] rebuilds from scratch. No-op if not started.
+    ///
+    /// This is the mobile "disable" semantics: unlike [`Node::down`] (standby,
+    /// control plane stays connected), `stop` takes the node offline outright.
+    pub fn stop(&self) {
+        // Take the Arc out under the lock, then drop it after cancelling so the
+        // next `start` sees `None` and rebuilds a fresh daemon.
+        let state = self.state.lock().unwrap().take();
+        if let Some(state) = state {
+            state.trigger_shutdown();
+        }
     }
 
     /// Peers + addresses + running flag + per-network detail for the UI.

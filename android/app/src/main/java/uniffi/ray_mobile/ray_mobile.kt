@@ -750,6 +750,30 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -765,7 +789,15 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 // when the library is loaded.
 internal interface IntegrityCheckingUniffiLib : Library {
     // Integrity check functions only
-    fun uniffi_ray_mobile_checksum_method_node_create(
+    fun uniffi_ray_mobile_checksum_method_node_accept_file_offer(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_accept_join_request(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_approve_connect_request(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_create(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_deny_join_request(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_down(
 ): Short
@@ -773,17 +805,31 @@ fun uniffi_ray_mobile_checksum_method_node_firewall_add(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_firewall_remove(
 ): Short
+fun uniffi_ray_mobile_checksum_method_node_firewall_set_default_inbound(
+): Short
 fun uniffi_ray_mobile_checksum_method_node_firewall_show(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_handle_link(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_invite(
 ): Short
+fun uniffi_ray_mobile_checksum_method_node_is_paired(
+): Short
 fun uniffi_ray_mobile_checksum_method_node_join(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_leave(
 ): Short
+fun uniffi_ray_mobile_checksum_method_node_list_connect_requests(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_list_file_offers(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_list_join_requests(
+): Short
 fun uniffi_ray_mobile_checksum_method_node_pair(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_reject_connect_request(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_reject_file_offer(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_set_dns_upstreams(
 ): Short
@@ -794,6 +840,8 @@ fun uniffi_ray_mobile_checksum_method_node_start(
 fun uniffi_ray_mobile_checksum_method_node_start_pairing(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_status(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_stop(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_submit_code(
 ): Short
@@ -856,13 +904,23 @@ fun uniffi_ray_mobile_fn_free_node(`ptr`: Pointer,uniffi_out_err: UniffiRustCall
 ): Unit
 fun uniffi_ray_mobile_fn_constructor_node_new(`configDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
+fun uniffi_ray_mobile_fn_method_node_accept_file_offer(`ptr`: Pointer,`id`: Long,`outputDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_ray_mobile_fn_method_node_accept_join_request(`ptr`: Pointer,`network`: RustBuffer.ByValue,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_ray_mobile_fn_method_node_approve_connect_request(`ptr`: Pointer,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_ray_mobile_fn_method_node_create(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_deny_join_request(`ptr`: Pointer,`network`: RustBuffer.ByValue,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_ray_mobile_fn_method_node_down(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_firewall_add(`ptr`: Pointer,`direction`: RustBuffer.ByValue,`action`: RustBuffer.ByValue,`protocol`: RustBuffer.ByValue,`port`: RustBuffer.ByValue,`peer`: RustBuffer.ByValue,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_firewall_remove(`ptr`: Pointer,`index`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_ray_mobile_fn_method_node_firewall_set_default_inbound(`ptr`: Pointer,`action`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_firewall_show(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -870,11 +928,23 @@ fun uniffi_ray_mobile_fn_method_node_handle_link(`ptr`: Pointer,`uri`: RustBuffe
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_invite(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_is_paired(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
 fun uniffi_ray_mobile_fn_method_node_join(`ptr`: Pointer,`code`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_leave(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_ray_mobile_fn_method_node_list_connect_requests(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_list_file_offers(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_list_join_requests(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_pair(`ptr`: Pointer,`ticket`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_ray_mobile_fn_method_node_reject_connect_request(`ptr`: Pointer,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_ray_mobile_fn_method_node_reject_file_offer(`ptr`: Pointer,`id`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_set_dns_upstreams(`ptr`: Pointer,`servers`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -886,6 +956,8 @@ fun uniffi_ray_mobile_fn_method_node_start_pairing(`ptr`: Pointer,uniffi_out_err
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_status(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_stop(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_ray_mobile_fn_method_node_submit_code(`ptr`: Pointer,`input`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_up(`ptr`: Pointer,`tunFd`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1016,7 +1088,19 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_accept_file_offer() != 16165.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_accept_join_request() != 20263.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_approve_connect_request() != 47115.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_create() != 50208.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_deny_join_request() != 27631.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_down() != 54510.toShort()) {
@@ -1028,6 +1112,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_firewall_remove() != 54283.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_firewall_set_default_inbound() != 39478.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_firewall_show() != 46519.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1037,13 +1124,31 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_invite() != 59156.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_is_paired() != 7476.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_join() != 21543.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_leave() != 29006.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_list_connect_requests() != 25345.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_list_file_offers() != 4122.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_list_join_requests() != 56409.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_pair() != 22172.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_reject_connect_request() != 60575.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_reject_file_offer() != 10539.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_set_dns_upstreams() != 50178.toShort()) {
@@ -1059,6 +1164,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_status() != 47392.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_stop() != 49047.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_submit_code() != 26371.toShort()) {
@@ -1262,6 +1370,29 @@ public object FfiConverterInt: FfiConverter<Int, Int> {
 /**
  * @suppress
  */
+public object FfiConverterULong: FfiConverter<ULong, Long> {
+    override fun lift(value: Long): ULong {
+        return value.toULong()
+    }
+
+    override fun read(buf: ByteBuffer): ULong {
+        return lift(buf.getLong())
+    }
+
+    override fun lower(value: ULong): Long {
+        return value.toLong()
+    }
+
+    override fun allocationSize(value: ULong) = 8UL
+
+    override fun write(value: ULong, buf: ByteBuffer) {
+        buf.putLong(value.toLong())
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
     override fun lift(value: Byte): Boolean {
         return value.toInt() != 0
@@ -1445,10 +1576,30 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
 public interface NodeInterface {
     
     /**
+     * Accept a file offer, saving it under `output_dir` (an app-writable path).
+     */
+    fun `acceptFileOffer`(`id`: kotlin.ULong, `outputDir`: kotlin.String)
+    
+    /**
+     * Approve a pending join request on a network we coordinate.
+     */
+    fun `acceptJoinRequest`(`network`: kotlin.String, `shortId`: kotlin.String)
+    
+    /**
+     * Approve an incoming connect request (mints a direct 2-peer network).
+     */
+    fun `approveConnectRequest`(`shortId`: kotlin.String)
+    
+    /**
      * Create a new network (default CLOSED membership) and register this node as
      * its coordinator. `name` is optional; the core generates one if absent.
      */
     fun `create`(`name`: kotlin.String?): NetworkInfo
+    
+    /**
+     * Deny a pending join request on a network we coordinate.
+     */
+    fun `denyJoinRequest`(`network`: kotlin.String, `shortId`: kotlin.String)
     
     /**
      * Tear the data plane down (stop the forward loop, close the fds) while
@@ -1467,6 +1618,12 @@ public interface NodeInterface {
     fun `firewallRemove`(`index`: kotlin.UInt)
     
     /**
+     * Set the inbound default action ("allow" or "deny"). The outbound default
+     * stays "allow"; inbound ICMP-allow is a separate built-in and is unaffected.
+     */
+    fun `firewallSetDefaultInbound`(`action`: kotlin.String)
+    
+    /**
      * Current firewall posture and rules.
      */
     fun `firewallShow`(): FirewallStateInfo
@@ -1483,6 +1640,14 @@ public interface NodeInterface {
     fun `invite`(`network`: kotlin.String): kotlin.String
     
     /**
+     * Whether this device already holds a device cert (it was paired to a
+     * primary). A paired device cannot start or accept further pairing, so the
+     * UI hides the pairing controls when this is true. Returns false before
+     * [`Node::start`] or when no cert is present.
+     */
+    fun `isPaired`(): kotlin.Boolean
+    
+    /**
      * Join an existing network by invite code (or a bare room id / network
      * pubkey). Maps the core's `IpcMessage` result to a [`NetworkInfo`].
      */
@@ -1494,10 +1659,35 @@ public interface NodeInterface {
     fun `leave`(`network`: kotlin.String)
     
     /**
+     * Incoming `ray connect` friend requests waiting for a decision.
+     */
+    fun `listConnectRequests`(): List<PendingRequest>
+    
+    /**
+     * Incoming file offers waiting to be accepted or declined.
+     */
+    fun `listFileOffers`(): List<FileOffer>
+    
+    /**
+     * Join requests awaiting approval on a network we coordinate.
+     */
+    fun `listJoinRequests`(`network`: kotlin.String): List<PendingRequest>
+    
+    /**
      * Pair this device with a primary device using a scanned/pasted pairing
      * ticket (`bs58(endpoint_id[32] || secret[32])`).
      */
     fun `pair`(`ticket`: kotlin.String)
+    
+    /**
+     * Decline an incoming connect request.
+     */
+    fun `rejectConnectRequest`(`shortId`: kotlin.String)
+    
+    /**
+     * Decline a file offer without downloading it.
+     */
+    fun `rejectFileOffer`(`id`: kotlin.ULong)
     
     /**
      * Point the Magic DNS resolver at the phone's real DNS servers so
@@ -1532,6 +1722,18 @@ public interface NodeInterface {
      * Empty snapshot before [`Node::start`].
      */
     fun `status`(): Status
+    
+    /**
+     * Fully tear down the control plane so the device goes offline: peers can
+     * no longer reach it and it drops out of every network's membership view.
+     * Cancels the daemon shutdown token and releases the shared state; the
+     * endpoint closes once the background tasks wind down. A later
+     * [`Node::start`] rebuilds from scratch. No-op if not started.
+     *
+     * This is the mobile "disable" semantics: unlike [`Node::down`] (standby,
+     * control plane stays connected), `stop` takes the node offline outright.
+     */
+    fun `stop`()
     
     /**
      * Accept any code the user pastes or scans and route it: a `rayfish://`
@@ -1654,6 +1856,51 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
+     * Accept a file offer, saving it under `output_dir` (an app-writable path).
+     */
+    @Throws(RayException::class)override fun `acceptFileOffer`(`id`: kotlin.ULong, `outputDir`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_accept_file_offer(
+        it, FfiConverterULong.lower(`id`),FfiConverterString.lower(`outputDir`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Approve a pending join request on a network we coordinate.
+     */
+    @Throws(RayException::class)override fun `acceptJoinRequest`(`network`: kotlin.String, `shortId`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_accept_join_request(
+        it, FfiConverterString.lower(`network`),FfiConverterString.lower(`shortId`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Approve an incoming connect request (mints a direct 2-peer network).
+     */
+    @Throws(RayException::class)override fun `approveConnectRequest`(`shortId`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_approve_connect_request(
+        it, FfiConverterString.lower(`shortId`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Create a new network (default CLOSED membership) and register this node as
      * its coordinator. `name` is optional; the core generates one if absent.
      */
@@ -1667,6 +1914,21 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     }
     )
     }
+    
+
+    
+    /**
+     * Deny a pending join request on a network we coordinate.
+     */
+    @Throws(RayException::class)override fun `denyJoinRequest`(`network`: kotlin.String, `shortId`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_deny_join_request(
+        it, FfiConverterString.lower(`network`),FfiConverterString.lower(`shortId`),_status)
+}
+    }
+    
     
 
     
@@ -1710,6 +1972,22 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     uniffiRustCallWithError(RayException) { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_remove(
         it, FfiConverterUInt.lower(`index`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Set the inbound default action ("allow" or "deny"). The outbound default
+     * stays "allow"; inbound ICMP-allow is a separate built-in and is unaffected.
+     */
+    @Throws(RayException::class)override fun `firewallSetDefaultInbound`(`action`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_set_default_inbound(
+        it, FfiConverterString.lower(`action`),_status)
 }
     }
     
@@ -1766,6 +2044,24 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
+     * Whether this device already holds a device cert (it was paired to a
+     * primary). A paired device cannot start or accept further pairing, so the
+     * UI hides the pairing controls when this is true. Returns false before
+     * [`Node::start`] or when no cert is present.
+     */override fun `isPaired`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_is_paired(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Join an existing network by invite code (or a bare room id / network
      * pubkey). Maps the core's `IpcMessage` result to a [`NetworkInfo`].
      */
@@ -1798,6 +2094,54 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
+     * Incoming `ray connect` friend requests waiting for a decision.
+     */
+    @Throws(RayException::class)override fun `listConnectRequests`(): List<PendingRequest> {
+            return FfiConverterSequenceTypePendingRequest.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_connect_requests(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Incoming file offers waiting to be accepted or declined.
+     */
+    @Throws(RayException::class)override fun `listFileOffers`(): List<FileOffer> {
+            return FfiConverterSequenceTypeFileOffer.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_file_offers(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Join requests awaiting approval on a network we coordinate.
+     */
+    @Throws(RayException::class)override fun `listJoinRequests`(`network`: kotlin.String): List<PendingRequest> {
+            return FfiConverterSequenceTypePendingRequest.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_join_requests(
+        it, FfiConverterString.lower(`network`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Pair this device with a primary device using a scanned/pasted pairing
      * ticket (`bs58(endpoint_id[32] || secret[32])`).
      */
@@ -1807,6 +2151,36 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     uniffiRustCallWithError(RayException) { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_pair(
         it, FfiConverterString.lower(`ticket`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Decline an incoming connect request.
+     */
+    @Throws(RayException::class)override fun `rejectConnectRequest`(`shortId`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_reject_connect_request(
+        it, FfiConverterString.lower(`shortId`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Decline a file offer without downloading it.
+     */
+    @Throws(RayException::class)override fun `rejectFileOffer`(`id`: kotlin.ULong)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_reject_file_offer(
+        it, FfiConverterULong.lower(`id`),_status)
 }
     }
     
@@ -1899,6 +2273,27 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
+     * Fully tear down the control plane so the device goes offline: peers can
+     * no longer reach it and it drops out of every network's membership view.
+     * Cancels the daemon shutdown token and releases the shared state; the
+     * endpoint closes once the background tasks wind down. A later
+     * [`Node::start`] rebuilds from scratch. No-op if not started.
+     *
+     * This is the mobile "disable" semantics: unlike [`Node::down`] (standby,
+     * control plane stays connected), `stop` takes the node offline outright.
+     */override fun `stop`()
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_stop(
+        it, _status)
+}
+    }
+    
+    
+
+    
+    /**
      * Accept any code the user pastes or scans and route it: a `rayfish://`
      * deep link, a bare invite code, or a bare pairing ticket. The two bare
      * forms are distinct encodings, so we can tell them apart. A pairing ticket
@@ -1969,6 +2364,53 @@ public object FfiConverterTypeNode: FfiConverter<Node, Pointer> {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
+    }
+}
+
+
+
+/**
+ * A pending incoming file offer, for the notifications UI.
+ */
+data class FileOffer (
+    var `id`: kotlin.ULong, 
+    var `from`: kotlin.String, 
+    var `filename`: kotlin.String, 
+    var `size`: kotlin.ULong, 
+    var `mimeType`: kotlin.String
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFileOffer: FfiConverterRustBuffer<FileOffer> {
+    override fun read(buf: ByteBuffer): FileOffer {
+        return FileOffer(
+            FfiConverterULong.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FileOffer) = (
+            FfiConverterULong.allocationSize(value.`id`) +
+            FfiConverterString.allocationSize(value.`from`) +
+            FfiConverterString.allocationSize(value.`filename`) +
+            FfiConverterULong.allocationSize(value.`size`) +
+            FfiConverterString.allocationSize(value.`mimeType`)
+    )
+
+    override fun write(value: FileOffer, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterString.write(value.`from`, buf)
+            FfiConverterString.write(value.`filename`, buf)
+            FfiConverterULong.write(value.`size`, buf)
+            FfiConverterString.write(value.`mimeType`, buf)
     }
 }
 
@@ -2207,6 +2649,46 @@ public object FfiConverterTypePeerInfo: FfiConverterRustBuffer<PeerInfo> {
             FfiConverterString.write(value.`nodeId`, buf)
             FfiConverterString.write(value.`hostname`, buf)
             FfiConverterBoolean.write(value.`online`, buf)
+    }
+}
+
+
+
+/**
+ * A pending request awaiting the user's decision: an incoming `ray connect`
+ * friend request, or a network-join request on a network we coordinate.
+ */
+data class PendingRequest (
+    var `shortId`: kotlin.String, 
+    var `hostname`: kotlin.String?, 
+    var `waitingSecs`: kotlin.ULong
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePendingRequest: FfiConverterRustBuffer<PendingRequest> {
+    override fun read(buf: ByteBuffer): PendingRequest {
+        return PendingRequest(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: PendingRequest) = (
+            FfiConverterString.allocationSize(value.`shortId`) +
+            FfiConverterOptionalString.allocationSize(value.`hostname`) +
+            FfiConverterULong.allocationSize(value.`waitingSecs`)
+    )
+
+    override fun write(value: PendingRequest, buf: ByteBuffer) {
+            FfiConverterString.write(value.`shortId`, buf)
+            FfiConverterOptionalString.write(value.`hostname`, buf)
+            FfiConverterULong.write(value.`waitingSecs`, buf)
     }
 }
 
@@ -2554,6 +3036,34 @@ public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.Str
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeFileOffer: FfiConverterRustBuffer<List<FileOffer>> {
+    override fun read(buf: ByteBuffer): List<FileOffer> {
+        val len = buf.getInt()
+        return List<FileOffer>(len) {
+            FfiConverterTypeFileOffer.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FileOffer>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFileOffer.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FileOffer>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFileOffer.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeFirewallRuleInfo: FfiConverterRustBuffer<List<FirewallRuleInfo>> {
     override fun read(buf: ByteBuffer): List<FirewallRuleInfo> {
         val len = buf.getInt()
@@ -2628,6 +3138,34 @@ public object FfiConverterSequenceTypePeerInfo: FfiConverterRustBuffer<List<Peer
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypePeerInfo.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypePendingRequest: FfiConverterRustBuffer<List<PendingRequest>> {
+    override fun read(buf: ByteBuffer): List<PendingRequest> {
+        val len = buf.getInt()
+        return List<PendingRequest>(len) {
+            FfiConverterTypePendingRequest.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<PendingRequest>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypePendingRequest.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<PendingRequest>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypePendingRequest.write(it, buf)
         }
     }
 }
