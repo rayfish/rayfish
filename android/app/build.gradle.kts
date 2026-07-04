@@ -16,8 +16,8 @@ android {
         applicationId = "xyz.rayfish.android"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.4"
 
         // ray-mobile only builds these two ABIs for now (device + emulator).
         ndk {

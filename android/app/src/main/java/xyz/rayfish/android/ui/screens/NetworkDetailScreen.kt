@@ -58,7 +58,6 @@ fun NetworkDetailScreen(
                         catch (t: Throwable) { onToast("Invite failed: ${t.message}") }
                     }
                 },
-                MenuItem("Copy address") { copyToClipboard(context, detail.name, detail.ipv4); onToast("Address copied") },
                 MenuItem("Leave network", destructive = true) { confirmLeave = true },
             ))
         }
@@ -93,7 +92,22 @@ fun NetworkDetailScreen(
         firewall?.let { fw ->
             SectionCard {
                 SectionLabel("Firewall")
-                KeyValueRow("Inbound default", fw.defaultInbound)
+                Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Inbound default", fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
+                    Spacer(Modifier.weight(1f))
+                    TextButton(
+                        onClick = {
+                            val next = if (fw.defaultInbound == "deny") "allow" else "deny"
+                            scope.launch {
+                                try {
+                                    withContext(Dispatchers.IO) { NodeHolder.get(context).firewallSetDefaultInbound(next) }
+                                    reloadFirewall(); onToast("Inbound default: $next")
+                                } catch (t: Throwable) { onToast("Failed: ${t.message}") }
+                            }
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    ) { Text("${fw.defaultInbound} ✎", fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Rose400) }
+                }
                 KeyValueRow("Outbound default", fw.defaultOutbound)
                 if (fw.rules.none { it.direction == "in" }) {
                     Text("No inbound rules", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Faint,
@@ -172,7 +186,7 @@ fun NetworkDetailScreen(
             title = { Text("Allow inbound", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    RayfishTextField(proto, { proto = it.trim().lowercase() }, "protocol: tcp, udp, icmp, any")
+                    RayfishDropdown(proto, listOf("tcp", "udp", "icmp", "any"), { proto = it }, "protocol")
                     RayfishTextField(port, { port = it.trim() }, "port (blank for any), e.g. 22")
                 }
             },

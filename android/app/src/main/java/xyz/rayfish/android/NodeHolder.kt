@@ -47,4 +47,16 @@ object NodeHolder {
             started = true
         }
     }
+
+    /**
+     * Fully stop the node so the device goes offline (control plane torn down,
+     * not just the data plane). Clears the started flag so the next
+     * [ensureStarted] rebuilds a fresh daemon. Safe to call when never started.
+     */
+    fun stopNode(context: Context) {
+        synchronized(this) {
+            runCatching { node?.stop() }
+            started = false
+        }
+    }
 }
