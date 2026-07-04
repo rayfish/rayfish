@@ -84,17 +84,16 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 /// `ray send` / `ray connect`, otherwise the initial handshake fails with "peer
 /// doesn't support any known protocol" until the first create/join triggers
 /// `refresh_alpns()`. Mirrors `ProtocolRouter::alpns()`.
-fn initial_alpns(app_config: &config::AppConfig) -> Vec<Vec<u8>> {
-    let mut alpns: Vec<Vec<u8>> = app_config
-        .networks
-        .iter()
-        .filter_map(|net| net.network_public_key.as_ref().map(transport::network_alpn))
-        .collect();
-    alpns.push(iroh_blobs::protocol::ALPN.to_vec());
-    alpns.push(transport::FILES_ALPN.to_vec());
-    alpns.push(PAIR_ALPN.to_vec());
-    alpns.push(transport::CONNECT_ALPN.to_vec());
-    alpns
+fn initial_alpns(_app_config: &config::AppConfig) -> Vec<Vec<u8>> {
+    // A single mesh ALPN now carries every network (network selection is in-band),
+    // so the advertised set is static and independent of the saved networks.
+    vec![
+        transport::mesh_alpn(),
+        iroh_blobs::protocol::ALPN.to_vec(),
+        transport::FILES_ALPN.to_vec(),
+        PAIR_ALPN.to_vec(),
+        transport::CONNECT_ALPN.to_vec(),
+    ]
 }
 
 /// Construct a headless [`MeshManager`] for an embedder (used by `ray-mobile`

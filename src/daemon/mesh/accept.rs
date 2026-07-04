@@ -409,6 +409,15 @@ impl CoordinatorAcceptState {
                 }
             };
 
+        // A direct (`ray connect`) network is a symmetric 2-peer link, so the
+        // pre-approved requester is made a co-coordinator: marked coordinator in
+        // the roster here and granted the network key over its connection below.
+        let grant_direct = was_approved
+            && config::load_network(&self.network_name)
+                .ok()
+                .flatten()
+                .is_some_and(|n| n.direct);
+
         let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
         let snap_bytes = {
             let mut s = self.state.write().unwrap();
@@ -419,7 +428,7 @@ impl CoordinatorAcceptState {
             let _ = s.members.add(Member {
                 identity: remote_id,
                 ip: peer_ip,
-                is_coordinator: false,
+                is_coordinator: grant_direct,
                 hostname: final_hostname.clone(),
                 user_identity: user_id_opt,
                 device_cert: device_cert.clone(),
@@ -475,8 +484,56 @@ impl CoordinatorAcceptState {
         }
         broadcast_member_sync(&self.ctx.peers, Some(peer_ip)).await;
 
-        self.spawn_admitted_member_tasks(conn, remote_id, peer_ip);
+        self.spawn_admitted_member_tasks(conn.clone(), remote_id, peer_ip);
+
+        // Direct link: hand the network key to the just-admitted peer so both
+        // sides are coordinators. Sent over its live mesh connection, where its
+        // member control reader is already `accept_bi`-ing (it handles
+        // `AdminGrant` -> persist key + promote to coordinator).
+        if grant_direct {
+            self.grant_direct_coordinator(&conn, remote_id).await;
+        }
         true
+    }
+
+    /// Send an `AdminGrant` (the per-network secret key) to a peer over its live
+    /// mesh connection, making it a co-coordinator. Used for `ray connect` direct
+    /// networks, which are symmetric 2-peer links. Best-effort: a failure only
+    /// leaves the peer as a plain member (it was already marked coordinator in the
+    /// signed roster), so it can be re-granted with `ray admin add`.
+    async fn grant_direct_coordinator(&self, conn: &Connection, peer: EndpointId) {
+        let (net_pubkey, net_secret) = {
+            let s = self.state.read().unwrap();
+            (s.network_public_key, s.network_secret_key.clone())
+        };
+        let Some(net_secret) = net_secret else {
+            return;
+        };
+        let grant = ControlMsg::AdminGrant {
+            network_pubkey: net_pubkey,
+            secret_key: net_secret.to_bytes(),
+        };
+        match conn.open_bi().await {
+            Ok((mut send, _)) => {
+                if let Err(e) = control::send_msg(&mut send, &grant).await {
+                    tracing::warn!(peer = %peer.fmt_short(), error = %e,
+                        "failed to grant co-coordinator to direct peer");
+                    return;
+                }
+                tracing::info!(peer = %peer.fmt_short(),
+                    "granted co-coordinator to direct-connect peer");
+                // Record the grant locally (mirrors `admin_add`) so our own
+                // `ray admin list` shows the peer as a key-holder too.
+                if let Ok(Some(mut net)) = config::load_network(&self.network_name)
+                    && !net.admins.contains(&peer)
+                {
+                    net.admins.push(peer);
+                    let _ = config::save_network(&net);
+                }
+            }
+            Err(e) => tracing::warn!(peer = %peer.fmt_short(), error = %e,
+                "failed to open stream to grant direct co-coordinator"),
+        }
     }
 
     /// Decide a joiner's authoritative IP + hostname from the current roster, or
@@ -778,9 +835,28 @@ impl ProtocolHandler for MeshProtocol {
     }
 }
 
+/// One control stream's already-read message plus its send half (for a
+/// same-stream reply, e.g. `Welcome`). Routed by the per-connection demux to the
+/// right per-network handler.
+pub(crate) type InControl = (iroh::endpoint::SendStream, ControlMsg);
+
+/// Daemon-wide dispatch context the accept loop needs to drive a mesh
+/// connection: build the per-peer forward context and route disconnects. Set on
+/// the `ProtocolRouter` by `MeshManager` after construction (the router is built
+/// first), via a `OnceLock`.
+pub(crate) struct MeshDispatch {
+    pub(crate) ctx: MeshCtx,
+    pub(crate) disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+    pub(crate) token: CancellationToken,
+}
+
 pub(crate) struct ProtocolRouter {
     blobs: BlobsProtocol,
-    handlers: DashMap<Vec<u8>, Arc<MeshProtocol>>,
+    /// Per-network mesh accept handlers, keyed by network **public key**. A single
+    /// mesh connection may carry several of these (the peer shares several
+    /// networks); the connection driver routes each control frame to the handler
+    /// named by `ControlFrame.net`.
+    handlers: DashMap<EndpointId, AcceptHandler>,
     /// File-transfer + pairing state and their ALPN accept arms. The accept loop
     /// delegates the `FILES_ALPN`/`PAIR_ALPN` arms to this; `MeshManager` holds
     /// the same handle for the IPC-side file/pairing commands.
@@ -789,10 +865,12 @@ pub(crate) struct ProtocolRouter {
     /// accept arm. The accept loop delegates to this; `MeshManager` holds the same
     /// handle for the IPC-side connect commands.
     connect: Arc<ConnectService>,
-    /// In-flight `ray ping` probes, keyed by nonce. The control reader fires the
-    /// oneshot when the matching `Pong` arrives so the ping handler can measure
-    /// round-trip time. Cloned into both control readers.
+    /// In-flight `ray ping` probes, keyed by nonce. The connection driver fires
+    /// the oneshot when the matching `Pong` arrives so the ping handler can
+    /// measure round-trip time.
     pub(crate) pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
+    /// Set once after construction; see [`MeshDispatch`].
+    mesh: std::sync::OnceLock<MeshDispatch>,
 }
 
 impl ProtocolRouter {
@@ -807,25 +885,46 @@ impl ProtocolRouter {
             files,
             connect,
             pending_pongs: Arc::new(DashMap::new()),
+            mesh: std::sync::OnceLock::new(),
         }
     }
 
-    pub(crate) fn register(&self, alpn: Vec<u8>, handler: AcceptHandler) {
-        self.handlers
-            .insert(alpn, Arc::new(MeshProtocol { handler }));
+    /// Install the daemon-wide mesh dispatch context. Called once by
+    /// `MeshManager` right after it is built.
+    pub(crate) fn set_mesh_dispatch(&self, dispatch: MeshDispatch) {
+        let _ = self.mesh.set(dispatch);
     }
 
-    pub(crate) fn unregister(&self, alpn: &[u8]) {
-        self.handlers.remove(alpn);
+    /// Register a network's accept handler under its public key.
+    pub(crate) fn register(&self, net_pubkey: EndpointId, handler: AcceptHandler) {
+        self.handlers.insert(net_pubkey, handler);
     }
 
+    /// Replace a network's accept handler (used when a member is promoted to
+    /// coordinator). Returns whether a handler was present.
+    pub(crate) fn is_registered(&self, net_pubkey: &EndpointId) -> bool {
+        self.handlers.contains_key(net_pubkey)
+    }
+
+    pub(crate) fn unregister(&self, net_pubkey: &EndpointId) {
+        self.handlers.remove(net_pubkey);
+    }
+
+    /// Look up a network's handler by public key.
+    pub(crate) fn handler_for(&self, net_pubkey: &EndpointId) -> Option<AcceptHandler> {
+        self.handlers.get(net_pubkey).map(|h| h.value().clone())
+    }
+
+    /// The static ALPN set the endpoint advertises: the single mesh ALPN plus the
+    /// network-independent blobs / files / pairing / connect ALPNs.
     pub(crate) fn alpns(&self) -> Vec<Vec<u8>> {
-        let mut alpns: Vec<Vec<u8>> = self.handlers.iter().map(|r| r.key().clone()).collect();
-        alpns.push(iroh_blobs::protocol::ALPN.to_vec());
-        alpns.push(transport::FILES_ALPN.to_vec());
-        alpns.push(PAIR_ALPN.to_vec());
-        alpns.push(transport::CONNECT_ALPN.to_vec());
-        alpns
+        vec![
+            transport::mesh_alpn(),
+            iroh_blobs::protocol::ALPN.to_vec(),
+            transport::FILES_ALPN.to_vec(),
+            PAIR_ALPN.to_vec(),
+            transport::CONNECT_ALPN.to_vec(),
+        ]
     }
 
     pub(crate) fn spawn_accept_loop(
@@ -857,15 +956,12 @@ impl ProtocolRouter {
                                 a if a == transport::FILES_ALPN => router.files.accept_file_offer(conn).await,
                                 a if a == PAIR_ALPN => router.files.accept_pair_request(conn).await,
                                 a if a == transport::CONNECT_ALPN => router.connect.accept_connect_request(conn).await,
+                                a if a == transport::mesh_alpn() => router.drive_mesh_connection(conn).await,
                                 _ => {
-                                    if let Some(handler) = router.handlers.get(&alpn).map(|r| r.clone()) {
-                                        let _ = handler.accept(conn).await;
-                                    } else {
-                                        tracing::warn!(
-                                            alpn = %String::from_utf8_lossy(&alpn),
-                                            "no handler for ALPN"
-                                        );
-                                    }
+                                    tracing::warn!(
+                                        alpn = %String::from_utf8_lossy(&alpn),
+                                        "no handler for ALPN"
+                                    );
                                 }
                             }
                         });
@@ -873,6 +969,110 @@ impl ProtocolRouter {
                 }
             }
         })
+    }
+
+    /// Drive one mesh connection (single mesh ALPN) for its whole lifetime. Spawns
+    /// the connection's single data reader on first network registration, then
+    /// loops accepting control streams and routing each `ControlFrame` to the
+    /// right per-network handler by `net`, or handling connection-level messages
+    /// (`NetworkHandles`, `Ping`/`Pong`) inline. Shared by the accept side (here)
+    /// and the dial side (`MeshManager::drive_dialed_connection`).
+    pub(crate) async fn drive_mesh_connection(self: Arc<Self>, conn: Connection) {
+        let peer_id = conn.remote_id();
+        let Some(mesh) = self.mesh.get() else {
+            tracing::error!("mesh dispatch not set; dropping connection");
+            return;
+        };
+        let token = mesh.token.clone();
+        let mut reader_spawned = false;
+        let mut gate = crate::ratelimit::ControlGate::new();
+        loop {
+            let accepted = tokio::select! {
+                _ = token.cancelled() => return,
+                r = conn.accept_bi() => r,
+            };
+            let (send, mut recv) = match accepted {
+                Ok(pair) => pair,
+                Err(_) => return, // connection closed; the data reader emits the disconnect
+            };
+            let frame = match control::recv_msg(&mut recv).await {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            match gate.check() {
+                crate::ratelimit::Verdict::Allow => {}
+                crate::ratelimit::Verdict::Drop => continue,
+                crate::ratelimit::Verdict::Close => {
+                    tracing::warn!(peer = %peer_id.fmt_short(), "control-plane flood; closing connection");
+                    conn.close(VarInt::from_u32(forward::ABUSE_CODE), b"control flood");
+                    return;
+                }
+            }
+            // Connection-level messages (not scoped to a network).
+            match &frame.msg {
+                ControlMsg::NetworkHandles { entries } => {
+                    self.apply_network_handles(peer_id, entries);
+                    continue;
+                }
+                ControlMsg::Ping { nonce } => {
+                    respond_pong(&conn, *nonce).await;
+                    continue;
+                }
+                ControlMsg::Pong { nonce } => {
+                    if let Some((_, tx)) = self.pending_pongs.remove(nonce) {
+                        let _ = tx.send(());
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            let Some(net_pubkey) = frame.net else {
+                continue;
+            };
+            let Some(handler) = self.handler_for(&net_pubkey) else {
+                tracing::debug!(peer = %peer_id.fmt_short(), net = %net_pubkey.fmt_short(), "control frame for unknown network; ignoring");
+                continue;
+            };
+            drop(recv); // one message per stream; the reply rides `send`
+            let registered = handler.handle_frame(&conn, send, peer_id, frame.msg).await;
+            if let Some(ip) = registered {
+                if !reader_spawned {
+                    reader_spawned = true;
+                    let peer_ipv6 = derive_ipv6(&peer_id);
+                    forward::spawn_peer_reader(
+                        conn.clone(),
+                        peer_id,
+                        ip,
+                        peer_ipv6,
+                        mesh.ctx.peers.clone(),
+                        mesh.ctx
+                            .forward_ctx(mesh.disconnect_tx.clone(), token.clone()),
+                    );
+                }
+                // (Re)announce our outbound handle table so the peer can decode
+                // datagrams we tag for this (possibly newly-shared) network.
+                announce_network_handles(&mesh.ctx.peers, &conn, ip).await;
+            }
+        }
+    }
+
+    /// Apply a peer's announced `NetworkHandles` (its handle → network decode
+    /// table) so our data reader can resolve inbound datagram tags. Resolves the
+    /// peer's mesh IPs from its endpoint id.
+    fn apply_network_handles(&self, peer_id: EndpointId, entries: &[control::NetworkHandle]) {
+        let Some(mesh) = self.mesh.get() else { return };
+        let ip = mesh.ctx.identity.derive_ip(&peer_id);
+        let ipv6 = derive_ipv6(&peer_id);
+        // Map network pubkey → local network name via the registry.
+        let mut table: Vec<(u16, SmolStr)> = Vec::new();
+        for e in entries {
+            if let Some(h) = self.handlers.get(&e.network)
+                && let Some(name) = h.network_name()
+            {
+                table.push((e.handle, SmolStr::new(name)));
+            }
+        }
+        mesh.ctx.peers.set_inbound_handles(&ip, &ipv6, &table);
     }
 }
 
