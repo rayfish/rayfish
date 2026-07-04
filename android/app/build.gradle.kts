@@ -23,6 +23,15 @@ android {
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
+
+        // Sentry client DSN (not a secret: it only authorizes sending events to
+        // this project). Read at runtime by Telemetry, which initializes Sentry
+        // only when the user's opt-out toggle leaves crash reporting on.
+        buildConfigField(
+            "String",
+            "SENTRY_DSN",
+            "\"https://3ace3eb4551a022cfd59fabe5b9f9c7e@o4511671603625984.ingest.de.sentry.io/4511671605198928\"",
+        )
     }
 
     buildTypes {
@@ -46,6 +55,8 @@ android {
 
     buildFeatures {
         compose = true
+        // Needed for the generated BuildConfig.SENTRY_DSN constant above.
+        buildConfig = true
     }
 
     // The JNA aar and the generated .so both land under jniLibs; keep them.
@@ -84,6 +95,10 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("com.google.zxing:core:3.5.3")
+
+    // Crash/error reporting. Initialized manually in Telemetry (not via manifest
+    // auto-init) so the user's opt-out toggle fully controls whether it runs.
+    implementation("io.sentry:sentry-android:8.47.0")
 }
 
 // --- Rust / cargo-ndk integration -----------------------------------------

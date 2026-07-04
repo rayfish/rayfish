@@ -38,6 +38,9 @@ object NodeHolder {
     // toggle records intent here and only explicit enable brings the node up.
     private const val PREFS_NAME = "rayfish_node"
     private const val KEY_ENABLED = "enabled"
+    // Crash reporting is opt-out: on unless the user turns it off in You. See
+    // [xyz.rayfish.android.Telemetry], which reads this to gate Sentry init.
+    private const val KEY_CRASH_REPORTING = "crash_reporting"
 
     fun isEnabled(context: Context): Boolean =
         context.applicationContext
@@ -48,6 +51,17 @@ object NodeHolder {
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_ENABLED, value).apply()
+    }
+
+    fun isCrashReportingEnabled(context: Context): Boolean =
+        context.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_CRASH_REPORTING, true)
+
+    fun setCrashReportingEnabled(context: Context, value: Boolean) {
+        context.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_CRASH_REPORTING, value).apply()
     }
 
     /**

@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.Status
 import xyz.rayfish.android.NodeHolder
+import xyz.rayfish.android.Telemetry
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.qr.rememberQrScanner
 import xyz.rayfish.android.ui.theme.*
@@ -95,6 +96,17 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 }
             }
         }
+        var crashReporting by remember { mutableStateOf(NodeHolder.isCrashReportingEnabled(context)) }
+        ToggleCard(
+            title = "Crash reporting",
+            subtitle = if (crashReporting) "on · anonymous diagnostics" else "off",
+            checked = crashReporting,
+            onCheckedChange = { on ->
+                crashReporting = on
+                NodeHolder.setCrashReportingEnabled(context, on)
+                if (on) Telemetry.enable(context) else Telemetry.disable()
+            },
+        )
         SectionCard {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("About", fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
