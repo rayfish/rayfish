@@ -6,10 +6,13 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import java.net.Inet4Address
 import kotlin.concurrent.thread
 import kotlinx.coroutines.runBlocking
 
@@ -54,6 +57,22 @@ class RayfishVpnService : VpnService() {
         // still establishes.
         val tunnelAddr = meshIp.ifBlank { "100.64.0.2" }
 
+        // Point the resolver at the phone's real DNS servers before the tunnel
+        // captures all DNS on 100.100.100.53. Without this, non-.ray lookups are
+        // refused and public browsing breaks while the VPN is up. Read them from
+        // the underlying (non-VPN) network, which is still active pre-establish.
+        try {
+            val dns = systemDnsServers()
+            if (dns.isNotEmpty()) {
+                NodeHolder.get(applicationContext).setDnsUpstreams(dns)
+                Log.i(TAG, "DNS upstreams set: $dns")
+            } else {
+                Log.w(TAG, "no underlying IPv4 DNS servers found; only .ray will resolve")
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "could not set DNS upstreams; only .ray will resolve", t)
+        }
+
         val builder = Builder()
             .setSession("Rayfish")
             .addAddress(tunnelAddr, 32)
@@ -89,6 +108,27 @@ class RayfishVpnService : VpnService() {
                 Log.e(TAG, "Node bring-up failed", t)
             }
         }
+    }
+
+    // The IPv4 DNS servers of the underlying (non-VPN) network, deduplicated.
+    // Enumerating all networks and skipping the VPN transport avoids reading our
+    // own tunnel's DNS (100.100.100.53) back, which would loop. IPv6-only
+    // resolvers are skipped: the mesh resolver forwards over IPv4.
+    private fun systemDnsServers(): List<String> {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return emptyList()
+        val servers = mutableListOf<String>()
+        for (network in cm.allNetworks) {
+            val caps = cm.getNetworkCapabilities(network) ?: continue
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+            val props = cm.getLinkProperties(network) ?: continue
+            for (addr in props.dnsServers) {
+                if (addr !is Inet4Address) continue
+                val ip = addr.hostAddress ?: continue
+                if (ip !in servers) servers.add(ip)
+            }
+        }
+        return servers
     }
 
     private fun stopTunnel() {

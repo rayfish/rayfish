@@ -748,6 +748,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -782,6 +784,8 @@ fun uniffi_ray_mobile_checksum_method_node_join(
 fun uniffi_ray_mobile_checksum_method_node_leave(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_pair(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_set_dns_upstreams(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_set_hostname(
 ): Short
@@ -871,6 +875,8 @@ fun uniffi_ray_mobile_fn_method_node_join(`ptr`: Pointer,`code`: RustBuffer.ByVa
 fun uniffi_ray_mobile_fn_method_node_leave(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_pair(`ptr`: Pointer,`ticket`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_ray_mobile_fn_method_node_set_dns_upstreams(`ptr`: Pointer,`servers`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_set_hostname(`ptr`: Pointer,`network`: RustBuffer.ByValue,`hostname`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1038,6 +1044,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_pair() != 22172.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_set_dns_upstreams() != 50178.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_set_hostname() != 56819.toShort()) {
@@ -1491,6 +1500,16 @@ public interface NodeInterface {
     fun `pair`(`ticket`: kotlin.String)
     
     /**
+     * Point the Magic DNS resolver at the phone's real DNS servers so
+     * non-`.ray` queries are forwarded instead of refused. On Android there is
+     * no `resolv.conf` to capture (the desktop path), so the platform reads the
+     * underlying network's DNS servers and passes them here before the tunnel
+     * captures all DNS. Non-IPv4 entries are ignored (the resolver forwards
+     * over IPv4). Requires [`Node::start`] first.
+     */
+    fun `setDnsUpstreams`(`servers`: List<kotlin.String>)
+    
+    /**
      * Set this device's hostname on `network`. Validated by the core.
      */
     fun `setHostname`(`network`: kotlin.String, `hostname`: kotlin.String)
@@ -1788,6 +1807,26 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     uniffiRustCallWithError(RayException) { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_pair(
         it, FfiConverterString.lower(`ticket`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Point the Magic DNS resolver at the phone's real DNS servers so
+     * non-`.ray` queries are forwarded instead of refused. On Android there is
+     * no `resolv.conf` to capture (the desktop path), so the platform reads the
+     * underlying network's DNS servers and passes them here before the tunnel
+     * captures all DNS. Non-IPv4 entries are ignored (the resolver forwards
+     * over IPv4). Requires [`Node::start`] first.
+     */
+    @Throws(RayException::class)override fun `setDnsUpstreams`(`servers`: List<kotlin.String>)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_set_dns_upstreams(
+        it, FfiConverterSequenceString.lower(`servers`),_status)
 }
     }
     

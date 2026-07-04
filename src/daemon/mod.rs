@@ -1627,6 +1627,14 @@ impl DaemonState {
         }
     }
 
+    /// Point the Magic DNS resolver at the given upstream servers so non-`.ray`
+    /// queries are forwarded there instead of refused. The desktop path captures
+    /// upstreams from the system resolver config; Android has none to capture, so
+    /// the platform reads the underlying network's DNS servers and passes them in.
+    pub fn set_dns_upstreams(&self, servers: Vec<Ipv4Addr>) {
+        self.resolver.set_upstreams(servers);
+    }
+
     /// Register a [`CoordinatorAcceptState`] handler for `network` and update
     /// the network's role in `self.networks` to [`NetworkRole::Coordinator`].
     ///

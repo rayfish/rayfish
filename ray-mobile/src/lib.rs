@@ -59,6 +59,7 @@ mod android_jni {
     }
 }
 
+use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
 use android_tun::{AndroidTunReader, AndroidTunWriter};
@@ -464,6 +465,19 @@ impl Node {
         }
     }
 
+    /// Point the Magic DNS resolver at the phone's real DNS servers so
+    /// non-`.ray` queries are forwarded instead of refused. On Android there is
+    /// no `resolv.conf` to capture (the desktop path), so the platform reads the
+    /// underlying network's DNS servers and passes them here before the tunnel
+    /// captures all DNS. Non-IPv4 entries are ignored (the resolver forwards
+    /// over IPv4). Requires [`Node::start`] first.
+    pub fn set_dns_upstreams(&self, servers: Vec<String>) -> Result<(), RayError> {
+        let state = self.state()?;
+        let parsed: Vec<Ipv4Addr> = servers.iter().filter_map(|s| s.parse().ok()).collect();
+        state.set_dns_upstreams(parsed);
+        Ok(())
+    }
+
     /// Bring the data plane up over the `VpnService` fd: attach the fd's
     /// reader/writer to the running daemon and mark the data plane active.
     /// Requires [`Node::start`] first.
@@ -559,7 +573,10 @@ impl Node {
             });
         }
         // The node's own mesh IPs are the same across networks (derived
-        // from its identity); take them from the first network if any.
+        // from its identity); take them from the first network if any. With no
+        // networks yet, derive the IPv4 from our identity so the tunnel still
+        // gets our real mesh address (the same value every network would use)
+        // instead of a placeholder.
         let (ipv4, ipv6) = networks
             .first()
             .map(|n| {
@@ -568,7 +585,12 @@ impl Node {
                     n.my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
                 )
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                (
+                    rayfish::membership::derive_ip(&endpoint_id).to_string(),
+                    String::new(),
+                )
+            });
 
         Status {
             running: active,
