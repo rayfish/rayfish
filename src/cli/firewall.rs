@@ -859,6 +859,7 @@ mod tests {
             ipv6: None,
             hostname: Some(hostname.to_string()),
             user_identity: user,
+            is_own_device: false,
             connection: None,
         }
     }

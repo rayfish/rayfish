@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Device ownership in `ray status`**: peer rows that are your own paired
+  devices are now tagged `(your device)`, and a paired device belonging to
+  another user is labelled `(user <id>)` (or shows that user's alias when you
+  have set one) so it is clear which user each device belongs to. The `--json`
+  output gains an `is_own_device` flag on each peer.
 - **Opt-in automatic updates**: enable with `sudo ray install --auto-update` or
   `ray auto-update on`, and the daemon checks GitHub about every 6 hours for a
   newer **stable** release, then downloads, verifies (SHA-256), swaps the binary,
@@ -61,9 +66,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   when auditing an OS firewall. Enabling mesh SSH with `ray firewall ssh on` now
   reminds you to authorize a peer with `ray firewall ssh allow` when none is set
   yet (the server rejects all logins until a peer is on the allow list).
+- **Bounded pending-join queue** — on a closed network, the coordinator's queue
+  of join requests awaiting `ray accept` is now capped (oldest request evicted
+  when full), so a peer churning fresh identities can no longer grow it without
+  limit. Legitimate queues are far below the cap, so this is invisible in normal
+  use.
+
+### Performance
+
+- **Drop-newest under datagram backpressure** — when a peer's QUIC datagram send
+  buffer is momentarily full, the new packet is dropped at the application
+  boundary instead of letting QUIC evict an older already-queued one (drop-newest
+  beats drop-oldest for a VPN), and the QUIC transport is tuned for the one
+  datagram stream per peer shape. Keeps the send path non-blocking with no
+  cross-peer head-of-line blocking.
 
 ### Fixed
 
+- **`ray status` peer traffic counters now line up**: the per-peer up/down
+  columns were packed into a single field, so the `↓` counter drifted from row to
+  row and the block did not read as a table. Up and down are now their own
+  right-aligned columns, so the arrows and digits line up down the list.
 - **`ray firewall add --peer` now accepts any peer identifier**: previously it
   only matched a short id / endpoint-id prefix, so the natural things to type
   (`--peer alice`, `--peer alice.homenet.ray`, `--peer 100.x.y.z`) failed with

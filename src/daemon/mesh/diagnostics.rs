@@ -1,13 +1,13 @@
-//! Read-only diagnostics for `DaemonState`: `status`, `build_report`, `ping`,
+//! Read-only diagnostics for `MeshManager`: `status`, `build_report`, `ping`,
 //! `netcheck`, and connection-info helpers. Split out of `daemon/mod.rs`.
 
 use super::super::*;
 
-impl DaemonState {
+impl MeshManager {
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// snapshot the daemon's status (identity, networks, peers).
     pub fn status(&self) -> IpcMessage {
-        let hostname_snapshot = self.hostname_table.try_read().ok();
+        let hostname_snapshot = self.dns.hostname_table.try_read().ok();
         let my_id = self.endpoint.id();
         // Direct-connection networks are flagged in config; collect their names
         // so each NetworkStatus can be tagged `[direct]` in the CLI.
@@ -49,8 +49,8 @@ impl DaemonState {
             packets_tx: self.stats.packets_tx.get(),
             bytes_rx: self.stats.bytes_rx.get(),
             bytes_tx: self.stats.bytes_tx.get(),
-            pending_files: self.protocol_router.pending_files.lock().unwrap().len(),
-            pending_connects: self.protocol_router.pending_connects.len(),
+            pending_files: self.files.pending_files.lock().unwrap().len(),
+            pending_connects: self.connect.pending_connects.len(),
             pending_networks,
         }
     }
@@ -124,6 +124,13 @@ impl DaemonState {
             .into_iter()
             .map(|(eid, _, conn)| (eid, conn))
             .collect();
+        // Our own user identity: the cert's user id on a paired device, else our
+        // own endpoint id (mirrors the `try_auto_accept_file` "own device" rule).
+        let own_user = self
+            .device_cert
+            .as_ref()
+            .map(|c| c.user_identity)
+            .unwrap_or(my_id);
         let peers = members
             .iter()
             .filter(|m| m.identity != my_id)
@@ -138,6 +145,7 @@ impl DaemonState {
                     ipv6: Some(derive_ipv6(&m.identity)),
                     hostname,
                     user_identity,
+                    is_own_device: user_id == own_user,
                     connection,
                 }
             })
