@@ -11,7 +11,12 @@ import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
-import android.util.Log
+// Drop-in for android.util.Log: still prints to logcat (debug and release) and
+// additionally records each line as a Sentry breadcrumb (context for a later
+// crash) plus a structured log when Sentry logs are enabled (see Telemetry).
+// Aliased to Log so the call sites below read unchanged. The Sentry side no-ops
+// when the user has crash reporting opted out (Sentry stays uninitialized).
+import io.sentry.android.core.SentryLogcatAdapter as Log
 import java.net.Inet4Address
 import kotlin.concurrent.thread
 import kotlinx.coroutines.runBlocking

@@ -27,6 +27,10 @@ object Telemetry {
             options.release = "rayfish-android@${BuildConfig.VERSION_NAME}"
             // Don't attach IPs, device names, or other personal data to events.
             options.isSendDefaultPii = false
+            // Turn on Sentry structured logs so lines routed through
+            // SentryLogcatAdapter (see RayfishVpnService) show up in the Logs
+            // view on their own, not only as breadcrumbs on a crash.
+            options.logs.isEnabled = true
         }
     }
 
