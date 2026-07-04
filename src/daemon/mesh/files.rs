@@ -14,7 +14,8 @@ impl MeshManager {
         } else {
             format!("{name}{suffix}")
         };
-        if let Some((ip, _)) = dns::resolve_name(&qualified, &suffix, &self.dns.hostname_table).await
+        if let Some((ip, _)) =
+            dns::resolve_name(&qualified, &suffix, &self.dns.hostname_table).await
         {
             // Try connected peers first
             if let Some(route) = self.peers.lookup_v4(&ip) {
@@ -141,7 +142,7 @@ impl MeshManager {
         }
     }
 
-    pub(crate) fn list_files(&self) -> IpcMessage {
+    pub fn list_files(&self) -> IpcMessage {
         let pending = self.files.pending_files.lock().unwrap();
         let files = pending
             .iter()
@@ -156,7 +157,24 @@ impl MeshManager {
         IpcMessage::FileList { files }
     }
 
-    pub(crate) async fn accept_file(
+    /// Decline a pending file offer: drop it from the queue without fetching the
+    /// blob. In-memory only, mirroring how `accept_file` consumes the entry.
+    pub fn reject_file(&self, id: u64) -> IpcMessage {
+        let mut pending = self.files.pending_files.lock().unwrap();
+        match pending.iter().position(|f| f.id == id) {
+            Some(i) => {
+                pending.remove(i);
+                IpcMessage::Ok {
+                    message: format!("declined file {id}"),
+                }
+            }
+            None => IpcMessage::Error {
+                message: format!("no pending file with id {id}"),
+            },
+        }
+    }
+
+    pub async fn accept_file(
         &self,
         id: u64,
         output: Option<String>,
@@ -383,7 +401,21 @@ impl MeshManager {
         }
     }
 
-    pub(crate) fn start_pairing(&self) -> IpcMessage {
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    /// mint a pairing ticket for this device.
+    pub fn start_pairing(&self) -> IpcMessage {
+        // Only a primary (a device that holds no cert of its own) may mint device
+        // certs. A device that already carries a cert is a secondary: its key is
+        // not the user identity, so any cert it signed would bind the new device
+        // to the wrong identity and fork the device group. Refuse to hand out a
+        // pairing ticket in that case; new devices must pair from the primary.
+        if self.current_device_cert().is_some() {
+            return IpcMessage::Error {
+                message: "this device is already paired; add new devices from your primary device"
+                    .to_string(),
+            };
+        }
+
         let secret: [u8; 32] = rand::random();
 
         let endpoint_id = self.endpoint.id();
@@ -397,8 +429,10 @@ impl MeshManager {
         IpcMessage::PairingTicket { ticket }
     }
 
-    pub(crate) async fn pair_with_device(
-        &self,
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    /// pair this device with a primary device using a scanned ticket.
+    pub async fn pair_with_device(
+        self: &Arc<Self>,
         endpoint_id: EndpointId,
         secret: Vec<u8>,
     ) -> IpcMessage {
@@ -477,7 +511,7 @@ impl MeshManager {
         };
 
         match response {
-            control::PairMsg::Response { cert } => {
+            control::PairMsg::Response { cert, networks } => {
                 if !cert.verify() {
                     return IpcMessage::Error {
                         message: "received invalid device certificate".to_string(),
@@ -487,6 +521,28 @@ impl MeshManager {
                     return IpcMessage::Error {
                         message: format!("failed to store device certificate: {e}"),
                     };
+                }
+                // Auto-join every network the primary shared. Each join attaches the
+                // freshly stored cert (see current_device_cert) so the coordinator,
+                // which owns this device, admits it without manual approval.
+                for net in networks {
+                    if self.networks.contains_key(&net.network_key) {
+                        continue;
+                    }
+                    let me = Arc::clone(self);
+                    tokio::spawn(async move {
+                        let _ = me
+                            .join_network(
+                                &net.network_key,
+                                Some(&net.name),
+                                None,
+                                None,
+                                None,
+                                false,
+                                false,
+                            )
+                            .await;
+                    });
                 }
                 IpcMessage::PairingComplete {
                     user_identity: cert.user_identity,

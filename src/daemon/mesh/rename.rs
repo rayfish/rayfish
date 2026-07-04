@@ -4,7 +4,6 @@
 
 use super::super::*;
 
-
 /// Decide whether a locally-requested rename has been confirmed by the signed
 /// blob. Satisfied when the blob's self-name equals the requested name or its
 /// coordinator-assigned collision form `{pending}-{digits}` (e.g. a request for
@@ -21,7 +20,6 @@ pub(crate) fn rename_satisfied(pending: &str, blob: Option<&str>) -> bool {
     }
 }
 
-
 /// Whether this node has an unconfirmed rename queued for `network_name`.
 /// Gates the reconverge worker's periodic backstop so it idles unless there's
 /// a rename to keep delivering.
@@ -31,7 +29,6 @@ pub(crate) fn has_pending_hostname(network_name: &str) -> bool {
         Ok(Some(net)) if net.pending_hostname.is_some()
     )
 }
-
 
 /// The hostname this node should announce to peers: a not-yet-confirmed rename
 /// intent (`pending_hostname`) if one is queued, otherwise the confirmed name.
@@ -43,7 +40,6 @@ pub(crate) fn outgoing_hostname(network_name: &str) -> Option<String> {
         _ => None,
     }
 }
-
 
 /// Drive a queued rename to completion. If `pending_hostname` is still set after
 /// a reconverge (i.e. the freshly-applied blob doesn't yet reflect it), dial

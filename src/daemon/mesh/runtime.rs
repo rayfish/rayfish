@@ -2,6 +2,8 @@
 //! connect-all, activate/deactivate (data plane), teardown, leave. Split out of `daemon/mod.rs`.
 
 use super::super::*;
+// Only the desktop-gated `start_ssh` binds SSH listeners on concrete IPs.
+#[cfg(feature = "desktop")]
 use std::net::IpAddr;
 use std::sync::RwLock;
 
@@ -550,6 +552,21 @@ impl MeshManager {
             }
         }
 
+        // Resume closed-network joins that were still awaiting approval at shutdown.
+        for pending in &app_config.pending_joins {
+            if self.networks.contains_key(&pending.network_key) {
+                continue;
+            }
+            let me = Arc::clone(self);
+            let key = pending.network_key.clone();
+            let name = pending.name.clone();
+            tokio::spawn(async move {
+                let _ = me
+                    .join_network(&key, name.as_deref(), None, None, None, false, false)
+                    .await;
+            });
+        }
+
         // Publish the contact record immediately so `ray connect` works right
         // away, rather than waiting up to one publisher interval (the active-gated
         // `spawn_contact_publisher` only re-checks every TTL/2).
@@ -570,6 +587,7 @@ impl MeshManager {
     /// Rebuild the live per-network SSH allow-list snapshot from persisted
     /// config, so a running listener authorizes against current rules. Cheap and
     /// only called on SSH config changes / activation (not the hot path).
+    #[cfg(feature = "desktop")]
     pub(crate) fn rebuild_ssh_authz(&self) {
         let mut map = HashMap::new();
         if let Ok(cfg) = config::load() {
@@ -585,6 +603,7 @@ impl MeshManager {
     /// Start the embedded mesh SSH listeners on this node's mesh addresses, if
     /// not already running. Idempotent. Bound to the data plane: called from
     /// `activate` when `ssh_enabled`, and from the `ssh on` IPC while active.
+    #[cfg(feature = "desktop")]
     pub(crate) fn start_ssh(self: &Arc<Self>) {
         let mut guard = self.ssh_token.lock().unwrap();
         if guard.is_some() {
@@ -607,6 +626,7 @@ impl MeshManager {
     }
 
     /// Stop the SSH listeners if running. Idempotent.
+    #[cfg(feature = "desktop")]
     pub(crate) fn stop_ssh(&self) {
         crate::forward::set_ssh_nat_active(false);
         if let Some(t) = self.ssh_token.lock().unwrap().take() {
@@ -617,7 +637,11 @@ impl MeshManager {
     /// Activate the VPN: bring the TUN interface up, configure system DNS.
     /// Idempotent — a no-op if already active. Runs entirely inside the
     /// (root) daemon, so the IPC client needs no privileges.
-    pub(crate) async fn activate(self: &Arc<Self>, hostname: Option<String>) -> IpcMessage {
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    /// bring the data plane up (mark active, configure Magic DNS). On Android the
+    /// packet interface + routes are the `VpnService`'s job, so those desktop
+    /// route calls are skipped.
+    pub async fn activate(self: &Arc<Self>, hostname: Option<String>) -> IpcMessage {
         // Persist the personal default hostname first (before the already-active
         // short-circuit) so `ray up --hostname X` records the new default even
         // when the VPN is already up. Used as the fallback for future
@@ -654,38 +678,52 @@ impl MeshManager {
         // wrong instead of silently reporting success on a degraded VPN.
         let mut warnings: Vec<String> = Vec::new();
 
-        if let Err(e) = tun::set_link_up(&self.tun_name) {
-            tracing::warn!(error = %e, "failed to bring TUN interface up");
-            warnings.push(format!("failed to bring TUN interface up: {e}"));
+        // The TUN device/routes are managed by the OS on desktop. On Android the
+        // packet interface is a `VpnService` fd whose routes are configured on the
+        // Kotlin side, so these desktop route calls don't apply.
+        #[cfg(not(target_os = "android"))]
+        {
+            let tun_name = self.tun_name.lock().unwrap().clone();
+            if let Err(e) = tun::set_link_up(&tun_name) {
+                tracing::warn!(error = %e, "failed to bring TUN interface up");
+                warnings.push(format!("failed to bring TUN interface up: {e}"));
+            }
+
+            // Route the 200::/7 peer range into the TUN. Must happen after
+            // link-up: on Linux the kernel won't install an IPv6 connected route
+            // while the link is down, so without this peer traffic leaks out the
+            // default route.
+            if let Err(e) = tun::route_peer_range(&tun_name).await {
+                tracing::warn!(error = %e, "failed to route 200::/7 into TUN");
+                warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
+            }
+
+            if let Err(e) = tun::route_magic_dns(&tun_name).await {
+                tracing::warn!(error = %e, "failed to route magic DNS IP into TUN");
+            }
+
+            // Loop our own addresses back through lo0 so self-traffic (e.g.
+            // pinging our own hostname) is answered locally instead of leaving via
+            // the TUN, where the forwarding loop would drop it as "no peer for
+            // dst". No-op on Linux (kernel installs the `local` route
+            // automatically).
+            let my_v4 = self.identity.local_ip();
+            let my_v6 = derive_ipv6(&self.identity.local_identity());
+            if let Err(e) = tun::route_self_loopback(my_v4, my_v6).await {
+                tracing::warn!(error = %e, "failed to install loopback self-route");
+                warnings.push(format!("failed to install loopback self-route: {e}"));
+            }
         }
 
-        // Route the 200::/7 peer range into the TUN. Must happen after link-up:
-        // on Linux the kernel won't install an IPv6 connected route while the
-        // link is down, so without this peer traffic leaks out the default route.
-        if let Err(e) = tun::route_peer_range(&self.tun_name).await {
-            tracing::warn!(error = %e, "failed to route 200::/7 into TUN");
-            warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
-        }
-
-        if let Err(e) = tun::route_magic_dns(&self.tun_name).await {
-            tracing::warn!(error = %e, "failed to route magic DNS IP into TUN");
-        }
-
-        // Loop our own addresses back through lo0 so self-traffic (e.g. pinging
-        // our own hostname) is answered locally instead of leaving via the TUN,
-        // where the forwarding loop would drop it as "no peer for dst". No-op on
-        // Linux (kernel installs the `local` route automatically).
-        let my_v4 = self.identity.local_ip();
-        let my_v6 = derive_ipv6(&self.identity.local_identity());
-        if let Err(e) = tun::route_self_loopback(my_v4, my_v6).await {
-            tracing::warn!(error = %e, "failed to install loopback self-route");
-            warnings.push(format!("failed to install loopback self-route: {e}"));
-        }
-
-        self.dns.configure(&self.tun_name, &mut warnings).await;
+        // Clone the TUN name out of the lock before awaiting: the embedder
+        // (mobile) stores it behind a mutex, and a std guard can't be held across
+        // an await point.
+        let dns_tun_name = self.tun_name.lock().unwrap().clone();
+        self.dns.configure(&dns_tun_name, &mut warnings).await;
 
         // Start the embedded mesh SSH server if enabled. It binds the mesh IPs'
         // port 22, so it follows the data plane (mesh addresses must be up).
+        #[cfg(feature = "desktop")]
         if config::load().map(|c| c.ssh_enabled).unwrap_or(false) {
             self.start_ssh();
         }
@@ -718,11 +756,16 @@ impl MeshManager {
         }
 
         // The SSH listeners bind the mesh IPs, which go down with the data plane.
+        #[cfg(feature = "desktop")]
         self.stop_ssh();
 
-        self.dns.revert(&self.tun_name).await;
+        // Clone the TUN name out of the lock before awaiting (see `activate`);
+        // the DnsManager reverts system DNS and clears the TUN search domains.
+        let tun_name = self.tun_name.lock().unwrap().clone();
+        self.dns.revert(&tun_name).await;
 
-        if let Err(e) = tun::set_link_down(&self.tun_name) {
+        #[cfg(not(target_os = "android"))]
+        if let Err(e) = tun::set_link_down(&tun_name) {
             tracing::warn!(error = %e, "failed to bring TUN interface down");
         }
 
@@ -753,8 +796,9 @@ impl MeshManager {
         true
     }
 
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
     #[tracing::instrument(skip(self), fields(net = name))]
-    pub(crate) async fn leave_network(&self, name: &str) -> IpcMessage {
+    pub async fn leave_network(&self, name: &str) -> IpcMessage {
         // Gracefully close our connections with the leave code BEFORE teardown
         // drops them, so each peer's reader sees an intentional close and the
         // coordinator prunes us from the roster (rather than waiting for an

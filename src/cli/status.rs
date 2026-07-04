@@ -145,6 +145,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
             bytes_tx,
             pending_files,
             pending_connects,
+            ..
         } => {
             if json_enabled() {
                 print_json(&serde_json::json!({
@@ -309,7 +310,15 @@ fn print_network(net: &ipc::NetworkStatus) {
     let rows: Vec<Vec<layout::Cell>> = net
         .peers
         .iter()
-        .map(|p| render_peer_row(&net.name, p, peer_alias(p, &alias_by_identity), up_w, down_w))
+        .map(|p| {
+            render_peer_row(
+                &net.name,
+                p,
+                peer_alias(p, &alias_by_identity),
+                up_w,
+                down_w,
+            )
+        })
         .collect();
     if rows.is_empty() {
         println!("    {}", style::faint("(no other members)"));

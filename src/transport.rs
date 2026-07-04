@@ -8,9 +8,9 @@ use anyhow::{Context, Result};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey,
     address_lookup::{PkarrPublisher, PkarrResolver},
-    endpoint::{Builder, QuicTransportConfig},
     endpoint::Connection,
     endpoint::presets,
+    endpoint::{Builder, QuicTransportConfig},
 };
 
 use crate::config::ServerOverride;

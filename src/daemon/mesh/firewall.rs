@@ -17,7 +17,7 @@ impl MeshManager {
     // Firewall handlers
     // -----------------------------------------------------------------------
 
-    pub(crate) async fn firewall_add(
+    pub async fn firewall_add(
         &self,
         direction: firewall::Direction,
         action: firewall::Action,
@@ -114,7 +114,7 @@ impl MeshManager {
         IpcMessage::Ok { message }
     }
 
-    pub(crate) fn firewall_remove(&self, index: usize) -> IpcMessage {
+    pub fn firewall_remove(&self, index: usize) -> IpcMessage {
         let len = self.firewall.get_config().rules.len();
         if index >= len {
             return IpcMessage::Error {
@@ -129,7 +129,7 @@ impl MeshManager {
         }
     }
 
-    pub(crate) fn firewall_show(&self) -> IpcMessage {
+    pub fn firewall_show(&self) -> IpcMessage {
         let config = self.firewall.get_config();
         let short_id = |id: &EndpointId| -> String { id.fmt_short().to_string() };
         IpcMessage::FirewallState {
@@ -278,7 +278,7 @@ impl MeshManager {
             // a duplicate (and a re-suggested action flip supersedes the old one).
             let deduped = firewall::dedup_by_selector(existing);
             let config = self.firewall.replace_network_rules(network, deduped);
-        save_firewall_warn(&config);
+            save_firewall_warn(&config);
         }
         IpcMessage::Ok {
             message: format!(
@@ -379,7 +379,7 @@ impl MeshManager {
     /// outbound default stays `Allow` — you always initiate freely). `allow`
     /// restores the old permissive inbound posture; `deny` is the secure default.
     /// Inbound ICMP-allow is a separate built-in default and is unaffected.
-    pub(crate) fn firewall_default(&self, action: firewall::Action) -> IpcMessage {
+    pub fn firewall_default(&self, action: firewall::Action) -> IpcMessage {
         self.edit_firewall(|c| c.default_inbound = action);
         IpcMessage::Ok {
             message: format!("inbound default set to {action}"),
@@ -452,6 +452,7 @@ impl MeshManager {
             tracing::warn!(error = %e, "failed to persist firewall config");
         }
         // Reflect immediately if the data plane is up (else activate() starts it).
+        #[cfg(feature = "desktop")]
         if self.active.load(Ordering::SeqCst) {
             if enabled {
                 self.start_ssh();
@@ -542,6 +543,7 @@ impl MeshManager {
             };
         }
         // Push the change to any live listener.
+        #[cfg(feature = "desktop")]
         self.rebuild_ssh_authz();
         let detail = if allow {
             let r = net.ssh_allow.iter().find(|r| r.peer == entry);

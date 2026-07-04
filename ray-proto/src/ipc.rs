@@ -340,6 +340,11 @@ pub enum IpcMessage {
         /// (global). Shown in the status "pending" summary.
         #[serde(default)]
         pending_connects: usize,
+        /// Networks this node has asked to join but has not yet been admitted
+        /// to (persisted `AppConfig.pending_joins`), minus any that are now
+        /// active. Shown in the UI as "waiting for approval".
+        #[serde(default)]
+        pending_networks: Vec<String>,
     },
     /// Reply to `Ping`. `probes` holds one entry per probe in send order: the
     /// measured round-trip in milliseconds, or `None` if that probe timed out.

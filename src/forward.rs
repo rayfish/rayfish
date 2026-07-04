@@ -21,7 +21,6 @@ use tokio_util::sync::CancellationToken;
 use crate::firewall::{self, Direction, SharedFirewall};
 use crate::peers::{DeviceUserMap, PeerTable};
 use crate::stats::{DropReason, ForwardMetrics};
-use crate::tun::{TunReader, TunWriter};
 
 /// Maximum datagram size accepted from a peer. Anything larger is dropped before
 /// being parsed or written to the TUN device, bounding memory use under a flood
@@ -35,8 +34,20 @@ const MAX_PEER_DATAGRAM: usize = 1500;
 /// quinn and is freed as those datagrams are sent).
 const TX_POOL_CHUNK: usize = 64 * 1024;
 
+/// The port a stock `ssh` client targets (`ssh user@host.ray`). Defined here in
+/// the always-compiled forward core because the userspace SSH NAT below rewrites
+/// it on every platform, including Android, where the desktop-only `crate::ssh`
+/// module (which re-exports this) is gated out.
+pub(crate) const SSH_PORT: u16 = 22;
+
+/// Internal port the embedded SSH server binds. Mesh `:22` is translated
+/// to/from this port by the userspace NAT below. Chosen below the ephemeral
+/// source-port ranges so the outbound NAT (which matches `src_port == this`)
+/// can't collide with a kernel-assigned ephemeral port. See `crate::ssh`.
+pub(crate) const SSH_LISTEN_PORT: u16 = 30022;
+
 /// Userspace NAT that maps this node's mesh `:22` to/from the embedded SSH
-/// server's internal listen port ([`crate::ssh::SSH_LISTEN_PORT`]). The kernel
+/// server's internal listen port ([`SSH_LISTEN_PORT`]). The kernel
 /// won't let us bind `<mesh-ip>:22` alongside a host sshd on `0.0.0.0:22`, so
 /// instead of an OS-firewall redirect (which would be Linux-only) we translate
 /// the port inside our own forwarding path — portable across every platform the
@@ -114,15 +125,15 @@ fn rewrite_ssh_port(pkt: &mut [u8], info: &firewall::PacketInfo, inbound: bool) 
         return false;
     }
     let (port_off, old, new) = if inbound {
-        if !nat.is_ours(info.dst_ip) || info.dst_port != crate::ssh::SSH_PORT {
+        if !nat.is_ours(info.dst_ip) || info.dst_port != SSH_PORT {
             return false;
         }
-        (ihl + 2, crate::ssh::SSH_PORT, nat.listen_port)
+        (ihl + 2, SSH_PORT, nat.listen_port)
     } else {
         if !nat.is_ours(info.src_ip) || info.src_port != nat.listen_port {
             return false;
         }
-        (ihl, nat.listen_port, crate::ssh::SSH_PORT)
+        (ihl, nat.listen_port, SSH_PORT)
     };
     pkt[port_off..port_off + 2].copy_from_slice(&new.to_be_bytes());
     let ck_off = ihl + 16;
@@ -218,6 +229,16 @@ pub struct DisconnectEvent {
     /// True when the peer closed gracefully with [`LEAVE_CODE`] (it ran
     /// `ray leave`), as opposed to a timeout/reset.
     pub intentional: bool,
+    /// [`Connection::stable_id`] of the connection that dropped, so a consumer
+    /// can tell whether the connection currently stored for this peer is still
+    /// the one that died. `None` for a synthetic kick that is not tied to a live
+    /// connection (the cold-restore reconnect seed), which always proceeds.
+    ///
+    /// Guards an ABA race: when a peer's process is killed and it re-dials with
+    /// the same identity, the coordinator registers the fresh connection before
+    /// the old one's idle timeout fires. Without this id, the stale connection's
+    /// delayed disconnect would evict the fresh connection and drop the peer.
+    pub conn_stable_id: Option<usize>,
 }
 
 /// Shared data-plane handles threaded into every per-peer reader. All fields are
@@ -226,7 +247,13 @@ pub struct DisconnectEvent {
 /// daemon's `MeshCtx` via `MeshCtx::forward_ctx`.
 pub struct ForwardCtx {
     pub firewall: SharedFirewall,
-    pub tun_tx: mpsc::Sender<Bytes>,
+    /// Swappable sender cell for the TUN writer. Peer readers outlive TUN
+    /// attach/detach cycles (the control plane stays up across a VPN toggle), so
+    /// they resolve the current writer per packet via `tun_tx.load_full()` rather
+    /// than capturing one sender. After a detach + re-attach the cell points at
+    /// the new writer, so a reader spawned during the first `up()` keeps
+    /// forwarding after the next one. See [`DaemonState::attach_tun`].
+    pub tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
     pub disconnect_tx: mpsc::Sender<DisconnectEvent>,
     pub token: CancellationToken,
     pub stats: Arc<ForwardMetrics>,
@@ -242,8 +269,8 @@ pub(crate) fn is_magic_dns(info: &firewall::PacketInfo) -> bool {
 /// looks up the peer in [`PeerTable`], and sends the packet as a QUIC datagram.
 /// Packets with no matching peer are silently dropped.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_mesh(
-    mut tun: TunReader,
+pub async fn run_mesh<R: crate::tun::TunRead>(
+    mut tun: R,
     peers: PeerTable,
     firewall: SharedFirewall,
     token: CancellationToken,
@@ -406,6 +433,7 @@ pub fn spawn_peer_reader(
                                 ipv6: peer_ipv6,
                                 network: network.clone(),
                                 intentional,
+                                conn_stable_id: Some(conn.stable_id()),
                             })
                             .await;
                         return;
@@ -426,9 +454,7 @@ pub fn spawn_peer_reader(
                     // ordinary traffic.
                     let datagram = match ssh_nat() {
                         Some(_) => match firewall::parse_packet_info(&datagram) {
-                            Some(info)
-                                if info.protocol == 6 && info.dst_port == crate::ssh::SSH_PORT =>
-                            {
+                            Some(info) if info.protocol == 6 && info.dst_port == SSH_PORT => {
                                 let mut v = datagram.to_vec();
                                 rewrite_ssh_port(&mut v, &info, true);
                                 Bytes::from(v)
@@ -437,9 +463,12 @@ pub fn spawn_peer_reader(
                         },
                         None => datagram,
                     };
-                    if tun_tx.send(datagram).await.is_err() {
-                        return;
-                    }
+                    // Resolve the live writer for each packet: the sender is
+                    // swapped on every TUN re-attach (VPN toggle). A send error
+                    // means the writer is currently down (standby between a
+                    // detach and the next attach); drop the packet and keep the
+                    // reader alive so it forwards again once a new TUN attaches.
+                    let _ = tun_tx.load_full().send(datagram).await;
                 }
                 InboundDecision::DropFirewall(info) => {
                     stats.record_drop(DropReason::Firewall);
@@ -474,8 +503,8 @@ pub fn spawn_peer_reader(
 /// `active` is the data-plane gate: while it is false (standby, after `ray
 /// down`) inbound datagrams are dropped instead of written, so a node that
 /// stays connected to peers still carries no traffic.
-pub fn spawn_tun_writer(
-    mut tun: TunWriter,
+pub fn spawn_tun_writer<W: crate::tun::TunWrite>(
+    mut tun: W,
     mut tun_rx: mpsc::Receiver<Bytes>,
     active: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
@@ -498,6 +527,47 @@ pub fn spawn_tun_writer(
 mod tests {
     use super::*;
     use crate::firewall::Action;
+
+    #[derive(Default)]
+    struct FakeTunWriter {
+        written: std::sync::Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl crate::tun::TunWrite for FakeTunWriter {
+        async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
+            self.written.lock().await.push(packet.to_vec());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tun_writer_writes_when_active() {
+        use std::sync::atomic::AtomicBool;
+        let writer = FakeTunWriter::default();
+        let sink = writer.written.clone();
+        let (tx, rx) = mpsc::channel::<Bytes>(8);
+        let active = std::sync::Arc::new(AtomicBool::new(true));
+        let handle = spawn_tun_writer(writer, rx, active);
+        tx.send(Bytes::from_static(b"kept")).await.unwrap();
+        drop(tx); // close channel so the writer task exits
+        handle.await.unwrap();
+        let got = sink.lock().await;
+        assert_eq!(got.as_slice(), &[b"kept".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn tun_writer_drops_when_inactive() {
+        use std::sync::atomic::AtomicBool;
+        let writer = FakeTunWriter::default();
+        let sink = writer.written.clone();
+        let (tx, rx) = mpsc::channel::<Bytes>(8);
+        let active = std::sync::Arc::new(AtomicBool::new(false));
+        let handle = spawn_tun_writer(writer, rx, active);
+        tx.send(Bytes::from_static(b"dropped")).await.unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        assert!(sink.lock().await.is_empty());
+    }
 
     #[test]
     fn test_parse_packet_valid_ipv4() {
@@ -666,16 +736,23 @@ mod tests {
 
     #[test]
     fn ssh_nat_rewrites_port_and_keeps_checksum_valid() {
-        let v4 = Ipv4Addr::new(100, 88, 0, 1);
-        init_ssh_nat(v4, Ipv6Addr::LOCALHOST, 41384);
+        // `SSH_NAT` is a process-global `OnceLock`, so another test in this binary
+        // (e.g. the headless daemon build) may seed it first, making our
+        // `init_ssh_nat` a no-op. Read the addresses the NAT actually holds and
+        // build the packet from those, so the test is independent of run order.
+        init_ssh_nat(Ipv4Addr::new(100, 88, 0, 1), Ipv6Addr::LOCALHOST, 41384);
         set_ssh_nat_active(true);
+        let (our_v4, listen_port) = {
+            let nat = ssh_nat().expect("nat active");
+            (nat.v4, nat.listen_port)
+        };
 
         // v4 TCP packet from a peer to our mesh :22, with a correct checksum.
         let mut pkt = vec![0u8; 40];
         pkt[0] = 0x45;
         pkt[9] = 6; // TCP
         pkt[12..16].copy_from_slice(&[100, 88, 0, 9]); // src (peer)
-        pkt[16..20].copy_from_slice(&v4.octets()); // dst (us)
+        pkt[16..20].copy_from_slice(&our_v4.octets()); // dst (us)
         pkt[20..22].copy_from_slice(&5000u16.to_be_bytes()); // src port
         pkt[22..24].copy_from_slice(&22u16.to_be_bytes()); // dst port 22
         pkt[32] = 0x50; // data offset = 5 (20-byte TCP header)
@@ -685,7 +762,10 @@ mod tests {
         let info = firewall::parse_packet_info(&pkt).unwrap();
         assert!(rewrite_ssh_port(&mut pkt, &info, true));
         let info2 = firewall::parse_packet_info(&pkt).unwrap();
-        assert_eq!(info2.dst_port, 41384, "dest port rewritten 22 -> listen");
+        assert_eq!(
+            info2.dst_port, listen_port,
+            "dest port rewritten 22 -> listen"
+        );
         // The incrementally-updated checksum must equal a freshly computed one.
         let field = u16::from_be_bytes([pkt[36], pkt[37]]);
         assert_eq!(

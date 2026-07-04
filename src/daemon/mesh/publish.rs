@@ -4,7 +4,6 @@
 
 use super::super::*;
 
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_network_publisher(
     client: PkarrRelayClient,
@@ -55,7 +54,6 @@ pub(crate) fn spawn_network_publisher(
     })
 }
 
-
 /// Publish this node's contact record (`ray connect`).
 /// Publishes the `contact_key -> current endpoint` pkarr record on a TTL/2
 /// interval (record TTL is 300s). Runs for the lifetime of the daemon (control
@@ -85,7 +83,6 @@ pub(crate) fn spawn_contact_publisher(
         }
     })
 }
-
 
 /// A polling publisher for a *granted* co-coordinator (a member that received
 /// the network key via `AdminGrant`). Unlike [`spawn_network_publisher`] (which
@@ -150,7 +147,6 @@ pub(crate) fn spawn_lazy_publisher(
         }
     })
 }
-
 
 pub(crate) async fn update_snapshot_and_publish(
     state: &SharedNetworkState,

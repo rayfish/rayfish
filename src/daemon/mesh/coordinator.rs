@@ -4,7 +4,6 @@
 
 use super::super::*;
 
-
 /// Extra context a coordinator needs to prune the canonical member list when a
 /// peer leaves deliberately (`ray leave`). Members pass `None` and only ever
 /// drop the connection from the [`PeerTable`].
@@ -17,7 +16,6 @@ pub(crate) struct CoordinatorCleanup {
     pub(crate) device_user_map: peers::DeviceUserMap,
     pub(crate) network_name: String,
 }
-
 
 pub(crate) fn spawn_peer_cleanup(
     mut disconnect_rx: mpsc::Receiver<forward::DisconnectEvent>,
@@ -32,10 +30,24 @@ pub(crate) fn spawn_peer_cleanup(
                 event = disconnect_rx.recv() => {
                     match event {
                         Some(ev) => {
+                            // Drop only this network's route, and only if the
+                            // stored connection is still the one that died. A
+                            // peer that was killed and re-dialed with the same
+                            // identity already has a fresh connection registered;
+                            // the stale connection's delayed disconnect must not
+                            // evict it (see DisconnectEvent::conn_stable_id).
+                            let removed = match ev.conn_stable_id {
+                                Some(id) => peers.remove_peer_from_network_if(&ev.ip, &ev.ipv6, &ev.network, id),
+                                None => {
+                                    peers.remove_peer_from_network(&ev.ip, &ev.ipv6, &ev.network);
+                                    true
+                                }
+                            };
+                            if !removed {
+                                tracing::debug!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, network = %ev.network, "ignoring stale disconnect; peer already reconnected");
+                                continue;
+                            }
                             tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, network = %ev.network, intentional = ev.intentional, "removing dead peer");
-                            // Drop only this network's route; a multi-homed peer
-                            // stays reachable via its other networks.
-                            peers.remove_peer_from_network(&ev.ip, &ev.ipv6, &ev.network);
 
                             // A deliberate `ray leave` (graceful close with the
                             // leave code) prunes the member from the roster and
@@ -64,7 +76,6 @@ pub(crate) fn spawn_peer_cleanup(
         }
     })
 }
-
 
 /// Coordinator-side per-member control reader. Continuously accepts control
 /// streams from one member and processes `MeshHello`s as live create-or-update
@@ -261,7 +272,6 @@ pub(crate) fn spawn_coordinator_control_reader(
     });
 }
 
-
 /// Send `msg` to each coordinator peer (per [`gossip_targets`]) that has a live
 /// connection on `network`. Best-effort: a target without a live connection is
 /// skipped (it will reconverge invite state from a future share/redeem or, for
@@ -286,7 +296,6 @@ pub(crate) async fn gossip_to_coordinators(
         }
     }
 }
-
 
 /// Whether `peer` is a coordinator in our verified roster. Invite-gossip arms
 /// (`InviteShare`/`InviteUsed`) act only on messages from a coordinator peer, so

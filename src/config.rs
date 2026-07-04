@@ -356,6 +356,17 @@ pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, Str
     }
 }
 
+/// A closed-network join that was queued for coordinator approval and has not
+/// yet been admitted. Persisted so the background retry survives a restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingJoinEntry {
+    /// The network public key (bare room id) we asked to join.
+    pub network_key: String,
+    /// The local display name to use once admitted, if the user gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_true")]
@@ -415,6 +426,10 @@ pub struct AppConfig {
     pub download_user: Option<u32>,
     #[serde(default)]
     pub networks: Vec<NetworkConfig>,
+    /// Closed-network joins queued for coordinator approval, awaiting
+    /// admission. See [`PendingJoinEntry`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_joins: Vec<PendingJoinEntry>,
 }
 
 impl Default for AppConfig {
@@ -434,6 +449,7 @@ impl Default for AppConfig {
             download_dir: None,
             download_user: None,
             networks: Vec::new(),
+            pending_joins: Vec::new(),
         }
     }
 }
@@ -510,6 +526,8 @@ struct Settings {
     download_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     download_user: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_joins: Vec<PendingJoinEntry>,
 }
 
 /// Look up the `rayfish` group's gid (Linux), if the group exists.
@@ -559,9 +577,24 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// Linux: `/etc/rayfish` (system service location, root:rayfish). macOS: the
 /// daemon's `~/.config/rayfish` (root-only under `/var/root`).
 pub fn config_dir() -> Result<PathBuf> {
+    // An explicit `RAYFISH_CONFIG_DIR` override is honored only on Android
+    // (`ray-mobile`'s `Node::new` points it at the app's `Context.getFilesDir()`)
+    // and in `cfg(test)` (headless/test harnesses run against an isolated config
+    // tree). Desktop/service production builds never check this var, so their
+    // resolved path is byte-for-byte unchanged from before the override existed.
+    #[cfg(any(target_os = "android", test))]
+    if let Some(dir) = std::env::var_os("RAYFISH_CONFIG_DIR") {
+        let dir = PathBuf::from(dir);
+        ensure_dir(&dir)?;
+        return Ok(dir);
+    }
     #[cfg(target_os = "linux")]
     let dir = PathBuf::from("/etc/rayfish");
-    #[cfg(not(target_os = "linux"))]
+    // Android without the override falls back to a fixed app-private path so the
+    // library still compiles/runs standalone.
+    #[cfg(target_os = "android")]
+    let dir = PathBuf::from("/data/local/tmp/rayfish");
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let dir = dirs::config_dir()
         .context("could not determine config directory")?
         .join("rayfish");
@@ -741,6 +774,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
             auto_update_last_attempt: None,
             download_dir: None,
             download_user: None,
+            pending_joins: Vec::new(),
         }
     };
 
@@ -783,6 +817,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         download_dir: settings.download_dir,
         download_user: settings.download_user,
         networks,
+        pending_joins: settings.pending_joins,
     })
 }
 
@@ -806,11 +841,48 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         auto_update_last_attempt: config.auto_update_last_attempt,
         download_dir: config.download_dir.clone(),
         download_user: config.download_user,
+        pending_joins: config.pending_joins.clone(),
     };
     let path = dir.join(SETTINGS_FILE);
     let contents = toml::to_string_pretty(&settings).context("serializing settings")?;
     // Secret-bearing: holds the contact key.
     write_atomic(&path, &contents, true)
+}
+
+/// Record a queued join so its background retry survives a daemon restart.
+/// Idempotent: a second call with the same key updates the stored name but
+/// does not duplicate the entry.
+pub fn add_pending_join(entry: PendingJoinEntry) -> Result<()> {
+    add_pending_join_in(&config_dir()?, entry)
+}
+
+fn add_pending_join_in(dir: &Path, entry: PendingJoinEntry) -> Result<()> {
+    let mut cfg = load_in(dir)?;
+    if let Some(existing) = cfg
+        .pending_joins
+        .iter_mut()
+        .find(|e| e.network_key == entry.network_key)
+    {
+        existing.name = entry.name;
+    } else {
+        cfg.pending_joins.push(entry);
+    }
+    save_settings_in(dir, &cfg)
+}
+
+/// Drop a pending-join marker once the network is admitted (or abandoned).
+pub fn remove_pending_join(network_key: &str) -> Result<()> {
+    remove_pending_join_in(&config_dir()?, network_key)
+}
+
+fn remove_pending_join_in(dir: &Path, network_key: &str) -> Result<()> {
+    let mut cfg = load_in(dir)?;
+    let before = cfg.pending_joins.len();
+    cfg.pending_joins.retain(|e| e.network_key != network_key);
+    if cfg.pending_joins.len() != before {
+        save_settings_in(dir, &cfg)?;
+    }
+    Ok(())
 }
 
 /// Persist a single network to `networks/<name>.toml`. Touches only that file,
@@ -877,6 +949,13 @@ pub fn remove_network(config: &mut AppConfig, name: &str) -> bool {
     config.networks.retain(|n| n.name != name);
     config.networks.len() < before
 }
+
+/// Process-wide lock serializing tests that mutate `RAYFISH_CONFIG_DIR` (or any
+/// other env var read by [`config_dir`]), since lib tests share one process and
+/// run on parallel threads. Shared across test modules (`identity`, `daemon`)
+/// so none of them observe a `RAYFISH_CONFIG_DIR` value set by a concurrent test.
+#[cfg(test)]
+pub(crate) static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -1512,5 +1591,41 @@ name = "test"
         let dir = tmp.path();
         assert!(save_network_in(dir, &net("../escape")).is_err());
         assert!(load_network_in(dir, "a/b").is_err());
+    }
+
+    #[test]
+    fn pending_join_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Start from an empty settings file.
+        save_settings_in(dir, &AppConfig::default()).unwrap();
+
+        add_pending_join_in(
+            dir,
+            PendingJoinEntry {
+                network_key: "abc123".to_string(),
+                name: Some("homelab".to_string()),
+            },
+        )
+        .unwrap();
+
+        let loaded = load_in(dir).unwrap();
+        assert_eq!(loaded.pending_joins.len(), 1);
+        assert_eq!(loaded.pending_joins[0].network_key, "abc123");
+
+        // Adding the same key again does not duplicate it.
+        add_pending_join_in(
+            dir,
+            PendingJoinEntry {
+                network_key: "abc123".to_string(),
+                name: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(load_in(dir).unwrap().pending_joins.len(), 1);
+
+        remove_pending_join_in(dir, "abc123").unwrap();
+        assert!(load_in(dir).unwrap().pending_joins.is_empty());
     }
 }

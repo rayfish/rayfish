@@ -12,9 +12,28 @@ use super::super::*;
 
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
     // Bail early on a CGNAT clash (e.g. Tailscale) before touching anything.
+    #[cfg(not(target_os = "android"))]
     check_cgnat_conflict()?;
 
-    let (daemon, _metrics_server, promote_rx) = build_daemon(token.clone(), stats).await?;
+    // Build the always-on infrastructure without a packet interface, then attach
+    // the desktop OS TUN device below. The headless builder is the same one
+    // `build_headless()` exposes to embedders (mobile), so both paths share
+    // identical construction.
+    let daemon = build_daemon(token.clone(), stats).await?;
+
+    // Attach the real OS TUN device: create it, record its name, and spawn the
+    // writer + `run_mesh` forwarding loop. On Android the packet interface is a
+    // `VpnService` fd attached later by `ray-mobile` via `attach_tun`, so this is
+    // skipped here.
+    #[cfg(not(target_os = "android"))]
+    {
+        let my_ipv6 = derive_ipv6(&daemon.identity.local_identity());
+        let (tun_reader, tun_writer, tun_name) = tun::create(daemon.identity.local_ip(), my_ipv6)
+            .await
+            .context("failed to create TUN device")?;
+        *daemon.tun_name.lock().unwrap() = tun_name;
+        daemon.attach_tun(tun_reader, tun_writer).await;
+    }
 
     // Connect the control plane (mesh connections) once, for the daemon's
     // whole lifetime, then bring the data plane up. `ray up`/`ray down` toggle
@@ -23,8 +42,19 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     daemon.connect_all_networks().await;
     daemon.activate(None).await;
 
+    // The promotion receiver was stashed on the daemon by the builder; take it
+    // back to drive the IPC loop.
+    let promote_rx = daemon
+        .promote_rx
+        .lock()
+        .unwrap()
+        .take()
+        .expect("promote_rx present after build");
+
     // Opt-in automatic updates: a single daemon-wide task that periodically
-    // checks for a newer stable release and swaps + restarts onto it.
+    // checks for a newer stable release and swaps + restarts onto it. Desktop-only
+    // (the self-replacing updater is not built into the Android lib).
+    #[cfg(feature = "desktop")]
     if daemon.auto_update {
         spawn_auto_update(daemon.shutdown_token.clone());
     }
@@ -67,14 +97,31 @@ fn initial_alpns(app_config: &config::AppConfig) -> Vec<Vec<u8>> {
     alpns
 }
 
+/// Construct a headless [`MeshManager`] for an embedder (used by `ray-mobile`
+/// and future embedders). Builds the same infrastructure as `run_daemon` minus
+/// the OS TUN device and the Unix-socket IPC server: the caller supplies a
+/// packet interface via [`MeshManager::attach_tun`]. The returned daemon is on
+/// standby (no data plane), with its saved networks' control plane connected.
+pub async fn build_headless() -> Result<Arc<MeshManager>> {
+    let token = CancellationToken::new();
+    let stats = Arc::new(ForwardMetrics::default());
+    let daemon = build_daemon(token, stats).await?;
+    // Bring the saved networks' control plane up, matching `run_daemon`.
+    daemon.connect_all_networks().await;
+    Ok(daemon)
+}
+
+/// Build all always-on daemon infrastructure WITHOUT a packet interface or the
+/// Unix-socket IPC server. The returned [`MeshManager`] is on standby (no data
+/// plane); attach a TUN with [`MeshManager::attach_tun`], connect saved networks,
+/// then bring the data plane up with [`MeshManager::activate`]. The promotion
+/// receiver and metrics-server guard are stashed on the state for the caller.
+///
+/// Shared by [`run_daemon`] (desktop) and [`build_headless`] (embedders).
 async fn build_daemon(
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
-) -> Result<(
-    Arc<MeshManager>,
-    Option<iroh_metrics::service::MetricsServer>,
-    mpsc::Receiver<String>,
-)> {
+) -> Result<Arc<MeshManager>> {
     // Relocate a pre-/etc config tree into /etc/rayfish (Linux upgrade path)
     // before anything reads identity or config. No-op on macOS / once migrated.
     config::migrate_location();
@@ -94,7 +141,7 @@ async fn build_daemon(
     forward::init_ssh_nat(
         my_ip,
         derive_ipv6(&identity.local_identity()),
-        crate::ssh::SSH_LISTEN_PORT,
+        crate::forward::SSH_LISTEN_PORT,
     );
 
     // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
@@ -130,11 +177,12 @@ async fn build_daemon(
         .context("failed to open blob store")?;
     let blobs_proto = BlobsProtocol::new(&blob_store, None);
 
-    // --- Single TUN device + the forwarding loop, shared across networks ---
-    let my_ipv6 = derive_ipv6(&identity.local_identity());
-    let (tun_reader, tun_writer, tun_name) = tun::create(my_ip, my_ipv6)
-        .await
-        .context("failed to create TUN device")?;
+    // --- Packet interface: deferred to `attach_tun` ---
+    // No OS TUN device or forwarding loop is created here. On desktop `run_daemon`
+    // creates the real device and calls `attach_tun`; on embedders (mobile) the
+    // `VpnService` fd is attached the same way. `tun_name` starts as a placeholder
+    // and is overwritten when a real interface is attached.
+    let tun_name = String::from("rayfish");
     // Append-only audit log of peer connect/disconnect events. If it can't be
     // opened (e.g. unwritable config dir) the daemon still runs without auditing.
     let peers = match audit::AuditLog::open() {
@@ -151,8 +199,14 @@ async fn build_daemon(
     let shared_firewall = SharedFirewall::new(fw_config);
     shared_firewall.clone().spawn_evictor(token.clone());
     let active = Arc::new(AtomicBool::new(false));
-    let (tun_tx, tun_rx) = mpsc::channel::<Bytes>(256);
-    forward::spawn_tun_writer(tun_writer, tun_rx, active.clone());
+    // Placeholder sender whose receiver is dropped immediately: no real channel
+    // exists until `attach_tun` creates one and swaps it in. `attach_tun`
+    // (desktop: once at boot; mobile: on each `up()`) recreates the channel, spawns
+    // the TUN writer + `run_mesh` forwarding loop, and stores the live sender here.
+    let tun_tx = {
+        let (placeholder_tx, _placeholder_rx) = mpsc::channel::<Bytes>(1);
+        Arc::new(arc_swap::ArcSwap::from_pointee(placeholder_tx))
+    };
     let device_user_map = peers::DeviceUserMap::new();
 
     // --- Magic DNS resolver + optional mDNS local discovery ---
@@ -161,15 +215,6 @@ async fn build_daemon(
     let dns_resolver = std::sync::Arc::new(crate::dns_resolver::Resolver::new(
         hostname_table.clone(),
         reverse_table.clone(),
-    ));
-    tokio::spawn(forward::run_mesh(
-        tun_reader,
-        peers.clone(),
-        shared_firewall.clone(),
-        token.clone(),
-        stats.clone(),
-        dns_resolver.clone(),
-        tun_tx.clone(),
     ));
     let mdns_enabled = app_config.mdns_enabled;
     if mdns_enabled {
@@ -208,7 +253,10 @@ async fn build_daemon(
         dns: DnsManager::new(hostname_table, reverse_table, dns_resolver.clone()),
         mdns_enabled,
         auto_update,
-        tun_name,
+        tun_name: std::sync::Mutex::new(tun_name),
+        tun_tasks: std::sync::Mutex::new(None),
+        promote_rx: std::sync::Mutex::new(Some(promote_rx)),
+        _metrics_server: std::sync::Mutex::new(None),
         files,
         connect,
         device_cert,
@@ -216,6 +264,7 @@ async fn build_daemon(
         pruned_peers: Arc::new(DashSet::new()),
         contact_public,
         active: active.clone(),
+        #[cfg(feature = "desktop")]
         ssh_authz: crate::ssh::new_authz(),
         ssh_token: std::sync::Mutex::new(None),
         promote_tx,
@@ -231,17 +280,15 @@ async fn build_daemon(
 
     // --- Contact record publisher (ray connect) ---
     if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
-        spawn_contact_publisher(
-            pkarr_client,
-            daemon.endpoint.id(),
-            token.clone(),
-        );
+        spawn_contact_publisher(pkarr_client, daemon.endpoint.id(), token.clone());
     }
     let metrics_server =
         spawn_metrics_server(stats, daemon.peers.clone(), &daemon.endpoint, token).await;
+    // Keep the metrics-server guard alive for the daemon's whole lifetime.
+    *daemon._metrics_server.lock().unwrap() = metrics_server;
 
     tracing::info!(ip = %my_ip, id = %daemon.endpoint.id().fmt_short(), "daemon started");
-    Ok((daemon, metrics_server, promote_rx))
+    Ok(daemon)
 }
 
 /// Advertise this endpoint over mDNS (`_rayfish._udp.local`) and log LAN peer
@@ -416,15 +463,19 @@ fn spawn_file_auto_accept(
 }
 
 /// First auto-update check runs ~5 min after boot (jittered), then every 6h.
+#[cfg(feature = "desktop")]
 const AUTO_UPDATE_INITIAL_DELAY: Duration = Duration::from_secs(300);
+#[cfg(feature = "desktop")]
 const AUTO_UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// Restart-loop guard: refuse a repeat of the same target inside this window.
+#[cfg(feature = "desktop")]
 const AUTO_UPDATE_BACKOFF_SECS: i64 = 24 * 60 * 60;
 
 /// Opt-in automatic updates: a single daemon-wide task that periodically checks
 /// GitHub for a newer stable release and, when found, swaps the binary and
 /// restarts the service onto it. All errors are logged and swallowed so the task
 /// never crashes the daemon.
+#[cfg(feature = "desktop")]
 fn spawn_auto_update(token: CancellationToken) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Jitter each tick so a fleet upgraded together doesn't hit the GitHub
@@ -451,6 +502,7 @@ fn spawn_auto_update(token: CancellationToken) -> tokio::task::JoinHandle<()> {
 /// backed off, swap the binary and trigger a self-restart. `Ok(())` means nothing
 /// needed doing (or the swap+restart was scheduled — the daemon is torn down and
 /// relaunched onto the new binary shortly after).
+#[cfg(feature = "desktop")]
 async fn auto_update_once() -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     let asset = crate::update::release_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
@@ -501,6 +553,7 @@ async fn auto_update_once() -> Result<()> {
 
 /// Current unix time in whole seconds (best-effort; 0 before the epoch, which
 /// never happens in practice).
+#[cfg(feature = "desktop")]
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

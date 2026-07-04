@@ -5,7 +5,6 @@
 
 use super::super::*;
 
-
 /// Materialize this node's suggested firewall rules for `network` from the
 /// verified blob state, then either install them (replacing the prior
 /// `Network(net)` set, leaving `Local` rules untouched) when the node opted into
@@ -88,7 +87,6 @@ pub(crate) fn apply_suggested_firewall(
     }
 }
 
-
 /// Resolve the network's *signed* group-blob hash (and seed peers) from the
 /// pkarr record. This is the sole authority for the roster/firewall.
 pub(crate) async fn resolve_signed(
@@ -98,7 +96,6 @@ pub(crate) async fn resolve_signed(
     let client = dht::create_pkarr_client(endpoint).ok()?;
     dht::resolve_network(&client, net_pubkey).await.ok()
 }
-
 
 /// Fetch the group blob for `signed` from any connected peer or seed, and verify
 /// its bytes against `signed`. Returns the verified blob, or `None` if no source
@@ -137,7 +134,6 @@ pub(crate) async fn fetch_verified_blob(
     }
     None
 }
-
 
 /// Reconverge the live network state from the signed pkarr record and apply it
 /// (roster + DNS + suggested firewall). Invoked when a peer sends a `MemberSync`
@@ -358,7 +354,6 @@ pub(crate) async fn apply_roster_to_dns(
     dns::sync_network_hostnames(hostname_table, reverse_table, network_name, &entries).await;
 }
 
-
 pub(crate) fn spawn_group_poller(
     client: PkarrRelayClient,
     net_pubkey: EndpointId,
@@ -485,7 +480,6 @@ pub(crate) fn spawn_group_poller(
         }
     })
 }
-
 
 /// Current Unix time in seconds. Reusable-key expiry uses wall-clock time (the
 /// same convention as the single-use invite ledger).

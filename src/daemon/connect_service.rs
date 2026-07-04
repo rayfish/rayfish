@@ -59,26 +59,43 @@ impl ConnectService {
                         return;
                     }
                 };
-                if let control::ConnectMsg::Request { from_contact_id, from_endpoint, hostname } = request {
+                if let control::ConnectMsg::Request {
+                    from_contact_id,
+                    from_endpoint,
+                    hostname,
+                } = request
+                {
                     // Bind the request to the dialing identity: the
                     // endpoint we pre-approve must be the one that dialed.
                     if from_endpoint != remote_id {
                         tracing::warn!(claimed = %from_endpoint.fmt_short(), actual = %remote_id.fmt_short(), "connect request endpoint mismatch");
-                        let _ = control::send_framed(&mut send, &control::ConnectMsg::Denied { reason: "endpoint mismatch".to_string() }).await;
+                        let _ = control::send_framed(
+                            &mut send,
+                            &control::ConnectMsg::Denied {
+                                reason: "endpoint mismatch".to_string(),
+                            },
+                        )
+                        .await;
                         return;
                     }
                     // Already approved? Reply with the minted room id so
                     // a re-dialing requester joins it (idempotent).
                     let already = approved.get(&from_endpoint).map(|r| *r.value());
                     let reply = if let Some((room_id, coordinator)) = already {
-                        control::ConnectMsg::Approved { room_id, coordinator }
+                        control::ConnectMsg::Approved {
+                            room_id,
+                            coordinator,
+                        }
                     } else {
-                        pending.insert(from_endpoint, PendingConnect {
-                            from_contact_id,
+                        pending.insert(
                             from_endpoint,
-                            hostname,
-                            requested_at: Instant::now(),
-                        });
+                            PendingConnect {
+                                from_contact_id,
+                                from_endpoint,
+                                hostname,
+                                requested_at: Instant::now(),
+                            },
+                        );
                         tracing::info!(from = %from_contact_id.fmt_short(), endpoint = %from_endpoint.fmt_short(), "connect request received");
                         control::ConnectMsg::Pending
                     };

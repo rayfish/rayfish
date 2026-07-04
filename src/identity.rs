@@ -73,3 +73,35 @@ pub fn load_device_cert() -> Result<Option<DeviceCert>> {
         Ok(None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CONFIG_ENV_LOCK;
+
+    #[test]
+    fn device_cert_store_then_load() {
+        // Serialize against other tests that mutate `RAYFISH_CONFIG_DIR` (see
+        // `daemon::headless_tests`), since lib tests share one process and run
+        // on parallel threads.
+        let _env_lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("RAYFISH_CONFIG_DIR", tmp.path());
+        }
+
+        let user = SecretKey::generate();
+        let device = SecretKey::generate().public();
+        let cert = DeviceCert::create(&user, &device);
+
+        assert!(load_device_cert().unwrap().is_none());
+        store_device_cert(&cert).unwrap();
+        let loaded = load_device_cert()
+            .unwrap()
+            .expect("cert present after store");
+        assert_eq!(loaded.user_identity, cert.user_identity);
+        assert_eq!(loaded.device_key, cert.device_key);
+        assert!(loaded.verify());
+    }
+}

@@ -4,7 +4,9 @@
 use super::super::*;
 
 impl MeshManager {
-    pub(crate) fn status(&self) -> IpcMessage {
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    /// snapshot the daemon's status (identity, networks, peers).
+    pub fn status(&self) -> IpcMessage {
         let hostname_snapshot = self.dns.hostname_table.try_read().ok();
         let my_id = self.endpoint.id();
         // Direct-connection networks are flagged in config; collect their names
@@ -23,6 +25,17 @@ impl MeshManager {
             .iter()
             .map(|h| self.network_status(&h, my_id, hostname_snapshot.as_deref(), &direct_names))
             .collect();
+        // Persisted pending-join markers, minus any network that has since
+        // become active (admitted while we were retrying in the background).
+        let pending_networks: Vec<String> = config::load()
+            .map(|c| {
+                c.pending_joins
+                    .into_iter()
+                    .filter(|p| !self.networks.contains_key(&p.network_key))
+                    .map(|p| p.name.unwrap_or(p.network_key))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         IpcMessage::StatusResponse {
             endpoint_id: self.endpoint.id(),
@@ -38,6 +51,7 @@ impl MeshManager {
             bytes_tx: self.stats.bytes_tx.get(),
             pending_files: self.files.pending_files.lock().unwrap().len(),
             pending_connects: self.connect.pending_connects.len(),
+            pending_networks,
         }
     }
 

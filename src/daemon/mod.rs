@@ -78,6 +78,9 @@ use crate::network_name;
 use crate::peers::{self, PeerTable};
 use crate::stats::ForwardMetrics;
 use crate::transport;
+// The desktop TUN device and its CGNAT pre-flight check don't exist on Android,
+// where the packet interface is a `VpnService` fd supplied from Kotlin.
+#[cfg(not(target_os = "android"))]
 use crate::tun::{self, check_cgnat_conflict};
 use ray_proto::SuggestedFirewall;
 
@@ -93,6 +96,12 @@ mod mesh;
 pub(crate) use mesh::*;
 // `run_daemon` (the `ray daemon` entry point) stays public for the binary.
 pub use mesh::run_daemon;
+// `build_headless` is the embedder (mobile) construction entry point.
+pub use mesh::build_headless;
+
+/// Legacy name for [`MeshManager`], kept so embedders (`ray-mobile`) that were
+/// written against `DaemonState` compile unchanged after the daemon refactor.
+pub type DaemonState = MeshManager;
 
 // Domain satellites with their own owned state (and ALPN accept arms), held by
 // `MeshManager` as fields rather than loose on the core. See each module.
@@ -123,7 +132,7 @@ const PAIR_ALPN: &[u8] = b"rayfish/pair/1";
 pub(crate) struct MeshCtx {
     identity: IrohIdentityProvider,
     peers: PeerTable,
-    tun_tx: mpsc::Sender<Bytes>,
+    tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
     stats: Arc<ForwardMetrics>,
     blob_store: FsStore,
     firewall: SharedFirewall,
@@ -188,7 +197,6 @@ pub(crate) fn to_approved_entries<'a>(
         })
         .collect()
 }
-
 
 #[derive(Clone)]
 struct GroupSnapshot {
@@ -311,6 +319,19 @@ pub struct NetworkHandle {
 /// and background task. Holds both the infrastructure that lives for the whole
 /// process and the handles for the currently-active networks. See the
 /// module-level docs for the two-lifecycle model.
+/// Handles for the packet-forwarding tasks a [`MeshManager::attach_tun`] call
+/// spawns (the TUN writer and the `run_mesh` reader loop), plus a dedicated
+/// cancellation token so the data plane can be stopped independently of a full
+/// daemon shutdown (used by [`MeshManager::detach_tun`] / `ray-mobile`'s `down`).
+struct TunTasks {
+    /// Cancels the `run_mesh` reader loop without touching `shutdown_token`.
+    cancel: CancellationToken,
+    /// The TUN writer task (`spawn_tun_writer`).
+    writer: JoinHandle<()>,
+    /// The `run_mesh` reader loop task.
+    mesh: JoinHandle<()>,
+}
+
 pub struct MeshManager {
     endpoint: Endpoint,
     identity: IrohIdentityProvider,
@@ -318,7 +339,15 @@ pub struct MeshManager {
     stats: Arc<ForwardMetrics>,
     /// When the daemon process started, used for uptime in diagnostics.
     start: Instant,
-    tun_tx: mpsc::Sender<Bytes>,
+    /// Sender half of the current TUN write channel, in a swappable cell.
+    /// [`DaemonState::attach_tun`] creates a fresh channel on every attach and
+    /// stores the new sender here, so incoming send-sites (peer readers, DNS
+    /// injection) always resolve the live writer via `tun_tx.load()`. This is
+    /// what makes the VPN off/on toggle work: `detach_tun` stops the writer, and
+    /// the next `attach_tun` swaps in a new sender feeding a fresh writer. On
+    /// desktop the daemon attaches exactly once, so the cell holds one sender for
+    /// its whole life and is never swapped.
+    tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
     networks: Arc<DashMap<String, NetworkHandle>>,
     shutdown_token: CancellationToken,
     blob_store: FsStore,
@@ -331,7 +360,21 @@ pub struct MeshManager {
     /// on` / `ray install --auto-update`). Read at startup; when set, `run_daemon`
     /// spawns the periodic update task. Echoed back in `ray status`.
     auto_update: bool,
-    tun_name: String,
+    /// Name of the OS TUN device (desktop) or a placeholder until a packet
+    /// interface is attached. Interior-mutable because on embedders (mobile) the
+    /// interface is attached after construction via [`MeshManager::attach_tun`],
+    /// while on desktop it is set once at boot.
+    tun_name: std::sync::Mutex<String>,
+    /// Handles for the packet-forwarding tasks spawned by
+    /// [`MeshManager::attach_tun`], kept so a future `down()`/detach can stop them.
+    tun_tasks: std::sync::Mutex<Option<TunTasks>>,
+    /// Promotion-channel receiver drained by [`serve_ipc`]. Stored here so the
+    /// headless builder can construct the daemon and hand the receiver back to
+    /// [`run_daemon`] afterwards.
+    promote_rx: std::sync::Mutex<Option<mpsc::Receiver<String>>>,
+    /// Prometheus metrics-server guard. Kept alive for the daemon's whole lifetime
+    /// (dropping it stops the export); `None` if the server failed to bind.
+    _metrics_server: std::sync::Mutex<Option<iroh_metrics::service::MetricsServer>>,
     /// File-transfer + pairing state and ALPN accept arms (see [`FileService`]).
     /// Shared with [`ProtocolRouter`], which runs the accept arms.
     files: Arc<FileService>,
@@ -353,10 +396,16 @@ pub struct MeshManager {
     active: Arc<AtomicBool>,
     /// Live per-network SSH allow lists for the embedded mesh SSH server. Swapped
     /// atomically on `ray firewall ssh allow/deny`, so a running listener picks up
-    /// changes without restart. See [`crate::ssh`].
+    /// changes without restart. See [`crate::ssh`]. Desktop-only: the embedded
+    /// mesh SSH server isn't part of the Android build.
+    #[cfg(feature = "desktop")]
     ssh_authz: crate::ssh::SshAuthz,
     /// Cancellation token for the running SSH listeners (`None` when off / on
     /// standby). Set by [`MeshManager::start_ssh`], cleared by `stop_ssh`.
+    // The only readers/writers (`start_ssh`/`stop_ssh`) are desktop-only, so on a
+    // `--no-default-features` (Android) build the field is inert; silence the
+    // resulting dead-code warning there rather than dropping the field.
+    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
     ssh_token: std::sync::Mutex<Option<CancellationToken>>,
     /// Promotion signal: a co-coordinator's per-peer control reader sends the
     /// network name here after persisting an `AdminGrant` key, and the main
@@ -401,6 +450,32 @@ fn should_promote(current: NetworkRole) -> bool {
 }
 
 impl MeshManager {
+    /// The device cert to present when joining, preferring the on-disk copy so a
+    /// join issued right after pairing (same process, no restart) carries the
+    /// freshly stored cert rather than the value loaded at startup.
+    pub fn current_device_cert(&self) -> Option<control::DeviceCert> {
+        identity::load_device_cert()
+            .ok()
+            .flatten()
+            .or_else(|| self.device_cert.clone())
+    }
+
+    /// Gracefully take the whole node offline: cancel the daemon-wide shutdown
+    /// token (stopping every network run loop, the accept loop, and the
+    /// data-plane forward tasks) and then close the iroh endpoint so all QUIC
+    /// connections terminate cleanly and peers see us drop immediately, rather
+    /// than lingering until an idle timeout. Awaiting the close matters for
+    /// embedders (mobile) that rebuild a fresh daemon on re-enable: without it
+    /// the old endpoint's connections outlive `stop`, so a coordinator keeps the
+    /// stale session while the rebuilt endpoint (same node key) comes up and the
+    /// device shows offline until the race clears. Mirrors the shutdown tail of
+    /// `run_daemon`. After this the `MeshManager` is spent; build a new one to
+    /// come back online.
+    pub async fn shutdown_and_close(&self) {
+        self.shutdown_token.cancel();
+        self.endpoint.close().await;
+    }
+
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
     /// handlers and background tasks. Every field is a cheap `Clone`.
     pub(crate) fn mesh_ctx(&self) -> MeshCtx {
@@ -428,7 +503,101 @@ impl MeshManager {
         self.endpoint.set_alpns(alpns);
 
         let network_names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
-        dns_config::update_search_domains(&network_names, &self.tun_name).await;
+        let tun_name = self.tun_name.lock().unwrap().clone();
+        dns_config::update_search_domains(&network_names, &tun_name).await;
+    }
+
+    /// Attach a packet interface to a headless [`DaemonState`] and start the data
+    /// plane's forwarding tasks: the TUN writer (`spawn_tun_writer`) and the mesh
+    /// forwarding loop (`run_mesh`, reading `reader` and using the state's
+    /// peers/firewall/stats/resolver).
+    ///
+    /// A fresh `tun_tx`/`tun_rx` channel is created on every call: the new
+    /// receiver feeds the writer, and the new sender is stored in the `tun_tx`
+    /// cell so incoming send-sites (peer readers, DNS injection) resolve the live
+    /// writer via `tun_tx.load()`. This makes re-attach work: after a
+    /// [`detach_tun`] the next `attach_tun` swaps in a new sender and a new writer,
+    /// so forwarding resumes. This is the exact VPN off/on toggle path on Android.
+    ///
+    /// This is the embedding API (used by `ray-mobile` and future embedders) and
+    /// is also how `run_daemon` wires the desktop OS TUN device. The forwarding
+    /// loop runs under a child of `shutdown_token`, and its handles are stored so a
+    /// later `down()`/detach can stop the data plane without tearing down the whole
+    /// daemon. Desktop attaches exactly once, so the cell is never swapped there.
+    pub async fn attach_tun<R: crate::tun::TunRead, W: crate::tun::TunWrite>(
+        self: &Arc<Self>,
+        reader: R,
+        writer: W,
+    ) {
+        // Fresh channel per attach. The previous writer (if any) was torn down by
+        // `detach_tun`, which dropped the old receiver; swapping in the new sender
+        // reconnects every incoming send-site to this writer.
+        let (new_tx, new_rx) = mpsc::channel::<Bytes>(256);
+        self.tun_tx.store(Arc::new(new_tx.clone()));
+
+        // A dedicated child token so the data plane can be stopped independently
+        // of a full daemon shutdown; it still cancels when `shutdown_token` does.
+        let cancel = self.shutdown_token.child_token();
+        let writer_handle = forward::spawn_tun_writer(writer, new_rx, self.active.clone());
+        let mesh_handle = {
+            let peers = self.peers.clone();
+            let firewall = self.firewall.clone();
+            let cancel = cancel.clone();
+            let stats = self.stats.clone();
+            let resolver = self.dns.resolver.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    forward::run_mesh(reader, peers, firewall, cancel, stats, resolver, new_tx)
+                        .await
+                {
+                    tracing::warn!(error = %e, "mesh forwarding loop exited with error");
+                }
+            })
+        };
+
+        // Self-healing: if `attach_tun` is called twice without an intervening
+        // `detach_tun`, stop the previous data plane before installing the new
+        // one. `JoinHandle::drop` detaches rather than aborts, so without this
+        // the old writer + `run_mesh` loop would keep running forever on the old
+        // fds (a leak of two live mesh loops). On the normal detach->attach path
+        // `detach_tun` already took the old tasks, so `replace` returns `None`.
+        let new_tasks = TunTasks {
+            cancel,
+            writer: writer_handle,
+            mesh: mesh_handle,
+        };
+        let old = self.tun_tasks.lock().unwrap().replace(new_tasks);
+        if let Some(old) = old {
+            old.cancel.cancel();
+            old.writer.abort();
+            old.mesh.abort();
+        }
+    }
+
+    /// Part of the embedding API (used by `ray-mobile`'s `down`): stop the
+    /// packet-forwarding data plane started by [`attach_tun`] (the TUN writer and
+    /// the `run_mesh` reader loop) WITHOUT tearing down the control plane. The
+    /// iroh endpoint and every network connection stay live, so the node remains
+    /// reachable to peers and keeps receiving roster/blob updates; only local
+    /// packet forwarding over the attached interface stops. Cancelling the loop's
+    /// child token and aborting the tasks drops the reader/writer, closing the
+    /// underlying fds. Idempotent: a no-op if no interface is attached.
+    pub fn detach_tun(&self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some(tasks) = self.tun_tasks.lock().unwrap().take() {
+            tasks.cancel.cancel();
+            tasks.writer.abort();
+            tasks.mesh.abort();
+        }
+    }
+
+    /// Point the Magic DNS resolver at the given upstream servers so non-`.ray`
+    /// queries are forwarded there instead of refused. The desktop path captures
+    /// upstreams from the system resolver config; Android has none to capture, so
+    /// the platform reads the underlying network's DNS servers and passes them in.
+    pub fn set_dns_upstreams(&self, servers: Vec<Ipv4Addr>) {
+        self.dns.resolver.set_upstreams(servers);
     }
 
     /// Register a [`CoordinatorAcceptState`] handler for `network` and update
@@ -745,7 +914,8 @@ impl MeshManager {
     // Hostname
     // -----------------------------------------------------------------------
 
-    pub(crate) async fn set_hostname(&self, network: &str, hostname: &str) -> IpcMessage {
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    pub async fn set_hostname(&self, network: &str, hostname: &str) -> IpcMessage {
         use crate::hostname;
 
         if !hostname::is_valid_hostname(hostname) {
@@ -789,8 +959,13 @@ impl MeshManager {
         }
 
         // Update DNS table: remove old entry for our IP, insert new one.
-        dns::remove_hostname_by_ip(&self.dns.hostname_table, &self.dns.reverse_table, network, my_ip)
-            .await;
+        dns::remove_hostname_by_ip(
+            &self.dns.hostname_table,
+            &self.dns.reverse_table,
+            network,
+            my_ip,
+        )
+        .await;
         dns::update_hostname(
             &self.dns.hostname_table,
             &self.dns.reverse_table,
@@ -861,7 +1036,7 @@ impl MeshManager {
                     identity: my_identity,
                     ip: my_ip,
                     hostname: Some(new_hostname.to_string()),
-                    device_cert: self.device_cert.clone(),
+                    device_cert: self.current_device_cert(),
                 };
                 if control::send_msg(&mut send, &msg).await.is_ok() {
                     sent += 1;
@@ -1105,7 +1280,7 @@ mod accept_handler_tests {
         MeshCtx {
             identity,
             peers: PeerTable::new(),
-            tun_tx,
+            tun_tx: Arc::new(arc_swap::ArcSwap::from_pointee(tun_tx)),
             stats: Arc::new(ForwardMetrics::default()),
             blob_store,
             firewall: SharedFirewall::new(crate::firewall::FirewallConfig::default()),
@@ -1371,5 +1546,245 @@ mod dial_fallback_tests {
         let outcomes = vec![DialOutcome::Welcomed, DialOutcome::Welcomed];
         let (idx, welcomed) = pick_first_welcome(&outcomes);
         assert_eq!((idx, welcomed), (0, true));
+    }
+}
+
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+
+    /// `build_headless()` constructs a usable `Arc<DaemonState>` (identity,
+    /// endpoint, blob store, DNS, pollers) in an isolated config dir and answers a
+    /// `status()` call, all without binding the Unix-socket IPC server that
+    /// `run_daemon`/`serve_ipc` would.
+    ///
+    /// Multi-threaded flavor: `build_headless` builds an iroh endpoint and an
+    /// iroh-blobs `FsStore` whose background actor tasks must make progress while
+    /// the builder awaits, matching the daemon binary's `#[tokio::main]` runtime.
+    /// The `timeout` guard turns a future startup regression into a fast failure
+    /// instead of a hung test.
+    /// Process-wide lock serializing tests that mutate `RAYFISH_CONFIG_DIR` (or
+    /// any other env var read by `config::config_dir()`), since lib tests share
+    /// one process and run on parallel threads. Shared with `identity::tests`
+    /// via `crate::config::CONFIG_ENV_LOCK` so neither module's tests observe a
+    /// `RAYFISH_CONFIG_DIR` bled through from the other.
+    use crate::config::CONFIG_ENV_LOCK as ENV_LOCK;
+
+    /// RAII guard that restores a previous env var value (or removes it if it
+    /// was unset) on drop, so the var is restored even if the test body panics.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    // `ENV_LOCK` is a `Mutex<()>` used only to serialize whole tests against each
+    // other; it guards no data mutated across the awaits, so holding it across
+    // them is intentional (that is the point) and safe.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_headless_returns_usable_state_without_ipc_socket() {
+        // Serialize against any other test that touches env vars read by
+        // `config::config_dir()`, so no concurrent test observes a bled-through
+        // `RAYFISH_CONFIG_DIR`.
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Isolate identity/config/blobs from the system config dir. The guard
+        // restores the previous value (or removes the var) on drop, including
+        // on panic, so this can't poison later tests.
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+
+        let daemon = tokio::time::timeout(std::time::Duration::from_secs(30), build_headless())
+            .await
+            .expect("build_headless should not hang")
+            .expect("build_headless should succeed");
+
+        // It returns a shared `Arc<DaemonState>`.
+        assert!(Arc::strong_count(&daemon) >= 1);
+
+        // The embedding `status()` API answers without a socket ever being bound.
+        assert!(matches!(daemon.status(), IpcMessage::StatusResponse { .. }));
+    }
+
+    /// In-memory TUN writer that records every written packet into a shared
+    /// buffer, so a test can observe which writer the data plane routed to.
+    #[derive(Clone, Default)]
+    struct FakeTunWriter {
+        written: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl crate::tun::TunWrite for FakeTunWriter {
+        async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
+            self.written.lock().unwrap().push(packet.to_vec());
+            Ok(())
+        }
+    }
+
+    /// In-memory TUN reader that never yields a packet, so `run_mesh` parks in
+    /// its read and only exits when its task is cancelled/aborted. It carries an
+    /// `Arc<()>` liveness token: the reader is owned solely by the spawned
+    /// `run_mesh` future, so the token's strong count drops back to the caller's
+    /// single reference the moment that task's future is dropped on abort. That
+    /// makes "the old data plane was torn down" directly observable.
+    struct FakeTunReader {
+        _alive: Arc<()>,
+    }
+
+    impl crate::tun::TunRead for FakeTunReader {
+        async fn read_into(&mut self, _buf: &mut bytes::BytesMut) -> anyhow::Result<usize> {
+            std::future::pending::<()>().await;
+            unreachable!("FakeTunReader never returns");
+        }
+    }
+
+    /// Poll `sink` until it holds `want` packets. Bounded (~2s total) so a real
+    /// failure fails fast instead of hanging; the short poll interval leaves room
+    /// for the cross-thread wakeup of the writer task without a fixed sleep that
+    /// would either flake (too short) or slow the suite (too long).
+    async fn wait_for_len(sink: &Arc<std::sync::Mutex<Vec<Vec<u8>>>>, want: usize) -> bool {
+        for _ in 0..400 {
+            if sink.lock().unwrap().len() >= want {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// Re-attaching the TUN after a `detach_tun` must resume forwarding to the
+    /// new writer (the VPN off/on toggle path), and a second `attach_tun`
+    /// WITHOUT an intervening detach must stop the previous writer instead of
+    /// leaking it (two live writers on two fds).
+    // See `build_headless_returns_usable_state_without_ipc_socket`: `ENV_LOCK`
+    // only serializes tests and guards no data across the awaits.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_tun_is_self_healing_on_reattach_and_double_attach() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+
+        let daemon = tokio::time::timeout(std::time::Duration::from_secs(30), build_headless())
+            .await
+            .expect("build_headless should not hang")
+            .expect("build_headless should succeed");
+
+        use std::sync::atomic::Ordering;
+
+        // Helper: send one packet through the same `tun_tx` cell the peer-reader
+        // and DNS-injection paths use, then wait for the given writer to see it.
+        async fn send_pkt(daemon: &Arc<DaemonState>, pkt: &'static [u8]) {
+            daemon
+                .tun_tx
+                .load_full()
+                .send(Bytes::from_static(pkt))
+                .await
+                .expect("tun_tx send should reach the live writer");
+        }
+
+        // Poll until `token`'s strong count falls back to 1 (only this test
+        // holds it), i.e. the `run_mesh` task that owned the matching reader was
+        // dropped. Bounded so a leak fails fast instead of hanging.
+        async fn wait_for_reader_dropped(token: &Arc<()>) -> bool {
+            for _ in 0..400 {
+                if Arc::strong_count(token) == 1 {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            false
+        }
+
+        // 1. First attach: reader1 + writer1, forwarding active.
+        let writer1 = FakeTunWriter::default();
+        let sink1 = writer1.written.clone();
+        daemon
+            .attach_tun(
+                FakeTunReader {
+                    _alive: Arc::new(()),
+                },
+                writer1,
+            )
+            .await;
+        daemon.active.store(true, Ordering::SeqCst);
+
+        send_pkt(&daemon, b"packet-1").await;
+        assert!(
+            wait_for_len(&sink1, 1).await,
+            "writer1 should receive the first packet"
+        );
+
+        // 2. Toggle: detach, then re-attach reader2 + writer2. This is the path
+        //    that used to silently break before the fresh-channel-per-attach fix.
+        daemon.detach_tun();
+        let writer2 = FakeTunWriter::default();
+        let sink2 = writer2.written.clone();
+        let alive2 = Arc::new(());
+        daemon
+            .attach_tun(
+                FakeTunReader {
+                    _alive: alive2.clone(),
+                },
+                writer2,
+            )
+            .await;
+        daemon.active.store(true, Ordering::SeqCst);
+
+        send_pkt(&daemon, b"packet-2").await;
+        assert!(
+            wait_for_len(&sink2, 1).await,
+            "writer2 should receive the packet after a detach->attach toggle"
+        );
+
+        // 3. Double-attach guard: attach writer3 WITHOUT detaching first. The
+        //    previous data plane (writer2's mesh loop + writer) must be aborted,
+        //    not leaked. Observe both halves of "no two live data planes":
+        //    - writer3 receives the packet (the cell now routes to writer3), and
+        //    - reader2's `run_mesh` task was dropped (`alive2` count back to 1),
+        //      which without the self-healing guard would leak and stay at 2.
+        let writer3 = FakeTunWriter::default();
+        let sink3 = writer3.written.clone();
+        daemon
+            .attach_tun(
+                FakeTunReader {
+                    _alive: Arc::new(()),
+                },
+                writer3,
+            )
+            .await;
+        daemon.active.store(true, Ordering::SeqCst);
+
+        send_pkt(&daemon, b"packet-3").await;
+        assert!(
+            wait_for_len(&sink3, 1).await,
+            "writer3 should receive the packet after a double-attach"
+        );
+        assert!(
+            wait_for_reader_dropped(&alive2).await,
+            "the prior mesh loop must be aborted on a second attach without detach (no leak)"
+        );
+
+        daemon.detach_tun();
     }
 }

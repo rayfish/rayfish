@@ -41,3 +41,5 @@ pub(crate) use rename::*;
 pub(crate) use select::*;
 // `run_daemon` is the public process entry point (called by `ray daemon`).
 pub use bootstrap::run_daemon;
+// `build_headless` is the embedder (mobile) construction entry point.
+pub use bootstrap::build_headless;

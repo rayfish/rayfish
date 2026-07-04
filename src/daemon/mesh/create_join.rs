@@ -63,9 +63,13 @@ impl MeshManager {
                 .as_ref()
                 .map(|s| s.hash)
                 .expect("snapshot set");
-            if let Err(e) =
-                dht::publish_network(&pkarr_client, net_secret_key, &blob_hash, &[self.endpoint.id()])
-                    .await
+            if let Err(e) = dht::publish_network(
+                &pkarr_client,
+                net_secret_key,
+                &blob_hash,
+                &[self.endpoint.id()],
+            )
+            .await
             {
                 tracing::warn!(error = %e, "failed to publish network record");
             }
@@ -123,8 +127,10 @@ impl MeshManager {
         (tasks, disconnect_tx)
     }
 
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    /// create a new network and register this node as its coordinator.
     #[tracing::instrument(skip(self, hostname), fields(mode = ?mode))]
-    pub(crate) async fn create_network(
+    pub async fn create_network(
         &self,
         mode: GroupMode,
         name: Option<String>,
@@ -252,8 +258,14 @@ impl MeshManager {
                 .unwrap_or_else(crate::hostname::generate_hostname),
         };
 
-        let mut net_state =
-            self.build_initial_roster(&name, my_ip, &my_hostname, mode, &net_secret_key, pre_approve)?;
+        let mut net_state = self.build_initial_roster(
+            &name,
+            my_ip,
+            &my_hostname,
+            mode,
+            &net_secret_key,
+            pre_approve,
+        )?;
 
         // Register in DNS hostname table
         dns::update_hostname(
@@ -294,8 +306,13 @@ impl MeshManager {
         let state = Arc::new(std::sync::RwLock::new(net_state));
         let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
         let dht_notify = Arc::new(tokio::sync::Notify::new());
-        let (tasks, disconnect_tx) =
-            self.spawn_coordinator_background_tasks(&name, &net_secret_key, &state, &dht_notify, &cancel);
+        let (tasks, disconnect_tx) = self.spawn_coordinator_background_tasks(
+            &name,
+            &net_secret_key,
+            &state,
+            &dht_notify,
+            &cancel,
+        );
 
         // Insert the handle first so register_coordinator_handler can update the role.
         let handle = NetworkHandle {
@@ -334,9 +351,11 @@ impl MeshManager {
         })
     }
 
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    /// join an existing network by key (optionally with an invite/coordinator).
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, hostname), fields(net = name.unwrap_or(network_key)))]
-    pub(crate) async fn join_network(
+    pub async fn join_network(
         self: &Arc<Self>,
         network_key: &str,
         name: Option<&str>,
@@ -359,8 +378,16 @@ impl MeshManager {
             )
             .await
         {
-            Ok(TryJoin::Joined(resp)) => resp,
+            Ok(TryJoin::Joined(resp)) => {
+                let _ = config::remove_pending_join(network_key);
+                resp
+            }
             Ok(TryJoin::Pending) => {
+                // Persist so the retry resumes after a restart.
+                let _ = config::add_pending_join(config::PendingJoinEntry {
+                    network_key: network_key.to_string(),
+                    name: name.map(|s| s.to_string()),
+                });
                 // Closed network: queued for live approval. Retry in the
                 // background on a backoff until `ray accept` admits us.
                 let me = Arc::clone(self);
@@ -388,7 +415,8 @@ impl MeshManager {
                             .await
                         {
                             Ok(TryJoin::Joined(_)) => {
-                                tracing::info!(net = %nk, "approval granted — joined");
+                                let _ = config::remove_pending_join(&nk);
+                                tracing::info!(net = %nk, "approval granted - joined");
                                 return;
                             }
                             Ok(TryJoin::Pending) => continue,
@@ -399,7 +427,7 @@ impl MeshManager {
                     }
                 });
                 IpcMessage::Ok {
-                    message: "join request sent — waiting for coordinator approval (run `ray status` to check)"
+                    message: "join request sent - waiting for coordinator approval (run `ray status` to check)"
                         .to_string(),
                 }
             }
@@ -522,7 +550,7 @@ impl MeshManager {
             anyhow::ensure!(
                 net_ver == mine,
                 "incompatible mesh protocol: this network runs v{net_ver}, this build speaks v{mine} \
-                 — run `ray update` so both sides match"
+                 - run `ray update` so both sides match"
             );
         }
 
@@ -567,7 +595,8 @@ impl MeshManager {
         for coordinator_id in &order {
             let cancel = self.shutdown_token.child_token();
             let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
-            let tasks = vec![self.spawn_join_reconnect(ctx, my_id, &disconnect_tx, disconnect_rx, &cancel)];
+            let tasks =
+                vec![self.spawn_join_reconnect(ctx, my_id, &disconnect_tx, disconnect_rx, &cancel)];
 
             tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
             let conn = match transport::connect_to_peer_with_alpn(
@@ -587,7 +616,15 @@ impl MeshManager {
             };
 
             match self
-                .run_join_handshake(ctx, data, conn, true, &disconnect_tx, &cancel, ctx.invite.clone())
+                .run_join_handshake(
+                    ctx,
+                    data,
+                    conn,
+                    true,
+                    &disconnect_tx,
+                    &cancel,
+                    ctx.invite.clone(),
+                )
                 .await
             {
                 Ok(JoinResult::Joined(state)) => {
@@ -646,7 +683,8 @@ impl MeshManager {
         let cancel = self.shutdown_token.child_token();
         let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
         let my_id = self.identity.local_identity();
-        let tasks = vec![self.spawn_join_reconnect(ctx, my_id, &disconnect_tx, disconnect_rx, &cancel)];
+        let tasks =
+            vec![self.spawn_join_reconnect(ctx, my_id, &disconnect_tx, disconnect_rx, &cancel)];
 
         // Fallback state built straight from the verified blob so registration
         // never blocks on (or dies with) the coordinator handshake.
@@ -678,7 +716,15 @@ impl MeshManager {
         .await
         {
             Ok(conn) => match self
-                .run_join_handshake(ctx, data, conn, false, &disconnect_tx, &cancel, ctx.invite.clone())
+                .run_join_handshake(
+                    ctx,
+                    data,
+                    conn,
+                    false,
+                    &disconnect_tx,
+                    &cancel,
+                    ctx.invite.clone(),
+                )
                 .await
             {
                 Ok(JoinResult::Joined(state)) => state,
@@ -725,6 +771,9 @@ impl MeshManager {
                         ipv6: derive_ipv6(&m.identity),
                         network: ctx.display_name.to_string(),
                         intentional: false,
+                        // Synthetic cold-restore kick: no live connection backs
+                        // it, so it must always drive the reconnect dial.
+                        conn_stable_id: None,
                     })
                     .await;
             }
@@ -757,7 +806,7 @@ impl MeshManager {
             self.mesh_ctx(),
             disconnect_tx.clone(),
             cancel.clone(),
-            self.device_cert.clone(),
+            self.current_device_cert(),
         )
     }
 
@@ -784,7 +833,7 @@ impl MeshManager {
             JoinParams {
                 my_hostname: Some(ctx.my_hostname.to_string()),
                 net_pubkey: ctx.net_pubkey,
-                device_cert: self.device_cert.clone(),
+                device_cert: self.current_device_cert(),
                 invite_secret,
                 suggested_firewall: data.suggested_firewall.clone(),
                 reusable_keys: data.reusable_keys.clone(),
@@ -1098,7 +1147,7 @@ impl MeshManager {
                 self.mesh_ctx(),
                 disconnect_tx.clone(),
                 cancel.clone(),
-                self.device_cert.clone(),
+                self.current_device_cert(),
             )];
 
             self.dial_all_members(
@@ -1189,7 +1238,7 @@ impl MeshManager {
                                 identity: my_identity,
                                 ip: my_ip,
                                 hostname: my_hostname.clone(),
-                                device_cert: self.device_cert.clone(),
+                                device_cert: self.current_device_cert(),
                             },
                         )
                         .await;
@@ -1234,5 +1283,4 @@ impl MeshManager {
             }
         }
     }
-
 }

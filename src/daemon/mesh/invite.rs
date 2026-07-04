@@ -4,7 +4,8 @@
 use super::super::*;
 
 impl MeshManager {
-    pub(crate) async fn invite_create(
+    /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    pub async fn invite_create(
         &self,
         network: &str,
         expires_secs: u64,
@@ -247,7 +248,7 @@ impl MeshManager {
         }
     }
 
-    pub(crate) fn list_requests(&self, network: &str) -> IpcMessage {
+    pub fn list_requests(&self, network: &str) -> IpcMessage {
         let Some(handle) = self.networks.get(network) else {
             return IpcMessage::Error {
                 message: format!("network '{network}' not active"),
@@ -271,7 +272,7 @@ impl MeshManager {
         IpcMessage::PendingRequests { requests }
     }
 
-    pub(crate) async fn accept_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
+    pub async fn accept_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
         if let Err(e) = self.coordinator_handle(network) {
             return e;
         }
@@ -341,7 +342,7 @@ impl MeshManager {
         }
     }
 
-    pub(crate) fn deny_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
+    pub fn deny_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
         if let Err(e) = self.coordinator_handle(network) {
             return e;
         }

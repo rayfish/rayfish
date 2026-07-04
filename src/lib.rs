@@ -53,6 +53,7 @@ pub mod audit;
 pub mod config;
 pub mod control;
 pub mod daemon;
+pub mod deeplink;
 pub mod dht;
 pub mod dns;
 pub mod dns_config;
@@ -68,6 +69,7 @@ pub mod layout;
 pub mod logdir;
 pub mod membership;
 pub mod network_name;
+#[cfg(feature = "desktop")]
 pub mod onepassword;
 pub mod peers;
 pub mod picker;
@@ -75,9 +77,13 @@ pub mod progress;
 pub mod ratelimit;
 pub mod reject;
 pub mod shutdown;
+#[cfg(feature = "desktop")]
 pub mod ssh;
 pub mod stats;
 pub mod style;
 pub mod transport;
 pub mod tun;
+// Self-replacing binary update relies on `self-replace` (a desktop-only dep) and
+// only ever runs from the desktop daemon/CLI; it is not part of the Android lib.
+#[cfg(feature = "desktop")]
 pub mod update;

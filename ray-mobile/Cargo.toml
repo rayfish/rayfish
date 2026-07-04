@@ -1,0 +1,54 @@
+[package]
+name = "ray-mobile"
+version = "0.1.4"
+edition = "2024"
+rust-version = "1.91"
+description = "Android UniFFI wrapper around the rayfish mesh core"
+license = "MPL-2.0"
+publish = false
+
+[lib]
+name = "ray_mobile"
+# `cdylib` is the Android JNI artifact (`libray_mobile.so`); `lib` lets the
+# host build produce a normal library for UniFFI library-mode bindgen and lets
+# the `uniffi-bindgen` bin resolve.
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+# The mesh core, without the desktop-only surface (ssh/1password/tun device).
+rayfish = { path = "..", default-features = false }
+# Proc-macro / library-mode UniFFI: no UDL file, no build.rs scaffolding.
+# `cli` pulls in `uniffi_bindgen_main` for the tiny bindgen bin target.
+uniffi = { version = "0.29", features = ["cli"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+# For the `Endpoint` type returned by `transport::create_endpoint_with_alpns`
+# (its `id()`/`close()` methods). Same crate/version as `rayfish` uses, so cargo
+# unifies to a single instance.
+iroh = { version = "1", features = ["metrics", "unstable-custom-transports", "unstable-net-report"] }
+bytes = "1"
+anyhow = "1"
+libc = "0.2"
+thiserror = "2"
+tracing = "0.1"
+
+# Android JNI bridges the Rust core needs at startup (see `android_jni`). Our
+# `.so` is loaded by JNA (not System.loadLibrary), so nothing registers the
+# app's JavaVM + Context on its own; Kotlin calls our JNI init once, which wires
+# up both consumers below. Versions match what iroh already pulls in, so cargo
+# unifies to a single instance of each.
+#   - ndk-context: iroh-dns reads Android's system DNS servers over JNI through
+#     it; without it `build_headless` panics with "android context was not
+#     initialized".
+#   - rustls-platform-verifier: iroh's relay/discovery HTTPS verifies certs with
+#     Android's trust store through it.
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-context = "0.1"
+rustls-platform-verifier = "0.7"
+jni = "0.22"
+
+[[bin]]
+# Library-mode bindgen entry point: `cargo run -p ray-mobile --bin uniffi-bindgen
+# -- generate --library <path to cdylib> --language kotlin --out-dir <dir>`.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
