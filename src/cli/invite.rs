@@ -267,4 +267,3 @@ pub(crate) async fn ipc_deny_request(network: &str, id: &str) -> Result<()> {
     }
     Ok(())
 }
-

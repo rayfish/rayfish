@@ -290,8 +290,7 @@ mod tests {
         let key = SecretKey::generate();
         let hash = blake3::hash(b"test");
         let values = vec![RECORD_VERSION.to_string(), format!("h,{hash}")];
-        let packet =
-            SignedPacket::from_txt_strings(&key, RECORD_NAME, values, RECORD_TTL).unwrap();
+        let packet = SignedPacket::from_txt_strings(&key, RECORD_NAME, values, RECORD_TTL).unwrap();
         assert_eq!(mesh_version_from_record(&packet), None);
     }
 

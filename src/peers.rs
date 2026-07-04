@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use iroh::EndpointId;
@@ -154,6 +154,25 @@ impl PeerTable {
         self.v6.get(ip).and_then(|e| e.route())
     }
 
+    /// Resolve a peer by its mesh source IP (v4 or v6) to its transport identity
+    /// and the set of networks we currently share a live connection with it on.
+    /// Used by the embedded mesh SSH server to authorize an incoming session: the
+    /// peer is identified by which mesh IP the TCP connection came from (the
+    /// ingress anti-spoof check in `forward.rs` guarantees that IP is the peer's
+    /// own). Returns `None` if no peer holds that address.
+    pub fn identity_and_networks(&self, ip: IpAddr) -> Option<(EndpointId, Vec<SmolStr>)> {
+        match ip {
+            IpAddr::V4(v4) => self
+                .v4
+                .get(&v4)
+                .map(|e| (e.endpoint_id, e.conns.keys().cloned().collect())),
+            IpAddr::V6(v6) => self
+                .v6
+                .get(&v6)
+                .map(|e| (e.endpoint_id, e.conns.keys().cloned().collect())),
+        }
+    }
+
     /// Removes the peer entirely (all networks). Used for identity rotation.
     pub fn remove(&self, ip: &Ipv4Addr, ipv6: &Ipv6Addr) {
         let removed = self.v4.remove(ip);
@@ -169,9 +188,10 @@ impl PeerTable {
     pub fn remove_peer_from_network(&self, ip: &Ipv4Addr, ipv6: &Ipv6Addr, network: &str) {
         let mut dropped = None;
         if let Some(mut e) = self.v4.get_mut(ip)
-            && e.conns.remove(network).is_some() {
-                dropped = Some(e.endpoint_id);
-            }
+            && e.conns.remove(network).is_some()
+        {
+            dropped = Some(e.endpoint_id);
+        }
         self.v4.remove_if(ip, |_, e| e.conns.is_empty());
         if let Some(mut e) = self.v6.get_mut(ipv6) {
             e.conns.remove(network);

@@ -5,14 +5,17 @@
 //! - [`spawn_peer_reader`]: one per peer, reads incoming datagrams and forwards to TUN writer
 //! - [`spawn_tun_writer`]: single task, writes incoming packets to the TUN device
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, ConnectionError, VarInt};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::firewall::{self, Direction, SharedFirewall};
@@ -32,6 +35,103 @@ const MAX_PEER_DATAGRAM: usize = 1500;
 /// quinn and is freed as those datagrams are sent).
 const TX_POOL_CHUNK: usize = 64 * 1024;
 
+/// Userspace NAT that maps this node's mesh `:22` to/from the embedded SSH
+/// server's internal listen port ([`crate::ssh::SSH_LISTEN_PORT`]). The kernel
+/// won't let us bind `<mesh-ip>:22` alongside a host sshd on `0.0.0.0:22`, so
+/// instead of an OS-firewall redirect (which would be Linux-only) we translate
+/// the port inside our own forwarding path — portable across every platform the
+/// TUN runs on. Inbound (peer -> us) rewrites dest `22 -> listen`; outbound
+/// (us -> peer) rewrites source `listen -> 22`. Active only while `ray firewall
+/// ssh` is on.
+struct SshNat {
+    active: AtomicBool,
+    v4: Ipv4Addr,
+    v6: Ipv6Addr,
+    listen_port: u16,
+}
+
+static SSH_NAT: OnceLock<SshNat> = OnceLock::new();
+
+/// Register this node's mesh addresses + SSH listen port. Called once at daemon
+/// start; the NAT stays inactive until [`set_ssh_nat_active`].
+pub fn init_ssh_nat(v4: Ipv4Addr, v6: Ipv6Addr, listen_port: u16) {
+    let _ = SSH_NAT.set(SshNat {
+        active: AtomicBool::new(false),
+        v4,
+        v6,
+        listen_port,
+    });
+}
+
+/// Toggle the SSH port NAT (on when the mesh SSH server is running).
+pub fn set_ssh_nat_active(on: bool) {
+    if let Some(nat) = SSH_NAT.get() {
+        nat.active.store(on, Ordering::Relaxed);
+    }
+}
+
+/// The NAT config, or `None` when unset or inactive.
+fn ssh_nat() -> Option<&'static SshNat> {
+    SSH_NAT.get().filter(|n| n.active.load(Ordering::Relaxed))
+}
+
+impl SshNat {
+    fn is_ours(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v) => v == self.v4,
+            IpAddr::V6(v) => v == self.v6,
+        }
+    }
+}
+
+/// RFC 1624 incremental checksum update for a single changed 16-bit word:
+/// `HC' = ~(~HC + ~m + m')`. Used so a port rewrite doesn't require recomputing
+/// the whole TCP checksum.
+fn csum_replace2(check: u16, old: u16, new: u16) -> u16 {
+    let mut sum = (!check as u32) + (!old as u32 & 0xffff) + new as u32;
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Rewrite a TCP port in place for the SSH NAT, fixing the TCP checksum. When
+/// `inbound`, maps dest `22 -> listen_port` (packet addressed to our mesh `:22`);
+/// otherwise maps source `listen_port -> 22` (our SSH server's reply). Returns
+/// `true` if it rewrote. `info` is the already-parsed header, so the common case
+/// (no match) costs nothing.
+fn rewrite_ssh_port(pkt: &mut [u8], info: &firewall::PacketInfo, inbound: bool) -> bool {
+    let Some(nat) = ssh_nat() else { return false };
+    if info.protocol != 6 {
+        return false; // TCP only
+    }
+    let ihl = match pkt.first().map(|b| b >> 4) {
+        Some(4) => ((pkt[0] & 0x0f) as usize) * 4,
+        Some(6) => 40, // rayfish packets carry no IPv6 extension headers
+        _ => return false,
+    };
+    if pkt.len() < ihl + 18 {
+        return false;
+    }
+    let (port_off, old, new) = if inbound {
+        if !nat.is_ours(info.dst_ip) || info.dst_port != crate::ssh::SSH_PORT {
+            return false;
+        }
+        (ihl + 2, crate::ssh::SSH_PORT, nat.listen_port)
+    } else {
+        if !nat.is_ours(info.src_ip) || info.src_port != nat.listen_port {
+            return false;
+        }
+        (ihl, nat.listen_port, crate::ssh::SSH_PORT)
+    };
+    pkt[port_off..port_off + 2].copy_from_slice(&new.to_be_bytes());
+    let ck_off = ihl + 16;
+    let old_ck = u16::from_be_bytes([pkt[ck_off], pkt[ck_off + 1]]);
+    let new_ck = csum_replace2(old_ck, old, new);
+    pkt[ck_off..ck_off + 2].copy_from_slice(&new_ck.to_be_bytes());
+    true
+}
+
 /// Decision returned by [`evaluate_inbound`] for a datagram received from a peer.
 pub(crate) enum InboundDecision {
     /// Packet passed the firewall check and may be written to the TUN.
@@ -41,6 +141,10 @@ pub(crate) enum InboundDecision {
     DropFirewall(firewall::PacketInfo),
     /// Dropped: too large or not a parseable IP packet.
     DropMalformed,
+    /// Dropped: the packet's source IP is not the sending peer's assigned mesh
+    /// address. A peer may only source packets from its own mesh IP, so this
+    /// blocks one peer from impersonating another's IP (ingress anti-spoofing).
+    DropSpoof,
 }
 
 /// Pure evaluation of an inbound peer datagram against the firewall and basic
@@ -52,6 +156,8 @@ pub(crate) fn evaluate_inbound(
     packet: &[u8],
     firewall: &SharedFirewall,
     peer_id: &EndpointId,
+    peer_ip: Ipv4Addr,
+    peer_ipv6: Ipv6Addr,
     network: &str,
 ) -> InboundDecision {
     if packet.len() > MAX_PEER_DATAGRAM {
@@ -60,6 +166,17 @@ pub(crate) fn evaluate_inbound(
     let Some(info) = firewall::parse_packet_info(packet) else {
         return InboundDecision::DropMalformed;
     };
+    // Ingress anti-spoofing: a peer may only inject packets sourced from its own
+    // assigned mesh address. Anything else (e.g. one peer forging another's mesh
+    // IP) is dropped before the firewall or any in-daemon listener sees it, so
+    // identity-from-source-IP (used by mesh SSH) stays trustworthy.
+    let src_ok = match info.src_ip {
+        IpAddr::V4(v4) => v4 == peer_ip,
+        IpAddr::V6(v6) => v6 == peer_ipv6,
+    };
+    if !src_ok {
+        return InboundDecision::DropSpoof;
+    }
     if firewall
         .evaluate_packet(Direction::In, &info, peer_id, Some(network))
         .is_deny()
@@ -80,12 +197,21 @@ pub const LEAVE_CODE: u32 = 0x1ea5e;
 /// treated as a non-intentional disconnect (the peer may reconnect; no quarantine).
 pub const ABUSE_CODE: u32 = 0xab05e;
 
+/// Application close code a coordinator (or any member pruning a stale roster
+/// entry) sends when it removes a peer from the network (`ray kick`). On the
+/// receiving (kicked) side it is treated like [`LEAVE_CODE`] — an intentional
+/// disconnect — so the kicked node stops reconnecting instead of churning back
+/// into the coordinator's pending queue. The pruning side does not observe its
+/// own close code (that read is a local close), so it relies on the shared
+/// `pruned_peers` set to suppress its reconnect loop.
+pub const KICK_CODE: u32 = 0x14ced;
+
 /// Sent by [`spawn_peer_reader`] when a peer connection drops,
 /// consumed by the reconnect loop (joiner) or cleanup task (coordinator).
 pub struct DisconnectEvent {
     pub endpoint_id: EndpointId,
     pub ip: Ipv4Addr,
-    pub ipv6: std::net::Ipv6Addr,
+    pub ipv6: Ipv6Addr,
     /// The network whose connection dropped. A multi-homed peer keeps its routes
     /// in the other networks; only this network's connection is torn down.
     pub network: String,
@@ -211,6 +337,18 @@ pub async fn run_mesh(
             stats.record_drop(DropReason::Backpressure);
             continue;
         }
+        // SSH NAT: rewrite our reply's source port (listen -> 22) so the peer
+        // sees it as coming from `:22`. The cheap pre-check (TCP + source port ==
+        // listen port) gates the copy; `rewrite_ssh_port` still confirms the
+        // source IP is ours and no-ops otherwise, so ordinary traffic is untouched.
+        let pkt = if ssh_nat().is_some_and(|n| info.protocol == 6 && info.src_port == n.listen_port)
+        {
+            let mut v = pkt.to_vec();
+            rewrite_ssh_port(&mut v, &info, false);
+            Bytes::from(v)
+        } else {
+            pkt
+        };
         match route.conn.send_datagram(pkt) {
             Ok(()) => stats.record_tx(n),
             Err(e) => {
@@ -228,10 +366,10 @@ pub fn spawn_peer_reader(
     conn: Connection,
     peer_id: EndpointId,
     peer_ip: Ipv4Addr,
-    peer_ipv6: std::net::Ipv6Addr,
+    peer_ipv6: Ipv6Addr,
     network: String,
     ctx: ForwardCtx,
-) -> tokio::task::JoinHandle<()> {
+) -> JoinHandle<()> {
     let ForwardCtx {
         firewall,
         tun_tx,
@@ -258,6 +396,7 @@ pub fn spawn_peer_reader(
                             &e,
                             ConnectionError::ApplicationClosed(ac)
                                 if ac.error_code == VarInt::from_u32(LEAVE_CODE)
+                                    || ac.error_code == VarInt::from_u32(KICK_CODE)
                         );
                         tracing::warn!(peer = %peer_id.fmt_short(), ip = %peer_ip, error = %e, intentional, "peer connection lost");
                         let _ = disconnect_tx
@@ -275,9 +414,29 @@ pub fn spawn_peer_reader(
             };
 
             let peer_user = device_user_map.resolve(&peer_id);
-            match evaluate_inbound(&datagram, &firewall, &peer_user, &network) {
+            match evaluate_inbound(
+                &datagram, &firewall, &peer_user, peer_ip, peer_ipv6, &network,
+            ) {
                 InboundDecision::Accept => {
                     stats.record_rx(datagram.len());
+                    // SSH NAT: a packet to our mesh `:22` is rewritten to the
+                    // SSH server's internal listen port before injection. The
+                    // anti-spoof + firewall checks above already ran on the
+                    // original `:22` packet. Cheap pre-check avoids a copy on
+                    // ordinary traffic.
+                    let datagram = match ssh_nat() {
+                        Some(_) => match firewall::parse_packet_info(&datagram) {
+                            Some(info)
+                                if info.protocol == 6 && info.dst_port == crate::ssh::SSH_PORT =>
+                            {
+                                let mut v = datagram.to_vec();
+                                rewrite_ssh_port(&mut v, &info, true);
+                                Bytes::from(v)
+                            }
+                            _ => datagram,
+                        },
+                        None => datagram,
+                    };
                     if tun_tx.send(datagram).await.is_err() {
                         return;
                     }
@@ -297,6 +456,13 @@ pub fn spawn_peer_reader(
                     }
                 }
                 InboundDecision::DropMalformed => stats.record_drop(DropReason::Malformed),
+                InboundDecision::DropSpoof => {
+                    stats.record_drop(DropReason::Spoof);
+                    tracing::debug!(
+                        peer = %peer_id.fmt_short(),
+                        "dropped inbound packet with spoofed source IP"
+                    );
+                }
             }
         }
     };
@@ -311,8 +477,8 @@ pub fn spawn_peer_reader(
 pub fn spawn_tun_writer(
     mut tun: TunWriter,
     mut tun_rx: mpsc::Receiver<Bytes>,
-    active: Arc<std::sync::atomic::AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
+    active: Arc<AtomicBool>,
+) -> JoinHandle<()> {
     use std::sync::atomic::Ordering;
     tokio::spawn(async move {
         while let Some(packet) = tun_rx.recv().await {
@@ -364,10 +530,17 @@ mod tests {
         assert!(info.dst_ip.is_ipv6());
     }
 
+    /// Mesh address the test packets are sourced from; passed to
+    /// `evaluate_inbound` as the sending peer's assigned IP so the ingress
+    /// anti-spoof check passes.
+    const TEST_V4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 5);
+    const TEST_V6: Ipv6Addr = Ipv6Addr::UNSPECIFIED;
+
     fn make_tcp_packet(dst_port: u16) -> Vec<u8> {
         let mut p = vec![0u8; 24];
         p[0] = 0x45; // IPv4, IHL=5
         p[9] = 6; // TCP
+        p[12..16].copy_from_slice(&[100, 64, 0, 5]); // src ip (TEST_V4)
         p[16..20].copy_from_slice(&[100, 64, 0, 3]); // dst ip
         p[20] = 0;
         p[21] = 80; // src port 80
@@ -381,6 +554,7 @@ mod tests {
             default_inbound: default,
             default_outbound: Action::Allow,
             reject: false,
+            disabled: false,
             rules,
         })
     }
@@ -391,7 +565,7 @@ mod tests {
         let peer = iroh::SecretKey::generate().public();
         let huge = vec![0u8; MAX_PEER_DATAGRAM + 1];
         assert!(matches!(
-            evaluate_inbound(&huge, &fw, &peer, "test-net"),
+            evaluate_inbound(&huge, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropMalformed
         ));
     }
@@ -404,7 +578,7 @@ mod tests {
         pkt[0] = 0x60; // IPv6
         pkt[6] = 6; // TCP
         assert!(matches!(
-            evaluate_inbound(&pkt, &fw, &peer, "test-net"),
+            evaluate_inbound(&pkt, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropFirewall(_)
         ));
     }
@@ -427,11 +601,11 @@ mod tests {
         let blocked = make_tcp_packet(22);
         let allowed = make_tcp_packet(80);
         assert!(matches!(
-            evaluate_inbound(&blocked, &fw, &peer, "test-net"),
+            evaluate_inbound(&blocked, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropFirewall(_)
         ));
         assert!(matches!(
-            evaluate_inbound(&allowed, &fw, &peer, "test-net"),
+            evaluate_inbound(&allowed, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::Accept
         ));
     }
@@ -444,7 +618,7 @@ mod tests {
         let fw = SharedFirewall::new(firewall::FirewallConfig::default());
         let pkt = make_tcp_packet(443);
         assert!(matches!(
-            evaluate_inbound(&pkt, &fw, &peer, "test-net"),
+            evaluate_inbound(&pkt, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropFirewall(_)
         ));
     }
@@ -458,16 +632,112 @@ mod tests {
         let mut pkt = vec![0u8; 28];
         pkt[0] = 0x45; // IPv4, IHL=5
         pkt[9] = 1; // ICMP
+        pkt[12..16].copy_from_slice(&[100, 64, 0, 5]); // src ip (TEST_V4)
         pkt[16..20].copy_from_slice(&[100, 64, 0, 3]); // dst ip
         assert!(matches!(
-            evaluate_inbound(&pkt, &fw, &peer, "test-net"),
+            evaluate_inbound(&pkt, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
+            InboundDecision::Accept
+        ));
+    }
+
+    /// Compute the TCP checksum of a v4 packet (20-byte IP header) with the
+    /// checksum field treated as zero — what a correct packet's field should hold.
+    fn tcp_csum_v4(pkt: &[u8]) -> u16 {
+        let tcp = &pkt[20..];
+        let mut sum = 0u32;
+        for off in [12, 14, 16, 18] {
+            sum += u16::from_be_bytes([pkt[off], pkt[off + 1]]) as u32;
+        }
+        sum += 6; // protocol
+        sum += tcp.len() as u32;
+        let mut i = 0;
+        while i + 1 < tcp.len() {
+            if i != 16 {
+                // skip the checksum field itself
+                sum += u16::from_be_bytes([tcp[i], tcp[i + 1]]) as u32;
+            }
+            i += 2;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[test]
+    fn ssh_nat_rewrites_port_and_keeps_checksum_valid() {
+        let v4 = Ipv4Addr::new(100, 88, 0, 1);
+        init_ssh_nat(v4, Ipv6Addr::LOCALHOST, 41384);
+        set_ssh_nat_active(true);
+
+        // v4 TCP packet from a peer to our mesh :22, with a correct checksum.
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x45;
+        pkt[9] = 6; // TCP
+        pkt[12..16].copy_from_slice(&[100, 88, 0, 9]); // src (peer)
+        pkt[16..20].copy_from_slice(&v4.octets()); // dst (us)
+        pkt[20..22].copy_from_slice(&5000u16.to_be_bytes()); // src port
+        pkt[22..24].copy_from_slice(&22u16.to_be_bytes()); // dst port 22
+        pkt[32] = 0x50; // data offset = 5 (20-byte TCP header)
+        let ck = tcp_csum_v4(&pkt);
+        pkt[36..38].copy_from_slice(&ck.to_be_bytes());
+
+        let info = firewall::parse_packet_info(&pkt).unwrap();
+        assert!(rewrite_ssh_port(&mut pkt, &info, true));
+        let info2 = firewall::parse_packet_info(&pkt).unwrap();
+        assert_eq!(info2.dst_port, 41384, "dest port rewritten 22 -> listen");
+        // The incrementally-updated checksum must equal a freshly computed one.
+        let field = u16::from_be_bytes([pkt[36], pkt[37]]);
+        assert_eq!(
+            field,
+            tcp_csum_v4(&pkt),
+            "checksum stays valid after rewrite"
+        );
+
+        // Inactive -> no rewrite.
+        set_ssh_nat_active(false);
+        let mut pkt2 = pkt.clone();
+        let info3 = firewall::parse_packet_info(&pkt2).unwrap();
+        assert!(!rewrite_ssh_port(&mut pkt2, &info3, true));
+    }
+
+    #[test]
+    fn csum_replace2_round_trips() {
+        // Swapping a field value and swapping it back restores the checksum.
+        let c = 0x1234u16;
+        assert_eq!(csum_replace2(csum_replace2(c, 22, 41384), 41384, 22), c);
+    }
+
+    #[test]
+    fn inbound_spoofed_source_ip_dropped() {
+        // A packet whose source IP isn't the sending peer's assigned mesh IP is
+        // dropped as spoofed, before the firewall or any in-daemon listener sees
+        // it — even when the firewall would otherwise allow it.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = inbound_fw(Action::Allow, vec![]);
+        let pkt = make_tcp_packet(80); // sourced from TEST_V4 (100.64.0.5)
+        // Same packet, but the peer is supposedly assigned a different IP.
+        assert!(matches!(
+            evaluate_inbound(
+                &pkt,
+                &fw,
+                &peer,
+                Ipv4Addr::new(100, 64, 0, 9),
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::DropSpoof
+        ));
+        // With the matching peer IP it passes.
+        assert!(matches!(
+            evaluate_inbound(&pkt, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::Accept
         ));
     }
 
     #[test]
     fn magic_dns_predicate_matches_only_magic_ip_port_53() {
-        let mk = |ip: std::net::IpAddr, port: u16| firewall::PacketInfo {
+        let mk = |ip: IpAddr, port: u16| firewall::PacketInfo {
             src_ip: "100.64.0.5".parse().unwrap(),
             dst_ip: ip,
             protocol: 17,
@@ -477,14 +747,8 @@ mod tests {
             icmp_type: 0,
             icmp_id: 0,
         };
-        assert!(is_magic_dns(&mk(
-            std::net::IpAddr::V4(crate::dns::MAGIC_DNS_V4),
-            53
-        )));
-        assert!(!is_magic_dns(&mk(
-            std::net::IpAddr::V4(crate::dns::MAGIC_DNS_V4),
-            80
-        )));
+        assert!(is_magic_dns(&mk(IpAddr::V4(crate::dns::MAGIC_DNS_V4), 53)));
+        assert!(!is_magic_dns(&mk(IpAddr::V4(crate::dns::MAGIC_DNS_V4), 80)));
         assert!(!is_magic_dns(&mk("100.64.0.9".parse().unwrap(), 53)));
     }
 
@@ -508,12 +772,26 @@ mod tests {
             }],
         );
         assert!(matches!(
-            evaluate_inbound(&make_tcp_packet(8080), &fw, &peer, "test-net"),
+            evaluate_inbound(
+                &make_tcp_packet(8080),
+                &fw,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
             InboundDecision::Accept
         ));
         // A different port stays denied.
         assert!(matches!(
-            evaluate_inbound(&make_tcp_packet(9090), &fw, &peer, "test-net"),
+            evaluate_inbound(
+                &make_tcp_packet(9090),
+                &fw,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
             InboundDecision::DropFirewall(_)
         ));
     }

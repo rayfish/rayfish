@@ -1,6 +1,9 @@
 //! CLI service-management handlers: up, install, start/stop/restart, operator.
 
 use crate::*;
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::process::Command;
 
 /// Create the `rayfish` system group if it doesn't already exist (Linux).
 /// Best-effort: the daemon's config writer falls back to `root:root` ownership
@@ -9,13 +12,13 @@ use crate::*;
 #[cfg(target_os = "linux")]
 pub(crate) fn ensure_rayfish_group() {
     // `getent group rayfish` exits 0 if the group exists.
-    let exists = std::process::Command::new("getent")
+    let exists = Command::new("getent")
         .args(["group", "rayfish"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
     if !exists {
-        let _ = std::process::Command::new("groupadd")
+        let _ = Command::new("groupadd")
             .args(["--system", "rayfish"])
             .status();
     }
@@ -51,7 +54,7 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
         // best-effort — the daemon falls back to root:root if the group is
         // absent (see config::set_owner).
         ensure_rayfish_group();
-        let path = std::path::Path::new("/etc/systemd/system/rayfish.service");
+        let path = Path::new("/etc/systemd/system/rayfish.service");
         let service =
             include_str!("../../contrib/rayfish.service").replace("/usr/local/bin/ray", &exe);
         std::fs::write(path, service)
@@ -62,7 +65,7 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        let path = std::path::Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist");
+        let path = Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist");
         let plist =
             include_str!("../../contrib/com.rayfish.vpn.plist").replace("/usr/local/bin/ray", &exe);
         std::fs::write(path, plist)
@@ -201,8 +204,20 @@ pub(crate) fn require_root() -> Result<()> {
 
 /// `ray install`: install the system service if needed (or refresh an existing
 /// install), then start it and verify the daemon comes up. Requires root.
-pub(crate) async fn cmd_install() -> Result<()> {
+///
+/// `--auto-update` opts this node into automatic stable updates: it is persisted
+/// to `settings.toml` *before* the (re)start so the freshly launched daemon
+/// reads it at boot and spawns the periodic update task.
+pub(crate) async fn cmd_install(auto_update: bool) -> Result<()> {
     require_root()?;
+    if auto_update {
+        let mut cfg = config::load()?;
+        if !cfg.auto_update {
+            cfg.auto_update = true;
+            config::save_settings(&cfg)?;
+        }
+        println!("automatic stable updates enabled for this node");
+    }
     install_and_start_service(None).await
 }
 
@@ -210,11 +225,11 @@ pub(crate) async fn cmd_install() -> Result<()> {
 pub(crate) fn service_unit_exists() -> bool {
     #[cfg(target_os = "linux")]
     {
-        return std::path::Path::new("/etc/systemd/system/rayfish.service").exists();
+        return Path::new("/etc/systemd/system/rayfish.service").exists();
     }
     #[cfg(target_os = "macos")]
     {
-        return std::path::Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist").exists();
+        return Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist").exists();
     }
     #[allow(unreachable_code)]
     false
@@ -321,12 +336,3 @@ pub(crate) async fn cmd_start() -> Result<()> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Self-update (`ray update`)
-// ---------------------------------------------------------------------------
-
-/// owner/repo slug for the GitHub releases this binary updates from. Matches
-/// `REPORT_REPO_URL` and the `install.sh` bootstrap installer.
-pub(crate) const REPO_SLUG: &str = "rayfish/rayfish";
-

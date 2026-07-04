@@ -51,6 +51,10 @@ pub(crate) struct JoinParams {
     pub(crate) reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
     /// Consent: auto-install suggested rules without a manual review queue.
     pub(crate) auto_accept_firewall: bool,
+    /// Seed for per-network auto-accept of file offers from own devices
+    /// (`--auto-accept-files`). Persisted config wins on reconnect/restore; this
+    /// is only the first-join seed.
+    pub(crate) auto_accept_files: bool,
     /// Fresh join (send `JoinRequest` first) vs reconnect/restore (coordinator
     /// speaks first).
     pub(crate) initial: bool,
@@ -96,6 +100,7 @@ pub(crate) async fn join_mesh_shared(
         suggested_firewall,
         reusable_keys,
         auto_accept_firewall,
+        auto_accept_files,
         initial,
     } = params;
     let my_identity = identity.local_identity();
@@ -130,6 +135,7 @@ pub(crate) async fn join_mesh_shared(
         net_pubkey,
         &my_hostname,
         auto_accept_firewall,
+        auto_accept_files,
     )?;
 
     // On reconnect/restore the coordinator hasn't seen our hostname this session,
@@ -234,15 +240,32 @@ fn persist_join_config(
     net_pubkey: EndpointId,
     my_hostname: &Option<String>,
     auto_accept_firewall: bool,
+    auto_accept_files: bool,
 ) -> Result<()> {
     let persisted_hostname = members
         .iter()
         .find(|m| m.identity == my_identity)
         .and_then(|m| m.hostname.clone())
         .or(my_hostname.clone());
-    let (direct, pending_hostname) = config::load_network(network_name)?
-        .map(|n| (n.direct, n.pending_hostname))
-        .unwrap_or((false, None));
+    // Preserve across reconnects/restores state the just-fetched blob doesn't
+    // carry: the direct-connection flag, a queued rename intent, the SSH allow
+    // list, and node-local aliases.
+    let (direct, pending_hostname, ssh_allow, aliases, prev_auto_accept_files) =
+        config::load_network(network_name)?
+            .map(|n| {
+                (
+                    n.direct,
+                    n.pending_hostname,
+                    n.ssh_allow,
+                    n.aliases,
+                    n.auto_accept_files,
+                )
+            })
+            .unwrap_or((false, None, vec![], BTreeMap::new(), false));
+    // The toggle command (`ray files auto-accept`) is authoritative, so preserve
+    // a previously-persisted value; the join-time `--auto-accept-files` seed only
+    // needs to take effect on the first join (no prior config).
+    let auto_accept_files = prev_auto_accept_files || auto_accept_files;
     config::save_network(&config::NetworkConfig {
         name: network_name.to_string(),
         group_mode: GroupMode::Restricted,
@@ -255,8 +278,11 @@ fn persist_join_config(
         network_public_key: Some(net_pubkey),
         transport: None,
         auto_accept_firewall,
+        auto_accept_files,
         admins: vec![],
         direct,
+        ssh_allow,
+        aliases,
     })
 }
 
@@ -763,6 +789,7 @@ pub(crate) fn spawn_reconnect_loop(
         stats,
         firewall,
         device_user_map,
+        pruned_peers,
         ..
     } = ctx;
     use tracing::Instrument as _;
@@ -789,6 +816,17 @@ pub(crate) fn spawn_reconnect_loop(
             // The coordinator's MemberSync will prune it from our roster.
             if event.intentional {
                 tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "peer left, not reconnecting");
+                continue;
+            }
+            // We just pruned this peer from the roster (it was kicked or departed)
+            // and closed the connection ourselves — that close is what woke this
+            // loop. The peer still lists us, so re-dialing would re-form the link.
+            // Consume the one-shot suppression entry and skip.
+            if pruned_peers
+                .remove(&(network_name.clone(), peer_id))
+                .is_some()
+            {
+                tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "peer removed from roster, not reconnecting");
                 continue;
             }
             tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "peer disconnected, will reconnect");

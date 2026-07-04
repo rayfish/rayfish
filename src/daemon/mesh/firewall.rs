@@ -17,7 +17,7 @@ impl MeshManager {
     // Firewall handlers
     // -----------------------------------------------------------------------
 
-    pub(crate) fn firewall_add(
+    pub(crate) async fn firewall_add(
         &self,
         direction: firewall::Direction,
         action: firewall::Action,
@@ -41,12 +41,28 @@ impl MeshManager {
             },
             None => vec![None],
         };
+        // Resolve the peer to its **device** endpoint id (accepts hostname, mesh
+        // IPv4/IPv6, short id, full endpoint id, or a paired user identity), then
+        // normalize to the value the data plane actually compares against, which
+        // differs by direction: inbound matches `device_user_map.resolve(...)`
+        // (the peer's user identity for a paired/multi-device peer, else its
+        // device id — so an `in` rule keyed on the user id matches every one of
+        // that user's devices), while outbound matches the raw device id. Same
+        // reasoning as the SSH-allow handler below.
         let peer = match peer {
-            Some(s) => match self.resolve_short_id_any_network(s) {
-                Some(id) => firewall::PeerFilter::Identity(id),
+            Some(s) => match self.resolve_peer_flexible(s).await {
+                Some(device_id) => {
+                    let id = match direction {
+                        firewall::Direction::In => self.device_user_map.resolve(&device_id),
+                        firewall::Direction::Out => device_id,
+                    };
+                    firewall::PeerFilter::Identity(id)
+                }
                 None => {
                     return IpcMessage::Error {
-                        message: format!("unknown peer '{s}'"),
+                        message: format!(
+                            "unknown peer '{s}' (try a hostname, mesh IP, short id, or identity)"
+                        ),
                     };
                 }
             },
@@ -120,6 +136,7 @@ impl MeshManager {
             default_inbound: config.default_inbound,
             default_outbound: config.default_outbound,
             reject: config.reject,
+            disabled: config.disabled,
             rules: firewall::rule_views(&config.rules, &short_id),
         }
     }
@@ -128,7 +145,11 @@ impl MeshManager {
     /// republish the signed blob. Authority comes from holding the per-network
     /// secret key (so any admin granted the key can suggest). Suggestions are
     /// advisory on every network; each node queues or auto-accepts them.
-    pub(crate) async fn firewall_suggest(&self, network: &str, suggestions: SuggestedFirewall) -> IpcMessage {
+    pub(crate) async fn firewall_suggest(
+        &self,
+        network: &str,
+        suggestions: SuggestedFirewall,
+    ) -> IpcMessage {
         let (state, dht_notify, has_key) = match self.networks.get(network) {
             Some(h) => {
                 let has_key = h.state.read().unwrap().network_secret_key.is_some();
@@ -217,8 +238,8 @@ impl MeshManager {
                 };
             }
         };
-        let accept_set: std::collections::HashSet<&FirewallRuleView> = accept.iter().collect();
-        let deny_set: std::collections::HashSet<&FirewallRuleView> = deny.iter().collect();
+        let accept_set: HashSet<&FirewallRuleView> = accept.iter().collect();
+        let deny_set: HashSet<&FirewallRuleView> = deny.iter().collect();
 
         // Partition the queue: keep the still-undecided rules; collect accepted.
         let mut accepted_rules = Vec::new();
@@ -381,4 +402,196 @@ impl MeshManager {
         self.firewall.update(config.clone());
         save_firewall_warn(&config);
     }
+
+    /// `ray firewall on|off`: the global kill switch. `off` sets
+    /// `config.disabled = true` so `evaluate_packet` allows every packet
+    /// (rules and defaults are bypassed; the anti-spoof check upstream still
+    /// runs). Hot-swaps the live `ArcSwap`, so the effect is immediate.
+    pub(crate) fn firewall_set_enabled(&self, enabled: bool) -> IpcMessage {
+        let mut config = (*self.firewall.get_config()).clone();
+        config.disabled = !enabled;
+        self.firewall.update(config.clone());
+        if let Err(e) = firewall::save_firewall(&config) {
+            tracing::warn!(error = %e, "failed to persist firewall config");
+        }
+        IpcMessage::Ok {
+            message: if enabled {
+                "firewall on (enforcing rules and defaults)".to_string()
+            } else {
+                "firewall off (all packets allowed on this device)".to_string()
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Mesh SSH (`ray firewall ssh ...`)
+    // -----------------------------------------------------------------------
+
+    /// Toggle the embedded mesh SSH server. Persists `ssh_enabled`, seeds/removes
+    /// the `allow in tcp:22` passthrough so SSH packets reach the listener under
+    /// the deny-inbound default, and starts/stops the listeners if the data plane
+    /// is active.
+    pub(crate) fn firewall_ssh_set(self: &Arc<Self>, enabled: bool) -> IpcMessage {
+        let mut app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to load config: {e}"),
+                };
+            }
+        };
+        app_config.ssh_enabled = enabled;
+        if let Err(e) = config::save_settings(&app_config) {
+            return IpcMessage::Error {
+                message: format!("failed to persist ssh setting: {e}"),
+            };
+        }
+        // Open/close port 22 at the packet layer; SSH-layer authz is the real gate.
+        let fw = self.firewall.set_ssh_passthrough(enabled);
+        if let Err(e) = firewall::save_firewall(&fw) {
+            tracing::warn!(error = %e, "failed to persist firewall config");
+        }
+        // Reflect immediately if the data plane is up (else activate() starts it).
+        if self.active.load(Ordering::SeqCst) {
+            if enabled {
+                self.start_ssh();
+            } else {
+                self.stop_ssh();
+            }
+        }
+        // Nudge: enabling the server does nothing until a peer is authorized. If
+        // no network has any `ssh_allow` entry yet, tell the user the next step.
+        let has_allow = app_config.networks.iter().any(|n| !n.ssh_allow.is_empty());
+        let message = if enabled && !has_allow {
+            "mesh SSH on. No peer is authorized yet. Grant access with \
+             `ray firewall ssh allow <network> <peer>` (peer = hostname / mesh IP / \
+             short id, or `*` for any peer on the network)."
+                .to_string()
+        } else {
+            format!("mesh SSH {}", if enabled { "on" } else { "off" })
+        };
+        IpcMessage::Ok { message }
+    }
+
+    /// Add or remove a peer from a network's SSH allow list. `peer` is `*` (any
+    /// peer on the network) or a name/ip/short-id resolved to a user identity.
+    /// On allow, `users` is the set of local accounts the peer may log in as
+    /// (empty = any non-root user; `"*"` = any incl. root) and **replaces** the
+    /// peer's prior users. On deny, the peer's rule is dropped (`users` ignored).
+    pub(crate) async fn firewall_ssh_allow(
+        &self,
+        network: &str,
+        peer: &str,
+        users: Vec<String>,
+        allow: bool,
+    ) -> IpcMessage {
+        let mut app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to load config: {e}"),
+                };
+            }
+        };
+        if !app_config.networks.iter().any(|n| n.name == network) {
+            return IpcMessage::Error {
+                message: format!("no such network: {network}"),
+            };
+        }
+        // Resolve the peer to a stored allow-entry: `*` stays literal, otherwise
+        // resolve to the peer's **user identity** hex. `resolve_peer_name` may
+        // return a transport endpoint id (for a connected peer) which differs
+        // from the user identity for a paired/multi-device peer; the SSH server
+        // authorizes by user identity (`device_user_map.resolve`), so normalize
+        // through the same map here. For an unmapped id this is a no-op.
+        let entry = if peer == "*" {
+            "*".to_string()
+        } else {
+            match self.resolve_peer_name(peer).await {
+                Some(id) => self.device_user_map.resolve(&id).to_string(),
+                None => {
+                    return IpcMessage::Error {
+                        message: format!("could not resolve peer: {peer}"),
+                    };
+                }
+            }
+        };
+        let net = app_config
+            .networks
+            .iter_mut()
+            .find(|n| n.name == network)
+            .expect("network presence checked above");
+        if allow {
+            // Normalize: a `*` collapses the list to just `*` (any incl. root);
+            // otherwise dedupe. Empty = the non-root default.
+            let users = normalize_ssh_users(users);
+            match net.ssh_allow.iter_mut().find(|r| r.peer == entry) {
+                Some(r) => r.users = users,
+                None => net.ssh_allow.push(config::SshRule {
+                    peer: entry.clone(),
+                    users,
+                }),
+            }
+        } else {
+            net.ssh_allow.retain(|r| r.peer != entry);
+        }
+        let net = net.clone();
+        if let Err(e) = config::save_network(&net) {
+            return IpcMessage::Error {
+                message: format!("failed to persist network config: {e}"),
+            };
+        }
+        // Push the change to any live listener.
+        self.rebuild_ssh_authz();
+        let detail = if allow {
+            let r = net.ssh_allow.iter().find(|r| r.peer == entry);
+            let as_users = match r.map(|r| r.users.as_slice()) {
+                Some([]) | None => " as any non-root user".to_string(),
+                Some(u) if u.iter().any(|x| x == "*") => " as any user".to_string(),
+                Some(u) => format!(" as {}", u.join(",")),
+            };
+            format!("ssh allow {peer} on {network}{as_users}")
+        } else {
+            format!("ssh deny {peer} on {network}")
+        };
+        IpcMessage::Ok { message: detail }
+    }
+
+    /// Report the SSH server state + per-network allow lists.
+    pub(crate) fn firewall_ssh_show(&self) -> IpcMessage {
+        let (enabled, networks) = match config::load() {
+            Ok(c) => (
+                c.ssh_enabled,
+                c.networks
+                    .into_iter()
+                    .filter(|n| !n.ssh_allow.is_empty())
+                    .map(|n| {
+                        let allow = n
+                            .ssh_allow
+                            .into_iter()
+                            .map(|r| ray_proto::ipc::SshAllowView {
+                                peer: r.peer,
+                                users: r.users,
+                            })
+                            .collect();
+                        (n.name, allow)
+                    })
+                    .collect(),
+            ),
+            Err(_) => (false, Vec::new()),
+        };
+        IpcMessage::FirewallSshState { enabled, networks }
+    }
+}
+
+/// Normalize an SSH allow rule's user list: a `*` (any user incl. root) collapses
+/// the whole list to just `*`; otherwise sort + dedupe. An empty list is left
+/// empty, meaning "any non-root user" (the secure default).
+fn normalize_ssh_users(mut users: Vec<String>) -> Vec<String> {
+    if users.iter().any(|u| u == "*") {
+        return vec!["*".to_string()];
+    }
+    users.sort();
+    users.dedup();
+    users
 }

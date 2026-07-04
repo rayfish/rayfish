@@ -16,6 +16,9 @@ struct JoinContext<'a> {
     /// attempt (a fresh join may try several coordinators).
     invite: Option<Vec<u8>>,
     auto_accept_firewall: bool,
+    /// Seed for per-network auto-accept of file offers from own devices
+    /// (`--auto-accept-files`); persisted, config wins on reconnect/restore.
+    auto_accept_files: bool,
     invite_lock: Arc<tokio::sync::Mutex<()>>,
     /// Pinned coordinator to dial first (the invite minter), if known.
     coordinator: Option<EndpointId>,
@@ -280,8 +283,11 @@ impl MeshManager {
             network_public_key: Some(net_public_key),
             transport: None,
             auto_accept_firewall: false,
+            auto_accept_files: false,
             admins: vec![],
             direct,
+            ssh_allow: vec![],
+            aliases: BTreeMap::new(),
         })?;
 
         let cancel = self.shutdown_token.child_token();
@@ -328,6 +334,7 @@ impl MeshManager {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, hostname), fields(net = name.unwrap_or(network_key)))]
     pub(crate) async fn join_network(
         self: &Arc<Self>,
@@ -337,6 +344,7 @@ impl MeshManager {
         invite: Option<Vec<u8>>,
         coordinator: Option<EndpointId>,
         auto_accept_firewall: bool,
+        auto_accept_files: bool,
     ) -> IpcMessage {
         match self
             .join_network_inner(
@@ -346,6 +354,7 @@ impl MeshManager {
                 invite.clone(),
                 coordinator,
                 auto_accept_firewall,
+                auto_accept_files,
                 true,
             )
             .await
@@ -373,6 +382,7 @@ impl MeshManager {
                                 invite.clone(),
                                 coordinator,
                                 auto_accept_firewall,
+                                auto_accept_files,
                                 true,
                             )
                             .await
@@ -410,6 +420,9 @@ impl MeshManager {
         // Auto-install coordinator-suggested firewall rules on this network
         // (`--auto-accept-firewall`); persisted so it survives restarts.
         auto_accept_firewall: bool,
+        // Seed for per-network auto-accept of file offers from own devices
+        // (`--auto-accept-files`); persisted, config wins on reconnect/restore.
+        auto_accept_files: bool,
         // True for a fresh join (we send a JoinRequest first); false when
         // restoring a network we're already a member of (legacy handshake where
         // the coordinator speaks first).
@@ -467,6 +480,7 @@ impl MeshManager {
             net_pubkey,
             invite,
             auto_accept_firewall,
+            auto_accept_files,
             invite_lock: invite_lock.clone(),
             coordinator,
         };
@@ -621,36 +635,107 @@ impl MeshManager {
                     .map(|m| m.identity)
             })
             .context("no coordinator found in network record")?;
-        tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
-        let conn = transport::connect_to_peer_with_alpn(&self.endpoint, coordinator_id, ctx.alpn)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("coordinator offline; cannot join this network right now: {e}")
-            })?;
 
+        // The reconnect loop is spawned unconditionally and up front. A member
+        // already holds the verified blob, so being *in* the network does not
+        // depend on the coordinator answering right now: if it is offline at
+        // restore we still register the network from the blob and let this loop
+        // dial it back when it returns. Without this a member that reboots while
+        // its coordinator is down silently drops the network from its running
+        // state until a lucky restart.
         let cancel = self.shutdown_token.child_token();
         let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
         let my_id = self.identity.local_identity();
         let tasks = vec![self.spawn_join_reconnect(ctx, my_id, &disconnect_tx, disconnect_rx, &cancel)];
 
-        match self
-            .run_join_handshake(ctx, data, conn, false, &disconnect_tx, &cancel, ctx.invite.clone())
-            .await?
+        // Fallback state built straight from the verified blob so registration
+        // never blocks on (or dies with) the coordinator handshake.
+        let state_from_blob = || {
+            let mut ns = NetworkState {
+                members: MemberList::from_members(data.members.clone()),
+                approved: ApprovedList::from_entries(data.approved.clone()),
+                snapshot: None,
+                network_secret_key: None,
+                network_public_key: ctx.net_pubkey,
+                network_name: Some(ctx.display_name.to_string()),
+                mode: GroupMode::Restricted,
+                suggested_firewall: data.suggested_firewall.clone(),
+                reusable_keys: data.reusable_keys.clone(),
+                pending_suggestions: Vec::new(),
+                pending: HashMap::new(),
+            };
+            ns.refresh_snapshot();
+            Arc::new(std::sync::RwLock::new(ns))
+        };
+
+        tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
+        let mut seed_from_blob = false;
+        let state = match transport::connect_to_peer_with_alpn(
+            &self.endpoint,
+            coordinator_id,
+            ctx.alpn,
+        )
+        .await
         {
-            JoinResult::Joined(state) => Ok(Some(EstablishedMesh {
-                state,
-                cancel,
-                disconnect_tx,
-                tasks,
-            })),
-            JoinResult::Pending => {
-                // Closed network: queued for live approval. Stop the just-spawned
-                // reconnect loop (nothing is connected yet); caller retries on a
-                // backoff until `ray accept` lets us in.
-                abort_join_tasks(&cancel, tasks);
-                Ok(None)
+            Ok(conn) => match self
+                .run_join_handshake(ctx, data, conn, false, &disconnect_tx, &cancel, ctx.invite.clone())
+                .await
+            {
+                Ok(JoinResult::Joined(state)) => state,
+                Ok(JoinResult::Pending) => {
+                    // Closed network: queued for live approval. Stop the just-
+                    // spawned reconnect loop (nothing connected yet); caller
+                    // retries on a backoff until `ray accept` lets us in.
+                    abort_join_tasks(&cancel, tasks);
+                    return Ok(None);
+                }
+                Err(e) => {
+                    // Dialed the coordinator but the handshake failed. We still
+                    // hold the verified blob, so register from it and let the
+                    // reconnect loop recover rather than dropping the network.
+                    tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator handshake failed on restore; registering from blob, reconnect loop will retry");
+                    seed_from_blob = true;
+                    state_from_blob()
+                }
+            },
+            Err(e) => {
+                // Coordinator offline at restore: register from the blob so the
+                // network stays live; the reconnect loop dials it back once it
+                // returns.
+                tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator offline on restore; registering from blob, reconnect loop will retry");
+                seed_from_blob = true;
+                state_from_blob()
+            }
+        };
+
+        // The reconnect loop is edge-triggered on disconnect events, so a cold
+        // registration (no live connection yet) needs a synthetic kick per member
+        // to start the backoff-retry dial. Only fires when we registered from the
+        // blob without a live handshake.
+        if seed_from_blob {
+            let me = self.identity.local_identity();
+            for m in &data.members {
+                if m.identity == me {
+                    continue;
+                }
+                let _ = disconnect_tx
+                    .send(forward::DisconnectEvent {
+                        endpoint_id: m.identity,
+                        ip: m.ip,
+                        ipv6: derive_ipv6(&m.identity),
+                        network: ctx.display_name.to_string(),
+                        intentional: false,
+                    })
+                    .await;
             }
         }
+
+        Ok(Some(EstablishedMesh {
+            state,
+            cancel,
+            disconnect_tx,
+            tasks,
+        }))
     }
 
     /// Spawn the per-network reconnect loop used by both dial paths.
@@ -704,6 +789,7 @@ impl MeshManager {
                 suggested_firewall: data.suggested_firewall.clone(),
                 reusable_keys: data.reusable_keys.clone(),
                 auto_accept_firewall: ctx.auto_accept_firewall,
+                auto_accept_files: ctx.auto_accept_files,
                 initial,
             },
             disconnect_tx.clone(),

@@ -9,7 +9,7 @@ impl MeshManager {
         let my_id = self.endpoint.id();
         // Direct-connection networks are flagged in config; collect their names
         // so each NetworkStatus can be tagged `[direct]` in the CLI.
-        let direct_names: std::collections::HashSet<String> = config::load()
+        let direct_names: HashSet<String> = config::load()
             .map(|c| {
                 c.networks
                     .iter()
@@ -27,6 +27,7 @@ impl MeshManager {
         IpcMessage::StatusResponse {
             endpoint_id: self.endpoint.id(),
             mdns_enabled: self.mdns_enabled,
+            auto_update: self.auto_update,
             active: self.active.load(Ordering::SeqCst),
             contact_id: Some(self.contact_public.to_string()),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -48,7 +49,7 @@ impl MeshManager {
         h: &NetworkHandle,
         my_id: EndpointId,
         hostname_snapshot: Option<&HashMap<String, HashMap<String, dns::HostnameEntry>>>,
-        direct_names: &std::collections::HashSet<String>,
+        direct_names: &HashSet<String>,
     ) -> NetworkStatus {
         // Direct-connection networks are tagged `[direct]` regardless of role.
         let role = if direct_names.contains(&h.name) {
@@ -56,11 +57,21 @@ impl MeshManager {
         } else {
             h.role.clone()
         };
+        // Node-local aliases (display-only) come straight from config; status is
+        // not a hot path, so a per-network read is fine.
+        let aliases = config::load_network(&h.name)
+            .ok()
+            .flatten()
+            .map(|n| n.aliases)
+            .unwrap_or_default();
         // Resolve a mesh IPv4 back to its `.ray` hostname via the DNS snapshot.
         let lookup_hostname = |ip| {
             hostname_snapshot.and_then(|table| {
                 table.get(&h.name).and_then(|hosts| {
-                    hosts.iter().find(|(_, v)| v.0 == ip).map(|(k, _)| k.clone())
+                    hosts
+                        .iter()
+                        .find(|(_, v)| v.0 == ip)
+                        .map(|(k, _)| k.clone())
                 })
             })
         };
@@ -80,11 +91,17 @@ impl MeshManager {
                         peers: vec![],
                         pending_suggestions: 0,
                         pending_requests: 0,
+                        aliases,
                     };
                 }
             };
             let count = s.members.all().len();
-            (s.roster(), count, s.pending_suggestions.len(), s.pending.len())
+            (
+                s.roster(),
+                count,
+                s.pending_suggestions.len(),
+                s.pending.len(),
+            )
         };
         // Index live connections by endpoint id for a fast lookup.
         let connected: HashMap<EndpointId, Connection> = self
@@ -93,6 +110,13 @@ impl MeshManager {
             .into_iter()
             .map(|(eid, _, conn)| (eid, conn))
             .collect();
+        // Our own user identity: the cert's user id on a paired device, else our
+        // own endpoint id (mirrors the `try_auto_accept_file` "own device" rule).
+        let own_user = self
+            .device_cert
+            .as_ref()
+            .map(|c| c.user_identity)
+            .unwrap_or(my_id);
         let peers = members
             .iter()
             .filter(|m| m.identity != my_id)
@@ -107,6 +131,7 @@ impl MeshManager {
                     ipv6: Some(derive_ipv6(&m.identity)),
                     hostname,
                     user_identity,
+                    is_own_device: user_id == own_user,
                     connection,
                 }
             })
@@ -122,6 +147,7 @@ impl MeshManager {
             peers,
             pending_suggestions,
             pending_requests,
+            aliases,
         }
     }
 
@@ -330,9 +356,7 @@ impl MeshManager {
             Some(r) => r,
             None => {
                 return IpcMessage::Error {
-                    message: format!(
-                        "{display} is not connected (no live mesh link to {ip})"
-                    ),
+                    message: format!("{display} is not connected (no live mesh link to {ip})"),
                 };
             }
         };
@@ -440,5 +464,4 @@ impl MeshManager {
             udp,
         }
     }
-
 }

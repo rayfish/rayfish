@@ -1,6 +1,8 @@
 //! CLI status & diagnostics output plus shared presentation helpers
 //! (`table`, `print_error`, …): status, down, report, set-hostname.
 
+use std::collections::HashMap;
+
 use crate::*;
 
 /// Human-readable byte size (GiB/MiB/KiB/B) for traffic and transfer counters.
@@ -132,6 +134,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
         ipc::IpcMessage::StatusResponse {
             endpoint_id,
             mdns_enabled,
+            auto_update,
             active,
             contact_id,
             daemon_version,
@@ -147,6 +150,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 print_json(&serde_json::json!({
                     "endpoint": endpoint_id.to_string(),
                     "mdns": mdns_enabled,
+                    "auto_update": auto_update,
                     "active": active,
                     "contact_id": contact_id,
                     "daemon_version": daemon_version,
@@ -174,12 +178,24 @@ pub(crate) async fn ipc_status() -> Result<()> {
             } else {
                 format!("{} {}", style::label("mDNS"), style::faint("off"))
             };
+            // Only surface auto-update in the header when it is on (opt-in), so the
+            // default line stays uncluttered.
+            let auto = if auto_update {
+                format!(
+                    "      {} {}",
+                    style::label("auto-update"),
+                    style::green("on")
+                )
+            } else {
+                String::new()
+            };
             println!();
             println!(
-                "  {}  {}      {}      {} {}",
+                "  {}  {}      {}{}      {} {}",
                 style::bold("rayfish"),
                 state,
                 mdns,
+                auto,
                 style::label("endpoint"),
                 style::value(&endpoint_id.fmt_short().to_string()),
             );
@@ -269,9 +285,32 @@ fn print_network(net: &ipc::NetworkStatus) {
         style::value(&format!("{online}/{}", net.peers.len())),
     );
 
-    // Peer rows as aligned columns: glyph · host · ipv4 · via · rtt · traffic
-    let rows: Vec<Vec<layout::Cell>> =
-        net.peers.iter().map(|p| render_peer_row(&net.name, p)).collect();
+    // Invert the local alias map (alias -> identity) for identity -> alias
+    // lookups when rendering peers.
+    let alias_by_identity: HashMap<&str, &str> = net
+        .aliases
+        .iter()
+        .map(|(alias, identity)| (identity.as_str(), alias.as_str()))
+        .collect();
+
+    // Peer rows as aligned columns: glyph · host · ipv4 · via · rtt · ↑tx · ↓rx.
+    // Pre-measure the widest up/down counter so each arrow hugs its number (one
+    // space) while the digits still right-align across rows.
+    let counter_width = |pick: fn(&ipc::ConnectionInfo) -> u64| {
+        net.peers
+            .iter()
+            .filter_map(|p| p.connection.as_ref())
+            .map(|c| format_bytes(pick(c)).len())
+            .max()
+            .unwrap_or(0)
+    };
+    let up_w = counter_width(|c| c.bytes_tx);
+    let down_w = counter_width(|c| c.bytes_rx);
+    let rows: Vec<Vec<layout::Cell>> = net
+        .peers
+        .iter()
+        .map(|p| render_peer_row(&net.name, p, peer_alias(p, &alias_by_identity), up_w, down_w))
+        .collect();
     if rows.is_empty() {
         println!("    {}", style::faint("(no other members)"));
     } else {
@@ -290,13 +329,60 @@ fn print_network(net: &ipc::NetworkStatus) {
     }
 }
 
-/// Build one peer's status row (glyph · host · ipv4 · via · rtt · traffic).
-fn render_peer_row(net_name: &str, peer: &ipc::PeerStatus) -> Vec<layout::Cell> {
-    let host = peer
+/// Resolve a peer's local alias, if any: match its identity (user identity when
+/// paired, else device endpoint id) against the inverted alias map.
+fn peer_alias<'a>(
+    peer: &ipc::PeerStatus,
+    alias_by_identity: &HashMap<&str, &'a str>,
+) -> Option<&'a str> {
+    let identity = peer.user_identity.unwrap_or(peer.endpoint_id).to_string();
+    alias_by_identity.get(identity.as_str()).copied()
+}
+
+/// Build one peer's status row (glyph · host · ipv4 · via · rtt · ↑tx · ↓rx). A
+/// local alias, when set, is shown inline after the host as `host.net.ray [alias]`.
+fn render_peer_row(
+    net_name: &str,
+    peer: &ipc::PeerStatus,
+    alias: Option<&str>,
+    up_w: usize,
+    down_w: usize,
+) -> Vec<layout::Cell> {
+    let base = peer
         .hostname
         .as_ref()
         .map(|h| format!("{h}.{}.{}", net_name, DNS_DOMAIN))
         .unwrap_or_else(|| peer.ip.to_string());
+    let host = match alias {
+        Some(a) => format!("{base} [{a}]"),
+        None => base,
+    };
+    // Ownership annotation, rendered as its own styled segment appended to the
+    // host (so it never nests inside the host's color). Mark our own paired
+    // devices; attribute an *unaliased* paired device to its owning user. When
+    // an alias is shown it already names the owner (it is keyed on the user
+    // identity for a paired device), so we skip the redundant segment.
+    let annotation: Option<(String, String)> = if peer.is_own_device {
+        Some(("(your device)".into(), style::green("(your device)")))
+    } else if alias.is_none() {
+        peer.user_identity.map(|uid| {
+            let s = format!("(user {})", uid.fmt_short());
+            let styled = style::faint(&s);
+            (s, styled)
+        })
+    } else {
+        None
+    };
+    // Plain text used for column width measurement includes the annotation.
+    let host_plain = match &annotation {
+        Some((plain, _)) => format!("{host} {plain}"),
+        None => host.clone(),
+    };
+    // Build the styled host, keeping the base and annotation in distinct colors.
+    let host_styled = |base_style: fn(&str) -> String| match &annotation {
+        Some((_, styled)) => format!("{} {styled}", base_style(&host)),
+        None => base_style(&host),
+    };
     match &peer.connection {
         Some(ci) => {
             let via = match ci.conn_type {
@@ -309,23 +395,24 @@ fn render_peer_row(net_name: &str, peer: &ipc::PeerStatus) -> Vec<layout::Cell> 
                 Some(ms) => (format!("{ms:.0}ms"), style::latency(ms)),
                 None => ("—".into(), style::faint("—")),
             };
-            let traffic_plain = format!(
-                "↑ {}  ↓ {}",
-                format_bytes(ci.bytes_tx),
-                format_bytes(ci.bytes_rx)
-            );
+            // One cell per direction: the counter is right-padded to the column's
+            // widest value so the arrow hugs its number (single space) while the
+            // digits still right-align down the column.
+            let up = format!("↑ {:>up_w$}", format_bytes(ci.bytes_tx));
+            let down = format!("↓ {:>down_w$}", format_bytes(ci.bytes_rx));
             vec![
                 layout::Cell::new("●", style::dot_online()),
-                layout::Cell::new(host.clone(), style::value(&host)),
+                layout::Cell::new(host_plain.clone(), host_styled(style::value)),
                 layout::Cell::new(peer.ip.to_string(), style::faint(&peer.ip.to_string())),
                 layout::Cell::new(via, style::faint(via)),
                 layout::Cell::right(rtt_plain, rtt_styled),
-                layout::Cell::new(traffic_plain.clone(), style::faint(&traffic_plain)),
+                layout::Cell::new(up.clone(), style::faint(&up)),
+                layout::Cell::new(down.clone(), style::faint(&down)),
             ]
         }
         None => vec![
             layout::Cell::new("○", style::dot_offline()),
-            layout::Cell::new(host.clone(), style::faint(&host)),
+            layout::Cell::new(host_plain.clone(), host_styled(style::faint)),
             layout::Cell::new(peer.ip.to_string(), style::faint(&peer.ip.to_string())),
             layout::Cell::new("—", style::faint("—")),
             layout::Cell::right("offline", style::faint("offline")),
@@ -480,4 +567,3 @@ pub(crate) async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()
     }
     Ok(())
 }
-
