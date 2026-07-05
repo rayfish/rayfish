@@ -166,21 +166,25 @@ pub(crate) async fn join_mesh_shared(
         remote_ip,
         network_name,
     );
-    connect_to_roster_peers(
-        ep,
-        alpn,
-        &members,
-        network_name,
+    // Dial the rest of the roster in the background. The coordinator link is
+    // already registered above, so the network is usable now; blocking the join
+    // on the full mesh means one slow or dead member (e.g. a stale offline peer
+    // whose discovery record still resolves) stalls boot for the whole
+    // per-dial handshake timeout. Peer links fill in as they connect, and the
+    // reconnect loop recovers any that are down.
+    spawn_roster_peer_dials(
+        ep.clone(),
+        alpn.to_vec(),
+        members.clone(),
+        network_name.to_string(),
         my_identity,
         my_ip,
         remote_id,
-        &device_cert,
-        &peers,
-        &worker_ctx,
-        &disconnect_tx,
-        &token,
-    )
-    .await?;
+        device_cert.clone(),
+        worker_ctx.clone(),
+        disconnect_tx.clone(),
+        token.clone(),
+    );
 
     let live_state = build_member_state(
         members,
@@ -378,56 +382,103 @@ fn register_mesh_peer(
 /// coordinator), send each a `MeshHello`, and register it as a peer. A member
 /// that's offline is logged and skipped; a stream-open/send failure aborts the
 /// join (propagated to the caller).
+/// Upper bound on a single background roster dial. Generous on purpose: the dial
+/// runs off the boot path, so a slow-but-live member (relay + NAT holepunch on a
+/// mobile link) is worth waiting for, while a truly dead member is still bounded
+/// instead of lingering on iroh's own internal handshake timeout.
+const MESH_PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Dial every other roster member concurrently in the background, sending each a
+/// `MeshHello` and registering it as a peer. Best-effort and non-blocking: this
+/// is spawned so the join completes as soon as the coordinator link is up, and a
+/// member that's offline (or stale) is bounded by [`MESH_PEER_DIAL_TIMEOUT`] and
+/// simply logged. The owned arguments let the task outlive the join call.
 #[allow(clippy::too_many_arguments)]
-async fn connect_to_roster_peers(
-    ep: &Endpoint,
-    alpn: &[u8],
-    members: &[crate::membership::Member],
-    network_name: &str,
+fn spawn_roster_peer_dials(
+    ep: Endpoint,
+    alpn: Vec<u8>,
+    members: Vec<crate::membership::Member>,
+    network_name: String,
     my_identity: EndpointId,
     my_ip: Ipv4Addr,
     skip_id: EndpointId,
-    device_cert: &Option<control::DeviceCert>,
-    peers: &PeerTable,
-    ctx: &MeshCtx,
-    disconnect_tx: &mpsc::Sender<forward::DisconnectEvent>,
-    token: &CancellationToken,
-) -> Result<()> {
-    for member in members {
-        if member.identity == my_identity || member.identity == skip_id {
-            continue;
-        }
-        match transport::connect_to_peer_with_alpn(ep, member.identity, alpn).await {
-            Ok(conn) => {
-                let (mut send, _recv) = conn.open_bi().await?;
-                control::send_msg(
-                    &mut send,
-                    &ControlMsg::MeshHello {
-                        identity: my_identity,
-                        ip: my_ip,
-                        hostname: outgoing_hostname(network_name),
-                        device_cert: device_cert.clone(),
-                    },
-                )
-                .await?;
-                register_mesh_peer(
-                    peers,
-                    ctx,
-                    disconnect_tx,
-                    token,
-                    conn,
-                    member.identity,
-                    member.ip,
-                    network_name,
-                );
-                tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
+    device_cert: Option<control::DeviceCert>,
+    ctx: MeshCtx,
+    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+    token: CancellationToken,
+) {
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        let mut dials = futures::stream::FuturesUnordered::new();
+        for member in &members {
+            if member.identity == my_identity || member.identity == skip_id {
+                continue;
             }
-            Err(e) => {
-                tracing::warn!(peer_ip = %member.ip, error = %e, "mesh peer unavailable");
-            }
+            // Borrow the owned task-locals into each future; the values live for
+            // the whole `while dials.next()` drain below.
+            let (ep, alpn, ctx) = (&ep, &alpn, &ctx);
+            let (disconnect_tx, token) = (&disconnect_tx, &token);
+            let (network_name, device_cert) = (&network_name, &device_cert);
+            dials.push(async move {
+                // Bound the dial and honor cancellation so one unreachable member
+                // can't keep this task alive far longer than the dial is worth.
+                let conn = tokio::select! {
+                    _ = token.cancelled() => return,
+                    r = tokio::time::timeout(
+                        MESH_PEER_DIAL_TIMEOUT,
+                        transport::connect_to_peer_with_alpn(ep, member.identity, alpn),
+                    ) => r,
+                };
+                match conn {
+                    Ok(Ok(conn)) => {
+                        let mut send = match conn.open_bi().await {
+                            Ok((send, _recv)) => send,
+                            Err(e) => {
+                                tracing::warn!(peer_ip = %member.ip, error = %e, "mesh peer stream open failed");
+                                return;
+                            }
+                        };
+                        if let Err(e) = control::send_msg(
+                            &mut send,
+                            &ControlMsg::MeshHello {
+                                identity: my_identity,
+                                ip: my_ip,
+                                hostname: outgoing_hostname(network_name),
+                                device_cert: device_cert.clone(),
+                            },
+                        )
+                        .await
+                        {
+                            tracing::warn!(peer_ip = %member.ip, error = %e, "mesh peer hello failed");
+                            return;
+                        }
+                        register_mesh_peer(
+                            &ctx.peers,
+                            ctx,
+                            disconnect_tx,
+                            token,
+                            conn,
+                            member.identity,
+                            member.ip,
+                            network_name,
+                        );
+                        tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(peer_ip = %member.ip, error = %e, "mesh peer unavailable");
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            peer_ip = %member.ip,
+                            timeout_secs = MESH_PEER_DIAL_TIMEOUT.as_secs(),
+                            "mesh peer dial timed out"
+                        );
+                    }
+                }
+            });
         }
-    }
-    Ok(())
+        while dials.next().await.is_some() {}
+    });
 }
 
 /// Run one coordinator handshake. A fresh join (`initial`) opens a stream, sends
