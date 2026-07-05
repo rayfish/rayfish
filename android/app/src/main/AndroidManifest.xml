@@ -48,6 +48,20 @@
             </intent-filter>
         </activity>
 
+        <!-- Portrait-locked QR scanner. The zxing-android-embedded default
+             CaptureActivity follows the device sensor with no fixed orientation,
+             which renders the camera preview sideways during pairing on many
+             phones. Pinning it to portrait (this app is portrait-only) keeps the
+             preview upright. Launched via CaptureActivityPortrait with
+             setOrientationLocked(false) so this orientation wins. -->
+        <activity
+            android:name=".ui.qr.CaptureActivityPortrait"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:stateNotNeeded="true"
+            android:theme="@style/zxing_CaptureTheme"
+            tools:ignore="LockedOrientationActivity" />
+
         <service
             android:name=".RayfishVpnService"
             android:exported="false"
