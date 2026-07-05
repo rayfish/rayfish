@@ -8,6 +8,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ray unpair <device>`**: revoke one of your paired devices, for example a
+  lost or stolen laptop. Run it from your **primary** device (the one you paired
+  the others from). Device certificates now carry a generation; unpairing bumps
+  your generation and publishes the new value (a single signed number) under your
+  user identity, so every peer rejects any certificate below it — even on
+  networks you do not run. Your **other** devices are automatically re-issued
+  fresh certificates and keep working; only the removed device is left behind.
+  The removed device is dropped from your networks, stops being treated as one of
+  your own devices (no silent auto-admit, no own-device file auto-accept), and,
+  if online and cooperative, is told to delete its own certificate. List your
+  paired devices first with `ray pair list` (`--json` supported). Notes: a device
+  that was **offline** while you unpaired is refreshed the next time it reconnects
+  to your primary (until then other networks reject it); the generation stays
+  published while your primary runs; and to fully retire a device from a network
+  someone else runs, ask that network's coordinator to remove it too.
 - **Device ownership in `ray status`**: peer rows that are your own paired
   devices are now tagged `(your device)`, and a paired device belonging to
   another user is labelled `(user <id>)` (or shows that user's alias when you

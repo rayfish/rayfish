@@ -159,6 +159,35 @@ impl CoordinatorAcceptState {
                 tracing::warn!(peer = %remote_id.fmt_short(), "invalid device certificate");
                 return;
             }
+            // Judge the cert against the generation floor (`ray unpair`). This one
+            // check covers every admission branch below — owner auto-admit,
+            // invite, live-approved, and open. A cert below the floor (a revoked
+            // device, or a stale sibling seen from a secondary) is rejected; our
+            // own stale-but-kept device is admitted and re-issued a fresh cert.
+            let (issuing, my_gen, revoked) =
+                cert_authority(self.ctx.identity.local_identity());
+            match revocation::cert_decision(
+                cert,
+                issuing,
+                my_gen,
+                &|d| revoked.contains(d),
+                &self.ctx.revocation,
+            ) {
+                revocation::CertDecision::Reject => {
+                    tracing::warn!(peer = %remote_id.fmt_short(), "rejecting revoked/stale device certificate");
+                    return;
+                }
+                revocation::CertDecision::Reissue => {
+                    // Our own kept device that was offline during a rotation:
+                    // push it a fresh cert at our current generation, then admit.
+                    if let Ok(secret) = crate::identity::load_or_create() {
+                        let fresh =
+                            control::DeviceCert::create(&secret, &cert.device_key, my_gen);
+                        push_cert_refresh(&conn, fresh).await;
+                    }
+                }
+                revocation::CertDecision::Admit => {}
+            }
             self.ctx
                 .device_user_map
                 .insert(remote_id, cert.user_identity);
@@ -907,7 +936,7 @@ mod pending_cap_tests {
         let owner = iroh::SecretKey::from([7u8; 32]);
         let owner_id = owner.public();
         let device = iroh::SecretKey::from([9u8; 32]).public();
-        let cert = control::DeviceCert::create(&owner, &device);
+        let cert = control::DeviceCert::create(&owner, &device, 0);
 
         // Cert signed by this owner -> admit.
         assert!(owner_admits(Some(&cert), owner_id));

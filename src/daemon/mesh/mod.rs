@@ -34,6 +34,10 @@ mod select;
 // `pub(crate) use mesh::*`).
 pub(crate) use accept::*;
 pub(crate) use coordinator::*;
+// Device-side unpair wipe + cert-refresh helpers, reached by both control readers.
+pub(crate) use files::{
+    cert_authority, push_cert_refresh, store_refreshed_cert, wipe_cert_if_unpaired_by,
+};
 pub(crate) use join::*;
 pub(crate) use publish::*;
 pub(crate) use reconverge::*;
