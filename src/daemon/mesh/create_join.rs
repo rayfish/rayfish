@@ -3,6 +3,15 @@
 
 use super::super::*;
 
+/// Upper bound on a single proactive full-mesh dial in `dial_all_members`. An
+/// offline peer's `connect` fails on its own (fast when it has no fresh
+/// discovery record, but up to iroh's internal handshake timeout — tens of
+/// seconds — when a stale record still points at it). We cap it so a
+/// restart/reconnect never blocks that long on a dead peer: the dial is
+/// best-effort and the peer's own reconnect loop re-establishes the link once it
+/// comes back online.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Borrowed bundle of the per-join inputs threaded through the dial + finalize
 /// phases of `join_network_inner`, so each phase takes one argument instead of a
 /// dozen. The references point at locals that live for the whole join.
@@ -1252,8 +1261,19 @@ impl MeshManager {
             let disconnect_tx = disconnect_tx.clone();
             let cancel = cancel.clone();
             dials.push(async move {
-                match transport::connect_to_peer_with_alpn(&self.endpoint, m.identity, alpn).await {
-                    Ok(peer_conn) => {
+                // Bound the dial and honor cancellation: an unreachable peer would
+                // otherwise sit in iroh's internal handshake timeout, keeping this
+                // background task alive (and deaf to `leave`/`down`/shutdown) far
+                // longer than the dial is worth.
+                let conn = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    r = tokio::time::timeout(
+                        DIAL_TIMEOUT,
+                        transport::connect_to_peer_with_alpn(&self.endpoint, m.identity, alpn),
+                    ) => r,
+                };
+                match conn {
+                    Ok(Ok(peer_conn)) => {
                         if let Ok((mut s, _)) = peer_conn.open_bi().await {
                             let _ = control::send_msg(
                                 &mut s,
@@ -1298,12 +1318,20 @@ impl MeshManager {
                             "dialed known member on restore/join (full mesh)"
                         );
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::debug!(
                             network = %network_name,
                             peer = %m.identity.fmt_short(),
                             error = %e,
                             "could not dial member yet; reconnect loop will retry"
+                        );
+                    }
+                    Err(_elapsed) => {
+                        tracing::debug!(
+                            network = %network_name,
+                            peer = %m.identity.fmt_short(),
+                            timeout_secs = DIAL_TIMEOUT.as_secs(),
+                            "dial timed out; reconnect loop will retry"
                         );
                     }
                 }

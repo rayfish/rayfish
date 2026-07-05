@@ -6,6 +6,11 @@ use std::path::Path;
 
 use super::super::*;
 
+/// Upper bound on the pairing dial to a primary device. `Endpoint::connect`
+/// retries discovery/relay with no timeout of its own, so without this an
+/// unreachable primary hangs the pairing call forever.
+const PAIR_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
 impl MeshManager {
     pub(crate) async fn resolve_peer_name(&self, name: &str) -> Option<EndpointId> {
         let suffix = format!(".{}", crate::DNS_DOMAIN);
@@ -434,22 +439,46 @@ impl MeshManager {
 
         *self.files.pairing_secret.lock().unwrap() = Some(secret);
 
+        tracing::info!("pairing session opened; awaiting a secondary to scan the ticket");
         IpcMessage::PairingTicket { ticket }
     }
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// pair this device with a primary device using a scanned ticket.
+    #[tracing::instrument(skip_all, fields(primary = %endpoint_id.fmt_short()))]
     pub async fn pair_with_device(
         self: &Arc<Self>,
         endpoint_id: EndpointId,
         secret: Vec<u8>,
     ) -> IpcMessage {
         let addr: iroh::EndpointAddr = endpoint_id.into();
-        let conn = match self.endpoint.connect(addr, PAIR_ALPN).await {
-            Ok(c) => c,
-            Err(e) => {
+        tracing::info!(primary = %endpoint_id.fmt_short(), "dialing primary device for pairing");
+        // `Endpoint::connect` has no built-in timeout: if a path to the primary
+        // never establishes (primary offline, no open pairing session, or an
+        // unreachable relay/NAT path) it keeps retrying discovery and the caller
+        // hangs indefinitely. Bound it so pairing fails fast with a clear message.
+        let conn = match tokio::time::timeout(
+            PAIR_CONNECT_TIMEOUT,
+            self.endpoint.connect(addr, PAIR_ALPN),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "pairing: could not connect to primary device");
                 return IpcMessage::Error {
                     message: format!("failed to connect to primary device: {e}"),
+                };
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = PAIR_CONNECT_TIMEOUT.as_secs(),
+                    "pairing: timed out connecting to primary device"
+                );
+                return IpcMessage::Error {
+                    message: "timed out reaching the primary device. Make sure it is online and \
+                              that you opened pairing on it (run `ray pair` there)."
+                        .to_string(),
                 };
             }
         };
@@ -557,6 +586,7 @@ impl MeshManager {
                         }
                     });
                 }
+                tracing::info!("pairing complete; device certificate stored");
                 IpcMessage::PairingComplete {
                     user_identity: cert.user_identity,
                 }
