@@ -106,9 +106,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   beats drop-oldest for a VPN), and the QUIC transport is tuned for the one
   datagram stream per peer shape. Keeps the send path non-blocking with no
   cross-peer head-of-line blocking.
+- **Faster reconnect on startup**: when a coordinator rejoins its networks it now
+  dials all known members concurrently instead of one at a time, so restore no
+  longer slows down with roster size or stalls on the first unreachable peer.
 
 ### Fixed
 
+- **`ray status` no longer flashes "no active networks" right after a daemon
+  (re)start**: the daemon began answering commands a moment before it finished
+  restoring your saved networks, so a `ray status` in that window (common right
+  after `ray restart` or an update) wrongly reported no networks even though they
+  were intact on disk. Coordinator networks are now registered before the daemon
+  accepts commands, so they show up immediately; connecting to peers still happens
+  in the background.
+- **QR scanner no longer opens sideways**: the pairing/join camera scanner
+  followed the rotation sensor and came up in landscape; it is now locked to
+  portrait.
 - **`ray status` peer traffic counters now line up**: the per-peer up/down
   columns were packed into a single field, so the `↓` counter drifted from row to
   row and the block did not read as a table. Up and down are now their own
