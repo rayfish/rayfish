@@ -261,6 +261,7 @@ async fn build_daemon(
         connect,
         device_cert,
         device_user_map,
+        revocation: crate::revocation::RevocationCache::new(),
         pruned_peers: Arc::new(DashSet::new()),
         contact_public,
         active: active.clone(),
@@ -281,6 +282,28 @@ async fn build_daemon(
     // --- Contact record publisher (ray connect) ---
     if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
         spawn_contact_publisher(pkarr_client, daemon.endpoint.id(), token.clone());
+    }
+
+    // --- Device-cert revocation (ray unpair) ---
+    // Seed the floor cache from this user's persisted generation so it is
+    // enforced locally the instant the daemon comes up, ahead of any pkarr fetch.
+    // A primary's endpoint id is the user identity that signed the certs.
+    {
+        let cfg = config::load().unwrap_or_default();
+        let own_user = daemon
+            .device_cert
+            .as_ref()
+            .map(|c| c.user_identity)
+            .unwrap_or_else(|| daemon.endpoint.id());
+        if cfg.cert_generation > 0 {
+            daemon.revocation.set_local(own_user, cfg.cert_generation);
+        }
+    }
+    if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
+        spawn_revocation_publisher(pkarr_client, token.clone());
+    }
+    if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
+        spawn_revocation_poller(daemon.clone(), pkarr_client, token.clone());
     }
     let metrics_server =
         spawn_metrics_server(stats, daemon.peers.clone(), &daemon.endpoint, token).await;

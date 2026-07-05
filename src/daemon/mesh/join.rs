@@ -290,6 +290,7 @@ fn persist_join_config(
         direct,
         ssh_allow,
         aliases,
+        ephemeral_ttl_secs: None,
     })
 }
 
@@ -776,6 +777,16 @@ fn spawn_member_control_listener(
                                     if let Some((_, tx)) = pending_pongs.remove(&nonce) {
                                         let _ = tx.send(());
                                     }
+                                }
+                                ControlMsg::Unpaired => {
+                                    // Our primary is unpairing this device. The
+                                    // helper verifies the sender signed our cert,
+                                    // so a stranger is a no-op.
+                                    wipe_cert_if_unpaired_by(initial_conn.remote_id());
+                                }
+                                ControlMsg::CertRefresh { cert } => {
+                                    // Our primary rotated and re-issued us.
+                                    store_refreshed_cert(&cert);
                                 }
                                 _ => {}
                             }

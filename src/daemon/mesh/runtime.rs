@@ -69,6 +69,7 @@ impl MeshManager {
                             user_identity: None,
                             device_cert: None,
                             collision_index: 0,
+                            last_seen: None,
                         });
                     }
                     for entry in &nc.approved {
@@ -95,6 +96,7 @@ impl MeshManager {
                     user_identity: None,
                     device_cert: None,
                     collision_index: 0,
+                    last_seen: None,
                 })
                 .expect("self-add cannot collide");
         }
@@ -195,6 +197,7 @@ impl MeshManager {
                 .map(|nc| nc.ssh_allow.clone())
                 .unwrap_or_default(),
             aliases: net_config.map(|nc| nc.aliases.clone()).unwrap_or_default(),
+            ephemeral_ttl_secs: None,
         })?;
 
         let cancel = self.shutdown_token.child_token();
@@ -444,39 +447,66 @@ impl MeshManager {
             };
         }
 
-        // Prune the roster + approved list, then republish the signed blob so the
-        // removal is authoritative, and drop the target's DNS entries.
-        {
-            let mut s = state.write().unwrap();
-            s.members.remove(&member_id);
-            s.approved.remove(&member_id);
-        }
-        dns::remove_hostname_by_ip(
-            &self.dns.hostname_table,
-            &self.dns.reverse_table,
-            network,
-            member_ip,
-        )
-        .await;
-        update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
-        broadcast_member_sync(&self.peers, None).await;
-
-        // Sever our own link(s) to the target now, rather than waiting for it to
-        // time out. Other members drop it when they reconverge from the freshly
-        // published record (`prune_departed_peers`).
-        for (pid, ip, conn) in self.peers.peers_for_network_with_conn(network) {
-            if pid == member_id || self.device_user_map.resolve(&pid) == member_id {
-                conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
-                self.peers
-                    .remove_peer_from_network(&ip, &derive_ipv6(&pid), network);
-            }
-        }
+        // Prune the roster + DNS, then publish + broadcast + sever the link.
+        let ctx = self.mesh_ctx();
+        remove_member_roster_only(&ctx, network, &state, member_id, member_ip).await;
+        finalize_removal(&ctx, network, &state, &dht_notify, &[member_id]).await;
 
         tracing::info!(peer = %member_id.fmt_short(), network = %network, "kicked member");
         IpcMessage::Ok {
             message: format!("kicked '{display}' from '{network}'"),
         }
     }
+
+    /// Set or clear the per-network ephemeral policy (coordinator-local). A
+    /// `None` TTL disables it. Persisted to the network's config; the pruner
+    /// re-reads it each tick, so no restart is needed.
+    pub(crate) async fn set_ephemeral(&self, network: &str, ttl_secs: Option<u64>) -> IpcMessage {
+        let mut cfg = match config::load_network(network) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return IpcMessage::Error {
+                    message: format!("network '{network}' not found"),
+                };
+            }
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to load network '{network}': {e}"),
+                };
+            }
+        };
+        cfg.ephemeral_ttl_secs = ttl_secs;
+        if let Err(e) = config::save_network(&cfg) {
+            return IpcMessage::Error {
+                message: format!("failed to save network '{network}': {e}"),
+            };
+        }
+        match ttl_secs {
+            Some(s) => IpcMessage::Ok {
+                message: format!("ephemeral policy on '{network}' set to {s}s"),
+            },
+            None => IpcMessage::Ok {
+                message: format!("ephemeral policy on '{network}' disabled"),
+            },
+        }
+    }
+
+    /// Read the per-network ephemeral TTL (open read).
+    pub(crate) fn get_ephemeral(&self, network: &str) -> IpcMessage {
+        match config::load_network(network) {
+            Ok(Some(c)) => IpcMessage::EphemeralStatus {
+                network: network.to_string(),
+                ttl_secs: c.ephemeral_ttl_secs,
+            },
+            Ok(None) => IpcMessage::Error {
+                message: format!("network '{network}' not found"),
+            },
+            Err(e) => IpcMessage::Error {
+                message: format!("failed to load network '{network}': {e}"),
+            },
+        }
+    }
+
 
     /// Connect to every saved network (control plane). Run once at daemon
     /// startup so mesh connections follow the daemon lifecycle, not the data

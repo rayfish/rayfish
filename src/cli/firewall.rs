@@ -877,6 +877,7 @@ mod tests {
             pending_suggestions: 0,
             pending_requests: 0,
             aliases: Default::default(),
+            ephemeral_ttl_secs: None,
         }
     }
 
