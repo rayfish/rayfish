@@ -101,6 +101,16 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 }
             }
         }
+        var autoAcceptOwn by remember { mutableStateOf(NodeHolder.isAutoAcceptOwnDevices(context)) }
+        ToggleCard(
+            title = "Auto-accept from my devices",
+            subtitle = if (autoAcceptOwn) "on · files from your paired devices save to Downloads" else "off · accept them manually",
+            checked = autoAcceptOwn,
+            onCheckedChange = { on ->
+                autoAcceptOwn = on
+                NodeHolder.setAutoAcceptOwnDevices(context, on)
+            },
+        )
         var crashReporting by remember { mutableStateOf(NodeHolder.isCrashReportingEnabled(context)) }
         ToggleCard(
             title = "Crash reporting",

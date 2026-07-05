@@ -523,6 +523,10 @@ pub struct PendingFileInfo {
     pub filename: String,
     pub size: u64,
     pub mime_type: String,
+    /// True when the sender resolves to one of the recipient's own paired
+    /// devices (used by the mobile UI to auto-accept own-device offers).
+    #[serde(default)]
+    pub own_device: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -962,6 +966,7 @@ mod tests {
             bytes_tx: 0,
             pending_files: 0,
             pending_connects: 0,
+            pending_networks: vec![],
         };
         let bytes = rmp_serde::to_vec(&resp).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();

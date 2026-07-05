@@ -1,12 +1,9 @@
 package xyz.rayfish.android.ui.screens
 
 import android.app.Activity
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.net.VpnService
-import android.os.Build
-import android.provider.MediaStore
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
@@ -26,8 +23,10 @@ import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.FileOffer
 import uniffi.ray_mobile.PendingRequest
 import uniffi.ray_mobile.Status
+import xyz.rayfish.android.FileAutoAccept
 import xyz.rayfish.android.NodeHolder
 import xyz.rayfish.android.RayfishVpnService
+import xyz.rayfish.android.moveToDownloads
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
 import java.io.File
@@ -96,6 +95,9 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     suspend fun reloadNotifs() {
         withContext(Dispatchers.IO) {
             val node = NodeHolder.get(context)
+            // Auto-accept own-device offers first so they don't linger as manual
+            // "Save" prompts; the list below then shows only offers from others.
+            runCatching { FileAutoAccept.run(context) }
             files = runCatching { node.listFileOffers() }.getOrDefault(emptyList())
             connects = runCatching { node.listConnectRequests() }.getOrDefault(emptyList())
             joins = currentNets.filter { it.isCoordinator }.flatMap { n ->
@@ -202,36 +204,6 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                 }
             }
         }
-    }
-}
-
-/**
- * Copy [src] into the device's public Downloads collection via MediaStore and
- * delete the app-private staging copy. Returns true on success. On API < 29
- * (no scoped MediaStore Downloads) it leaves the file in place and returns
- * false, so the caller can report the fallback location.
- */
-private fun moveToDownloads(context: Context, src: File, displayName: String, mime: String): Boolean {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
-    if (!src.exists()) return false
-    val resolver = context.contentResolver
-    val values = ContentValues().apply {
-        put(MediaStore.Downloads.DISPLAY_NAME, displayName)
-        if (mime.isNotEmpty()) put(MediaStore.Downloads.MIME_TYPE, mime)
-        put(MediaStore.Downloads.IS_PENDING, 1)
-    }
-    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return false
-    return try {
-        resolver.openOutputStream(uri)?.use { out -> src.inputStream().use { it.copyTo(out) } }
-            ?: return false
-        values.clear()
-        values.put(MediaStore.Downloads.IS_PENDING, 0)
-        resolver.update(uri, values, null, null)
-        src.delete()
-        true
-    } catch (t: Throwable) {
-        resolver.delete(uri, null, null)
-        false
     }
 }
 
