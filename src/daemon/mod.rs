@@ -76,6 +76,7 @@ use crate::membership::{
 };
 use crate::network_name;
 use crate::peers::{self, PeerTable};
+use crate::revocation::{self, RevocationCache};
 use crate::stats::ForwardMetrics;
 use crate::transport;
 // The desktop TUN device and its CGNAT pre-flight check don't exist on Android,
@@ -139,6 +140,10 @@ pub(crate) struct MeshCtx {
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
     device_user_map: peers::DeviceUserMap,
+    /// Last-known revoked device keys per user identity (`ray unpair`). Consulted
+    /// wherever a `DeviceCert` is trusted (admission, MeshHello, reconverge) so a
+    /// revoked device stops being honored mesh-wide. See [`crate::revocation`].
+    revocation: RevocationCache,
     /// Peers removed from a network's roster (via `ray kick` or a stale-entry
     /// prune during reconverge), keyed by `(network, transport id)`. A member
     /// closes such a peer's connection but can't see its own close code, so its
@@ -383,6 +388,8 @@ pub struct MeshManager {
     connect: Arc<ConnectService>,
     device_cert: Option<control::DeviceCert>,
     device_user_map: peers::DeviceUserMap,
+    /// Device-cert revocation cache (`ray unpair`); see [`MeshCtx::revocation`].
+    revocation: RevocationCache,
     /// Peers removed from a roster whose reconnect should be suppressed once.
     /// Shared into [`MeshCtx::pruned_peers`]; see that field for the mechanism.
     pruned_peers: Arc<DashSet<(String, EndpointId)>>,
@@ -489,6 +496,7 @@ impl MeshManager {
             hostname_table: self.dns.hostname_table.clone(),
             reverse_table: self.dns.reverse_table.clone(),
             device_user_map: self.device_user_map.clone(),
+            revocation: self.revocation.clone(),
             pruned_peers: self.pruned_peers.clone(),
         }
     }
@@ -699,6 +707,7 @@ impl MeshManager {
                 | IpcMessage::Ping { .. }
                 | IpcMessage::Netcheck
                 | IpcMessage::AliasList { .. }
+                | IpcMessage::ListPairedDevices
         ) {
             return None;
         }
@@ -871,6 +880,8 @@ impl MeshManager {
                 endpoint_id,
                 secret,
             } => self.pair_with_device(endpoint_id, secret).await,
+            IpcMessage::ListPairedDevices => self.list_paired_devices(),
+            IpcMessage::Unpair { device } => self.unpair(&device).await,
             IpcMessage::SetOperator { uid } => self.set_operator(uid),
             IpcMessage::InviteCreate {
                 network,
@@ -1287,6 +1298,7 @@ mod accept_handler_tests {
             hostname_table: dns::new_hostname_table(),
             reverse_table: dns::new_reverse_table(),
             device_user_map: peers::DeviceUserMap::new(),
+            revocation: RevocationCache::new(),
             pruned_peers: Arc::new(DashSet::new()),
         }
     }

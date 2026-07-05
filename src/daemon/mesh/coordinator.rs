@@ -101,13 +101,16 @@ pub(crate) fn spawn_coordinator_control_reader(
     pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
 ) {
     let MeshCtx {
+        identity,
         peers,
         blob_store,
         hostname_table,
         reverse_table,
         device_user_map,
+        revocation,
         ..
     } = ctx;
+    let my_identity = identity.local_identity();
     tokio::spawn(async move {
         let mut gate = crate::ratelimit::ControlGate::new();
         loop {
@@ -182,6 +185,19 @@ pub(crate) fn spawn_coordinator_control_reader(
                     }
                     continue;
                 }
+                ControlMsg::Unpaired => {
+                    // The peer claims to be our primary unpairing us. Verified
+                    // inside against our own cert's signer, so a stranger is a
+                    // no-op.
+                    wipe_cert_if_unpaired_by(remote_id);
+                    continue;
+                }
+                ControlMsg::CertRefresh { cert } => {
+                    // Our primary rotated and re-issued us. Verified inside
+                    // against our own cert (signer + device key + generation).
+                    store_refreshed_cert(&cert);
+                    continue;
+                }
                 _ => {}
             }
             let ControlMsg::MeshHello {
@@ -193,10 +209,21 @@ pub(crate) fn spawn_coordinator_control_reader(
                 continue;
             };
 
-            // Verify and store device cert if present.
+            // Verify and store device cert if present, unless it is below the
+            // issuing user's generation floor (`ray unpair`) — a revoked/stale
+            // cert is not recorded as a paired device, so it stops resolving to
+            // the user's identity. (A `Reissue` verdict — our own stale device —
+            // is treated as fine to record; the admission path pushes its refresh.)
+            let cert_ok = device_cert.as_ref().is_some_and(|cert| {
+                if !cert.verify() || cert.device_key != remote_id {
+                    return false;
+                }
+                let (issuing, my_gen, revoked) = cert_authority(my_identity);
+                revocation::cert_decision(cert, issuing, my_gen, &|d| revoked.contains(d), &revocation)
+                    != revocation::CertDecision::Reject
+            });
             if let Some(ref cert) = device_cert
-                && cert.verify()
-                && cert.device_key == remote_id
+                && cert_ok
             {
                 {
                     let mut s = state.write().unwrap();
