@@ -51,6 +51,23 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         .take()
         .expect("promote_rx present after build");
 
+    // Single daemon-wide connection supervisor: consumes every data reader's
+    // disconnect and, per dropped identity, prunes departed peers we coordinate
+    // and reconnects the rest across all their shared networks.
+    let disconnect_rx = daemon
+        .disconnect_rx
+        .lock()
+        .unwrap()
+        .take()
+        .expect("disconnect_rx present after build");
+    {
+        let daemon = daemon.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            daemon.run_connection_supervisor(disconnect_rx, token).await;
+        });
+    }
+
     // Opt-in automatic updates: a single daemon-wide task that periodically
     // checks for a newer stable release and swaps + restarts onto it. Desktop-only
     // (the self-replacing updater is not built into the Android lib).
@@ -237,6 +254,9 @@ async fn build_daemon(
     // Promotion channel: a co-coordinator's control reader signals the main
     // daemon loop to swap in the coordinator accept handler on `AdminGrant`.
     let (promote_tx, promote_rx) = mpsc::channel::<String>(16);
+    // Daemon-wide disconnect channel: every per-connection data reader reports
+    // peer drops here, drained by the single connection supervisor.
+    let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(256);
     let daemon = Arc::new(MeshManager {
         endpoint: ep,
         identity,
@@ -267,6 +287,8 @@ async fn build_daemon(
         ssh_authz: crate::ssh::new_authz(),
         ssh_token: std::sync::Mutex::new(None),
         promote_tx,
+        disconnect_tx,
+        disconnect_rx: std::sync::Mutex::new(Some(disconnect_rx)),
     });
 
     // --- Accept loop (ALPN dispatch) + Prometheus metrics ---

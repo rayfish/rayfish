@@ -107,24 +107,11 @@ impl MeshManager {
             ));
         }
 
-        // Disconnect handler (coordinator removes dead peers, republishes blob)
-        let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
-        tasks.push(spawn_peer_cleanup(
-            disconnect_rx,
-            self.peers.clone(),
-            cancel.clone(),
-            Some(CoordinatorCleanup {
-                state: state.clone(),
-                blob_store: self.blob_store.clone(),
-                dht_notify: Some(dht_notify.clone()),
-                hostname_table: self.dns.hostname_table.clone(),
-                reverse_table: self.dns.reverse_table.clone(),
-                device_user_map: self.device_user_map.clone(),
-                network_name: name.to_string(),
-            }),
-        ));
-
-        (tasks, disconnect_tx)
+        // Dead-peer cleanup + reconnect are handled daemon-wide by the single
+        // connection supervisor (see `MeshManager::run_connection_supervisor`), so
+        // there is no per-network disconnect task any more. Callers still receive
+        // the daemon-wide disconnect sender to build peer readers.
+        (tasks, self.disconnect_tx.clone())
     }
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):

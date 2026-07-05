@@ -261,7 +261,19 @@ pub async fn send_msg(
     Ok(())
 }
 
+/// Read one mesh control message off a stream, discarding the frame envelope.
+/// Used by the handshake paths (join/reconnect/pair) that already know which
+/// network the stream belongs to. The per-connection demux uses [`recv_frame`]
+/// instead, since it must route by `ControlFrame.net`.
 pub async fn recv_msg(stream: &mut RecvStream) -> Result<ControlMsg> {
+    Ok(recv_frame(stream).await?.msg)
+}
+
+/// Read one mesh control message off a stream, keeping the frame envelope (the
+/// network it pertains to, or `None` for connection-level messages). Used by the
+/// per-connection demux (`ProtocolRouter::drive_mesh_connection`) to route each
+/// frame to the right per-network handler.
+pub async fn recv_frame(stream: &mut RecvStream) -> Result<ControlFrame> {
     recv_framed(stream).await
 }
 
