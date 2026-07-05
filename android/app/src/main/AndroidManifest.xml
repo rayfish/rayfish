@@ -74,6 +74,16 @@
             </intent-filter>
         </activity>
 
+        <!-- QR scanner pinned to portrait. zxing's default CaptureActivity
+             follows the rotation sensor and comes up sideways on foldables;
+             forcing the orientation here is the reliable fix. -->
+        <activity
+            android:name=".ui.qr.PortraitCaptureActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:stateNotNeeded="true"
+            tools:ignore="LockedOrientationActivity" />
+
         <service
             android:name=".SendService"
             android:exported="false"

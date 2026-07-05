@@ -142,9 +142,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   were intact on disk. Coordinator networks are now registered before the daemon
   accepts commands, so they show up immediately; connecting to peers still happens
   in the background.
-- **QR scanner no longer opens sideways**: the pairing/join camera scanner
-  followed the rotation sensor and came up in landscape; it is now locked to
-  portrait.
+- **QR scanner no longer opens sideways (including on foldables)**: the
+  pairing/join camera scanner followed the rotation sensor and came up in
+  landscape. Locking it to the launch orientation was not enough on foldables
+  (Galaxy Z Fold), which report landscape at launch, so the scanner is now pinned
+  to portrait outright.
+- **"Send diagnostics" (Android) now reliably delivers each report**: repeat
+  sends folded into a single report and the send was fire-and-forget, so a tap
+  could look like it did nothing. Each report is now delivered before the "sent"
+  confirmation and recorded separately.
+- **Pairing no longer hangs forever when the primary is unreachable**: scanning a
+  pairing code dialed the primary device with no timeout, so if it could not be
+  reached (offline, no open pairing session, or an unreachable network path) the
+  pairing call hung indefinitely with no feedback. It now fails within 20 seconds
+  with a clear message telling you to check that the primary is online and that
+  you opened pairing on it.
 - **`ray status` peer traffic counters now line up**: the per-peer up/down
   columns were packed into a single field, so the `↓` counter drifted from row to
   row and the block did not read as a table. Up and down are now their own
