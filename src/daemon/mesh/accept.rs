@@ -45,13 +45,10 @@ pub(crate) struct CoordinatorAcceptState {
     pub(crate) ctx: MeshCtx,
     pub(crate) network_name: String,
     pub(crate) state: SharedNetworkState,
-    pub(crate) disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     pub(crate) token: CancellationToken,
     pub(crate) dht_notify: Option<Arc<tokio::sync::Notify>>,
     /// Shared with this network's [`NetworkHandle`]; see its `invite_lock`.
     pub(crate) invite_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Shared with the router; lets the control reader resolve `ray ping` Pongs.
-    pub(crate) pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl CoordinatorAcceptState {
@@ -298,7 +295,7 @@ impl CoordinatorAcceptState {
         peer_id: EndpointId,
         id: String,
         secret_hash: Vec<u8>,
-        expires: Option<u64>,
+        expires: u64,
     ) {
         if !sender_is_coordinator(&self.state, peer_id) {
             tracing::warn!(peer = %peer_id.fmt_short(), "ignoring InviteShare from non-coordinator");
@@ -376,6 +373,7 @@ impl CoordinatorAcceptState {
                     gossip_to_coordinators(
                         &self.ctx.peers,
                         &self.network_name,
+                        self.net_pubkey(),
                         &members,
                         self.ctx.identity.local_identity(),
                         &ControlMsg::InviteUsed {

@@ -215,7 +215,6 @@ impl MeshManager {
             invite_lock.clone(),
             Some(dht_notify.clone()),
             net_public_key,
-            disconnect_tx.clone(),
             cancel.clone(),
         );
 
@@ -262,16 +261,13 @@ impl MeshManager {
             .into_iter()
             .cloned()
             .collect();
-        let alpn = transport::network_alpn(&net_public_key);
         self.dial_all_members(
             &members_to_dial,
-            &alpn,
+            net_public_key,
             name,
             self.identity.local_identity(),
             my_ip,
             persisted_hostname.clone(),
-            disconnect_tx.clone(),
-            cancel.clone(),
         )
         .await;
 
@@ -459,7 +455,8 @@ impl MeshManager {
         )
         .await;
         update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
-        broadcast_member_sync(&self.peers, None).await;
+        let net_pubkey = state.read().unwrap().network_public_key;
+        broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
 
         // Sever our own link(s) to the target now, rather than waiting for it to
         // time out. Other members drop it when they reconverge from the freshly
@@ -790,8 +787,7 @@ impl MeshManager {
 
         self.peers.remove_by_network(name);
         dns::remove_network(&self.dns.hostname_table, &self.dns.reverse_table, name).await;
-        self.protocol_router
-            .unregister(&transport::network_alpn(&handle.network_key));
+        self.protocol_router.unregister(&handle.network_key);
         self.refresh_alpns().await;
         true
     }
