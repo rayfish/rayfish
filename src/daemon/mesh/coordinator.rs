@@ -309,3 +309,76 @@ pub(crate) fn sender_is_coordinator(state: &SharedNetworkState, peer: EndpointId
         .iter()
         .any(|m| m.identity == peer && m.is_coordinator)
 }
+
+/// Pure prune decision for one member under the ephemeral policy. Never prunes
+/// a coordinator, self, a currently-connected peer, or one with no `last_seen`.
+/// Otherwise prunes once the offline window exceeds the TTL. `saturating_sub`
+/// guards a clock that moved backwards.
+pub(crate) fn should_prune(
+    m: &Member,
+    connected: bool,
+    is_self: bool,
+    ttl_secs: u64,
+    now: u64,
+) -> bool {
+    if m.is_coordinator || is_self || connected {
+        return false;
+    }
+    match m.last_seen {
+        None => false,
+        Some(t) => now.saturating_sub(t) > ttl_secs,
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    fn mk(seed: u8, is_coordinator: bool, last_seen: Option<u64>) -> Member {
+        let mut key_bytes = [0u8; 32];
+        key_bytes[0] = seed;
+        let id = SecretKey::from(key_bytes).public();
+        Member {
+            identity: id,
+            ip: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            is_coordinator,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+            last_seen,
+        }
+    }
+
+    const TTL: u64 = 3600;
+    const NOW: u64 = 1_000_000;
+
+    #[test]
+    fn never_prunes_coordinator_self_or_connected() {
+        // coordinator, even if long offline
+        assert!(!should_prune(&mk(1, true, Some(0)), false, false, TTL, NOW));
+        // self
+        assert!(!should_prune(&mk(2, false, Some(0)), false, true, TTL, NOW));
+        // currently connected
+        assert!(!should_prune(&mk(3, false, Some(0)), true, false, TTL, NOW));
+    }
+
+    #[test]
+    fn never_prunes_when_last_seen_none() {
+        assert!(!should_prune(&mk(4, false, None), false, false, TTL, NOW));
+    }
+
+    #[test]
+    fn prunes_only_past_the_ttl_strictly() {
+        // exactly at TTL boundary -> not yet (strict `>`)
+        assert!(!should_prune(&mk(5, false, Some(NOW - TTL)), false, false, TTL, NOW));
+        // one second past the TTL -> prune
+        assert!(should_prune(&mk(6, false, Some(NOW - TTL - 1)), false, false, TTL, NOW));
+    }
+
+    #[test]
+    fn backwards_clock_does_not_prune() {
+        // last_seen in the "future" (clock went backwards) -> saturating_sub = 0
+        assert!(!should_prune(&mk(7, false, Some(NOW + 100)), false, false, TTL, NOW));
+    }
+}
