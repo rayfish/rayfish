@@ -108,7 +108,7 @@ impl MeshManager {
 
     /// Restores a coordinator network from saved config (uses the existing name).
     pub(crate) async fn restore_coordinator_network(
-        &self,
+        self: &Arc<Self>,
         name: &str,
         mode: GroupMode,
     ) -> Result<IpcMessage> {
@@ -246,14 +246,6 @@ impl MeshManager {
             }
         }
 
-        // Full mesh: proactively dial every known member so a restarting
-        // coordinator/co-coordinator reconnects to peers that haven't (yet)
-        // dialed in. Without this, a co-coordinator that comes back up only
-        // learns about peers that connect *to it*; it never dials out, so two
-        // co-coordinators restarting together can each show the other as
-        // offline until one is manually disturbed. Done before the handle
-        // takes ownership of `state`/`cancel`/`disconnect_tx`; the accept
-        // handler is already registered so return traffic is handled.
         let members_to_dial: Vec<Member> = state
             .read()
             .unwrap()
@@ -263,18 +255,12 @@ impl MeshManager {
             .cloned()
             .collect();
         let alpn = transport::network_alpn(&net_public_key);
-        self.dial_all_members(
-            &members_to_dial,
-            &alpn,
-            name,
-            self.identity.local_identity(),
-            my_ip,
-            persisted_hostname.clone(),
-            disconnect_tx.clone(),
-            cancel.clone(),
-        )
-        .await;
 
+        // Register the network from its restored local state *before* dialing
+        // peers, so `ray status` / IPC sees it the instant the local restore
+        // finishes. `dial_all_members` awaits a handshake per peer; when it gated
+        // this insert, a freshly (re)started daemon answered `status` with "no
+        // active networks" until every dial resolved.
         let handle = NetworkHandle {
             name: name.to_string(),
             network_key: net_public_key,
@@ -282,13 +268,39 @@ impl MeshManager {
             my_ip,
             state,
             dht_notify: Some(dht_notify),
-            cancel,
+            cancel: cancel.clone(),
             tasks,
             invite_lock,
-            disconnect_tx,
+            disconnect_tx: disconnect_tx.clone(),
         };
         self.networks.insert(name.to_string(), handle);
         self.refresh_alpns().await;
+
+        // Full mesh: proactively dial every known member in the background so a
+        // restarting coordinator/co-coordinator reconnects to peers that haven't
+        // (yet) dialed in — without blocking restore on peer connectivity. Without
+        // the dial, a co-coordinator that comes back up only learns about peers
+        // that connect *to it*, so two co-coordinators restarting together each
+        // show the other offline until one is disturbed. The accept handler is
+        // already registered so return traffic is handled, and the reconnect loop
+        // retries anything still unreachable.
+        {
+            let me = Arc::clone(self);
+            let network_name = name.to_string();
+            tokio::spawn(async move {
+                me.dial_all_members(
+                    &members_to_dial,
+                    &alpn,
+                    &network_name,
+                    me.identity.local_identity(),
+                    my_ip,
+                    persisted_hostname,
+                    disconnect_tx,
+                    cancel,
+                )
+                .await;
+            });
+        }
 
         tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network restored (coordinator)");
 
@@ -491,6 +503,7 @@ impl MeshManager {
             }
         };
         let mut count = 0;
+        let mut coordinator_restores = Vec::new();
         for net in &app_config.networks {
             count += 1;
             if net.network_secret_key.is_some() {
@@ -498,7 +511,7 @@ impl MeshManager {
                 let name = net.name.clone();
                 let mode = net.group_mode;
                 let daemon_c = Arc::clone(self);
-                tokio::spawn(async move {
+                coordinator_restores.push(tokio::spawn(async move {
                     match daemon_c.restore_coordinator_network(&name, mode).await {
                         Ok(IpcMessage::Created { name, .. }) => {
                             tracing::info!(network = %name, "restored coordinator network");
@@ -511,7 +524,7 @@ impl MeshManager {
                         }
                         _ => {}
                     }
-                });
+                }));
             } else {
                 // We're a member, rejoin via DHT lookup.
                 let name = net.name.clone();
@@ -550,6 +563,16 @@ impl MeshManager {
                     }
                 });
             }
+        }
+
+        // Barrier: wait until every saved coordinator network has registered (its
+        // local restore — roster + accept handler — is done) before returning, so
+        // `run_daemon` opens the IPC server only once these networks are visible to
+        // `ray status`. Peer dialing runs in the background (see
+        // `restore_coordinator_network`), so this never blocks on connectivity;
+        // member networks reconnect via their own loop and appear as they connect.
+        for restore in coordinator_restores {
+            let _ = restore.await;
         }
 
         // Resume closed-network joins that were still awaiting approval at shutdown.

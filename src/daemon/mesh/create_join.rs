@@ -1225,62 +1225,79 @@ impl MeshManager {
         // Announce the current name (a pending rename or the confirmed one),
         // read fresh from config, rather than a value captured before a rename.
         let my_hostname = outgoing_hostname(network_name).or(my_hostname);
+        // Dial every member concurrently. Each `connect_to_peer_with_alpn` awaits
+        // an iroh handshake (hundreds of ms, or a multi-second timeout for an
+        // offline peer), so a serial loop made restore/reconnect scale linearly
+        // with the roster and stall on the first unreachable peer. Driving the
+        // dials as a FuturesUnordered runs them all at once: total time is the
+        // slowest single dial, not their sum.
+        let mut dials = futures::stream::FuturesUnordered::new();
         for m in members {
             if m.identity == my_identity {
                 continue;
             }
-            match transport::connect_to_peer_with_alpn(&self.endpoint, m.identity, alpn).await {
-                Ok(peer_conn) => {
-                    if let Ok((mut s, _)) = peer_conn.open_bi().await {
-                        let _ = control::send_msg(
-                            &mut s,
-                            &ControlMsg::MeshHello {
-                                identity: my_identity,
-                                ip: my_ip,
-                                hostname: my_hostname.clone(),
-                                device_cert: self.current_device_cert(),
+            let my_hostname = my_hostname.clone();
+            let disconnect_tx = disconnect_tx.clone();
+            let cancel = cancel.clone();
+            dials.push(async move {
+                match transport::connect_to_peer_with_alpn(&self.endpoint, m.identity, alpn).await {
+                    Ok(peer_conn) => {
+                        if let Ok((mut s, _)) = peer_conn.open_bi().await {
+                            let _ = control::send_msg(
+                                &mut s,
+                                &ControlMsg::MeshHello {
+                                    identity: my_identity,
+                                    ip: my_ip,
+                                    hostname: my_hostname,
+                                    device_cert: self.current_device_cert(),
+                                },
+                            )
+                            .await;
+                        }
+                        crate::spawn_path_logger(
+                            peer_conn.clone(),
+                            m.identity.fmt_short().to_string(),
+                        );
+                        self.peers.add(
+                            m.ip,
+                            derive_ipv6(&m.identity),
+                            peer_conn.clone(),
+                            m.identity,
+                            network_name,
+                        );
+                        forward::spawn_peer_reader(
+                            peer_conn,
+                            m.identity,
+                            m.ip,
+                            derive_ipv6(&m.identity),
+                            network_name.to_string(),
+                            forward::ForwardCtx {
+                                firewall: self.firewall.clone(),
+                                tun_tx: self.tun_tx.clone(),
+                                disconnect_tx,
+                                token: cancel,
+                                stats: self.stats.clone(),
+                                device_user_map: self.device_user_map.clone(),
                             },
-                        )
-                        .await;
+                        );
+                        tracing::info!(
+                            network = %network_name,
+                            peer = %m.identity.fmt_short(),
+                            "dialed known member on restore/join (full mesh)"
+                        );
                     }
-                    crate::spawn_path_logger(peer_conn.clone(), m.identity.fmt_short().to_string());
-                    self.peers.add(
-                        m.ip,
-                        derive_ipv6(&m.identity),
-                        peer_conn.clone(),
-                        m.identity,
-                        network_name,
-                    );
-                    forward::spawn_peer_reader(
-                        peer_conn,
-                        m.identity,
-                        m.ip,
-                        derive_ipv6(&m.identity),
-                        network_name.to_string(),
-                        forward::ForwardCtx {
-                            firewall: self.firewall.clone(),
-                            tun_tx: self.tun_tx.clone(),
-                            disconnect_tx: disconnect_tx.clone(),
-                            token: cancel.clone(),
-                            stats: self.stats.clone(),
-                            device_user_map: self.device_user_map.clone(),
-                        },
-                    );
-                    tracing::info!(
-                        network = %network_name,
-                        peer = %m.identity.fmt_short(),
-                        "dialed known member on restore/join (full mesh)"
-                    );
+                    Err(e) => {
+                        tracing::debug!(
+                            network = %network_name,
+                            peer = %m.identity.fmt_short(),
+                            error = %e,
+                            "could not dial member yet; reconnect loop will retry"
+                        );
+                    }
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        network = %network_name,
-                        peer = %m.identity.fmt_short(),
-                        error = %e,
-                        "could not dial member yet; reconnect loop will retry"
-                    );
-                }
-            }
+            });
         }
+        use futures::StreamExt;
+        while dials.next().await.is_some() {}
     }
 }
