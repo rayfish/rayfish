@@ -124,6 +124,16 @@ impl MeshManager {
             }),
         ));
 
+        // Ephemeral policy pruner (coordinator-only): auto-remove members
+        // offline longer than the network's configured TTL. No-op while unset.
+        tasks.push(spawn_stale_member_pruner(
+            self.mesh_ctx(),
+            name.to_string(),
+            state.clone(),
+            Some(dht_notify.clone()),
+            cancel.clone(),
+        ));
+
         (tasks, disconnect_tx)
     }
 
@@ -177,6 +187,7 @@ impl MeshManager {
                 user_identity: None,
                 device_cert: None,
                 collision_index: 0,
+                last_seen: None,
             })
             .expect("self-add cannot collide");
 
@@ -300,6 +311,7 @@ impl MeshManager {
             direct,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
+            ephemeral_ttl_secs: None,
         })?;
 
         let cancel = self.shutdown_token.child_token();

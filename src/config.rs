@@ -160,6 +160,12 @@ pub struct NetworkConfig {
     /// GroupBlob.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub aliases: BTreeMap<String, String>,
+    /// Coordinator-local ephemeral policy: auto-remove a member offline
+    /// longer than this many seconds. `None` = off (default). A 1-hour floor
+    /// is enforced at the CLI. Local only (only the coordinator enforces);
+    /// never rides the signed blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_ttl_secs: Option<u64>,
 }
 
 /// One mesh-SSH authorization entry: a peer and the local unix users it may log
@@ -430,6 +436,18 @@ pub struct AppConfig {
     /// admission. See [`PendingJoinEntry`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_joins: Vec<PendingJoinEntry>,
+    /// This user's current device-cert generation (`ray unpair` / rotation). A
+    /// bump revokes every device below it; the current value is published to
+    /// pkarr as the "floor" that verifiers reject certs beneath. `0` means no
+    /// rotation has happened. See [`crate::revocation`].
+    #[serde(default)]
+    pub cert_generation: u64,
+    /// Device keys this user has revoked via `ray unpair` (hex `EndpointId`).
+    /// **Local-only, never published** — the generation floor is what propagates.
+    /// The primary keeps this list so it can refuse to re-issue a revoked device
+    /// that reconnects with a stale cert, while re-issuing the devices it keeps.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_devices: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -450,6 +468,8 @@ impl Default for AppConfig {
             download_user: None,
             networks: Vec::new(),
             pending_joins: Vec::new(),
+            cert_generation: 0,
+            revoked_devices: Vec::new(),
         }
     }
 }
@@ -464,6 +484,16 @@ pub fn contact_secret(config: &mut AppConfig) -> SecretKey {
     let secret = SecretKey::generate();
     config.contact_secret_key = Some(secret.clone());
     secret
+}
+
+/// Parse the persisted revoked device keys (`revoked_devices`) into
+/// `EndpointId`s, skipping any malformed entry.
+pub fn revoked_device_ids(config: &AppConfig) -> Vec<EndpointId> {
+    config
+        .revoked_devices
+        .iter()
+        .filter_map(|s| s.parse::<EndpointId>().ok())
+        .collect()
 }
 
 /// Rotate this node's contact key, replacing it with a fresh one. The old
@@ -528,6 +558,10 @@ struct Settings {
     download_user: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_joins: Vec<PendingJoinEntry>,
+    #[serde(default)]
+    cert_generation: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    revoked_devices: Vec<String>,
 }
 
 /// Look up the `rayfish` group's gid (Linux), if the group exists.
@@ -775,6 +809,8 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
             download_dir: None,
             download_user: None,
             pending_joins: Vec::new(),
+            cert_generation: 0,
+            revoked_devices: Vec::new(),
         }
     };
 
@@ -818,6 +854,8 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         download_user: settings.download_user,
         networks,
         pending_joins: settings.pending_joins,
+        cert_generation: settings.cert_generation,
+        revoked_devices: settings.revoked_devices,
     })
 }
 
@@ -842,6 +880,8 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         download_dir: config.download_dir.clone(),
         download_user: config.download_user,
         pending_joins: config.pending_joins.clone(),
+        cert_generation: config.cert_generation,
+        revoked_devices: config.revoked_devices.clone(),
     };
     let path = dir.join(SETTINGS_FILE);
     let contents = toml::to_string_pretty(&settings).context("serializing settings")?;
@@ -1002,6 +1042,7 @@ mod tests {
                     direct: false,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
+                    ephemeral_ttl_secs: None,
                 },
                 NetworkConfig {
                     name: "work".to_string(),
@@ -1020,6 +1061,7 @@ mod tests {
                     direct: false,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
+                    ephemeral_ttl_secs: None,
                 },
             ],
             ..Default::default()
@@ -1059,6 +1101,7 @@ mod tests {
             direct: false,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
+            ephemeral_ttl_secs: None,
         };
         upsert_network(&mut config, net);
         assert_eq!(config.networks.len(), 1);
@@ -1086,6 +1129,7 @@ mod tests {
                 direct: false,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
+                ephemeral_ttl_secs: None,
             }],
             ..Default::default()
         };
@@ -1106,6 +1150,7 @@ mod tests {
             direct: false,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
+            ephemeral_ttl_secs: None,
         };
         upsert_network(&mut config, updated.clone());
         assert_eq!(config.networks.len(), 1);
@@ -1137,6 +1182,7 @@ mod tests {
                     direct: false,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
+                    ephemeral_ttl_secs: None,
                 },
                 NetworkConfig {
                     name: "remove-me".to_string(),
@@ -1155,6 +1201,7 @@ mod tests {
                     direct: false,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
+                    ephemeral_ttl_secs: None,
                 },
             ],
             ..Default::default()
@@ -1201,6 +1248,7 @@ mod tests {
                 direct: false,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
+                ephemeral_ttl_secs: None,
             }],
             ..Default::default()
         };
@@ -1232,6 +1280,7 @@ mod tests {
                 direct: false,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
+                ephemeral_ttl_secs: None,
             }],
             ..Default::default()
         };
@@ -1287,6 +1336,18 @@ name = "test"
         assert!(config.networks[0].network_public_key.is_none());
     }
 
+    #[test]
+    fn ephemeral_ttl_roundtrips_and_defaults_none() {
+        let mut n = net("eph");
+        n.ephemeral_ttl_secs = Some(3600);
+        let text = toml::to_string(&n).unwrap();
+        let back: NetworkConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.ephemeral_ttl_secs, Some(3600));
+        // A config written before the field existed omits the key -> None.
+        let minimal: NetworkConfig = toml::from_str("name = \"x\"").unwrap();
+        assert_eq!(minimal.ephemeral_ttl_secs, None);
+    }
+
     fn net(name: &str) -> NetworkConfig {
         NetworkConfig {
             name: name.to_string(),
@@ -1305,6 +1366,7 @@ name = "test"
             direct: false,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
+            ephemeral_ttl_secs: None,
         }
     }
 
