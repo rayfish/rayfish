@@ -976,6 +976,7 @@ mod tests {
                 pending_suggestions: 0,
                 pending_requests: 0,
                 aliases: BTreeMap::new(),
+                ephemeral_ttl_secs: None,
             }],
             packets_rx: 0,
             packets_tx: 0,
