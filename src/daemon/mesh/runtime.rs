@@ -461,11 +461,17 @@ impl MeshManager {
         // Sever our own link(s) to the target now, rather than waiting for it to
         // time out. Other members drop it when they reconverge from the freshly
         // published record (`prune_departed_peers`).
-        for (pid, ip, conn) in self.peers.peers_for_network_with_conn(network) {
+        for (pid, ip, _conn) in self.peers.peers_for_network_with_conn(network) {
             if pid == member_id || self.device_user_map.resolve(&pid) == member_id {
-                conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
-                self.peers
-                    .remove_peer_from_network(&ip, &derive_ipv6(&pid), network);
+                // Only close the shared connection if this was the peer's last
+                // network with us; otherwise just drop this network's route so a
+                // peer we share other networks with stays reachable there.
+                if let Some(conn) =
+                    self.peers
+                        .remove_peer_from_network(&ip, &derive_ipv6(&pid), network)
+                {
+                    conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
+                }
             }
         }
 
