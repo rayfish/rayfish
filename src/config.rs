@@ -160,6 +160,12 @@ pub struct NetworkConfig {
     /// GroupBlob.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub aliases: BTreeMap<String, String>,
+    /// Coordinator-local ephemeral policy: auto-remove a member offline
+    /// longer than this many seconds. `None` = off (default). A 1-hour floor
+    /// is enforced at the CLI. Local only (only the coordinator enforces);
+    /// never rides the signed blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_ttl_secs: Option<u64>,
 }
 
 /// One mesh-SSH authorization entry: a peer and the local unix users it may log
@@ -1002,6 +1008,7 @@ mod tests {
                     direct: false,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
+                    ephemeral_ttl_secs: None,
                 },
                 NetworkConfig {
                     name: "work".to_string(),
@@ -1020,6 +1027,7 @@ mod tests {
                     direct: false,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
+                    ephemeral_ttl_secs: None,
                 },
             ],
             ..Default::default()
@@ -1059,6 +1067,7 @@ mod tests {
             direct: false,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
+            ephemeral_ttl_secs: None,
         };
         upsert_network(&mut config, net);
         assert_eq!(config.networks.len(), 1);
@@ -1086,6 +1095,7 @@ mod tests {
                 direct: false,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
+                ephemeral_ttl_secs: None,
             }],
             ..Default::default()
         };
@@ -1106,6 +1116,7 @@ mod tests {
             direct: false,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
+            ephemeral_ttl_secs: None,
         };
         upsert_network(&mut config, updated.clone());
         assert_eq!(config.networks.len(), 1);
@@ -1137,6 +1148,7 @@ mod tests {
                     direct: false,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
+                    ephemeral_ttl_secs: None,
                 },
                 NetworkConfig {
                     name: "remove-me".to_string(),
@@ -1155,6 +1167,7 @@ mod tests {
                     direct: false,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
+                    ephemeral_ttl_secs: None,
                 },
             ],
             ..Default::default()
@@ -1201,6 +1214,7 @@ mod tests {
                 direct: false,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
+                ephemeral_ttl_secs: None,
             }],
             ..Default::default()
         };
@@ -1232,6 +1246,7 @@ mod tests {
                 direct: false,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
+                ephemeral_ttl_secs: None,
             }],
             ..Default::default()
         };
@@ -1287,6 +1302,18 @@ name = "test"
         assert!(config.networks[0].network_public_key.is_none());
     }
 
+    #[test]
+    fn ephemeral_ttl_roundtrips_and_defaults_none() {
+        let mut n = net("eph");
+        n.ephemeral_ttl_secs = Some(3600);
+        let text = toml::to_string(&n).unwrap();
+        let back: NetworkConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.ephemeral_ttl_secs, Some(3600));
+        // A config written before the field existed omits the key -> None.
+        let minimal: NetworkConfig = toml::from_str("name = \"x\"").unwrap();
+        assert_eq!(minimal.ephemeral_ttl_secs, None);
+    }
+
     fn net(name: &str) -> NetworkConfig {
         NetworkConfig {
             name: name.to_string(),
@@ -1305,6 +1332,7 @@ name = "test"
             direct: false,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
+            ephemeral_ttl_secs: None,
         }
     }
 

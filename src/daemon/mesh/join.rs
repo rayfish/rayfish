@@ -290,6 +290,7 @@ fn persist_join_config(
         direct,
         ssh_allow,
         aliases,
+        ephemeral_ttl_secs: None,
     })
 }
 

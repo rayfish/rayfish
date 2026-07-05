@@ -197,6 +197,7 @@ impl MeshManager {
                 .map(|nc| nc.ssh_allow.clone())
                 .unwrap_or_default(),
             aliases: net_config.map(|nc| nc.aliases.clone()).unwrap_or_default(),
+            ephemeral_ttl_secs: None,
         })?;
 
         let cancel = self.shutdown_token.child_token();
