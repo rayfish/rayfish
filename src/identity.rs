@@ -60,6 +60,17 @@ pub fn store_device_cert(cert: &DeviceCert) -> Result<()> {
     Ok(())
 }
 
+/// Delete this device's stored cert (`ray unpair` best-effort wipe on the
+/// unpaired device). Idempotent: succeeds if the file is already absent.
+pub fn delete_device_cert() -> Result<()> {
+    let path = device_cert_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).context("delete device cert"),
+    }
+}
+
 pub fn load_device_cert() -> Result<Option<DeviceCert>> {
     let path = device_cert_path()?;
     if path.exists() {
@@ -93,7 +104,7 @@ mod tests {
 
         let user = SecretKey::generate();
         let device = SecretKey::generate().public();
-        let cert = DeviceCert::create(&user, &device);
+        let cert = DeviceCert::create(&user, &device, 0);
 
         assert!(load_device_cert().unwrap().is_none());
         store_device_cert(&cert).unwrap();

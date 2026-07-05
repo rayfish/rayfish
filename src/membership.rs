@@ -14,6 +14,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::control::DeviceCert;
 
+/// Current Unix time in whole seconds (0 if the clock predates the epoch).
+/// Shared clock source for `Member::last_seen` stamping and the ephemeral pruner.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// A peer that has been admitted to the network.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
@@ -31,6 +40,12 @@ pub struct Member {
     /// collides with an already-assigned address.
     #[serde(default)]
     pub collision_index: u32,
+    /// Unix seconds this peer was last observed going offline. `None` = never
+    /// observed offline, so the ephemeral pruner never evicts it. Stamped on
+    /// disconnect and seeded at admit; part of the hashed blob so it replicates
+    /// to co-coordinators and survives a coordinator restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<u64>,
 }
 
 /// Controls who can approve new members joining the network.
@@ -783,6 +798,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         list.add(member.clone()).unwrap();
         assert!(list.is_member(&id));
@@ -802,6 +818,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         list.add(member).unwrap();
         let found = list.get_by_ip(Ipv4Addr::new(100, 64, 10, 5)).unwrap();
@@ -820,6 +837,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         })
         .unwrap();
         let result = list.add(Member {
@@ -830,6 +848,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         });
         assert!(result.is_err());
     }
@@ -846,6 +865,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         })
         .unwrap();
         list.add(Member {
@@ -856,6 +876,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         })
         .unwrap();
         assert!(list.get(&id).unwrap().is_coordinator);
@@ -873,6 +894,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         })
         .unwrap();
         let removed = list.remove(&id);
@@ -892,6 +914,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         })
         .unwrap();
         list.add(Member {
@@ -902,6 +925,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         })
         .unwrap();
         assert_eq!(list.all().len(), 2);
@@ -918,6 +942,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         assert!(policy.can_authorize(&member));
     }
@@ -933,6 +958,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         let regular = Member {
             identity: test_id(2),
@@ -942,6 +968,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         assert!(policy.can_authorize(&coordinator));
         assert!(!policy.can_authorize(&regular));
@@ -978,6 +1005,7 @@ mod tests {
                 user_identity: None,
                 device_cert: None,
                 collision_index: 0,
+                last_seen: None,
             })
             .unwrap();
         let entry = ApprovedEntry {
@@ -1119,6 +1147,7 @@ mod tests {
                 user_identity: None,
                 device_cert: None,
                 collision_index: 0,
+                last_seen: None,
             });
         }
         list
@@ -1138,6 +1167,7 @@ mod tests {
             user_identity: Some(user),
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         })
         .unwrap();
 
@@ -1309,6 +1339,58 @@ mod tests {
         let result = verify_group_blob(&bytes, &bad_hash);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("hash mismatch"));
+    }
+
+    #[test]
+    fn last_seen_survives_blob_roundtrip() {
+        let id = test_id(7);
+        let mut members = MemberList::new();
+        members
+            .add(Member {
+                identity: id,
+                ip: derive_ip(&id),
+                is_coordinator: false,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+                collision_index: 0,
+                last_seen: Some(12345),
+            })
+            .unwrap();
+        let approved = ApprovedList::new();
+        let sf = ray_proto::SuggestedFirewall::default();
+        let bytes = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new());
+        let hash = group_blob_hash(&members, &approved, &sf, None, &BTreeMap::new());
+        let data = verify_group_blob(&bytes, &hash).unwrap();
+        assert_eq!(data.members[0].last_seen, Some(12345));
+    }
+
+    #[test]
+    fn last_seen_absent_decodes_to_none() {
+        // A member with no last_seen serializes WITHOUT the field
+        // (skip_serializing_if), exactly like a blob published before the field
+        // existed; it must decode to None with no mass eviction on upgrade.
+        let id = test_id(8);
+        let mut members = MemberList::new();
+        members
+            .add(Member {
+                identity: id,
+                ip: derive_ip(&id),
+                is_coordinator: false,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+                collision_index: 0,
+                last_seen: None,
+            })
+            .unwrap();
+        let approved = ApprovedList::new();
+        let sf = ray_proto::SuggestedFirewall::default();
+        let bytes = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new());
+        assert!(!String::from_utf8_lossy(&bytes).contains("last_seen"));
+        let hash = group_blob_hash(&members, &approved, &sf, None, &BTreeMap::new());
+        let data = verify_group_blob(&bytes, &hash).unwrap();
+        assert_eq!(data.members[0].last_seen, None);
     }
 
     #[test]
@@ -1536,6 +1618,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         assert!(validate_member(&member).is_ok());
     }
@@ -1553,6 +1636,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         let err = validate_member(&member).unwrap_err().to_string();
         assert!(err.contains("does not match"), "{err}");
@@ -1569,6 +1653,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         assert!(validate_member(&member).is_err());
     }
@@ -1585,6 +1670,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         let gw = Member {
             identity: id,
@@ -1594,6 +1680,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         assert!(validate_member(&net).is_err());
         assert!(validate_member(&gw).is_err());
@@ -1626,6 +1713,7 @@ mod tests {
                 user_identity: None,
                 device_cert: None,
                 collision_index: 0,
+                last_seen: None,
             };
             assert!(
                 validate_member(&member).is_ok(),
@@ -1649,6 +1737,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         let blob = GroupBlob {
             members: vec![bad_member],
@@ -1673,6 +1762,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         let blob = GroupBlob {
             members: vec![bad_member],
@@ -1697,6 +1787,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         })
         .unwrap();
         mark_coordinator(&mut list, &id);
@@ -1740,10 +1831,12 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 2,
+            last_seen: None,
         };
         assert!(validate_member(&good).is_ok());
         let bad = Member {
             collision_index: 1,
+            last_seen: None,
             ..good.clone()
         }; // ip is for index 2, claims 1
         assert!(validate_member(&bad).is_err());
@@ -1760,6 +1853,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         let dup = derive_ip(&a);
         assert!(validate_no_duplicate_ips(&[m(a, dup), m(test_id(2), dup)]).is_err());
@@ -1786,6 +1880,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: idx_a,
+            last_seen: None,
         })
         .unwrap();
 
@@ -1822,6 +1917,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         let resolved = resolve_ip_tiebreak(vec![mk(hi), mk(lo)]);
         // lower identity keeps `ip`; higher re-rolls to a free index.
@@ -1854,6 +1950,7 @@ mod tests {
             hostname: None,
             user_identity: None,
             device_cert: None,
+            last_seen: None,
         };
         assert!(validate_member(&m).is_err());
     }

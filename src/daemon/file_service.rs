@@ -149,7 +149,15 @@ impl FileService {
                                         .collect(),
                                     Err(_) => Vec::new(),
                                 };
-                                let cert = control::DeviceCert::create(&secret_key, &device_pubkey);
+                                // Issue at our current generation so a freshly
+                                // paired device is already above the floor.
+                                let generation =
+                                    config::load().map(|c| c.cert_generation).unwrap_or(0);
+                                let cert = control::DeviceCert::create(
+                                    &secret_key,
+                                    &device_pubkey,
+                                    generation,
+                                );
                                 let response = control::PairMsg::Response { cert, networks };
                                 let response_bytes = match rmp_serde::to_vec_named(&response) {
                                     Ok(b) => b,

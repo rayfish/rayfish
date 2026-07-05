@@ -56,6 +56,23 @@ pub enum IpcMessage {
         network: String,
         peer: String,
     },
+    /// Coordinator-local: set (or clear) the per-network ephemeral policy — the
+    /// TTL after which an offline member is auto-removed. `ttl_secs = None`
+    /// disables it. Mutation (root/operator).
+    SetEphemeral {
+        network: String,
+        ttl_secs: Option<u64>,
+    },
+    /// Read the per-network ephemeral TTL (open read). Answered with
+    /// `EphemeralStatus`.
+    GetEphemeral {
+        network: String,
+    },
+    /// Response to `GetEphemeral`: the network's current TTL (`None` = off).
+    EphemeralStatus {
+        network: String,
+        ttl_secs: Option<u64>,
+    },
     Status,
     /// Build a diagnostic bundle (logs + metrics + sanitized status) on disk and
     /// return its path plus a pre-filled GitHub issue title/body. Open to any
@@ -205,6 +222,17 @@ pub enum IpcMessage {
     PairWithDevice {
         endpoint_id: EndpointId,
         secret: Vec<u8>,
+    },
+    /// List this user's paired devices (enumerated from the network rosters).
+    /// Reply: [`IpcMessage::PairedDevices`].
+    ListPairedDevices,
+    /// Revoke one of this user's paired devices (`ray unpair`). Primary-only.
+    /// Publishes a signed revocation record, drops the device locally, severs it
+    /// from networks this node coordinates, and best-effort signals the device to
+    /// wipe its own cert. Reply: [`IpcMessage::Ok`] / [`IpcMessage::Error`].
+    Unpair {
+        /// Device identifier: hostname, mesh IP, short id, or full endpoint id.
+        device: String,
     },
     /// Authorize a local user (by UID) to control the daemon without root, the
     /// way `tailscale up --operator` does. Root-only.
@@ -423,6 +451,10 @@ pub enum IpcMessage {
     PairingComplete {
         user_identity: EndpointId,
     },
+    /// This user's paired devices (reply to `ListPairedDevices`).
+    PairedDevices {
+        devices: Vec<PairedDeviceInfo>,
+    },
     /// A diagnostic bundle was written to `path` (a `.tgz`, owned by the caller).
     /// `issue_title`/`issue_body` pre-fill a GitHub issue; the user attaches the
     /// bundle file manually.
@@ -493,6 +525,21 @@ pub struct AdminInfo {
     pub self_node: bool,
 }
 
+/// One of this user's paired secondary devices (reply to `ListPairedDevices`),
+/// enumerated from the network rosters as members whose `user_identity` is ours
+/// but whose device id is not.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PairedDeviceInfo {
+    /// The device's transport endpoint id (what `ray unpair` revokes).
+    pub device_id: EndpointId,
+    /// Short id form for display.
+    pub short_id: String,
+    /// The device's hostname if known from any roster.
+    pub hostname: Option<String>,
+    /// Networks this device is currently a member of.
+    pub networks: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InviteInfo {
     pub id: String,
@@ -552,6 +599,10 @@ pub struct NetworkStatus {
     /// seeds `ray apply`'s `aliases:` map.
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
+    /// Per-network ephemeral auto-kick TTL in seconds, if the policy is on
+    /// (`ray ephemeral <net> <dur>`). `None` = off. Shown on the network line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_ttl_secs: Option<u64>,
 }
 
 #[derive(
@@ -959,6 +1010,7 @@ mod tests {
                 pending_suggestions: 0,
                 pending_requests: 0,
                 aliases: BTreeMap::new(),
+                ephemeral_ttl_secs: None,
             }],
             packets_rx: 0,
             packets_tx: 0,

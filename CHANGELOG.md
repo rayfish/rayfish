@@ -16,6 +16,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Downloads with no tap — this is on by default and can be turned off under
   "Auto-accept from my devices" in the You screen. (Own-device is determined from
   the device pairing certificate, so a file from someone else always asks first.)
+- **Ephemeral peer auto-kick**: a per-network policy that automatically removes
+  members which stay offline longer than a configured time, the same as
+  `ray kick`. Set it with `ray ephemeral <net> <duration>` (`12h`, `7d`, `1w`;
+  minimum 1 hour), turn it off with `ray ephemeral <net> off`, and read it with
+  `ray ephemeral <net> show`. Off by default; the current TTL shows on the
+  network's line in `ray status`. Only the coordinator enforces it, and only
+  offline peers are pruned, so it applies to open and closed networks alike (a
+  removed peer can simply re-join or re-request later).
+- **`ray unpair <device>`**: revoke one of your paired devices, for example a
+  lost or stolen laptop. Run it from your **primary** device (the one you paired
+  the others from). Device certificates now carry a generation; unpairing bumps
+  your generation and publishes the new value (a single signed number) under your
+  user identity, so every peer rejects any certificate below it — even on
+  networks you do not run. Your **other** devices are automatically re-issued
+  fresh certificates and keep working; only the removed device is left behind.
+  The removed device is dropped from your networks, stops being treated as one of
+  your own devices (no silent auto-admit, no own-device file auto-accept), and,
+  if online and cooperative, is told to delete its own certificate. List your
+  paired devices first with `ray pair list` (`--json` supported). Notes: a device
+  that was **offline** while you unpaired is refreshed the next time it reconnects
+  to your primary (until then other networks reject it); the generation stays
+  published while your primary runs; and to fully retire a device from a network
+  someone else runs, ask that network's coordinator to remove it too.
 - **Consistent Android device name**: the phone now uses one device name across
   every network instead of a different random name per network. It is seeded from
   your device model on first run and can be changed in the You screen (the change
