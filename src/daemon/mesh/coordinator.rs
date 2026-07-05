@@ -49,24 +49,44 @@ pub(crate) fn spawn_peer_cleanup(
                             }
                             tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, network = %ev.network, intentional = ev.intentional, "removing dead peer");
 
-                            // A deliberate `ray leave` (graceful close with the
-                            // leave code) prunes the member from the roster and
-                            // propagates the change; a transient drop only clears
-                            // the green dot above. Only the coordinator is
-                            // authoritative, so members pass `coordinator = None`.
-                            if ev.intentional && let Some(c) = &coordinator {
+                            // A deliberate `ray leave` (graceful close) prunes the
+                            // member from the roster; any other drop stamps the
+                            // member's `last_seen` so the ephemeral pruner can age
+                            // it out. Both republish the signed blob and broadcast
+                            // a MemberSync so co-coordinators converge. Only the
+                            // coordinator is authoritative, so members pass
+                            // `coordinator = None` and do neither.
+                            if let Some(c) = &coordinator {
                                 let member_id = c.device_user_map.resolve(&ev.endpoint_id);
-                                c.state.write().unwrap().members.remove(&member_id);
-                                dns::remove_hostname_by_ip(
-                                    &c.hostname_table,
-                                    &c.reverse_table,
-                                    &c.network_name,
-                                    ev.ip,
-                                )
-                                .await;
-                                update_snapshot_and_publish(&c.state, &c.blob_store, &c.dht_notify).await;
-                                broadcast_member_sync(&peers, None).await;
-                                tracing::info!(peer = %member_id.fmt_short(), "pruned member after leave");
+                                let mut changed = false;
+                                {
+                                    let mut st = c.state.write().unwrap();
+                                    if ev.intentional {
+                                        st.members.remove(&member_id);
+                                        changed = true;
+                                    } else if let Some(m) = st.members.get_mut(&member_id) {
+                                        m.last_seen = Some(crate::membership::now_secs());
+                                        changed = true;
+                                    }
+                                }
+                                if ev.intentional {
+                                    dns::remove_hostname_by_ip(
+                                        &c.hostname_table,
+                                        &c.reverse_table,
+                                        &c.network_name,
+                                        ev.ip,
+                                    )
+                                    .await;
+                                }
+                                if changed {
+                                    update_snapshot_and_publish(&c.state, &c.blob_store, &c.dht_notify).await;
+                                    broadcast_member_sync(&peers, None).await;
+                                    if ev.intentional {
+                                        tracing::info!(peer = %member_id.fmt_short(), "pruned member after leave");
+                                    } else {
+                                        tracing::debug!(peer = %member_id.fmt_short(), network = %c.network_name, "stamped last_seen on member disconnect");
+                                    }
+                                }
                             }
                         }
                         None => return,
