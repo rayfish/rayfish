@@ -447,8 +447,28 @@ impl MeshManager {
             };
         }
 
-        // Prune the roster + approved list, then republish the signed blob so the
-        // removal is authoritative, and drop the target's DNS entries.
+        // Prune the roster + DNS, then publish + broadcast + sever the link.
+        self.remove_member_roster_only(network, &state, member_id, member_ip)
+            .await;
+        self.finalize_removal(network, &state, &dht_notify, &[member_id])
+            .await;
+
+        tracing::info!(peer = %member_id.fmt_short(), network = %network, "kicked member");
+        IpcMessage::Ok {
+            message: format!("kicked '{display}' from '{network}'"),
+        }
+    }
+
+    /// Remove one identity from the roster + approved list and drop its DNS
+    /// entries. Does NOT publish or broadcast; the caller batches that via
+    /// [`Self::finalize_removal`] so several removals collapse into one publish.
+    pub(crate) async fn remove_member_roster_only(
+        &self,
+        network: &str,
+        state: &SharedNetworkState,
+        member_id: EndpointId,
+        member_ip: Ipv4Addr,
+    ) {
         {
             let mut s = state.write().unwrap();
             s.members.remove(&member_id);
@@ -461,23 +481,29 @@ impl MeshManager {
             member_ip,
         )
         .await;
-        update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
-        broadcast_member_sync(&self.peers, None).await;
+    }
 
-        // Sever our own link(s) to the target now, rather than waiting for it to
-        // time out. Other members drop it when they reconverge from the freshly
-        // published record (`prune_departed_peers`).
+    /// Republish the signed blob, broadcast a payload-free `MemberSync`, and
+    /// sever our own link(s) to every `victim` with `KICK_CODE`. Call once after
+    /// one or more [`Self::remove_member_roster_only`] edits. Other members drop
+    /// the victims when they reconverge from the freshly published record
+    /// (`prune_departed_peers`).
+    pub(crate) async fn finalize_removal(
+        &self,
+        network: &str,
+        state: &SharedNetworkState,
+        dht_notify: &Option<Arc<tokio::sync::Notify>>,
+        victims: &[EndpointId],
+    ) {
+        update_snapshot_and_publish(state, &self.blob_store, dht_notify).await;
+        broadcast_member_sync(&self.peers, None).await;
         for (pid, ip, conn) in self.peers.peers_for_network_with_conn(network) {
-            if pid == member_id || self.device_user_map.resolve(&pid) == member_id {
+            let resolved = self.device_user_map.resolve(&pid);
+            if victims.iter().any(|v| *v == pid || *v == resolved) {
                 conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
                 self.peers
                     .remove_peer_from_network(&ip, &derive_ipv6(&pid), network);
             }
-        }
-
-        tracing::info!(peer = %member_id.fmt_short(), network = %network, "kicked member");
-        IpcMessage::Ok {
-            message: format!("kicked '{display}' from '{network}'"),
         }
     }
 
