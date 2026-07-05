@@ -273,7 +273,6 @@ pub(crate) fn is_alpn_mismatch(err: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iroh::SecretKey;
 
     #[test]
     fn test_mesh_alpn() {
