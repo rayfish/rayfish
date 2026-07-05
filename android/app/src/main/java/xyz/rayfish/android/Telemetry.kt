@@ -88,10 +88,16 @@ object Telemetry {
         if (!Sentry.isEnabled()) return null
         val node = NodeHolder.get(context)
         val logs = runCatching { node.logSnapshot() }.getOrDefault("")
+        // A per-send stamp so each report is its own Sentry issue instead of
+        // folding into one group. Without it every "Send diagnostics" click
+        // reuses the same message and only bumps the existing issue's count, so
+        // repeat sends look like nothing happened.
+        val stamp = System.currentTimeMillis().toString()
         var id: String? = null
         Sentry.withScope { scope ->
             scope.setTag("install_id", NodeHolder.installId(context))
             scope.setTag("transport", transportType(context))
+            scope.setFingerprint(listOf("rayfish-diagnostics", stamp))
             scope.addAttachment(Attachment(logs.toByteArray(), "rayfish-logs.txt", "text/plain"))
             runCatching {
                 val h = node.healthSnapshot()
@@ -107,6 +113,10 @@ object Telemetry {
             }
             id = Sentry.captureMessage("rayfish diagnostics", SentryLevel.INFO).toString()
         }
+        // captureMessage only enqueues; block briefly so a user-initiated report
+        // is actually delivered before we tell them it was sent. Called off the
+        // main thread (Dispatchers.IO in YouScreen).
+        Sentry.flush(5000)
         return id
     }
 }
