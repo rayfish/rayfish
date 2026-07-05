@@ -99,7 +99,17 @@ impl MeshManager {
                         room_id,
                         coordinator,
                     }) => {
-                        let _ = me.join_direct(room_id, coordinator, hostname.clone()).await;
+                        match me.join_direct(room_id, coordinator, hostname.clone()).await {
+                            IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => {
+                                tracing::info!(peer = %peer.fmt_short(), "direct connect join ok");
+                            }
+                            IpcMessage::Error { message } => {
+                                tracing::warn!(peer = %peer.fmt_short(), error = %message, "direct connect join failed");
+                            }
+                            other => {
+                                tracing::warn!(peer = %peer.fmt_short(), response = ?other, "direct connect join: unexpected response");
+                            }
+                        }
                         me.connect.outgoing_connects.remove(&peer);
                         return;
                     }
