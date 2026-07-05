@@ -198,3 +198,50 @@ pub(crate) async fn ipc_leave(name: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// Parse a human duration (`Nh`/`Nd`/`Nw`) into seconds, enforcing a 1-hour
+/// floor. Returns the TTL in seconds or a user-facing error string. Used by
+/// `ray ephemeral <net> <duration>` to set the per-network policy.
+pub(crate) fn parse_ephemeral_duration(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let split = s
+        .find(|c: char| c.is_alphabetic())
+        .ok_or_else(|| format!("invalid duration '{s}' (use Nh, Nd, or Nw)"))?;
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("invalid duration '{s}' (use Nh, Nd, or Nw)"))?;
+    let secs = match unit {
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        "w" => n * 604_800,
+        other => return Err(format!("unknown unit '{other}' (use h, d, or w)")),
+    };
+    if secs < 3600 {
+        return Err("minimum ephemeral TTL is 1h".to_string());
+    }
+    Ok(secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ephemeral_duration;
+
+    #[test]
+    fn parses_valid_durations() {
+        assert_eq!(parse_ephemeral_duration("12h"), Ok(43_200));
+        assert_eq!(parse_ephemeral_duration("7d"), Ok(604_800));
+        assert_eq!(parse_ephemeral_duration("1w"), Ok(604_800));
+        assert_eq!(parse_ephemeral_duration("1h"), Ok(3_600));
+        assert_eq!(parse_ephemeral_duration(" 2d "), Ok(172_800));
+    }
+
+    #[test]
+    fn rejects_sub_hour_and_garbage() {
+        assert!(parse_ephemeral_duration("30m").is_err()); // unknown unit
+        assert!(parse_ephemeral_duration("0h").is_err()); // below floor
+        assert!(parse_ephemeral_duration("garbage").is_err());
+        assert!(parse_ephemeral_duration("5").is_err()); // no unit
+        assert!(parse_ephemeral_duration("").is_err());
+    }
+}
