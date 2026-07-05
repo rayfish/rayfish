@@ -68,7 +68,7 @@ impl MeshManager {
             secret_key: net_secret_key.to_bytes(),
         };
         match conn.open_bi().await {
-            Ok((mut send, _)) => match control::send_msg(&mut send, &grant).await {
+            Ok((mut send, _)) => match control::send_msg(&mut send, Some(net_pubkey), &grant).await {
                 Ok(()) => {
                     // The grant connection is dropped when this handler returns;
                     // wait for the grantee to read it so it flushes first.

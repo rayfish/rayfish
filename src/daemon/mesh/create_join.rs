@@ -323,7 +323,6 @@ impl MeshManager {
             invite_lock,
             Some(dht_notify),
             net_public_key,
-            disconnect_tx,
             cancel,
         );
         self.refresh_alpns().await;
@@ -453,7 +452,7 @@ impl MeshManager {
 
         let data = self.resolve_and_fetch_blob(net_pubkey).await?;
 
-        let alpn = transport::network_alpn(&net_pubkey);
+        let alpn = transport::mesh_alpn();
         let my_ip = self.identity.local_ip();
         // Use coordinator's network name from GroupBlob, or user alias, or truncated key as fallback
         let blob_name = data
@@ -581,9 +580,10 @@ impl MeshManager {
         let mut last_err = anyhow::anyhow!("no coordinators tried");
         for coordinator_id in &order {
             let cancel = self.shutdown_token.child_token();
-            let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
-            let tasks =
-                vec![self.spawn_join_reconnect(ctx, my_id, &disconnect_tx, disconnect_rx, &cancel)];
+            // Reconnect + cleanup are daemon-wide now (the connection supervisor),
+            // so no per-network reconnect task; readers report to the shared sender.
+            let disconnect_tx = self.disconnect_tx.clone();
+            let tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
 
             tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
             let conn = match transport::connect_to_peer_with_alpn(
@@ -668,10 +668,9 @@ impl MeshManager {
         // its coordinator is down silently drops the network from its running
         // state until a lucky restart.
         let cancel = self.shutdown_token.child_token();
-        let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
-        let my_id = self.identity.local_identity();
-        let tasks =
-            vec![self.spawn_join_reconnect(ctx, my_id, &disconnect_tx, disconnect_rx, &cancel)];
+        // Reconnect + cleanup are daemon-wide now (the connection supervisor).
+        let disconnect_tx = self.disconnect_tx.clone();
+        let tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
 
         // Fallback state built straight from the verified blob so registration
         // never blocks on (or dies with) the coordinator handshake.
@@ -741,28 +740,21 @@ impl MeshManager {
             }
         };
 
-        // The reconnect loop is edge-triggered on disconnect events, so a cold
-        // registration (no live connection yet) needs a synthetic kick per member
-        // to start the backoff-retry dial. Only fires when we registered from the
-        // blob without a live handshake.
+        // Cold registration (no live connection yet): the daemon-wide supervisor
+        // is edge-triggered on disconnects, and this peer isn't in the table, so
+        // kick a reconnect directly for each member on this network. Only fires
+        // when we registered from the blob without a live handshake. NB: the
+        // NetworkHandle is inserted by `finalize_join` after this returns, so the
+        // dial's per-network target lookup must tolerate a brief absence — the
+        // supervisor re-checks `self.networks` at dial time, by when it's present.
         if seed_from_blob {
             let me = self.identity.local_identity();
+            let net = SmolStr::new(ctx.display_name);
             for m in &data.members {
                 if m.identity == me {
                     continue;
                 }
-                let _ = disconnect_tx
-                    .send(forward::DisconnectEvent {
-                        endpoint_id: m.identity,
-                        ip: m.ip,
-                        ipv6: derive_ipv6(&m.identity),
-                        network: ctx.display_name.to_string(),
-                        intentional: false,
-                        // Synthetic cold-restore kick: no live connection backs
-                        // it, so it must always drive the reconnect dial.
-                        conn_stable_id: None,
-                    })
-                    .await;
+                self.clone().spawn_reconnect(m.identity, m.ip, vec![net.clone()]);
             }
         }
 
@@ -774,32 +766,9 @@ impl MeshManager {
         }))
     }
 
-    /// Spawn the per-network reconnect loop used by both dial paths.
-    fn spawn_join_reconnect(
-        &self,
-        ctx: &JoinContext<'_>,
-        my_id: EndpointId,
-        disconnect_tx: &mpsc::Sender<forward::DisconnectEvent>,
-        disconnect_rx: mpsc::Receiver<forward::DisconnectEvent>,
-        cancel: &CancellationToken,
-    ) -> tokio::task::JoinHandle<()> {
-        spawn_reconnect_loop(
-            disconnect_rx,
-            self.endpoint.clone(),
-            ctx.alpn.to_vec(),
-            ctx.display_name.to_string(),
-            my_id,
-            ctx.my_ip,
-            self.mesh_ctx(),
-            disconnect_tx.clone(),
-            cancel.clone(),
-            self.current_device_cert(),
-        )
-    }
-
     /// Run the mesh handshake over an established connection (shared by both dial
     /// paths). `initial` distinguishes a fresh join (we speak first) from a
-    /// reconnect/restore (coordinator speaks first).
+    /// reconnect/restore (we re-announce, then reconverge from the signed record).
     #[allow(clippy::too_many_arguments)]
     async fn run_join_handshake(
         &self,
@@ -832,7 +801,7 @@ impl MeshManager {
             cancel.clone(),
             self.promote_tx.clone(),
             ctx.invite_lock.clone(),
-            self.protocol_router.pending_pongs.clone(),
+            self.protocol_router.clone(),
         )
         .await
     }
@@ -849,13 +818,12 @@ impl MeshManager {
         let EstablishedMesh {
             state,
             cancel,
-            disconnect_tx,
+            disconnect_tx: _,
             mut tasks,
         } = mesh;
         let JoinContext {
             display_name,
             my_hostname,
-            alpn,
             my_ip,
             net_pubkey,
             invite_lock,
@@ -865,7 +833,8 @@ impl MeshManager {
         // A node that already holds the network secret key (e.g. a
         // co-coordinator joining after a config-only restore) should run as
         // Coordinator so it can admit future peers immediately — even though
-        // it arrived here via join rather than restore.
+        // it arrived here via join rather than restore. This overwrites the
+        // member handler `join_mesh_shared` registered on the live-join path.
         let held_key = state.read().unwrap().network_secret_key.clone();
         match role_for_key_holder(held_key.is_some()) {
             NetworkRole::Coordinator => {
@@ -876,23 +845,33 @@ impl MeshManager {
                     invite_lock.clone(),
                     None,
                     net_public_key,
-                    disconnect_tx.clone(),
                     cancel.clone(),
                 );
             }
             // `Direct` is a display-only role (set in `status`), never produced by
-            // `role_for_key_holder`; a non-key-holder runs as a plain member.
+            // `role_for_key_holder`; a non-key-holder runs as a plain member. The
+            // live-join path already registered the member handler in
+            // `join_mesh_shared`; register here only for the cold-restore path
+            // (state built from the blob, no live handshake). Reconverge for that
+            // path is covered by the 60s group poller below.
             NetworkRole::Member | NetworkRole::Direct => {
-                self.protocol_router.register(
-                    alpn.to_vec(),
-                    AcceptHandler::Member(Arc::new(MemberAcceptState {
-                        ctx: self.mesh_ctx(),
-                        network_name: display_name.to_string(),
-                        state: state.clone(),
-                        disconnect_tx: disconnect_tx.clone(),
-                        token: cancel.clone(),
-                    })),
-                );
+                if !self.protocol_router.is_registered(&net_pubkey) {
+                    self.protocol_router.register(
+                        net_pubkey,
+                        AcceptHandler::Member(Arc::new(MemberAcceptState {
+                            ctx: self.mesh_ctx(),
+                            network_name: display_name.to_string(),
+                            state: state.clone(),
+                            token: cancel.clone(),
+                            net_pubkey,
+                            my_identity: self.identity.local_identity(),
+                            endpoint: self.endpoint.clone(),
+                            promote_tx: self.promote_tx.clone(),
+                            invite_lock: invite_lock.clone(),
+                            reconverge_notify: Arc::new(tokio::sync::Notify::new()),
+                        })),
+                    );
+                }
             }
         }
 
@@ -941,7 +920,7 @@ impl MeshManager {
             cancel,
             tasks,
             invite_lock,
-            disconnect_tx,
+            disconnect_tx: self.disconnect_tx.clone(),
         };
         self.networks.insert(display_name.to_string(), handle);
         self.refresh_alpns().await;
@@ -1122,36 +1101,11 @@ impl MeshManager {
             let my_ip = self.identity.local_ip();
             let my_hostname = net_config.my_hostname.clone();
             let cancel = self.shutdown_token.child_token();
-            let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
-
-            let tasks = vec![spawn_reconnect_loop(
-                disconnect_rx,
-                self.endpoint.clone(),
-                alpn.to_vec(),
-                network_name.to_string(),
-                my_identity,
-                my_ip,
-                self.mesh_ctx(),
-                disconnect_tx.clone(),
-                cancel.clone(),
-                self.current_device_cert(),
-            )];
-
-            self.dial_all_members(
-                &data.members,
-                alpn,
-                network_name,
-                my_identity,
-                my_ip,
-                my_hostname.clone(),
-                disconnect_tx.clone(),
-                cancel.clone(),
-            )
-            .await;
+            let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
 
             let mut ns = NetworkState {
-                members: MemberList::from_members(data.members),
-                approved: ApprovedList::from_entries(data.approved),
+                members: MemberList::from_members(data.members.clone()),
+                approved: ApprovedList::from_entries(data.approved.clone()),
                 snapshot: None,
                 network_secret_key: None,
                 network_public_key: net_pubkey,
@@ -1165,6 +1119,35 @@ impl MeshManager {
             ns.refresh_snapshot();
             let live_state = Arc::new(std::sync::RwLock::new(ns));
 
+            // Register the member accept handler so the per-connection demux
+            // dispatches coordinator broadcasts to us, then dial the roster.
+            // Reconverge for this fallback path is covered by the group poller.
+            self.protocol_router.register(
+                net_pubkey,
+                AcceptHandler::Member(Arc::new(MemberAcceptState {
+                    ctx: self.mesh_ctx(),
+                    network_name: network_name.to_string(),
+                    state: live_state.clone(),
+                    token: cancel.clone(),
+                    net_pubkey,
+                    my_identity,
+                    endpoint: self.endpoint.clone(),
+                    promote_tx: self.promote_tx.clone(),
+                    invite_lock: invite_lock.clone(),
+                    reconverge_notify: Arc::new(tokio::sync::Notify::new()),
+                })),
+            );
+
+            self.dial_all_members(
+                &data.members,
+                net_pubkey,
+                network_name,
+                my_identity,
+                my_ip,
+                my_hostname.clone(),
+            )
+            .await;
+
             let handle = NetworkHandle {
                 name: network_name.to_string(),
                 network_key: net_pubkey,
@@ -1173,9 +1156,9 @@ impl MeshManager {
                 state: live_state,
                 dht_notify: None,
                 cancel,
-                tasks,
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
-                disconnect_tx,
+                tasks: vec![],
+                invite_lock,
+                disconnect_tx: self.disconnect_tx.clone(),
             };
             self.networks.insert(network_name.to_string(), handle);
             self.refresh_alpns().await;
@@ -1197,30 +1180,36 @@ impl MeshManager {
     /// reconnects to **all** known members (full mesh), not just the peers
     /// that happen to dial in. Failures per-peer are logged at debug and
     /// skipped (the reconnect loop + group poller are the backstop).
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn dial_all_members(
         &self,
         members: &[Member],
-        alpn: &[u8],
+        net_pubkey: EndpointId,
         network_name: &str,
         my_identity: EndpointId,
         my_ip: Ipv4Addr,
         my_hostname: Option<String>,
-        disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
-        cancel: CancellationToken,
     ) {
         // Announce the current name (a pending rename or the confirmed one),
         // read fresh from config, rather than a value captured before a rename.
         let my_hostname = outgoing_hostname(network_name).or(my_hostname);
+        let ctx = self.mesh_ctx();
+        let token = self.shutdown_token.clone();
         for m in members {
             if m.identity == my_identity {
                 continue;
             }
-            match transport::connect_to_peer_with_alpn(&self.endpoint, m.identity, alpn).await {
+            match transport::connect_to_peer_with_alpn(
+                &self.endpoint,
+                m.identity,
+                &transport::mesh_alpn(),
+            )
+            .await
+            {
                 Ok(peer_conn) => {
                     if let Ok((mut s, _)) = peer_conn.open_bi().await {
                         let _ = control::send_msg(
                             &mut s,
+                            Some(net_pubkey),
                             &ControlMsg::MeshHello {
                                 identity: my_identity,
                                 ip: my_ip,
@@ -1231,28 +1220,16 @@ impl MeshManager {
                         .await;
                     }
                     crate::spawn_path_logger(peer_conn.clone(), m.identity.fmt_short().to_string());
-                    self.peers.add(
-                        m.ip,
-                        derive_ipv6(&m.identity),
-                        peer_conn.clone(),
-                        m.identity,
-                        network_name,
-                    );
-                    forward::spawn_peer_reader(
-                        peer_conn,
-                        m.identity,
-                        m.ip,
-                        derive_ipv6(&m.identity),
-                        network_name.to_string(),
-                        forward::ForwardCtx {
-                            firewall: self.firewall.clone(),
-                            tun_tx: self.tun_tx.clone(),
-                            disconnect_tx: disconnect_tx.clone(),
-                            token: cancel.clone(),
-                            stats: self.stats.clone(),
-                            device_user_map: self.device_user_map.clone(),
-                        },
-                    );
+                    // Register the route + single data reader, then drive the new
+                    // connection's control demux and announce our handle table.
+                    let conn_changed =
+                        ctx.register_peer_conn(&peer_conn, m.identity, m.ip, network_name, &token);
+                    if conn_changed {
+                        let router = self.protocol_router.clone();
+                        let dconn = peer_conn.clone();
+                        tokio::spawn(async move { router.drive_mesh_connection(dconn).await });
+                    }
+                    announce_network_handles(&self.peers, &peer_conn, m.ip).await;
                     tracing::info!(
                         network = %network_name,
                         peer = %m.identity.fmt_short(),
@@ -1264,7 +1241,7 @@ impl MeshManager {
                         network = %network_name,
                         peer = %m.identity.fmt_short(),
                         error = %e,
-                        "could not dial member yet; reconnect loop will retry"
+                        "could not dial member yet; connection supervisor will retry"
                     );
                 }
             }

@@ -1,275 +1,220 @@
-//! Coordinator-side background loops: the per-member control reader (renames,
-//! invite gossip, ping/pong), the dead-peer cleanup loop, and the invite-gossip
-//! send helpers.
+//! The daemon-wide connection supervisor (dead-peer prune + reconnect) and the
+//! invite-gossip send helper. Under one mesh connection per identity, a dropped
+//! connection tears the peer down across every shared network at once, so
+//! teardown/reconnect is node-wide rather than per-network. The per-member rename
+//! reader and coordinator/member accept handlers now live in the per-connection
+//! demux (`ProtocolRouter::drive_mesh_connection` → `AcceptHandler::handle_frame`).
 
 use super::super::*;
 
-/// Extra context a coordinator needs to prune the canonical member list when a
-/// peer leaves deliberately (`ray leave`). Members pass `None` and only ever
-/// drop the connection from the [`PeerTable`].
-pub(crate) struct CoordinatorCleanup {
-    pub(crate) state: SharedNetworkState,
-    pub(crate) blob_store: FsStore,
-    pub(crate) dht_notify: Option<Arc<tokio::sync::Notify>>,
-    pub(crate) hostname_table: dns::HostnameTable,
-    pub(crate) reverse_table: dns::ReverseLookupTable,
-    pub(crate) device_user_map: peers::DeviceUserMap,
-    pub(crate) network_name: String,
-}
-
-pub(crate) fn spawn_peer_cleanup(
-    mut disconnect_rx: mpsc::Receiver<forward::DisconnectEvent>,
-    peers: PeerTable,
-    token: CancellationToken,
-    coordinator: Option<CoordinatorCleanup>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+impl MeshManager {
+    /// Single daemon-wide loop consuming every data reader's disconnect. For each
+    /// dropped identity it removes the peer from the table, prunes it from every
+    /// network we coordinate on a deliberate leave, and otherwise reconnects it
+    /// across all its shared networks.
+    pub(crate) async fn run_connection_supervisor(
+        self: Arc<Self>,
+        mut disconnect_rx: mpsc::Receiver<forward::DisconnectEvent>,
+        token: CancellationToken,
+    ) {
         loop {
-            tokio::select! {
+            let ev = tokio::select! {
                 _ = token.cancelled() => return,
-                event = disconnect_rx.recv() => {
-                    match event {
-                        Some(ev) => {
-                            // Drop only this network's route, and only if the
-                            // stored connection is still the one that died. A
-                            // peer that was killed and re-dialed with the same
-                            // identity already has a fresh connection registered;
-                            // the stale connection's delayed disconnect must not
-                            // evict it (see DisconnectEvent::conn_stable_id).
-                            let removed = match ev.conn_stable_id {
-                                Some(id) => peers.remove_peer_from_network_if(&ev.ip, &ev.ipv6, &ev.network, id),
-                                None => {
-                                    peers.remove_peer_from_network(&ev.ip, &ev.ipv6, &ev.network);
-                                    true
-                                }
-                            };
-                            if !removed {
-                                tracing::debug!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, network = %ev.network, "ignoring stale disconnect; peer already reconnected");
-                                continue;
-                            }
-                            tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, network = %ev.network, intentional = ev.intentional, "removing dead peer");
-
-                            // A deliberate `ray leave` (graceful close with the
-                            // leave code) prunes the member from the roster and
-                            // propagates the change; a transient drop only clears
-                            // the green dot above. Only the coordinator is
-                            // authoritative, so members pass `coordinator = None`.
-                            if ev.intentional && let Some(c) = &coordinator {
-                                let member_id = c.device_user_map.resolve(&ev.endpoint_id);
-                                c.state.write().unwrap().members.remove(&member_id);
-                                dns::remove_hostname_by_ip(
-                                    &c.hostname_table,
-                                    &c.reverse_table,
-                                    &c.network_name,
-                                    ev.ip,
-                                )
-                                .await;
-                                update_snapshot_and_publish(&c.state, &c.blob_store, &c.dht_notify).await;
-                                broadcast_member_sync(&peers, None).await;
-                                tracing::info!(peer = %member_id.fmt_short(), "pruned member after leave");
-                            }
-                        }
-                        None => return,
-                    }
-                }
-            }
+                ev = disconnect_rx.recv() => match ev {
+                    Some(ev) => ev,
+                    None => return,
+                },
+            };
+            self.clone().handle_disconnect(ev).await;
         }
-    })
-}
+    }
 
-/// Coordinator-side per-member control reader. Continuously accepts control
-/// streams from one member and processes `MeshHello`s as live create-or-update
-/// signals — the only path by which a member's hostname (or device cert) reaches
-/// the coordinator after the initial handshake. On a hostname that differs from
-/// the stored one, the coordinator resolves collisions authoritatively, updates
-/// the roster + DNS, republishes the group blob, and broadcasts `MemberSync` so
-/// every peer reflects the change immediately. Runs until the network token is
-/// cancelled or the connection drops.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_coordinator_control_reader(
-    conn: Connection,
-    remote_id: EndpointId,
-    peer_ip: Ipv4Addr,
-    network_name: String,
-    state: SharedNetworkState,
-    ctx: MeshCtx,
-    dht_notify: Option<Arc<tokio::sync::Notify>>,
-    token: CancellationToken,
-    // Serializes single-use invite ledger access for the invite-gossip arms.
-    invite_lock: Arc<tokio::sync::Mutex<()>>,
-    // Fires the waiting `ray ping` handler when a matching `Pong` arrives.
-    pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
-) {
-    let MeshCtx {
-        peers,
-        blob_store,
-        hostname_table,
-        reverse_table,
-        device_user_map,
-        ..
-    } = ctx;
-    tokio::spawn(async move {
-        let mut gate = crate::ratelimit::ControlGate::new();
-        loop {
-            let accepted = tokio::select! {
-                _ = token.cancelled() => return,
-                r = conn.accept_bi() => r,
+    async fn handle_disconnect(self: Arc<Self>, ev: forward::DisconnectEvent) {
+        // ABA guard: if the stored connection is newer than the one that died,
+        // the peer already re-dialed. Ignore the stale event rather than tearing
+        // down the live link (see DisconnectEvent::conn_stable_id).
+        if let Some(id) = ev.conn_stable_id
+            && !self.peers.conn_is_current(&ev.ip, id)
+        {
+            tracing::debug!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, "ignoring stale disconnect; peer already reconnected");
+            return;
+        }
+
+        // The networks this peer was reachable on, captured before removal.
+        let nets: Vec<SmolStr> = self
+            .peers
+            .identity_and_networks(std::net::IpAddr::V4(ev.ip))
+            .map(|(_, nets)| nets)
+            .unwrap_or_default();
+
+        // One connection carried every network, so the drop removes the peer
+        // everywhere at once.
+        self.peers.remove(&ev.ip, &ev.ipv6);
+        tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, intentional = ev.intentional, "peer connection dropped");
+
+        if ev.intentional {
+            // Deliberate `ray leave` (graceful close with the leave code): prune
+            // the member from every network we coordinate.
+            for net in &nets {
+                self.prune_member_on_leave(net, &ev).await;
+            }
+            return;
+        }
+        // Transient drop: reconnect across every shared network, skipping any we
+        // just pruned this peer from (a one-shot suppression via pruned_peers).
+        self.spawn_reconnect(ev.endpoint_id, ev.ip, nets);
+    }
+
+    /// Coordinator-authoritative prune of a member that left `network`: drop it
+    /// from the roster + DNS, republish the signed blob, and broadcast a
+    /// `MemberSync` trigger. A no-op on a network we don't coordinate.
+    async fn prune_member_on_leave(&self, network: &str, ev: &forward::DisconnectEvent) {
+        let (state, net_pubkey, dht_notify) = {
+            let Some(h) = self.networks.get(network) else {
+                return;
             };
-            let mut recv = match accepted {
-                Ok((_send, recv)) => recv,
-                Err(_) => return, // connection closed
-            };
-            let msg = match control::recv_msg(&mut recv).await {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            // Throttle inbound control messages per connection: drop over-budget
-            // ones, and drop the peer entirely if it sustains a flood.
-            match gate.check() {
-                crate::ratelimit::Verdict::Allow => {}
-                crate::ratelimit::Verdict::Drop => continue,
-                crate::ratelimit::Verdict::Close => {
-                    tracing::warn!(peer = %remote_id.fmt_short(), "control-plane flood; closing connection");
-                    conn.close(VarInt::from_u32(forward::ABUSE_CODE), b"control flood");
+            if !h.role.is_coordinator() {
+                return;
+            }
+            (h.state.clone(), h.network_key, h.dht_notify.clone())
+        };
+        let member_id = self.device_user_map.resolve(&ev.endpoint_id);
+        state.write().unwrap().members.remove(&member_id);
+        dns::remove_hostname_by_ip(
+            &self.dns.hostname_table,
+            &self.dns.reverse_table,
+            network,
+            ev.ip,
+        )
+        .await;
+        update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+        broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
+        tracing::info!(peer = %member_id.fmt_short(), network, "pruned member after leave");
+    }
+
+    /// Reconnect a dropped peer with one dial that re-establishes every network we
+    /// still share with it. Backs off exponentially; on success re-registers the
+    /// peer per network and drives the new connection's control demux. Also used
+    /// by cold restore (coordinator offline at boot) to dial members from the
+    /// verified blob before any live connection exists.
+    pub(crate) fn spawn_reconnect(
+        self: Arc<Self>,
+        peer_id: EndpointId,
+        peer_ip: Ipv4Addr,
+        nets: Vec<SmolStr>,
+    ) {
+        // Networks to re-handshake: those we haven't pruned this peer from
+        // (kick/departure records a one-shot suppression here).
+        let mut candidate_nets: Vec<SmolStr> = Vec::new();
+        for net in &nets {
+            // Consume the one-shot prune suppression exactly once, here, so a later
+            // dial iteration can't re-include a net we deliberately dropped.
+            if self
+                .pruned_peers
+                .remove(&(net.to_string(), peer_id))
+                .is_some()
+            {
+                tracing::info!(peer = %peer_id.fmt_short(), network = %net, "peer removed from roster, not reconnecting");
+                continue;
+            }
+            candidate_nets.push(net.clone());
+        }
+        if candidate_nets.is_empty() {
+            return;
+        }
+
+        let this = self.clone();
+        let token = self.shutdown_token.clone();
+        let my_identity = self.identity.local_identity();
+        let device_cert = self.current_device_cert();
+        use tracing::Instrument as _;
+        let span = tracing::info_span!("reconnect", peer = %peer_id.fmt_short());
+        tokio::spawn(
+            async move {
+                let mut backoff = BACKOFF_INITIAL;
+                // Bounds how long we keep waiting for a network handle that never
+                // registers (e.g. the network was left mid-reconnect).
+                let mut empty_tries = 0u32;
+                loop {
+                    if token.is_cancelled() {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = token.cancelled() => return,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
+
+                    // Re-resolve the live network handles each iteration: on cold
+                    // restore the `NetworkHandle` is inserted just after the dial
+                    // was scheduled, so it may be absent on the first pass.
+                    let targets: Vec<(String, EndpointId, Ipv4Addr)> = candidate_nets
+                        .iter()
+                        .filter_map(|net| {
+                            this.networks
+                                .get(net.as_str())
+                                .map(|h| (net.to_string(), h.network_key, h.my_ip))
+                        })
+                        .collect();
+                    if targets.is_empty() {
+                        empty_tries += 1;
+                        if empty_tries > 6 {
+                            return;
+                        }
+                        continue;
+                    }
+
+                    let conn = match transport::connect_to_peer_with_alpn(
+                        &this.endpoint,
+                        peer_id,
+                        &transport::mesh_alpn(),
+                    )
+                    .await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "reconnect attempt failed");
+                            continue;
+                        }
+                    };
+                    // Announce ourselves on every still-shared network over the one
+                    // connection, and register the peer's route per network.
+                    let mut any = false;
+                    for (name, net_pubkey, my_ip) in &targets {
+                        let Ok((mut send, _)) = conn.open_bi().await else {
+                            continue;
+                        };
+                        let hello = ControlMsg::MeshHello {
+                            identity: my_identity,
+                            ip: *my_ip,
+                            hostname: outgoing_hostname(name),
+                            device_cert: device_cert.clone(),
+                        };
+                        if control::send_msg(&mut send, Some(*net_pubkey), &hello)
+                            .await
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        this.mesh_ctx()
+                            .register_peer_conn(&conn, peer_id, peer_ip, name, &token);
+                        any = true;
+                    }
+                    if !any {
+                        continue;
+                    }
+                    tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "reconnected to peer");
+                    // Drive the new connection's control demux + announce handles.
+                    let router = this.protocol_router.clone();
+                    let dconn = conn.clone();
+                    tokio::spawn(async move { router.drive_mesh_connection(dconn).await });
+                    announce_network_handles(&this.peers, &conn, peer_ip).await;
                     return;
                 }
             }
-            // Invite gossip from another coordinator: a co-coordinator that minted
-            // or redeemed an invite tells us so our ledger stays in sync. Honor it
-            // only from a coordinator peer in our verified roster.
-            match msg {
-                ControlMsg::InviteShare {
-                    id,
-                    secret_hash,
-                    expires,
-                } => {
-                    if !sender_is_coordinator(&state, remote_id) {
-                        tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteShare from non-coordinator");
-                        continue;
-                    }
-                    let Ok(hash) = String::from_utf8(secret_hash) else {
-                        tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteShare with non-utf8 hash");
-                        continue;
-                    };
-                    let _guard = invite_lock.lock().await;
-                    if let Ok(mut store) = crate::invite::InviteStore::load(&network_name) {
-                        let _ = store.record_shared(id, hash, expires);
-                    }
-                    continue;
-                }
-                ControlMsg::InviteUsed { secret_hash } => {
-                    if !sender_is_coordinator(&state, remote_id) {
-                        tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteUsed from non-coordinator");
-                        continue;
-                    }
-                    let Ok(hash) = String::from_utf8(secret_hash) else {
-                        tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteUsed with non-utf8 hash");
-                        continue;
-                    };
-                    let _guard = invite_lock.lock().await;
-                    if let Ok(mut store) = crate::invite::InviteStore::load(&network_name) {
-                        let _ = store.burn_by_hash(&hash);
-                    }
-                    continue;
-                }
-                ControlMsg::Ping { nonce } => {
-                    respond_pong(&conn, nonce).await;
-                    continue;
-                }
-                ControlMsg::Pong { nonce } => {
-                    if let Some((_, tx)) = pending_pongs.remove(&nonce) {
-                        let _ = tx.send(());
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-            let ControlMsg::MeshHello {
-                hostname,
-                device_cert,
-                ..
-            } = msg
-            else {
-                continue;
-            };
-
-            // Verify and store device cert if present.
-            if let Some(ref cert) = device_cert
-                && cert.verify()
-                && cert.device_key == remote_id
-            {
-                {
-                    let mut s = state.write().unwrap();
-                    if let Some(m) = s.members.get_mut(&remote_id) {
-                        m.user_identity = Some(cert.user_identity);
-                        m.device_cert = Some(cert.clone());
-                    }
-                }
-                device_user_map.insert(remote_id, cert.user_identity);
-            }
-
-            let Some(desired) = hostname else { continue };
-            tracing::info!(
-                network = %network_name,
-                peer = %remote_id.fmt_short(),
-                desired = %desired,
-                "coordinator received MeshHello hostname"
-            );
-
-            // Resolve collisions authoritatively against the rest of the roster,
-            // then detect whether this is a genuine change for this member.
-            let (final_hostname, changed) = {
-                let s = state.read().unwrap();
-                let taken: Vec<String> = s
-                    .members
-                    .all()
-                    .iter()
-                    .filter(|m| m.identity != remote_id)
-                    .filter_map(|m| m.hostname.clone())
-                    .collect();
-                let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
-                let final_hostname = crate::hostname::resolve_collision(&desired, &taken_refs);
-                let old = s
-                    .members
-                    .all()
-                    .iter()
-                    .find(|m| m.identity == remote_id)
-                    .and_then(|m| m.hostname.clone());
-                let changed = old.as_deref() != Some(final_hostname.as_str());
-                (final_hostname, changed)
-            };
-
-            if changed {
-                let mut s = state.write().unwrap();
-                if let Some(m) = s.members.get_mut(&remote_id) {
-                    m.hostname = Some(final_hostname.clone());
-                }
-            }
-
-            // Re-assert this peer's DNS entry (idempotent; clears any stale name
-            // sharing its IP before inserting the current one).
-            dns::remove_hostname_by_ip(&hostname_table, &reverse_table, &network_name, peer_ip)
-                .await;
-            let ipv6 = derive_ipv6(&remote_id);
-            dns::update_hostname(
-                &hostname_table,
-                &reverse_table,
-                &network_name,
-                &final_hostname,
-                peer_ip,
-                ipv6,
-            )
-            .await;
-
-            if changed {
-                tracing::info!(peer = %remote_id.fmt_short(), network = %network_name, hostname = %final_hostname, "peer hostname changed; republishing blob + broadcasting MemberSync");
-                update_snapshot_and_publish(&state, &blob_store, &dht_notify).await;
-                broadcast_member_sync(&peers, None).await;
-            } else {
-                tracing::debug!(peer = %remote_id.fmt_short(), network = %network_name, hostname = %final_hostname, "peer hostname unchanged; no republish (idempotent MeshHello)");
-            }
-        }
-    });
+            .instrument(span),
+        );
+    }
 }
 
 /// Send `msg` to each coordinator peer (per [`gossip_targets`]) that has a live
@@ -279,6 +224,7 @@ pub(crate) fn spawn_coordinator_control_reader(
 pub(crate) async fn gossip_to_coordinators(
     peers: &PeerTable,
     network: &str,
+    net_pubkey: EndpointId,
     members: &[Member],
     me: EndpointId,
     msg: &ControlMsg,
@@ -292,7 +238,7 @@ pub(crate) async fn gossip_to_coordinators(
             continue;
         }
         if let Ok((mut send, _)) = conn.open_bi().await {
-            let _ = control::send_msg(&mut send, msg).await;
+            let _ = control::send_msg(&mut send, Some(net_pubkey), msg).await;
         }
     }
 }

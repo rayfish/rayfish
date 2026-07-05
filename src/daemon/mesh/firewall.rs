@@ -177,7 +177,8 @@ impl MeshManager {
         // record now, instead of waiting up to 60s for the group poller. Like the
         // rename flow, this is a payload-free trigger — the suggestions still come
         // exclusively from the network-key-signed blob, never from this message.
-        broadcast_member_sync(&self.peers, None).await;
+        let net_pubkey = state.read().unwrap().network_public_key;
+        broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
         // The coordinator is the blob's source, so the group poller's hash
         // check (local == published) short-circuits and it never re-applies its
         // own authored suggestions. Materialize them here so the coordinator is

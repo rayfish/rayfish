@@ -83,6 +83,7 @@ use crate::transport;
 #[cfg(not(target_os = "android"))]
 use crate::tun::{self, check_cgnat_conflict};
 use ray_proto::SuggestedFirewall;
+use smol_str::SmolStr;
 
 // `MeshManager`'s IPC operations are split by domain into the `mesh/` submodule;
 // see `mesh/mod.rs`. Each holds an additional `impl MeshManager` block. Nested a
@@ -672,7 +673,6 @@ impl MeshManager {
     /// swap; the caller is responsible for spawning the `disconnect_rx` cleanup
     /// task **before** calling this so the channel is live when the first
     /// incoming connection arrives.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_coordinator_handler(
         &self,
         network: &str,
@@ -680,7 +680,6 @@ impl MeshManager {
         invite_lock: Arc<tokio::sync::Mutex<()>>,
         dht_notify: Option<Arc<Notify>>,
         network_key: EndpointId,
-        disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
         cancel: CancellationToken,
     ) {
         self.protocol_router.register(
@@ -689,11 +688,9 @@ impl MeshManager {
                 ctx: self.mesh_ctx(),
                 network_name: network.to_string(),
                 state,
-                disconnect_tx,
                 token: cancel,
                 dht_notify,
                 invite_lock,
-                pending_pongs: self.protocol_router.pending_pongs.clone(),
             })),
         );
         // Flip the stored role so `ray status` reports Coordinator immediately.
@@ -724,12 +721,11 @@ impl MeshManager {
                 h.invite_lock.clone(),
                 h.dht_notify.clone(),
                 h.network_key,
-                h.disconnect_tx.clone(),
                 h.cancel.clone(),
             )
         }; // DashMap ref dropped before the registration below.
         self.register_coordinator_handler(
-            network, parts.0, parts.1, parts.2, parts.3, parts.4, parts.5,
+            network, parts.0, parts.1, parts.2, parts.3, parts.4,
         );
         self.refresh_alpns().await;
         tracing::info!(network, "promoted to coordinator accept handler");

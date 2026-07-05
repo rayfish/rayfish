@@ -389,7 +389,7 @@ impl MeshManager {
             let sent = Instant::now();
             let sent_ok = match conn.open_bi().await {
                 Ok((mut send, _)) => {
-                    control::send_msg(&mut send, &control::ControlMsg::Ping { nonce })
+                    control::send_msg(&mut send, None, &control::ControlMsg::Ping { nonce })
                         .await
                         .is_ok()
                 }

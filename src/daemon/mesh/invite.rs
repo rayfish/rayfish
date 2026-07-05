@@ -49,10 +49,12 @@ impl MeshManager {
                         .cloned()
                         .collect();
                     let me = self.endpoint.id();
+                    let net_pubkey = handle.network_key;
                     drop(handle);
                     gossip_to_coordinators(
                         &self.peers,
                         network,
+                        net_pubkey,
                         &members,
                         me,
                         &ControlMsg::InviteShare {
@@ -301,12 +303,13 @@ impl MeshManager {
         };
 
         let user_id = pj.device_cert.as_ref().map(|c| c.user_identity);
-        let ip = {
+        let (ip, net_pubkey) = {
             let Some(handle) = self.networks.get(network) else {
                 return IpcMessage::Error {
                     message: format!("network '{network}' not active"),
                 };
             };
+            let net_pubkey = handle.network_key;
             let mut s = handle.state.write().unwrap();
             // Assign authoritatively from the current roster so two coordinators
             // accepting concurrently can be reconciled by the reconverge tiebreak.
@@ -324,11 +327,13 @@ impl MeshManager {
                 &members,
             );
             s.refresh_snapshot();
-            ip
+            (ip, net_pubkey)
         };
         self.store_and_publish_group(network).await;
         broadcast_control_msg(
             &self.peers,
+            net_pubkey,
+            network,
             &ControlMsg::MemberApproved {
                 identity,
                 ip,

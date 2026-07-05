@@ -115,7 +115,9 @@ impl MeshManager {
         {
             Ok(conn) => match conn.open_bi().await {
                 Ok((mut send, _)) => {
-                    if let Err(e) = control::send_msg(&mut send, &msg).await {
+                    // File offers ride the separate FILES_ALPN, not the mesh demux,
+                    // so they carry no network scope.
+                    if let Err(e) = control::send_msg(&mut send, None, &msg).await {
                         return IpcMessage::Error {
                             message: format!("failed to send offer: {e}"),
                         };
