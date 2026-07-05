@@ -257,7 +257,7 @@ pub(crate) fn prune_departed_peers(
     network_name: &str,
     my_identity: EndpointId,
 ) {
-    for (peer_id, ip, conn) in peers.peers_for_network_with_conn(network_name) {
+    for (peer_id, ip, _conn) in peers.peers_for_network_with_conn(network_name) {
         // Membership is by roster identity, which for a paired peer is its user
         // identity, not the transport id the PeerTable is keyed on. Check both.
         let user_id = device_user_map.resolve(&peer_id);
@@ -270,11 +270,15 @@ pub(crate) fn prune_departed_peers(
         }
         tracing::info!(peer = %peer_id.fmt_short(), network = %network_name, "pruning peer no longer in roster");
         pruned_peers.insert((network_name.to_string(), peer_id));
-        conn.close(
-            VarInt::from_u32(forward::KICK_CODE),
-            b"removed from network",
-        );
-        peers.remove_peer_from_network(&ip, &derive_ipv6(&peer_id), network_name);
+        // One connection carries every shared network, so only close it when this
+        // was the peer's last network with us; otherwise just drop this network's
+        // route and leave the peer reachable on the others (`remove_peer_from_network`
+        // returns the connection iff its network set emptied).
+        if let Some(conn) =
+            peers.remove_peer_from_network(&ip, &derive_ipv6(&peer_id), network_name)
+        {
+            conn.close(VarInt::from_u32(forward::KICK_CODE), b"removed from network");
+        }
     }
 }
 
