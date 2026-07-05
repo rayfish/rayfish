@@ -301,6 +301,7 @@ impl MeshManager {
             direct,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
+            ephemeral_ttl_secs: None,
         })?;
 
         let cancel = self.shutdown_token.child_token();
