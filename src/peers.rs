@@ -92,6 +92,21 @@ pub struct PeerRoute {
     pub handle: u16,
 }
 
+/// Whether installing a connection with stable id `incoming` as a peer's data
+/// connection makes the stored connection newly current — so a fresh
+/// [`forward::spawn_peer_reader`](crate::forward::spawn_peer_reader) must be
+/// started for it. A peer with no prior entry (`prior == None`) is always new; an
+/// existing peer is new only when its stored connection's stable id differs (a
+/// reconnect installed a different QUIC connection). Same id means a refresh of
+/// the already-read live connection, so no new reader.
+///
+/// The decision must be taken from the entry's state *before* the add mutates it:
+/// seeding a vacant entry with the incoming connection and then comparing would
+/// always report "unchanged" and never start the reader.
+fn connection_is_new(prior: Option<usize>, incoming: usize) -> bool {
+    prior != Some(incoming)
+}
+
 /// Lowest free handle (≥ 1; `0` is reserved as "invalid") not already assigned
 /// in `used`.
 fn next_free_handle(used: &HashMap<SmolStr, u16>) -> u16 {
@@ -166,22 +181,34 @@ impl PeerTable {
     ) -> bool {
         let net = SmolStr::new(network);
         let stable = conn.stable_id();
-        // Whether the peer had no prior connection at all (drives audit connect).
+        // Whether the peer had no prior entry at all (drives the audit connect
+        // event) and whether the stored connection just became current (drives the
+        // single data-reader spawn in `register_peer_conn`). Both are read from the
+        // entry's state *before* this add mutates it: an `or_insert_with` seeded
+        // with the incoming connection would report "unchanged" on a brand-new peer
+        // and the reader would never start (100% inbound loss).
         let first_ever;
-        // Whether the stored connection is (now) `conn` but wasn't before.
         let conn_changed;
         {
-            let mut e = self.v4.entry(ip).or_insert_with(|| {
-                first_conn_placeholder(endpoint_id, conn.clone(), net.clone())
-            });
-            first_ever = e.networks.is_empty();
-            conn_changed = e.conn.stable_id() != stable || first_ever;
-            e.endpoint_id = endpoint_id;
-            e.conn = conn.clone();
-            e.networks.insert(net.clone());
-            if !e.out_handles.contains_key(&net) {
-                let h = next_free_handle(&e.out_handles);
-                e.out_handles.insert(net.clone(), h);
+            use dashmap::mapref::entry::Entry;
+            match self.v4.entry(ip) {
+                Entry::Occupied(mut o) => {
+                    let e = o.get_mut();
+                    first_ever = false;
+                    conn_changed = connection_is_new(Some(e.conn.stable_id()), stable);
+                    e.endpoint_id = endpoint_id;
+                    e.conn = conn.clone();
+                    e.networks.insert(net.clone());
+                    if !e.out_handles.contains_key(&net) {
+                        let h = next_free_handle(&e.out_handles);
+                        e.out_handles.insert(net.clone(), h);
+                    }
+                }
+                Entry::Vacant(v) => {
+                    first_ever = true;
+                    conn_changed = connection_is_new(None, stable);
+                    v.insert(first_conn_placeholder(endpoint_id, conn.clone(), net.clone()));
+                }
             }
         }
         {
@@ -570,6 +597,198 @@ mod tests {
     fn test_peer_table_empty_ids() {
         let table = PeerTable::new();
         assert!(table.all_peer_ids().is_empty());
+    }
+
+    // ---- In-process real-connection tests --------------------------------
+    //
+    // These build two loopback iroh endpoints (relay + address-lookup disabled)
+    // and drive the actual `PeerTable::add` / `forward::spawn_peer_reader` path
+    // with genuine `Connection`s, so they catch wiring regressions the pure
+    // helpers above can't — notably the bug where a brand-new peer's first `add`
+    // reported the connection as "unchanged", so no data reader was ever spawned
+    // and every inbound datagram was silently lost.
+
+    use iroh::endpoint::presets;
+    use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
+
+    const MESH_TEST_ALPN: &[u8] = b"rayfish/test/mesh";
+
+    async fn loopback_endpoint() -> Endpoint {
+        Endpoint::builder(presets::N0)
+            .secret_key(SecretKey::generate())
+            .alpns(vec![MESH_TEST_ALPN.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind loopback endpoint")
+    }
+
+    /// Establish one real mesh connection between two fresh endpoints and return
+    /// `(server, client, server_side_conn, client_side_conn)`. `dial` re-uses the
+    /// given client to open an additional connection to the same server.
+    async fn connected_pair() -> (Endpoint, Endpoint, Connection, Connection) {
+        let server = loopback_endpoint().await;
+        let client = loopback_endpoint().await;
+        let (conn_server, conn_client) = dial(&server, &client).await;
+        (server, client, conn_server, conn_client)
+    }
+
+    /// Open one more connection from `client` to `server`; returns
+    /// `(server_side, client_side)` `Connection`s.
+    async fn dial(server: &Endpoint, client: &Endpoint) -> (Connection, Connection) {
+        let server_addr: EndpointAddr = server.addr();
+        let accept = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .accept()
+                    .await
+                    .expect("incoming")
+                    .await
+                    .expect("accept connection")
+            })
+        };
+        let conn_client = client
+            .connect(server_addr, MESH_TEST_ALPN)
+            .await
+            .expect("client connect");
+        let conn_server = accept.await.expect("accept task");
+        (conn_server, conn_client)
+    }
+
+    #[tokio::test]
+    async fn add_reports_first_connection_as_new_so_reader_spawns() {
+        // Regression: the *first* registration of a brand-new peer must return
+        // `true` (connection changed) so `register_peer_conn` spawns the single
+        // data reader. The old placeholder-seeded check returned `false` here,
+        // leaving the peer with no reader -> 100% inbound loss.
+        let (_srv, _cli, conn, _client_side) = connected_pair().await;
+        let peer = conn.remote_id();
+        let ip = crate::membership::derive_ip(&peer);
+        let ipv6 = crate::membership::derive_ipv6(&peer);
+        let table = PeerTable::new();
+
+        assert!(
+            table.add(ip, ipv6, conn.clone(), peer, "n1"),
+            "first add of a new peer must report the connection as new"
+        );
+        // Same connection, a second shared network: one reader already serves it,
+        // so this must NOT report a new connection (no duplicate reader).
+        assert!(
+            !table.add(ip, ipv6, conn.clone(), peer, "n2"),
+            "re-adding the same connection for another network must not respawn"
+        );
+        // Both networks route over the one connection.
+        let route = table.lookup_v4(&ip).expect("peer routable");
+        assert_eq!(route.conn.stable_id(), conn.stable_id());
+    }
+
+    #[tokio::test]
+    async fn add_reports_reconnect_as_new() {
+        // A reconnect installs a different QUIC connection (new stable id) to the
+        // same peer identity: `add` must report it new so the stale reader is
+        // replaced.
+        let (server, client, conn1, _c1) = connected_pair().await;
+        let peer = conn1.remote_id();
+        let ip = crate::membership::derive_ip(&peer);
+        let ipv6 = crate::membership::derive_ipv6(&peer);
+        let table = PeerTable::new();
+        assert!(table.add(ip, ipv6, conn1.clone(), peer, "n1"));
+
+        // Second, distinct connection to the same server identity.
+        let (conn2, _c2) = dial(&server, &client).await;
+        assert_ne!(conn1.stable_id(), conn2.stable_id(), "distinct connections");
+        assert!(
+            table.add(ip, ipv6, conn2.clone(), peer, "n1"),
+            "a reconnect (different connection) must report the connection as new"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_reader_delivers_inbound_datagram_to_tun() {
+        use crate::firewall::{FirewallConfig, SharedFirewall};
+        use crate::forward::{ForwardCtx, spawn_peer_reader, tag_datagram};
+        use crate::stats::ForwardMetrics;
+        use bytes::Bytes;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        // R receives, S sends. Establish a real connection; `conn_r` is R's side.
+        let (_srv, _cli, conn_r, conn_s) = connected_pair().await;
+        let s_id = conn_r.remote_id();
+        let s_ip = crate::membership::derive_ip(&s_id);
+        let s_ipv6 = crate::membership::derive_ipv6(&s_id);
+        let r_ip = crate::membership::derive_ip(&conn_s.remote_id());
+
+        // Register S in R's table for "net" and teach R that S's tag 1 = "net".
+        let peers = PeerTable::new();
+        peers.add(s_ip, s_ipv6, conn_r.clone(), s_id, "net");
+        peers.add_inbound_handle_by_id(&s_id, 1, SmolStr::new("net"));
+
+        let (tun_tx, mut tun_rx) = mpsc::channel::<Bytes>(8);
+        let (disc_tx, _disc_rx) = mpsc::channel(8);
+        let ctx = ForwardCtx {
+            firewall: SharedFirewall::new(FirewallConfig::default()),
+            tun_tx: Arc::new(arc_swap::ArcSwap::new(Arc::new(tun_tx))),
+            disconnect_tx: disc_tx,
+            token: CancellationToken::new(),
+            stats: Arc::new(ForwardMetrics::default()),
+            device_user_map: DeviceUserMap::new(),
+        };
+        spawn_peer_reader(conn_r.clone(), s_id, peers.clone(), ctx);
+
+        // S sends a tagged ICMP echo from its own mesh IP: default firewall
+        // allows inbound ICMP, and the source matches S's assigned IP so the
+        // anti-spoof check passes. The reader must untag, resolve the network via
+        // the handle, and write the raw IP packet (tag stripped) to the TUN.
+        let icmp = icmp_echo_packet(s_ip, r_ip);
+        conn_s
+            .send_datagram(tag_datagram(1, &icmp))
+            .expect("send datagram");
+
+        let got = tokio::time::timeout(Duration::from_secs(5), tun_rx.recv())
+            .await
+            .expect("reader forwarded a datagram before timeout")
+            .expect("tun channel stayed open");
+        assert_eq!(&got[..], &icmp[..], "TUN packet must be the untagged IP packet");
+    }
+
+    /// Minimal IPv4/ICMP echo-request packet from `src` to `dst`, enough for
+    /// `firewall::parse_packet_info` (version/IHL, protocol 1, src/dst) and the
+    /// seeded inbound `allow icmp` rule.
+    fn icmp_echo_packet(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+        let mut p = vec![0u8; 28];
+        p[0] = 0x45; // IPv4, IHL=5
+        p[3] = 28; // total length
+        p[9] = 1; // ICMP
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        p[20] = 8; // ICMP type = echo request
+        p
+    }
+
+    #[test]
+    fn connection_is_new_starts_reader_for_brand_new_peer() {
+        // A peer with no prior entry: `add` must report the connection as new so
+        // `register_peer_conn` spawns the data reader. Regression for the bug where
+        // a placeholder seeded with the incoming connection made a first-ever add
+        // report "unchanged", leaving the peer with no reader and 100% inbound loss.
+        assert!(connection_is_new(None, 7));
+    }
+
+    #[test]
+    fn connection_is_new_false_when_same_connection_refreshed() {
+        // Re-adding the same live connection (e.g. a second shared network over the
+        // one connection) must not spawn a duplicate reader.
+        assert!(!connection_is_new(Some(7), 7));
+    }
+
+    #[test]
+    fn connection_is_new_true_on_reconnect_to_different_connection() {
+        // A reconnect installs a different QUIC connection (new stable id): the
+        // stale reader is gone, so a fresh one must start.
+        assert!(connection_is_new(Some(7), 8));
     }
 
     #[test]
