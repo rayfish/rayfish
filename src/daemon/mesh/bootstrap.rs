@@ -291,6 +291,14 @@ async fn build_daemon(
         disconnect_rx: std::sync::Mutex::new(Some(disconnect_rx)),
     });
 
+    // Install the daemon-wide mesh dispatch context so the per-connection demux
+    // (`drive_mesh_connection`) can build peer readers + route disconnects. Must
+    // happen before the accept loop starts handing it connections.
+    protocol_router.set_mesh_dispatch(MeshDispatch {
+        ctx: daemon.mesh_ctx(),
+        token: token.clone(),
+    });
+
     // --- Accept loop (ALPN dispatch) + Prometheus metrics ---
     protocol_router.spawn_accept_loop(daemon.endpoint.clone(), token.clone());
 

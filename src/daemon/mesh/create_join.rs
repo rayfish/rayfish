@@ -25,12 +25,11 @@ struct JoinContext<'a> {
 }
 
 /// A live mesh connection produced by the dial phase: the per-network state cell
-/// plus the cancellation token, disconnect channel, and background tasks that
-/// `finalize_join` folds into the `NetworkHandle`.
+/// plus the cancellation token and background tasks that `finalize_join` folds
+/// into the `NetworkHandle`.
 struct EstablishedMesh {
     state: SharedNetworkState,
     cancel: CancellationToken,
-    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -618,7 +617,6 @@ impl MeshManager {
                     return Ok(Some(EstablishedMesh {
                         state,
                         cancel,
-                        disconnect_tx,
                         tasks,
                     }));
                 }
@@ -761,7 +759,6 @@ impl MeshManager {
         Ok(Some(EstablishedMesh {
             state,
             cancel,
-            disconnect_tx,
             tasks,
         }))
     }
@@ -818,7 +815,6 @@ impl MeshManager {
         let EstablishedMesh {
             state,
             cancel,
-            disconnect_tx: _,
             mut tasks,
         } = mesh;
         let JoinContext {
@@ -1047,7 +1043,7 @@ impl MeshManager {
         &self,
         network_name: &str,
         net_pubkey: EndpointId,
-        alpn: &[u8],
+        _alpn: &[u8],
     ) -> Result<IpcMessage> {
         tracing::info!(network = %network_name, "trying DHT fallback");
 

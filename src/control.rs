@@ -521,7 +521,7 @@ mod tests {
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
         assert_eq!(msg, decoded.msg);
-        if let ControlMsg::AdminGrant { secret_key, .. } = decoded {
+        if let ControlMsg::AdminGrant { secret_key, .. } = decoded.msg {
             assert_eq!(SecretKey::from(secret_key).public(), key.public());
         }
     }
@@ -569,7 +569,7 @@ mod tests {
         if let ControlMsg::MeshHello {
             device_cert: Some(c),
             ..
-        } = &decoded
+        } = &decoded.msg
         {
             assert!(c.verify());
         } else {
@@ -589,8 +589,8 @@ mod tests {
                 secret_hash: vec![4, 5, 6],
             },
         ] {
-            let bytes = encode_msg(&msg);
-            assert_eq!(decode_msg(&bytes).unwrap(), msg);
+            let bytes = encode_msg(None, &msg);
+            assert_eq!(decode_msg(&bytes).unwrap().msg, msg);
         }
     }
 
@@ -603,8 +603,8 @@ mod tests {
                 nonce: 0x0123_4567_89ab_cdef,
             },
         ] {
-            let bytes = encode_msg(&msg);
-            assert_eq!(decode_msg(&bytes).unwrap(), msg);
+            let bytes = encode_msg(None, &msg);
+            assert_eq!(decode_msg(&bytes).unwrap().msg, msg);
         }
     }
 

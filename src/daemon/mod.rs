@@ -50,7 +50,7 @@ use dashmap::{DashMap, DashSet};
 use anyhow::{Context, Result};
 use iroh::address_lookup::PkarrRelayClient;
 use iroh::endpoint::{Connection, Endpoint, VarInt};
-use iroh::protocol::{AcceptError, ProtocolHandler};
+use iroh::protocol::ProtocolHandler;
 use iroh::{EndpointId, SecretKey};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, HashAndFormat};
@@ -1243,12 +1243,6 @@ async fn open_and_send(conn: &Connection, net: Option<EndpointId>, msg: &Control
     control::send_msg(&mut send, net, msg).await
 }
 
-/// Send a `MemberSync` trigger for `net_pubkey` over `conn`. Net-scoped so the
-/// receiver's demux routes it to the right per-network handler.
-async fn send_member_sync(conn: &Connection, net_pubkey: EndpointId) {
-    let _ = open_and_send(conn, Some(net_pubkey), &ControlMsg::MemberSync).await;
-}
-
 /// Reply to a `ray ping` probe by echoing `Pong{nonce}` over a fresh stream
 /// (see [`open_and_send`] for why the reply can't ride the request stream back).
 /// Connection-level (`net = None`): the ping/pong path isn't tied to a network.
@@ -1358,6 +1352,7 @@ mod accept_handler_tests {
     /// dummy handles, none of which the constructed handlers exercise here.
     fn sample_mesh_ctx(identity: IrohIdentityProvider, blob_store: FsStore) -> MeshCtx {
         let (tun_tx, _) = tokio::sync::mpsc::channel(1);
+        let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
         MeshCtx {
             identity,
             peers: PeerTable::new(),
@@ -1369,39 +1364,48 @@ mod accept_handler_tests {
             reverse_table: dns::new_reverse_table(),
             device_user_map: peers::DeviceUserMap::new(),
             pruned_peers: Arc::new(DashSet::new()),
+            disconnect_tx,
         }
     }
 
     async fn sample_coordinator_handler() -> AcceptHandler {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
-        let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
         let my_key = SecretKey::from_bytes(&[2u8; 32]);
         let my_id = my_key.public();
         AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
             ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store),
             network_name: "test-net".to_string(),
             state: make_network_state(),
-            disconnect_tx,
             token: CancellationToken::new(),
             dht_notify: None,
             invite_lock: Arc::new(tokio::sync::Mutex::new(())),
-            pending_pongs: Arc::new(DashMap::new()),
         }))
     }
 
     async fn sample_member_handler() -> AcceptHandler {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
-        let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
         let my_key = SecretKey::from_bytes(&[3u8; 32]);
+        let my_id = my_key.public();
         AcceptHandler::Member(Arc::new(MemberAcceptState {
-            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_key.public(), 0), blob_store),
+            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store.clone()),
             network_name: "test-net".to_string(),
             state: make_network_state(),
-            disconnect_tx,
             token: CancellationToken::new(),
+            net_pubkey: SecretKey::from_bytes(&[1u8; 32]).public(),
+            my_identity: my_id,
+            endpoint: sample_test_endpoint().await,
+            promote_tx: tokio::sync::mpsc::channel(1).0,
+            invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+            reconverge_notify: Arc::new(tokio::sync::Notify::new()),
         }))
+    }
+
+    /// A throwaway bound endpoint for constructing a `MemberAcceptState` in tests
+    /// (the handler is only inspected for its variant, never driven).
+    async fn sample_test_endpoint() -> Endpoint {
+        Endpoint::bind(iroh::endpoint::presets::N0).await.unwrap()
     }
 
     #[tokio::test]
