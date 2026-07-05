@@ -29,6 +29,9 @@ object Telemetry {
         SentryAndroid.init(context.applicationContext) { options ->
             options.dsn = dsn
             options.release = "rayfish-android@${BuildConfig.VERSION_NAME}"
+            // Debug builds (the `.dev` package) report under the `dev`
+            // environment so they don't mix into production telemetry.
+            options.environment = if (BuildConfig.DEBUG) "dev" else "production"
             // Don't attach IPs, device names, or other personal data to events.
             options.isSendDefaultPii = false
             // Turn on Sentry structured logs so lines routed through
