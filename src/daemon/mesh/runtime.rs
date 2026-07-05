@@ -69,6 +69,7 @@ impl MeshManager {
                             user_identity: None,
                             device_cert: None,
                             collision_index: 0,
+                            last_seen: None,
                         });
                     }
                     for entry in &nc.approved {
@@ -95,6 +96,7 @@ impl MeshManager {
                     user_identity: None,
                     device_cert: None,
                     collision_index: 0,
+                    last_seen: None,
                 })
                 .expect("self-add cannot collide");
         }

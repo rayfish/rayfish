@@ -296,6 +296,7 @@ mod tests {
                 user_identity: None,
                 device_cert: None,
                 collision_index: 0,
+                last_seen: None,
             }],
         };
         let bytes = encode_msg(&msg);
@@ -415,6 +416,7 @@ mod tests {
                 user_identity: None,
                 device_cert: None,
                 collision_index: 0,
+                last_seen: None,
             }],
             approved: vec![ApprovedEntry {
                 identity: test_id(2),

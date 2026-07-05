@@ -1409,6 +1409,7 @@ mod coordinator_dial_order_tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
         // minter = b: b first, then the other coordinator a, never c (not coord), never me.
@@ -1426,6 +1427,7 @@ mod coordinator_dial_order_tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
 
         // No coordinators in the roster ⇒ empty order (caller bails).
@@ -1485,6 +1487,7 @@ mod coordinator_dial_order_tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         let members = vec![mk(a, true), mk(b, false), mk(c, true)];
         let me = a;
@@ -1503,6 +1506,7 @@ mod coordinator_dial_order_tests {
             user_identity: None,
             device_cert: None,
             collision_index: 0,
+            last_seen: None,
         };
         // Only members are us (coordinator) and a plain member: nobody to gossip to.
         let members = vec![mk(me, true), mk(test_id(2), false)];
