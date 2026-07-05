@@ -56,6 +56,23 @@ pub enum IpcMessage {
         network: String,
         peer: String,
     },
+    /// Coordinator-local: set (or clear) the per-network ephemeral policy — the
+    /// TTL after which an offline member is auto-removed. `ttl_secs = None`
+    /// disables it. Mutation (root/operator).
+    SetEphemeral {
+        network: String,
+        ttl_secs: Option<u64>,
+    },
+    /// Read the per-network ephemeral TTL (open read). Answered with
+    /// `EphemeralStatus`.
+    GetEphemeral {
+        network: String,
+    },
+    /// Response to `GetEphemeral`: the network's current TTL (`None` = off).
+    EphemeralStatus {
+        network: String,
+        ttl_secs: Option<u64>,
+    },
     Status,
     /// Build a diagnostic bundle (logs + metrics + sanitized status) on disk and
     /// return its path plus a pre-filled GitHub issue title/body. Open to any

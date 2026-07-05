@@ -116,6 +116,14 @@ pub(crate) enum Command {
         /// Member to remove: hostname, mesh IP, or short id
         peer: String,
     },
+    /// Set or show a per-network ephemeral policy: auto-remove members offline
+    /// longer than the given duration (coordinator only)
+    Ephemeral {
+        /// Network name
+        network: String,
+        /// `Nh`/`Nd`/`Nw` to enable, `off` to disable, or `show` to print
+        arg: String,
+    },
     /// Show status of all networks (active + saved)
     #[command(visible_aliases = ["st", "ls"])]
     Status,
@@ -973,6 +981,7 @@ async fn main() -> Result<()> {
         }
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Kick { network, peer } => ipc_kick(&network, &peer).await,
+        Command::Ephemeral { network, arg } => ipc_ephemeral(&network, &arg).await,
         Command::Status => ipc_status().await,
         Command::Report => ipc_report().await,
         Command::Daemon => {

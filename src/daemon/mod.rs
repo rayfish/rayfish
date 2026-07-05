@@ -699,6 +699,7 @@ impl MeshManager {
                 | IpcMessage::Ping { .. }
                 | IpcMessage::Netcheck
                 | IpcMessage::AliasList { .. }
+                | IpcMessage::GetEphemeral { .. }
         ) {
             return None;
         }
@@ -793,6 +794,10 @@ impl MeshManager {
             IpcMessage::Leave { name } => self.leave_network(&name).await,
             IpcMessage::Nuke { name, force } => self.nuke_network(&name, force).await,
             IpcMessage::Kick { network, peer } => self.kick_member(&network, &peer).await,
+            IpcMessage::SetEphemeral { network, ttl_secs } => {
+                self.set_ephemeral(&network, ttl_secs).await
+            }
+            IpcMessage::GetEphemeral { network } => self.get_ephemeral(&network),
             IpcMessage::Status => self.status(),
             IpcMessage::Report => self.build_report(peer_cred),
             IpcMessage::Up { hostname } => self.activate(hostname).await,

@@ -199,6 +199,69 @@ pub(crate) async fn ipc_leave(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Render a TTL in seconds back to the largest whole `Nw`/`Nd`/`Nh` unit
+/// (falling back to seconds), for display in `ray ephemeral show` and status.
+pub(crate) fn format_ttl(secs: u64) -> String {
+    if secs % 604_800 == 0 {
+        format!("{}w", secs / 604_800)
+    } else if secs % 86_400 == 0 {
+        format!("{}d", secs / 86_400)
+    } else if secs % 3_600 == 0 {
+        format!("{}h", secs / 3_600)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// `ray ephemeral <net> <duration|off|show>`: set, clear, or print a network's
+/// ephemeral auto-kick TTL.
+pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    if arg == "show" {
+        ipc::send(
+            &mut stream,
+            ipc::IpcMessage::GetEphemeral {
+                network: network.to_string(),
+            },
+        )
+        .await?;
+        match ipc::recv(&mut stream).await? {
+            ipc::IpcMessage::EphemeralStatus { ttl_secs, .. } => match ttl_secs {
+                Some(s) => println!("ephemeral policy on '{network}': {}", format_ttl(s)),
+                None => println!("ephemeral policy on '{network}': off"),
+            },
+            ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+            other => eprintln!("Unexpected response: {:?}", other),
+        }
+        return Ok(());
+    }
+    let ttl_secs = if arg == "off" {
+        None
+    } else {
+        match parse_ephemeral_duration(arg) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                print_error("error", &e, None);
+                return Ok(());
+            }
+        }
+    };
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::SetEphemeral {
+            network: network.to_string(),
+            ttl_secs,
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
 /// Parse a human duration (`Nh`/`Nd`/`Nw`) into seconds, enforcing a 1-hour
 /// floor. Returns the TTL in seconds or a user-facing error string. Used by
 /// `ray ephemeral <net> <duration>` to set the per-network policy.
