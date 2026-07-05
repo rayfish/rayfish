@@ -565,6 +565,10 @@ pub struct NetworkStatus {
     /// seeds `ray apply`'s `aliases:` map.
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
+    /// Per-network ephemeral auto-kick TTL in seconds, if the policy is on
+    /// (`ray ephemeral <net> <dur>`). `None` = off. Shown on the network line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_ttl_secs: Option<u64>,
 }
 
 #[derive(
