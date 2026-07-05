@@ -8,11 +8,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **One mesh connection per peer, not per network**: peers now hold a single
+  QUIC connection per device identity that carries traffic for every network they
+  share, instead of one connection per shared network. A host you share two
+  networks with is one connection with one round-trip estimate, so `ray status`
+  and `ray ping` report the **same** RTT for it everywhere (previously each could
+  read a different, sometimes-stale, per-network connection). Networks are now a
+  membership/policy layer decoupled from the transport. **This is a breaking
+  mesh-protocol change** — every peer must be on the new version to connect (older
+  peers are cleanly severed by the protocol-version gate; run `ray update`). A
+  peer kicked or removed from one shared network stays reachable on the others.
 - **`ray connect` links are now symmetric**: when a direct 2-peer connection is
   approved, both peers become coordinators of the auto-created network (the
   requester is granted the network key on admission). Either side can now manage
   the link (rename, re-invite, keep it alive) instead of only the peer who
   approved it.
+
+### Fixed
+
+- **QR scanner preview no longer appears sideways** when pairing a device on
+  Android: the scanner is now pinned to portrait so the camera preview stays
+  upright.
 
 ### Added
 
