@@ -436,6 +436,18 @@ pub struct AppConfig {
     /// admission. See [`PendingJoinEntry`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_joins: Vec<PendingJoinEntry>,
+    /// This user's current device-cert generation (`ray unpair` / rotation). A
+    /// bump revokes every device below it; the current value is published to
+    /// pkarr as the "floor" that verifiers reject certs beneath. `0` means no
+    /// rotation has happened. See [`crate::revocation`].
+    #[serde(default)]
+    pub cert_generation: u64,
+    /// Device keys this user has revoked via `ray unpair` (hex `EndpointId`).
+    /// **Local-only, never published** — the generation floor is what propagates.
+    /// The primary keeps this list so it can refuse to re-issue a revoked device
+    /// that reconnects with a stale cert, while re-issuing the devices it keeps.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_devices: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -456,6 +468,8 @@ impl Default for AppConfig {
             download_user: None,
             networks: Vec::new(),
             pending_joins: Vec::new(),
+            cert_generation: 0,
+            revoked_devices: Vec::new(),
         }
     }
 }
@@ -470,6 +484,16 @@ pub fn contact_secret(config: &mut AppConfig) -> SecretKey {
     let secret = SecretKey::generate();
     config.contact_secret_key = Some(secret.clone());
     secret
+}
+
+/// Parse the persisted revoked device keys (`revoked_devices`) into
+/// `EndpointId`s, skipping any malformed entry.
+pub fn revoked_device_ids(config: &AppConfig) -> Vec<EndpointId> {
+    config
+        .revoked_devices
+        .iter()
+        .filter_map(|s| s.parse::<EndpointId>().ok())
+        .collect()
 }
 
 /// Rotate this node's contact key, replacing it with a fresh one. The old
@@ -534,6 +558,10 @@ struct Settings {
     download_user: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_joins: Vec<PendingJoinEntry>,
+    #[serde(default)]
+    cert_generation: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    revoked_devices: Vec<String>,
 }
 
 /// Look up the `rayfish` group's gid (Linux), if the group exists.
@@ -781,6 +809,8 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
             download_dir: None,
             download_user: None,
             pending_joins: Vec::new(),
+            cert_generation: 0,
+            revoked_devices: Vec::new(),
         }
     };
 
@@ -824,6 +854,8 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         download_user: settings.download_user,
         networks,
         pending_joins: settings.pending_joins,
+        cert_generation: settings.cert_generation,
+        revoked_devices: settings.revoked_devices,
     })
 }
 
@@ -848,6 +880,8 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         download_dir: config.download_dir.clone(),
         download_user: config.download_user,
         pending_joins: config.pending_joins.clone(),
+        cert_generation: config.cert_generation,
+        revoked_devices: config.revoked_devices.clone(),
     };
     let path = dir.join(SETTINGS_FILE);
     let contents = toml::to_string_pretty(&settings).context("serializing settings")?;

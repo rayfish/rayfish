@@ -8,6 +8,8 @@ pub(crate) async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>)
         (None, Some(ticket)) | (Some(PairAction::Accept { ticket }), _) => {
             ipc_pair_accept(&ticket).await
         }
+        // `rayfish pair list`
+        (Some(PairAction::List), _) => ipc_pair_list().await,
         // `rayfish pair` — start pairing on primary device
         (None, None) => ipc_pair_start().await,
         // `rayfish pair backup`
@@ -78,6 +80,73 @@ pub(crate) async fn ipc_pair_accept(ticket: &str) -> Result<()> {
             println!();
             println!("This device will present its certificate when joining networks.");
         }
+        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+pub(crate) async fn ipc_pair_list() -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(&mut stream, ipc::IpcMessage::ListPairedDevices).await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::PairedDevices { devices } => {
+            if json_enabled() {
+                print_json(&serde_json::json!(
+                    devices
+                        .iter()
+                        .map(|d| serde_json::json!({
+                            "device_id": d.device_id.to_string(),
+                            "short_id": d.short_id,
+                            "hostname": d.hostname,
+                            "networks": d.networks,
+                        }))
+                        .collect::<Vec<_>>()
+                ));
+            } else if devices.is_empty() {
+                println!("\n  {}\n", style::faint("no paired devices"));
+            } else {
+                let rows = devices
+                    .iter()
+                    .map(|d| {
+                        let host = d.hostname.clone().unwrap_or_else(|| "—".to_string());
+                        let nets = if d.networks.is_empty() {
+                            "—".to_string()
+                        } else {
+                            d.networks.join(", ")
+                        };
+                        vec![
+                            layout::Cell::new(host.clone(), style::value(&host)),
+                            layout::Cell::new(d.short_id.clone(), style::rose(&d.short_id)),
+                            layout::Cell::new(nets.clone(), style::faint(&nets)),
+                        ]
+                    })
+                    .collect();
+                println!();
+                print!("{}", table(&["device", "id", "networks"], rows, 2));
+                println!(
+                    "\n  {}",
+                    style::faint("revoke one with: ray unpair <device>")
+                );
+            }
+        }
+        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+pub(crate) async fn ipc_unpair(device: &str) -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::Unpair {
+            device: device.to_string(),
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => print_error("error", &message, None),
         other => eprintln!("Unexpected response: {:?}", other),
     }

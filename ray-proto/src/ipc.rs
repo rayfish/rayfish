@@ -223,6 +223,17 @@ pub enum IpcMessage {
         endpoint_id: EndpointId,
         secret: Vec<u8>,
     },
+    /// List this user's paired devices (enumerated from the network rosters).
+    /// Reply: [`IpcMessage::PairedDevices`].
+    ListPairedDevices,
+    /// Revoke one of this user's paired devices (`ray unpair`). Primary-only.
+    /// Publishes a signed revocation record, drops the device locally, severs it
+    /// from networks this node coordinates, and best-effort signals the device to
+    /// wipe its own cert. Reply: [`IpcMessage::Ok`] / [`IpcMessage::Error`].
+    Unpair {
+        /// Device identifier: hostname, mesh IP, short id, or full endpoint id.
+        device: String,
+    },
     /// Authorize a local user (by UID) to control the daemon without root, the
     /// way `tailscale up --operator` does. Root-only.
     SetOperator {
@@ -440,6 +451,10 @@ pub enum IpcMessage {
     PairingComplete {
         user_identity: EndpointId,
     },
+    /// This user's paired devices (reply to `ListPairedDevices`).
+    PairedDevices {
+        devices: Vec<PairedDeviceInfo>,
+    },
     /// A diagnostic bundle was written to `path` (a `.tgz`, owned by the caller).
     /// `issue_title`/`issue_body` pre-fill a GitHub issue; the user attaches the
     /// bundle file manually.
@@ -508,6 +523,21 @@ pub struct AdminInfo {
     pub short_id: String,
     /// `true` if this is the local node.
     pub self_node: bool,
+}
+
+/// One of this user's paired secondary devices (reply to `ListPairedDevices`),
+/// enumerated from the network rosters as members whose `user_identity` is ours
+/// but whose device id is not.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PairedDeviceInfo {
+    /// The device's transport endpoint id (what `ray unpair` revokes).
+    pub device_id: EndpointId,
+    /// Short id form for display.
+    pub short_id: String,
+    /// The device's hostname if known from any roster.
+    pub hostname: Option<String>,
+    /// Networks this device is currently a member of.
+    pub networks: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
