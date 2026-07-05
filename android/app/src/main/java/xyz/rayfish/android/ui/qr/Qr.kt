@@ -44,7 +44,10 @@ fun rememberQrScanner(onResult: (String?) -> Unit): () -> Unit {
                 .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
                 .setBeepEnabled(false)
                 .setPrompt("Scan a Rayfish code")
-                .setOrientationLocked(false)
+                // Lock the scanner to the launch (portrait) orientation. With this
+                // false, the capture activity follows the rotation sensor and flips
+                // to landscape, so the preview comes up sideways.
+                .setOrientationLocked(true)
         )
     }
 }
