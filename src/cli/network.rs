@@ -202,11 +202,11 @@ pub(crate) async fn ipc_leave(name: &str) -> Result<()> {
 /// Render a TTL in seconds back to the largest whole `Nw`/`Nd`/`Nh` unit
 /// (falling back to seconds), for display in `ray ephemeral show` and status.
 pub(crate) fn format_ttl(secs: u64) -> String {
-    if secs % 604_800 == 0 {
+    if secs.is_multiple_of(604_800) {
         format!("{}w", secs / 604_800)
-    } else if secs % 86_400 == 0 {
+    } else if secs.is_multiple_of(86_400) {
         format!("{}d", secs / 86_400)
-    } else if secs % 3_600 == 0 {
+    } else if secs.is_multiple_of(3_600) {
         format!("{}h", secs / 3_600)
     } else {
         format!("{secs}s")
