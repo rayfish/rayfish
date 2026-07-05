@@ -279,11 +279,19 @@ fn print_network(net: &ipc::NetworkStatus) {
         print!("   {}", style::value(dns));
     }
     print!("   {}", style::faint(&net.my_ip.to_string()));
-    println!(
+    print!(
         "   {} {}",
         style::label("members"),
         style::value(&format!("{online}/{}", net.peers.len())),
     );
+    if let Some(ttl) = net.ephemeral_ttl_secs {
+        print!(
+            "   {} {}",
+            style::label("ephemeral"),
+            style::value(&format_ttl(ttl)),
+        );
+    }
+    println!();
 
     // Invert the local alias map (alias -> identity) for identity -> alias
     // lookups when rendering peers.

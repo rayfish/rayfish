@@ -116,6 +116,14 @@ pub(crate) enum Command {
         /// Member to remove: hostname, mesh IP, or short id
         peer: String,
     },
+    /// Set or show a per-network ephemeral policy: auto-remove members offline
+    /// longer than the given duration (coordinator only)
+    Ephemeral {
+        /// Network name
+        network: String,
+        /// `Nh`/`Nd`/`Nw` to enable, `off` to disable, or `show` to print
+        arg: String,
+    },
     /// Show status of all networks (active + saved)
     #[command(visible_aliases = ["st", "ls"])]
     Status,
@@ -316,6 +324,12 @@ pub(crate) enum Command {
         /// Pairing ticket from the primary device (shorthand for `rayfish pair accept <ticket>`)
         ticket: Option<String>,
     },
+    /// Revoke a paired device: invalidate its certificate mesh-wide (primary only)
+    Unpair {
+        /// Device to revoke: hostname, mesh IP, short id, or full endpoint id
+        /// (see `ray pair list`)
+        device: String,
+    },
     /// Handle a rayfish:// deep link (join or pair)
     Open {
         /// The rayfish:// URI, e.g. rayfish://join/<code> or rayfish://pair/<ticket>
@@ -388,6 +402,9 @@ pub(crate) enum PairAction {
         /// The pairing ticket
         ticket: String,
     },
+    /// List this user's paired devices
+    #[command(visible_alias = "ls")]
+    List,
     /// Export an encrypted backup of the signing key
     Backup {
         /// Store the backup in 1Password (via the `op` CLI) instead of printing it
@@ -973,6 +990,7 @@ async fn main() -> Result<()> {
         }
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Kick { network, peer } => ipc_kick(&network, &peer).await,
+        Command::Ephemeral { network, arg } => ipc_ephemeral(&network, &arg).await,
         Command::Status => ipc_status().await,
         Command::Report => ipc_report().await,
         Command::Daemon => {
@@ -1031,6 +1049,7 @@ async fn main() -> Result<()> {
         Command::Send { file, peer } => ipc_send_file(&file, &peer).await,
         Command::Files { action } => ipc_files(action).await,
         Command::Pair { action, ticket } => cmd_pair(action, ticket).await,
+        Command::Unpair { device } => ipc_unpair(&device).await,
         Command::Open { uri } => cmd_open(&uri).await,
         Command::Version => {
             println!("ray {FULL_VERSION}");
