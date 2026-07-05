@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Ephemeral peer auto-kick**: a per-network policy that automatically removes
+  members which stay offline longer than a configured time, the same as
+  `ray kick`. Set it with `ray ephemeral <net> <duration>` (`12h`, `7d`, `1w`;
+  minimum 1 hour), turn it off with `ray ephemeral <net> off`, and read it with
+  `ray ephemeral <net> show`. Off by default; the current TTL shows on the
+  network's line in `ray status`. Only the coordinator enforces it, and only
+  offline peers are pruned, so it applies to open and closed networks alike (a
+  removed peer can simply re-join or re-request later).
 - **`ray unpair <device>`**: revoke one of your paired devices, for example a
   lost or stolen laptop. Run it from your **primary** device (the one you paired
   the others from). Device certificates now carry a generation; unpairing bumps

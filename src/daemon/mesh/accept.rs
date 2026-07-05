@@ -453,6 +453,7 @@ impl CoordinatorAcceptState {
                 user_identity: user_id_opt,
                 device_cert: device_cert.clone(),
                 collision_index,
+                last_seen: Some(crate::membership::now_secs()),
             });
             s.refresh_snapshot();
             s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
@@ -746,6 +747,7 @@ impl MemberAcceptState {
                 user_identity: user_id_opt,
                 device_cert: device_cert.clone(),
                 collision_index: member_idx,
+                last_seen: Some(crate::membership::now_secs()),
             });
             s.refresh_snapshot();
             (

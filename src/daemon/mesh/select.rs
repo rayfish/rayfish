@@ -80,6 +80,7 @@ pub(crate) fn persisted_roster(network_name: &str) -> Vec<Member> {
                     user_identity: None,
                     device_cert: None,
                     collision_index: 0,
+                    last_seen: None,
                 })
                 .collect()
         })

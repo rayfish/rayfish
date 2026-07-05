@@ -56,6 +56,23 @@ pub enum IpcMessage {
         network: String,
         peer: String,
     },
+    /// Coordinator-local: set (or clear) the per-network ephemeral policy — the
+    /// TTL after which an offline member is auto-removed. `ttl_secs = None`
+    /// disables it. Mutation (root/operator).
+    SetEphemeral {
+        network: String,
+        ttl_secs: Option<u64>,
+    },
+    /// Read the per-network ephemeral TTL (open read). Answered with
+    /// `EphemeralStatus`.
+    GetEphemeral {
+        network: String,
+    },
+    /// Response to `GetEphemeral`: the network's current TTL (`None` = off).
+    EphemeralStatus {
+        network: String,
+        ttl_secs: Option<u64>,
+    },
     Status,
     /// Build a diagnostic bundle (logs + metrics + sanitized status) on disk and
     /// return its path plus a pre-filled GitHub issue title/body. Open to any
@@ -578,6 +595,10 @@ pub struct NetworkStatus {
     /// seeds `ray apply`'s `aliases:` map.
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
+    /// Per-network ephemeral auto-kick TTL in seconds, if the policy is on
+    /// (`ray ephemeral <net> <dur>`). `None` = off. Shown on the network line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_ttl_secs: Option<u64>,
 }
 
 #[derive(
@@ -985,6 +1006,7 @@ mod tests {
                 pending_suggestions: 0,
                 pending_requests: 0,
                 aliases: BTreeMap::new(),
+                ephemeral_ttl_secs: None,
             }],
             packets_rx: 0,
             packets_tx: 0,
