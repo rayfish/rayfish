@@ -45,6 +45,14 @@ pub fn effective_pkarr_url() -> String {
 /// EndpointId so a peer can dial them without knowing the transport id.
 const CONTACT_RECORD_NAME: &str = "_rayfish_contact";
 
+/// pkarr record name for a user's device-cert **generation floor** (`ray unpair`
+/// / rotation). Published under the user's own key (the identity that signs
+/// device certs), it carries a single monotonic generation. Any peer that sees a
+/// `DeviceCert` resolves this record for `cert.user_identity` and rejects the
+/// cert if `cert.generation` is below the floor. Because the pkarr address *is*
+/// the user public key, the record is self-authenticating and cannot be forged.
+const CERT_FLOOR_RECORD_NAME: &str = "_rayfish_certgen";
+
 // ---------------------------------------------------------------------------
 // Pkarr client
 // ---------------------------------------------------------------------------
@@ -166,6 +174,36 @@ pub fn decode_contact_record(packet: &SignedPacket) -> Result<EndpointId> {
 }
 
 // ---------------------------------------------------------------------------
+// Cert-generation floor encoding / decoding (ray unpair / rotation)
+// ---------------------------------------------------------------------------
+
+/// Encode a cert-generation floor record: the user's current generation. Signed
+/// by (and published under) the user's own key, so only the identity that issued
+/// the certs can move it. pkarr's packet timestamp gives monotonicity, so a stale
+/// cached copy can never lower the floor.
+pub fn encode_cert_floor_record(user_secret: &SecretKey, generation: u64) -> Result<SignedPacket> {
+    let values = vec![RECORD_VERSION.to_string(), format!("g,{generation}")];
+    SignedPacket::from_txt_strings(user_secret, CERT_FLOOR_RECORD_NAME, values, RECORD_TTL)
+        .map_err(|e| anyhow::anyhow!("failed to build cert-floor record: {e}"))
+}
+
+pub fn decode_cert_floor_record(packet: &SignedPacket) -> Result<u64> {
+    let records = packet.txt_records(CERT_FLOOR_RECORD_NAME);
+    ensure!(!records.is_empty(), "no cert-floor records found");
+    ensure!(
+        records[0] == RECORD_VERSION,
+        "unsupported record version: {}",
+        records[0]
+    );
+    for record in &records[1..] {
+        if let Some(gen_str) = record.strip_prefix("g,") {
+            return gen_str.parse::<u64>().context("invalid cert generation");
+        }
+    }
+    anyhow::bail!("missing cert generation (g,)")
+}
+
+// ---------------------------------------------------------------------------
 // Publish / resolve
 // ---------------------------------------------------------------------------
 
@@ -227,6 +265,35 @@ pub async fn resolve_contact(
         .await
         .map_err(|e| anyhow::anyhow!("failed to resolve contact record: {e}"))?;
     decode_contact_record(&packet)
+}
+
+/// Publish this user's cert-generation floor (`user_key -> generation`).
+/// Republished on a TTL/2 cadence by `spawn_revocation_publisher` so the floor
+/// stays resolvable while the primary's daemon runs.
+pub async fn publish_cert_floor(
+    client: &PkarrRelayClient,
+    user_secret: &SecretKey,
+    generation: u64,
+) -> Result<()> {
+    let packet = encode_cert_floor_record(user_secret, generation)?;
+    client
+        .publish(&packet)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to publish cert-floor record: {e}"))
+}
+
+/// Resolve a user's cert-generation floor. A missing record (never published, or
+/// TTL-expired) surfaces as an `Err`, which callers treat as "floor 0" and fail
+/// open — see `RevocationCache`.
+pub async fn resolve_cert_floor(
+    client: &PkarrRelayClient,
+    user_pubkey: EndpointId,
+) -> Result<u64> {
+    let packet = client
+        .resolve(user_pubkey)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to resolve cert-floor record: {e}"))?;
+    decode_cert_floor_record(&packet)
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +434,45 @@ mod tests {
                 .to_string()
                 .contains("missing contact endpoint")
         );
+    }
+
+    #[test]
+    fn cert_floor_record_roundtrip() {
+        let user = SecretKey::generate();
+        let packet = encode_cert_floor_record(&user, 42).unwrap();
+        assert_eq!(decode_cert_floor_record(&packet).unwrap(), 42);
+    }
+
+    #[test]
+    fn cert_floor_record_zero_is_valid() {
+        let user = SecretKey::generate();
+        let packet = encode_cert_floor_record(&user, 0).unwrap();
+        assert_eq!(decode_cert_floor_record(&packet).unwrap(), 0);
+    }
+
+    #[test]
+    fn cert_floor_record_rejects_unknown_version() {
+        let key = SecretKey::generate();
+        let values = vec!["v99".to_string(), "g,5".to_string()];
+        let packet =
+            SignedPacket::from_txt_strings(&key, CERT_FLOOR_RECORD_NAME, values, 300).unwrap();
+        let result = decode_cert_floor_record(&packet);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported record version")
+        );
+    }
+
+    #[test]
+    fn cert_floor_record_rejects_missing_gen() {
+        let key = SecretKey::generate();
+        let values = vec!["v1".to_string()];
+        let packet =
+            SignedPacket::from_txt_strings(&key, CERT_FLOOR_RECORD_NAME, values, 300).unwrap();
+        assert!(decode_cert_floor_record(&packet).is_err());
     }
 
     #[test]
