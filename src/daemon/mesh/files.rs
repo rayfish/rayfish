@@ -530,18 +530,23 @@ impl MeshManager {
                         continue;
                     }
                     let me = Arc::clone(self);
+                    let net_name = net.name.clone();
+                    let net_key = net.network_key.clone();
                     tokio::spawn(async move {
-                        let _ = me
-                            .join_network(
-                                &net.network_key,
-                                Some(&net.name),
-                                None,
-                                None,
-                                None,
-                                false,
-                                false,
-                            )
-                            .await;
+                        match me
+                            .join_network(&net_key, Some(&net_name), None, None, None, false, false)
+                            .await
+                        {
+                            IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => {
+                                tracing::info!(network = %net_name, "pairing auto-join ok");
+                            }
+                            IpcMessage::Error { message } => {
+                                tracing::warn!(network = %net_name, error = %message, "pairing auto-join failed");
+                            }
+                            other => {
+                                tracing::warn!(network = %net_name, response = ?other, "pairing auto-join: unexpected response");
+                            }
+                        }
                     });
                 }
                 IpcMessage::PairingComplete {

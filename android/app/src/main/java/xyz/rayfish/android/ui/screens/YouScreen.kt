@@ -25,9 +25,14 @@ import xyz.rayfish.android.ui.theme.*
 fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val firstNet = status?.networks?.firstOrNull()
     var editing by remember { mutableStateOf(false) }
     var hostnameInput by remember { mutableStateOf("") }
+    var deviceName by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) {
+        deviceName = withContext(Dispatchers.IO) {
+            runCatching { NodeHolder.get(context).defaultHostname() }.getOrDefault("")
+        }
+    }
     var pairingTicket by remember { mutableStateOf<String?>(null) }
     var paired by remember { mutableStateOf(false) }
     // A device that already holds a cert cannot pair again (it must not mint new
@@ -59,10 +64,10 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         SectionCard {
             SectionLabel("This device")
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("Hostname", fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-                if (firstNet != null) TextButton(onClick = { hostnameInput = firstNet.hostname; editing = true }) {
-                    Text(firstNet.hostname.ifEmpty { "set" } + " ✎", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Rose400)
-                } else Text("join a network first", fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint)
+                Text("Device name", fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
+                TextButton(onClick = { hostnameInput = deviceName; editing = true }) {
+                    Text(deviceName.ifEmpty { "set" } + " ✎", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Rose400)
+                }
             }
             val nodeId = status?.nodeId?.takeIf { it.isNotEmpty() }
             val ip4 = status?.ipv4?.takeIf { it.isNotEmpty() }
@@ -99,7 +104,7 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         var crashReporting by remember { mutableStateOf(NodeHolder.isCrashReportingEnabled(context)) }
         ToggleCard(
             title = "Crash reporting",
-            subtitle = if (crashReporting) "on · anonymous diagnostics" else "off",
+            subtitle = if (crashReporting) "on · diagnostics" else "off",
             checked = crashReporting,
             onCheckedChange = { on ->
                 crashReporting = on
@@ -107,6 +112,16 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 if (on) Telemetry.enable(context) else Telemetry.disable()
             },
         )
+        if (crashReporting) {
+            PillButton("Send diagnostics", onClick = {
+                scope.launch {
+                    val id = withContext(Dispatchers.IO) {
+                        runCatching { Telemetry.sendDiagnostics(context) }.getOrNull()
+                    }
+                    onToast(if (id != null) "Diagnostics sent" else "Diagnostics unavailable")
+                }
+            }, modifier = Modifier.fillMaxWidth())
+        }
         SectionCard {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("About", fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
@@ -115,11 +130,11 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         }
     }
 
-    if (editing && firstNet != null) {
+    if (editing) {
         AlertDialog(
             onDismissRequest = { editing = false },
             containerColor = Rf.Sheet,
-            title = { Text("Hostname", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
+            title = { Text("Device name", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     RayfishTextField(hostnameInput, { hostnameInput = it }, "lowercase, 1-63 chars")
@@ -134,10 +149,12 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                         try {
                             withContext(Dispatchers.IO) {
                                 val node = NodeHolder.get(context)
+                                node.setDefaultHostname(h)
                                 nets.forEach { node.setHostname(it.name, h) }
                             }
-                            onToast("Hostname set"); onChanged(); editing = false
-                        } catch (t: Throwable) { onToast("Invalid hostname: ${t.message}") }
+                            deviceName = h
+                            onToast("Device name set"); onChanged(); editing = false
+                        } catch (t: Throwable) { onToast("Invalid name: ${t.message}") }
                     }
                 }) { Text("Save", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
             },
