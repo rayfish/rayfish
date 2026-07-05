@@ -135,10 +135,59 @@ where
         } else if level == Level::ERROR {
             d.error.fetch_add(1, Ordering::Relaxed);
         }
+        // Also mirror the line to Android logcat so `adb logcat -s rayfish`
+        // shows the core's tracing during development (the ring buffer alone is
+        // only readable through the in-app "Send diagnostics" attachment).
+        #[cfg(target_os = "android")]
+        android_log::write(level, meta.target(), visitor.text.trim_end());
         // Keep the log path non-blocking: drop the line if the buffer is
         // momentarily contended rather than stalling a logging thread.
         if let Ok(mut ring) = d.ring.try_lock() {
             ring.push(line, level);
+        }
+    }
+}
+
+/// Thin FFI bridge to Android's liblog so core `tracing` events show up in
+/// logcat under the `rayfish` tag. Kept as a direct `__android_log_write` call
+/// (linked via `-llog`) to avoid pulling in another logging crate.
+#[cfg(target_os = "android")]
+mod android_log {
+    use std::ffi::CString;
+    use std::os::raw::c_char;
+
+    use tracing::Level;
+
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(prio: i32, tag: *const c_char, text: *const c_char) -> i32;
+    }
+
+    /// Android log priorities (see `<android/log.h>`).
+    const ANDROID_LOG_DEBUG: i32 = 3;
+    const ANDROID_LOG_INFO: i32 = 4;
+    const ANDROID_LOG_WARN: i32 = 5;
+    const ANDROID_LOG_ERROR: i32 = 6;
+
+    pub(super) fn write(level: Level, target: &str, text: &str) {
+        let prio = match level {
+            Level::ERROR => ANDROID_LOG_ERROR,
+            Level::WARN => ANDROID_LOG_WARN,
+            Level::INFO => ANDROID_LOG_INFO,
+            _ => ANDROID_LOG_DEBUG,
+        };
+        // liblog splits on the tag, so keep the crate target in the message.
+        let Ok(tag) = CString::new("rayfish") else {
+            return;
+        };
+        // A NUL in the message would truncate it; skip the line rather than lose
+        // the tag alignment.
+        if let Ok(msg) = CString::new(format!("{target}: {text}")) {
+            // SAFETY: both pointers are valid NUL-terminated C strings that
+            // outlive the call, and liblog is always present on Android.
+            unsafe {
+                __android_log_write(prio, tag.as_ptr(), msg.as_ptr());
+            }
         }
     }
 }
