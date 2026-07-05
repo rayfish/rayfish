@@ -782,6 +782,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -844,6 +846,8 @@ fun uniffi_ray_mobile_checksum_method_node_pair(
 fun uniffi_ray_mobile_checksum_method_node_reject_connect_request(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_reject_file_offer(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_send_file(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_set_default_hostname(
 ): Short
@@ -967,6 +971,8 @@ fun uniffi_ray_mobile_fn_method_node_pair(`ptr`: Pointer,`ticket`: RustBuffer.By
 fun uniffi_ray_mobile_fn_method_node_reject_connect_request(`ptr`: Pointer,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_reject_file_offer(`ptr`: Pointer,`id`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_ray_mobile_fn_method_node_send_file(`ptr`: Pointer,`path`: RustBuffer.ByValue,`peer`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_set_default_hostname(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1182,6 +1188,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_reject_file_offer() != 10539.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_send_file() != 31964.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_set_default_hostname() != 40200.toShort()) {
@@ -1744,6 +1753,18 @@ public interface NodeInterface {
     fun `rejectFileOffer`(`id`: kotlin.ULong)
     
     /**
+     * Send a file to a peer. `path` is a readable file path (the core reads its
+     * bytes and adds them to the blob store); `peer` is any identifier the core
+     * resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+     * Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
+     * (or auto-accepts if it is one of the sender's own paired devices). Needs
+     * only the control plane ([`Node::start`]), not the tunnel, but the peer must
+     * be reachable. Runs to completion synchronously; callers drive it off the UI
+     * thread (Android's share flow runs it in a foreground service).
+     */
+    fun `sendFile`(`path`: kotlin.String, `peer`: kotlin.String)
+    
+    /**
      * Set the device's default hostname. Validated with the core's hostname
      * rules; rejected names leave the stored value untouched. Config-only;
      * safe before `start`.
@@ -2297,6 +2318,28 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
+     * Send a file to a peer. `path` is a readable file path (the core reads its
+     * bytes and adds them to the blob store); `peer` is any identifier the core
+     * resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+     * Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
+     * (or auto-accepts if it is one of the sender's own paired devices). Needs
+     * only the control plane ([`Node::start`]), not the tunnel, but the peer must
+     * be reachable. Runs to completion synchronously; callers drive it off the UI
+     * thread (Android's share flow runs it in a foreground service).
+     */
+    @Throws(RayException::class)override fun `sendFile`(`path`: kotlin.String, `peer`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_send_file(
+        it, FfiConverterString.lower(`path`),FfiConverterString.lower(`peer`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Set the device's default hostname. Validated with the core's hostname
      * rules; rejected names leave the stored value untouched. Config-only;
      * safe before `start`.
@@ -2503,7 +2546,12 @@ data class FileOffer (
     var `from`: kotlin.String, 
     var `filename`: kotlin.String, 
     var `size`: kotlin.ULong, 
-    var `mimeType`: kotlin.String
+    var `mimeType`: kotlin.String, 
+    /**
+     * True when the sender is one of this user's own paired devices. The UI
+     * auto-accepts these (own-device shares) without a manual tap.
+     */
+    var `ownDevice`: kotlin.Boolean
 ) {
     
     companion object
@@ -2520,6 +2568,7 @@ public object FfiConverterTypeFileOffer: FfiConverterRustBuffer<FileOffer> {
             FfiConverterString.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -2528,7 +2577,8 @@ public object FfiConverterTypeFileOffer: FfiConverterRustBuffer<FileOffer> {
             FfiConverterString.allocationSize(value.`from`) +
             FfiConverterString.allocationSize(value.`filename`) +
             FfiConverterULong.allocationSize(value.`size`) +
-            FfiConverterString.allocationSize(value.`mimeType`)
+            FfiConverterString.allocationSize(value.`mimeType`) +
+            FfiConverterBoolean.allocationSize(value.`ownDevice`)
     )
 
     override fun write(value: FileOffer, buf: ByteBuffer) {
@@ -2537,6 +2587,7 @@ public object FfiConverterTypeFileOffer: FfiConverterRustBuffer<FileOffer> {
             FfiConverterString.write(value.`filename`, buf)
             FfiConverterULong.write(value.`size`, buf)
             FfiConverterString.write(value.`mimeType`, buf)
+            FfiConverterBoolean.write(value.`ownDevice`, buf)
     }
 }
 

@@ -68,8 +68,23 @@ impl MeshManager {
         None
     }
 
-    pub(crate) async fn send_file(&self, path: &str, peer: &str) -> IpcMessage {
-        let peer_id = match self.resolve_peer_name(peer).await {
+    /// Resolve whether a pending offer's sender is one of *our own* paired
+    /// devices: the sender's resolved user identity must equal ours (our device
+    /// cert's `user_identity`, or on the primary — which holds no cert — our own
+    /// endpoint id). A non-paired peer resolves to its own transport id and so
+    /// can never match. Shared by `try_auto_accept_file` and `list_files` (which
+    /// surfaces it as `PendingFileInfo.own_device` for the mobile UI).
+    pub(crate) fn is_own_device_sender(&self, from: EndpointId) -> bool {
+        let own_user = self
+            .device_cert
+            .as_ref()
+            .map(|c| c.user_identity)
+            .unwrap_or_else(|| self.endpoint.id());
+        self.device_user_map.resolve(&from) == own_user
+    }
+
+    pub async fn send_file(&self, path: &str, peer: &str) -> IpcMessage {
+        let peer_id = match self.resolve_peer_flexible(peer).await {
             Some(id) => id,
             None => {
                 return IpcMessage::Error {
@@ -152,6 +167,7 @@ impl MeshManager {
                 filename: f.filename.clone(),
                 size: f.size,
                 mime_type: f.mime_type.clone(),
+                own_device: self.is_own_device_sender(f.from),
             })
             .collect();
         IpcMessage::FileList { files }
@@ -283,17 +299,9 @@ impl MeshManager {
             }
         };
 
-        // Own-device gate: the sender's resolved user identity must match ours.
-        // Our identity is our device cert's user_identity, or (on the primary,
-        // which has no cert) our own endpoint id. A non-paired peer resolves to
-        // its own transport id and so can never match.
-        let own_user = self
-            .device_cert
-            .as_ref()
-            .map(|c| c.user_identity)
-            .unwrap_or_else(|| self.endpoint.id());
-        let sender_user = self.device_user_map.resolve(&from);
-        if sender_user != own_user {
+        // Own-device gate: the sender must resolve to one of our own paired
+        // devices (see `is_own_device_sender`).
+        if !self.is_own_device_sender(from) {
             return;
         }
 

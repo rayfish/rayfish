@@ -33,6 +33,9 @@ class RayfishVpnService : VpnService() {
     private var tunnel: ParcelFileDescriptor? = null
     private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
     private var heartbeat: java.util.concurrent.ScheduledExecutorService? = null
+    // Polls for incoming own-device file offers and auto-accepts them, so files
+    // shared to this device land in Downloads even with the app UI closed.
+    private var autoAcceptPoller: java.util.concurrent.ScheduledExecutorService? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -160,6 +163,17 @@ class RayfishVpnService : VpnService() {
                 30, 30, java.util.concurrent.TimeUnit.MINUTES,
             )
         }
+
+        // Auto-accept own-device file offers while the tunnel is up, so a file
+        // shared to this device from one of the user's own devices lands in
+        // Downloads without the app being open. Gated by the user's opt-out toggle
+        // inside FileAutoAccept.run.
+        autoAcceptPoller = java.util.concurrent.Executors.newSingleThreadScheduledExecutor().also { exec ->
+            exec.scheduleWithFixedDelay(
+                { runCatching { FileAutoAccept.run(applicationContext) } },
+                4, 4, java.util.concurrent.TimeUnit.SECONDS,
+            )
+        }
     }
 
     // The IPv4 DNS servers of the underlying (non-VPN) network, deduplicated.
@@ -206,6 +220,8 @@ class RayfishVpnService : VpnService() {
         netCallback = null
         heartbeat?.shutdownNow()
         heartbeat = null
+        autoAcceptPoller?.shutdownNow()
+        autoAcceptPoller = null
 
         tunnel = null
     }

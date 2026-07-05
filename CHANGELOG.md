@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Share with Rayfish (Android)**: photos, videos, and any file can now be shared
+  straight to a mesh peer from the Android system share sheet. Pick an online peer
+  and the file is delivered in the background (a notification confirms it was sent),
+  so you are never left waiting. Sharing several items at once is supported. Files
+  sent to one of your **own** paired devices are auto-accepted there and saved to
+  Downloads with no tap — this is on by default and can be turned off under
+  "Auto-accept from my devices" in the You screen. (Own-device is determined from
+  the device pairing certificate, so a file from someone else always asks first.)
 - **Consistent Android device name**: the phone now uses one device name across
   every network instead of a different random name per network. It is seeded from
   your device model on first run and can be changed in the You screen (the change
