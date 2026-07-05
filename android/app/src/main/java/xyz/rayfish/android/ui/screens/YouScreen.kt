@@ -25,7 +25,6 @@ import xyz.rayfish.android.ui.theme.*
 fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val firstNet = status?.networks?.firstOrNull()
     var editing by remember { mutableStateOf(false) }
     var hostnameInput by remember { mutableStateOf("") }
     var deviceName by remember { mutableStateOf("") }

@@ -58,24 +58,19 @@ class RayfishVpnService : VpnService() {
 
         // Bring the control plane up before building the tunnel so status() can
         // report our real mesh IP. ensureStarted is idempotent.
-        val meshIp = try {
+        val (meshIp, meshV6) = try {
             runBlocking {
                 NodeHolder.ensureStarted(applicationContext)
-                NodeHolder.get(applicationContext).status().ipv4
+                val snapshot = NodeHolder.get(applicationContext).status()
+                snapshot.ipv4 to snapshot.ipv6
             }
         } catch (t: Throwable) {
             Log.e(TAG, "could not read mesh IP before tunnel build", t)
-            ""
+            "" to ""
         }
         // Fall back to the CGNAT base if we have no networks yet, so the tunnel
         // still establishes.
         val tunnelAddr = meshIp.ifBlank { "100.64.0.2" }
-
-        val meshV6 = try {
-            runBlocking { NodeHolder.get(applicationContext).status().ipv6 }
-        } catch (t: Throwable) {
-            ""
-        }
 
         // Point the resolver at the phone's real DNS servers before the tunnel
         // captures all DNS on 100.100.100.53. Without this, non-.ray lookups are
@@ -112,7 +107,7 @@ class RayfishVpnService : VpnService() {
         for (pkg in DISALLOWED_APPS) {
             try {
                 builder.addDisallowedApplication(pkg)
-            } catch (e: PackageManager.NameNotFoundException) {
+            } catch (_: PackageManager.NameNotFoundException) {
                 Log.i(TAG, "disallowed app not installed, skipping: $pkg")
             }
         }
