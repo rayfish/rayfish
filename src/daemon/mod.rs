@@ -141,31 +141,85 @@ pub(crate) struct MeshCtx {
     device_user_map: peers::DeviceUserMap,
     /// Peers removed from a network's roster (via `ray kick` or a stale-entry
     /// prune during reconverge), keyed by `(network, transport id)`. A member
-    /// closes such a peer's connection but can't see its own close code, so its
-    /// reconnect loop would re-dial the removed peer (which still lists it) and
-    /// re-form the link. The reconnect loop consumes an entry here to skip that
+    /// closes such a peer's connection but can't see its own close code, so the
+    /// connection supervisor would re-dial the removed peer (which still lists it)
+    /// and re-form the link. The supervisor consumes an entry here to skip that
     /// one reconnect. Populated in [`reconverge_and_apply`] and the kick handler.
     pruned_peers: Arc<DashSet<(String, EndpointId)>>,
+    /// Daemon-wide disconnect channel. Every per-connection data reader
+    /// (`forward::spawn_peer_reader`) reports its peer's drop here, and a single
+    /// [`MeshManager::run_connection_supervisor`] consumes it. Under one mesh
+    /// connection per identity a drop tears the peer down across every shared
+    /// network at once, so this is node-wide rather than per-network.
+    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
 }
 
 impl MeshCtx {
     /// Build the per-peer data-plane bundle for `forward::spawn_peer_reader`,
-    /// combining this context's shared handles with the caller's per-connection
-    /// `disconnect_tx`/`token`.
-    fn forward_ctx(
-        &self,
-        disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
-        token: CancellationToken,
-    ) -> forward::ForwardCtx {
+    /// combining this context's shared handles with the caller's `token`. The
+    /// disconnect sender is the daemon-wide one carried on the context.
+    fn forward_ctx(&self, token: CancellationToken) -> forward::ForwardCtx {
         forward::ForwardCtx {
             firewall: self.firewall.clone(),
             tun_tx: self.tun_tx.clone(),
-            disconnect_tx,
+            disconnect_tx: self.disconnect_tx.clone(),
             token,
             stats: self.stats.clone(),
             device_user_map: self.device_user_map.clone(),
         }
     }
+
+    /// Register a peer's connection for `network` in the peer table and, if this
+    /// is the connection's first registration (any network), start its single
+    /// data-plane reader. One reader serves every network the connection carries,
+    /// so subsequent networks over the same connection only add a route. Returns
+    /// whether the reader was started (i.e. the stored connection is new).
+    pub(crate) fn register_peer_conn(
+        &self,
+        conn: &Connection,
+        peer_id: EndpointId,
+        ip: Ipv4Addr,
+        network: &str,
+        token: &CancellationToken,
+    ) -> bool {
+        let ipv6 = derive_ipv6(&peer_id);
+        let conn_changed = self.peers.add(ip, ipv6, conn.clone(), peer_id, network);
+        if conn_changed {
+            forward::spawn_peer_reader(
+                conn.clone(),
+                peer_id,
+                self.peers.clone(),
+                self.forward_ctx(token.clone()),
+            );
+        }
+        conn_changed
+    }
+}
+
+/// Announce our outbound handle table to a peer over `conn` so it can decode the
+/// datagrams we tag for each shared network. Full snapshot (idempotent replace on
+/// the receiver); connection-level (`net = None`). Resolves each local network
+/// name to its public key from config, which is cheap and only runs when a
+/// connection's shared-network set changes.
+pub(crate) async fn announce_network_handles(peers: &PeerTable, conn: &Connection, peer_ip: Ipv4Addr) {
+    let entries: Vec<control::NetworkHandle> = peers
+        .outbound_handles(&peer_ip)
+        .into_iter()
+        .filter_map(|(name, handle)| {
+            let pubkey = config::load_network(&name)
+                .ok()
+                .flatten()
+                .and_then(|n| n.network_public_key)?;
+            Some(control::NetworkHandle {
+                network: pubkey,
+                handle,
+            })
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    let _ = open_and_send(conn, None, &ControlMsg::NetworkHandles { entries }).await;
 }
 
 /// Project a roster's `Member`s into the persistable `config::MemberEntry` form
@@ -414,6 +468,14 @@ pub struct MeshManager {
     /// clones (not the full `MeshManager`), so it can't promote itself — hence
     /// the channel hand-off to the loop that does hold the `Arc<MeshManager>`.
     promote_tx: mpsc::Sender<String>,
+    /// Daemon-wide disconnect sender, cloned into every [`MeshCtx`] so every
+    /// per-connection data reader reports peer drops to one place. See
+    /// [`MeshCtx::disconnect_tx`].
+    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+    /// Receiver half of the daemon-wide disconnect channel, handed to
+    /// [`run_daemon`] to drive the single [`MeshManager::run_connection_supervisor`]
+    /// (mirrors the `promote_rx` hand-off).
+    disconnect_rx: std::sync::Mutex<Option<mpsc::Receiver<forward::DisconnectEvent>>>,
 }
 
 /// Map key-holding status to a [`NetworkRole`].
@@ -490,6 +552,7 @@ impl MeshManager {
             reverse_table: self.dns.reverse_table.clone(),
             device_user_map: self.device_user_map.clone(),
             pruned_peers: self.pruned_peers.clone(),
+            disconnect_tx: self.disconnect_tx.clone(),
         }
     }
 
@@ -621,7 +684,7 @@ impl MeshManager {
         cancel: CancellationToken,
     ) {
         self.protocol_router.register(
-            transport::network_alpn(&network_key),
+            network_key,
             AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
                 ctx: self.mesh_ctx(),
                 network_name: network.to_string(),
@@ -999,7 +1062,8 @@ impl MeshManager {
                 "coordinator renamed self; republishing blob + broadcasting MemberSync"
             );
             update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
-            broadcast_member_sync(&self.peers, None).await;
+            let net_pubkey = state.read().unwrap().network_public_key;
+            broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
         } else {
             self.announce_rename_to_peers(network, my_identity, my_ip, &new_hostname)
                 .await;
@@ -1023,6 +1087,7 @@ impl MeshManager {
         new_hostname: &str,
     ) {
         let peers = self.peers.peers_for_network_with_conn(network);
+        let net_pubkey = self.networks.get(network).map(|h| h.network_key);
         tracing::info!(
             network = %network,
             hostname = %new_hostname,
@@ -1038,7 +1103,7 @@ impl MeshManager {
                     hostname: Some(new_hostname.to_string()),
                     device_cert: self.current_device_cert(),
                 };
-                if control::send_msg(&mut send, &msg).await.is_ok() {
+                if control::send_msg(&mut send, net_pubkey, &msg).await.is_ok() {
                     sent += 1;
                 }
             }
@@ -1177,35 +1242,55 @@ fn write_bundle(path: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()>
 /// daemon-initiated control message rides its own `open_bi` (the control readers
 /// drop the request stream's send half, so a reply can't ride it back). Returns
 /// the result so callers can log per-peer failures.
-async fn open_and_send(conn: &Connection, msg: &ControlMsg) -> Result<()> {
+async fn open_and_send(conn: &Connection, net: Option<EndpointId>, msg: &ControlMsg) -> Result<()> {
     let (mut send, _recv) = conn.open_bi().await.context("open control stream")?;
-    control::send_msg(&mut send, msg).await
+    control::send_msg(&mut send, net, msg).await
 }
 
-async fn send_member_sync(conn: &Connection) {
-    let _ = open_and_send(conn, &ControlMsg::MemberSync).await;
+/// Send a `MemberSync` trigger for `net_pubkey` over `conn`. Net-scoped so the
+/// receiver's demux routes it to the right per-network handler.
+async fn send_member_sync(conn: &Connection, net_pubkey: EndpointId) {
+    let _ = open_and_send(conn, Some(net_pubkey), &ControlMsg::MemberSync).await;
 }
 
 /// Reply to a `ray ping` probe by echoing `Pong{nonce}` over a fresh stream
 /// (see [`open_and_send`] for why the reply can't ride the request stream back).
+/// Connection-level (`net = None`): the ping/pong path isn't tied to a network.
 async fn respond_pong(conn: &Connection, nonce: u64) {
-    let _ = open_and_send(conn, &ControlMsg::Pong { nonce }).await;
+    let _ = open_and_send(conn, None, &ControlMsg::Pong { nonce }).await;
 }
 
-async fn broadcast_member_sync(peers: &PeerTable, exclude_ip: Option<Ipv4Addr>) {
-    for (ip, conn) in peers.all_connections() {
+/// Broadcast a `MemberSync` trigger for one network to every peer that shares it,
+/// tagged with the network's public key so each receiver routes it correctly.
+/// A single mesh connection carries several networks now, so this filters to the
+/// network's own peers rather than blasting every connection.
+async fn broadcast_member_sync(
+    peers: &PeerTable,
+    net_pubkey: EndpointId,
+    network_name: &str,
+    exclude_ip: Option<Ipv4Addr>,
+) {
+    for (_id, ip, conn) in peers.peers_for_network_with_conn(network_name) {
         if Some(ip) == exclude_ip {
             continue;
         }
-        if let Err(e) = open_and_send(&conn, &ControlMsg::MemberSync).await {
+        if let Err(e) = open_and_send(&conn, Some(net_pubkey), &ControlMsg::MemberSync).await {
             tracing::warn!(peer_ip = %ip, error = %e, "failed to sync members");
         }
     }
 }
 
-async fn broadcast_control_msg(peers: &PeerTable, msg: &ControlMsg) {
-    for (_ip, conn) in peers.all_connections() {
-        let _ = open_and_send(&conn, msg).await;
+/// Broadcast a network-scoped control message to every peer that shares the
+/// network, tagged with its public key. Same per-network filtering as
+/// [`broadcast_member_sync`].
+async fn broadcast_control_msg(
+    peers: &PeerTable,
+    net_pubkey: EndpointId,
+    network_name: &str,
+    msg: &ControlMsg,
+) {
+    for (_id, _ip, conn) in peers.peers_for_network_with_conn(network_name) {
+        let _ = open_and_send(&conn, Some(net_pubkey), msg).await;
     }
 }
 
