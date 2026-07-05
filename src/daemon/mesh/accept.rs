@@ -997,18 +997,13 @@ impl AcceptHandler {
     }
 }
 
-/// One control stream's already-read message plus its send half (for a
-/// same-stream reply, e.g. `Welcome`). Routed by the per-connection demux to the
-/// right per-network handler.
-pub(crate) type InControl = (iroh::endpoint::SendStream, ControlMsg);
-
 /// Daemon-wide dispatch context the accept loop needs to drive a mesh
-/// connection: build the per-peer forward context and route disconnects. Set on
-/// the `ProtocolRouter` by `MeshManager` after construction (the router is built
+/// connection: the shared handles (`ctx` carries the disconnect sender used to
+/// build per-peer readers) plus the cancellation token. Set on the
+/// `ProtocolRouter` by `MeshManager` after construction (the router is built
 /// first), via a `OnceLock`.
 pub(crate) struct MeshDispatch {
     pub(crate) ctx: MeshCtx,
-    pub(crate) disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     pub(crate) token: CancellationToken,
 }
 

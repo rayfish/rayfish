@@ -276,12 +276,10 @@ mod tests {
     use iroh::SecretKey;
 
     #[test]
-    fn test_network_alpn() {
-        let key = SecretKey::generate().public();
-        let alpn = network_alpn(&key);
-        let key_str = key.to_string();
-        let expected = format!("rayfish/net/{MESH_PROTOCOL_VERSION}/{}", &key_str[..16]);
-        assert_eq!(alpn, expected.as_bytes());
+    fn test_mesh_alpn() {
+        // The mesh ALPN is a single node-wide protocol id, no per-network suffix.
+        let expected = format!("rayfish/mesh/{MESH_PROTOCOL_VERSION}");
+        assert_eq!(mesh_alpn(), expected.as_bytes());
     }
 
     #[test]
