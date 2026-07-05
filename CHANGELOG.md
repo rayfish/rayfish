@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Ephemeral peer auto-kick**: a per-network policy that automatically removes
+  members which stay offline longer than a configured time, the same as
+  `ray kick`. Set it with `ray ephemeral <net> <duration>` (`12h`, `7d`, `1w`;
+  minimum 1 hour), turn it off with `ray ephemeral <net> off`, and read it with
+  `ray ephemeral <net> show`. Off by default; the current TTL shows on the
+  network's line in `ray status`. Only the coordinator enforces it, and only
+  offline peers are pruned, so it applies to open and closed networks alike (a
+  removed peer can simply re-join or re-request later).
 - **Consistent Android device name**: the phone now uses one device name across
   every network instead of a different random name per network. It is seeded from
   your device model on first run and can be changed in the You screen (the change
