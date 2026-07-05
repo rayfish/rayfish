@@ -448,10 +448,9 @@ impl MeshManager {
         }
 
         // Prune the roster + DNS, then publish + broadcast + sever the link.
-        self.remove_member_roster_only(network, &state, member_id, member_ip)
-            .await;
-        self.finalize_removal(network, &state, &dht_notify, &[member_id])
-            .await;
+        let ctx = self.mesh_ctx();
+        remove_member_roster_only(&ctx, network, &state, member_id, member_ip).await;
+        finalize_removal(&ctx, network, &state, &dht_notify, &[member_id]).await;
 
         tracing::info!(peer = %member_id.fmt_short(), network = %network, "kicked member");
         IpcMessage::Ok {
@@ -459,53 +458,6 @@ impl MeshManager {
         }
     }
 
-    /// Remove one identity from the roster + approved list and drop its DNS
-    /// entries. Does NOT publish or broadcast; the caller batches that via
-    /// [`Self::finalize_removal`] so several removals collapse into one publish.
-    pub(crate) async fn remove_member_roster_only(
-        &self,
-        network: &str,
-        state: &SharedNetworkState,
-        member_id: EndpointId,
-        member_ip: Ipv4Addr,
-    ) {
-        {
-            let mut s = state.write().unwrap();
-            s.members.remove(&member_id);
-            s.approved.remove(&member_id);
-        }
-        dns::remove_hostname_by_ip(
-            &self.dns.hostname_table,
-            &self.dns.reverse_table,
-            network,
-            member_ip,
-        )
-        .await;
-    }
-
-    /// Republish the signed blob, broadcast a payload-free `MemberSync`, and
-    /// sever our own link(s) to every `victim` with `KICK_CODE`. Call once after
-    /// one or more [`Self::remove_member_roster_only`] edits. Other members drop
-    /// the victims when they reconverge from the freshly published record
-    /// (`prune_departed_peers`).
-    pub(crate) async fn finalize_removal(
-        &self,
-        network: &str,
-        state: &SharedNetworkState,
-        dht_notify: &Option<Arc<tokio::sync::Notify>>,
-        victims: &[EndpointId],
-    ) {
-        update_snapshot_and_publish(state, &self.blob_store, dht_notify).await;
-        broadcast_member_sync(&self.peers, None).await;
-        for (pid, ip, conn) in self.peers.peers_for_network_with_conn(network) {
-            let resolved = self.device_user_map.resolve(&pid);
-            if victims.iter().any(|v| *v == pid || *v == resolved) {
-                conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
-                self.peers
-                    .remove_peer_from_network(&ip, &derive_ipv6(&pid), network);
-            }
-        }
-    }
 
     /// Connect to every saved network (control plane). Run once at daemon
     /// startup so mesh connections follow the daemon lifecycle, not the data

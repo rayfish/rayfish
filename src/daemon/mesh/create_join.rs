@@ -124,6 +124,16 @@ impl MeshManager {
             }),
         ));
 
+        // Ephemeral policy pruner (coordinator-only): auto-remove members
+        // offline longer than the network's configured TTL. No-op while unset.
+        tasks.push(spawn_stale_member_pruner(
+            self.mesh_ctx(),
+            name.to_string(),
+            state.clone(),
+            Some(dht_notify.clone()),
+            cancel.clone(),
+        ));
+
         (tasks, disconnect_tx)
     }
 

@@ -402,3 +402,111 @@ mod prune_tests {
         assert!(!should_prune(&mk(7, false, Some(NOW + 100)), false, false, TTL, NOW));
     }
 }
+
+/// Interval between stale-member sweeps. Well under the 1-hour TTL floor so a
+/// member that crosses the threshold is evicted within one interval.
+const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Remove one identity from the roster + approved list and drop its DNS
+/// entries. Does NOT publish or broadcast; the caller batches that via
+/// [`finalize_removal`] so several removals collapse into one publish. Shared by
+/// the manual kick handler and the ephemeral pruner.
+pub(crate) async fn remove_member_roster_only(
+    ctx: &MeshCtx,
+    network: &str,
+    state: &SharedNetworkState,
+    member_id: EndpointId,
+    member_ip: Ipv4Addr,
+) {
+    {
+        let mut s = state.write().unwrap();
+        s.members.remove(&member_id);
+        s.approved.remove(&member_id);
+    }
+    dns::remove_hostname_by_ip(&ctx.hostname_table, &ctx.reverse_table, network, member_ip).await;
+}
+
+/// Republish the signed blob, broadcast a payload-free `MemberSync`, and sever
+/// our own link(s) to every `victim` with `KICK_CODE`. Call once after one or
+/// more [`remove_member_roster_only`] edits. Other members drop the victims when
+/// they reconverge from the freshly published record (`prune_departed_peers`).
+pub(crate) async fn finalize_removal(
+    ctx: &MeshCtx,
+    network: &str,
+    state: &SharedNetworkState,
+    dht_notify: &Option<Arc<tokio::sync::Notify>>,
+    victims: &[EndpointId],
+) {
+    update_snapshot_and_publish(state, &ctx.blob_store, dht_notify).await;
+    broadcast_member_sync(&ctx.peers, None).await;
+    for (pid, ip, conn) in ctx.peers.peers_for_network_with_conn(network) {
+        let resolved = ctx.device_user_map.resolve(&pid);
+        if victims.iter().any(|v| *v == pid || *v == resolved) {
+            conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
+            ctx.peers
+                .remove_peer_from_network(&ip, &derive_ipv6(&pid), network);
+        }
+    }
+}
+
+/// Coordinator-only: periodically evict members that have been offline longer
+/// than the network's `ephemeral_ttl_secs` (off by default). Ticks every
+/// [`PRUNE_INTERVAL`] plus once shortly after spawn, reading the TTL fresh from
+/// config each tick so `ray ephemeral` takes effect without a restart. Reuses
+/// the exact kick teardown, batched into one publish per sweep.
+pub(crate) fn spawn_stale_member_pruner(
+    ctx: MeshCtx,
+    network: String,
+    state: SharedNetworkState,
+    dht_notify: Option<Arc<tokio::sync::Notify>>,
+    token: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut first = true;
+        loop {
+            let delay = if first {
+                std::time::Duration::from_secs(60)
+            } else {
+                PRUNE_INTERVAL
+            };
+            first = false;
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            let ttl = match config::load_network(&network) {
+                Ok(Some(c)) => c.ephemeral_ttl_secs,
+                _ => None,
+            };
+            let Some(ttl) = ttl else { continue };
+            let now = crate::membership::now_secs();
+            let me = ctx.identity.local_identity();
+            let connected: std::collections::HashSet<EndpointId> = ctx
+                .peers
+                .peers_for_network_with_conn(&network)
+                .into_iter()
+                .map(|(eid, _, _)| eid)
+                .collect();
+            let victims: Vec<(EndpointId, Ipv4Addr)> = {
+                let s = state.read().unwrap();
+                s.members
+                    .all()
+                    .into_iter()
+                    .filter(|m| {
+                        should_prune(m, connected.contains(&m.identity), m.identity == me, ttl, now)
+                    })
+                    .map(|m| (m.identity, m.ip))
+                    .collect()
+            };
+            if victims.is_empty() {
+                continue;
+            }
+            for (id, ip) in &victims {
+                remove_member_roster_only(&ctx, &network, &state, *id, *ip).await;
+                tracing::info!(peer = %id.fmt_short(), network = %network, ttl_secs = ttl, "auto-kicked stale member (ephemeral TTL)");
+            }
+            let ids: Vec<EndpointId> = victims.iter().map(|(id, _)| *id).collect();
+            finalize_removal(&ctx, &network, &state, &dht_notify, &ids).await;
+        }
+    })
+}
