@@ -132,6 +132,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Faster reconnect on startup**: when a coordinator rejoins its networks it now
   dials all known members concurrently instead of one at a time, so restore no
   longer slows down with roster size or stalls on the first unreachable peer.
+- **No boot stall when a member is offline**: joining or reconnecting to a network
+  no longer waits to dial the whole roster before the network comes up. A single
+  unreachable member (for example a stale, offline device still on the roster)
+  used to block startup for the full per-peer connection timeout, tens of seconds,
+  before any other peer connected. The network is now usable as soon as the
+  coordinator link is up, and the remaining peers connect concurrently in the
+  background. This was most visible on the Android app as a long delay before
+  peers showed online.
 
 ### Fixed
 
