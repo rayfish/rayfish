@@ -284,6 +284,54 @@ impl FileService {
         }
     }
 
+    /// This user's identity: the cert's `user_identity` (paired secondary) or our
+    /// own endpoint id (primary/unpaired).
+    fn own_user_identity(&self) -> EndpointId {
+        self.current_device_cert()
+            .map(|c| c.user_identity)
+            .unwrap_or_else(|| self.transport.endpoint.id())
+    }
+
+    /// `ray pair list`: enumerate this user's other paired devices as roster
+    /// members sharing our `user_identity` but a different device id.
+    pub(crate) fn list_paired_devices(&self) -> IpcMessage {
+        let own_user = self.own_user_identity();
+        let own_device = self.transport.endpoint.id();
+        let mut by_device: HashMap<EndpointId, (Option<String>, Vec<String>)> = HashMap::new();
+        for entry in self.registry.networks.iter() {
+            let net_name = entry.key().clone();
+            let roster = entry.value().state.read().unwrap().roster();
+            for m in roster {
+                if m.user_identity == Some(own_user)
+                    && m.identity != own_user
+                    && m.identity != own_device
+                {
+                    let e = by_device
+                        .entry(m.identity)
+                        .or_insert_with(|| (m.hostname.clone(), Vec::new()));
+                    if e.0.is_none() {
+                        e.0 = m.hostname.clone();
+                    }
+                    e.1.push(net_name.clone());
+                }
+            }
+        }
+        let devices = by_device
+            .into_iter()
+            .map(|(device_id, (hostname, mut networks))| {
+                networks.sort();
+                networks.dedup();
+                ipc::PairedDeviceInfo {
+                    device_id,
+                    short_id: device_id.fmt_short().to_string(),
+                    hostname,
+                    networks,
+                }
+            })
+            .collect();
+        IpcMessage::PairedDevices { devices }
+    }
+
     /// Add a file to the blob store and offer it to a peer over `FILES_ALPN`.
     pub(crate) async fn send_file(&self, path: &str, peer: &str) -> IpcMessage {
         let peer_id = match self.registry.resolve_peer_flexible(peer).await {
