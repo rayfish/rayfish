@@ -293,13 +293,35 @@ async fn build_daemon(
     }
 
     // --- Protocol router + the shared MeshManager ---
-    // Auto-accept worker channel: the file service nudges this with each newly-
-    // queued offer id; the worker (spawned once the daemon exists) evaluates it.
-    let (new_file_tx, new_file_rx) = mpsc::unbounded_channel::<u64>();
+    // Group the foundation handles so extracted services can depend on
+    // `Arc<Transport>`. Clones here are cheap (all fields are `Arc`-backed); the
+    // loose `MeshManager` fields below still hold the originals until the daemon
+    // god object is dissolved.
+    let transport = Arc::new(Transport::new(
+        ep.clone(),
+        identity.clone(),
+        blob_store.clone(),
+        stats.clone(),
+        contact_public,
+    ));
+    // Networks map is shared with the NetworkRegistry service (M5 seam): both
+    // hold the same `Arc<DashMap>` so methods migrate to the registry gradually.
+    let networks = Arc::new(DashMap::new());
+    let registry = Arc::new(NetworkRegistry::new(networks.clone()));
     // Re-auth channel: the pairing accept arm nudges this with a re-paired device's
     // key so the daemon loop clears its nullifier (see `MeshManager::reauth_device`).
     let (reauth_tx, reauth_rx) = mpsc::channel::<EndpointId>(4);
-    let files = Arc::new(FileService::new(key.clone(), new_file_tx, reauth_tx));
+    // FileService owns file transfer + pairing. It evaluates own-device auto-accept
+    // directly (no worker channel), so it depends on Transport (endpoint + blobs)
+    // and NetworkRegistry (the membership gate).
+    let files = Arc::new(FileService::new(
+        key.clone(),
+        transport.clone(),
+        registry.clone(),
+        device_cert.clone(),
+        device_user_map.clone(),
+        reauth_tx,
+    ));
     let connect = Arc::new(ConnectService::new());
     let protocol_router = Arc::new(ProtocolRouter::new(
         blobs_proto,
@@ -316,21 +338,6 @@ async fn build_daemon(
     // Self-unpair channel: a control reader that received `Unpaired` from our
     // primary signals the daemon loop to leave all networks + wipe our cert.
     let (self_unpair_tx, self_unpair_rx) = mpsc::channel::<()>(4);
-    // Group the foundation handles so extracted services can depend on
-    // `Arc<Transport>`. Clones here are cheap (all fields are `Arc`-backed); the
-    // loose `MeshManager` fields below still hold the originals until the daemon
-    // god object is dissolved.
-    let transport = Arc::new(Transport::new(
-        ep.clone(),
-        identity.clone(),
-        blob_store.clone(),
-        stats.clone(),
-        contact_public,
-    ));
-    // Networks map is shared with the NetworkRegistry service (M5 seam): both
-    // hold the same `Arc<DashMap>` so methods migrate to the registry gradually.
-    let networks = Arc::new(DashMap::new());
-    let registry = Arc::new(NetworkRegistry::new(networks.clone()));
     let daemon = Arc::new(MeshManager {
         transport,
         registry,
@@ -385,10 +392,8 @@ async fn build_daemon(
     // --- Accept loop (ALPN dispatch) + Prometheus metrics ---
     protocol_router.spawn_accept_loop(daemon.endpoint.clone(), token.clone());
 
-    // Auto-accept worker: evaluates each newly-queued file offer for own-device
-    // auto-accept (no-op unless the sender is our own paired device on an
-    // opted-in network).
-    spawn_file_auto_accept(daemon.clone(), new_file_rx, token.clone());
+    // File auto-accept is evaluated inline by `FileService::accept_file_offer`
+    // (no worker channel), so nothing to spawn here.
 
     // --- Contact record publisher (ray connect) ---
     if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
@@ -571,26 +576,6 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<MeshManager>) -> Res
     Ok(())
 }
 
-/// Daemon-wide worker: drains newly-queued file-offer ids from the file service
-/// and evaluates each for own-device auto-accept (a no-op unless the sender is
-/// one of our own paired devices on a network with `auto_accept_files` on).
-fn spawn_file_auto_accept(
-    daemon: Arc<MeshManager>,
-    mut rx: mpsc::UnboundedReceiver<u64>,
-    token: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => return,
-                id = rx.recv() => match id {
-                    Some(id) => daemon.try_auto_accept_file(id).await,
-                    None => return,
-                },
-            }
-        }
-    })
-}
 
 /// First auto-update check runs ~5 min after boot (jittered), then every 6h.
 #[cfg(feature = "desktop")]

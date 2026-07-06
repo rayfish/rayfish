@@ -1,7 +1,6 @@
 //! File-sharing and device-pairing handlers for `MeshManager`: `send_file`,
 //! `list_files`, `accept_file`, pairing. Split out of `daemon/mod.rs`.
 
-use std::ffi::CString;
 use std::path::Path;
 
 use super::super::*;
@@ -69,21 +68,6 @@ impl MeshManager {
             }
         }
         None
-    }
-
-    /// Resolve whether a pending offer's sender is one of *our own* paired
-    /// devices: the sender's resolved user identity must equal ours (our device
-    /// cert's `user_identity`, or on the primary (which holds no cert) our own
-    /// endpoint id). A non-paired peer resolves to its own transport id and so
-    /// can never match. Shared by `try_auto_accept_file` and `list_files` (which
-    /// surfaces it as `PendingFileInfo.own_device` for the mobile UI).
-    pub(crate) fn is_own_device_sender(&self, from: EndpointId) -> bool {
-        let own_user = self
-            .device_cert
-            .as_ref()
-            .map(|c| c.user_identity)
-            .unwrap_or_else(|| self.endpoint.id());
-        self.device_user_map.resolve(&from) == own_user
     }
 
     pub async fn send_file(&self, path: &str, peer: &str) -> IpcMessage {
@@ -172,7 +156,7 @@ impl MeshManager {
                 filename: f.filename.clone(),
                 size: f.size,
                 mime_type: f.mime_type.clone(),
-                own_device: self.is_own_device_sender(f.from),
+                own_device: self.files.is_own_device_sender(f.from),
             })
             .collect();
         IpcMessage::FileList { files }
@@ -192,152 +176,6 @@ impl MeshManager {
             None => IpcMessage::Error {
                 message: format!("no pending file with id {id}"),
             },
-        }
-    }
-
-    pub async fn accept_file(
-        &self,
-        id: u64,
-        output: Option<String>,
-        peer_cred: Option<(u32, u32)>,
-    ) -> IpcMessage {
-        let pending_file = {
-            let mut pending = self.files.pending_files.lock().unwrap();
-            let idx = pending.iter().position(|f| f.id == id);
-            match idx {
-                Some(i) => pending.remove(i),
-                None => {
-                    return IpcMessage::Error {
-                        message: format!("no pending file with id {id}"),
-                    };
-                }
-            }
-        };
-
-        let blob_hash = iroh_blobs::Hash::from_bytes(*pending_file.blob_hash.as_bytes());
-
-        let conn = match transport::connect_to_peer_with_alpn(
-            &self.endpoint,
-            pending_file.from,
-            iroh_blobs::protocol::ALPN,
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("cannot reach sender: {e}"),
-                };
-            }
-        };
-
-        if let Err(e) = self
-            .blob_store
-            .remote()
-            .fetch(conn, iroh_blobs::HashAndFormat::raw(blob_hash))
-            .await
-        {
-            return IpcMessage::Error {
-                message: format!("blob fetch failed: {e}"),
-            };
-        }
-
-        let bytes = match self.blob_store.blobs().get_bytes(blob_hash).await {
-            Ok(b) => b,
-            Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("blob read failed: {e}"),
-                };
-            }
-        };
-
-        let dir = match output {
-            Some(ref p) => PathBuf::from(p),
-            None => dirs::download_dir().unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("Downloads")
-            }),
-        };
-
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            return IpcMessage::Error {
-                message: format!("cannot create directory '{}': {e}", dir.display()),
-            };
-        }
-
-        let dest = dir.join(&pending_file.filename);
-        if let Err(e) = std::fs::write(&dest, &bytes) {
-            return IpcMessage::Error {
-                message: format!("write failed: {e}"),
-            };
-        }
-
-        if let Some((uid, gid)) = peer_cred {
-            use std::os::unix::ffi::OsStrExt;
-            if let Ok(c) = CString::new(dest.as_os_str().as_bytes()) {
-                unsafe { libc::chown(c.as_ptr(), uid, gid) };
-            }
-            if let Ok(c) = CString::new(dir.as_os_str().as_bytes()) {
-                unsafe { libc::chown(c.as_ptr(), uid, gid) };
-            }
-        }
-
-        IpcMessage::Ok {
-            message: format!("saved to {}", dest.display()),
-        }
-    }
-
-    /// Evaluate a newly-queued (or already-pending) file offer against the
-    /// own-devices auto-accept policy and, if it qualifies, accept it without
-    /// user action. A no-op (offer stays queued) unless: the sender resolves to
-    /// *our own* user identity (a paired device) **and** it is a member of at
-    /// least one network with `auto_accept_files` enabled. Never removes the
-    /// pending entry unless it actually accepts (via `accept_file`).
-    pub(crate) async fn try_auto_accept_file(&self, id: u64) {
-        // Peek the offer's sender without consuming the queue entry.
-        let from = {
-            let pending = self.files.pending_files.lock().unwrap();
-            match pending.iter().find(|f| f.id == id) {
-                Some(f) => f.from,
-                None => return,
-            }
-        };
-
-        // Own-device gate: the sender must resolve to one of our own paired
-        // devices (see `is_own_device_sender`).
-        if !self.is_own_device_sender(from) {
-            return;
-        }
-
-        // Network gate: the sender must be a member of a network we've enabled.
-        if !self.registry.member_on_autoaccept_network(from) {
-            return;
-        }
-
-        // Placement must be explicitly resolvable (download-dir / download-user /
-        // operator). With none configured we do not write as root: leave the
-        // offer queued for manual `ray files accept`.
-        let (dir, cred) = match resolve_download_target() {
-            Some((dir, cred)) => (dir, cred),
-            None => {
-                tracing::warn!(
-                    from = %from.fmt_short(),
-                    "auto-accept: no download target configured (set `ray files download-dir` or `download-user`); leaving offer queued"
-                );
-                return;
-            }
-        };
-        let output = Some(dir.to_string_lossy().into_owned());
-
-        match self.accept_file(id, output, cred).await {
-            IpcMessage::Ok { message } => {
-                tracing::info!(from = %from.fmt_short(), %message, "file auto-accepted from own device");
-            }
-            IpcMessage::Error { message } => {
-                tracing::warn!(from = %from.fmt_short(), %message, "file auto-accept failed");
-            }
-            _ => {}
         }
     }
 
@@ -382,7 +220,7 @@ impl MeshManager {
                 .map(|f| f.id)
                 .collect();
             for id in ids {
-                self.try_auto_accept_file(id).await;
+                self.files.try_auto_accept_file(id).await;
             }
         }
         IpcMessage::Ok {
@@ -954,7 +792,7 @@ fn dir_owner(path: &std::path::Path) -> Option<(u32, u32)> {
 /// [`pick_download_target`]. `None` means "no configured target": the caller
 /// must leave the offer queued rather than writing as root. The daemon runs as
 /// root, so its own `~/Downloads` is never a valid fallback.
-fn resolve_download_target() -> Option<(PathBuf, Option<(u32, u32)>)> {
+pub(crate) fn resolve_download_target() -> Option<(PathBuf, Option<(u32, u32)>)> {
     let cfg = config::load().ok()?;
     let dir = cfg.download_dir.map(PathBuf::from);
     let dir_owned = dir.as_deref().and_then(dir_owner);
