@@ -61,37 +61,7 @@ impl MeshManager {
         net_state: &mut NetworkState,
         net_secret_key: &SecretKey,
     ) {
-        // Seed this coordinated network's nullifiers from our durable
-        // `revoked_devices` set so past `ray unpair`s survive a restart and reach
-        // every network we coordinate. Union (never clears) so a nullifier adopted
-        // from a co-coordinator's blob is preserved.
-        {
-            let cfg = config::load().unwrap_or_default();
-            net_state
-                .nullifiers
-                .extend(config::revoked_device_ids(&cfg));
-        }
-        net_state.refresh_snapshot();
-        if let Some(snap) = &net_state.snapshot {
-            let _ = self.blob_store.blobs().add_slice(&snap.msgpack_bytes).await;
-        }
-        if let Ok(pkarr_client) = dht::create_pkarr_client(&self.endpoint) {
-            let blob_hash = net_state
-                .snapshot
-                .as_ref()
-                .map(|s| s.hash)
-                .expect("snapshot set");
-            if let Err(e) = dht::publish_network(
-                &pkarr_client,
-                net_secret_key,
-                &blob_hash,
-                &[self.endpoint.id()],
-            )
-            .await
-            {
-                tracing::warn!(error = %e, "failed to publish network record");
-            }
-        }
+        self.registry.seal_and_publish(net_state, net_secret_key).await
     }
 
     /// Spawn the two background tasks every coordinator network needs: the pkarr
@@ -183,53 +153,8 @@ impl MeshManager {
         net_secret_key: &SecretKey,
         pre_approve: Option<(EndpointId, Option<String>)>,
     ) -> Result<NetworkState> {
-        let mut member_list = MemberList::new();
-        member_list
-            .add(Member {
-                identity: self.identity.local_identity(),
-                ip: my_ip,
-                is_coordinator: true,
-                hostname: Some(my_hostname.to_string()),
-                user_identity: None,
-                device_cert: None,
-                collision_index: 0,
-                last_seen: None,
-            })
-            .expect("self-add cannot collide");
-
-        let mut approved = ApprovedList::new();
-        if let Some((peer_id, peer_hostname)) = pre_approve {
-            let peer_ip = self.identity.derive_ip(&peer_id);
-            approved
-                .approve(
-                    ApprovedEntry {
-                        identity: peer_id,
-                        ip: peer_ip,
-                        hostname: peer_hostname,
-                        user_identity: None,
-                        device_cert: None,
-                        collision_index: 0,
-                    },
-                    &member_list,
-                )
-                .map_err(|e| anyhow::anyhow!("failed to pre-approve peer: {e:?}"))?;
-        }
-
-        Ok(NetworkState {
-            members: member_list,
-            approved,
-            snapshot: None,
-            network_secret_key: Some(net_secret_key.clone()),
-            network_public_key: net_secret_key.public(),
-            network_name: Some(name.to_string()),
-            mode,
-            suggested_firewall: SuggestedFirewall::default(),
-            reusable_keys: BTreeMap::new(),
-            // Seeded from persisted `revoked_devices` by `seal_and_publish`.
-            nullifiers: BTreeSet::new(),
-            pending_suggestions: Vec::new(),
-            pending: HashMap::new(),
-        })
+        self.registry
+            .build_initial_roster(name, my_ip, my_hostname, mode, net_secret_key, pre_approve)
     }
 
     pub(crate) async fn create_network_inner(
