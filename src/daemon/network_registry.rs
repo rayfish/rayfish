@@ -166,6 +166,42 @@ impl NetworkRegistry {
         self.networks.contains_key(name)
     }
 
+    /// Store a network's current blob snapshot in the blob store and publish the
+    /// signed pkarr record (hash + seed peers). No-op if the network is gone or
+    /// has no snapshot / secret key (only a coordinator holds the key).
+    pub(crate) async fn store_and_publish_group(&self, network: &str) {
+        let (hash, net_key, snap_bytes) = {
+            let Some(handle) = self.networks.get(network) else {
+                return;
+            };
+            let s = handle.state.read().unwrap();
+            (
+                s.snapshot.as_ref().map(|x| x.hash),
+                s.network_secret_key.clone(),
+                s.snapshot.as_ref().map(|x| x.msgpack_bytes.clone()),
+            )
+        };
+        if let Some(bytes) = snap_bytes {
+            let _ = self.transport.blob_store.blobs().add_slice(&bytes).await;
+        }
+        if let (Some(hash), Some(key)) = (hash, net_key)
+            && let Ok(client) = dht::create_pkarr_client(&self.transport.endpoint)
+        {
+            let mut seed_peers: Vec<EndpointId> = self
+                .peers
+                .peers_for_network(network)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            seed_peers.push(self.transport.endpoint.id());
+            seed_peers.sort_by_key(|id| id.to_string());
+            seed_peers.dedup();
+            if let Err(e) = dht::publish_network(&client, &key, &hash, &seed_peers).await {
+                tracing::warn!(error = %e, "failed to publish network record after accept");
+            }
+        }
+    }
+
     /// Resolve a peer name (hostname, `host.net.ray`, or mesh IPv4) to its
     /// endpoint id: Magic DNS + connected-peer route first, then the member
     /// roster (offline peers / self), then a short-id / endpoint-id prefix scan.
