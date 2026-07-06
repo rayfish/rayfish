@@ -1126,21 +1126,7 @@ impl MeshManager {
     }
 
     pub(crate) fn resolve_short_id_any_network(&self, short: &str) -> Option<EndpointId> {
-        if short == "self" {
-            return Some(self.endpoint.id());
-        }
-        for entry in self.networks.iter() {
-            let state = entry.value().state.read().unwrap();
-            if let Some(m) = state
-                .members
-                .all()
-                .iter()
-                .find(|m| m.identity.to_string().starts_with(short))
-            {
-                return Some(m.identity);
-            }
-        }
-        None
+        self.registry.resolve_short_id_any_network(short)
     }
 
     // -----------------------------------------------------------------------
