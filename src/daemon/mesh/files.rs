@@ -212,55 +212,9 @@ impl MeshManager {
         }
     }
 
-    /// This node's "user identity": our device cert's `user_identity` if we are a
-    /// paired secondary, else our own endpoint id (we are the primary). Matches
-    /// the own-device gate used by file auto-accept.
-    fn own_user_identity(&self) -> EndpointId {
-        self.current_device_cert()
-            .map(|c| c.user_identity)
-            .unwrap_or_else(|| self.endpoint.id())
-    }
-
-    /// Enumerate this user's paired secondary devices from the network rosters
-    /// (`ray pair list`). A paired device is any roster member whose
-    /// `user_identity` is ours but whose device id is neither ours nor the user
-    /// identity itself.
+    /// `ray pair list`: enumerate this user's other paired devices.
     pub(crate) fn list_paired_devices(&self) -> IpcMessage {
-        let own_user = self.own_user_identity();
-        let own_device = self.endpoint.id();
-        let mut by_device: HashMap<EndpointId, (Option<String>, Vec<String>)> = HashMap::new();
-        for entry in self.networks.iter() {
-            let net_name = entry.key().clone();
-            let roster = entry.value().state.read().unwrap().roster();
-            for m in roster {
-                if m.user_identity == Some(own_user)
-                    && m.identity != own_user
-                    && m.identity != own_device
-                {
-                    let e = by_device
-                        .entry(m.identity)
-                        .or_insert_with(|| (m.hostname.clone(), Vec::new()));
-                    if e.0.is_none() {
-                        e.0 = m.hostname.clone();
-                    }
-                    e.1.push(net_name.clone());
-                }
-            }
-        }
-        let devices = by_device
-            .into_iter()
-            .map(|(device_id, (hostname, mut networks))| {
-                networks.sort();
-                networks.dedup();
-                ipc::PairedDeviceInfo {
-                    device_id,
-                    short_id: device_id.fmt_short().to_string(),
-                    hostname,
-                    networks,
-                }
-            })
-            .collect();
-        IpcMessage::PairedDevices { devices }
+        self.files.list_paired_devices()
     }
 
     /// Revoke one of this user's paired devices (`ray unpair`). Primary-only.
