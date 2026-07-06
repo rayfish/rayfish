@@ -161,6 +161,11 @@ impl NetworkRegistry {
         }
     }
 
+    /// Whether a network by this name is currently active (in the live map).
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.networks.contains_key(name)
+    }
+
     /// Whether `identity` is a current member of at least one network that has
     /// file auto-accept enabled. Backs the own-device file auto-accept gate.
     pub(crate) fn member_on_autoaccept_network(&self, identity: EndpointId) -> bool {

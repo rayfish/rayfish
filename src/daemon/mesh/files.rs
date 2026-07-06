@@ -147,117 +147,24 @@ impl MeshManager {
     }
 
     pub fn list_files(&self) -> IpcMessage {
-        let pending = self.files.pending_files.lock().unwrap();
-        let files = pending
-            .iter()
-            .map(|f| ipc::PendingFileInfo {
-                id: f.id,
-                from: f.from.fmt_short().to_string(),
-                filename: f.filename.clone(),
-                size: f.size,
-                mime_type: f.mime_type.clone(),
-                own_device: self.files.is_own_device_sender(f.from),
-            })
-            .collect();
-        IpcMessage::FileList { files }
+        self.files.list_files()
     }
 
-    /// Decline a pending file offer: drop it from the queue without fetching the
-    /// blob. In-memory only, mirroring how `accept_file` consumes the entry.
+    /// Decline a pending file offer (delegates to [`FileService`]).
     pub fn reject_file(&self, id: u64) -> IpcMessage {
-        let mut pending = self.files.pending_files.lock().unwrap();
-        match pending.iter().position(|f| f.id == id) {
-            Some(i) => {
-                pending.remove(i);
-                IpcMessage::Ok {
-                    message: format!("declined file {id}"),
-                }
-            }
-            None => IpcMessage::Error {
-                message: format!("no pending file with id {id}"),
-            },
-        }
+        self.files.reject_file(id)
     }
 
-    /// Toggle this node's per-network auto-accept of file offers from our own
-    /// paired devices (persisted in config). Turning it on also drains any
-    /// already-queued offers that now qualify.
+    /// Toggle per-network own-device file auto-accept (delegates to
+    /// [`FileService`]).
     pub(crate) async fn files_auto_accept(&self, network: &str, enabled: bool) -> IpcMessage {
-        if !self.networks.contains_key(network) {
-            return IpcMessage::Error {
-                message: format!("network '{network}' not found"),
-            };
-        }
-        match config::load_network(network) {
-            Ok(Some(mut nc)) => {
-                nc.auto_accept_files = enabled;
-                if let Err(e) = config::save_network(&nc) {
-                    return IpcMessage::Error {
-                        message: format!("failed to persist auto-accept setting: {e}"),
-                    };
-                }
-            }
-            Ok(None) => {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not found in config"),
-                };
-            }
-            Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to load config: {e}"),
-                };
-            }
-        }
-        // On enable, sweep any already-queued offers so a file that arrived
-        // before the toggle still lands.
-        if enabled {
-            let ids: Vec<u64> = self
-                .files
-                .pending_files
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|f| f.id)
-                .collect();
-            for id in ids {
-                self.files.try_auto_accept_file(id).await;
-            }
-        }
-        IpcMessage::Ok {
-            message: format!(
-                "auto-accept files from your own devices {} for '{network}'",
-                if enabled { "enabled" } else { "disabled" }
-            ),
-        }
+        self.files.files_auto_accept(network, enabled).await
     }
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
-    /// mint a pairing ticket for this device.
+    /// mint a pairing ticket for this device (delegates to [`FileService`]).
     pub fn start_pairing(&self) -> IpcMessage {
-        // Only a primary (a device that holds no cert of its own) may mint device
-        // certs. A device that already carries a cert is a secondary: its key is
-        // not the user identity, so any cert it signed would bind the new device
-        // to the wrong identity and fork the device group. Refuse to hand out a
-        // pairing ticket in that case; new devices must pair from the primary.
-        if self.current_device_cert().is_some() {
-            return IpcMessage::Error {
-                message: "this device is already paired; add new devices from your primary device"
-                    .to_string(),
-            };
-        }
-
-        let secret: [u8; 32] = rand::random();
-
-        let endpoint_id = self.endpoint.id();
-        let mut ticket_bytes = Vec::with_capacity(64);
-        ticket_bytes.extend_from_slice(endpoint_id.as_bytes());
-        ticket_bytes.extend_from_slice(&secret);
-        let ticket = bs58::encode(&ticket_bytes).into_string();
-
-        *self.files.pairing_secret.lock().unwrap() = Some(secret);
-
-        tracing::info!("pairing session opened; awaiting a secondary to scan the ticket");
-        IpcMessage::PairingTicket { ticket }
+        self.files.start_pairing()
     }
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):

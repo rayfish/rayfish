@@ -275,6 +275,126 @@ impl FileService {
         }
     }
 
+    /// This device's pairing cert. On-disk authoritative (a cleanly-absent file
+    /// means unpaired); only a genuine read error falls back to the boot copy.
+    fn current_device_cert(&self) -> Option<control::DeviceCert> {
+        match identity::load_device_cert() {
+            Ok(cert) => cert,
+            Err(_) => self.device_cert.clone(),
+        }
+    }
+
+    /// List pending file offers awaiting `ray files accept`, tagging each with
+    /// whether it came from one of our own paired devices.
+    pub(crate) fn list_files(&self) -> IpcMessage {
+        let pending = self.pending_files.lock().unwrap();
+        let files = pending
+            .iter()
+            .map(|f| ipc::PendingFileInfo {
+                id: f.id,
+                from: f.from.fmt_short().to_string(),
+                filename: f.filename.clone(),
+                size: f.size,
+                mime_type: f.mime_type.clone(),
+                own_device: self.is_own_device_sender(f.from),
+            })
+            .collect();
+        IpcMessage::FileList { files }
+    }
+
+    /// Decline a pending file offer: drop it from the queue without fetching the
+    /// blob. In-memory only, mirroring how `accept_file` consumes the entry.
+    pub(crate) fn reject_file(&self, id: u64) -> IpcMessage {
+        let mut pending = self.pending_files.lock().unwrap();
+        match pending.iter().position(|f| f.id == id) {
+            Some(i) => {
+                pending.remove(i);
+                IpcMessage::Ok {
+                    message: format!("declined file {id}"),
+                }
+            }
+            None => IpcMessage::Error {
+                message: format!("no pending file with id {id}"),
+            },
+        }
+    }
+
+    /// Toggle this node's per-network auto-accept of file offers from our own
+    /// paired devices (persisted in config). Turning it on also drains any
+    /// already-queued offers that now qualify.
+    pub(crate) async fn files_auto_accept(&self, network: &str, enabled: bool) -> IpcMessage {
+        if !self.registry.contains(network) {
+            return IpcMessage::Error {
+                message: format!("network '{network}' not found"),
+            };
+        }
+        match config::load_network(network) {
+            Ok(Some(mut nc)) => {
+                nc.auto_accept_files = enabled;
+                if let Err(e) = config::save_network(&nc) {
+                    return IpcMessage::Error {
+                        message: format!("failed to persist auto-accept setting: {e}"),
+                    };
+                }
+            }
+            Ok(None) => {
+                return IpcMessage::Error {
+                    message: format!("network '{network}' not found in config"),
+                };
+            }
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to load config: {e}"),
+                };
+            }
+        }
+        // On enable, sweep any already-queued offers so a file that arrived
+        // before the toggle still lands.
+        if enabled {
+            let ids: Vec<u64> = self
+                .pending_files
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|f| f.id)
+                .collect();
+            for id in ids {
+                self.try_auto_accept_file(id).await;
+            }
+        }
+        IpcMessage::Ok {
+            message: format!(
+                "auto-accept files from your own devices {} for '{network}'",
+                if enabled { "enabled" } else { "disabled" }
+            ),
+        }
+    }
+
+    /// Mint a pairing ticket for this device. Only a primary (holding no cert of
+    /// its own) may mint device certs; a secondary is refused so a new device
+    /// can't be bound to the wrong identity.
+    pub(crate) fn start_pairing(&self) -> IpcMessage {
+        if self.current_device_cert().is_some() {
+            return IpcMessage::Error {
+                message: "this device is already paired; add new devices from your primary device"
+                    .to_string(),
+            };
+        }
+
+        let secret: [u8; 32] = rand::random();
+
+        let endpoint_id = self.transport.endpoint.id();
+        let mut ticket_bytes = Vec::with_capacity(64);
+        ticket_bytes.extend_from_slice(endpoint_id.as_bytes());
+        ticket_bytes.extend_from_slice(&secret);
+        let ticket = bs58::encode(&ticket_bytes).into_string();
+
+        *self.pairing_secret.lock().unwrap() = Some(secret);
+
+        tracing::info!("pairing session opened; awaiting a secondary to scan the ticket");
+        IpcMessage::PairingTicket { ticket }
+    }
+
     /// `PAIR_ALPN`: complete a device-pairing handshake. Verifies the dialer's
     /// secret against the active pairing session and, on match, signs and returns
     /// a `DeviceCert` binding the new device key to our identity.
