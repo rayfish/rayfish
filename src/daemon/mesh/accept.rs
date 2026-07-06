@@ -1071,10 +1071,6 @@ impl ProtocolRouter {
         self.conn.is_registered(net_pubkey)
     }
 
-    pub(crate) fn unregister(&self, net_pubkey: &EndpointId) {
-        self.conn.unregister(net_pubkey);
-    }
-
     /// In-flight `ray ping` probe map (nonce → oneshot), owned by the driver.
     pub(crate) fn pending_pongs(&self) -> &Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>> {
         &self.conn.pending_pongs

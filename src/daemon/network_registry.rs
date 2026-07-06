@@ -23,8 +23,14 @@ pub(crate) struct NetworkRegistry {
     /// Live peer routing table, for severing / notifying peers on roster change.
     peers: PeerTable,
     /// The per-peer connection driver, so the registry can (re-)register a
-    /// network's accept handler (coordinator promotion) directly.
+    /// network's accept handler (coordinator promotion) or unregister it on
+    /// teardown directly.
     conn: Arc<ConnectionManager>,
+    /// Magic-DNS service, to clear a torn-down network's `.ray` entries.
+    dns: Arc<DnsService>,
+    /// The TUN interface name, shared with the daemon (which sets it once the TUN
+    /// is up), for refreshing DNS search domains after a network is torn down.
+    tun_name: Arc<Mutex<String>>,
 }
 
 impl NetworkRegistry {
@@ -33,12 +39,69 @@ impl NetworkRegistry {
         transport: Arc<Transport>,
         peers: PeerTable,
         conn: Arc<ConnectionManager>,
+        dns: Arc<DnsService>,
+        tun_name: Arc<Mutex<String>>,
     ) -> Self {
         Self {
             networks,
             transport,
             peers,
             conn,
+            dns,
+            tun_name,
+        }
+    }
+
+    /// Tear down a network's runtime: cancel its tasks, drop its peers + `.ray`
+    /// entries, unregister its accept handler, and refresh DNS search domains.
+    /// Returns whether the network was actually active. The mesh ALPN set is
+    /// static, so (unlike the old `refresh_alpns`) only the search domains need
+    /// updating here.
+    pub(crate) async fn teardown_network_runtime(&self, name: &str) -> bool {
+        let Some(handle) = self.networks.remove(name).map(|(_, v)| v) else {
+            return false;
+        };
+        handle.cancel.cancel();
+        for task in handle.tasks {
+            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        }
+
+        self.peers.remove_by_network(name);
+        self.dns.clear_network(name).await;
+        self.conn.unregister(&handle.network_key);
+        self.refresh_search_domains().await;
+        true
+    }
+
+    /// Re-derive the OS DNS search domains from the currently-joined networks.
+    /// Split out of the daemon's `refresh_alpns` (whose ALPN half is a no-op now
+    /// the mesh ALPN is static) for the teardown path.
+    async fn refresh_search_domains(&self) {
+        let network_names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
+        let tun_name = self.tun_name.lock().unwrap().clone();
+        dns_config::update_search_domains(&network_names, &tun_name).await;
+    }
+
+    /// Leave a network: gracefully close our connections with the leave code (so
+    /// peers see an intentional departure and prune us), tear down the runtime,
+    /// and remove it from config.
+    pub(crate) async fn leave_network(&self, name: &str) -> IpcMessage {
+        for (_eid, _ip, conn) in self.peers.peers_for_network_with_conn(name) {
+            conn.close(VarInt::from_u32(forward::LEAVE_CODE), b"leave");
+        }
+
+        let was_active = self.teardown_network_runtime(name).await;
+        let removed_from_config = config::delete_network(name).unwrap_or(false);
+
+        if was_active || removed_from_config {
+            tracing::info!(network = %name, "left network");
+            IpcMessage::Ok {
+                message: format!("left network '{}'", name),
+            }
+        } else {
+            IpcMessage::Error {
+                message: format!("network '{}' not found", name),
+            }
         }
     }
 
