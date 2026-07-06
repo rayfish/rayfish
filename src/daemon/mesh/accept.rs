@@ -1020,23 +1020,8 @@ impl AcceptHandler {
     }
 }
 
-/// Daemon-wide dispatch context the accept loop needs to drive a mesh
-/// connection: the shared handles (`ctx` carries the disconnect sender used to
-/// build per-peer readers) plus the cancellation token. Set on the
-/// `ProtocolRouter` by `MeshManager` after construction (the router is built
-/// first), via a `OnceLock`.
-pub(crate) struct MeshDispatch {
-    pub(crate) ctx: MeshCtx,
-    pub(crate) token: CancellationToken,
-}
-
 pub(crate) struct ProtocolRouter {
     blobs: BlobsProtocol,
-    /// Per-network mesh accept handlers, keyed by network **public key**. A single
-    /// mesh connection may carry several of these (the peer shares several
-    /// networks); the connection driver routes each control frame to the handler
-    /// named by `ControlFrame.net`.
-    handlers: DashMap<EndpointId, AcceptHandler>,
     /// File-transfer + pairing state and their ALPN accept arms. The accept loop
     /// delegates the `FILES_ALPN`/`PAIR_ALPN` arms to this; `MeshManager` holds
     /// the same handle for the IPC-side file/pairing commands.
@@ -1045,12 +1030,10 @@ pub(crate) struct ProtocolRouter {
     /// accept arm. The accept loop delegates to this; `MeshManager` holds the same
     /// handle for the IPC-side connect commands.
     connect: Arc<ConnectService>,
-    /// In-flight `ray ping` probes, keyed by nonce. The connection driver fires
-    /// the oneshot when the matching `Pong` arrives so the ping handler can
-    /// measure round-trip time.
-    pub(crate) pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
-    /// Set once after construction; see [`MeshDispatch`].
-    mesh: std::sync::OnceLock<MeshDispatch>,
+    /// The per-peer mesh connection driver: owns the per-network handler registry,
+    /// the frame demux, and the ping-probe map. The mesh ALPN is delegated here;
+    /// register/handler_for/`pending_pongs` calls pass through to it.
+    conn: Arc<ConnectionManager>,
 }
 
 impl ProtocolRouter {
@@ -1061,38 +1044,35 @@ impl ProtocolRouter {
     ) -> Self {
         Self {
             blobs,
-            handlers: DashMap::new(),
             files,
             connect,
-            pending_pongs: Arc::new(DashMap::new()),
-            mesh: std::sync::OnceLock::new(),
+            conn: Arc::new(ConnectionManager::new()),
         }
     }
 
-    /// Install the daemon-wide mesh dispatch context. Called once by
-    /// `MeshManager` right after it is built.
+    /// Install the daemon-wide mesh dispatch context on the connection driver.
     pub(crate) fn set_mesh_dispatch(&self, dispatch: MeshDispatch) {
-        let _ = self.mesh.set(dispatch);
+        self.conn.set_mesh_dispatch(dispatch);
     }
 
-    /// Register a network's accept handler under its public key.
+    /// Register a network's accept handler under its public key. Passthrough to
+    /// the connection driver, which owns the handler registry.
     pub(crate) fn register(&self, net_pubkey: EndpointId, handler: AcceptHandler) {
-        self.handlers.insert(net_pubkey, handler);
+        self.conn.register(net_pubkey, handler);
     }
 
-    /// Replace a network's accept handler (used when a member is promoted to
-    /// coordinator). Returns whether a handler was present.
+    /// Whether a handler is registered for this network public key.
     pub(crate) fn is_registered(&self, net_pubkey: &EndpointId) -> bool {
-        self.handlers.contains_key(net_pubkey)
+        self.conn.is_registered(net_pubkey)
     }
 
     pub(crate) fn unregister(&self, net_pubkey: &EndpointId) {
-        self.handlers.remove(net_pubkey);
+        self.conn.unregister(net_pubkey);
     }
 
-    /// Look up a network's handler by public key.
-    pub(crate) fn handler_for(&self, net_pubkey: &EndpointId) -> Option<AcceptHandler> {
-        self.handlers.get(net_pubkey).map(|h| h.value().clone())
+    /// In-flight `ray ping` probe map (nonce → oneshot), owned by the driver.
+    pub(crate) fn pending_pongs(&self) -> &Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>> {
+        &self.conn.pending_pongs
     }
 
     /// The static ALPN set the endpoint advertises: the single mesh ALPN plus the
@@ -1151,116 +1131,12 @@ impl ProtocolRouter {
         })
     }
 
-    /// Drive one mesh connection (single mesh ALPN) for its whole lifetime. Spawns
-    /// the connection's single data reader on first network registration, then
-    /// loops accepting control streams and routing each `ControlFrame` to the
-    /// right per-network handler by `net`, or handling connection-level messages
-    /// (`NetworkHandles`, `Ping`/`Pong`) inline. Shared by the accept side (here)
-    /// and the dial side (`MeshManager::drive_dialed_connection`).
+    /// Drive one mesh connection for its whole lifetime. Passthrough to the
+    /// connection manager, which owns the driver, demux, and handler registry.
+    /// Used by the accept loop (above) and the dial side
+    /// (`MeshManager::drive_dialed_connection`).
     pub(crate) async fn drive_mesh_connection(self: Arc<Self>, conn: Connection) {
-        let peer_id = conn.remote_id();
-        let Some(mesh) = self.mesh.get() else {
-            tracing::error!("mesh dispatch not set; dropping connection");
-            return;
-        };
-        let token = mesh.token.clone();
-        let mut gate = crate::ratelimit::ControlGate::new();
-        loop {
-            let accepted = tokio::select! {
-                _ = token.cancelled() => return,
-                r = conn.accept_bi() => r,
-            };
-            let (send, mut recv) = match accepted {
-                Ok(pair) => pair,
-                Err(_) => return, // connection closed; the data reader emits the disconnect
-            };
-            let frame = match control::recv_frame(&mut recv).await {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            match gate.check() {
-                crate::ratelimit::Verdict::Allow => {}
-                crate::ratelimit::Verdict::Drop => continue,
-                crate::ratelimit::Verdict::Close => {
-                    tracing::warn!(peer = %peer_id.fmt_short(), "control-plane flood; closing connection");
-                    conn.close(VarInt::from_u32(forward::ABUSE_CODE), b"control flood");
-                    return;
-                }
-            }
-            // Connection-level messages (not scoped to a network).
-            match &frame.msg {
-                ControlMsg::NetworkHandles { entries } => {
-                    self.apply_network_handles(peer_id, entries);
-                    continue;
-                }
-                ControlMsg::Ping { nonce } => {
-                    respond_pong(&conn, *nonce).await;
-                    continue;
-                }
-                ControlMsg::Pong { nonce } => {
-                    if let Some((_, tx)) = self.pending_pongs.remove(nonce) {
-                        let _ = tx.send(());
-                    }
-                    continue;
-                }
-                ControlMsg::Unpaired => {
-                    // Our primary is unpairing this device. Act only if the sender
-                    // actually signed our cert (a stranger is a no-op), then hand
-                    // off to the daemon loop, which leaves every network + wipes the
-                    // cert. The reader holds only field clones, hence the channel.
-                    if is_unpaired_by(peer_id) {
-                        let _ = mesh.ctx.self_unpair_tx.try_send(());
-                    }
-                    continue;
-                }
-                ControlMsg::CertRefresh { cert } => {
-                    // Our primary rotated and re-issued us; verified inside against
-                    // our own cert (signer + device key + generation).
-                    store_refreshed_cert(cert);
-                    continue;
-                }
-                _ => {}
-            }
-            let Some(net_pubkey) = frame.net else {
-                continue;
-            };
-            let Some(handler) = self.handler_for(&net_pubkey) else {
-                tracing::debug!(peer = %peer_id.fmt_short(), net = %net_pubkey.fmt_short(), "control frame for unknown network; ignoring");
-                continue;
-            };
-            drop(recv); // one message per stream; the reply rides `send`
-            // `handle_frame` registers the peer (route + data reader) as a side
-            // effect and returns its mesh v4 once it is a member on this network.
-            if let Some(ip) = handler.handle_frame(&conn, send, peer_id, frame.msg).await {
-                // (Re)announce our outbound handle table so the peer can decode
-                // datagrams we tag for this (possibly newly-shared) network.
-                announce_network_handles(&mesh.ctx.peers, &conn, ip).await;
-            }
-        }
-    }
-
-    /// Apply a peer's announced `NetworkHandles` (its handle → network decode
-    /// table) so our data reader can resolve inbound datagram tags. Stores the
-    /// table on the peer's registered mesh IPs (falling back to the index-0
-    /// derivation if it isn't registered yet).
-    fn apply_network_handles(&self, peer_id: EndpointId, entries: &[control::NetworkHandle]) {
-        let Some(mesh) = self.mesh.get() else { return };
-        let ip = mesh
-            .ctx
-            .peers
-            .v4_for_id(&peer_id)
-            .unwrap_or_else(|| mesh.ctx.identity.derive_ip(&peer_id));
-        let ipv6 = derive_ipv6(&peer_id);
-        // Map network pubkey → local network name via the registry.
-        let mut table: Vec<(u16, SmolStr)> = Vec::new();
-        for e in entries {
-            if let Some(h) = self.handlers.get(&e.network)
-                && let Some(name) = h.network_name()
-            {
-                table.push((e.handle, SmolStr::new(name)));
-            }
-        }
-        mesh.ctx.peers.set_inbound_handles(&ip, &ipv6, &table);
+        self.conn.clone().drive_mesh_connection(conn).await;
     }
 }
 

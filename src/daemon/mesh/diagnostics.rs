@@ -388,7 +388,7 @@ impl MeshManager {
             }
             let nonce: u64 = rand::random();
             let (tx, rx) = tokio::sync::oneshot::channel();
-            self.protocol_router.pending_pongs.insert(nonce, tx);
+            self.protocol_router.pending_pongs().insert(nonce, tx);
             let sent = Instant::now();
             let sent_ok = match conn.open_bi().await {
                 Ok((mut send, _)) => {
@@ -407,7 +407,7 @@ impl MeshManager {
                 None
             };
             // Drop the slot whether or not the Pong arrived (timeout / send error).
-            self.protocol_router.pending_pongs.remove(&nonce);
+            self.protocol_router.pending_pongs().remove(&nonce);
             probes.push(rtt);
         }
 

@@ -884,7 +884,7 @@ impl MeshManager {
         }
 
         self.peers.remove_by_network(name);
-        dns::remove_network(&self.dns.hostname_table, &self.dns.reverse_table, name).await;
+        self.dns.clear_network(name).await;
         self.protocol_router.unregister(&handle.network_key);
         self.refresh_alpns().await;
         true
