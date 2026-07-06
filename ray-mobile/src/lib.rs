@@ -199,6 +199,9 @@ pub struct FileOffer {
     pub filename: String,
     pub size: u64,
     pub mime_type: String,
+    /// True when the sender is one of this user's own paired devices. The UI
+    /// auto-accepts these (own-device shares) without a manual tap.
+    pub own_device: bool,
 }
 
 /// A pending request awaiting the user's decision: an incoming `ray connect`
@@ -395,7 +398,7 @@ impl Node {
             invite,
             coordinator,
             false, // auto_accept_firewall
-            false, // auto_accept_files
+            true,  // auto_accept_files (own-device offers, identity-checked)
         ));
 
         match result {
@@ -616,6 +619,25 @@ impl Node {
 
     // --- Notifications: pending file offers, connect requests, join requests ---
 
+    /// Send a file to a peer. `path` is a readable file path (the core reads its
+    /// bytes and adds them to the blob store); `peer` is any identifier the core
+    /// resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+    /// Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
+    /// (or auto-accepts if it is one of the sender's own paired devices). Needs
+    /// only the control plane ([`Node::start`]), not the tunnel, but the peer must
+    /// be reachable. Runs to completion synchronously; callers drive it off the UI
+    /// thread (Android's share flow runs it in a foreground service).
+    pub fn send_file(&self, path: String, peer: String) -> Result<(), RayError> {
+        let state = self.state()?;
+        match self.runtime.block_on(state.send_file(&path, &peer)) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!(
+                "unexpected send response: {other:?}"
+            ))),
+        }
+    }
+
     /// Incoming file offers waiting to be accepted or declined.
     pub fn list_file_offers(&self) -> Result<Vec<FileOffer>, RayError> {
         let state = self.state()?;
@@ -628,6 +650,7 @@ impl Node {
                     filename: f.filename,
                     size: f.size,
                     mime_type: f.mime_type,
+                    own_device: f.own_device,
                 })
                 .collect()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
@@ -795,6 +818,21 @@ impl Node {
             IpcMessage::Error { message } => Err(RayError::PairFailed(message)),
             other => Err(RayError::PairFailed(format!(
                 "unexpected pair response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Unpair this device from its primary: leave every network it joined under
+    /// the shared identity (peers drop it right away) and delete the stored
+    /// device cert. Only meaningful when [`Node::is_paired`] is true; a node with
+    /// no cert returns an error. Requires [`Node::start`].
+    pub fn unpair(&self) -> Result<(), RayError> {
+        let state = self.state()?;
+        match self.runtime.block_on(state.unpair_self()) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::PairFailed(message)),
+            other => Err(RayError::PairFailed(format!(
+                "unexpected unpair response: {other:?}"
             ))),
         }
     }

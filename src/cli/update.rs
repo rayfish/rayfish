@@ -55,7 +55,7 @@ pub(crate) async fn print_pending_changelog(
     nightly: bool,
     pinned: bool,
 ) {
-    // Nightly and pinned resolve to a single release we already fetched — just
+    // Nightly and pinned resolve to a single release we already fetched, just
     // surface its body. (A semver walk doesn't apply: nightlies share a version,
     // and a pinned target may be a downgrade.)
     if nightly || pinned {
@@ -129,8 +129,8 @@ pub(crate) async fn cmd_update(
 
     // reqwest is built with `rustls-no-provider`, so it relies on a process-level
     // default CryptoProvider. Install ring (already in the tree via iroh) before
-    // building the client. `install_default` errors only if one is already set —
-    // harmless here, so ignore it.
+    // building the client. `install_default` errors only if one is already set
+    // (harmless here), so ignore it.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let client = Client::builder()
@@ -196,7 +196,7 @@ pub(crate) async fn cmd_update(
     };
 
     // Fetch the published checksum sidecar first (it is tiny) so the swap
-    // decision — especially the nightly checksum compare — can run before
+    // decision (especially the nightly checksum compare) can run before
     // downloading the whole binary.
     let base = format!("https://github.com/{REPO_SLUG}/releases/download/{tag}");
     let bin_url = format!("{base}/{asset}");
@@ -204,7 +204,7 @@ pub(crate) async fn cmd_update(
     let expected = fetch_checksum(&client, &tag, &asset).await?;
     spinner.finish_and_clear();
 
-    // "Up to date?" — a pinned version is "current" only if it equals what we
+    // "Up to date?": a pinned version is "current" only if it equals what we
     // run (so `--version` can downgrade); nightly compares the running binary's
     // checksum to the published one (two nightlies share a crate version, so
     // semver can't tell them apart); stable gates on semver. If we can't read
@@ -225,7 +225,7 @@ pub(crate) async fn cmd_update(
         println!("latest:  {remote_label}");
         // Best-effort: report the running daemon's version too. If it differs
         // from this CLI binary the daemon is stale (e.g. a prior update never
-        // restarted it) — a restart, not a download, is what's needed.
+        // restarted it): a restart, not a download, is what's needed.
         if let Some(daemon_version) = daemon_version().await
             && daemon_version != current
         {
@@ -333,7 +333,7 @@ async fn download_verify_and_install(
     }
 
     // Download, verify against the (already-fetched) checksum, and atomically
-    // swap the running binary — the shared engine handles all three.
+    // swap the running binary: the shared engine handles all three.
     let spinner = progress::spinner(format!("downloading {asset} ({remote_label})…"));
     let res = download_and_swap(client, bin_url, expected, asset).await;
     spinner.finish_and_clear();

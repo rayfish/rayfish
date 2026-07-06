@@ -35,7 +35,7 @@ pub struct DeviceCert {
 
 impl DeviceCert {
     /// Bytes the signature covers. For `generation == 0` this is the device key
-    /// alone — exactly the pre-epoch scheme, so certs issued before this field
+    /// alone, exactly the pre-epoch scheme, so certs issued before this field
     /// existed (deserialized as generation 0) still verify. For `generation > 0`
     /// the little-endian generation is appended, binding it into the signature.
     fn signing_bytes(device_pubkey: &EndpointId, generation: u64) -> Vec<u8> {
@@ -212,8 +212,8 @@ pub enum ControlMsg {
     /// it only when the sender's identity is the `user_identity` in its own device
     /// cert (so a stranger cannot trigger a wipe): it deletes its stored device
     /// cert and leaves the networks it holds only by that cert. The authoritative
-    /// revocation is the signed pkarr record; this is just a courtesy wipe for a
-    /// cooperative device.
+    /// revocation is the per-network blob nullifier set; this is just a courtesy
+    /// wipe for a cooperative device.
     Unpaired,
     /// Primary → secondary: a freshly-signed cert at a new generation, pushed
     /// after a rotation (`ray unpair`) so a kept device stays above the floor.
@@ -248,7 +248,7 @@ pub async fn send_msg(stream: &mut SendStream, msg: &ControlMsg) -> Result<()> {
     // exactly one message per bidirectional stream (the reader does
     // `accept_bi → recv_msg` in a loop), so finishing here is always correct.
     // Without it, dropping the `SendStream` resets it (RESET_STREAM) and the
-    // peer loses any data not yet acknowledged — e.g. roster broadcasts sent
+    // peer loses any data not yet acknowledged, e.g. roster broadcasts sent
     // over a persistent connection. (Delivery before a *connection* drop still
     // needs the caller to wait on `conn.closed()`.)
     let _ = stream.finish();

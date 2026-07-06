@@ -6,12 +6,12 @@
 //!
 //! The daemon deliberately separates two concepts that are easy to conflate:
 //!
-//! - **Process / infrastructure lifecycle** — the iroh endpoint, IPC socket,
+//! - **Process / infrastructure lifecycle**: the iroh endpoint, IPC socket,
 //!   accept loop, blob store, DNS resolver, metrics server, and the TUN *file
 //!   descriptor*. These are built once in [`run_daemon`] and live for the whole
 //!   process. They are torn down only by the daemon-wide `shutdown_token`
 //!   (real shutdown / `IpcMessage::Shutdown`).
-//! - **Active VPN state** — the TUN link being *up*, system DNS being
+//! - **Active VPN state**: the TUN link being *up*, system DNS being
 //!   configured, and the saved networks being connected. This is toggled at
 //!   runtime by [`MeshManager::activate`] / [`MeshManager::deactivate`], driven
 //!   by the `Up` / `Down` IPC commands, and tracked by [`MeshManager::active`].
@@ -28,7 +28,7 @@
 //!
 //! - `shutdown_token` (the token passed into [`run_daemon`]) gates all the
 //!   always-on infrastructure. Cancelling it stops the **process**. `Down`
-//!   never touches it — otherwise the IPC accept loop would die and there would
+//!   never touches it, otherwise the IPC accept loop would die and there would
 //!   be nothing left to receive the next `Up`.
 //! - Each active network owns a `shutdown_token.child_token()` stored on its
 //!   [`NetworkHandle`]. `deactivate` cancels these per-network children to stop
@@ -36,13 +36,13 @@
 //!   `activate` mints *fresh* child tokens, so `up → down → up` cycles work.
 
 use bytes::Bytes;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
@@ -76,7 +76,6 @@ use crate::membership::{
 };
 use crate::network_name;
 use crate::peers::{self, PeerTable};
-use crate::revocation::{self, RevocationCache};
 use crate::stats::ForwardMetrics;
 use crate::transport;
 // The desktop TUN device and its CGNAT pre-flight check don't exist on Android,
@@ -119,13 +118,13 @@ const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// ALPN for the device-pairing protocol. The trailing `/1` is its protocol
-/// version — **bump it on any breaking change to the `PairMsg` handshake**;
+/// version - **bump it on any breaking change to the `PairMsg` handshake**;
 /// peers on different versions can't negotiate a connection (transport-enforced).
 const PAIR_ALPN: &[u8] = b"rayfish/pair/1";
 
 /// Node-wide shared handles, cloned into every per-network accept handler and
-/// background task. Every field is a cheap `Clone` — an `Arc`-backed handle, a
-/// channel sender, or a small wrapper — so the whole bundle is cloned by value
+/// background task. Every field is a cheap `Clone` (an `Arc`-backed handle, a
+/// channel sender, or a small wrapper), so the whole bundle is cloned by value
 /// instead of threaded as a dozen separate arguments/struct fields. Built once
 /// per daemon via [`MeshManager::mesh_ctx`]; a new daemon-wide dependency is one
 /// field here rather than one parameter at every call site.
@@ -140,10 +139,6 @@ pub(crate) struct MeshCtx {
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
     device_user_map: peers::DeviceUserMap,
-    /// Last-known revoked device keys per user identity (`ray unpair`). Consulted
-    /// wherever a `DeviceCert` is trusted (admission, MeshHello, reconverge) so a
-    /// revoked device stops being honored mesh-wide. See [`crate::revocation`].
-    revocation: RevocationCache,
     /// Peers removed from a network's roster (via `ray kick` or a stale-entry
     /// prune during reconverge), keyed by `(network, transport id)`. A member
     /// closes such a peer's connection but can't see its own close code, so its
@@ -151,6 +146,11 @@ pub(crate) struct MeshCtx {
     /// re-form the link. The reconnect loop consumes an entry here to skip that
     /// one reconnect. Populated in [`reconverge_and_apply`] and the kick handler.
     pruned_peers: Arc<DashSet<(String, EndpointId)>>,
+    /// Signal from a per-peer control reader that this device's primary sent
+    /// `ControlMsg::Unpaired`. The reader holds only field clones (not the full
+    /// `MeshManager`), so it hands off to the daemon loop, which runs
+    /// [`MeshManager::unpair_self`] (leave all networks + wipe the cert).
+    self_unpair_tx: mpsc::Sender<()>,
 }
 
 impl MeshCtx {
@@ -234,6 +234,12 @@ pub(crate) struct NetworkState {
     /// received. Reloaded from the verified blob on every reconverge so any admin
     /// can admit and revocation propagates.
     reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
+    /// Device keys nullified on this network (`ray unpair`). Carried in the signed
+    /// blob: a coordinator seeds it from its persisted `revoked_devices` and drops
+    /// nullified devices from `members`; a member adopts it from the verified blob
+    /// on every reconverge. Enforcement (admission, MeshHello, prune) rejects a
+    /// cert whose device key is listed.
+    nullifiers: BTreeSet<EndpointId>,
     /// Materialized suggested rules awaiting manual `ray firewall accept` on a
     /// node that did not opt into `--auto-accept-firewall`. Empty when
     /// auto-accepting.
@@ -280,6 +286,7 @@ impl NetworkState {
             &self.suggested_firewall,
             self.network_name.as_deref(),
             &self.reusable_keys,
+            &self.nullifiers,
         );
         let hash = blake3::hash(&bytes);
         self.snapshot = Some(GroupSnapshot {
@@ -292,7 +299,7 @@ impl NetworkState {
 /// Runtime state for one active network. Created when a network is joined,
 /// created, or reconnected; dropped (after `cancel`ling and awaiting `tasks`)
 /// when the network is left or the VPN is put on standby. The persisted config
-/// (in `networks.toml`) outlives this handle — standby tears down the handle
+/// (in `networks.toml`) outlives this handle: standby tears down the handle
 /// but keeps the config so `activate` can rebuild it.
 #[allow(dead_code)]
 pub struct NetworkHandle {
@@ -369,17 +376,17 @@ pub struct MeshManager {
     /// interface is attached. Interior-mutable because on embedders (mobile) the
     /// interface is attached after construction via [`MeshManager::attach_tun`],
     /// while on desktop it is set once at boot.
-    tun_name: std::sync::Mutex<String>,
+    tun_name: Mutex<String>,
     /// Handles for the packet-forwarding tasks spawned by
     /// [`MeshManager::attach_tun`], kept so a future `down()`/detach can stop them.
-    tun_tasks: std::sync::Mutex<Option<TunTasks>>,
+    tun_tasks: Mutex<Option<TunTasks>>,
     /// Promotion-channel receiver drained by [`serve_ipc`]. Stored here so the
     /// headless builder can construct the daemon and hand the receiver back to
     /// [`run_daemon`] afterwards.
-    promote_rx: std::sync::Mutex<Option<mpsc::Receiver<String>>>,
+    promote_rx: Mutex<Option<mpsc::Receiver<String>>>,
     /// Prometheus metrics-server guard. Kept alive for the daemon's whole lifetime
     /// (dropping it stops the export); `None` if the server failed to bind.
-    _metrics_server: std::sync::Mutex<Option<iroh_metrics::service::MetricsServer>>,
+    _metrics_server: Mutex<Option<iroh_metrics::service::MetricsServer>>,
     /// File-transfer + pairing state and ALPN accept arms (see [`FileService`]).
     /// Shared with [`ProtocolRouter`], which runs the accept arms.
     files: Arc<FileService>,
@@ -388,8 +395,6 @@ pub struct MeshManager {
     connect: Arc<ConnectService>,
     device_cert: Option<control::DeviceCert>,
     device_user_map: peers::DeviceUserMap,
-    /// Device-cert revocation cache (`ray unpair`); see [`MeshCtx::revocation`].
-    revocation: RevocationCache,
     /// Peers removed from a roster whose reconnect should be suppressed once.
     /// Shared into [`MeshCtx::pruned_peers`]; see that field for the mechanism.
     pruned_peers: Arc<DashSet<(String, EndpointId)>>,
@@ -413,14 +418,25 @@ pub struct MeshManager {
     // `--no-default-features` (Android) build the field is inert; silence the
     // resulting dead-code warning there rather than dropping the field.
     #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
-    ssh_token: std::sync::Mutex<Option<CancellationToken>>,
+    ssh_token: Mutex<Option<CancellationToken>>,
     /// Promotion signal: a co-coordinator's per-peer control reader sends the
     /// network name here after persisting an `AdminGrant` key, and the main
     /// daemon loop ([`serve_ipc`]) drains it into
     /// [`MeshManager::promote_to_coordinator`]. The reader holds only field
-    /// clones (not the full `MeshManager`), so it can't promote itself — hence
+    /// clones (not the full `MeshManager`), so it can't promote itself, hence
     /// the channel hand-off to the loop that does hold the `Arc<MeshManager>`.
     promote_tx: mpsc::Sender<String>,
+    /// Self-unpair signal (see [`MeshCtx::self_unpair_tx`]): a control reader that
+    /// received `ControlMsg::Unpaired` from our primary sends here, and the daemon
+    /// loop drains it into [`MeshManager::unpair_self`]. Same reader-can't-hold-the
+    /// -`Arc` hand-off pattern as `promote_tx`.
+    self_unpair_tx: mpsc::Sender<()>,
+    /// Receiver half of the self-unpair channel, taken once by the daemon loop.
+    self_unpair_rx: Mutex<Option<mpsc::Receiver<()>>>,
+    /// Receiver half of the re-auth channel (see [`FileService`]): the pairing
+    /// accept arm sends a re-paired device's key here, and the daemon loop drains
+    /// it into [`MeshManager::reauth_device`] to clear the device's nullifier.
+    reauth_rx: Mutex<Option<mpsc::Receiver<EndpointId>>>,
 }
 
 /// Map key-holding status to a [`NetworkRole`].
@@ -461,10 +477,15 @@ impl MeshManager {
     /// join issued right after pairing (same process, no restart) carries the
     /// freshly stored cert rather than the value loaded at startup.
     pub fn current_device_cert(&self) -> Option<control::DeviceCert> {
-        identity::load_device_cert()
-            .ok()
-            .flatten()
-            .or_else(|| self.device_cert.clone())
+        // The on-disk cert is authoritative: a cleanly-absent file (`Ok(None)`,
+        // e.g. after `unpair_self` deletes it) means unpaired, so we must NOT fall
+        // back to the in-memory copy loaded at build, otherwise `is_paired()`
+        // would keep reporting paired after a self-unpair. Only a genuine read
+        // error falls back to the in-memory cert.
+        match identity::load_device_cert() {
+            Ok(cert) => cert,
+            Err(_) => self.device_cert.clone(),
+        }
     }
 
     /// Gracefully take the whole node offline: cancel the daemon-wide shutdown
@@ -496,8 +517,8 @@ impl MeshManager {
             hostname_table: self.dns.hostname_table.clone(),
             reverse_table: self.dns.reverse_table.clone(),
             device_user_map: self.device_user_map.clone(),
-            revocation: self.revocation.clone(),
             pruned_peers: self.pruned_peers.clone(),
+            self_unpair_tx: self.self_unpair_tx.clone(),
         }
     }
 
@@ -655,7 +676,7 @@ impl MeshManager {
     /// Idempotent: a network already running as coordinator is left untouched
     /// ([`should_promote`]). The needed [`NetworkHandle`] fields are cloned
     /// inside a scoped block so the `DashMap` ref is dropped before the
-    /// (synchronous) registration — never held across it.
+    /// (synchronous) registration, never held across it.
     pub(crate) async fn promote_to_coordinator(&self, network: &str) {
         let parts = {
             let Some(h) = self.networks.get(network) else {
@@ -686,7 +707,7 @@ impl MeshManager {
     /// when the request is permitted, or `Some(error)` to short-circuit it.
     ///
     /// Identity is taken from the connecting socket's `SO_PEERCRED` (the kernel
-    /// vouches for it — it can't be forged by the client), so the socket file
+    /// vouches for it, it can't be forged by the client), so the socket file
     /// mode only has to permit the connection, not gate authority.
     pub(crate) fn check_authorized(
         req: &IpcMessage,
@@ -1028,7 +1049,7 @@ impl MeshManager {
     }
 
     /// Fast-path a member's rename to its connected peers via `MeshHello` (only
-    /// the coordinator's continuous control reader acts on it — resolving
+    /// the coordinator's continuous control reader acts on it, resolving
     /// collisions and broadcasting the authoritative `MemberSync`). The durable
     /// `pending_hostname` intent + reconverge drain backstop the rest.
     async fn announce_rename_to_peers(
@@ -1267,7 +1288,7 @@ mod report_tests {
 #[cfg(test)]
 mod accept_handler_tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
     // Build a minimal NetworkState for use in test AcceptHandler construction.
@@ -1284,6 +1305,7 @@ mod accept_handler_tests {
             mode: GroupMode::Restricted,
             suggested_firewall: SuggestedFirewall::default(),
             reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         }))
@@ -1303,8 +1325,8 @@ mod accept_handler_tests {
             hostname_table: dns::new_hostname_table(),
             reverse_table: dns::new_reverse_table(),
             device_user_map: peers::DeviceUserMap::new(),
-            revocation: RevocationCache::new(),
             pruned_peers: Arc::new(DashSet::new()),
+            self_unpair_tx: tokio::sync::mpsc::channel(1).0,
         }
     }
 

@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- The background send service (Share with Rayfish) runs as a data-sync FGS. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.CAMERA" />
 
@@ -16,7 +18,7 @@
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
-        android:label="@string/app_name"
+        android:label="${appName}"
         android:supportsRtl="true"
         android:theme="@style/Theme.Rayfish">
 
@@ -35,7 +37,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
-            android:label="@string/app_name">
+            android:label="${appName}">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -47,6 +49,45 @@
                 <data android:scheme="rayfish" />
             </intent-filter>
         </activity>
+
+        <!-- "Share with Rayfish" target: shows the recipient picker, then hands off
+             to SendService for background delivery. -->
+        <activity
+            android:name=".ShareActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:label="${shareLabel}"
+            android:theme="@style/Theme.Rayfish">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+                <data android:mimeType="video/*" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+                <data android:mimeType="video/*" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
+        <!-- QR scanner pinned to portrait. zxing's default CaptureActivity
+             follows the rotation sensor and comes up sideways on foldables;
+             forcing the orientation here is the reliable fix. -->
+        <activity
+            android:name=".ui.qr.PortraitCaptureActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:stateNotNeeded="true"
+            tools:ignore="LockedOrientationActivity" />
+
+        <service
+            android:name=".SendService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <service
             android:name=".RayfishVpnService"

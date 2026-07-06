@@ -100,7 +100,7 @@ pub(crate) async fn resolve_signed(
 /// Fetch the group blob for `signed` from any connected peer or seed, and verify
 /// its bytes against `signed`. Returns the verified blob, or `None` if no source
 /// could serve a blob matching the signed hash. The blob is content-addressed by
-/// `signed`, so a peer can only ever serve the authentic blob — never a forgery.
+/// `signed`, so a peer can only ever serve the authentic blob, never a forgery.
 pub(crate) async fn fetch_verified_blob(
     endpoint: &Endpoint,
     blob_store: &FsStore,
@@ -137,7 +137,7 @@ pub(crate) async fn fetch_verified_blob(
 
 /// Reconverge the live network state from the signed pkarr record and apply it
 /// (roster + DNS + suggested firewall). Invoked when a peer sends a `MemberSync`
-/// or `BlobUpdated` *hint* — the hint is only a trigger; the roster/firewall come
+/// or `BlobUpdated` *hint*: the hint is only a trigger; the roster/firewall come
 /// exclusively from the network-key-signed record, never from the peer message.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn reconverge_and_apply(
@@ -158,8 +158,8 @@ pub(crate) async fn reconverge_and_apply(
         hostname_table,
         reverse_table,
         device_user_map,
-        revocation,
         pruned_peers,
+        self_unpair_tx,
         ..
     } = ctx;
     let current = state.read().unwrap().snapshot.as_ref().map(|s| s.hash);
@@ -168,11 +168,22 @@ pub(crate) async fn reconverge_and_apply(
         return;
     };
     if crate::membership::trusted_reconverge_hash(current, signed).is_none() {
-        // Already converged on the signed hash — but a local rename can still be
-        // unconfirmed precisely *because* the coordinator hasn't republished, so
-        // the hash never changes. Keep driving the rename to the coordinator
+        // Already converged on the signed hash. Even so, check whether we have
+        // been nullified in the blob we already hold (e.g. we applied it while
+        // still offline-blocked from ever receiving `ControlMsg::Unpaired`): if so,
+        // tear ourselves out. Otherwise keep driving any unconfirmed local rename
         // (the drain no-ops unless `pending_hostname` is set).
-        let roster = state.read().unwrap().roster();
+        let (roster, nullifiers) = {
+            let s = state.read().unwrap();
+            (s.roster(), s.nullifiers.clone())
+        };
+        if let Some(cert) = device_cert
+            && self_is_nullified(cert, &roster, &nullifiers)
+        {
+            tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
+            let _ = self_unpair_tx.try_send(());
+            return;
+        }
         drain_pending_rename(
             endpoint,
             &roster,
@@ -191,6 +202,21 @@ pub(crate) async fn reconverge_and_apply(
         tracing::warn!(network = %network_name, "reconverge: could not fetch verified blob");
         return;
     };
+    // Self-unpair: if our own device cert is nullified in this (verified, signed)
+    // blob and the blob is coordinated by our *own* primary, the primary has
+    // revoked this device. Tear ourselves out (delete the cert + leave every
+    // network) even if we never received the best-effort `ControlMsg::Unpaired`
+    // (e.g. we were offline at unpair time). This rides the signed blob the group
+    // poller already fetches, so it needs no live mesh link. The
+    // own-primary-coordinator gate stops a foreign network's coordinator from
+    // forcing a global deauth by listing our key.
+    if let Some(cert) = device_cert
+        && self_is_nullified(cert, &data.members, &data.nullifiers)
+    {
+        tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
+        let _ = self_unpair_tx.try_send(());
+        return;
+    }
     // Two coordinators can independently admit a fresh joiner at the same
     // collision index, producing a roster with duplicate IPs. Resolve it
     // deterministically (lowest identity keeps the slot, others re-roll) before
@@ -204,6 +230,7 @@ pub(crate) async fn reconverge_and_apply(
         s.members = MemberList::from_members(tiebroken);
         s.approved = ApprovedList::from_entries(data.approved.clone());
         s.suggested_firewall = data.suggested_firewall.clone();
+        s.nullifiers = data.nullifiers.clone();
         s.refresh_snapshot();
         s.roster()
     };
@@ -218,13 +245,12 @@ pub(crate) async fn reconverge_and_apply(
     // Drop any live connection to a peer the signed roster no longer lists (it was
     // kicked, or left while we were offline). Removing it from the roster alone
     // stops us *routing* to it, but the peer reader keeps injecting its inbound
-    // datagrams until the connection closes — so close it. We record the peer in
+    // datagrams until the connection closes, so close it. We record the peer in
     // `pruned_peers` first: closing wakes our own reconnect loop, which would
     // otherwise re-dial the peer (it still lists us) and re-form the link.
     prune_departed_peers(
         peers,
         device_user_map,
-        revocation,
         pruned_peers,
         state,
         network_name,
@@ -246,6 +272,23 @@ pub(crate) async fn reconverge_and_apply(
     tracing::info!(network = %network_name, "reconverged from signed record");
 }
 
+/// Whether this device's own cert has been nullified by its **own primary** in a
+/// verified blob, the signal to self-unpair. True iff (1) our `device_key` is in
+/// the blob's `nullifiers`, and (2) the blob is coordinated by our user identity
+/// (a coordinator member whose identity is our `cert.user_identity`). The second
+/// condition ensures only our primary can trigger a global teardown; a foreign
+/// network listing our key just gets us pruned there, not deauthorized everywhere.
+pub(crate) fn self_is_nullified(
+    cert: &control::DeviceCert,
+    members: &[Member],
+    nullifiers: &std::collections::BTreeSet<EndpointId>,
+) -> bool {
+    nullifiers.contains(&cert.device_key)
+        && members
+            .iter()
+            .any(|m| m.is_coordinator && m.identity == cert.user_identity)
+}
+
 /// Close and drop every connection to a peer that `network`'s current roster no
 /// longer contains. Runs on every node after it applies a verified roster, so a
 /// kicked (or departed) peer is severed mesh-wide, not just by the coordinator
@@ -254,39 +297,27 @@ pub(crate) async fn reconverge_and_apply(
 pub(crate) fn prune_departed_peers(
     peers: &PeerTable,
     device_user_map: &peers::DeviceUserMap,
-    revocation: &RevocationCache,
     pruned_peers: &Arc<DashSet<(String, EndpointId)>>,
     state: &SharedNetworkState,
     network_name: &str,
     my_identity: EndpointId,
 ) {
-    // Cert-floor authority for this node, computed once (config + disk reads).
-    let (issuing, my_gen, revoked_set) = cert_authority(my_identity);
+    // Device keys nullified on this network (`ray unpair`), read once.
+    let nullifiers = state.read().unwrap().nullifiers.clone();
     for (peer_id, ip, conn) in peers.peers_for_network_with_conn(network_name) {
         // Membership is by roster identity, which for a paired peer is its user
         // identity, not the transport id the PeerTable is keyed on. Check both.
         let user_id = device_user_map.resolve(&peer_id);
-        // A peer whose cert is below its owning user's generation floor
-        // (`ray unpair`) is severed even if a stale roster still lists it — the
-        // floor is authoritative over the (possibly not-yet-republished)
-        // membership. The peer's cert lives in the roster entry.
-        let member_cert = {
-            let s = state.read().unwrap();
-            s.members
-                .all()
-                .iter()
-                .find(|m| m.identity == peer_id || m.identity == user_id)
-                .and_then(|m| m.device_cert.clone())
-        };
-        let revoked = member_cert.as_ref().is_some_and(|cert| {
-            revocation::cert_decision(cert, issuing, my_gen, &|d| revoked_set.contains(d), revocation)
-                == revocation::CertDecision::Reject
-        });
+        // A peer whose device key is nullified on this network is severed even if a
+        // stale roster still lists it, the nullifier is authoritative over the
+        // (possibly not-yet-republished) membership. `peer_id` is the transport
+        // (device) key the nullifier set is keyed on.
+        let nullified = nullifiers.contains(&peer_id);
         let still_member = {
             let s = state.read().unwrap();
             s.members.is_member(&peer_id) || s.members.is_member(&user_id)
         };
-        if !revoked && (still_member || peer_id == my_identity || user_id == my_identity) {
+        if !nullified && (still_member || peer_id == my_identity || user_id == my_identity) {
             continue;
         }
         tracing::info!(peer = %peer_id.fmt_short(), network = %network_name, "pruning peer no longer in roster");
@@ -388,6 +419,7 @@ pub(crate) fn spawn_group_poller(
         peers,
         blob_store,
         firewall: fw,
+        self_unpair_tx,
         ..
     } = ctx;
     tokio::spawn(async move {
@@ -402,7 +434,7 @@ pub(crate) fn spawn_group_poller(
                 s.snapshot.as_ref().map(|snap| snap.hash)
             };
 
-            let (remote_hash, _seed_peers) = match dht::resolve_network(&client, net_pubkey).await {
+            let (remote_hash, seed_peers) = match dht::resolve_network(&client, net_pubkey).await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::debug!(error = %e, "group poll failed");
@@ -416,50 +448,36 @@ pub(crate) fn spawn_group_poller(
 
             tracing::info!(old = ?current_hash, new = %remote_hash, "group blob changed");
 
-            let blob_hash = iroh_blobs::Hash::from_bytes(*remote_hash.as_bytes());
-
-            let peer_ids: Vec<EndpointId> = peers
-                .peers_for_network(&network_name)
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect();
-
-            let mut new_data = None;
-            for peer_id in &peer_ids {
-                let conn = match transport::connect_to_peer_with_alpn(
-                    &endpoint,
-                    *peer_id,
-                    iroh_blobs::protocol::ALPN,
-                )
-                .await
-                {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                if blob_store
-                    .remote()
-                    .fetch(conn, HashAndFormat::raw(blob_hash))
-                    .await
-                    .is_err()
-                {
-                    continue;
-                }
-                match blob_store.blobs().get_bytes(blob_hash).await {
-                    Ok(bytes) => match crate::membership::decode_group_blob(&bytes) {
-                        Ok(data) => {
-                            new_data = Some(data);
-                            break;
-                        }
-                        Err(_) => continue,
-                    },
-                    Err(_) => continue,
-                }
-            }
-
-            let Some(data) = new_data else {
+            // Fetch the verified blob from any connected peer *or* the record's
+            // seed peers. Including the seeds is essential: a node that has been
+            // isolated (e.g. an unpaired device the coordinator already severed)
+            // has no connected peers, so a connected-only fetch could never
+            // discover its own removal/nullification.
+            let Some(data) = fetch_verified_blob(
+                &endpoint,
+                &blob_store,
+                &peers,
+                remote_hash,
+                &network_name,
+                &seed_peers,
+            )
+            .await
+            else {
                 tracing::warn!("could not fetch updated group blob from any peer");
                 continue;
             };
+
+            // Self-unpair: our own primary listed this device in the signed blob's
+            // nullifiers (`ray unpair`). Tear ourselves out even though we never
+            // received `ControlMsg::Unpaired` (we were offline/severed). Rides the
+            // signed blob, so it needs no live mesh link. See `self_is_nullified`.
+            if let Some(cert) = crate::identity::load_device_cert().ok().flatten()
+                && self_is_nullified(&cert, &data.members, &data.nullifiers)
+            {
+                tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
+                let _ = self_unpair_tx.try_send(());
+                break;
+            }
 
             // Reconcile: find removed peers
             let old_members: Vec<EndpointId> = {
@@ -495,6 +513,7 @@ pub(crate) fn spawn_group_poller(
                 s.members = MemberList::from_members(data.members.clone());
                 s.approved = ApprovedList::from_entries(data.approved.clone());
                 s.suggested_firewall = data.suggested_firewall.clone();
+                s.nullifiers = data.nullifiers.clone();
                 s.refresh_snapshot();
             }
             apply_suggested_firewall(&fw, endpoint.id(), &network_name, &state);
@@ -509,4 +528,49 @@ pub(crate) fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod self_nullified_tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn member(identity: EndpointId, is_coordinator: bool) -> Member {
+        Member {
+            identity,
+            ip: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            is_coordinator,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+            last_seen: None,
+        }
+    }
+
+    #[test]
+    fn self_unpair_only_when_own_primary_nullifies() {
+        let primary = SecretKey::generate(); // our user identity
+        let device = SecretKey::generate().public();
+        let cert = control::DeviceCert::create(&primary, &device, 0);
+        let mut nulls = std::collections::BTreeSet::new();
+        nulls.insert(device);
+
+        // Our primary coordinates the network and listed us: self-unpair.
+        let roster = vec![member(primary.public(), true)];
+        assert!(self_is_nullified(&cert, &roster, &nulls));
+
+        // Nullified, but the network is coordinated by someone else (foreign):
+        // must NOT trigger a global teardown.
+        let foreign = vec![member(SecretKey::generate().public(), true)];
+        assert!(!self_is_nullified(&cert, &foreign, &nulls));
+
+        // Our primary is present but only as a plain member (not coordinator):
+        // not authoritative here.
+        let noncoord = vec![member(primary.public(), false)];
+        assert!(!self_is_nullified(&cert, &noncoord, &nulls));
+
+        // Not nullified at all.
+        assert!(!self_is_nullified(&cert, &roster, &std::collections::BTreeSet::new()));
+    }
 }

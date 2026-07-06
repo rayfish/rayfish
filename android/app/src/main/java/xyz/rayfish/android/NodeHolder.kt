@@ -42,6 +42,11 @@ object NodeHolder {
     // [xyz.rayfish.android.Telemetry], which reads this to gate Sentry init.
     private const val KEY_CRASH_REPORTING = "crash_reporting"
     private const val KEY_INSTALL_ID = "install_id"
+    // Auto-accept incoming file offers from the user's own paired devices. Default
+    // on: sharing to one of your own devices lands the file with no manual tap. The
+    // "own device" decision is made core-side from the device cert chain and
+    // surfaced as FileOffer.own_device; this toggle is only the opt-out.
+    private const val KEY_AUTO_ACCEPT_OWN = "auto_accept_own_devices"
 
     fun isEnabled(context: Context): Boolean =
         context.applicationContext
@@ -52,6 +57,17 @@ object NodeHolder {
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_ENABLED, value).apply()
+    }
+
+    fun isAutoAcceptOwnDevices(context: Context): Boolean =
+        context.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_AUTO_ACCEPT_OWN, true)
+
+    fun setAutoAcceptOwnDevices(context: Context, value: Boolean) {
+        context.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_AUTO_ACCEPT_OWN, value).apply()
     }
 
     fun isCrashReportingEnabled(context: Context): Boolean =

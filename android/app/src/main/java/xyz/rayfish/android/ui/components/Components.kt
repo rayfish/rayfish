@@ -182,7 +182,10 @@ fun RayfishDropdown(
 fun ToggleCard(title: String, subtitle: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
     SectionCard {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-            Column {
+            // weight(1f) lets a long subtitle wrap within the available space
+            // instead of pushing the Switch off the card's right edge; the
+            // end padding keeps the wrapped text off the Switch.
+            Column(Modifier.weight(1f).padding(end = 12.dp)) {
                 Text(title, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
                 Text(subtitle, fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Muted, modifier = Modifier.padding(top = 3.dp))
             }

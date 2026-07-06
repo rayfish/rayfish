@@ -2,20 +2,20 @@
 //!
 //! The spec is a read-only description of the *intended* network state: which
 //! networks should exist and the suggested firewall rules for each. `ray apply`
-//! reconciles the live state against it — creating missing (closed) networks and
-//! publishing suggestions — but never joins or mutates membership directly (it
+//! reconciles the live state against it (creating missing (closed) networks and
+//! publishing suggestions) but never joins or mutates membership directly (it
 //! only reports the membership gap and offers to mint hostname-bound invites).
 //!
 //! The spec reuses [`ray_proto::policy::SuggestedFirewall`] verbatim, so the
 //! wire/blob shape and the authoring shape are identical: an admin authors the
 //! exact rules a node will materialize, keyed by hostname, before any host has
 //! joined. A `*` subject targets every node, and a `*` peer in `allows`/`denies`
-//! means any peer — so "everyone opens 6969 to anyone" is one line. Specs are
+//! means any peer, so "everyone opens 6969 to anyone" is one line. Specs are
 //! **YAML only** (most readable); output (`--dry-run`, `--example`) is YAML too.
 //!
 //! Firewall model: suggestions are additive. An `allows` list opens exactly the
 //! listed peers/ports (the node's own inbound default, Deny by default, drops
-//! the rest — no catch-all is synthesized); a `denies` list blocks exactly those
+//! the rest, no catch-all is synthesized); a `denies` list blocks exactly those
 //! peers; an empty subject suggests nothing. There is no `default` field.
 
 use std::collections::BTreeMap;
@@ -83,7 +83,7 @@ pub fn load(path: &Path) -> Result<DeploySpec> {
 fn deserialize_spec(cfg: config::Config) -> Result<DeploySpec> {
     // The `config` crate represents YAML `null` (e.g. an empty `beta:` subject) as
     // `ValueKind::Nil`. serde can't turn a present-but-Nil value into a struct
-    // — field-level `#[serde(default)]` only fires for *absent* keys — so an
+    // (field-level `#[serde(default)]` only fires for *absent* keys) so an
     // empty subject would error ("invalid type: null, expected struct").
     // Normalize Nil → empty Table first: in this spec a null always means
     // "default/empty" (an open subject).
@@ -188,7 +188,7 @@ networks:
         admins: "tcp:22"
 "#;
 
-/// Union of every concrete hostname mentioned in the spec — both subjects and
+/// Union of every concrete hostname mentioned in the spec, both subjects and
 /// peer hostnames in `allows`/`denies`. This is the set of hosts the spec
 /// expects to exist; it is diffed against the joined hosts. The `*` wildcard
 /// (subject or peer) is not a real host and is excluded.

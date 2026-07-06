@@ -102,7 +102,7 @@ pub(crate) async fn ipc_join(
     )
     .await?;
     // Joining dials the coordinator and runs the handshake daemon-side, so this
-    // can take a few seconds — show a spinner while we wait.
+    // can take a few seconds, show a spinner while we wait.
     let spinner = progress::spinner("joining…");
     let resp = ipc::recv(&mut stream).await?;
     spinner.finish_and_clear();

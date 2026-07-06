@@ -33,7 +33,7 @@ pub(crate) fn has_pending_hostname(network_name: &str) -> bool {
 /// The hostname this node should announce to peers: a not-yet-confirmed rename
 /// intent (`pending_hostname`) if one is queued, otherwise the confirmed name.
 /// Read fresh from config at every announce so a rename done mid-session is
-/// advertised on the next (re)connect — not a value captured at daemon start.
+/// advertised on the next (re)connect, not a value captured at daemon start.
 pub(crate) fn outgoing_hostname(network_name: &str) -> Option<String> {
     match config::load_network(network_name) {
         Ok(Some(net)) => net.pending_hostname.or(net.my_hostname),

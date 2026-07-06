@@ -44,7 +44,11 @@ fun rememberQrScanner(onResult: (String?) -> Unit): () -> Unit {
                 .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
                 .setBeepEnabled(false)
                 .setPrompt("Scan a Rayfish code")
-                .setOrientationLocked(false)
+                // Force portrait. setOrientationLocked only locks to whatever the
+                // sensor reads at launch, which is landscape on foldables; a
+                // capture activity pinned to portrait in the manifest is the fix.
+                .setCaptureActivity(PortraitCaptureActivity::class.java)
+                .setOrientationLocked(true)
         )
     }
 }

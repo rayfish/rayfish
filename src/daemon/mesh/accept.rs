@@ -159,34 +159,19 @@ impl CoordinatorAcceptState {
                 tracing::warn!(peer = %remote_id.fmt_short(), "invalid device certificate");
                 return;
             }
-            // Judge the cert against the generation floor (`ray unpair`). This one
-            // check covers every admission branch below — owner auto-admit,
-            // invite, live-approved, and open. A cert below the floor (a revoked
-            // device, or a stale sibling seen from a secondary) is rejected; our
-            // own stale-but-kept device is admitted and re-issued a fresh cert.
-            let (issuing, my_gen, revoked) =
-                cert_authority(self.ctx.identity.local_identity());
-            match revocation::cert_decision(
-                cert,
-                issuing,
-                my_gen,
-                &|d| revoked.contains(d),
-                &self.ctx.revocation,
-            ) {
-                revocation::CertDecision::Reject => {
-                    tracing::warn!(peer = %remote_id.fmt_short(), "rejecting revoked/stale device certificate");
-                    return;
-                }
-                revocation::CertDecision::Reissue => {
-                    // Our own kept device that was offline during a rotation:
-                    // push it a fresh cert at our current generation, then admit.
-                    if let Ok(secret) = crate::identity::load_or_create() {
-                        let fresh =
-                            control::DeviceCert::create(&secret, &cert.device_key, my_gen);
-                        push_cert_refresh(&conn, fresh).await;
-                    }
-                }
-                revocation::CertDecision::Admit => {}
+            // Reject a cert nullified on this network (`ray unpair`). This one check
+            // covers every admission branch below: owner auto-admit, invite,
+            // live-approved, and open. A nullified device key is refused; every
+            // other device is admitted unchanged (no fleet rotation).
+            if self
+                .state
+                .read()
+                .unwrap()
+                .nullifiers
+                .contains(&cert.device_key)
+            {
+                tracing::warn!(peer = %remote_id.fmt_short(), "rejecting nullified device certificate");
+                return;
             }
             self.ctx
                 .device_user_map
@@ -265,7 +250,7 @@ impl CoordinatorAcceptState {
                 }
                 // Queue for live operator approval, bounded by MAX_PENDING_JOINS
                 // (oldest-evicted) so a peer churning fresh identities can't grow
-                // it without limit. Still no per-peer concurrent-stream cap — the
+                // it without limit. Still no per-peer concurrent-stream cap, the
                 // control-flood rate limiter covers sustained message floods.
                 {
                     let mut s = self.state.write().unwrap();
@@ -364,7 +349,7 @@ impl CoordinatorAcceptState {
                 }
             }
             Err(single_use_err) => {
-                // Not a single-use invite — it may be a reusable key, which
+                // Not a single-use invite, it may be a reusable key, which
                 // lives in the signed blob and is redeemable by any network-key
                 // holder (no burn). The blob is the verified source of truth.
                 let reusable_id = {

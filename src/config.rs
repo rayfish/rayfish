@@ -133,13 +133,13 @@ pub struct NetworkConfig {
     pub auto_accept_firewall: bool,
     /// Auto-accept incoming file offers from our own paired devices on this
     /// network (no manual `ray files accept`). Own-devices-only (the sender's
-    /// user identity must match ours); secure default off. Set per-network by
-    /// `ray join --auto-accept-files` or toggled with
-    /// `ray files auto-accept <net> on|off`.
-    #[serde(default)]
+    /// user identity must match ours), so it is safe on by default. Opt out per
+    /// network with `ray join --no-auto-accept-files` or `ray files auto-accept
+    /// <net> off`.
+    #[serde(default = "default_true")]
     pub auto_accept_files: bool,
     /// Identities this coordinator has granted the per-network secret key to
-    /// (`ray admin add`). Local tracking only — the key is shared and not
+    /// (`ray admin add`). Local tracking only: the key is shared and not
     /// attributable, so this is the coordinator's record of grants, not a
     /// verifiable roster. Never published in the GroupBlob.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -436,16 +436,15 @@ pub struct AppConfig {
     /// admission. See [`PendingJoinEntry`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_joins: Vec<PendingJoinEntry>,
-    /// This user's current device-cert generation (`ray unpair` / rotation). A
-    /// bump revokes every device below it; the current value is published to
-    /// pkarr as the "floor" that verifiers reject certs beneath. `0` means no
-    /// rotation has happened. See [`crate::revocation`].
+    /// Legacy device-cert generation counter (pre-nullifier revocation). No longer
+    /// used for revocation decisions; kept only so old `settings.toml` files parse.
     #[serde(default)]
     pub cert_generation: u64,
-    /// Device keys this user has revoked via `ray unpair` (hex `EndpointId`).
-    /// **Local-only, never published** — the generation floor is what propagates.
-    /// The primary keeps this list so it can refuse to re-issue a revoked device
-    /// that reconnects with a stale cert, while re-issuing the devices it keeps.
+    /// Device keys this user has nullified via `ray unpair` (hex `EndpointId`). The
+    /// coordinator's durable nullifier seed: it survives a restart and is unioned
+    /// into every coordinated network's signed blob (`GroupBlob.nullifiers`) at seal
+    /// time, so a listed device's cert is rejected mesh-wide. A device is removed
+    /// here when it re-pairs (re-auth). See `MeshManager::unpair`/`reauth_device`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revoked_devices: Vec<String>,
 }
@@ -510,8 +509,8 @@ pub fn rotate_contact_secret(config: &mut AppConfig) -> SecretKey {
 // Config is sharded so a write to one network can never clobber another:
 //
 //   <config_dir>/settings.toml          globals (mdns, operator, default
-//                                        hostname, contact key) — secret-bearing
-//   <config_dir>/networks/<name>.toml   one NetworkConfig each — secret-bearing
+//                                        hostname, contact key), secret-bearing
+//   <config_dir>/networks/<name>.toml   one NetworkConfig each, secret-bearing
 //
 // All writes go through `write_atomic` (temp file in the same dir + rename), so
 // a concurrent reader never observes a torn file. This replaces the old single
@@ -637,7 +636,7 @@ pub fn config_dir() -> Result<PathBuf> {
 }
 
 /// Reject a network name that can't be a safe single path component (defence in
-/// depth — names are already validated as hostnames elsewhere).
+/// depth, names are already validated as hostnames elsewhere).
 fn validate_net_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 64
@@ -652,7 +651,7 @@ fn validate_net_name(name: &str) -> Result<()> {
 
 /// Atomically write `bytes` to `path`: write a sibling temp file, set its
 /// perms/owner, then rename over the target. The rename is atomic on POSIX, so
-/// a concurrent reader sees either the old file or the new one — never a torn
+/// a concurrent reader sees either the old file or the new one, never a torn
 /// one. `secret` selects 0600 root:root vs 0640 root:rayfish.
 ///
 /// Public so every rayfish config writer (identity key, invite ledger, etc.)
@@ -732,7 +731,7 @@ pub fn migrate_location() {
         for e in entries.flatten() {
             let dest = new.join(e.file_name());
             // Same-filesystem rename is atomic; if it fails (e.g. EXDEV across
-            // mounts) the entry is left in place and the daemon starts fresh —
+            // mounts) the entry is left in place and the daemon starts fresh,
             // logged so the operator can move it by hand.
             match std::fs::rename(e.path(), &dest) {
                 Ok(()) => moved += 1,
@@ -744,7 +743,7 @@ pub fn migrate_location() {
         if moved > 0 {
             // Lock the relocated tree down: secrets keep old, possibly-loose perms
             // (older builds wrote the key without restricting it). Be conservative
-            // — 0600 everything; later targeted writes relax non-secret files.
+            // by using 0600 everything; later targeted writes relax non-secret files.
             if let Ok(entries) = std::fs::read_dir(&new) {
                 for e in entries.flatten() {
                     if e.path().is_file() {
