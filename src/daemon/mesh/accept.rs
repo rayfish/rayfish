@@ -676,8 +676,10 @@ pub(crate) struct MemberAcceptState {
     pub(crate) my_identity: EndpointId,
     /// The shared endpoint, needed to spin up a lazy publisher on promotion.
     pub(crate) endpoint: Endpoint,
-    /// Promotion signal to the daemon loop after persisting an `AdminGrant` key.
-    pub(crate) promote_tx: mpsc::Sender<String>,
+    /// The network-owning service. On an `AdminGrant` this reader promotes itself
+    /// by calling `registry.promote_to_coordinator` directly (was the `promote_tx`
+    /// hand-off to the daemon loop).
+    pub(crate) registry: Arc<NetworkRegistry>,
     /// Serializes single-use invite ledger access for the gossip arms.
     pub(crate) invite_lock: Arc<tokio::sync::Mutex<()>>,
     /// Kicks the debounced reconverge worker on a `MemberSync`/`BlobUpdated`
@@ -977,9 +979,11 @@ impl MemberAcceptState {
             );
             tracing::info!(network = %self.network_name, "promoted to co-coordinator; lazy publisher started");
         }
-        // The loop holds the `Arc<MeshManager>` this task does not. Best-effort:
-        // a closed channel only means the daemon is shutting down.
-        let _ = self.promote_tx.send(self.network_name.clone()).await;
+        // Swap ourselves to a coordinator accept handler directly (was a
+        // `promote_tx` hand-off to the daemon loop). The registry owns the
+        // ConnectionManager + networks map; we supply our own daemon-wide ctx.
+        self.registry
+            .promote_to_coordinator(&self.ctx, &self.network_name);
     }
 }
 
@@ -1041,12 +1045,13 @@ impl ProtocolRouter {
         blobs: BlobsProtocol,
         files: Arc<FileService>,
         connect: Arc<ConnectService>,
+        conn: Arc<ConnectionManager>,
     ) -> Self {
         Self {
             blobs,
             files,
             connect,
-            conn: Arc::new(ConnectionManager::new()),
+            conn,
         }
     }
 

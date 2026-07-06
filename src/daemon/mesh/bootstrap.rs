@@ -42,14 +42,6 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     daemon.connect_all_networks().await;
     daemon.activate(None).await;
 
-    // The promotion receiver was stashed on the daemon by the builder; take it
-    // back to drive the IPC loop.
-    let promote_rx = daemon
-        .promote_rx
-        .lock()
-        .unwrap()
-        .take()
-        .expect("promote_rx present after build");
     let self_unpair_rx = daemon
         .self_unpair_rx
         .lock()
@@ -82,7 +74,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         spawn_auto_update(daemon.shutdown_token.clone());
     }
 
-    let result = serve_ipc(&daemon, promote_rx, self_unpair_rx, token).await;
+    let result = serve_ipc(&daemon, self_unpair_rx, token).await;
 
     // Close the iroh endpoint before returning. Dropping it on return logs
     // "Endpoint dropped without calling `Endpoint::close`. Aborting
@@ -143,12 +135,6 @@ pub async fn build_headless() -> Result<Arc<MeshManager>> {
 /// no `serve_ipc` loop. Mirrors the matching arms in [`serve_ipc`]; the channels
 /// are stashed on the daemon by `build_daemon`, so take them here exactly once.
 fn spawn_headless_signal_drain(daemon: Arc<MeshManager>) {
-    let mut promote_rx = daemon
-        .promote_rx
-        .lock()
-        .unwrap()
-        .take()
-        .expect("promote_rx present after build");
     let mut self_unpair_rx = daemon
         .self_unpair_rx
         .lock()
@@ -160,7 +146,6 @@ fn spawn_headless_signal_drain(daemon: Arc<MeshManager>) {
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
-                Some(net) = promote_rx.recv() => { daemon.promote_to_coordinator(&net).await; }
                 Some(()) = self_unpair_rx.recv() => { let _ = daemon.unpair_self().await; }
             }
         }
@@ -291,6 +276,10 @@ async fn build_daemon(
         stats.clone(),
         contact_public,
     ));
+    // The per-peer connection driver is built once here and shared by the
+    // ProtocolRouter (which delegates the mesh ALPN to it) and the
+    // NetworkRegistry (which re-registers a network's handler on promotion).
+    let conn = Arc::new(ConnectionManager::new());
     // Networks map is shared with the NetworkRegistry service (M5 seam): both
     // hold the same `Arc<DashMap>` so methods migrate to the registry gradually.
     let networks = Arc::new(DashMap::new());
@@ -298,6 +287,7 @@ async fn build_daemon(
         networks.clone(),
         transport.clone(),
         peers.clone(),
+        conn.clone(),
     ));
     // FileService owns file transfer + pairing. It evaluates own-device auto-accept
     // directly (no worker channel) and clears a re-paired device's nullifier by
@@ -315,11 +305,9 @@ async fn build_daemon(
         blobs_proto,
         files.clone(),
         connect.clone(),
+        conn.clone(),
     ));
     let auto_update = app_config.auto_update;
-    // Promotion channel: a co-coordinator's control reader signals the main
-    // daemon loop to swap in the coordinator accept handler on `AdminGrant`.
-    let (promote_tx, promote_rx) = mpsc::channel::<String>(16);
     // Daemon-wide disconnect channel: every per-connection data reader reports
     // peer drops here, drained by the single connection supervisor.
     let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(256);
@@ -349,7 +337,6 @@ async fn build_daemon(
         auto_update,
         tun_name: std::sync::Mutex::new(tun_name),
         tun_tasks: std::sync::Mutex::new(None),
-        promote_rx: std::sync::Mutex::new(Some(promote_rx)),
         _metrics_server: std::sync::Mutex::new(None),
         files,
         connect,
@@ -361,7 +348,6 @@ async fn build_daemon(
         #[cfg(feature = "desktop")]
         ssh_authz: crate::ssh::new_authz(),
         ssh_token: std::sync::Mutex::new(None),
-        promote_tx,
         disconnect_tx,
         disconnect_rx: std::sync::Mutex::new(Some(disconnect_rx)),
         self_unpair_tx,
@@ -483,7 +469,6 @@ async fn spawn_metrics_server(
 /// handled on its own task so a slow client can't block the accept loop.
 async fn serve_ipc(
     daemon: &Arc<MeshManager>,
-    mut promote_rx: mpsc::Receiver<String>,
     mut self_unpair_rx: mpsc::Receiver<()>,
     token: CancellationToken,
 ) -> Result<()> {
@@ -505,13 +490,6 @@ async fn serve_ipc(
                 daemon.deactivate().await;
                 let _ = std::fs::remove_file(&socket_path);
                 return Ok(());
-            }
-            // A co-coordinator just persisted an `AdminGrant` key: swap its
-            // accept handler to coordinator so it can admit fresh joiners.
-            // Idempotent and quick (a synchronous handler swap), so running it
-            // inline in the loop is fine.
-            Some(net) = promote_rx.recv() => {
-                daemon.promote_to_coordinator(&net).await;
             }
             // Our primary unpaired us: leave all networks + wipe the cert so we
             // drop out of the mesh right away. Hand-off from a control reader that

@@ -435,10 +435,9 @@ pub struct MeshManager {
     tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
     networks: Arc<DashMap<String, NetworkHandle>>,
     /// The network-owning service. Shares the same `networks` map (M5 seam); the
-    /// daemon delegates membership queries and, progressively, the network
-    /// methods to it. Held here so services built from `MeshManager` can take a
-    /// clone; the daemon's own call sites migrate onto it over M5.
-    #[allow(dead_code)]
+    /// daemon delegates coordinator registration / promotion to it, and hands
+    /// clones to services (FileService) and control readers (MemberAcceptState)
+    /// so they call it directly instead of signalling the daemon over a channel.
     registry: Arc<NetworkRegistry>,
     shutdown_token: CancellationToken,
     blob_store: FsStore,
@@ -460,10 +459,6 @@ pub struct MeshManager {
     /// Handles for the packet-forwarding tasks spawned by
     /// [`MeshManager::attach_tun`], kept so a future `down()`/detach can stop them.
     tun_tasks: Mutex<Option<TunTasks>>,
-    /// Promotion-channel receiver drained by [`serve_ipc`]. Stored here so the
-    /// headless builder can construct the daemon and hand the receiver back to
-    /// [`run_daemon`] afterwards.
-    promote_rx: Mutex<Option<mpsc::Receiver<String>>>,
     /// Prometheus metrics-server guard. Kept alive for the daemon's whole lifetime
     /// (dropping it stops the export); `None` if the server failed to bind.
     _metrics_server: Mutex<Option<iroh_metrics::service::MetricsServer>>,
@@ -499,25 +494,17 @@ pub struct MeshManager {
     // resulting dead-code warning there rather than dropping the field.
     #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
     ssh_token: Mutex<Option<CancellationToken>>,
-    /// Promotion signal: a co-coordinator's per-peer control reader sends the
-    /// network name here after persisting an `AdminGrant` key, and the main
-    /// daemon loop ([`serve_ipc`]) drains it into
-    /// [`MeshManager::promote_to_coordinator`]. The reader holds only field
-    /// clones (not the full `MeshManager`), so it can't promote itself, hence
-    /// the channel hand-off to the loop that does hold the `Arc<MeshManager>`.
-    promote_tx: mpsc::Sender<String>,
     /// Daemon-wide disconnect sender, cloned into every [`MeshCtx`] so every
     /// per-connection data reader reports peer drops to one place. See
     /// [`MeshCtx::disconnect_tx`].
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     /// Receiver half of the daemon-wide disconnect channel, handed to
-    /// [`run_daemon`] to drive the single [`MeshManager::run_connection_supervisor`]
-    /// (mirrors the `promote_rx` hand-off).
+    /// [`run_daemon`] to drive the single [`MeshManager::run_connection_supervisor`].
     disconnect_rx: std::sync::Mutex<Option<mpsc::Receiver<forward::DisconnectEvent>>>,
     /// Self-unpair signal (see [`MeshCtx::self_unpair_tx`]): a control reader that
     /// received `ControlMsg::Unpaired` from our primary sends here, and the daemon
-    /// loop drains it into [`MeshManager::unpair_self`]. Same reader-can't-hold-the
-    /// -`Arc` hand-off pattern as `promote_tx`.
+    /// loop drains it into [`MeshManager::unpair_self`]. The reader holds only field
+    /// clones (not the full `MeshManager`), so it hands off to the loop that does.
     self_unpair_tx: mpsc::Sender<()>,
     /// Receiver half of the self-unpair channel, taken once by the daemon loop.
     self_unpair_rx: Mutex<Option<mpsc::Receiver<()>>>,
@@ -740,53 +727,17 @@ impl MeshManager {
         network_key: EndpointId,
         cancel: CancellationToken,
     ) {
-        self.protocol_router.register(
+        // The registration logic lives on NetworkRegistry (which owns the
+        // ConnectionManager + networks map); the daemon supplies its ctx.
+        self.registry.register_coordinator_handler(
+            &self.mesh_ctx(),
+            network,
+            state,
+            invite_lock,
+            dht_notify,
             network_key,
-            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-                ctx: self.mesh_ctx(),
-                network_name: network.to_string(),
-                state,
-                token: cancel,
-                dht_notify,
-                invite_lock,
-            })),
+            cancel,
         );
-        // Flip the stored role so `ray status` reports Coordinator immediately.
-        if let Some(mut handle) = self.networks.get_mut(network) {
-            handle.role = NetworkRole::Coordinator;
-        }
-    }
-
-    /// Re-register the [`CoordinatorAcceptState`] for `network` so a node just
-    /// granted the per-network key (via `AdminGrant`) can admit fresh joiners
-    /// instead of silently dropping their `JoinRequest`s under
-    /// `AcceptHandler::Member`.
-    ///
-    /// Idempotent: a network already running as coordinator is left untouched
-    /// ([`should_promote`]). The needed [`NetworkHandle`] fields are cloned
-    /// inside a scoped block so the `DashMap` ref is dropped before the
-    /// (synchronous) registration, never held across it.
-    pub(crate) async fn promote_to_coordinator(&self, network: &str) {
-        let parts = {
-            let Some(h) = self.networks.get(network) else {
-                return;
-            };
-            if !should_promote(h.role.clone()) {
-                return;
-            }
-            (
-                h.state.clone(),
-                h.invite_lock.clone(),
-                h.dht_notify.clone(),
-                h.network_key,
-                h.cancel.clone(),
-            )
-        }; // DashMap ref dropped before the registration below.
-        self.register_coordinator_handler(
-            network, parts.0, parts.1, parts.2, parts.3, parts.4,
-        );
-        self.refresh_alpns().await;
-        tracing::info!(network, "promoted to coordinator accept handler");
     }
 
     /// Tailscale-style access control. Read-only queries are open to any local
@@ -1453,11 +1404,41 @@ mod accept_handler_tests {
         }))
     }
 
+    /// Throwaway [`NetworkRegistry`] for accept-handler tests: empty networks map
+    /// and dummy foundation handles, none of which the constructed handlers touch.
+    fn sample_registry(
+        endpoint: Endpoint,
+        identity: IrohIdentityProvider,
+        blob_store: FsStore,
+        contact: EndpointId,
+    ) -> Arc<NetworkRegistry> {
+        let transport = Arc::new(Transport::new(
+            endpoint,
+            identity,
+            blob_store,
+            Arc::new(ForwardMetrics::default()),
+            contact,
+        ));
+        Arc::new(NetworkRegistry::new(
+            Arc::new(DashMap::new()),
+            transport,
+            PeerTable::new(),
+            Arc::new(ConnectionManager::new()),
+        ))
+    }
+
     async fn sample_member_handler() -> AcceptHandler {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
         let my_key = SecretKey::from_bytes(&[3u8; 32]);
         let my_id = my_key.public();
+        let endpoint = sample_test_endpoint().await;
+        let registry = sample_registry(
+            endpoint.clone(),
+            IrohIdentityProvider::new(my_id, 0),
+            blob_store.clone(),
+            my_id,
+        );
         AcceptHandler::Member(Arc::new(MemberAcceptState {
             ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store.clone()),
             network_name: "test-net".to_string(),
@@ -1465,8 +1446,8 @@ mod accept_handler_tests {
             token: CancellationToken::new(),
             net_pubkey: SecretKey::from_bytes(&[1u8; 32]).public(),
             my_identity: my_id,
-            endpoint: sample_test_endpoint().await,
-            promote_tx: tokio::sync::mpsc::channel(1).0,
+            endpoint,
+            registry,
             invite_lock: Arc::new(tokio::sync::Mutex::new(())),
             reconverge_notify: Arc::new(tokio::sync::Notify::new()),
         }))
