@@ -39,12 +39,6 @@ pub(crate) struct FileService {
     device_cert: Option<control::DeviceCert>,
     /// Transport-key → user-identity map, to resolve a file sender's owner.
     device_user_map: peers::DeviceUserMap,
-    /// Re-auth nudge: a (re-)pair signs a fresh cert for the device, so its key is
-    /// sent here for the daemon loop to clear from the durable nullifier seed and
-    /// from every coordinated network's blob (see `MeshManager::reauth_device`).
-    /// The accept arm holds only field clones, so it hands the work off rather than
-    /// touching `MeshManager` (mirrors `MeshCtx::self_unpair_tx`).
-    reauth_tx: mpsc::Sender<EndpointId>,
 }
 
 impl FileService {
@@ -54,7 +48,6 @@ impl FileService {
         registry: Arc<NetworkRegistry>,
         device_cert: Option<control::DeviceCert>,
         device_user_map: peers::DeviceUserMap,
-        reauth_tx: mpsc::Sender<EndpointId>,
     ) -> Self {
         Self {
             pending_files: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -65,7 +58,6 @@ impl FileService {
             registry,
             device_cert,
             device_user_map,
-            reauth_tx,
         }
     }
 
@@ -337,11 +329,15 @@ impl FileService {
                                     Err(_) => Vec::new(),
                                 };
                                 // A deliberate (re-)pair re-authorizes this device.
-                                // Hand its key to the daemon loop so it clears any
-                                // nullifier for it (durable seed + every coordinated
-                                // blob); otherwise admission would keep rejecting the
-                                // fresh cert and the device would reconnect-loop.
-                                let _ = self.reauth_tx.try_send(device_pubkey);
+                                // Clear any nullifier for it (durable seed + every
+                                // coordinated blob) so admission stops rejecting the
+                                // fresh cert; otherwise the device would reconnect-
+                                // loop. Spawned so the reseal/publish doesn't delay
+                                // the cert response the joiner is waiting on.
+                                let registry = self.registry.clone();
+                                tokio::spawn(async move {
+                                    registry.reauth_device(device_pubkey).await;
+                                });
                                 let generation =
                                     config::load().map(|c| c.cert_generation).unwrap_or(0);
                                 let cert = control::DeviceCert::create(

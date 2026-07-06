@@ -521,10 +521,6 @@ pub struct MeshManager {
     self_unpair_tx: mpsc::Sender<()>,
     /// Receiver half of the self-unpair channel, taken once by the daemon loop.
     self_unpair_rx: Mutex<Option<mpsc::Receiver<()>>>,
-    /// Receiver half of the re-auth channel (see [`FileService`]): the pairing
-    /// accept arm sends a re-paired device's key here, and the daemon loop drains
-    /// it into [`MeshManager::reauth_device`] to clear the device's nullifier.
-    reauth_rx: Mutex<Option<mpsc::Receiver<EndpointId>>>,
 }
 
 /// Map key-holding status to a [`NetworkRole`].

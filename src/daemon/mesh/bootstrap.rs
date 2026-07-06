@@ -56,12 +56,6 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         .unwrap()
         .take()
         .expect("self_unpair_rx present after build");
-    let reauth_rx = daemon
-        .reauth_rx
-        .lock()
-        .unwrap()
-        .take()
-        .expect("reauth_rx present after build");
 
     // Single daemon-wide connection supervisor: consumes every data reader's
     // disconnect and, per dropped identity, prunes departed peers we coordinate
@@ -88,7 +82,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         spawn_auto_update(daemon.shutdown_token.clone());
     }
 
-    let result = serve_ipc(&daemon, promote_rx, self_unpair_rx, reauth_rx, token).await;
+    let result = serve_ipc(&daemon, promote_rx, self_unpair_rx, token).await;
 
     // Close the iroh endpoint before returning. Dropping it on return logs
     // "Endpoint dropped without calling `Endpoint::close`. Aborting
@@ -161,12 +155,6 @@ fn spawn_headless_signal_drain(daemon: Arc<MeshManager>) {
         .unwrap()
         .take()
         .expect("self_unpair_rx present after build");
-    let mut reauth_rx = daemon
-        .reauth_rx
-        .lock()
-        .unwrap()
-        .take()
-        .expect("reauth_rx present after build");
     let token = daemon.shutdown_token.clone();
     tokio::spawn(async move {
         loop {
@@ -174,7 +162,6 @@ fn spawn_headless_signal_drain(daemon: Arc<MeshManager>) {
                 _ = token.cancelled() => break,
                 Some(net) = promote_rx.recv() => { daemon.promote_to_coordinator(&net).await; }
                 Some(()) = self_unpair_rx.recv() => { let _ = daemon.unpair_self().await; }
-                Some(dev) = reauth_rx.recv() => { daemon.reauth_device(dev).await; }
             }
         }
     });
@@ -307,20 +294,21 @@ async fn build_daemon(
     // Networks map is shared with the NetworkRegistry service (M5 seam): both
     // hold the same `Arc<DashMap>` so methods migrate to the registry gradually.
     let networks = Arc::new(DashMap::new());
-    let registry = Arc::new(NetworkRegistry::new(networks.clone()));
-    // Re-auth channel: the pairing accept arm nudges this with a re-paired device's
-    // key so the daemon loop clears its nullifier (see `MeshManager::reauth_device`).
-    let (reauth_tx, reauth_rx) = mpsc::channel::<EndpointId>(4);
+    let registry = Arc::new(NetworkRegistry::new(
+        networks.clone(),
+        transport.clone(),
+        peers.clone(),
+    ));
     // FileService owns file transfer + pairing. It evaluates own-device auto-accept
-    // directly (no worker channel), so it depends on Transport (endpoint + blobs)
-    // and NetworkRegistry (the membership gate).
+    // directly (no worker channel) and clears a re-paired device's nullifier by
+    // calling NetworkRegistry directly (was the reauth_tx hand-off channel), so it
+    // depends on Transport (endpoint + blobs) and NetworkRegistry.
     let files = Arc::new(FileService::new(
         key.clone(),
         transport.clone(),
         registry.clone(),
         device_cert.clone(),
         device_user_map.clone(),
-        reauth_tx,
     ));
     let connect = Arc::new(ConnectService::new());
     let protocol_router = Arc::new(ProtocolRouter::new(
@@ -378,7 +366,6 @@ async fn build_daemon(
         disconnect_rx: std::sync::Mutex::new(Some(disconnect_rx)),
         self_unpair_tx,
         self_unpair_rx: std::sync::Mutex::new(Some(self_unpair_rx)),
-        reauth_rx: std::sync::Mutex::new(Some(reauth_rx)),
     });
 
     // Install the daemon-wide mesh dispatch context so the per-connection demux
@@ -498,7 +485,6 @@ async fn serve_ipc(
     daemon: &Arc<MeshManager>,
     mut promote_rx: mpsc::Receiver<String>,
     mut self_unpair_rx: mpsc::Receiver<()>,
-    mut reauth_rx: mpsc::Receiver<EndpointId>,
     token: CancellationToken,
 ) -> Result<()> {
     let socket_path = ipc::socket_path();
@@ -532,11 +518,6 @@ async fn serve_ipc(
             // holds only field clones (see `MeshCtx::self_unpair_tx`).
             Some(()) = self_unpair_rx.recv() => {
                 let _ = daemon.unpair_self().await;
-            }
-            // A device just (re-)paired to us: clear its nullifier from the durable
-            // seed and every coordinated blob so its fresh cert is honored again.
-            Some(dev) = reauth_rx.recv() => {
-                daemon.reauth_device(dev).await;
             }
             result = listener.accept() => match result {
                 Ok((stream, _)) => {
