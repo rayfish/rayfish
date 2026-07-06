@@ -22,7 +22,7 @@ pub enum DropReason {
     /// Outbound packet dropped at the application boundary because the peer's
     /// QUIC datagram send buffer was too full to accept it without evicting an
     /// already-queued (older) packet. Dropping the *new* packet here (drop-newest)
-    /// is preferable to letting QUIC drop the *oldest* queued one — for a VPN the
+    /// is preferable to letting QUIC drop the *oldest* queued one: for a VPN the
     /// oldest queued packet is more likely to be useful (already-accepted work)
     /// than a fresh one arriving into a saturated link.
     Backpressure,

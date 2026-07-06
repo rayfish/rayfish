@@ -40,7 +40,7 @@ impl MeshManager {
     /// Resolve a firewall `--peer` argument to a peer's **device** endpoint id,
     /// accepting far more forms than [`resolve_peer_name`]: hostname (bare or
     /// `host.net.ray`), mesh IPv4 (also for offline members, since the roster
-    /// stores v4), mesh IPv6 (connected peers only — the roster carries no v6),
+    /// stores v4), mesh IPv6 (connected peers only, the roster carries no v6),
     /// short id / full endpoint id, or a paired **user identity** (resolved to
     /// that user's joined device). Returns the device id `D`; `firewall_add`
     /// normalizes it to the user identity for inbound rules. Kept separate from
@@ -75,7 +75,7 @@ impl MeshManager {
 
     /// Resolve whether a pending offer's sender is one of *our own* paired
     /// devices: the sender's resolved user identity must equal ours (our device
-    /// cert's `user_identity`, or on the primary — which holds no cert — our own
+    /// cert's `user_identity`, or on the primary (which holds no cert) our own
     /// endpoint id). A non-paired peer resolves to its own transport id and so
     /// can never match. Shared by `try_auto_accept_file` and `list_files` (which
     /// surfaces it as `PendingFileInfo.own_device` for the mobile UI).
@@ -665,7 +665,7 @@ impl MeshManager {
     ///
     /// Records the device key as a durable nullifier (`revoked_devices`), then, on
     /// every network this node coordinates, adds it to the signed blob's nullifier
-    /// set, removes it from the roster, and republishes — so the blob stops
+    /// set, removes it from the roster, and republishes, so the blob stops
     /// honoring its cert. Best-effort tells the device to wipe its own cert. Live
     /// links to the device are severed everywhere; other nodes reject its cert and
     /// prune it when they reconverge from the republished blob. Networks this node
@@ -839,7 +839,7 @@ impl MeshManager {
 
     /// Best-effort `ControlMsg::Unpaired` to a device over any shared live mesh
     /// connection, asking it to wipe its own cert. Never blocks unpair on success
-    /// — the authoritative revocation is the signed pkarr record.
+    /// the authoritative revocation is the signed pkarr record.
     async fn send_unpaired_notice(&self, target: EndpointId) {
         for entry in self.networks.iter() {
             let net = entry.key().clone();
@@ -874,6 +874,17 @@ impl MeshManager {
         let networks: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
         for net in &networks {
             self.leave_network(net).await;
+        }
+        // Also purge any saved-but-inactive network configs. When a device is
+        // unpaired while offline it discovers this at startup restore, before its
+        // networks are added to `self.networks` (the join bails on the nullifier
+        // check first), so the loop above sees none, yet the config files remain
+        // and would make the node churn trying to rejoin networks it was removed
+        // from. Delete them directly.
+        if let Ok(cfg) = config::load() {
+            for net in &cfg.networks {
+                let _ = config::delete_network(&net.name);
+            }
         }
         // Then wipe the cert so this device is no longer one of its user's devices.
         match crate::identity::delete_device_cert() {

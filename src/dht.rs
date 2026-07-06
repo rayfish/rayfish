@@ -90,7 +90,7 @@ pub fn encode_network_record(
 
 /// Extracts the coordinator's advertised mesh protocol version (`m,<v>`) from a
 /// network record, if present. Returns `None` for older records published before
-/// the version was added — callers treat that as "unknown, fall through to the
+/// the version was added: callers treat that as "unknown, fall through to the
 /// ALPN gate" rather than blocking.
 pub fn mesh_version_from_record(packet: &SignedPacket) -> Option<u32> {
     packet
@@ -136,7 +136,7 @@ pub fn decode_network_record(packet: &SignedPacket) -> Result<(blake3::Hash, Vec
 
 /// Encode a contact record: maps the contact key to the user's current
 /// transport EndpointId. Signed by (and published under) the contact key, so
-/// only its holder can publish it. Carries nothing else — no roster, hostname,
+/// only its holder can publish it. Carries nothing else: no roster, hostname,
 /// or member identities.
 pub fn encode_contact_record(
     contact_key: &SecretKey,
@@ -183,7 +183,7 @@ pub async fn publish_network(
 }
 
 /// Resolves the raw signed network record packet. Use this when you need fields
-/// beyond `(blob_hash, seed_peers)` — e.g. [`mesh_version_from_record`] for the
+/// beyond `(blob_hash, seed_peers)`, e.g. [`mesh_version_from_record`] for the
 /// pre-dial compatibility check. Decode the standard fields with
 /// [`decode_network_record`].
 pub async fn resolve_network_packet(

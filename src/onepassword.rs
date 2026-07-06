@@ -3,7 +3,7 @@
 //!
 //! The blob stored here is the same `enc1…` base58 string the bare backup
 //! prints: the secret key encrypted with Argon2 + XChaCha20Poly1305 under a
-//! user-chosen password. 1Password is only a transport — a 1Password
+//! user-chosen password. 1Password is only a transport: a 1Password
 //! compromise alone still can't unlock the key without the backup password.
 //!
 //! All calls shell out to `op` synchronously (matching the codebase's
@@ -80,7 +80,7 @@ pub fn store(vault: Option<&str>, title: &str, blob: &str, public_key: &str) -> 
         return Ok(());
     }
 
-    // Item likely doesn't exist — create it from a JSON template via stdin so
+    // Item likely doesn't exist, create it from a JSON template via stdin so
     // the secret is not exposed on argv.
     let template = serde_json::json!({
         "title": title,

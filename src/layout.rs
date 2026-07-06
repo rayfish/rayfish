@@ -41,7 +41,7 @@ impl Cell {
         }
     }
 
-    /// Unstyled cell — plain and styled are identical.
+    /// Unstyled cell: plain and styled are identical.
     pub fn plain(text: impl Into<String> + Clone) -> Self {
         Cell::new(text.clone(), text)
     }

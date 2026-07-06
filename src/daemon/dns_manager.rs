@@ -42,7 +42,7 @@ impl DnsManager {
     /// Point system DNS at the in-daemon Magic DNS resolver: detect the OS DNS
     /// backend, merge any user-configured upstreams over the captured ones, and
     /// (Linux direct-resolv.conf mode) spawn the inotify re-assert watcher.
-    /// Failures are non-fatal — pushed to `warnings` so `ray up` can surface them.
+    /// Failures are non-fatal: pushed to `warnings` so `ray up` can surface them.
     pub(crate) async fn configure(&self, tun_name: &str, warnings: &mut Vec<String>) {
         // Configure system DNS to route .ray queries to our in-daemon resolver.
         dns_config::restore_stale_backups();

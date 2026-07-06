@@ -318,7 +318,7 @@ pub fn derive_ip(identity: &EndpointId) -> Ipv4Addr {
 
 /// Derives a virtual IPv4 with a collision index. Index 0 produces the same
 /// result as [`derive_ip`]. Higher indices rotate the address to resolve
-/// collisions in the 22-bit space. The index is local state — each node
+/// collisions in the 22-bit space. The index is local state: each node
 /// resolves collisions independently.
 pub fn derive_ip_with_index(identity: &EndpointId, index: u32) -> Ipv4Addr {
     let input = if index == 0 {
@@ -351,7 +351,7 @@ fn is_reserved_ipv4(ip: Ipv4Addr) -> bool {
 
 /// Finds the lowest collision index whose derived IPv4 is free in `members`.
 ///
-/// An IP is considered free if no *different* identity holds it — a re-add of
+/// An IP is considered free if no *different* identity holds it: a re-add of
 /// the same identity at its existing index is always accepted. Returns the
 /// `(ip, index)` pair that should be stored in `Member.ip` / `Member.collision_index`.
 pub fn assign_ip(members: &MemberList, identity: &EndpointId) -> (Ipv4Addr, u32) {
@@ -415,7 +415,7 @@ impl IdentityProvider for IrohIdentityProvider {
 // ---------------------------------------------------------------------------
 
 /// A reusable, expiring join key (Tailscale auth-key analog). Only the
-/// `blake3(secret)` hash is published — the raw secret lives solely in the code
+/// `blake3(secret)` hash is published: the raw secret lives solely in the code
 /// handed to a joiner. Because it rides the signed `GroupBlob`, *any* network-key
 /// holder can verify-and-admit and revocation propagates to every admin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -501,7 +501,7 @@ pub fn revoke_reusable(keys: &mut BTreeMap<String, ReusableKey>, id: &str) -> Re
 
 /// Verify a presented reusable-key secret against a key set. Returns the key iff
 /// it is present, not revoked, and not expired (`now` is Unix seconds). This is
-/// the (pure) admission decision for a reusable join — usable by any network-key
+/// the (pure) admission decision for a reusable join, usable by any network-key
 /// holder, since the key set comes from the network-key-signed blob.
 pub fn validate_reusable_key<'a>(
     keys: &'a BTreeMap<String, ReusableKey>,
@@ -579,7 +579,7 @@ pub fn group_blob_hash(
 /// This is the invariant the network *should* enforce at every trust boundary
 /// (GroupBlob decode, `Welcome`/`MemberSync` application, `MeshHello.ip`). Today
 /// the daemon trusts the `ip` field carried in those messages, which permits IP
-/// hijacking — see the security audit. This helper exists so enforcement can be
+/// hijacking (see the security audit). This helper exists so enforcement can be
 /// added at the data layer without changing the on-wire format.
 pub fn validate_member(member: &Member) -> Result<()> {
     let expected = derive_ip_with_index(&member.identity, member.collision_index);
@@ -688,7 +688,7 @@ pub fn verify_group_blob(bytes: &[u8], expected_hash: &blake3::Hash) -> Result<G
 ///
 /// The network-key-signed pkarr record is the *sole* authority: `signed` is the
 /// hash it commits to. Peer control messages (`MemberSync`, `BlobUpdated`) are
-/// payload-free triggers — they carry no hash — so there is never any
+/// payload-free triggers (they carry no hash) so there is never any
 /// peer-supplied value that could be fetched or applied. Returns `Some(signed)`
 /// when it differs from what we already hold (`current`), else `None`.
 pub fn trusted_reconverge_hash(
@@ -1332,7 +1332,7 @@ mod tests {
 
     #[test]
     fn no_reconverge_when_already_on_signed_hash() {
-        // We already hold the authoritative (signed) blob — no work to do.
+        // We already hold the authoritative (signed) blob, no work to do.
         let signed = blake3::hash(b"authoritative blob");
         assert_eq!(trusted_reconverge_hash(Some(signed), signed), None);
     }

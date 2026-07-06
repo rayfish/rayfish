@@ -494,7 +494,7 @@ fn spawn_roster_peer_dials(
 /// Run one coordinator handshake. A fresh join (`initial`) opens a stream, sends
 /// a `JoinRequest` (invite secret + hostname), and reads the verdict on the same
 /// stream. A reconnect/restore keeps the legacy handshake where the coordinator
-/// speaks first (Welcome/JoinApproved/MemberSync) — on a `MemberSync` trigger the
+/// speaks first (Welcome/JoinApproved/MemberSync): on a `MemberSync` trigger the
 /// roster comes from the network-key-signed pkarr record, never peer-supplied
 /// membership. Returns the admitted roster, or `Pending` on a closed network.
 #[allow(clippy::too_many_arguments)]
@@ -568,7 +568,7 @@ async fn perform_join_handshake(
                 (members, vec![])
             }
             ControlMsg::MemberSync => {
-                // Reconnected via a peer. The message is only a trigger — fetch
+                // Reconnected via a peer. The message is only a trigger, fetch
                 // the authoritative roster from the network-key-signed pkarr
                 // record. If it's briefly unreachable, fall back to our last
                 // persisted roster rather than trusting peer-supplied membership.
@@ -726,7 +726,7 @@ fn spawn_member_control_listener(
                                 }
                                 ControlMsg::BlobUpdated => {
                                     // Trigger only. Reconverge from the network-key-signed
-                                    // pkarr record — a malicious member can't inject a
+                                    // pkarr record, a malicious member can't inject a
                                     // forged roster/firewall blob via this message. Coalesced
                                     // into the debounced reconverge worker.
                                     reconverge_notify.notify_one();
@@ -924,14 +924,14 @@ pub(crate) fn spawn_reconnect_loop(
             }
 
             // A deliberate `ray leave` (graceful close with the leave code) means
-            // the peer is gone for good — don't spin a reconnect task against it.
+            // the peer is gone for good, don't spin a reconnect task against it.
             // The coordinator's MemberSync will prune it from our roster.
             if event.intentional {
                 tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "peer left, not reconnecting");
                 continue;
             }
             // We just pruned this peer from the roster (it was kicked or departed)
-            // and closed the connection ourselves — that close is what woke this
+            // and closed the connection ourselves, that close is what woke this
             // loop. The peer still lists us, so re-dialing would re-form the link.
             // Consume the one-shot suppression entry and skip.
             if pruned_peers
