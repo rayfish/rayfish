@@ -36,6 +36,16 @@ pub(crate) struct NetworkRegistry {
     device_cert: Option<control::DeviceCert>,
     /// Daemon-wide shutdown token; each network's cancel is a child of it.
     shutdown_token: CancellationToken,
+    /// Per-device firewall, threaded into the [`MeshCtx`] handler bundle.
+    firewall: SharedFirewall,
+    /// Transport-key -> user-identity map, threaded into the [`MeshCtx`] bundle.
+    device_user_map: peers::DeviceUserMap,
+    /// Sender to the single TUN writer, threaded into peer readers via [`MeshCtx`].
+    tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
+    /// Roster-pruned peers to skip on reconnect (see [`MeshCtx::pruned_peers`]).
+    pruned_peers: Arc<DashSet<(String, EndpointId)>>,
+    /// Daemon-wide disconnect channel drained by the connection supervisor.
+    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
 }
 
 impl NetworkRegistry {
@@ -49,6 +59,11 @@ impl NetworkRegistry {
         tun_name: Arc<Mutex<String>>,
         device_cert: Option<control::DeviceCert>,
         shutdown_token: CancellationToken,
+        firewall: SharedFirewall,
+        device_user_map: peers::DeviceUserMap,
+        tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
+        pruned_peers: Arc<DashSet<(String, EndpointId)>>,
+        disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     ) -> Self {
         Self {
             networks,
@@ -59,6 +74,32 @@ impl NetworkRegistry {
             tun_name,
             device_cert,
             shutdown_token,
+            firewall,
+            device_user_map,
+            tun_tx,
+            pruned_peers,
+            disconnect_tx,
+        }
+    }
+
+    /// Build the [`MeshCtx`] handler bundle from the registry's own handles. This
+    /// is the same bundle `MeshManager::mesh_ctx` produces; relocating the builder
+    /// here lets the network methods (create/join/coordinator spawn) assemble it
+    /// themselves instead of taking it as a threaded-in argument.
+    pub(crate) fn mesh_ctx(self: &Arc<Self>) -> MeshCtx {
+        MeshCtx {
+            identity: self.transport.identity.clone(),
+            peers: self.peers.clone(),
+            tun_tx: self.tun_tx.clone(),
+            stats: self.transport.stats.clone(),
+            blob_store: self.transport.blob_store.clone(),
+            firewall: self.firewall.clone(),
+            hostname_table: self.dns.hostname_table.clone(),
+            reverse_table: self.dns.reverse_table.clone(),
+            device_user_map: self.device_user_map.clone(),
+            pruned_peers: self.pruned_peers.clone(),
+            disconnect_tx: self.disconnect_tx.clone(),
+            registry: self.clone(),
         }
     }
 

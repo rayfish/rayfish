@@ -257,6 +257,12 @@ async fn build_daemon(
     // Networks map is shared with the NetworkRegistry service (M5 seam): both
     // hold the same `Arc<DashMap>` so methods migrate to the registry gradually.
     let networks = Arc::new(DashMap::new());
+    // Daemon-wide disconnect channel: every per-connection data reader reports
+    // peer drops here, drained by the single connection supervisor. Built here
+    // (before the registry) so both the registry's MeshCtx builder and the
+    // MeshManager literal share the one sender.
+    let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(256);
+    let pruned_peers = Arc::new(DashSet::new());
     let registry = Arc::new(NetworkRegistry::new(
         networks.clone(),
         transport.clone(),
@@ -266,6 +272,11 @@ async fn build_daemon(
         tun_name.clone(),
         device_cert.clone(),
         token.clone(),
+        shared_firewall.clone(),
+        device_user_map.clone(),
+        tun_tx.clone(),
+        pruned_peers.clone(),
+        disconnect_tx.clone(),
     ));
     // FileService owns file transfer + pairing. It evaluates own-device auto-accept
     // directly (no worker channel) and clears a re-paired device's nullifier by
@@ -286,9 +297,6 @@ async fn build_daemon(
         conn.clone(),
     ));
     let auto_update = app_config.auto_update;
-    // Daemon-wide disconnect channel: every per-connection data reader reports
-    // peer drops here, drained by the single connection supervisor.
-    let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(256);
     let daemon = Arc::new(MeshManager {
         transport,
         registry,
@@ -313,7 +321,7 @@ async fn build_daemon(
         connect,
         device_cert,
         device_user_map,
-        pruned_peers: Arc::new(DashSet::new()),
+        pruned_peers,
         contact_public,
         active: active.clone(),
         #[cfg(feature = "desktop")]

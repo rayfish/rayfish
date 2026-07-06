@@ -579,20 +579,8 @@ impl MeshManager {
     }
 
     pub(crate) fn mesh_ctx(&self) -> MeshCtx {
-        MeshCtx {
-            identity: self.identity.clone(),
-            peers: self.peers.clone(),
-            tun_tx: self.tun_tx.clone(),
-            stats: self.stats.clone(),
-            blob_store: self.blob_store.clone(),
-            firewall: self.firewall.clone(),
-            hostname_table: self.dns.hostname_table.clone(),
-            reverse_table: self.dns.reverse_table.clone(),
-            device_user_map: self.device_user_map.clone(),
-            pruned_peers: self.pruned_peers.clone(),
-            disconnect_tx: self.disconnect_tx.clone(),
-            registry: self.registry.clone(),
-        }
+        // The registry holds clones of the same handles; it is the single builder.
+        self.registry.mesh_ctx()
     }
 
     pub(crate) async fn refresh_alpns(&self) {
@@ -1415,6 +1403,8 @@ mod accept_handler_tests {
             reverse_table.clone(),
         ));
         let dns = Arc::new(DnsService::new(hostname_table, reverse_table, dns_resolver));
+        let (disconnect_tx, _disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(1);
+        let (placeholder_tx, _placeholder_rx) = mpsc::channel::<Bytes>(1);
         Arc::new(NetworkRegistry::new(
             Arc::new(DashMap::new()),
             transport,
@@ -1424,6 +1414,11 @@ mod accept_handler_tests {
             Arc::new(Mutex::new(String::from("test"))),
             None,
             CancellationToken::new(),
+            SharedFirewall::new(firewall::FirewallConfig::default()),
+            peers::DeviceUserMap::new(),
+            Arc::new(arc_swap::ArcSwap::from_pointee(placeholder_tx)),
+            Arc::new(DashSet::new()),
+            disconnect_tx,
         ))
     }
 
