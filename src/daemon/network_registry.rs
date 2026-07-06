@@ -217,14 +217,14 @@ impl NetworkRegistry {
     /// coordinator accept handler. `direct`/`pre_approve` back the `ray connect`
     /// 2-peer path. Takes a `&MeshCtx` for the task spawn + handler registration.
     pub(crate) async fn create_network_inner(
-        &self,
-        ctx: &MeshCtx,
+        self: &Arc<Self>,
         mode: GroupMode,
         custom_name: Option<String>,
         hostname: Option<String>,
         direct: bool,
         pre_approve: Option<(EndpointId, Option<String>)>,
     ) -> Result<IpcMessage> {
+        let ctx = self.mesh_ctx();
         let name = match custom_name {
             Some(n) => {
                 anyhow::ensure!(
@@ -310,7 +310,7 @@ impl NetworkRegistry {
         let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
         let dht_notify = Arc::new(tokio::sync::Notify::new());
         let (tasks, disconnect_tx) = self.spawn_coordinator_background_tasks(
-            ctx,
+            &ctx,
             &name,
             &net_secret_key,
             &state,
@@ -334,7 +334,7 @@ impl NetworkRegistry {
         self.networks.insert(name.clone(), handle);
 
         self.register_coordinator_handler(
-            ctx,
+            &ctx,
             &name,
             state,
             invite_lock,
