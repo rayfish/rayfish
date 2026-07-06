@@ -35,7 +35,7 @@ mod select;
 pub(crate) use accept::*;
 pub(crate) use coordinator::*;
 // Device-side unpair wipe + cert-refresh helpers, reached by both control readers.
-pub(crate) use files::{is_unpaired_by, store_refreshed_cert};
+pub(crate) use files::{is_unpaired_by, resolve_download_target, store_refreshed_cert};
 pub(crate) use join::*;
 pub(crate) use publish::*;
 pub(crate) use reconverge::*;

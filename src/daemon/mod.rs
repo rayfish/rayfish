@@ -436,7 +436,9 @@ pub struct MeshManager {
     networks: Arc<DashMap<String, NetworkHandle>>,
     /// The network-owning service. Shares the same `networks` map (M5 seam); the
     /// daemon delegates membership queries and, progressively, the network
-    /// methods to it.
+    /// methods to it. Held here so services built from `MeshManager` can take a
+    /// clone; the daemon's own call sites migrate onto it over M5.
+    #[allow(dead_code)]
     registry: Arc<NetworkRegistry>,
     shutdown_token: CancellationToken,
     blob_store: FsStore,
@@ -990,7 +992,9 @@ impl MeshManager {
             IpcMessage::AliasList { network } => self.list_aliases(&network),
             IpcMessage::SendFile { path, peer } => self.send_file(&path, &peer).await,
             IpcMessage::ListFiles => self.list_files(),
-            IpcMessage::AcceptFile { id, output } => self.accept_file(id, output, peer_cred).await,
+            IpcMessage::AcceptFile { id, output } => {
+                self.files.accept_file(id, output, peer_cred).await
+            }
             IpcMessage::StartPairing => self.start_pairing(),
             IpcMessage::PairWithDevice {
                 endpoint_id,

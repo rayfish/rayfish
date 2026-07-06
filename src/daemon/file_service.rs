@@ -9,6 +9,8 @@
 //! peers, the shared blob store) and read this service's state.
 
 use super::*;
+use std::ffi::CString;
+use std::path::PathBuf;
 
 /// A received file offer awaiting `ray files accept`.
 pub(crate) struct PendingFile {
@@ -29,10 +31,14 @@ pub(crate) struct FileService {
     pub(crate) pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
     /// This node's transport secret key, used to sign device certs on pairing.
     secret_key: SecretKey,
-    /// Auto-accept nudge: each newly-queued offer's id is sent here so the
-    /// daemon-wide worker (`spawn_file_auto_accept`) can evaluate it for
-    /// own-device auto-accept without waiting for a manual `ray files accept`.
-    new_file_tx: mpsc::UnboundedSender<u64>,
+    /// Foundation handles (endpoint + blob store) for fetching accepted files.
+    transport: Arc<Transport>,
+    /// The network-owning service, for the own-device auto-accept membership gate.
+    registry: Arc<NetworkRegistry>,
+    /// This device's cert (if paired), to resolve our own user identity.
+    device_cert: Option<control::DeviceCert>,
+    /// Transport-key → user-identity map, to resolve a file sender's owner.
+    device_user_map: peers::DeviceUserMap,
     /// Re-auth nudge: a (re-)pair signs a fresh cert for the device, so its key is
     /// sent here for the daemon loop to clear from the durable nullifier seed and
     /// from every coordinated network's blob (see `MeshManager::reauth_device`).
@@ -44,7 +50,10 @@ pub(crate) struct FileService {
 impl FileService {
     pub(crate) fn new(
         secret_key: SecretKey,
-        new_file_tx: mpsc::UnboundedSender<u64>,
+        transport: Arc<Transport>,
+        registry: Arc<NetworkRegistry>,
+        device_cert: Option<control::DeviceCert>,
+        device_user_map: peers::DeviceUserMap,
         reauth_tx: mpsc::Sender<EndpointId>,
     ) -> Self {
         Self {
@@ -52,7 +61,10 @@ impl FileService {
             file_id_counter: Arc::new(AtomicU64::new(1)),
             pairing_secret: Arc::new(std::sync::Mutex::new(None)),
             secret_key,
-            new_file_tx,
+            transport,
+            registry,
+            device_cert,
+            device_user_map,
             reauth_tx,
         }
     }
@@ -84,11 +96,13 @@ impl FileService {
                                 mime_type,
                                 blob_hash,
                             });
-                            // Nudge the auto-accept worker: it accepts only offers
-                            // from our own paired devices on an opted-in network,
-                            // and no-ops otherwise, so the offer stays queued for
-                            // `ray files accept` unless it qualifies.
-                            let _ = self.new_file_tx.send(id);
+                            // Evaluate own-device auto-accept directly: it accepts
+                            // only offers from our own paired devices on an opted-in
+                            // network, and no-ops otherwise, so the offer stays
+                            // queued for `ray files accept` unless it qualifies. We
+                            // are already in a per-connection task, so awaiting the
+                            // fetch here blocks only this offer.
+                            self.try_auto_accept_file(id).await;
                         } else {
                             tracing::warn!(claimed = %from.fmt_short(), actual = %remote_id.fmt_short(), "file offer identity mismatch");
                         }
@@ -104,6 +118,168 @@ impl FileService {
             Err(e) => {
                 tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to accept bi stream for file offer");
             }
+        }
+    }
+
+    /// Whether a file sender resolves to *our own* user identity (a paired
+    /// device of ours), the gate for own-device file auto-accept. An unpaired
+    /// node uses its endpoint id as its own user identity, so a stranger can
+    /// never match. Shared by `try_auto_accept_file` and `list_files`.
+    pub(crate) fn is_own_device_sender(&self, from: EndpointId) -> bool {
+        let own_user = self
+            .device_cert
+            .as_ref()
+            .map(|c| c.user_identity)
+            .unwrap_or_else(|| self.transport.endpoint.id());
+        self.device_user_map.resolve(&from) == own_user
+    }
+
+    /// Evaluate a newly-queued (or already-pending) file offer against the
+    /// own-devices auto-accept policy and, if it qualifies, accept it without
+    /// user action. A no-op (offer stays queued) unless: the sender resolves to
+    /// *our own* user identity (a paired device) **and** it is a member of at
+    /// least one network with `auto_accept_files` enabled. Never removes the
+    /// pending entry unless it actually accepts (via `accept_file`).
+    pub(crate) async fn try_auto_accept_file(&self, id: u64) {
+        // Peek the offer's sender without consuming the queue entry.
+        let from = {
+            let pending = self.pending_files.lock().unwrap();
+            match pending.iter().find(|f| f.id == id) {
+                Some(f) => f.from,
+                None => return,
+            }
+        };
+
+        // Own-device gate: the sender must resolve to one of our own paired
+        // devices.
+        if !self.is_own_device_sender(from) {
+            return;
+        }
+
+        // Network gate: the sender must be a member of a network we've enabled.
+        if !self.registry.member_on_autoaccept_network(from) {
+            return;
+        }
+
+        // Placement must be explicitly resolvable (download-dir / download-user /
+        // operator). With none configured we do not write as root: leave the
+        // offer queued for manual `ray files accept`.
+        let (dir, cred) = match resolve_download_target() {
+            Some((dir, cred)) => (dir, cred),
+            None => {
+                tracing::warn!(
+                    from = %from.fmt_short(),
+                    "auto-accept: no download target configured (set `ray files download-dir` or `download-user`); leaving offer queued"
+                );
+                return;
+            }
+        };
+        let output = Some(dir.to_string_lossy().into_owned());
+
+        match self.accept_file(id, output, cred).await {
+            IpcMessage::Ok { message } => {
+                tracing::info!(from = %from.fmt_short(), %message, "file auto-accepted from own device");
+            }
+            IpcMessage::Error { message } => {
+                tracing::warn!(from = %from.fmt_short(), %message, "file auto-accept failed");
+            }
+            _ => {}
+        }
+    }
+
+    /// Fetch a pending file's blob from its sender, write it to disk, and (when a
+    /// `peer_cred` is given) chown it to that user. Removes the pending entry.
+    pub(crate) async fn accept_file(
+        &self,
+        id: u64,
+        output: Option<String>,
+        peer_cred: Option<(u32, u32)>,
+    ) -> IpcMessage {
+        let pending_file = {
+            let mut pending = self.pending_files.lock().unwrap();
+            let idx = pending.iter().position(|f| f.id == id);
+            match idx {
+                Some(i) => pending.remove(i),
+                None => {
+                    return IpcMessage::Error {
+                        message: format!("no pending file with id {id}"),
+                    };
+                }
+            }
+        };
+
+        let blob_hash = iroh_blobs::Hash::from_bytes(*pending_file.blob_hash.as_bytes());
+
+        let conn = match transport::connect_to_peer_with_alpn(
+            &self.transport.endpoint,
+            pending_file.from,
+            iroh_blobs::protocol::ALPN,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("cannot reach sender: {e}"),
+                };
+            }
+        };
+
+        if let Err(e) = self
+            .transport
+            .blob_store
+            .remote()
+            .fetch(conn, iroh_blobs::HashAndFormat::raw(blob_hash))
+            .await
+        {
+            return IpcMessage::Error {
+                message: format!("blob fetch failed: {e}"),
+            };
+        }
+
+        let bytes = match self.transport.blob_store.blobs().get_bytes(blob_hash).await {
+            Ok(b) => b,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("blob read failed: {e}"),
+                };
+            }
+        };
+
+        let dir = match output {
+            Some(ref p) => PathBuf::from(p),
+            None => dirs::download_dir().unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("Downloads")
+            }),
+        };
+
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return IpcMessage::Error {
+                message: format!("cannot create directory '{}': {e}", dir.display()),
+            };
+        }
+
+        let dest = dir.join(&pending_file.filename);
+        if let Err(e) = std::fs::write(&dest, &bytes) {
+            return IpcMessage::Error {
+                message: format!("write failed: {e}"),
+            };
+        }
+
+        if let Some((uid, gid)) = peer_cred {
+            use std::os::unix::ffi::OsStrExt;
+            if let Ok(c) = CString::new(dest.as_os_str().as_bytes()) {
+                unsafe { libc::chown(c.as_ptr(), uid, gid) };
+            }
+            if let Ok(c) = CString::new(dir.as_os_str().as_bytes()) {
+                unsafe { libc::chown(c.as_ptr(), uid, gid) };
+            }
+        }
+
+        IpcMessage::Ok {
+            message: format!("saved to {}", dest.display()),
         }
     }
 
