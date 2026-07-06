@@ -59,29 +59,6 @@ object Telemetry {
         }
     }
 
-    /** Structured health event. No-op when Sentry is off. Best-effort. */
-    fun sendHealth(context: Context) {
-        if (!Sentry.isEnabled()) return
-        val h = runCatching { NodeHolder.get(context).healthSnapshot() }.getOrNull() ?: return
-        Sentry.withScope { scope ->
-            scope.level = if (h.errorCount > 0uL) SentryLevel.WARNING else SentryLevel.INFO
-            scope.setTag("install_id", NodeHolder.installId(context))
-            scope.setTag("transport", transportType(context))
-            scope.setTag("mesh_up", h.meshUp.toString())
-            scope.setContexts("rayfish", mapOf(
-                "running" to h.running,
-                "networks" to h.networkCount.toLong(),
-                "peers_online" to h.peersOnline.toLong(),
-                "node_id" to h.nodeId,
-                "mesh_ipv4" to h.meshIpv4,
-                "warn_count" to h.warnCount.toLong(),
-                "error_count" to h.errorCount.toLong(),
-                "recent_errors" to h.recentErrors,
-            ))
-            Sentry.captureMessage("rayfish health", scope.level ?: SentryLevel.INFO)
-        }
-    }
-
     /** Full log snapshot as a Sentry attachment. Returns the event id, or null
      * when Sentry is off / the send failed. Best-effort. */
     fun sendDiagnostics(context: Context): String? {
