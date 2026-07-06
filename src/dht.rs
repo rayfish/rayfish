@@ -45,13 +45,13 @@ pub fn effective_pkarr_url() -> String {
 /// EndpointId so a peer can dial them without knowing the transport id.
 const CONTACT_RECORD_NAME: &str = "_rayfish_contact";
 
-/// pkarr record name for a user's device-cert **generation floor** (`ray unpair`
-/// / rotation). Published under the user's own key (the identity that signs
-/// device certs), it carries a single monotonic generation. Any peer that sees a
-/// `DeviceCert` resolves this record for `cert.user_identity` and rejects the
-/// cert if `cert.generation` is below the floor. Because the pkarr address *is*
+/// pkarr record name for a user's **revoked device set** (`ray unpair`). Published
+/// under the user's own key (the identity that signs device certs), it carries a
+/// monotonic version plus the list of device keys the user has revoked. Any peer
+/// that sees a `DeviceCert` resolves this record for `cert.user_identity` and
+/// rejects the cert if `cert.device_key` is listed. Because the pkarr address *is*
 /// the user public key, the record is self-authenticating and cannot be forged.
-const CERT_FLOOR_RECORD_NAME: &str = "_rayfish_certgen";
+const REVOKED_RECORD_NAME: &str = "_rayfish_revoked";
 
 // ---------------------------------------------------------------------------
 // Pkarr client
@@ -177,30 +177,41 @@ pub fn decode_contact_record(packet: &SignedPacket) -> Result<EndpointId> {
 // Cert-generation floor encoding / decoding (ray unpair / rotation)
 // ---------------------------------------------------------------------------
 
-/// Encode a cert-generation floor record: the user's current generation. Signed
-/// by (and published under) the user's own key, so only the identity that issued
-/// the certs can move it. pkarr's packet timestamp gives monotonicity, so a stale
-/// cached copy can never lower the floor.
-pub fn encode_cert_floor_record(user_secret: &SecretKey, generation: u64) -> Result<SignedPacket> {
-    let values = vec![RECORD_VERSION.to_string(), format!("g,{generation}")];
-    SignedPacket::from_txt_strings(user_secret, CERT_FLOOR_RECORD_NAME, values, RECORD_TTL)
-        .map_err(|e| anyhow::anyhow!("failed to build cert-floor record: {e}"))
+/// Encode a revoked-device-set record: a monotonic `version` plus one entry per
+/// revoked device key. Signed by (and published under) the user's own key, so only
+/// the identity that issued the certs can change it. The `version` gives the set
+/// monotonicity so a stale/replayed copy can't resurrect or drop a revocation.
+pub fn encode_revoked_record(
+    user_secret: &SecretKey,
+    version: u64,
+    devices: &[EndpointId],
+) -> Result<SignedPacket> {
+    let mut values = vec![RECORD_VERSION.to_string(), format!("v,{version}")];
+    values.extend(devices.iter().map(|d| format!("d,{d}")));
+    SignedPacket::from_txt_strings(user_secret, REVOKED_RECORD_NAME, values, RECORD_TTL)
+        .map_err(|e| anyhow::anyhow!("failed to build revoked-device record: {e}"))
 }
 
-pub fn decode_cert_floor_record(packet: &SignedPacket) -> Result<u64> {
-    let records = packet.txt_records(CERT_FLOOR_RECORD_NAME);
-    ensure!(!records.is_empty(), "no cert-floor records found");
+/// Decode a revoked-device-set record into `(version, device keys)`.
+pub fn decode_revoked_record(packet: &SignedPacket) -> Result<(u64, Vec<EndpointId>)> {
+    let records = packet.txt_records(REVOKED_RECORD_NAME);
+    ensure!(!records.is_empty(), "no revoked-device records found");
     ensure!(
         records[0] == RECORD_VERSION,
         "unsupported record version: {}",
         records[0]
     );
+    let mut version: Option<u64> = None;
+    let mut devices = Vec::new();
     for record in &records[1..] {
-        if let Some(gen_str) = record.strip_prefix("g,") {
-            return gen_str.parse::<u64>().context("invalid cert generation");
+        if let Some(v) = record.strip_prefix("v,") {
+            version = Some(v.parse::<u64>().context("invalid revocation version")?);
+        } else if let Some(d) = record.strip_prefix("d,") {
+            devices.push(d.parse::<EndpointId>().context("invalid revoked device key")?);
         }
     }
-    anyhow::bail!("missing cert generation (g,)")
+    let version = version.context("missing revocation version (v,)")?;
+    Ok((version, devices))
 }
 
 // ---------------------------------------------------------------------------
@@ -267,33 +278,34 @@ pub async fn resolve_contact(
     decode_contact_record(&packet)
 }
 
-/// Publish this user's cert-generation floor (`user_key -> generation`).
-/// Republished on a TTL/2 cadence by `spawn_revocation_publisher` so the floor
-/// stays resolvable while the primary's daemon runs.
-pub async fn publish_cert_floor(
+/// Publish this user's revoked device set (`user_key -> {version, devices}`).
+/// Republished on a TTL/2 cadence by `spawn_revocation_publisher` so the set stays
+/// resolvable while the primary's daemon runs.
+pub async fn publish_revoked(
     client: &PkarrRelayClient,
     user_secret: &SecretKey,
-    generation: u64,
+    version: u64,
+    devices: &[EndpointId],
 ) -> Result<()> {
-    let packet = encode_cert_floor_record(user_secret, generation)?;
+    let packet = encode_revoked_record(user_secret, version, devices)?;
     client
         .publish(&packet)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to publish cert-floor record: {e}"))
+        .map_err(|e| anyhow::anyhow!("failed to publish revoked-device record: {e}"))
 }
 
-/// Resolve a user's cert-generation floor. A missing record (never published, or
-/// TTL-expired) surfaces as an `Err`, which callers treat as "floor 0" and fail
+/// Resolve a user's revoked device set. A missing record (never published, or
+/// TTL-expired) surfaces as an `Err`, which callers treat as an empty set and fail
 /// open — see `RevocationCache`.
-pub async fn resolve_cert_floor(
+pub async fn resolve_revoked(
     client: &PkarrRelayClient,
     user_pubkey: EndpointId,
-) -> Result<u64> {
+) -> Result<(u64, Vec<EndpointId>)> {
     let packet = client
         .resolve(user_pubkey)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to resolve cert-floor record: {e}"))?;
-    decode_cert_floor_record(&packet)
+        .map_err(|e| anyhow::anyhow!("failed to resolve revoked-device record: {e}"))?;
+    decode_revoked_record(&packet)
 }
 
 // ---------------------------------------------------------------------------
@@ -437,26 +449,33 @@ mod tests {
     }
 
     #[test]
-    fn cert_floor_record_roundtrip() {
+    fn revoked_record_roundtrip() {
         let user = SecretKey::generate();
-        let packet = encode_cert_floor_record(&user, 42).unwrap();
-        assert_eq!(decode_cert_floor_record(&packet).unwrap(), 42);
+        let d1 = SecretKey::generate().public();
+        let d2 = SecretKey::generate().public();
+        let packet = encode_revoked_record(&user, 42, &[d1, d2]).unwrap();
+        let (version, devices) = decode_revoked_record(&packet).unwrap();
+        assert_eq!(version, 42);
+        assert_eq!(devices.len(), 2);
+        assert!(devices.contains(&d1) && devices.contains(&d2));
     }
 
     #[test]
-    fn cert_floor_record_zero_is_valid() {
+    fn revoked_record_empty_set_is_valid() {
         let user = SecretKey::generate();
-        let packet = encode_cert_floor_record(&user, 0).unwrap();
-        assert_eq!(decode_cert_floor_record(&packet).unwrap(), 0);
+        let packet = encode_revoked_record(&user, 3, &[]).unwrap();
+        let (version, devices) = decode_revoked_record(&packet).unwrap();
+        assert_eq!(version, 3);
+        assert!(devices.is_empty());
     }
 
     #[test]
-    fn cert_floor_record_rejects_unknown_version() {
+    fn revoked_record_rejects_unknown_version() {
         let key = SecretKey::generate();
-        let values = vec!["v99".to_string(), "g,5".to_string()];
+        let values = vec!["v99".to_string(), "v,5".to_string()];
         let packet =
-            SignedPacket::from_txt_strings(&key, CERT_FLOOR_RECORD_NAME, values, 300).unwrap();
-        let result = decode_cert_floor_record(&packet);
+            SignedPacket::from_txt_strings(&key, REVOKED_RECORD_NAME, values, 300).unwrap();
+        let result = decode_revoked_record(&packet);
         assert!(result.is_err());
         assert!(
             result
@@ -467,12 +486,12 @@ mod tests {
     }
 
     #[test]
-    fn cert_floor_record_rejects_missing_gen() {
+    fn revoked_record_rejects_missing_version() {
         let key = SecretKey::generate();
         let values = vec!["v1".to_string()];
         let packet =
-            SignedPacket::from_txt_strings(&key, CERT_FLOOR_RECORD_NAME, values, 300).unwrap();
-        assert!(decode_cert_floor_record(&packet).is_err());
+            SignedPacket::from_txt_strings(&key, REVOKED_RECORD_NAME, values, 300).unwrap();
+        assert!(decode_revoked_record(&packet).is_err());
     }
 
     #[test]

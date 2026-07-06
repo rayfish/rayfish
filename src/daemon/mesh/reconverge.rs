@@ -246,6 +246,27 @@ pub(crate) async fn reconverge_and_apply(
     tracing::info!(network = %network_name, "reconverged from signed record");
 }
 
+impl MeshManager {
+    /// Sever any live peer whose device cert is now below its user's generation
+    /// floor, across every network. Called when the revocation poller learns a
+    /// raised floor (a device was just unpaired) so peers drop the revoked device
+    /// right away instead of waiting for each network's next 60s group poll.
+    pub(crate) fn prune_revoked_across_networks(&self) {
+        let my_identity = self.identity.local_identity();
+        for entry in self.networks.iter() {
+            prune_departed_peers(
+                &self.peers,
+                &self.device_user_map,
+                &self.revocation,
+                &self.pruned_peers,
+                &entry.value().state,
+                entry.key(),
+                my_identity,
+            );
+        }
+    }
+}
+
 /// Close and drop every connection to a peer that `network`'s current roster no
 /// longer contains. Runs on every node after it applies a verified roster, so a
 /// kicked (or departed) peer is severed mesh-wide, not just by the coordinator
@@ -260,15 +281,15 @@ pub(crate) fn prune_departed_peers(
     network_name: &str,
     my_identity: EndpointId,
 ) {
-    // Cert-floor authority for this node, computed once (config + disk reads).
-    let (issuing, my_gen, revoked_set) = cert_authority(my_identity);
+    // Revocation authority for this node, computed once (config + disk reads).
+    let (issuing, revoked_set) = cert_authority(my_identity);
     for (peer_id, ip, conn) in peers.peers_for_network_with_conn(network_name) {
         // Membership is by roster identity, which for a paired peer is its user
         // identity, not the transport id the PeerTable is keyed on. Check both.
         let user_id = device_user_map.resolve(&peer_id);
-        // A peer whose cert is below its owning user's generation floor
-        // (`ray unpair`) is severed even if a stale roster still lists it — the
-        // floor is authoritative over the (possibly not-yet-republished)
+        // A peer whose device key is in its owning user's revoked set (`ray
+        // unpair`) is severed even if a stale roster still lists it — the revoked
+        // set is authoritative over the (possibly not-yet-republished)
         // membership. The peer's cert lives in the roster entry.
         let member_cert = {
             let s = state.read().unwrap();
@@ -279,7 +300,7 @@ pub(crate) fn prune_departed_peers(
                 .and_then(|m| m.device_cert.clone())
         };
         let revoked = member_cert.as_ref().is_some_and(|cert| {
-            revocation::cert_decision(cert, issuing, my_gen, &|d| revoked_set.contains(d), revocation)
+            revocation::cert_decision(cert, issuing, &|d| revoked_set.contains(d), revocation)
                 == revocation::CertDecision::Reject
         });
         let still_member = {

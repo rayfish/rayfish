@@ -50,6 +50,12 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         .unwrap()
         .take()
         .expect("promote_rx present after build");
+    let self_unpair_rx = daemon
+        .self_unpair_rx
+        .lock()
+        .unwrap()
+        .take()
+        .expect("self_unpair_rx present after build");
 
     // Opt-in automatic updates: a single daemon-wide task that periodically
     // checks for a newer stable release and swaps + restarts onto it. Desktop-only
@@ -59,7 +65,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         spawn_auto_update(daemon.shutdown_token.clone());
     }
 
-    let result = serve_ipc(&daemon, promote_rx, token).await;
+    let result = serve_ipc(&daemon, promote_rx, self_unpair_rx, token).await;
 
     // Close the iroh endpoint before returning. Dropping it on return logs
     // "Endpoint dropped without calling `Endpoint::close`. Aborting
@@ -238,6 +244,9 @@ async fn build_daemon(
     // Promotion channel: a co-coordinator's control reader signals the main
     // daemon loop to swap in the coordinator accept handler on `AdminGrant`.
     let (promote_tx, promote_rx) = mpsc::channel::<String>(16);
+    // Self-unpair channel: a control reader that received `Unpaired` from our
+    // primary signals the daemon loop to leave all networks + wipe our cert.
+    let (self_unpair_tx, self_unpair_rx) = mpsc::channel::<()>(4);
     let daemon = Arc::new(MeshManager {
         endpoint: ep,
         identity,
@@ -269,6 +278,8 @@ async fn build_daemon(
         ssh_authz: crate::ssh::new_authz(),
         ssh_token: std::sync::Mutex::new(None),
         promote_tx,
+        self_unpair_tx,
+        self_unpair_rx: std::sync::Mutex::new(Some(self_unpair_rx)),
     });
 
     // --- Accept loop (ALPN dispatch) + Prometheus metrics ---
@@ -295,8 +306,13 @@ async fn build_daemon(
             .as_ref()
             .map(|c| c.user_identity)
             .unwrap_or_else(|| daemon.endpoint.id());
-        if cfg.cert_generation > 0 {
-            daemon.revocation.set_local(own_user, cfg.cert_generation);
+        let devices = config::revoked_device_ids(&cfg);
+        if !devices.is_empty() {
+            daemon.revocation.set_local(
+                own_user,
+                cfg.revocation_version,
+                devices.into_iter().collect(),
+            );
         }
     }
     if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
@@ -398,6 +414,7 @@ async fn spawn_metrics_server(
 async fn serve_ipc(
     daemon: &Arc<MeshManager>,
     mut promote_rx: mpsc::Receiver<String>,
+    mut self_unpair_rx: mpsc::Receiver<()>,
     token: CancellationToken,
 ) -> Result<()> {
     let socket_path = ipc::socket_path();
@@ -425,6 +442,12 @@ async fn serve_ipc(
             // inline in the loop is fine.
             Some(net) = promote_rx.recv() => {
                 daemon.promote_to_coordinator(&net).await;
+            }
+            // Our primary unpaired us: leave all networks + wipe the cert so we
+            // drop out of the mesh right away. Hand-off from a control reader that
+            // holds only field clones (see `MeshCtx::self_unpair_tx`).
+            Some(()) = self_unpair_rx.recv() => {
+                let _ = daemon.unpair_self().await;
             }
             result = listener.accept() => match result {
                 Ok((stream, _)) => {

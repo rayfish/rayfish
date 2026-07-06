@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Unpair this device (Android)**: a paired phone can now unpair itself from the
+  You screen. It leaves every network it joined, deletes its pairing certificate,
+  and other peers disconnect from it right away. Re-pair from your primary device
+  to rejoin. (This is the device-side counterpart to running `ray unpair` on your
+  primary.)
 - **Share with Rayfish (Android)**: photos, videos, and any file can now be shared
   straight to a mesh peer from the Android system share sheet. Pick an online peer
   and the file is delivered in the background (a notification confirms it was sent),
@@ -26,19 +31,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   removed peer can simply re-join or re-request later).
 - **`ray unpair <device>`**: revoke one of your paired devices, for example a
   lost or stolen laptop. Run it from your **primary** device (the one you paired
-  the others from). Device certificates now carry a generation; unpairing bumps
-  your generation and publishes the new value (a single signed number) under your
-  user identity, so every peer rejects any certificate below it — even on
-  networks you do not run. Your **other** devices are automatically re-issued
-  fresh certificates and keep working; only the removed device is left behind.
-  The removed device is dropped from your networks, stops being treated as one of
-  your own devices (no silent auto-admit, no own-device file auto-accept), and,
-  if online and cooperative, is told to delete its own certificate. List your
-  paired devices first with `ray pair list` (`--json` supported). Notes: a device
-  that was **offline** while you unpaired is refreshed the next time it reconnects
-  to your primary (until then other networks reject it); the generation stays
-  published while your primary runs; and to fully retire a device from a network
-  someone else runs, ask that network's coordinator to remove it too.
+  the others from). Revocation is **per device**: unpairing publishes a signed
+  deny-list under your user identity naming just that device's key, so every peer
+  rejects its certificate — even on networks you do not run. Your **other**
+  devices are completely untouched (no fleet-wide certificate rotation, nothing
+  to re-issue). The removed device is dropped from your networks, stops being
+  treated as one of your own devices (no silent auto-admit, no own-device file
+  auto-accept), and, if online and cooperative, is told to leave the mesh and
+  delete its own certificate. **Re-authorize later** by simply re-pairing the
+  device: that clears it from the deny-list and issues a fresh certificate. List
+  your paired devices first with `ray pair list` (`--json` supported). Notes: the
+  deny-list stays published while your primary runs; to fully retire a device from
+  a network someone else runs, ask that network's coordinator to remove it too.
 - **Consistent Android device name**: the phone now uses one device name across
   every network instead of a different random name per network. It is seeded from
   your device model on first run and can be changed in the You screen (the change
@@ -70,14 +74,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   daemon, which briefly drops the VPN (peers reconnect automatically), so it stays
   opt-in. A backoff guard means a bad release is retried at most once a day
   instead of looping. `ray status` shows when auto-update is on.
-- **Auto-accept files from your own devices**: turn on
-  `ray files auto-accept <network> on` (or join with
-  `ray join <net> --auto-accept-files`) and incoming file transfers from your
+- **Auto-accept files from your own devices**: incoming file transfers from your
   own paired devices land automatically in your `~/Downloads`, with no manual
   `ray files accept`. Only offers whose sender is one of your own devices (same
   paired identity) on that network are accepted; files from anyone else still
-  queue for review. Turning it on also accepts any offers already waiting from
-  your devices. Off by default; `ray files auto-accept <net> off` disables it.
+  queue for review. This is now **on by default** (it is identity-checked, so it
+  only ever accepts your own devices). Opt out for a network with
+  `ray files auto-accept <net> off`, or when joining with
+  `ray join <net> --no-auto-accept-files`.
 - **Configurable auto-accept download location**: `ray files download-dir <path>`
   sends auto-accepted files to an absolute directory (owned by the dir's owner or
   `download-user`); `ray files download-user <user>` routes them to that user's
@@ -109,6 +113,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Own-device file receipt is on by default**: accepting files from your own
+  paired devices (identity-checked, so never anyone else) no longer needs a flag.
+  New joins get it automatically; opt out with `ray join --no-auto-accept-files`
+  or `ray files auto-accept <net> off`. The old `ray join --auto-accept-files`
+  flag is replaced by `--no-auto-accept-files`.
 - **`ray firewall show` clarifies the firewall is separate from your host
   firewall**: the output now notes that this is a mesh firewall applied on top of
   your host/kernel firewall (both must allow a packet), so it is not forgotten
@@ -143,6 +152,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Peers now disconnect from an unpaired device right away**: after `ray unpair`
+  (or a device unpairing itself), other peers could stay connected to it for a
+  while. The unpaired device now tears itself out of the mesh (leaves its networks)
+  as soon as it learns it was unpaired, and coordinators/members drop a revoked
+  device the moment they see the updated deny-list, instead of waiting up to a
+  minute for the next roster refresh.
+- **Re-pairing a previously-unpaired device no longer flaps**: after unpairing and
+  then re-pairing the same device, it could rapidly connect and drop over and over
+  (its old key was still on your deny-list, so your primary kept rejecting the
+  fresh certificate). Re-pairing now clears the device from the deny-list, so it
+  reconnects cleanly and stays connected.
 - **`ray status` no longer flashes "no active networks" right after a daemon
   (re)start**: the daemon began answering commands a moment before it finished
   restoring your saved networks, so a `ray status` in that window (common right

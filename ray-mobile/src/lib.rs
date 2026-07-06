@@ -398,7 +398,7 @@ impl Node {
             invite,
             coordinator,
             false, // auto_accept_firewall
-            false, // auto_accept_files
+            true,  // auto_accept_files (own-device offers, identity-checked)
         ));
 
         match result {
@@ -818,6 +818,21 @@ impl Node {
             IpcMessage::Error { message } => Err(RayError::PairFailed(message)),
             other => Err(RayError::PairFailed(format!(
                 "unexpected pair response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Unpair this device from its primary: leave every network it joined under
+    /// the shared identity (peers drop it right away) and delete the stored
+    /// device cert. Only meaningful when [`Node::is_paired`] is true; a node with
+    /// no cert returns an error. Requires [`Node::start`].
+    pub fn unpair(&self) -> Result<(), RayError> {
+        let state = self.state()?;
+        match self.runtime.block_on(state.unpair_self()) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::PairFailed(message)),
+            other => Err(RayError::PairFailed(format!(
+                "unexpected unpair response: {other:?}"
             ))),
         }
     }
