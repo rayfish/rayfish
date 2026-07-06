@@ -200,18 +200,7 @@ impl MeshManager {
 
     /// `ray connections`: list pending incoming connect requests.
     pub fn list_connections(&self) -> IpcMessage {
-        let now = Instant::now();
-        let requests = self
-            .connect
-            .pending_connects
-            .iter()
-            .map(|p| ipc::PendingRequestInfo {
-                short_id: p.from_contact_id.fmt_short().to_string(),
-                hostname: p.hostname.clone(),
-                waiting_secs: now.saturating_duration_since(p.requested_at).as_secs(),
-            })
-            .collect();
-        IpcMessage::PendingRequests { requests }
+        self.connect.list_connections()
     }
 
     /// Build a unique, valid network name for a direct connection from the two
@@ -236,29 +225,7 @@ impl MeshManager {
     /// Decline a pending connect request: drop it without minting a network. The
     /// requester's retry loop eventually times out.
     pub fn reject_connect(&self, id_prefix: &str) -> IpcMessage {
-        let found = self
-            .connect
-            .pending_connects
-            .iter()
-            .find(|p| {
-                p.from_contact_id
-                    .fmt_short()
-                    .to_string()
-                    .starts_with(id_prefix)
-                    || p.from_contact_id.to_string().starts_with(id_prefix)
-            })
-            .map(|p| *p.key());
-        match found {
-            Some(peer) => {
-                self.connect.pending_connects.remove(&peer);
-                IpcMessage::Ok {
-                    message: format!("declined connection request '{id_prefix}'"),
-                }
-            }
-            None => IpcMessage::Error {
-                message: format!("no pending connection request matching '{id_prefix}'"),
-            },
-        }
+        self.connect.reject_connect(id_prefix)
     }
 
     /// `ray connections approve <id>`: approve a pending connect request, minting
@@ -340,29 +307,7 @@ impl MeshManager {
     /// `ray contact rotate`: replace this node's contact key. The old contact id
     /// stops resolving once its pkarr record expires (~5 min).
     pub(crate) async fn rotate_contact(&self) -> IpcMessage {
-        let mut cfg = match config::load() {
-            Ok(c) => c,
-            Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to load config: {e}"),
-                };
-            }
-        };
-        let secret = config::rotate_contact_secret(&mut cfg);
-        if let Err(e) = config::save_settings(&cfg) {
-            return IpcMessage::Error {
-                message: format!("failed to save config: {e}"),
-            };
-        }
-        // Publish the new record immediately if active.
-        if self.active.load(Ordering::SeqCst)
-            && let Ok(client) = dht::create_pkarr_client(&self.endpoint)
-        {
-            let _ = dht::publish_contact(&client, &secret, self.endpoint.id()).await;
-        }
-        IpcMessage::ContactIdResponse {
-            contact_id: secret.public().to_string(),
-        }
+        self.connect.rotate_contact().await
     }
 
     /// Store the current group snapshot as a blob and re-publish the pkarr record
