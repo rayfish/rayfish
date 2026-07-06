@@ -812,7 +812,14 @@ impl MeshManager {
         // Collect coordinated networks (clone the handles) before awaiting.
         let mut nets: Vec<(String, SharedNetworkState, Option<Arc<Notify>>)> = Vec::new();
         for entry in self.networks.iter() {
-            if entry.value().state.read().unwrap().network_secret_key.is_some() {
+            if entry
+                .value()
+                .state
+                .read()
+                .unwrap()
+                .network_secret_key
+                .is_some()
+            {
                 nets.push((
                     entry.key().clone(),
                     entry.value().state.clone(),
@@ -888,7 +895,9 @@ impl MeshManager {
         }
         // Then wipe the cert so this device is no longer one of its user's devices.
         match crate::identity::delete_device_cert() {
-            Ok(()) => tracing::warn!("unpaired this device: deleted device certificate and left all networks"),
+            Ok(()) => tracing::warn!(
+                "unpaired this device: deleted device certificate and left all networks"
+            ),
             Err(e) => {
                 tracing::warn!(error = %e, "unpair: failed to delete device cert");
                 return IpcMessage::Error {

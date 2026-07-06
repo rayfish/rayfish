@@ -571,6 +571,10 @@ mod self_nullified_tests {
         assert!(!self_is_nullified(&cert, &noncoord, &nulls));
 
         // Not nullified at all.
-        assert!(!self_is_nullified(&cert, &roster, &std::collections::BTreeSet::new()));
+        assert!(!self_is_nullified(
+            &cert,
+            &roster,
+            &std::collections::BTreeSet::new()
+        ));
     }
 }

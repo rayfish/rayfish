@@ -1387,8 +1387,22 @@ mod tests {
             .unwrap();
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
-        let bytes = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new(), &BTreeSet::new());
-        let hash = group_blob_hash(&members, &approved, &sf, None, &BTreeMap::new(), &BTreeSet::new());
+        let bytes = canonical_group_bytes(
+            &members,
+            &approved,
+            &sf,
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        let hash = group_blob_hash(
+            &members,
+            &approved,
+            &sf,
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         let data = verify_group_blob(&bytes, &hash).unwrap();
         assert_eq!(data.members[0].last_seen, Some(12345));
     }
@@ -1414,9 +1428,23 @@ mod tests {
             .unwrap();
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
-        let bytes = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new(), &BTreeSet::new());
+        let bytes = canonical_group_bytes(
+            &members,
+            &approved,
+            &sf,
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         assert!(!String::from_utf8_lossy(&bytes).contains("last_seen"));
-        let hash = group_blob_hash(&members, &approved, &sf, None, &BTreeMap::new(), &BTreeSet::new());
+        let hash = group_blob_hash(
+            &members,
+            &approved,
+            &sf,
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         let data = verify_group_blob(&bytes, &hash).unwrap();
         assert_eq!(data.members[0].last_seen, None);
     }
@@ -1433,8 +1461,22 @@ mod tests {
         sf.insert("subject".to_string(), hs);
 
         // Deterministic: BTreeMap keys canonicalize regardless of insert order.
-        let a = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new(), &BTreeSet::new());
-        let b = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new(), &BTreeSet::new());
+        let a = canonical_group_bytes(
+            &members,
+            &approved,
+            &sf,
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        let b = canonical_group_bytes(
+            &members,
+            &approved,
+            &sf,
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         assert_eq!(a, b);
 
         // Suggestions are part of the signed content, so they change the hash.
@@ -1446,7 +1488,14 @@ mod tests {
             &BTreeMap::new(),
             &BTreeSet::new(),
         );
-        let h_sf = group_blob_hash(&members, &approved, &sf, None, &BTreeMap::new(), &BTreeSet::new());
+        let h_sf = group_blob_hash(
+            &members,
+            &approved,
+            &sf,
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         assert_ne!(h_empty, h_sf);
     }
 
