@@ -368,36 +368,7 @@ impl MeshManager {
     /// Store the current group snapshot as a blob and re-publish the pkarr record
     /// so members reconcile the new membership (used after `ray accept`).
     pub(crate) async fn store_and_publish_group(&self, network: &str) {
-        let (hash, net_key, snap_bytes) = {
-            let Some(handle) = self.networks.get(network) else {
-                return;
-            };
-            let s = handle.state.read().unwrap();
-            (
-                s.snapshot.as_ref().map(|x| x.hash),
-                s.network_secret_key.clone(),
-                s.snapshot.as_ref().map(|x| x.msgpack_bytes.clone()),
-            )
-        };
-        if let Some(bytes) = snap_bytes {
-            let _ = self.blob_store.blobs().add_slice(&bytes).await;
-        }
-        if let (Some(hash), Some(key)) = (hash, net_key)
-            && let Ok(client) = dht::create_pkarr_client(&self.endpoint)
-        {
-            let mut seed_peers: Vec<EndpointId> = self
-                .peers
-                .peers_for_network(network)
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect();
-            seed_peers.push(self.endpoint.id());
-            seed_peers.sort_by_key(|id| id.to_string());
-            seed_peers.dedup();
-            if let Err(e) = dht::publish_network(&client, &key, &hash, &seed_peers).await {
-                tracing::warn!(error = %e, "failed to publish network record after accept");
-            }
-        }
+        self.registry.store_and_publish_group(network).await
     }
 
     // -----------------------------------------------------------------------
