@@ -526,7 +526,6 @@ impl MeshManager {
         }
     }
 
-
     /// Connect to every saved network (control plane). Run once at daemon
     /// startup so mesh connections follow the daemon lifecycle, not the data
     /// plane: `ray down` keeps these connected so the node stays online to
