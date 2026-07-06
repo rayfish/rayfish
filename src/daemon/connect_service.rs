@@ -138,6 +138,174 @@ impl ConnectService {
         }
     }
 
+    /// `ray connect <contact-id>`: resolve the contact to an endpoint, dial it
+    /// over CONNECT_ALPN, and send a request. If approved immediately we join the
+    /// minted direct network; if pending we retry on a backoff.
+    pub(crate) async fn connect(self: &Arc<Self>, contact_id: &str, hostname: Option<String>) -> IpcMessage {
+        let contact_pubkey = match contact_id.parse::<EndpointId>() {
+            Ok(id) => id,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("invalid contact id: {e}"),
+                };
+            }
+        };
+        if contact_pubkey == self.transport.contact_public {
+            return IpcMessage::Error {
+                message: "cannot connect to your own contact id".to_string(),
+            };
+        }
+        let pkarr = match dht::create_pkarr_client(&self.transport.endpoint) {
+            Ok(c) => c,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to create pkarr client: {e}"),
+                };
+            }
+        };
+        let peer = match dht::resolve_contact(&pkarr, contact_pubkey).await {
+            Ok(id) => id,
+            Err(_) => {
+                return IpcMessage::Error {
+                    message: "contact offline or unknown (could not resolve contact id)"
+                        .to_string(),
+                };
+            }
+        };
+        if let Some(name) = self.registry.existing_direct_network_with(&peer) {
+            return IpcMessage::Ok {
+                message: format!("already connected to this peer on '{name}'"),
+            };
+        }
+        self.outgoing_connects.insert(peer);
+        match self.send_connect_request(peer, hostname.clone()).await {
+            Ok(control::ConnectMsg::Approved {
+                room_id,
+                coordinator,
+            }) => {
+                self.outgoing_connects.remove(&peer);
+                self.join_direct(room_id, coordinator, hostname).await
+            }
+            Ok(control::ConnectMsg::Pending) => {
+                self.spawn_connect_retry(peer, hostname);
+                IpcMessage::Ok {
+                    message: "connect request sent — waiting for approval".to_string(),
+                }
+            }
+            Ok(control::ConnectMsg::Denied { reason }) => {
+                self.outgoing_connects.remove(&peer);
+                IpcMessage::Error {
+                    message: format!("connection denied: {reason}"),
+                }
+            }
+            Ok(_) => IpcMessage::Error {
+                message: "unexpected response from contact".to_string(),
+            },
+            Err(e) => {
+                self.outgoing_connects.remove(&peer);
+                IpcMessage::Error {
+                    message: format!("failed to reach contact: {e}"),
+                }
+            }
+        }
+    }
+
+    /// Send a single connect request to `peer` over `CONNECT_ALPN` and return the
+    /// reply.
+    pub(crate) async fn send_connect_request(
+        &self,
+        peer: EndpointId,
+        hostname: Option<String>,
+    ) -> Result<control::ConnectMsg> {
+        let conn = transport::connect_to_peer_with_alpn(
+            &self.transport.endpoint,
+            peer,
+            transport::CONNECT_ALPN,
+        )
+        .await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        control::send_framed(
+            &mut send,
+            &control::ConnectMsg::Request {
+                from_contact_id: self.transport.contact_public,
+                from_endpoint: self.transport.endpoint.id(),
+                hostname,
+            },
+        )
+        .await?;
+        control::recv_framed::<control::ConnectMsg>(&mut recv).await
+    }
+
+    /// Join a direct network the remote peer minted for us (flags it `direct` in
+    /// config so `ray status` tags it).
+    pub(crate) async fn join_direct(
+        &self,
+        room_id: EndpointId,
+        coordinator: EndpointId,
+        hostname: Option<String>,
+    ) -> IpcMessage {
+        let resp = self
+            .registry
+            .join_network(
+                &room_id.to_string(),
+                None,
+                hostname,
+                None,
+                Some(coordinator),
+                false,
+                false,
+            )
+            .await;
+        if let IpcMessage::Joined { name, .. } = &resp
+            && let Ok(Some(mut n)) = config::load_network(name)
+        {
+            n.direct = true;
+            let _ = config::save_network(&n);
+        }
+        resp
+    }
+
+    /// Retry a pending connect request on a backoff until approved/denied.
+    pub(crate) fn spawn_connect_retry(self: &Arc<Self>, peer: EndpointId, hostname: Option<String>) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut backoff = BACKOFF_INITIAL;
+            loop {
+                tokio::select! {
+                    _ = me.registry.shutdown_token.cancelled() => return,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(BACKOFF_MAX);
+                match me.send_connect_request(peer, hostname.clone()).await {
+                    Ok(control::ConnectMsg::Approved {
+                        room_id,
+                        coordinator,
+                    }) => {
+                        match me.join_direct(room_id, coordinator, hostname.clone()).await {
+                            IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => {
+                                tracing::info!(peer = %peer.fmt_short(), "direct connect join ok");
+                            }
+                            IpcMessage::Error { message } => {
+                                tracing::warn!(peer = %peer.fmt_short(), error = %message, "direct connect join failed");
+                            }
+                            other => {
+                                tracing::warn!(peer = %peer.fmt_short(), response = ?other, "direct connect join: unexpected response");
+                            }
+                        }
+                        me.outgoing_connects.remove(&peer);
+                        return;
+                    }
+                    Ok(control::ConnectMsg::Denied { reason }) => {
+                        tracing::warn!(reason, peer = %peer.fmt_short(), "connect request denied");
+                        me.outgoing_connects.remove(&peer);
+                        return;
+                    }
+                    _ => {} // Pending or transient error, keep retrying.
+                }
+            }
+        });
+    }
+
     /// List pending incoming `ray connect` requests awaiting approval.
     pub(crate) fn list_connections(&self) -> IpcMessage {
         let now = Instant::now();
