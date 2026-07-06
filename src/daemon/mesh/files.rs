@@ -638,42 +638,8 @@ impl MeshManager {
     /// floor). Used by the phone's "unpair this device" control and by the
     /// device-side handler when its primary sends `ControlMsg::Unpaired`. A device
     /// with no cert (a primary) has nothing to unpair.
-    pub async fn unpair_self(self: &Arc<Self>) -> IpcMessage {
-        if self.current_device_cert().is_none() {
-            return IpcMessage::Error {
-                message: "this device is not paired to a primary".to_string(),
-            };
-        }
-        // Leave every network first (graceful LEAVE_CODE close + config removal),
-        // so peers see an intentional departure and prune us immediately.
-        let networks: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
-        for net in &networks {
-            self.leave_network(net).await;
-        }
-        // Also purge any saved-but-inactive network configs. When a device is
-        // unpaired while offline it discovers this at startup restore, before its
-        // networks are added to `self.networks` (the join bails on the nullifier
-        // check first), so the loop above sees none, yet the config files remain
-        // and would make the node churn trying to rejoin networks it was removed
-        // from. Delete them directly.
-        if let Ok(cfg) = config::load() {
-            for net in &cfg.networks {
-                let _ = config::delete_network(&net.name);
-            }
-        }
-        // Then wipe the cert so this device is no longer one of its user's devices.
-        match crate::identity::delete_device_cert() {
-            Ok(()) => tracing::warn!("unpaired this device: deleted device certificate and left all networks"),
-            Err(e) => {
-                tracing::warn!(error = %e, "unpair: failed to delete device cert");
-                return IpcMessage::Error {
-                    message: format!("left all networks but failed to delete device cert: {e}"),
-                };
-            }
-        }
-        IpcMessage::Ok {
-            message: format!("unpaired this device (left {} network(s))", networks.len()),
-        }
+    pub async fn unpair_self(&self) -> IpcMessage {
+        self.registry.unpair_self().await
     }
 }
 

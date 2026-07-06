@@ -159,7 +159,7 @@ pub(crate) async fn reconverge_and_apply(
         reverse_table,
         device_user_map,
         pruned_peers,
-        self_unpair_tx,
+        registry,
         ..
     } = ctx;
     let current = state.read().unwrap().snapshot.as_ref().map(|s| s.hash);
@@ -181,7 +181,10 @@ pub(crate) async fn reconverge_and_apply(
             && self_is_nullified(cert, &roster, &nullifiers)
         {
             tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-            let _ = self_unpair_tx.try_send(());
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let _ = registry.unpair_self().await;
+            });
             return;
         }
         drain_pending_rename(
@@ -214,7 +217,10 @@ pub(crate) async fn reconverge_and_apply(
         && self_is_nullified(cert, &data.members, &data.nullifiers)
     {
         tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-        let _ = self_unpair_tx.try_send(());
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            let _ = registry.unpair_self().await;
+        });
         return;
     }
     // Two coordinators can independently admit a fresh joiner at the same
@@ -423,7 +429,7 @@ pub(crate) fn spawn_group_poller(
         peers,
         blob_store,
         firewall: fw,
-        self_unpair_tx,
+        registry,
         ..
     } = ctx;
     tokio::spawn(async move {
@@ -479,7 +485,10 @@ pub(crate) fn spawn_group_poller(
                 && self_is_nullified(&cert, &data.members, &data.nullifiers)
             {
                 tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-                let _ = self_unpair_tx.try_send(());
+                let registry = registry.clone();
+                tokio::spawn(async move {
+                    let _ = registry.unpair_self().await;
+                });
                 break;
             }
 

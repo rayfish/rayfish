@@ -492,13 +492,16 @@ impl MeshManager {
         // unpair time (so it never got `ControlMsg::Unpaired`) and the coordinator
         // now rejects its cert at the mesh handshake: the blob is fetched from the
         // record's seed peers, needs no mesh admission, and this runs on every
-        // startup restore + reconnect. Hand off to the daemon loop, which runs
-        // `unpair_self` (delete the cert + leave every network).
+        // startup restore + reconnect. Spawn `unpair_self` (delete the cert +
+        // leave every network) so it runs off this join path.
         if let Some(cert) = self.current_device_cert()
             && self_is_nullified(&cert, &data.members, &data.nullifiers)
         {
             tracing::warn!(network = %network_key, "this device is nullified by its primary in the signed blob; unpairing self");
-            let _ = self.self_unpair_tx.try_send(());
+            let registry = self.registry.clone();
+            tokio::spawn(async move {
+                let _ = registry.unpair_self().await;
+            });
             anyhow::bail!("this device has been unpaired by its primary");
         }
 

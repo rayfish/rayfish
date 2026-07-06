@@ -42,13 +42,6 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     daemon.connect_all_networks().await;
     daemon.activate(None).await;
 
-    let self_unpair_rx = daemon
-        .self_unpair_rx
-        .lock()
-        .unwrap()
-        .take()
-        .expect("self_unpair_rx present after build");
-
     // Single daemon-wide connection supervisor: consumes every data reader's
     // disconnect and, per dropped identity, prunes departed peers we coordinate
     // and reconnects the rest across all their shared networks.
@@ -74,7 +67,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         spawn_auto_update(daemon.shutdown_token.clone());
     }
 
-    let result = serve_ipc(&daemon, self_unpair_rx, token).await;
+    let result = serve_ipc(&daemon, token).await;
 
     // Close the iroh endpoint before returning. Dropping it on return logs
     // "Endpoint dropped without calling `Endpoint::close`. Aborting
@@ -122,34 +115,10 @@ pub async fn build_headless() -> Result<Arc<MeshManager>> {
     let daemon = build_daemon(token, stats).await?;
     // Bring the saved networks' control plane up, matching `run_daemon`.
     daemon.connect_all_networks().await;
-    // Desktop drives the promote/self-unpair/reauth hand-off channels from
-    // `serve_ipc`; a headless embedder (Android) has no IPC loop, so drain them
-    // here. Without this a control reader's or join path's signal (e.g. this
-    // device discovering it was nullified by its primary) is sent but never
-    // acted on, so `unpair_self` never runs and the stale cert lingers.
-    spawn_headless_signal_drain(daemon.clone());
+    // Control readers and the join path now run their network ops (promotion,
+    // self-unpair) directly via NetworkRegistry, so a headless embedder needs no
+    // hand-off drain loop.
     Ok(daemon)
-}
-
-/// Drain the promote/self-unpair/reauth hand-off channels on an embedder that has
-/// no `serve_ipc` loop. Mirrors the matching arms in [`serve_ipc`]; the channels
-/// are stashed on the daemon by `build_daemon`, so take them here exactly once.
-fn spawn_headless_signal_drain(daemon: Arc<MeshManager>) {
-    let mut self_unpair_rx = daemon
-        .self_unpair_rx
-        .lock()
-        .unwrap()
-        .take()
-        .expect("self_unpair_rx present after build");
-    let token = daemon.shutdown_token.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => break,
-                Some(()) = self_unpair_rx.recv() => { let _ = daemon.unpair_self().await; }
-            }
-        }
-    });
 }
 
 /// Build all always-on daemon infrastructure WITHOUT a packet interface or the
@@ -295,6 +264,7 @@ async fn build_daemon(
         conn.clone(),
         dns.clone(),
         tun_name.clone(),
+        device_cert.clone(),
     ));
     // FileService owns file transfer + pairing. It evaluates own-device auto-accept
     // directly (no worker channel) and clears a re-paired device's nullifier by
@@ -318,9 +288,6 @@ async fn build_daemon(
     // Daemon-wide disconnect channel: every per-connection data reader reports
     // peer drops here, drained by the single connection supervisor.
     let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(256);
-    // Self-unpair channel: a control reader that received `Unpaired` from our
-    // primary signals the daemon loop to leave all networks + wipe our cert.
-    let (self_unpair_tx, self_unpair_rx) = mpsc::channel::<()>(4);
     let daemon = Arc::new(MeshManager {
         transport,
         registry,
@@ -353,8 +320,6 @@ async fn build_daemon(
         ssh_token: std::sync::Mutex::new(None),
         disconnect_tx,
         disconnect_rx: std::sync::Mutex::new(Some(disconnect_rx)),
-        self_unpair_tx,
-        self_unpair_rx: std::sync::Mutex::new(Some(self_unpair_rx)),
     });
 
     // Install the daemon-wide mesh dispatch context so the per-connection demux
@@ -470,11 +435,7 @@ async fn spawn_metrics_server(
 /// `token` is cancelled. On shutdown, put the VPN on standby (revert DNS, drop
 /// connections, bring the TUN down) and remove the socket file. Each request is
 /// handled on its own task so a slow client can't block the accept loop.
-async fn serve_ipc(
-    daemon: &Arc<MeshManager>,
-    mut self_unpair_rx: mpsc::Receiver<()>,
-    token: CancellationToken,
-) -> Result<()> {
+async fn serve_ipc(daemon: &Arc<MeshManager>, token: CancellationToken) -> Result<()> {
     let socket_path = ipc::socket_path();
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -493,12 +454,6 @@ async fn serve_ipc(
                 daemon.deactivate().await;
                 let _ = std::fs::remove_file(&socket_path);
                 return Ok(());
-            }
-            // Our primary unpaired us: leave all networks + wipe the cert so we
-            // drop out of the mesh right away. Hand-off from a control reader that
-            // holds only field clones (see `MeshCtx::self_unpair_tx`).
-            Some(()) = self_unpair_rx.recv() => {
-                let _ = daemon.unpair_self().await;
             }
             result = listener.accept() => match result {
                 Ok((stream, _)) => {
