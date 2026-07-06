@@ -27,9 +27,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use iroh::EndpointId;
 use pty_process::Size;
-use russh::CryptoVec;
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, Config, Handle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
@@ -629,7 +629,7 @@ async fn run_pipe_session(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if h_out
-                        .data(channel_id, CryptoVec::from(&buf[..n]))
+                        .data(channel_id, Bytes::copy_from_slice(&buf[..n]))
                         .await
                         .is_err()
                     {
@@ -648,7 +648,7 @@ async fn run_pipe_session(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if h_err
-                        .extended_data(channel_id, 1, CryptoVec::from(&buf[..n]))
+                        .extended_data(channel_id, 1, Bytes::copy_from_slice(&buf[..n]))
                         .await
                         .is_err()
                     {
@@ -738,15 +738,15 @@ fn parse_hostkey_paths(dump: &str) -> Vec<PathBuf> {
 /// Load the persisted SSH host key, generating and persisting one on first use.
 /// Stored as OpenSSH PEM at `<config_dir>/ssh_host_key`, mode 0600.
 fn load_or_generate_host_key() -> Result<PrivateKey> {
-    use russh::keys::ssh_key::{LineEnding, rand_core::OsRng};
+    use russh::keys::ssh_key::LineEnding;
 
     let path = crate::config::config_dir()?.join("ssh_host_key");
     if path.exists() {
         let pem = std::fs::read_to_string(&path).context("reading ssh host key")?;
         return PrivateKey::from_openssh(&pem).context("parsing ssh host key");
     }
-    let key =
-        PrivateKey::random(&mut OsRng, Algorithm::Ed25519).context("generating ssh host key")?;
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+        .context("generating ssh host key")?;
     let pem = key
         .to_openssh(LineEnding::LF)
         .context("encoding ssh host key")?;

@@ -140,7 +140,7 @@ semver = "1"
 # Embedded mesh SSH server (`ray firewall ssh on`): pure-Rust async SSH on tokio.
 # Use the `ring` crypto backend (already in the tree via iroh) instead of the
 # default `aws-lc-rs`, whose C build breaks cross-compilation (`just cross`).
-russh = { version = "0.54", default-features = false, features = ["ring", "flate2"], optional = true }
+russh = { version = "0.61.2", default-features = false, features = ["ring", "flate2"], optional = true }
 # PTY allocation + login-shell spawning for SSH sessions (async/tokio).
 pty-process = { version = "0.5", features = ["async"], optional = true }
 # getpwnam-style passwd lookup to resolve the requested SSH unix user.
