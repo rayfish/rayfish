@@ -19,9 +19,7 @@ impl MeshManager {
         } else {
             format!("{name}{suffix}")
         };
-        if let Some((ip, _)) =
-            dns::resolve_name(&qualified, &suffix, &self.dns.hostname_table).await
-        {
+        if let Some((ip, _)) = self.dns.resolve(&qualified, &suffix).await {
             // Try connected peers first
             if let Some(route) = self.peers.lookup_v4(&ip) {
                 return Some(route.endpoint_id);

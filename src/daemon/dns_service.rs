@@ -1,16 +1,22 @@
-//! Magic DNS state and OS-DNS configuration, owned by [`MeshManager`] as one
-//! cohesive unit instead of five loose fields.
+//! `DnsService`: Magic DNS, a leaf service in the daemon dependency graph.
 //!
 //! Holds the `.ray` naming tables (the single source of truth that the mesh
 //! roster writes and the in-daemon resolver reads), the resolver itself, and the
 //! OS-DNS configurator/re-assert handles owned while the data plane is active.
-//! The mesh accept handlers and background tasks get cheap `Clone` handles of the
-//! naming tables; the OS-DNS lifecycle (`configure`/`revert`) stays here and
-//! takes the TUN name as a parameter since the core owns it.
+//! It depends on nothing above it and holds no back-reference to the daemon: all
+//! input arrives as method arguments (a roster to publish, a name to resolve),
+//! all output is the return value. Shared as `Arc<DnsService>` into its
+//! consumers (the roster writers and the packet-path resolver). The OS-DNS
+//! lifecycle (`configure`/`revert`) takes the TUN name as a parameter since the
+//! foundation owns it.
+//!
+//! Named-interface methods: `sync_network` / `clear_network` (writer side) and
+//! `resolve` (reader side), on top of `configure` / `revert` (lifecycle).
 
 use super::*;
+use std::net::Ipv6Addr;
 
-pub(crate) struct DnsManager {
+pub(crate) struct DnsService {
     /// `.ray` forward lookup table (hostname → IP). Cloned into `MeshCtx` and the
     /// resolver; the roster is the single source of truth that writes it.
     pub(crate) hostname_table: dns::HostnameTable,
@@ -24,7 +30,7 @@ pub(crate) struct DnsManager {
     reassert_token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
 }
 
-impl DnsManager {
+impl DnsService {
     pub(crate) fn new(
         hostname_table: dns::HostnameTable,
         reverse_table: dns::ReverseLookupTable,
@@ -37,6 +43,29 @@ impl DnsManager {
             configurator: Arc::new(std::sync::Mutex::new(None)),
             reassert_token: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Rebuild one network's forward + reverse `.ray` entries from its roster
+    /// (the roster is the single source of truth for `*.ray`). Writer side.
+    #[allow(dead_code)] // adopted by NetworkRegistry in M5
+    pub(crate) async fn sync_network(
+        &self,
+        network: &str,
+        entries: &[(String, Ipv4Addr, Ipv6Addr)],
+    ) {
+        dns::sync_network_hostnames(&self.hostname_table, &self.reverse_table, network, entries)
+            .await;
+    }
+
+    /// Drop a network's `.ray` names entirely (on leave / nuke / kick).
+    pub(crate) async fn clear_network(&self, network: &str) {
+        dns::remove_network(&self.hostname_table, &self.reverse_table, network).await;
+    }
+
+    /// Resolve a fully-qualified `.ray` name against the forward table. Reader
+    /// side (packet path); returns `None` for names outside the mesh.
+    pub(crate) async fn resolve(&self, name: &str, suffix: &str) -> Option<dns::HostnameEntry> {
+        dns::resolve_name(name, suffix, &self.hostname_table).await
     }
 
     /// Point system DNS at the in-daemon Magic DNS resolver: detect the OS DNS

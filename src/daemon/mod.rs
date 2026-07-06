@@ -104,10 +104,18 @@ pub use mesh::build_headless;
 /// written against `DaemonState` compile unchanged after the daemon refactor.
 pub type DaemonState = MeshManager;
 
+// The process-lifetime network + storage foundation every service depends on.
+mod foundation;
+pub(crate) use foundation::Transport;
+
+// The per-peer mesh connection driver (one connection per peer, frame demux).
+mod connection_manager;
+pub(crate) use connection_manager::{ConnectionManager, MeshDispatch};
+
 // Domain satellites with their own owned state (and ALPN accept arms), held by
 // `MeshManager` as fields rather than loose on the core. See each module.
-mod dns_manager;
-pub(crate) use dns_manager::DnsManager;
+mod dns_service;
+pub(crate) use dns_service::DnsService;
 
 mod file_service;
 pub(crate) use file_service::FileService;
@@ -400,6 +408,12 @@ struct TunTasks {
 }
 
 pub struct MeshManager {
+    /// The process-lifetime foundation (endpoint, identity, blob store, metrics,
+    /// contact id), grouped so extracted services can depend on `Arc<Transport>`
+    /// instead of the whole daemon. During the service-decomposition transition
+    /// this holds clones of the same handles the loose fields below still use;
+    /// the loose fields go away when `MeshManager` is dissolved.
+    transport: Arc<Transport>,
     endpoint: Endpoint,
     identity: IrohIdentityProvider,
     peers: PeerTable,
@@ -420,8 +434,9 @@ pub struct MeshManager {
     blob_store: FsStore,
     firewall: SharedFirewall,
     protocol_router: Arc<ProtocolRouter>,
-    /// Magic DNS naming tables, resolver, and OS-DNS configurator (see [`DnsManager`]).
-    dns: DnsManager,
+    /// Magic DNS leaf service: naming tables, resolver, and OS-DNS configurator
+    /// (see [`DnsService`]). Shared as `Arc` so extracted consumers can hold it.
+    dns: Arc<DnsService>,
     mdns_enabled: bool,
     /// Whether this node opted into automatic stable updates (`ray auto-update
     /// on` / `ray install --auto-update`). Read at startup; when set, `run_daemon`
@@ -569,6 +584,14 @@ impl MeshManager {
 
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
     /// handlers and background tasks. Every field is a cheap `Clone`.
+    /// The process-lifetime foundation (endpoint, identity, blob store, metrics,
+    /// contact id). Extracted services depend on this `Arc<Transport>` rather
+    /// than the whole daemon. First consumed in M2.
+    #[allow(dead_code)]
+    pub(crate) fn transport(&self) -> Arc<Transport> {
+        self.transport.clone()
+    }
+
     pub(crate) fn mesh_ctx(&self) -> MeshCtx {
         MeshCtx {
             identity: self.identity.clone(),

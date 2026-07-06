@@ -316,7 +316,19 @@ async fn build_daemon(
     // Self-unpair channel: a control reader that received `Unpaired` from our
     // primary signals the daemon loop to leave all networks + wipe our cert.
     let (self_unpair_tx, self_unpair_rx) = mpsc::channel::<()>(4);
+    // Group the foundation handles so extracted services can depend on
+    // `Arc<Transport>`. Clones here are cheap (all fields are `Arc`-backed); the
+    // loose `MeshManager` fields below still hold the originals until the daemon
+    // god object is dissolved.
+    let transport = Arc::new(Transport::new(
+        ep.clone(),
+        identity.clone(),
+        blob_store.clone(),
+        stats.clone(),
+        contact_public,
+    ));
     let daemon = Arc::new(MeshManager {
+        transport,
         endpoint: ep,
         identity,
         peers,
@@ -328,7 +340,11 @@ async fn build_daemon(
         blob_store,
         firewall: shared_firewall,
         protocol_router: protocol_router.clone(),
-        dns: DnsManager::new(hostname_table, reverse_table, dns_resolver.clone()),
+        dns: Arc::new(DnsService::new(
+            hostname_table,
+            reverse_table,
+            dns_resolver.clone(),
+        )),
         mdns_enabled,
         auto_update,
         tun_name: std::sync::Mutex::new(tun_name),
