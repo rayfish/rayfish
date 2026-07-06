@@ -338,7 +338,6 @@ async fn build_daemon(
         #[cfg(feature = "desktop")]
         ssh_authz: crate::ssh::new_authz(),
         ssh_token: std::sync::Mutex::new(None),
-        disconnect_tx,
         disconnect_rx: std::sync::Mutex::new(Some(disconnect_rx)),
     });
 

@@ -130,6 +130,34 @@ impl MeshManager {
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// join an existing network by key (optionally with an invite/coordinator).
+    /// Thin delegate to the network registry, which owns the join path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn join_network(
+        self: &Arc<Self>,
+        network_key: &str,
+        name: Option<&str>,
+        hostname: Option<String>,
+        invite: Option<Vec<u8>>,
+        coordinator: Option<EndpointId>,
+        auto_accept_firewall: bool,
+        auto_accept_files: bool,
+    ) -> IpcMessage {
+        self.registry
+            .join_network(
+                network_key,
+                name,
+                hostname,
+                invite,
+                coordinator,
+                auto_accept_firewall,
+                auto_accept_files,
+            )
+            .await
+    }
+}
+
+impl NetworkRegistry {
+    /// Join an existing network by key (optionally with an invite/coordinator).
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, hostname), fields(net = name.unwrap_or(network_key)))]
     pub async fn join_network(
@@ -255,7 +283,7 @@ impl MeshManager {
             && self_is_nullified(&cert, &data.members, &data.nullifiers)
         {
             tracing::warn!(network = %network_key, "this device is nullified by its primary in the signed blob; unpairing self");
-            let registry = self.registry.clone();
+            let registry = self.clone();
             tokio::spawn(async move {
                 let _ = registry.unpair_self().await;
             });
@@ -263,7 +291,7 @@ impl MeshManager {
         }
 
         let alpn = transport::mesh_alpn();
-        let my_ip = self.identity.local_ip();
+        let my_ip = self.transport.identity.local_ip();
         // Use coordinator's network name from GroupBlob, or user alias, or truncated key as fallback
         let blob_name = data
             .name
@@ -335,7 +363,7 @@ impl MeshManager {
         &self,
         net_pubkey: EndpointId,
     ) -> Result<crate::membership::GroupBlob> {
-        let pkarr_client = dht::create_pkarr_client(&self.endpoint)?;
+        let pkarr_client = dht::create_pkarr_client(&self.transport.endpoint)?;
         let record = dht::resolve_network_packet(&pkarr_client, net_pubkey)
             .await
             .context("failed to resolve network record")?;
@@ -377,7 +405,7 @@ impl MeshManager {
         ctx: &JoinContext<'_>,
         data: &crate::membership::GroupBlob,
     ) -> Result<Option<EstablishedMesh>> {
-        let my_id = self.identity.local_identity();
+        let my_id = self.transport.identity.local_identity();
         // With no invite, use our own id as the nominal minter;
         // coordinator_dial_order filters it out (minter != me), so we just get
         // all blob coordinators in order.
@@ -407,7 +435,7 @@ impl MeshManager {
 
             tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
             let conn = match transport::connect_to_peer_with_alpn(
-                &self.endpoint,
+                &self.transport.endpoint,
                 *coordinator_id,
                 ctx.alpn,
             )
@@ -515,7 +543,7 @@ impl MeshManager {
         tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
         let mut seed_from_blob = false;
         let state = match transport::connect_to_peer_with_alpn(
-            &self.endpoint,
+            &self.transport.endpoint,
             coordinator_id,
             ctx.alpn,
         )
@@ -568,13 +596,13 @@ impl MeshManager {
         // dial's per-network target lookup must tolerate a brief absence — the
         // supervisor re-checks `self.networks` at dial time, by when it's present.
         if seed_from_blob {
-            let me = self.identity.local_identity();
+            let me = self.transport.identity.local_identity();
             let net = SmolStr::new(ctx.display_name);
             for m in &data.members {
                 if m.identity == me {
                     continue;
                 }
-                self.registry
+                self
                     .clone()
                     .spawn_reconnect(m.identity, m.ip, vec![net.clone()]);
             }
@@ -592,7 +620,7 @@ impl MeshManager {
     /// reconnect/restore (we re-announce, then reconverge from the signed record).
     #[allow(clippy::too_many_arguments)]
     async fn run_join_handshake(
-        &self,
+        self: &Arc<Self>,
         ctx: &JoinContext<'_>,
         data: &crate::membership::GroupBlob,
         conn: iroh::endpoint::Connection,
@@ -603,7 +631,7 @@ impl MeshManager {
     ) -> Result<JoinResult> {
         join_mesh_shared(
             conn,
-            &self.endpoint,
+            &self.transport.endpoint,
             ctx.display_name,
             ctx.alpn,
             self.mesh_ctx(),
@@ -620,9 +648,9 @@ impl MeshManager {
             },
             disconnect_tx.clone(),
             cancel.clone(),
-            self.registry.clone(),
+            self.clone(),
             ctx.invite_lock.clone(),
-            self.protocol_router.clone(),
+            self.protocol_router().clone(),
         )
         .await
     }
@@ -660,6 +688,7 @@ impl MeshManager {
             NetworkRole::Coordinator => {
                 let net_public_key = state.read().unwrap().network_public_key;
                 self.register_coordinator_handler(
+                    &self.mesh_ctx(),
                     display_name,
                     state.clone(),
                     invite_lock.clone(),
@@ -675,8 +704,8 @@ impl MeshManager {
             // (state built from the blob, no live handshake). Reconverge for that
             // path is covered by the 60s group poller below.
             NetworkRole::Member | NetworkRole::Direct => {
-                if !self.protocol_router.is_registered(&net_pubkey) {
-                    self.protocol_router.register(
+                if !self.protocol_router().is_registered(&net_pubkey) {
+                    self.protocol_router().register(
                         net_pubkey,
                         AcceptHandler::Member(Arc::new(MemberAcceptState {
                             ctx: self.mesh_ctx(),
@@ -684,9 +713,9 @@ impl MeshManager {
                             state: state.clone(),
                             token: cancel.clone(),
                             net_pubkey,
-                            my_identity: self.identity.local_identity(),
-                            endpoint: self.endpoint.clone(),
-                            registry: self.registry.clone(),
+                            my_identity: self.transport.identity.local_identity(),
+                            endpoint: self.transport.endpoint.clone(),
+                            registry: self.clone(),
                             invite_lock: invite_lock.clone(),
                             reconverge_notify: Arc::new(tokio::sync::Notify::new()),
                         })),
@@ -708,7 +737,7 @@ impl MeshManager {
             .as_ref()
             .map(|s| s.msgpack_bytes.clone());
         if let Some(bytes) = snap_bytes {
-            let _ = self.blob_store.blobs().add_slice(&bytes).await;
+            let _ = self.transport.blob_store.blobs().add_slice(&bytes).await;
         }
 
         // Save config with network public key (use display_name for config)
@@ -718,12 +747,12 @@ impl MeshManager {
         }
 
         // Membership poller
-        if let Ok(poller_client) = dht::create_pkarr_client(&self.endpoint) {
+        if let Ok(poller_client) = dht::create_pkarr_client(&self.transport.endpoint) {
             tasks.push(spawn_group_poller(
                 poller_client,
                 net_pubkey,
                 state.clone(),
-                self.endpoint.clone(),
+                self.transport.endpoint.clone(),
                 self.mesh_ctx(),
                 display_name.to_string(),
                 cancel.clone(),
@@ -743,7 +772,7 @@ impl MeshManager {
             disconnect_tx: self.disconnect_tx.clone(),
         };
         self.networks.insert(display_name.to_string(), handle);
-        self.refresh_alpns().await;
+        self.refresh_search_domains().await;
 
         // Register hostnames in DNS table
         dns::update_hostname(
@@ -752,7 +781,7 @@ impl MeshManager {
             display_name,
             my_hostname,
             my_ip,
-            derive_ipv6(&self.identity.local_identity()),
+            derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
         for member in &data.members {
@@ -774,7 +803,7 @@ impl MeshManager {
         Ok(TryJoin::Joined(IpcMessage::Joined {
             name: display_name.to_string(),
             my_ip,
-            my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
+            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
         }))
     }
 
@@ -790,7 +819,7 @@ impl MeshManager {
         &self,
         net_pubkey: EndpointId,
     ) -> Result<crate::membership::GroupBlob> {
-        let pkarr_client = dht::create_pkarr_client(&self.endpoint)?;
+        let pkarr_client = dht::create_pkarr_client(&self.transport.endpoint)?;
         let (expected_hash, seed_peers) = dht::resolve_network(&pkarr_client, net_pubkey)
             .await
             .context("resolve pkarr record for roster restore")?;
@@ -798,7 +827,7 @@ impl MeshManager {
 
         // Local blob store first: the coordinator stored these bytes before
         // publishing, so they're on disk.
-        if let Ok(bytes) = self.blob_store.blobs().get_bytes(blob_hash).await
+        if let Ok(bytes) = self.transport.blob_store.blobs().get_bytes(blob_hash).await
             && let Ok(data) = verify_group_blob(&bytes, &expected_hash)
         {
             return Ok(data);
@@ -806,11 +835,11 @@ impl MeshManager {
 
         // Fall back to fetching from a seed peer.
         for peer_id in &seed_peers {
-            if *peer_id == self.endpoint.id() {
+            if *peer_id == self.transport.endpoint.id() {
                 continue;
             }
             let conn = match transport::connect_to_peer_with_alpn(
-                &self.endpoint,
+                &self.transport.endpoint,
                 *peer_id,
                 iroh_blobs::protocol::ALPN,
             )
@@ -819,7 +848,7 @@ impl MeshManager {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            if self
+            if self.transport
                 .blob_store
                 .remote()
                 .fetch(conn, HashAndFormat::raw(blob_hash))
@@ -828,7 +857,7 @@ impl MeshManager {
             {
                 continue;
             }
-            if let Ok(bytes) = self.blob_store.blobs().get_bytes(blob_hash).await
+            if let Ok(bytes) = self.transport.blob_store.blobs().get_bytes(blob_hash).await
                 && let Ok(data) = verify_group_blob(&bytes, &expected_hash)
             {
                 return Ok(data);
@@ -843,17 +872,17 @@ impl MeshManager {
         blob_hash: iroh_blobs::Hash,
     ) -> Result<crate::membership::GroupBlob> {
         let conn = transport::connect_to_peer_with_alpn(
-            &self.endpoint,
+            &self.transport.endpoint,
             peer_id,
             iroh_blobs::protocol::ALPN,
         )
         .await?;
-        self.blob_store
+        self.transport.blob_store
             .remote()
             .fetch(conn, HashAndFormat::raw(blob_hash))
             .await
             .map_err(|e| anyhow::anyhow!("blob fetch failed: {e}"))?;
-        let bytes = self
+        let bytes = self.transport
             .blob_store
             .blobs()
             .get_bytes(blob_hash)
@@ -864,17 +893,17 @@ impl MeshManager {
 
     #[allow(dead_code)]
     pub(crate) async fn try_dht_fallback_join(
-        &self,
+        self: &Arc<Self>,
         network_name: &str,
         net_pubkey: EndpointId,
         _alpn: &[u8],
     ) -> Result<IpcMessage> {
         tracing::info!(network = %network_name, "trying DHT fallback");
 
-        let pkarr_client = dht::create_pkarr_client(&self.endpoint)?;
+        let pkarr_client = dht::create_pkarr_client(&self.transport.endpoint)?;
         let (expected_hash, _peer_ids) = dht::resolve_network(&pkarr_client, net_pubkey).await?;
 
-        let my_identity = self.identity.local_identity();
+        let my_identity = self.transport.identity.local_identity();
         let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
 
         let app_config = config::load()?;
@@ -890,7 +919,7 @@ impl MeshManager {
             }
 
             let blobs_conn = match transport::connect_to_peer_with_alpn(
-                &self.endpoint,
+                &self.transport.endpoint,
                 member.identity,
                 iroh_blobs::protocol::ALPN,
             )
@@ -900,7 +929,7 @@ impl MeshManager {
                 Err(_) => continue,
             };
 
-            if self
+            if self.transport
                 .blob_store
                 .remote()
                 .fetch(blobs_conn, HashAndFormat::raw(blob_hash))
@@ -910,7 +939,7 @@ impl MeshManager {
                 continue;
             }
 
-            let blob_bytes = match self.blob_store.blobs().get_bytes(blob_hash).await {
+            let blob_bytes = match self.transport.blob_store.blobs().get_bytes(blob_hash).await {
                 Ok(bytes) => bytes,
                 Err(_) => continue,
             };
@@ -918,7 +947,7 @@ impl MeshManager {
             let data = verify_group_blob(&blob_bytes, &expected_hash)?;
             tracing::info!(network = %network_name, members = data.members.len(), "group blob resolved via DHT fallback");
 
-            let my_ip = self.identity.local_ip();
+            let my_ip = self.transport.identity.local_ip();
             let my_hostname = net_config.my_hostname.clone();
             let cancel = self.shutdown_token.child_token();
             let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -943,7 +972,7 @@ impl MeshManager {
             // Register the member accept handler so the per-connection demux
             // dispatches coordinator broadcasts to us, then dial the roster.
             // Reconverge for this fallback path is covered by the group poller.
-            self.protocol_router.register(
+            self.protocol_router().register(
                 net_pubkey,
                 AcceptHandler::Member(Arc::new(MemberAcceptState {
                     ctx: self.mesh_ctx(),
@@ -952,8 +981,8 @@ impl MeshManager {
                     token: cancel.clone(),
                     net_pubkey,
                     my_identity,
-                    endpoint: self.endpoint.clone(),
-                    registry: self.registry.clone(),
+                    endpoint: self.transport.endpoint.clone(),
+                    registry: self.clone(),
                     invite_lock: invite_lock.clone(),
                     reconverge_notify: Arc::new(tokio::sync::Notify::new()),
                 })),
@@ -982,12 +1011,12 @@ impl MeshManager {
                 disconnect_tx: self.disconnect_tx.clone(),
             };
             self.networks.insert(network_name.to_string(), handle);
-            self.refresh_alpns().await;
+            self.refresh_search_domains().await;
 
             return Ok(IpcMessage::Joined {
                 name: network_name.to_string(),
                 my_ip,
-                my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
+                my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
             });
         }
 
@@ -1002,7 +1031,7 @@ impl MeshManager {
     /// that happen to dial in. Failures per-peer are logged at debug and
     /// skipped (the reconnect loop + group poller are the backstop).
     pub(crate) async fn dial_all_members(
-        &self,
+        self: &Arc<Self>,
         members: &[Member],
         net_pubkey: EndpointId,
         network_name: &str,
@@ -1024,7 +1053,7 @@ impl MeshManager {
             // connection supervisor retries anything still unreachable.
             let dialed = tokio::time::timeout(
                 DIAL_TIMEOUT,
-                transport::connect_to_peer_with_alpn(&self.endpoint, m.identity, &transport::mesh_alpn()),
+                transport::connect_to_peer_with_alpn(&self.transport.endpoint, m.identity, &transport::mesh_alpn()),
             )
             .await;
             match dialed {
@@ -1048,7 +1077,7 @@ impl MeshManager {
                     let conn_changed =
                         ctx.register_peer_conn(&peer_conn, m.identity, m.ip, network_name, &token);
                     if conn_changed {
-                        let router = self.protocol_router.clone();
+                        let router = self.protocol_router().clone();
                         let dconn = peer_conn.clone();
                         tokio::spawn(async move { router.drive_mesh_connection(dconn).await });
                     }

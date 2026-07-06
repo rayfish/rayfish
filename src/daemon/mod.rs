@@ -494,12 +494,10 @@ pub struct MeshManager {
     // resulting dead-code warning there rather than dropping the field.
     #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
     ssh_token: Mutex<Option<CancellationToken>>,
-    /// Daemon-wide disconnect sender, cloned into every [`MeshCtx`] so every
-    /// per-connection data reader reports peer drops to one place. See
-    /// [`MeshCtx::disconnect_tx`].
-    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     /// Receiver half of the daemon-wide disconnect channel, handed to
-    /// [`run_daemon`] to drive the single [`MeshManager::run_connection_supervisor`].
+    /// [`run_daemon`] to drive the single connection supervisor (now on the
+    /// registry). The sender lives on [`NetworkRegistry`]; only the parked
+    /// receiver remains here for bootstrap to take.
     disconnect_rx: std::sync::Mutex<Option<mpsc::Receiver<forward::DisconnectEvent>>>,
 }
 
