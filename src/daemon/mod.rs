@@ -36,7 +36,7 @@
 //!   `activate` mints *fresh* child tokens, so `up → down → up` cycles work.
 
 use bytes::Bytes;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -76,7 +76,6 @@ use crate::membership::{
 };
 use crate::network_name;
 use crate::peers::{self, PeerTable};
-use crate::revocation::{self, RevocationCache};
 use crate::stats::ForwardMetrics;
 use crate::transport;
 // The desktop TUN device and its CGNAT pre-flight check don't exist on Android,
@@ -140,10 +139,6 @@ pub(crate) struct MeshCtx {
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
     device_user_map: peers::DeviceUserMap,
-    /// Last-known revoked device keys per user identity (`ray unpair`). Consulted
-    /// wherever a `DeviceCert` is trusted (admission, MeshHello, reconverge) so a
-    /// revoked device stops being honored mesh-wide. See [`crate::revocation`].
-    revocation: RevocationCache,
     /// Peers removed from a network's roster (via `ray kick` or a stale-entry
     /// prune during reconverge), keyed by `(network, transport id)`. A member
     /// closes such a peer's connection but can't see its own close code, so its
@@ -239,6 +234,12 @@ pub(crate) struct NetworkState {
     /// received. Reloaded from the verified blob on every reconverge so any admin
     /// can admit and revocation propagates.
     reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
+    /// Device keys nullified on this network (`ray unpair`). Carried in the signed
+    /// blob: a coordinator seeds it from its persisted `revoked_devices` and drops
+    /// nullified devices from `members`; a member adopts it from the verified blob
+    /// on every reconverge. Enforcement (admission, MeshHello, prune) rejects a
+    /// cert whose device key is listed.
+    nullifiers: BTreeSet<EndpointId>,
     /// Materialized suggested rules awaiting manual `ray firewall accept` on a
     /// node that did not opt into `--auto-accept-firewall`. Empty when
     /// auto-accepting.
@@ -285,6 +286,7 @@ impl NetworkState {
             &self.suggested_firewall,
             self.network_name.as_deref(),
             &self.reusable_keys,
+            &self.nullifiers,
         );
         let hash = blake3::hash(&bytes);
         self.snapshot = Some(GroupSnapshot {
@@ -393,8 +395,6 @@ pub struct MeshManager {
     connect: Arc<ConnectService>,
     device_cert: Option<control::DeviceCert>,
     device_user_map: peers::DeviceUserMap,
-    /// Device-cert revocation cache (`ray unpair`); see [`MeshCtx::revocation`].
-    revocation: RevocationCache,
     /// Peers removed from a roster whose reconnect should be suppressed once.
     /// Shared into [`MeshCtx::pruned_peers`]; see that field for the mechanism.
     pruned_peers: Arc<DashSet<(String, EndpointId)>>,
@@ -433,6 +433,10 @@ pub struct MeshManager {
     self_unpair_tx: mpsc::Sender<()>,
     /// Receiver half of the self-unpair channel, taken once by the daemon loop.
     self_unpair_rx: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
+    /// Receiver half of the re-auth channel (see [`FileService`]): the pairing
+    /// accept arm sends a re-paired device's key here, and the daemon loop drains
+    /// it into [`MeshManager::reauth_device`] to clear the device's nullifier.
+    reauth_rx: std::sync::Mutex<Option<mpsc::Receiver<EndpointId>>>,
 }
 
 /// Map key-holding status to a [`NetworkRole`].
@@ -508,7 +512,6 @@ impl MeshManager {
             hostname_table: self.dns.hostname_table.clone(),
             reverse_table: self.dns.reverse_table.clone(),
             device_user_map: self.device_user_map.clone(),
-            revocation: self.revocation.clone(),
             pruned_peers: self.pruned_peers.clone(),
             self_unpair_tx: self.self_unpair_tx.clone(),
         }
@@ -1280,7 +1283,7 @@ mod report_tests {
 #[cfg(test)]
 mod accept_handler_tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
     // Build a minimal NetworkState for use in test AcceptHandler construction.
@@ -1297,6 +1300,7 @@ mod accept_handler_tests {
             mode: GroupMode::Restricted,
             suggested_firewall: SuggestedFirewall::default(),
             reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         }))
@@ -1316,7 +1320,6 @@ mod accept_handler_tests {
             hostname_table: dns::new_hostname_table(),
             reverse_table: dns::new_reverse_table(),
             device_user_map: peers::DeviceUserMap::new(),
-            revocation: RevocationCache::new(),
             pruned_peers: Arc::new(DashSet::new()),
             self_unpair_tx: tokio::sync::mpsc::channel(1).0,
         }

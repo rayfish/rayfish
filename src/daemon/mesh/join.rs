@@ -49,6 +49,9 @@ pub(crate) struct JoinParams {
     /// From the fetched blob: reusable join keys, so this node can validate
     /// redemptions if it later holds the network key (HA admission).
     pub(crate) reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
+    /// From the fetched blob: device keys nullified on this network (`ray unpair`),
+    /// so a joined member enforces them locally until the next reconverge.
+    pub(crate) nullifiers: BTreeSet<EndpointId>,
     /// Consent: auto-install suggested rules without a manual review queue.
     pub(crate) auto_accept_firewall: bool,
     /// Seed for per-network auto-accept of file offers from own devices
@@ -99,6 +102,7 @@ pub(crate) async fn join_mesh_shared(
         invite_secret,
         suggested_firewall,
         reusable_keys,
+        nullifiers,
         auto_accept_firewall,
         auto_accept_files,
         initial,
@@ -193,6 +197,7 @@ pub(crate) async fn join_mesh_shared(
         network_name,
         suggested_firewall,
         reusable_keys,
+        nullifiers,
         &blob_store,
     )
     .await;
@@ -326,6 +331,7 @@ async fn send_reconnect_hello(
 /// Build the in-memory `NetworkState` cell for a joined member from the admitted
 /// roster + blob-derived firewall/keys, refresh its snapshot, and seed the local
 /// blob store with those bytes.
+#[allow(clippy::too_many_arguments)]
 async fn build_member_state(
     members: Vec<crate::membership::Member>,
     approved: Vec<ApprovedEntry>,
@@ -333,6 +339,7 @@ async fn build_member_state(
     network_name: &str,
     suggested_firewall: SuggestedFirewall,
     reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
+    nullifiers: BTreeSet<EndpointId>,
     blob_store: &FsStore,
 ) -> SharedNetworkState {
     let mut ns = NetworkState {
@@ -345,6 +352,7 @@ async fn build_member_state(
         mode: GroupMode::Restricted,
         suggested_firewall,
         reusable_keys,
+        nullifiers,
         pending_suggestions: Vec::new(),
         pending: HashMap::new(),
     };

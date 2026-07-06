@@ -14,6 +14,7 @@ struct RestoredRoster {
     approved: ApprovedList,
     suggested_firewall: SuggestedFirewall,
     reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
+    nullifiers: BTreeSet<EndpointId>,
 }
 
 impl MeshManager {
@@ -37,10 +38,12 @@ impl MeshManager {
         let mut suggested_firewall = SuggestedFirewall::default();
         // Reusable join keys are authoritative in the signed blob too.
         let mut reusable_keys = BTreeMap::new();
+        let mut nullifiers = BTreeSet::new();
         match self.restore_roster_from_blob(net_public_key).await {
             Ok(data) => {
                 suggested_firewall = data.suggested_firewall.clone();
                 reusable_keys = data.reusable_keys.clone();
+                nullifiers = data.nullifiers.clone();
                 for m in &data.members {
                     let _ = member_list.add(m.clone());
                 }
@@ -105,6 +108,7 @@ impl MeshManager {
             approved: approved_list,
             suggested_firewall,
             reusable_keys,
+            nullifiers,
         }
     }
 
@@ -148,6 +152,7 @@ impl MeshManager {
             approved: approved_list,
             suggested_firewall,
             reusable_keys,
+            nullifiers,
         } = self
             .restore_member_roster(name, net_public_key, net_config, my_ip, &persisted_hostname)
             .await;
@@ -162,6 +167,7 @@ impl MeshManager {
             mode,
             suggested_firewall,
             reusable_keys,
+            nullifiers,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         };
@@ -365,6 +371,7 @@ impl MeshManager {
                 &SuggestedFirewall::default(),
                 None,
                 &BTreeMap::new(),
+                &BTreeSet::new(),
             );
             if let Err(e) = dht::publish_network(&client, &key, &empty_hash, &[]).await {
                 tracing::warn!(error = %e, "failed to publish empty network record on nuke");

@@ -159,21 +159,18 @@ impl CoordinatorAcceptState {
                 tracing::warn!(peer = %remote_id.fmt_short(), "invalid device certificate");
                 return;
             }
-            // Judge the cert against the revoked set (`ray unpair`). This one check
+            // Reject a cert nullified on this network (`ray unpair`). This one check
             // covers every admission branch below — owner auto-admit, invite,
-            // live-approved, and open. A cert whose device key is revoked (by us for
-            // our own device, or by the signer as seen from a secondary) is
-            // rejected; every other device is admitted unchanged (no fleet
-            // rotation).
-            let (issuing, revoked) = cert_authority(self.ctx.identity.local_identity());
-            if revocation::cert_decision(
-                cert,
-                issuing,
-                &|d| revoked.contains(d),
-                &self.ctx.revocation,
-            ) == revocation::CertDecision::Reject
+            // live-approved, and open. A nullified device key is refused; every
+            // other device is admitted unchanged (no fleet rotation).
+            if self
+                .state
+                .read()
+                .unwrap()
+                .nullifiers
+                .contains(&cert.device_key)
             {
-                tracing::warn!(peer = %remote_id.fmt_short(), "rejecting revoked device certificate");
+                tracing::warn!(peer = %remote_id.fmt_short(), "rejecting nullified device certificate");
                 return;
             }
             self.ctx

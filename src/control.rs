@@ -212,8 +212,8 @@ pub enum ControlMsg {
     /// it only when the sender's identity is the `user_identity` in its own device
     /// cert (so a stranger cannot trigger a wipe): it deletes its stored device
     /// cert and leaves the networks it holds only by that cert. The authoritative
-    /// revocation is the signed pkarr record; this is just a courtesy wipe for a
-    /// cooperative device.
+    /// revocation is the per-network blob nullifier set; this is just a courtesy
+    /// wipe for a cooperative device.
     Unpaired,
     /// Primary → secondary: a freshly-signed cert at a new generation, pushed
     /// after a rotation (`ray unpair`) so a kept device stays above the floor.

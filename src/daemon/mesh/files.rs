@@ -561,7 +561,12 @@ impl MeshManager {
                 }
                 // Auto-join every network the primary shared. Each join attaches the
                 // freshly stored cert (see current_device_cert) so the coordinator,
-                // which owns this device, admits it without manual approval.
+                // which owns this device, admits it without manual approval. Dial
+                // the primary itself as the coordinator: it just shared these
+                // networks (so it is online and either coordinates them or knows a
+                // coordinator), and this does not depend on the fetched blob's
+                // roster flagging it `is_coordinator`. Falls back to the blob's
+                // coordinators if the primary does not admit.
                 for net in networks {
                     if self.networks.contains_key(&net.network_key) {
                         continue;
@@ -571,7 +576,15 @@ impl MeshManager {
                     let net_key = net.network_key.clone();
                     tokio::spawn(async move {
                         match me
-                            .join_network(&net_key, Some(&net_name), None, None, None, false, false)
+                            .join_network(
+                                &net_key,
+                                Some(&net_name),
+                                None,
+                                None,
+                                Some(endpoint_id),
+                                false,
+                                false,
+                            )
                             .await
                         {
                             IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => {
@@ -650,12 +663,13 @@ impl MeshManager {
 
     /// Revoke one of this user's paired devices (`ray unpair`). Primary-only.
     ///
-    /// Persists + publishes a signed revocation record for the device key,
-    /// enforces it locally right away, best-effort tells the device to wipe its
-    /// own cert, and — on every network this node coordinates — removes the
-    /// device from the roster and republishes so the blob stops carrying its
-    /// cert. Live links to the device are severed everywhere; other nodes drop it
-    /// when they reconverge (or resolve the revocation record).
+    /// Records the device key as a durable nullifier (`revoked_devices`), then, on
+    /// every network this node coordinates, adds it to the signed blob's nullifier
+    /// set, removes it from the roster, and republishes — so the blob stops
+    /// honoring its cert. Best-effort tells the device to wipe its own cert. Live
+    /// links to the device are severed everywhere; other nodes reject its cert and
+    /// prune it when they reconverge from the republished blob. Networks this node
+    /// does not coordinate are unaffected in Phase 1 (see the amendments design).
     pub(crate) async fn unpair(self: &Arc<Self>, device: &str) -> IpcMessage {
         // Only the primary holds the user identity secret that signs both the
         // certs and their revocation. A secondary carries a device cert.
@@ -713,45 +727,33 @@ impl MeshManager {
             };
         }
 
-        // 1. Add the device to our revoked set and bump the revocation version.
-        //    Per-cert: only this device is revoked; every other device we keep is
-        //    left untouched (no generation bump, no re-issue).
+        // 1. Record the nullified device durably. `revoked_devices` is the
+        //    coordinator's persistent nullifier seed: it survives a restart and is
+        //    unioned into every coordinated network's blob at seal time. Per-cert:
+        //    only this device is nullified; every other device we keep is untouched.
         let mut cfg = config::load().unwrap_or_default();
         let hex = target.to_string();
         if !cfg.revoked_devices.contains(&hex) {
             cfg.revoked_devices.push(hex);
         }
-        cfg.revocation_version += 1;
-        let version = cfg.revocation_version;
-        let revoked_set: std::collections::HashSet<EndpointId> =
-            config::revoked_device_ids(&cfg).into_iter().collect();
         if let Err(e) = config::save_settings(&cfg) {
             return IpcMessage::Error {
-                message: format!("failed to persist revocation: {e}"),
+                message: format!("failed to persist nullifier: {e}"),
             };
         }
-        self.revocation
-            .set_local(own_user, version, revoked_set.clone());
         self.device_user_map.remove(&target);
 
-        // 2. Publish the updated revoked set, so every peer rejects the revoked
-        //    device's cert (verifiers adopt it on its strictly-newer version).
-        let devices: Vec<EndpointId> = revoked_set.into_iter().collect();
-        if let Ok(client) = dht::create_pkarr_client(&self.endpoint)
-            && let Ok(secret) = crate::identity::load_or_create()
-            && let Err(e) = dht::publish_revoked(&client, &secret, version, &devices).await
-        {
-            tracing::warn!(error = %e, "failed to publish revoked-device record");
-        }
-
-        // 3. Best-effort: ask the revoked device to wipe its own cert if online.
+        // 2. Best-effort: ask the device to wipe its own cert if online.
         self.send_unpaired_notice(target).await;
 
-        // 4. Drop the device from every network we coordinate, and sever links.
+        // 3. Nullify the device on every network we coordinate (add to the signed
+        //    blob's nullifier set + drop it from the roster), republish, and sever
+        //    links. Other nodes reject its cert and prune it on reconverge.
         for (net, state, dht_notify, has_key) in nets {
             if has_key {
                 let member_ip = {
                     let mut s = state.write().unwrap();
+                    s.nullifiers.insert(target);
                     let ip = s
                         .members
                         .all()
@@ -787,7 +789,51 @@ impl MeshManager {
 
         tracing::info!(device = %target.fmt_short(), "unpaired device");
         IpcMessage::Ok {
-            message: format!("unpaired '{display}' and revoked its device certificate"),
+            message: format!("unpaired '{display}' and nullified its device certificate"),
+        }
+    }
+
+    /// Clear a re-paired device's nullifier (the inverse of [`unpair`]). Invoked by
+    /// the daemon loop when the pairing accept arm re-authorizes a device: drops it
+    /// from the durable `revoked_devices` seed and from every coordinated network's
+    /// blob nullifier set, republishing so the device's fresh cert is honored mesh
+    /// wide again. Non-coordinated networks clear on their own coordinator's next
+    /// reseal. Best-effort; a persist/publish failure is logged, not surfaced.
+    pub(crate) async fn reauth_device(self: &Arc<Self>, device: EndpointId) {
+        // Drop from the durable nullifier seed so a later reseal won't re-add it.
+        let mut cfg = config::load().unwrap_or_default();
+        let hex = device.to_string();
+        if let Some(pos) = cfg.revoked_devices.iter().position(|d| *d == hex) {
+            cfg.revoked_devices.remove(pos);
+            if let Err(e) = config::save_settings(&cfg) {
+                tracing::warn!(error = %e, "reauth: failed to clear device from nullifier seed");
+            }
+        }
+        // Collect coordinated networks (clone the handles) before awaiting.
+        let mut nets: Vec<(String, SharedNetworkState, Option<Arc<Notify>>)> = Vec::new();
+        for entry in self.networks.iter() {
+            if entry.value().state.read().unwrap().network_secret_key.is_some() {
+                nets.push((
+                    entry.key().clone(),
+                    entry.value().state.clone(),
+                    entry.value().dht_notify.clone(),
+                ));
+            }
+        }
+        let mut changed = false;
+        for (_net, state, dht_notify) in nets {
+            let removed = {
+                let mut s = state.write().unwrap();
+                s.nullifiers.remove(&device)
+            };
+            if removed {
+                changed = true;
+                update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+            }
+        }
+        if changed {
+            broadcast_member_sync(&self.peers, None).await;
+            tracing::info!(device = %device.fmt_short(), "re-authorized device (cleared nullifier)");
         }
     }
 
@@ -842,32 +888,6 @@ impl MeshManager {
         IpcMessage::Ok {
             message: format!("unpaired this device (left {} network(s))", networks.len()),
         }
-    }
-}
-
-/// Device-side handler for an inbound `ControlMsg::Unpaired` from `sender`. Acts
-/// only when this device holds a cert signed by `sender` (so a stranger can't
-/// trigger a wipe): deletes the stored device cert best-effort. The authoritative
-/// revocation is the signed pkarr record; this just completes a cooperative wipe.
-/// The in-memory cert copy clears on the next daemon restart.
-/// This node's cert-issuing authority for [`revocation::cert_decision`]:
-/// `(issuing_identity, revoked_set)`. The issuing identity is `Some(my_identity)`
-/// only on the **primary** (holds the user secret + the authoritative revoked
-/// set); on a secondary it is `None`, so every cert is judged by the published
-/// set instead. Reads config fresh so a revoke/re-auth takes effect without a
-/// restart.
-pub(crate) fn cert_authority(
-    my_identity: EndpointId,
-) -> (Option<EndpointId>, std::collections::HashSet<EndpointId>) {
-    let is_primary = crate::identity::load_device_cert().ok().flatten().is_none();
-    if is_primary {
-        let cfg = config::load().unwrap_or_default();
-        (
-            Some(my_identity),
-            config::revoked_device_ids(&cfg).into_iter().collect(),
-        )
-    } else {
-        (None, std::collections::HashSet::new())
     }
 }
 

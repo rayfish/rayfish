@@ -121,17 +121,14 @@ pub(crate) fn spawn_coordinator_control_reader(
     pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
 ) {
     let MeshCtx {
-        identity,
         peers,
         blob_store,
         hostname_table,
         reverse_table,
         device_user_map,
-        revocation,
         self_unpair_tx,
         ..
     } = ctx;
-    let my_identity = identity.local_identity();
     tokio::spawn(async move {
         let mut gate = crate::ratelimit::ControlGate::new();
         loop {
@@ -233,17 +230,15 @@ pub(crate) fn spawn_coordinator_control_reader(
                 continue;
             };
 
-            // Verify and store device cert if present, unless the device key is in
-            // the issuing user's revoked set (`ray unpair`) — a revoked cert is not
+            // Verify and store device cert if present, unless the device key is
+            // nullified on this network (`ray unpair`) — a nullified cert is not
             // recorded as a paired device, so it stops resolving to the user's
             // identity.
             let cert_ok = device_cert.as_ref().is_some_and(|cert| {
                 if !cert.verify() || cert.device_key != remote_id {
                     return false;
                 }
-                let (issuing, revoked) = cert_authority(my_identity);
-                revocation::cert_decision(cert, issuing, &|d| revoked.contains(d), &revocation)
-                    != revocation::CertDecision::Reject
+                !state.read().unwrap().nullifiers.contains(&cert.device_key)
             });
             if let Some(ref cert) = device_cert
                 && cert_ok

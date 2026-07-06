@@ -158,7 +158,6 @@ pub(crate) async fn reconverge_and_apply(
         hostname_table,
         reverse_table,
         device_user_map,
-        revocation,
         pruned_peers,
         ..
     } = ctx;
@@ -204,6 +203,7 @@ pub(crate) async fn reconverge_and_apply(
         s.members = MemberList::from_members(tiebroken);
         s.approved = ApprovedList::from_entries(data.approved.clone());
         s.suggested_firewall = data.suggested_firewall.clone();
+        s.nullifiers = data.nullifiers.clone();
         s.refresh_snapshot();
         s.roster()
     };
@@ -224,7 +224,6 @@ pub(crate) async fn reconverge_and_apply(
     prune_departed_peers(
         peers,
         device_user_map,
-        revocation,
         pruned_peers,
         state,
         network_name,
@@ -246,27 +245,6 @@ pub(crate) async fn reconverge_and_apply(
     tracing::info!(network = %network_name, "reconverged from signed record");
 }
 
-impl MeshManager {
-    /// Sever any live peer whose device cert is now below its user's generation
-    /// floor, across every network. Called when the revocation poller learns a
-    /// raised floor (a device was just unpaired) so peers drop the revoked device
-    /// right away instead of waiting for each network's next 60s group poll.
-    pub(crate) fn prune_revoked_across_networks(&self) {
-        let my_identity = self.identity.local_identity();
-        for entry in self.networks.iter() {
-            prune_departed_peers(
-                &self.peers,
-                &self.device_user_map,
-                &self.revocation,
-                &self.pruned_peers,
-                &entry.value().state,
-                entry.key(),
-                my_identity,
-            );
-        }
-    }
-}
-
 /// Close and drop every connection to a peer that `network`'s current roster no
 /// longer contains. Runs on every node after it applies a verified roster, so a
 /// kicked (or departed) peer is severed mesh-wide, not just by the coordinator
@@ -275,39 +253,27 @@ impl MeshManager {
 pub(crate) fn prune_departed_peers(
     peers: &PeerTable,
     device_user_map: &peers::DeviceUserMap,
-    revocation: &RevocationCache,
     pruned_peers: &Arc<DashSet<(String, EndpointId)>>,
     state: &SharedNetworkState,
     network_name: &str,
     my_identity: EndpointId,
 ) {
-    // Revocation authority for this node, computed once (config + disk reads).
-    let (issuing, revoked_set) = cert_authority(my_identity);
+    // Device keys nullified on this network (`ray unpair`), read once.
+    let nullifiers = state.read().unwrap().nullifiers.clone();
     for (peer_id, ip, conn) in peers.peers_for_network_with_conn(network_name) {
         // Membership is by roster identity, which for a paired peer is its user
         // identity, not the transport id the PeerTable is keyed on. Check both.
         let user_id = device_user_map.resolve(&peer_id);
-        // A peer whose device key is in its owning user's revoked set (`ray
-        // unpair`) is severed even if a stale roster still lists it — the revoked
-        // set is authoritative over the (possibly not-yet-republished)
-        // membership. The peer's cert lives in the roster entry.
-        let member_cert = {
-            let s = state.read().unwrap();
-            s.members
-                .all()
-                .iter()
-                .find(|m| m.identity == peer_id || m.identity == user_id)
-                .and_then(|m| m.device_cert.clone())
-        };
-        let revoked = member_cert.as_ref().is_some_and(|cert| {
-            revocation::cert_decision(cert, issuing, &|d| revoked_set.contains(d), revocation)
-                == revocation::CertDecision::Reject
-        });
+        // A peer whose device key is nullified on this network is severed even if a
+        // stale roster still lists it — the nullifier is authoritative over the
+        // (possibly not-yet-republished) membership. `peer_id` is the transport
+        // (device) key the nullifier set is keyed on.
+        let nullified = nullifiers.contains(&peer_id);
         let still_member = {
             let s = state.read().unwrap();
             s.members.is_member(&peer_id) || s.members.is_member(&user_id)
         };
-        if !revoked && (still_member || peer_id == my_identity || user_id == my_identity) {
+        if !nullified && (still_member || peer_id == my_identity || user_id == my_identity) {
             continue;
         }
         tracing::info!(peer = %peer_id.fmt_short(), network = %network_name, "pruning peer no longer in roster");
