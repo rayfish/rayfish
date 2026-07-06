@@ -32,14 +32,90 @@ pub(crate) struct ConnectService {
     /// the concurrency tie-break: if both peers requested *and* approved each
     /// other, only the higher endpoint id mints, avoiding a duplicate network.
     pub(crate) outgoing_connects: Arc<DashSet<EndpointId>>,
+    /// Foundation handles (endpoint + contact id) for the connect handshake and
+    /// contact-record publishing.
+    transport: Arc<Transport>,
+    /// Whether the data plane is active, gating immediate contact republish on
+    /// key rotation.
+    active: Arc<AtomicBool>,
 }
 
 impl ConnectService {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(transport: Arc<Transport>, active: Arc<AtomicBool>) -> Self {
         Self {
             pending_connects: Arc::new(DashMap::new()),
             approved_connects: Arc::new(DashMap::new()),
             outgoing_connects: Arc::new(DashSet::new()),
+            transport,
+            active,
+        }
+    }
+
+    /// List pending incoming `ray connect` requests awaiting approval.
+    pub(crate) fn list_connections(&self) -> IpcMessage {
+        let now = Instant::now();
+        let requests = self
+            .pending_connects
+            .iter()
+            .map(|p| ipc::PendingRequestInfo {
+                short_id: p.from_contact_id.fmt_short().to_string(),
+                hostname: p.hostname.clone(),
+                waiting_secs: now.saturating_duration_since(p.requested_at).as_secs(),
+            })
+            .collect();
+        IpcMessage::PendingRequests { requests }
+    }
+
+    /// Decline a pending connection request by contact-id prefix.
+    pub(crate) fn reject_connect(&self, id_prefix: &str) -> IpcMessage {
+        let found = self
+            .pending_connects
+            .iter()
+            .find(|p| {
+                p.from_contact_id
+                    .fmt_short()
+                    .to_string()
+                    .starts_with(id_prefix)
+                    || p.from_contact_id.to_string().starts_with(id_prefix)
+            })
+            .map(|p| *p.key());
+        match found {
+            Some(peer) => {
+                self.pending_connects.remove(&peer);
+                IpcMessage::Ok {
+                    message: format!("declined connection request '{id_prefix}'"),
+                }
+            }
+            None => IpcMessage::Error {
+                message: format!("no pending connection request matching '{id_prefix}'"),
+            },
+        }
+    }
+
+    /// Rotate this node's contact key and, if the data plane is active, republish
+    /// the contact record immediately so the new id resolves.
+    pub(crate) async fn rotate_contact(&self) -> IpcMessage {
+        let mut cfg = match config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to load config: {e}"),
+                };
+            }
+        };
+        let secret = config::rotate_contact_secret(&mut cfg);
+        if let Err(e) = config::save_settings(&cfg) {
+            return IpcMessage::Error {
+                message: format!("failed to save config: {e}"),
+            };
+        }
+        if self.active.load(Ordering::SeqCst)
+            && let Ok(client) = dht::create_pkarr_client(&self.transport.endpoint)
+        {
+            let _ = dht::publish_contact(&client, &secret, self.transport.endpoint.id()).await;
+        }
+        IpcMessage::ContactIdResponse {
+            contact_id: secret.public().to_string(),
         }
     }
 
