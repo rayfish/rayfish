@@ -34,9 +34,12 @@ pub(crate) struct NetworkRegistry {
     /// This device's cert loaded at boot, the in-memory fallback for the paired
     /// check when the on-disk cert read errors (see [`Self::current_device_cert`]).
     device_cert: Option<control::DeviceCert>,
+    /// Daemon-wide shutdown token; each network's cancel is a child of it.
+    shutdown_token: CancellationToken,
 }
 
 impl NetworkRegistry {
+    #[allow(clippy::too_many_arguments)] // one clone per shared daemon handle
     pub(crate) fn new(
         networks: Arc<DashMap<String, NetworkHandle>>,
         transport: Arc<Transport>,
@@ -45,6 +48,7 @@ impl NetworkRegistry {
         dns: Arc<DnsService>,
         tun_name: Arc<Mutex<String>>,
         device_cert: Option<control::DeviceCert>,
+        shutdown_token: CancellationToken,
     ) -> Self {
         Self {
             networks,
@@ -54,6 +58,7 @@ impl NetworkRegistry {
             dns,
             tun_name,
             device_cert,
+            shutdown_token,
         }
     }
 
@@ -164,6 +169,148 @@ impl NetworkRegistry {
     /// Whether a network by this name is currently active (in the live map).
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.networks.contains_key(name)
+    }
+
+    /// Mint a new network: generate its keypair, build the initial roster, seal +
+    /// publish the blob, persist config, spawn coordinator tasks, and register the
+    /// coordinator accept handler. `direct`/`pre_approve` back the `ray connect`
+    /// 2-peer path. Takes a `&MeshCtx` for the task spawn + handler registration.
+    pub(crate) async fn create_network_inner(
+        &self,
+        ctx: &MeshCtx,
+        mode: GroupMode,
+        custom_name: Option<String>,
+        hostname: Option<String>,
+        direct: bool,
+        pre_approve: Option<(EndpointId, Option<String>)>,
+    ) -> Result<IpcMessage> {
+        let name = match custom_name {
+            Some(n) => {
+                anyhow::ensure!(
+                    crate::hostname::is_valid_hostname(&n),
+                    "invalid network name '{n}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
+                );
+                n
+            }
+            None => network_name::generate_name(),
+        };
+
+        let net_secret_key = SecretKey::generate();
+        let net_public_key = net_secret_key.public();
+
+        if self.networks.contains_key(&name) {
+            return Ok(IpcMessage::Error {
+                message: format!("network '{name}' already active"),
+            });
+        }
+
+        let my_ip = self.transport.identity.local_ip();
+
+        let my_hostname = match hostname {
+            Some(h) => {
+                anyhow::ensure!(
+                    crate::hostname::is_valid_hostname(&h),
+                    "invalid hostname '{h}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
+                );
+                h
+            }
+            None => config::load()
+                .ok()
+                .and_then(|c| c.default_hostname)
+                .unwrap_or_else(crate::hostname::generate_hostname),
+        };
+
+        let mut net_state = self.build_initial_roster(
+            &name,
+            my_ip,
+            &my_hostname,
+            mode,
+            &net_secret_key,
+            pre_approve,
+        )?;
+
+        dns::update_hostname(
+            &self.dns.hostname_table,
+            &self.dns.reverse_table,
+            &name,
+            &my_hostname,
+            my_ip,
+            derive_ipv6(&self.transport.identity.local_identity()),
+        )
+        .await;
+
+        self.seal_and_publish(&mut net_state, &net_secret_key).await;
+
+        let member_entries = to_member_entries(net_state.members.all());
+        let approved_entries = to_approved_entries(net_state.approved.all());
+        config::save_network(&config::NetworkConfig {
+            name: name.clone(),
+            group_mode: mode,
+            my_ip: Some(my_ip),
+            my_hostname: Some(my_hostname.clone()),
+            pending_hostname: None,
+            members: member_entries,
+            approved: approved_entries,
+            network_secret_key: Some(net_secret_key.clone()),
+            network_public_key: Some(net_public_key),
+            transport: None,
+            auto_accept_firewall: false,
+            // Own-device file offers are auto-accepted by default (identity-checked).
+            auto_accept_files: true,
+            admins: vec![],
+            direct,
+            ssh_allow: vec![],
+            aliases: BTreeMap::new(),
+            ephemeral_ttl_secs: None,
+        })?;
+
+        let cancel = self.shutdown_token.child_token();
+        let state = Arc::new(std::sync::RwLock::new(net_state));
+        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let dht_notify = Arc::new(tokio::sync::Notify::new());
+        let (tasks, disconnect_tx) = self.spawn_coordinator_background_tasks(
+            ctx,
+            &name,
+            &net_secret_key,
+            &state,
+            &dht_notify,
+            &cancel,
+        );
+
+        // Insert the handle first so register_coordinator_handler can update the role.
+        let handle = NetworkHandle {
+            name: name.clone(),
+            network_key: net_public_key,
+            role: NetworkRole::Coordinator,
+            my_ip,
+            state: state.clone(),
+            dht_notify: Some(dht_notify.clone()),
+            cancel: cancel.clone(),
+            tasks,
+            invite_lock: invite_lock.clone(),
+            disconnect_tx: disconnect_tx.clone(),
+        };
+        self.networks.insert(name.clone(), handle);
+
+        self.register_coordinator_handler(
+            ctx,
+            &name,
+            state,
+            invite_lock,
+            Some(dht_notify),
+            net_public_key,
+            cancel,
+        );
+        self.refresh_search_domains().await;
+
+        tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network created");
+
+        Ok(IpcMessage::Created {
+            name,
+            network_key: net_public_key,
+            my_ip,
+            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
+        })
     }
 
     /// Build the initial [`NetworkState`] for a network we're minting: a member

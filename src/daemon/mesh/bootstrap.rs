@@ -265,6 +265,7 @@ async fn build_daemon(
         dns.clone(),
         tun_name.clone(),
         device_cert.clone(),
+        token.clone(),
     ));
     // FileService owns file transfer + pairing. It evaluates own-device auto-accept
     // directly (no worker channel) and clears a re-paired device's nullifier by

@@ -115,24 +115,6 @@ impl MeshManager {
     /// `ray status` can tag it). `pre_approve` adds a peer to the `ApprovedList`
     /// before the blob is signed/published, so the named peer can be welcomed
     /// without a separate `ray accept` round-trip, used by `approve_connection`.
-    /// Build the initial [`NetworkState`] for a freshly created network: the
-    /// creator as sole coordinator, plus any `pre_approve` peer (a `ray connect`
-    /// requester) admitted up front so the published blob already carries the
-    /// approval and the peer is welcomed on its join without a separate
-    /// `ray accept`.
-    fn build_initial_roster(
-        &self,
-        name: &str,
-        my_ip: Ipv4Addr,
-        my_hostname: &str,
-        mode: GroupMode,
-        net_secret_key: &SecretKey,
-        pre_approve: Option<(EndpointId, Option<String>)>,
-    ) -> Result<NetworkState> {
-        self.registry
-            .build_initial_roster(name, my_ip, my_hostname, mode, net_secret_key, pre_approve)
-    }
-
     pub(crate) async fn create_network_inner(
         &self,
         mode: GroupMode,
@@ -141,135 +123,16 @@ impl MeshManager {
         direct: bool,
         pre_approve: Option<(EndpointId, Option<String>)>,
     ) -> Result<IpcMessage> {
-        let name = match custom_name {
-            Some(n) => {
-                anyhow::ensure!(
-                    crate::hostname::is_valid_hostname(&n),
-                    "invalid network name '{n}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
-                );
-                n
-            }
-            None => network_name::generate_name(),
-        };
-
-        // Generate per-network keypair
-        let net_secret_key = SecretKey::generate();
-        let net_public_key = net_secret_key.public();
-
-        if self.networks.contains_key(&name) {
-            return Ok(IpcMessage::Error {
-                message: format!("network '{name}' already active"),
-            });
-        }
-
-        let my_ip = self.identity.local_ip();
-
-        let my_hostname = match hostname {
-            Some(h) => {
-                anyhow::ensure!(
-                    crate::hostname::is_valid_hostname(&h),
-                    "invalid hostname '{h}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
-                );
-                h
-            }
-            None => config::load()
-                .ok()
-                .and_then(|c| c.default_hostname)
-                .unwrap_or_else(crate::hostname::generate_hostname),
-        };
-
-        let mut net_state = self.build_initial_roster(
-            &name,
-            my_ip,
-            &my_hostname,
-            mode,
-            &net_secret_key,
-            pre_approve,
-        )?;
-
-        // Register in DNS hostname table
-        dns::update_hostname(
-            &self.dns.hostname_table,
-            &self.dns.reverse_table,
-            &name,
-            &my_hostname,
-            my_ip,
-            derive_ipv6(&self.identity.local_identity()),
-        )
-        .await;
-
-        self.seal_and_publish(&mut net_state, &net_secret_key).await;
-
-        // Save to config
-        let member_entries = to_member_entries(net_state.members.all());
-        let approved_entries = to_approved_entries(net_state.approved.all());
-        config::save_network(&config::NetworkConfig {
-            name: name.clone(),
-            group_mode: mode,
-            my_ip: Some(my_ip),
-            my_hostname: Some(my_hostname.clone()),
-            pending_hostname: None,
-            members: member_entries,
-            approved: approved_entries,
-            network_secret_key: Some(net_secret_key.clone()),
-            network_public_key: Some(net_public_key),
-            transport: None,
-            auto_accept_firewall: false,
-            // Own-device file offers are auto-accepted by default (identity-checked).
-            auto_accept_files: true,
-            admins: vec![],
-            direct,
-            ssh_allow: vec![],
-            aliases: BTreeMap::new(),
-            ephemeral_ttl_secs: None,
-        })?;
-
-        let cancel = self.shutdown_token.child_token();
-        let state = Arc::new(std::sync::RwLock::new(net_state));
-        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let dht_notify = Arc::new(tokio::sync::Notify::new());
-        let (tasks, disconnect_tx) = self.spawn_coordinator_background_tasks(
-            &name,
-            &net_secret_key,
-            &state,
-            &dht_notify,
-            &cancel,
-        );
-
-        // Insert the handle first so register_coordinator_handler can update the role.
-        let handle = NetworkHandle {
-            name: name.clone(),
-            network_key: net_public_key,
-            role: NetworkRole::Coordinator,
-            my_ip,
-            state: state.clone(),
-            dht_notify: Some(dht_notify.clone()),
-            cancel: cancel.clone(),
-            tasks,
-            invite_lock: invite_lock.clone(),
-            disconnect_tx: disconnect_tx.clone(),
-        };
-        self.networks.insert(name.clone(), handle);
-
-        // Register protocol handler for this network
-        self.register_coordinator_handler(
-            &name,
-            state,
-            invite_lock,
-            Some(dht_notify),
-            net_public_key,
-            cancel,
-        );
-        self.refresh_alpns().await;
-
-        tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network created");
-
-        Ok(IpcMessage::Created {
-            name,
-            network_key: net_public_key,
-            my_ip,
-            my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
-        })
+        self.registry
+            .create_network_inner(
+                &self.mesh_ctx(),
+                mode,
+                custom_name,
+                hostname,
+                direct,
+                pre_approve,
+            )
+            .await
     }
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
