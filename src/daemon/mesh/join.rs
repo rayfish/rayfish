@@ -303,6 +303,7 @@ fn persist_join_config(
         direct,
         ssh_allow,
         aliases,
+        ephemeral_ttl_secs: None,
     })
 }
 
@@ -330,6 +331,9 @@ async fn build_member_state(
         reusable_keys,
         pending_suggestions: Vec::new(),
         pending: HashMap::new(),
+        // A joining member starts with an empty nullifier set and adopts the
+        // coordinator's from the signed blob on its first reconverge.
+        nullifiers: BTreeSet::new(),
     };
     ns.refresh_snapshot();
     if let Some(snap) = &ns.snapshot {

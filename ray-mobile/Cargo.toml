@@ -31,6 +31,7 @@ anyhow = "1"
 libc = "0.2"
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
 
 # Android JNI bridges the Rust core needs at startup (see `android_jni`). Our
 # `.so` is loaded by JNA (not System.loadLibrary), so nothing registers the

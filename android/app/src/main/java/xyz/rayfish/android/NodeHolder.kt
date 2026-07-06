@@ -41,6 +41,12 @@ object NodeHolder {
     // Crash reporting is opt-out: on unless the user turns it off in You. See
     // [xyz.rayfish.android.Telemetry], which reads this to gate Sentry init.
     private const val KEY_CRASH_REPORTING = "crash_reporting"
+    private const val KEY_INSTALL_ID = "install_id"
+    // Auto-accept incoming file offers from the user's own paired devices. Default
+    // on: sharing to one of your own devices lands the file with no manual tap. The
+    // "own device" decision is made core-side from the device cert chain and
+    // surfaced as FileOffer.own_device; this toggle is only the opt-out.
+    private const val KEY_AUTO_ACCEPT_OWN = "auto_accept_own_devices"
 
     fun isEnabled(context: Context): Boolean =
         context.applicationContext
@@ -53,6 +59,17 @@ object NodeHolder {
             .edit().putBoolean(KEY_ENABLED, value).apply()
     }
 
+    fun isAutoAcceptOwnDevices(context: Context): Boolean =
+        context.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_AUTO_ACCEPT_OWN, true)
+
+    fun setAutoAcceptOwnDevices(context: Context, value: Boolean) {
+        context.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_AUTO_ACCEPT_OWN, value).apply()
+    }
+
     fun isCrashReportingEnabled(context: Context): Boolean =
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -62,6 +79,39 @@ object NodeHolder {
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_CRASH_REPORTING, value).apply()
+    }
+
+    /** Stable random id for this install, minted once and persisted. Tags every
+     * diagnostics event so a device's events group together in Sentry. */
+    fun installId(context: Context): String {
+        val prefs = context.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.getString(KEY_INSTALL_ID, null)?.let { return it }
+        val id = java.util.UUID.randomUUID().toString()
+        prefs.edit().putString(KEY_INSTALL_ID, id).apply()
+        return id
+    }
+
+    /** Seed the device's default hostname from the Android model on first run,
+     * so pairing auto-joins all use one consistent name. Idempotent: no-op once
+     * a name is set. Runs on the caller's (IO) context; touches config only. */
+    fun seedDeviceName(context: Context) {
+        val node = get(context)
+        val current = runCatching { node.defaultHostname() }.getOrDefault("")
+        if (current.isNotBlank()) return
+        val seed = sanitizeHostname(android.os.Build.MODEL ?: "")
+        runCatching { node.setDefaultHostname(seed) }
+    }
+
+    /** Lowercase, keep [a-z0-9-], collapse/trim hyphens, cap 63, fall back to
+     * "phone". Matches the core's is_valid_hostname rules. */
+    private fun sanitizeHostname(raw: String): String {
+        var s = raw.lowercase()
+            .replace(Regex("[^a-z0-9-]"), "-")
+            .replace(Regex("-+"), "-")
+            .trim('-')
+        if (s.length > 63) s = s.substring(0, 63).trim('-')
+        return s.ifEmpty { "phone" }
     }
 
     /**
@@ -78,6 +128,7 @@ object NodeHolder {
                 // iroh endpoint sets up TLS, which fails without it.
                 RustlsInit.ensureInitialized(context)
                 get(context).start()
+                seedDeviceName(context)
             }
             started = true
         }

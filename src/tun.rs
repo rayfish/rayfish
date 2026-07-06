@@ -27,7 +27,7 @@ use tun::{Configuration, DeviceReader, DeviceWriter};
 /// fake in tests. Reading into caller-owned spare capacity keeps the forward
 /// loop's zero-copy `split_to(n).freeze()` hand-off.
 ///
-/// Contract: `Ok(0)` means "no packet this time, retry" — the forwarding loop
+/// Contract: `Ok(0)` means "no packet this time, retry", the forwarding loop
 /// treats it as a spurious wakeup and loops again. End-of-stream (e.g. an
 /// Android `VpnService` fd whose descriptor is revoked/closed) MUST surface as
 /// `Err`, never as a perpetual `Ok(0)`, or `run_mesh` would busy-spin at 100%
@@ -151,7 +151,7 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
 
 /// Assigns the TUN's own IPv6 address. The `200::/7` peer range is routed into
 /// the TUN separately by [`route_peer_range`], which must run *after* the link
-/// is up — assigning the address here at creation time (link still down) is not
+/// is up: assigning the address here at creation time (link still down) is not
 /// enough on Linux, where the kernel does not reliably install the connected
 /// route until the interface comes up.
 #[cfg(target_os = "linux")]
@@ -215,7 +215,7 @@ async fn configure_ipv6(tun_name: &str, addr: Ipv6Addr) -> Result<()> {
 /// whereas it re-installs the IPv4 `100.64.0.0/10` connected route from the /10
 /// netmask automatically on link-up. On macOS the point-to-point utun installs
 /// neither range reliably, so *both* `100.64.0.0/10` and `200::/7` are added
-/// explicitly. Idempotent — safe to call on every `up` cycle.
+/// explicitly. Idempotent, safe to call on every `up` cycle.
 #[cfg(target_os = "linux")]
 pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     use futures::TryStreamExt;
@@ -260,7 +260,7 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
 #[cfg(target_os = "macos")]
 pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     // utun is point-to-point, so the address prefix alone does not reliably
-    // create the range route — we add both families explicitly. The IPv4 `/10`
+    // create the range route, we add both families explicitly. The IPv4 `/10`
     // is only installed implicitly by the `tun` crate at device creation and
     // macOS drops it across an `up`/`down` cycle, so (like the IPv6 `/7`) we
     // re-add it on every activate or peers become unreachable over IPv4 while
@@ -286,7 +286,7 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
 /// host route so that packets from the kernel addressed to that IP are delivered
 /// to the TUN device (and thus intercepted by our DNS server) rather than going
 /// out the host's default gateway. The IP is **never** assigned as a local
-/// interface address — it is a route-only entry. Idempotent across `up`/`down`.
+/// interface address, it is a route-only entry. Idempotent across `up`/`down`.
 #[cfg(target_os = "linux")]
 pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
     use futures::TryStreamExt;
@@ -360,7 +360,7 @@ pub async fn route_magic_dns(_tun_name: &str) -> Result<()> {
 
 /// Install host routes for our *own* dual-stack addresses via the loopback
 /// interface so traffic to ourselves (e.g. `ping dario.field.ray` resolving to
-/// our own IP) is short-circuited locally instead of being sent out the TUN —
+/// our own IP) is short-circuited locally instead of being sent out the TUN,
 /// where the forwarding loop would drop it as "no peer for dst".
 ///
 /// On a normal broadcast interface macOS auto-installs a `<own-ip> -> lo0` route

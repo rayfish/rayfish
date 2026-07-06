@@ -8,7 +8,7 @@ use std::io::IsTerminal;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Hard override that forces all styling, spinners, and interactive UI off —
+/// Hard override that forces all styling, spinners, and interactive UI off,
 /// set once by `--json` so machine-readable output is never colorized.
 static PLAIN: AtomicBool = AtomicBool::new(false);
 
@@ -47,7 +47,7 @@ fn paint(code: &str, s: &str) -> String {
     }
 }
 
-// Palette — mirrors the rose/emerald/zinc identity used on the website mockup.
+// Palette: mirrors the rose/emerald/zinc identity used on the website mockup.
 /// Brand accent (the prompt, join codes). rose-400-ish.
 pub fn rose(s: &str) -> String {
     paint("38;5;204", s)
@@ -64,7 +64,7 @@ pub fn label(s: &str) -> String {
 pub fn faint(s: &str) -> String {
     paint("38;5;240", s)
 }
-/// Primary value text — bright and readable.
+/// Primary value text, bright and readable.
 pub fn value(s: &str) -> String {
     paint("38;5;252", s)
 }

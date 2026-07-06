@@ -12,6 +12,7 @@
 //! `IpcMessage` results to the UniFFI records below.
 
 mod android_tun;
+mod diag;
 
 /// JNI bridge that hands the Android `JavaVM` + app `Context` to the two Rust
 /// dependencies that need them: `ndk-context` (so iroh-dns can read the system
@@ -68,6 +69,7 @@ use rayfish::control;
 use rayfish::daemon::{DaemonState, build_headless};
 use rayfish::deeplink::{self, RayfishLink};
 use rayfish::firewall::{Action, Direction, Protocol};
+use rayfish::hostname;
 use rayfish::identity;
 use rayfish::invite;
 use rayfish::ipc::IpcMessage;
@@ -146,6 +148,29 @@ pub struct Status {
     pub pending_networks: Vec<String>,
 }
 
+/// One network's liveness, for the health snapshot.
+#[derive(uniffi::Record)]
+pub struct NetworkHealth {
+    pub name: String,
+    pub connected: bool,
+}
+
+/// Lightweight health vitals for auto-telemetry. Cheap to build (reads a status
+/// snapshot + the diagnostics counters); safe to call before `start`.
+#[derive(uniffi::Record)]
+pub struct HealthSnapshot {
+    pub running: bool,
+    pub network_count: u32,
+    pub peers_online: u32,
+    pub networks: Vec<NetworkHealth>,
+    pub mesh_up: bool,
+    pub node_id: String,
+    pub mesh_ipv4: String,
+    pub warn_count: u64,
+    pub error_count: u64,
+    pub recent_errors: Vec<String>,
+}
+
 /// One firewall rule as shown in the UI.
 #[derive(uniffi::Record)]
 pub struct FirewallRuleInfo {
@@ -174,6 +199,9 @@ pub struct FileOffer {
     pub filename: String,
     pub size: u64,
     pub mime_type: String,
+    /// True when the sender is one of this user's own paired devices. The UI
+    /// auto-accepts these (own-device shares) without a manual tap.
+    pub own_device: bool,
 }
 
 /// A pending request awaiting the user's decision: an incoming `ray connect`
@@ -311,6 +339,9 @@ impl Node {
     /// `RAYFISH_CONFIG_DIR`, which `config::config_dir()` honors on Android.
     #[uniffi::constructor]
     pub fn new(config_dir: String) -> Arc<Self> {
+        // Capture the core's tracing output for Android diagnostics. Idempotent;
+        // safe to call once per process (Node is a process singleton).
+        diag::install();
         // SAFETY-ish: set before any core call reads config. Single-threaded at
         // construction time.
         unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", &config_dir) };
@@ -367,7 +398,7 @@ impl Node {
             invite,
             coordinator,
             false, // auto_accept_firewall
-            false, // auto_accept_files
+            true,  // auto_accept_files (own-device offers, identity-checked)
         ));
 
         match result {
@@ -472,6 +503,30 @@ impl Node {
         }
     }
 
+    /// The device's default hostname (seeds every join, incl. pairing
+    /// auto-joins). Empty when unset. Config-only; safe before `start`.
+    pub fn default_hostname(&self) -> String {
+        config::load()
+            .ok()
+            .and_then(|c| c.default_hostname)
+            .unwrap_or_default()
+    }
+
+    /// Set the device's default hostname. Validated with the core's hostname
+    /// rules; rejected names leave the stored value untouched. Config-only;
+    /// safe before `start`.
+    pub fn set_default_hostname(&self, name: String) -> Result<(), RayError> {
+        if !hostname::is_valid_hostname(&name) {
+            return Err(RayError::BadCode(format!(
+                "invalid hostname '{name}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
+            )));
+        }
+        let mut cfg = config::load().map_err(RayError::network)?;
+        cfg.default_hostname = Some(name);
+        config::save_settings(&cfg).map_err(RayError::network)?;
+        Ok(())
+    }
+
     /// Current firewall posture and rules.
     pub fn firewall_show(&self) -> Result<FirewallStateInfo, RayError> {
         let state = self.state()?;
@@ -564,6 +619,25 @@ impl Node {
 
     // --- Notifications: pending file offers, connect requests, join requests ---
 
+    /// Send a file to a peer. `path` is a readable file path (the core reads its
+    /// bytes and adds them to the blob store); `peer` is any identifier the core
+    /// resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+    /// Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
+    /// (or auto-accepts if it is one of the sender's own paired devices). Needs
+    /// only the control plane ([`Node::start`]), not the tunnel, but the peer must
+    /// be reachable. Runs to completion synchronously; callers drive it off the UI
+    /// thread (Android's share flow runs it in a foreground service).
+    pub fn send_file(&self, path: String, peer: String) -> Result<(), RayError> {
+        let state = self.state()?;
+        match self.runtime.block_on(state.send_file(&path, &peer)) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!(
+                "unexpected send response: {other:?}"
+            ))),
+        }
+    }
+
     /// Incoming file offers waiting to be accepted or declined.
     pub fn list_file_offers(&self) -> Result<Vec<FileOffer>, RayError> {
         let state = self.state()?;
@@ -576,6 +650,7 @@ impl Node {
                     filename: f.filename,
                     size: f.size,
                     mime_type: f.mime_type,
+                    own_device: f.own_device,
                 })
                 .collect()),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
@@ -747,6 +822,21 @@ impl Node {
         }
     }
 
+    /// Unpair this device from its primary: leave every network it joined under
+    /// the shared identity (peers drop it right away) and delete the stored
+    /// device cert. Only meaningful when [`Node::is_paired`] is true; a node with
+    /// no cert returns an error. Requires [`Node::start`].
+    pub fn unpair(&self) -> Result<(), RayError> {
+        let state = self.state()?;
+        match self.runtime.block_on(state.unpair_self()) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::PairFailed(message)),
+            other => Err(RayError::PairFailed(format!(
+                "unexpected unpair response: {other:?}"
+            ))),
+        }
+    }
+
     /// Point the Magic DNS resolver at the phone's real DNS servers so
     /// non-`.ray` queries are forwarded instead of refused. On Android there is
     /// no `resolv.conf` to capture (the desktop path), so the platform reads the
@@ -896,7 +986,7 @@ impl Node {
             .unwrap_or_else(|| {
                 (
                     rayfish::membership::derive_ip(&endpoint_id).to_string(),
-                    String::new(),
+                    rayfish::membership::derive_ipv6(&endpoint_id).to_string(),
                 )
             });
 
@@ -909,6 +999,39 @@ impl Node {
             networks: detail,
             pending_networks,
         }
+    }
+
+    /// Lightweight health vitals for auto-telemetry. Reuses `status()` for mesh
+    /// state and reads the diagnostics counters. Cumulative WARN/ERROR counts
+    /// (since process start); reading does not reset them.
+    pub fn health_snapshot(&self) -> HealthSnapshot {
+        let s = self.status();
+        let networks: Vec<NetworkHealth> = s
+            .networks
+            .iter()
+            .map(|n| NetworkHealth {
+                name: n.name.clone(),
+                connected: n.peers.iter().any(|p| p.online),
+            })
+            .collect();
+        let peers_online = s.peers.iter().filter(|p| p.online).count() as u32;
+        HealthSnapshot {
+            running: s.running,
+            network_count: s.networks.len() as u32,
+            peers_online,
+            networks,
+            mesh_up: peers_online > 0,
+            node_id: s.node_id.chars().take(10).collect(),
+            mesh_ipv4: s.ipv4.clone(),
+            warn_count: diag::warn_count(),
+            error_count: diag::error_count(),
+            recent_errors: diag::recent_errors(),
+        }
+    }
+
+    /// The full buffered core log, for the "Send diagnostics" button.
+    pub fn log_snapshot(&self) -> String {
+        diag::snapshot()
     }
 
     /// Follow a `rayfish://join/<code>` or `rayfish://pair/<ticket>` deep link,
@@ -938,5 +1061,30 @@ impl Node {
             return self.pair(code).map(|()| LinkAction::Paired);
         }
         self.join(code).map(LinkAction::Joined)
+    }
+}
+
+#[cfg(test)]
+mod device_name_tests {
+    use super::*;
+
+    #[test]
+    fn set_default_hostname_persists_and_rejects_invalid() {
+        // Isolated config dir; Node::new points RAYFISH_CONFIG_DIR at it.
+        let dir = std::env::temp_dir().join(format!("rayfish-dn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = Node::new(dir.to_string_lossy().to_string());
+
+        node.set_default_hostname("my-phone".into()).unwrap();
+        assert_eq!(node.default_hostname(), "my-phone");
+        assert_eq!(
+            rayfish::config::load().unwrap().default_hostname.as_deref(),
+            Some("my-phone")
+        );
+
+        // Invalid name is rejected and does not overwrite the stored value.
+        assert!(node.set_default_hostname("BAD NAME".into()).is_err());
+        assert_eq!(node.default_hostname(), "my-phone");
     }
 }

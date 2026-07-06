@@ -18,16 +18,16 @@ use crate::config::ServerOverride;
 use std::sync::Arc;
 
 /// ALPN for the file-transfer protocol. The trailing `/1` is its protocol
-/// version — **bump it (`/2`, …) on any breaking change to the file wire
+/// version, **bump it (`/2`, …) on any breaking change to the file wire
 /// protocol** (`FileOffer`/blob handshake). iroh negotiates the ALPN at the QUIC
 /// handshake, so a peer on a different version shares no common ALPN and the
-/// transfer simply can't connect — the version gate needs no in-band check.
+/// transfer simply can't connect: the version gate needs no in-band check.
 pub const FILES_ALPN: &[u8] = b"rayfish/files/1";
 
 /// Identity-level ALPN for the `ray connect` friend-request handshake. Unlike
-/// `network_alpn`, this is not per-network — it accepts connection requests
+/// `network_alpn`, this is not per-network: it accepts connection requests
 /// addressed to this node's contact key. The trailing `/1` is its protocol
-/// version — **bump it on any breaking change to the `ConnectMsg` handshake**;
+/// version, **bump it on any breaking change to the `ConnectMsg` handshake**;
 /// peers on different versions can't negotiate a connection (transport-enforced).
 pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/1";
 
@@ -43,12 +43,12 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// Mesh wire-protocol version, embedded in the single mesh ALPN. Bump this on any
 /// breaking change to the mesh control/forwarding protocol. Because iroh negotiates
 /// the ALPN during the QUIC handshake, two peers on different mesh versions share no
-/// common ALPN and simply cannot connect — the version gate is enforced by the
+/// common ALPN and simply cannot connect: the version gate is enforced by the
 /// transport, with no in-band handshake.
 ///
 /// Bumped to 2 for the single-connection-per-identity change: one mesh ALPN carries
-/// every shared network (network selection is now in-band — a `ControlFrame.net`
-/// per control message and a `u16` handle tag per datagram — not encoded in the
+/// every shared network (network selection is now in-band, a `ControlFrame.net`
+/// per control message and a `u16` handle tag per datagram, not encoded in the
 /// ALPN as it was in v1's `rayfish/net/<v>/<prefix>`).
 pub const MESH_PROTOCOL_VERSION: u32 = 2;
 
@@ -128,7 +128,7 @@ async fn bind_endpoint(
         //     on the hot path (see `forward::run_mesh`).
         // The congestion controller stays at the noq default (Cubic). Switching to
         // BBR3 would help on lossy/shallow-buffer consumer uplinks but requires a
-        // `noq-proto` dependency to reach the config type — deferred to a measured
+        // `noq-proto` dependency to reach the config type, deferred to a measured
         // follow-up (see iroh-audit BASELINE.md, cross-parameter sweep).
         .transport_config(quic_transport_config());
 
@@ -243,8 +243,8 @@ pub async fn connect_to_peer_with_alpn(
     let conn = match ep.connect(addr, alpn).await {
         Ok(conn) => conn,
         // An ALPN mismatch fails the QUIC/TLS handshake opaquely. Map that one
-        // case to an actionable hint (it's a heuristic — a peer that isn't
-        // running rayfish at all looks similar — hence "may be").
+        // case to an actionable hint (it's a heuristic: a peer that isn't
+        // running rayfish at all looks similar, hence "may be").
         Err(e) if is_alpn_mismatch(&e.to_string()) => {
             return Err(e).context(
                 "no shared protocol with peer — it may be running an incompatible \

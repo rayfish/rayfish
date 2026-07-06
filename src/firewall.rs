@@ -1,15 +1,15 @@
 //! Local device firewall for VPN traffic flowing through the TUN device.
 //!
-//! ## Scope — what is and isn't filtered
+//! ## Scope: what is and isn't filtered
 //!
 //! This firewall only inspects **IP packets carried inside the VPN** (datagrams
 //! read from the TUN device on the outbound side, and QUIC datagrams from peers
-//! on the inbound side — see `forward::run_mesh` / `forward::evaluate_inbound`).
+//! on the inbound side, see `forward::run_mesh` / `forward::evaluate_inbound`).
 //!
 //! The rayfish/iroh **control plane** (`Welcome`, `MemberSync`, `BlobUpdated`,
 //! `MeshHello`, …) travels over QUIC *bidirectional streams*,
 //! not datagrams, and the iroh transport itself runs on the host's real network
-//! interfaces — neither ever enters the TUN device. **The firewall therefore
+//! interfaces, neither ever enters the TUN device. **The firewall therefore
 //! cannot block rayfish/iroh connections**, regardless of rules. Blocking the VPN
 //! transport itself is deliberately impossible from the firewall policy.
 //!
@@ -37,7 +37,7 @@
 //! scan matches first. It shows up in `ray firewall show` like any other rule, so
 //! a user who wants to deny ICMP simply removes it (`ray firewall remove <i>`),
 //! after which inbound ICMP falls through to the deny default. (An explicit
-//! `deny in icmp` rule ordered before it also blocks it — explicit rules always
+//! `deny in icmp` rule ordered before it also blocks it: explicit rules always
 //! win, first-match.)
 //!
 //! ## Stateful behaviour
@@ -138,8 +138,8 @@ pub fn ssh_passthrough_rule() -> FirewallRule {
     }
 }
 
-/// Two rules have the same *selector* if they match the same traffic —
-/// direction, protocol, port, peer, and network — regardless of `action` or
+/// Two rules have the same *selector* if they match the same traffic:
+/// direction, protocol, port, peer, and network, regardless of `action` or
 /// `origin`. Used by `ray firewall add` to merge a contradicting/duplicate rule
 /// (drop the old same-selector entry, keep only the new one) so the rule list
 /// stays bounded instead of accumulating shadowed rules on every toggle.
@@ -175,7 +175,7 @@ pub struct FirewallRule {
     pub peer: PeerFilter,
     /// Restrict the rule to traffic on a specific network. `None` (the default,
     /// so older `firewall.toml` files keep working) matches any network. Lets a
-    /// multi-homed host scope a rule to the network a packet arrived on — e.g.
+    /// multi-homed host scope a rule to the network a packet arrived on, e.g.
     /// "allow :8080 only from peers reached via `db`".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
@@ -193,7 +193,7 @@ pub struct FirewallConfig {
     /// out of the box). Inbound ICMP is allowed-by-default *before* this falls
     /// through (so `ping`/reachability works), unless an explicit `deny in icmp`
     /// rule overrides it. Older `firewall.toml` files that predate the split (and
-    /// carried a single `default_action`) deserialize with this serde default —
+    /// carried a single `default_action`) deserialize with this serde default,
     /// i.e. they too become deny-inbound on upgrade.
     #[serde(default = "default_inbound_action")]
     pub default_inbound: Action,
@@ -231,7 +231,7 @@ fn default_outbound_action() -> Action {
 /// The seeded "allow inbound ICMP from any peer" rule that ships in a fresh
 /// firewall config. It is an ordinary `Local`, first-match rule (not a magic
 /// default), so `ray firewall show` lists it and `ray firewall remove <i>`
-/// deletes it — removing it makes the inbound default deny ICMP too.
+/// deletes it: removing it makes the inbound default deny ICMP too.
 pub fn default_icmp_rule() -> FirewallRule {
     FirewallRule {
         direction: Direction::In,
@@ -251,7 +251,7 @@ impl Default for FirewallConfig {
             default_outbound: default_outbound_action(),
             reject: false,
             disabled: false,
-            // Ship inbound TCP/UDP denied but inbound ICMP allowed — as a visible,
+            // Ship inbound TCP/UDP denied but inbound ICMP allowed, as a visible,
             // removable rule rather than a hard-coded special case.
             rules: vec![default_icmp_rule()],
         }
@@ -337,7 +337,7 @@ impl SharedFirewall {
     }
 
     /// The default action for a packet that matched no explicit rule, by
-    /// direction. Inbound ICMP is *not* special-cased here — it is allowed by a
+    /// direction. Inbound ICMP is *not* special-cased here: it is allowed by a
     /// seeded, removable `allow in icmp` rule (see [`default_icmp_rule`]) that the
     /// rule scan matches first, so the user can delete it to deny ICMP.
     fn default_for(&self, direction: Direction) -> Action {
@@ -380,7 +380,7 @@ impl SharedFirewall {
     /// (`forward.rs`) calls. See the module docs for the full semantics.
     ///
     /// Order:
-    /// 1. Explicit rules (first-match wins) — for both directions.
+    /// 1. Explicit rules (first-match wins), for both directions.
     /// 2. If outbound and permitted: record/refresh the flow so the peer's return
     ///    traffic is recognized. Denied outbound is never tracked (otherwise a
     ///    denied connection could whitelist its own return traffic).
@@ -435,7 +435,7 @@ impl SharedFirewall {
                 // sever this device's own outbound connections.
                 //
                 // ICMP is the exception: an echo-*request* is always new inbound
-                // (someone pinging us), never return traffic — only an
+                // (someone pinging us), never return traffic: only an
                 // echo-*reply* answers a ping we sent. So conntrack may rescue an
                 // inbound ICMP packet only when it's a reply; a request must face
                 // the rules/default. Without this, a request and reply share a
@@ -570,7 +570,7 @@ pub struct PacketInfo {
     pub tcp_flags: u8,
     /// ICMP/ICMPv6 type byte (offset 0 of the ICMP header). 0 for non-ICMP.
     /// Lets conntrack distinguish an echo-request (new inbound) from an
-    /// echo-reply (return traffic) — ICMP has no ports, so without the type a
+    /// echo-reply (return traffic): ICMP has no ports, so without the type a
     /// request and a reply collapse to the same flow.
     pub icmp_type: u8,
     /// ICMP echo identifier (offset 4..6 of the ICMP header) for echo
@@ -584,14 +584,14 @@ fn is_icmp(proto: u8) -> bool {
     proto == 1 || proto == 58
 }
 
-/// True for an ICMP echo-*request* (ICMPv4 type 8 / ICMPv6 type 128) — the
+/// True for an ICMP echo-*request* (ICMPv4 type 8 / ICMPv6 type 128), the
 /// packet `ping` sends. Only an echo-request *we* initiate establishes a
 /// trackable flow.
 fn is_icmp_echo_request(proto: u8, icmp_type: u8) -> bool {
     (proto == 1 && icmp_type == 8) || (proto == 58 && icmp_type == 128)
 }
 
-/// True for an ICMP echo-*reply* (ICMPv4 type 0 / ICMPv6 type 129) — the answer
+/// True for an ICMP echo-*reply* (ICMPv4 type 0 / ICMPv6 type 129), the answer
 /// to a ping. Only an echo-reply can be conntrack return traffic for an
 /// outbound echo-request.
 fn is_icmp_echo_reply(proto: u8, icmp_type: u8) -> bool {
@@ -778,14 +778,14 @@ pub fn parse_port_list(s: &str) -> Result<Vec<PortRange>> {
 
 /// Parse a single suggested-firewall spec token into (protocol, optional port).
 ///
-/// Grammar (protocol is always explicit — no bare-number back-compat):
+/// Grammar (protocol is always explicit, no bare-number back-compat):
 /// - `tcp:22`, `tcp:80-443`, `tcp:*` → TCP with a port / range / wildcard
 /// - `udp:53`, `udp:*`              → UDP
 /// - `icmp`                         → ICMP (port-less; `:*` ignored)
 /// - `any` / `any:*`                → every protocol, every port
 /// - bare `tcp` / `udp`             → all ports of that protocol
 ///
-/// A bare number (`"22"`) is rejected — use `tcp:22`. Comma-separated tokens
+/// A bare number (`"22"`) is rejected: use `tcp:22`. Comma-separated tokens
 /// (`tcp:22,icmp`) are split by the caller, which produces one rule each.
 pub fn parse_spec_token(tok: &str) -> Result<(Protocol, Option<PortRange>)> {
     let tok = tok.trim();
@@ -828,11 +828,11 @@ pub fn parse_spec_token(tok: &str) -> Result<(Protocol, Option<PortRange>)> {
 /// from `suggestions` targeting `my_hostname`. Two subjects apply to a node: its
 /// own hostname and the wildcard `*` subject (which targets every node, e.g.
 /// "everyone opens 6969"). Peer hostnames are resolved to identities via
-/// `resolve` (the blob's member list); unresolved peers are skipped — their rules
+/// `resolve` (the blob's member list); unresolved peers are skipped, their rules
 /// materialize once they join. The `*` peer key means *any peer* and bypasses
 /// resolution. Every rule is inbound, network-scoped to `net`, and tagged
 /// `origin: Network(net)`. Suggestions are purely additive: each token yields
-/// exactly one rule (allow or deny) and nothing is synthesized — the node's own
+/// exactly one rule (allow or deny) and nothing is synthesized: the node's own
 /// `default_inbound` (Deny by default) already covers anything an allow-list
 /// leaves out, so no catch-all deny is appended. Each port spec token is
 /// `proto:ports` or a bare proto keyword (`icmp`, `any`, `tcp`); a comma-separated
@@ -889,7 +889,7 @@ pub fn materialize_suggestions(
     // Suggestions are purely additive: each token becomes one rule, allow or
     // deny, and nothing else is synthesized. A node's own `default_inbound`
     // (Deny by default) already drops everything an allow-list doesn't cover,
-    // so we don't append a network-scoped catch-all deny — it would only be
+    // so we don't append a network-scoped catch-all deny, it would only be
     // redundant under the deny default and would surprise operators reviewing
     // `ray firewall pending` with a rule they never suggested.
     rules
@@ -1163,7 +1163,7 @@ mod tests {
     #[test]
     fn explicit_deny_in_icmp_ordered_before_seed_wins() {
         // A user-added `deny in icmp` placed ahead of the seeded allow rule blocks
-        // ICMP — first-match wins. (Equivalently, removing the seed rule denies it
+        // ICMP: first-match wins. (Equivalently, removing the seed rule denies it
         // too; see `removing_seeded_icmp_rule_denies_icmp`.)
         let deny_icmp = FirewallRule {
             direction: Direction::In,
@@ -1175,7 +1175,7 @@ mod tests {
             origin: RuleOrigin::Local,
         };
         let fw = SharedFirewall::new(FirewallConfig {
-            // deny first, then the seeded allow — the deny must win.
+            // deny first, then the seeded allow: the deny must win.
             rules: vec![deny_icmp, default_icmp_rule()],
             ..FirewallConfig::default()
         });
@@ -1319,7 +1319,7 @@ mod tests {
     #[test]
     fn rule_scoped_to_arrival_network() {
         // A deny rule scoped to network "db" must only bite traffic arriving via
-        // "db" — letting a multi-homed host (in `db` and `dev`) restrict a peer
+        // "db", letting a multi-homed host (in `db` and `dev`) restrict a peer
         // on one network while leaving the other untouched.
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Allow,
@@ -1921,7 +1921,7 @@ mod tests {
         // The conntrack ICMP leak: with the allow-icmp rule removed and a
         // deny-inbound default, a recent *outbound* ping to a peer must NOT let
         // that peer ping us back in. An inbound echo-request is always new
-        // inbound traffic, never "return traffic" — even with the same echo id.
+        // inbound traffic, never "return traffic", even with the same echo id.
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
@@ -2118,7 +2118,7 @@ mod tests {
             "peer" => Some(peer),
             _ => None,
         };
-        // An allow-list yields exactly its allow rules — no synthesized catch-all
+        // An allow-list yields exactly its allow rules, no synthesized catch-all
         // deny. The node's own `default_inbound` already drops the rest.
         let suggestions = suggest("me", &[("peer", "tcp:9000")]);
         let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
@@ -2134,7 +2134,7 @@ mod tests {
     #[test]
     fn materialize_deny_only_blacklist_no_catch_all() {
         // A subject with only `denies` (blacklist mode) does NOT get a
-        // catch-all deny — the listed peer is blocked, the rest stays open.
+        // catch-all deny: the listed peer is blocked, the rest stays open.
         let me = test_id(1);
         let eve = test_id(3);
         let resolve = |h: &str| match h {

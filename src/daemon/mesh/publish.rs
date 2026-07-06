@@ -29,6 +29,7 @@ pub(crate) fn spawn_network_publisher(
                             &s.suggested_firewall,
                             s.network_name.as_deref(),
                             &s.reusable_keys,
+                            &s.nullifiers,
                         )
                     })
             };
@@ -117,6 +118,7 @@ pub(crate) fn spawn_lazy_publisher(
                             &s.suggested_firewall,
                             s.network_name.as_deref(),
                             &s.reusable_keys,
+                            &s.nullifiers,
                         )
                     })
             };

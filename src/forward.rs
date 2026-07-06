@@ -76,7 +76,7 @@ pub(crate) const SSH_LISTEN_PORT: u16 = 30022;
 /// server's internal listen port ([`SSH_LISTEN_PORT`]). The kernel
 /// won't let us bind `<mesh-ip>:22` alongside a host sshd on `0.0.0.0:22`, so
 /// instead of an OS-firewall redirect (which would be Linux-only) we translate
-/// the port inside our own forwarding path — portable across every platform the
+/// the port inside our own forwarding path, portable across every platform the
 /// TUN runs on. Inbound (peer -> us) rewrites dest `22 -> listen`; outbound
 /// (us -> peer) rewrites source `listen -> 22`. Active only while `ray firewall
 /// ssh` is on.
@@ -188,7 +188,7 @@ pub(crate) enum InboundDecision {
 /// packet validity. Extracted from [`spawn_peer_reader`] so it can be unit-tested.
 ///
 /// Non-IP / truncated / oversized packets are rejected (`DropMalformed`) rather
-/// than passed through — previously such packets bypassed the firewall entirely.
+/// than passed through: previously such packets bypassed the firewall entirely.
 pub(crate) fn evaluate_inbound(
     packet: &[u8],
     firewall: &SharedFirewall,
@@ -236,8 +236,8 @@ pub const ABUSE_CODE: u32 = 0xab05e;
 
 /// Application close code a coordinator (or any member pruning a stale roster
 /// entry) sends when it removes a peer from the network (`ray kick`). On the
-/// receiving (kicked) side it is treated like [`LEAVE_CODE`] — an intentional
-/// disconnect — so the kicked node stops reconnecting instead of churning back
+/// receiving (kicked) side it is treated like [`LEAVE_CODE`], an intentional
+/// disconnect, so the kicked node stops reconnecting instead of churning back
 /// into the coordinator's pending queue. The pruning side does not observe its
 /// own close code (that read is a local close), so it relies on the shared
 /// `pruned_peers` set to suppress its reconnect loop.
@@ -312,7 +312,7 @@ pub async fn run_mesh<R: crate::tun::TunRead>(
     loop {
         // Ensure a full MTU of contiguous spare capacity before reading (a short
         // buffer would truncate the packet). `reserve` reuses the current chunk
-        // until it's exhausted, then allocates a fresh one — so allocation is
+        // until it's exhausted, then allocates a fresh one, so allocation is
         // amortized across many packets instead of paid per packet.
         if pool.capacity() < MAX_PEER_DATAGRAM {
             pool.reserve(TX_POOL_CHUNK);
@@ -327,7 +327,7 @@ pub async fn run_mesh<R: crate::tun::TunRead>(
             continue;
         }
         // Zero-copy hand-off: slice the packet out of the pool as an owned
-        // `Bytes` sharing the chunk's allocation — no copy, no per-packet malloc.
+        // `Bytes` sharing the chunk's allocation, no copy, no per-packet malloc.
         let pkt = pool.split_to(n).freeze();
         tracing::debug!(len = n, first_byte = pkt[0], "TUN read");
         let Some(info) = firewall::parse_packet_info(&pkt) else {
@@ -352,7 +352,7 @@ pub async fn run_mesh<R: crate::tun::TunRead>(
             stats.record_drop(DropReason::NoPeer);
             continue;
         };
-        // Reachability is "we share a network" — enforced by connection
+        // Reachability is "we share a network", enforced by connection
         // existence. The per-host firewall is the fine-grained gate.
         if firewall
             .evaluate_packet(
@@ -784,7 +784,7 @@ mod tests {
     }
 
     /// Compute the TCP checksum of a v4 packet (20-byte IP header) with the
-    /// checksum field treated as zero — what a correct packet's field should hold.
+    /// checksum field treated as zero, what a correct packet's field should hold.
     fn tcp_csum_v4(pkt: &[u8]) -> u16 {
         let tcp = &pkt[20..];
         let mut sum = 0u32;
@@ -865,7 +865,7 @@ mod tests {
     fn inbound_spoofed_source_ip_dropped() {
         // A packet whose source IP isn't the sending peer's assigned mesh IP is
         // dropped as spoofed, before the firewall or any in-daemon listener sees
-        // it — even when the firewall would otherwise allow it.
+        // it, even when the firewall would otherwise allow it.
         let peer = iroh::SecretKey::generate().public();
         let fw = inbound_fw(Action::Allow, vec![]);
         let pkt = make_tcp_packet(80); // sourced from TEST_V4 (100.64.0.5)

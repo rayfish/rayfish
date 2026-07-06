@@ -102,7 +102,7 @@ pub(crate) fn pluralize(n: usize, noun: &str) -> String {
 
 pub(crate) async fn ipc_status() -> Result<()> {
     let Ok(mut stream) = ipc::connect().await else {
-        // Daemon not running — show saved config
+        // Daemon not running, show saved config
         let app_config = config::load()?;
         println!();
         println!("  {}", style::red("✗ daemon not running"));
@@ -240,7 +240,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
             // Daemon/CLI version skew: after a self-update the CLI binary is new
             // but the long-running daemon may still be the old one (e.g. its
             // restart failed). Empty `daemon_version` means the daemon predates
-            // this field — say nothing rather than guess.
+            // this field: say nothing rather than guess.
             let cli_version = env!("CARGO_PKG_VERSION");
             if !daemon_version.is_empty() && daemon_version != cli_version {
                 println!();
@@ -279,11 +279,19 @@ fn print_network(net: &ipc::NetworkStatus) {
         print!("   {}", style::value(dns));
     }
     print!("   {}", style::faint(&net.my_ip.to_string()));
-    println!(
+    print!(
         "   {} {}",
         style::label("members"),
         style::value(&format!("{online}/{}", net.peers.len())),
     );
+    if let Some(ttl) = net.ephemeral_ttl_secs {
+        print!(
+            "   {} {}",
+            style::label("ephemeral"),
+            style::value(&format_ttl(ttl)),
+        );
+    }
+    println!();
 
     // Invert the local alias map (alias -> identity) for identity -> alias
     // lookups when rendering peers.
@@ -322,7 +330,7 @@ fn print_network(net: &ipc::NetworkStatus) {
         println!("    {}", style::faint("(no other members)"));
     } else {
         // `indent` strips the block's trailing newline, so use `println!` to
-        // terminate the last peer row — otherwise the network's `join <room-id>`
+        // terminate the last peer row, otherwise the network's `join <room-id>`
         // line below gets glued onto it.
         println!("{}", indent(&layout::columns(&rows, 3), 4));
     }

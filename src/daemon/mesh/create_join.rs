@@ -3,6 +3,15 @@
 
 use super::super::*;
 
+/// Upper bound on a single proactive full-mesh dial in `dial_all_members`. An
+/// offline peer's `connect` fails on its own (fast when it has no fresh
+/// discovery record, but up to iroh's internal handshake timeout (tens of
+/// seconds) when a stale record still points at it). We cap it so a
+/// restart/reconnect never blocks that long on a dead peer: the dial is
+/// best-effort and the peer's own reconnect loop re-establishes the link once it
+/// comes back online.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Borrowed bundle of the per-join inputs threaded through the dial + finalize
 /// phases of `join_network_inner`, so each phase takes one argument instead of a
 /// dozen. The references point at locals that live for the whole join.
@@ -46,12 +55,22 @@ impl MeshManager {
     /// Refresh the network's blob snapshot, store its bytes in the local blob
     /// store, and publish the network-key-signed pkarr record (blob hash + this
     /// endpoint as the seed peer). Shared by network creation and coordinator
-    /// restore — both seal a freshly built `NetworkState` and announce it.
+    /// restore: both seal a freshly built `NetworkState` and announce it.
     pub(crate) async fn seal_and_publish(
         &self,
         net_state: &mut NetworkState,
         net_secret_key: &SecretKey,
     ) {
+        // Seed this coordinated network's nullifiers from our durable
+        // `revoked_devices` set so past `ray unpair`s survive a restart and reach
+        // every network we coordinate. Union (never clears) so a nullifier adopted
+        // from a co-coordinator's blob is preserved.
+        {
+            let cfg = config::load().unwrap_or_default();
+            net_state
+                .nullifiers
+                .extend(config::revoked_device_ids(&cfg));
+        }
         net_state.refresh_snapshot();
         if let Some(snap) = &net_state.snapshot {
             let _ = self.blob_store.blobs().add_slice(&snap.msgpack_bytes).await;
@@ -110,6 +129,17 @@ impl MeshManager {
         // connection supervisor (see `MeshManager::run_connection_supervisor`), so
         // there is no per-network disconnect task any more. Callers still receive
         // the daemon-wide disconnect sender to build peer readers.
+
+        // Ephemeral policy pruner (coordinator-only): auto-remove members
+        // offline longer than the network's configured TTL. No-op while unset.
+        tasks.push(spawn_stale_member_pruner(
+            self.mesh_ctx(),
+            name.to_string(),
+            state.clone(),
+            Some(dht_notify.clone()),
+            cancel.clone(),
+        ));
+
         (tasks, self.disconnect_tx.clone())
     }
 
@@ -138,7 +168,7 @@ impl MeshManager {
     /// `direct` marks an auto-minted 2-peer `ray connect` network (persisted so
     /// `ray status` can tag it). `pre_approve` adds a peer to the `ApprovedList`
     /// before the blob is signed/published, so the named peer can be welcomed
-    /// without a separate `ray accept` round-trip — used by `approve_connection`.
+    /// without a separate `ray accept` round-trip, used by `approve_connection`.
     /// Build the initial [`NetworkState`] for a freshly created network: the
     /// creator as sole coordinator, plus any `pre_approve` peer (a `ray connect`
     /// requester) admitted up front so the published blob already carries the
@@ -163,6 +193,7 @@ impl MeshManager {
                 user_identity: None,
                 device_cert: None,
                 collision_index: 0,
+                last_seen: None,
             })
             .expect("self-add cannot collide");
 
@@ -194,6 +225,8 @@ impl MeshManager {
             mode,
             suggested_firewall: SuggestedFirewall::default(),
             reusable_keys: BTreeMap::new(),
+            // Seeded from persisted `revoked_devices` by `seal_and_publish`.
+            nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         })
@@ -281,11 +314,13 @@ impl MeshManager {
             network_public_key: Some(net_public_key),
             transport: None,
             auto_accept_firewall: false,
-            auto_accept_files: false,
+            // Own-device file offers are auto-accepted by default (identity-checked).
+            auto_accept_files: true,
             admins: vec![],
             direct,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
+            ephemeral_ttl_secs: None,
         })?;
 
         let cancel = self.shutdown_token.child_token();
@@ -451,6 +486,22 @@ impl MeshManager {
 
         let data = self.resolve_and_fetch_blob(net_pubkey).await?;
 
+        // If our own primary has nullified this device in the signed blob
+        // (`ray unpair`), tear ourselves out instead of trying (and failing) to
+        // join. This is the reliable teardown path when the device was offline at
+        // unpair time (so it never got `ControlMsg::Unpaired`) and the coordinator
+        // now rejects its cert at the mesh handshake: the blob is fetched from the
+        // record's seed peers, needs no mesh admission, and this runs on every
+        // startup restore + reconnect. Hand off to the daemon loop, which runs
+        // `unpair_self` (delete the cert + leave every network).
+        if let Some(cert) = self.current_device_cert()
+            && self_is_nullified(&cert, &data.members, &data.nullifiers)
+        {
+            tracing::warn!(network = %network_key, "this device is nullified by its primary in the signed blob; unpairing self");
+            let _ = self.self_unpair_tx.try_send(());
+            anyhow::bail!("this device has been unpaired by its primary");
+        }
+
         let alpn = transport::mesh_alpn();
         let my_ip = self.identity.local_ip();
         // Use coordinator's network name from GroupBlob, or user alias, or truncated key as fallback
@@ -482,7 +533,7 @@ impl MeshManager {
         // One invite-ledger lock for this network, shared between the join's
         // control listener (which may handle InviteShare/InviteUsed once this
         // node is promoted to co-coordinator) and the coordinator handler we may
-        // register below — so all ledger access stays serialized.
+        // register below, so all ledger access stays serialized.
         let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
 
         let ctx = JoinContext {
@@ -502,7 +553,7 @@ impl MeshManager {
         // blob's dial order (minter first) until one welcomes us; a reconnect/
         // restore uses the legacy single-coordinator handshake where the
         // coordinator speaks first. Either may return `None` (closed network,
-        // queued for `ray accept`) — propagate that to the caller as `Pending`.
+        // queued for `ray accept`), propagate that to the caller as `Pending`.
         let established = if initial {
             self.dial_fresh_join(&ctx, &data).await?
         } else {
@@ -571,7 +622,17 @@ impl MeshManager {
         // coordinator_dial_order filters it out (minter != me), so we just get
         // all blob coordinators in order.
         let minter = ctx.coordinator.unwrap_or(my_id);
-        let order = coordinator_dial_order(minter, &data.members, my_id);
+        let mut order = coordinator_dial_order(minter, &data.members, my_id);
+        // An explicitly-provided coordinator (from an invite, or the primary we
+        // just paired with) is a trusted dial target even if the fetched blob's
+        // roster does not flag it `is_coordinator`: a stale roster must not
+        // strand the join. Try it first.
+        if let Some(coord) = ctx.coordinator
+            && coord != my_id
+            && !order.contains(&coord)
+        {
+            order.insert(0, coord);
+        }
         if order.is_empty() {
             anyhow::bail!("no coordinator found in network record");
         }
@@ -621,7 +682,7 @@ impl MeshManager {
                     }));
                 }
                 Ok(JoinResult::Pending) => {
-                    // This coordinator queued the request — don't try the next;
+                    // This coordinator queued the request, don't try the next;
                     // let the caller retry with backoff until accepted.
                     abort_join_tasks(&cancel, tasks);
                     return Ok(None);
@@ -683,6 +744,7 @@ impl MeshManager {
                 mode: GroupMode::Restricted,
                 suggested_firewall: data.suggested_firewall.clone(),
                 reusable_keys: data.reusable_keys.clone(),
+                nullifiers: data.nullifiers.clone(),
                 pending_suggestions: Vec::new(),
                 pending: HashMap::new(),
             };
@@ -957,7 +1019,7 @@ impl MeshManager {
     /// Fetch the authoritative GroupBlob for a network we coordinate, used to
     /// restore the roster across a daemon restart. Resolves the pkarr record to
     /// get the blob hash, reads the bytes back from the local blob store (where
-    /// we stored them before publishing — no network round-trip), and verifies +
+    /// we stored them before publishing, no network round-trip), and verifies +
     /// decodes. Falls back to fetching from a seed peer if the local store
     /// doesn't have them (e.g. blobs dir was wiped). Returns an error if the DHT
     /// is unreachable, so the caller can fall back to the (possibly stale)
@@ -1109,6 +1171,7 @@ impl MeshManager {
                 mode: GroupMode::Restricted,
                 suggested_firewall: SuggestedFirewall::default(),
                 reusable_keys: data.reusable_keys.clone(),
+                nullifiers: data.nullifiers.clone(),
                 pending_suggestions: Vec::new(),
                 pending: HashMap::new(),
             };
@@ -1194,14 +1257,16 @@ impl MeshManager {
             if m.identity == my_identity {
                 continue;
             }
-            match transport::connect_to_peer_with_alpn(
-                &self.endpoint,
-                m.identity,
-                &transport::mesh_alpn(),
+            // Bound each dial so a dead peer with a stale discovery record can't
+            // stall restore for iroh's full internal handshake timeout; the
+            // connection supervisor retries anything still unreachable.
+            let dialed = tokio::time::timeout(
+                DIAL_TIMEOUT,
+                transport::connect_to_peer_with_alpn(&self.endpoint, m.identity, &transport::mesh_alpn()),
             )
-            .await
-            {
-                Ok(peer_conn) => {
+            .await;
+            match dialed {
+                Ok(Ok(peer_conn)) => {
                     if let Ok((mut s, _)) = peer_conn.open_bi().await {
                         let _ = control::send_msg(
                             &mut s,
@@ -1232,12 +1297,20 @@ impl MeshManager {
                         "dialed known member on restore/join (full mesh)"
                     );
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::debug!(
                         network = %network_name,
                         peer = %m.identity.fmt_short(),
                         error = %e,
                         "could not dial member yet; connection supervisor will retry"
+                    );
+                }
+                Err(_elapsed) => {
+                    tracing::debug!(
+                        network = %network_name,
+                        peer = %m.identity.fmt_short(),
+                        timeout_secs = DIAL_TIMEOUT.as_secs(),
+                        "dial timed out; connection supervisor will retry"
                     );
                 }
             }

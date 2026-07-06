@@ -46,7 +46,7 @@ impl MeshManager {
         // normalize to the value the data plane actually compares against, which
         // differs by direction: inbound matches `device_user_map.resolve(...)`
         // (the peer's user identity for a paired/multi-device peer, else its
-        // device id — so an `in` rule keyed on the user id matches every one of
+        // device id, so an `in` rule keyed on the user id matches every one of
         // that user's devices), while outbound matches the raw device id. Same
         // reasoning as the SSH-allow handler below.
         let peer = match peer {
@@ -175,7 +175,7 @@ impl MeshManager {
         update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
         // Nudge connected members to reconverge from the freshly-published signed
         // record now, instead of waiting up to 60s for the group poller. Like the
-        // rename flow, this is a payload-free trigger — the suggestions still come
+        // rename flow, this is a payload-free trigger, the suggestions still come
         // exclusively from the network-key-signed blob, never from this message.
         let net_pubkey = state.read().unwrap().network_public_key;
         broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
@@ -377,7 +377,7 @@ impl MeshManager {
     }
 
     /// `ray firewall default allow|deny` flips the **inbound** default (the
-    /// outbound default stays `Allow` — you always initiate freely). `allow`
+    /// outbound default stays `Allow`, you always initiate freely). `allow`
     /// restores the old permissive inbound posture; `deny` is the secure default.
     /// Inbound ICMP-allow is a separate built-in default and is unaffected.
     pub fn firewall_default(&self, action: firewall::Action) -> IpcMessage {

@@ -373,8 +373,8 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
 ///
 /// The grammar is `PEER:proto:ports`, but the leading `PEER:` is optional: when
 /// the value begins with a protocol keyword (`tcp`/`udp`/`icmp`/`any`) the peer
-/// defaults to `*` (any peer). So `tcp:22` is read as "tcp/22 from any peer" —
-/// the intuitive form — instead of "any port from a peer named `tcp`", which
+/// defaults to `*` (any peer). So `tcp:22` is read as "tcp/22 from any peer"
+/// (the intuitive form) instead of "any port from a peer named `tcp`", which
 /// would silently drop on the joiner (unresolvable hostname) and materialize no
 /// rule at all, inverting the intent.
 pub(crate) fn parse_suggest_token(spec: &str, flag: &str) -> Result<(String, String)> {
@@ -462,13 +462,13 @@ pub(crate) async fn ipc_firewall_suggest(
 
 /// `ray apply <spec>`: reconcile trusted networks against a deploy spec.
 ///
-/// B2 — orchestrator: for each network in the spec, `Create { trusted }` if it
+/// B2, orchestrator: for each network in the spec, `Create { trusted }` if it
 /// isn't active, then publish the spec's `firewall` block as suggestions
-/// (idempotent — always replaces the live set). `--prune` limits the published
+/// (idempotent: always replaces the live set). `--prune` limits the published
 /// set to subjects present in the spec, dropping any live suggestions for
 /// hosts no longer mentioned. Never joins.
 ///
-/// B3 — membership diff: expected hosts = union of hostnames in the spec's
+/// B3, membership diff: expected hosts = union of hostnames in the spec's
 /// `firewall:` blocks; joined hosts = hostnames from `Status` (this node +
 /// peers). Reports the gap and prints hostname-bound invite commands; with
 /// `--invite-missing` mints them via IPC.
@@ -568,7 +568,7 @@ pub(crate) async fn ipc_apply(
 
         // Publish suggestions (idempotent). With --prune, publish exactly the
         // spec's set; without it, merge into the live set (so `apply` never
-        // silently drops subjects authored out-of-band — use --prune for that).
+        // silently drops subjects authored out-of-band - use --prune for that).
         let to_publish = if prune {
             net_firewall.clone()
         } else {
@@ -586,7 +586,7 @@ pub(crate) async fn ipc_apply(
             Err(e) => eprintln!("{}   suggest failed: {e}", style::red("  !")),
         }
 
-        // B3 — membership diff for this network.
+        // B3, membership diff for this network.
         let joined = joined_hostnames(&status_networks, net_name);
         for host in apply::expected_hosts(&expanded) {
             if !joined.iter().any(|j| j == &host) {
@@ -595,7 +595,7 @@ pub(crate) async fn ipc_apply(
         }
     }
 
-    // B3 — report the membership gap.
+    // B3, report the membership gap.
     if missing_hosts.is_empty() {
         println!("{}", style::green("All expected hosts have joined."));
     } else {
@@ -877,6 +877,7 @@ mod tests {
             pending_suggestions: 0,
             pending_requests: 0,
             aliases: Default::default(),
+            ephemeral_ttl_secs: None,
         }
     }
 

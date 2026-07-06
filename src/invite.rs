@@ -2,7 +2,7 @@
 //!
 //! An invite is a single-use, expiring credential that lets a new machine join a
 //! closed network without live operator approval. The coordinator mints invites
-//! and is the *only* node that can verify and burn them — the ledger lives on the
+//! and is the *only* node that can verify and burn them: the ledger lives on the
 //! coordinator's machine at `~/.config/rayfish/invites/<network>.toml` and is
 //! never published into the GroupBlob.
 //!
@@ -33,7 +33,7 @@ pub enum InviteStatus {
 }
 
 /// A single invite record. `secret_hash` (not the secret) is persisted, like a
-/// password hash — the raw secret only ever exists in the code handed to the joiner.
+/// password hash: the raw secret only ever exists in the code handed to the joiner.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invite {
     /// Short human id: the first 8 hex chars of `blake3(secret)`.
@@ -79,7 +79,7 @@ pub struct InviteStore {
 
 /// Current Unix time in seconds. Invite expiry uses wall-clock time, so a large
 /// backward clock adjustment on the coordinator could briefly un-expire an
-/// invite (or a forward jump expire one early) — acceptable for a TTL credential.
+/// invite (or a forward jump expire one early), acceptable for a TTL credential.
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -87,7 +87,7 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Hex blake3 of a secret — the canonical `secret_hash` form the ledger stores
+/// Hex blake3 of a secret: the canonical `secret_hash` form the ledger stores
 /// and the form gossiped to co-coordinators (as UTF-8 bytes on the wire).
 pub(crate) fn hash_secret(secret: &[u8]) -> String {
     blake3::hash(secret).to_hex().to_string()

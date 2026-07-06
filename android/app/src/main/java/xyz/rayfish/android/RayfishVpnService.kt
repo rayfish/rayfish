@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
@@ -30,6 +31,9 @@ class RayfishVpnService : VpnService() {
 
     @Volatile
     private var tunnel: ParcelFileDescriptor? = null
+    // Polls for incoming own-device file offers and auto-accepts them, so files
+    // shared to this device land in Downloads even with the app UI closed.
+    private var autoAcceptPoller: java.util.concurrent.ScheduledExecutorService? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -55,14 +59,15 @@ class RayfishVpnService : VpnService() {
 
         // Bring the control plane up before building the tunnel so status() can
         // report our real mesh IP. ensureStarted is idempotent.
-        val meshIp = try {
+        val (meshIp, meshV6) = try {
             runBlocking {
                 NodeHolder.ensureStarted(applicationContext)
-                NodeHolder.get(applicationContext).status().ipv4
+                val snapshot = NodeHolder.get(applicationContext).status()
+                snapshot.ipv4 to snapshot.ipv6
             }
         } catch (t: Throwable) {
             Log.e(TAG, "could not read mesh IP before tunnel build", t)
-            ""
+            "" to ""
         }
         // Fall back to the CGNAT base if we have no networks yet, so the tunnel
         // still establishes.
@@ -92,6 +97,22 @@ class RayfishVpnService : VpnService() {
             .addSearchDomain("ray")
             .setMtu(1280)
 
+        // Route the mesh IPv6 range through the tunnel (mirrors the desktop
+        // 200::/7 route). Skipped if we have no v6 address to bind.
+        if (meshV6.isNotBlank()) {
+            builder.addAddress(meshV6, 128)
+            builder.addRoute("200::", 7)
+        }
+        // Keep VPN-hostile apps (Android Auto, casting, RCS, Sonos) off the
+        // tunnel. Each add is guarded: an uninstalled package must not abort setup.
+        for (pkg in DISALLOWED_APPS) {
+            try {
+                builder.addDisallowedApplication(pkg)
+            } catch (_: PackageManager.NameNotFoundException) {
+                Log.i(TAG, "disallowed app not installed, skipping: $pkg")
+            }
+        }
+
         val pfd = builder.establish()
         if (pfd == null) {
             Log.e(TAG, "VpnService.Builder.establish() returned null; tunnel not up")
@@ -118,6 +139,17 @@ class RayfishVpnService : VpnService() {
             } catch (t: Throwable) {
                 Log.e(TAG, "Node bring-up failed", t)
             }
+        }
+
+        // Auto-accept own-device file offers while the tunnel is up, so a file
+        // shared to this device from one of the user's own devices lands in
+        // Downloads without the app being open. Gated by the user's opt-out toggle
+        // inside FileAutoAccept.run.
+        autoAcceptPoller = java.util.concurrent.Executors.newSingleThreadScheduledExecutor().also { exec ->
+            exec.scheduleWithFixedDelay(
+                { runCatching { FileAutoAccept.run(applicationContext) } },
+                4, 4, java.util.concurrent.TimeUnit.SECONDS,
+            )
         }
     }
 
@@ -157,6 +189,10 @@ class RayfishVpnService : VpnService() {
         } catch (t: Throwable) {
             Log.w(TAG, "closing tunnel fd failed", t)
         }
+
+        autoAcceptPoller?.shutdownNow()
+        autoAcceptPoller = null
+
         tunnel = null
     }
 
@@ -203,5 +239,16 @@ class RayfishVpnService : VpnService() {
         private const val CHANNEL_ID = "rayfish_vpn"
         private const val NOTIF_ID = 1
         const val ACTION_STOP = "xyz.rayfish.android.STOP"
+
+        // Apps that misbehave behind a VPN (casting, RCS, local-device discovery).
+        // Mirrors Tailscale's default Android exclusions. Excluded so they never
+        // see the VPN interface; our tunnel is split (mesh routes only) anyway.
+        private val DISALLOWED_APPS = listOf(
+            "com.google.android.projection.gearhead", // Android Auto
+            "com.google.android.apps.chromecast.app", // Google Home / Chromecast
+            "com.google.android.apps.messaging",      // RCS / Jibe messaging
+            "com.gopro.smarty",                       // GoPro
+            "com.sonos.acr", "com.sonos.acr2",        // Sonos
+        )
     }
 }

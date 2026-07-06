@@ -25,11 +25,17 @@ import xyz.rayfish.android.ui.theme.*
 fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val firstNet = status?.networks?.firstOrNull()
     var editing by remember { mutableStateOf(false) }
     var hostnameInput by remember { mutableStateOf("") }
+    var deviceName by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) {
+        deviceName = withContext(Dispatchers.IO) {
+            runCatching { NodeHolder.get(context).defaultHostname() }.getOrDefault("")
+        }
+    }
     var pairingTicket by remember { mutableStateOf<String?>(null) }
     var paired by remember { mutableStateOf(false) }
+    var confirmUnpair by remember { mutableStateOf(false) }
     // A device that already holds a cert cannot pair again (it must not mint new
     // certs). Refresh whenever status changes so the card flips right after a pair.
     LaunchedEffect(status?.nodeId) {
@@ -59,10 +65,10 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         SectionCard {
             SectionLabel("This device")
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("Hostname", fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-                if (firstNet != null) TextButton(onClick = { hostnameInput = firstNet.hostname; editing = true }) {
-                    Text(firstNet.hostname.ifEmpty { "set" } + " ✎", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Rose400)
-                } else Text("join a network first", fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Faint)
+                Text("Device name", fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
+                TextButton(onClick = { hostnameInput = deviceName; editing = true }) {
+                    Text(deviceName.ifEmpty { "set" } + " ✎", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Rose400)
+                }
             }
             val nodeId = status?.nodeId?.takeIf { it.isNotEmpty() }
             val ip4 = status?.ipv4?.takeIf { it.isNotEmpty() }
@@ -81,6 +87,8 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             } else if (paired) {
                 Text("This device is paired. Add new devices from your primary device.",
                     fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
+                Spacer(Modifier.height(10.dp))
+                OutlinePillButton("Unpair this device", onClick = { confirmUnpair = true }, modifier = Modifier.fillMaxWidth())
             } else {
                 Text("Pair another of your devices: show it a code, or scan the code it shows.",
                     fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
@@ -96,10 +104,20 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 }
             }
         }
+        var autoAcceptOwn by remember { mutableStateOf(NodeHolder.isAutoAcceptOwnDevices(context)) }
+        ToggleCard(
+            title = "Auto-accept from my devices",
+            subtitle = if (autoAcceptOwn) "on · files from your paired devices save to Downloads" else "off · accept them manually",
+            checked = autoAcceptOwn,
+            onCheckedChange = { on ->
+                autoAcceptOwn = on
+                NodeHolder.setAutoAcceptOwnDevices(context, on)
+            },
+        )
         var crashReporting by remember { mutableStateOf(NodeHolder.isCrashReportingEnabled(context)) }
         ToggleCard(
             title = "Crash reporting",
-            subtitle = if (crashReporting) "on · anonymous diagnostics" else "off",
+            subtitle = if (crashReporting) "on · diagnostics" else "off",
             checked = crashReporting,
             onCheckedChange = { on ->
                 crashReporting = on
@@ -107,6 +125,16 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 if (on) Telemetry.enable(context) else Telemetry.disable()
             },
         )
+        if (crashReporting) {
+            PillButton("Send diagnostics", onClick = {
+                scope.launch {
+                    val id = withContext(Dispatchers.IO) {
+                        runCatching { Telemetry.sendDiagnostics(context) }.getOrNull()
+                    }
+                    onToast(if (id != null) "Diagnostics sent" else "Diagnostics unavailable")
+                }
+            }, modifier = Modifier.fillMaxWidth())
+        }
         SectionCard {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("About", fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
@@ -115,11 +143,11 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
         }
     }
 
-    if (editing && firstNet != null) {
+    if (editing) {
         AlertDialog(
             onDismissRequest = { editing = false },
             containerColor = Rf.Sheet,
-            title = { Text("Hostname", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
+            title = { Text("Device name", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     RayfishTextField(hostnameInput, { hostnameInput = it }, "lowercase, 1-63 chars")
@@ -134,14 +162,40 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                         try {
                             withContext(Dispatchers.IO) {
                                 val node = NodeHolder.get(context)
+                                node.setDefaultHostname(h)
                                 nets.forEach { node.setHostname(it.name, h) }
                             }
-                            onToast("Hostname set"); onChanged(); editing = false
-                        } catch (t: Throwable) { onToast("Invalid hostname: ${t.message}") }
+                            deviceName = h
+                            onToast("Device name set"); onChanged(); editing = false
+                        } catch (t: Throwable) { onToast("Invalid name: ${t.message}") }
                     }
                 }) { Text("Save", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
             },
             dismissButton = { TextButton(onClick = { editing = false }) { Text("Cancel", color = Rf.Body, fontFamily = Chakra) } },
+        )
+    }
+    if (confirmUnpair) {
+        AlertDialog(
+            onDismissRequest = { confirmUnpair = false },
+            containerColor = Rf.Sheet,
+            title = { Text("Unpair this device?", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
+            text = {
+                Text("This device leaves all your networks and deletes its pairing certificate. Peers disconnect from it right away. Re-pair from your primary device to rejoin.",
+                    fontFamily = Chakra, fontSize = 12.sp, color = Rf.Body)
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmUnpair = false
+                    scope.launch {
+                        try {
+                            withContext(Dispatchers.IO) { NodeHolder.get(context).unpair() }
+                            paired = false
+                            onToast("Unpaired this device"); onChanged()
+                        } catch (t: Throwable) { onToast("Unpair failed: ${t.message}") }
+                    }
+                }) { Text("Unpair", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = { TextButton(onClick = { confirmUnpair = false }) { Text("Cancel", color = Rf.Body, fontFamily = Chakra) } },
         )
     }
     pairingTicket?.let { t -> QrCodeSheet("Show this to your other device", t, context, onToast) { pairingTicket = null } }
