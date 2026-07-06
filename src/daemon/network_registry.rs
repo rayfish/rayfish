@@ -203,7 +203,7 @@ impl NetworkRegistry {
     /// Re-derive the OS DNS search domains from the currently-joined networks.
     /// Split out of the daemon's `refresh_alpns` (whose ALPN half is a no-op now
     /// the mesh ALPN is static) for the teardown path.
-    async fn refresh_search_domains(&self) {
+    pub(crate) async fn refresh_search_domains(&self) {
         let network_names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
         let tun_name = self.tun_name.lock().unwrap().clone();
         dns_config::update_search_domains(&network_names, &tun_name).await;

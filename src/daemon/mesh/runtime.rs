@@ -39,7 +39,7 @@ impl MeshManager {
         // Reusable join keys are authoritative in the signed blob too.
         let mut reusable_keys = BTreeMap::new();
         let mut nullifiers = BTreeSet::new();
-        match self.restore_roster_from_blob(net_public_key).await {
+        match self.registry.restore_roster_from_blob(net_public_key).await {
             Ok(data) => {
                 suggested_firewall = data.suggested_firewall.clone();
                 reusable_keys = data.reusable_keys.clone();
@@ -262,7 +262,7 @@ impl MeshManager {
             .into_iter()
             .cloned()
             .collect();
-        self.dial_all_members(
+        self.registry.dial_all_members(
             &members_to_dial,
             net_public_key,
             name,
@@ -304,7 +304,7 @@ impl MeshManager {
             let me = Arc::clone(self);
             let network_name = name.to_string();
             tokio::spawn(async move {
-                me.dial_all_members(
+                me.registry.dial_all_members(
                     &members_to_dial,
                     net_public_key,
                     &network_name,
@@ -613,6 +613,7 @@ impl MeshManager {
                 let daemon_c = Arc::clone(self);
                 tokio::spawn(async move {
                     match daemon_c
+                        .registry
                         .join_network_inner(
                             &net_pubkey,
                             Some(&name),
