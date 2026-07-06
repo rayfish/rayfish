@@ -12,62 +12,13 @@ const PAIR_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl MeshManager {
     pub(crate) async fn resolve_peer_name(&self, name: &str) -> Option<EndpointId> {
-        let suffix = format!(".{}", crate::DNS_DOMAIN);
-        let qualified = if name.ends_with(&suffix) {
-            name.to_string()
-        } else {
-            format!("{name}{suffix}")
-        };
-        if let Some((ip, _)) = self.dns.resolve(&qualified, &suffix).await {
-            // Try connected peers first
-            if let Some(route) = self.peers.lookup_v4(&ip) {
-                return Some(route.endpoint_id);
-            }
-            // Fall back to member list (peer may be offline or it's us)
-            for entry in self.networks.iter() {
-                let state = entry.value().state.read().unwrap();
-                if let Some(m) = state.members.all().iter().find(|m| m.ip == ip) {
-                    return Some(m.identity);
-                }
-            }
-        }
-        self.resolve_short_id_any_network(name)
+        self.registry.resolve_peer_name(name).await
     }
 
-    /// Resolve a firewall `--peer` argument to a peer's **device** endpoint id,
-    /// accepting far more forms than [`resolve_peer_name`]: hostname (bare or
-    /// `host.net.ray`), mesh IPv4 (also for offline members, since the roster
-    /// stores v4), mesh IPv6 (connected peers only, the roster carries no v6),
-    /// short id / full endpoint id, or a paired **user identity** (resolved to
-    /// that user's joined device). Returns the device id `D`; `firewall_add`
-    /// normalizes it to the user identity for inbound rules. Kept separate from
-    /// `resolve_peer_name` so `ping`/`send` behaviour is unchanged; the extra
-    /// cases could later back those commands too.
+    /// Resolve a peer argument to its **device** endpoint id, accepting more
+    /// forms than [`Self::resolve_peer_name`] (delegates to [`NetworkRegistry`]).
     pub(crate) async fn resolve_peer_flexible(&self, name: &str) -> Option<EndpointId> {
-        // Hostname (Magic DNS) + short-id / endpoint-id-prefix fallback.
-        if let Some(id) = self.resolve_peer_name(name).await {
-            return Some(id);
-        }
-        // Mesh IP literal of a *connected* peer (fast path; also the only way to
-        // reach a peer by IPv6, since the roster carries no v6 address).
-        if let Ok(v4) = name.parse::<Ipv4Addr>()
-            && let Some(route) = self.peers.lookup_v4(&v4)
-        {
-            return Some(route.endpoint_id);
-        }
-        if let Ok(v6) = name.parse::<std::net::Ipv6Addr>()
-            && let Some(route) = self.peers.lookup_v6(&v6)
-        {
-            return Some(route.endpoint_id);
-        }
-        // Roster scan: an offline peer's mesh IPv4, or a paired user identity.
-        for entry in self.networks.iter() {
-            let state = entry.value().state.read().unwrap();
-            if let Some(id) = state.members.resolve_peer_literal(name) {
-                return Some(id);
-            }
-        }
-        None
+        self.registry.resolve_peer_flexible(name).await
     }
 
     pub async fn send_file(&self, path: &str, peer: &str) -> IpcMessage {

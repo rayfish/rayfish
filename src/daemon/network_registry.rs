@@ -166,6 +166,77 @@ impl NetworkRegistry {
         self.networks.contains_key(name)
     }
 
+    /// Resolve a peer name (hostname, `host.net.ray`, or mesh IPv4) to its
+    /// endpoint id: Magic DNS + connected-peer route first, then the member
+    /// roster (offline peers / self), then a short-id / endpoint-id prefix scan.
+    pub(crate) async fn resolve_peer_name(&self, name: &str) -> Option<EndpointId> {
+        let suffix = format!(".{}", crate::DNS_DOMAIN);
+        let qualified = if name.ends_with(&suffix) {
+            name.to_string()
+        } else {
+            format!("{name}{suffix}")
+        };
+        if let Some((ip, _)) = self.dns.resolve(&qualified, &suffix).await {
+            if let Some(route) = self.peers.lookup_v4(&ip) {
+                return Some(route.endpoint_id);
+            }
+            for entry in self.networks.iter() {
+                let state = entry.value().state.read().unwrap();
+                if let Some(m) = state.members.all().iter().find(|m| m.ip == ip) {
+                    return Some(m.identity);
+                }
+            }
+        }
+        self.resolve_short_id_any_network(name)
+    }
+
+    /// Resolve a firewall `--peer` argument to a peer's **device** endpoint id,
+    /// accepting more forms than [`Self::resolve_peer_name`]: hostname, mesh IPv4
+    /// (incl. offline members from the roster), mesh IPv6 (connected peers only),
+    /// short / full endpoint id, or a paired user identity.
+    pub(crate) async fn resolve_peer_flexible(&self, name: &str) -> Option<EndpointId> {
+        if let Some(id) = self.resolve_peer_name(name).await {
+            return Some(id);
+        }
+        if let Ok(v4) = name.parse::<Ipv4Addr>()
+            && let Some(route) = self.peers.lookup_v4(&v4)
+        {
+            return Some(route.endpoint_id);
+        }
+        if let Ok(v6) = name.parse::<std::net::Ipv6Addr>()
+            && let Some(route) = self.peers.lookup_v6(&v6)
+        {
+            return Some(route.endpoint_id);
+        }
+        for entry in self.networks.iter() {
+            let state = entry.value().state.read().unwrap();
+            if let Some(id) = state.members.resolve_peer_literal(name) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Resolve `"self"` or a short / prefix endpoint id against every network's
+    /// roster to a full endpoint id.
+    pub(crate) fn resolve_short_id_any_network(&self, short: &str) -> Option<EndpointId> {
+        if short == "self" {
+            return Some(self.transport.endpoint.id());
+        }
+        for entry in self.networks.iter() {
+            let state = entry.value().state.read().unwrap();
+            if let Some(m) = state
+                .members
+                .all()
+                .iter()
+                .find(|m| m.identity.to_string().starts_with(short))
+            {
+                return Some(m.identity);
+            }
+        }
+        None
+    }
+
     /// Whether `identity` is a current member of at least one network that has
     /// file auto-accept enabled. Backs the own-device file auto-accept gate.
     pub(crate) fn member_on_autoaccept_network(&self, identity: EndpointId) -> bool {
