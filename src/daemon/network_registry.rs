@@ -12,40 +12,50 @@
 //! signalling the daemon through a channel.
 
 use super::*;
+use std::sync::OnceLock;
 
 pub(crate) struct NetworkRegistry {
     /// Per-network runtime handles, keyed by network name. Shared with
     /// `MeshManager` during the transition (same `Arc`), so a method can move to
     /// the registry without splitting the map.
-    networks: Arc<DashMap<String, NetworkHandle>>,
+    // Fields are `pub(crate)` because the network methods migrating onto the
+    // registry live in their existing `daemon/mesh/*.rs` files (as `impl
+    // NetworkRegistry` blocks), which are sibling modules and so cannot see
+    // module-private fields. Mirrors how `MeshManager`'s fields are reached.
+    pub(crate) networks: Arc<DashMap<String, NetworkHandle>>,
     /// Foundation handles (endpoint + blob store) for reseal/publish.
-    transport: Arc<Transport>,
+    pub(crate) transport: Arc<Transport>,
     /// Live peer routing table, for severing / notifying peers on roster change.
-    peers: PeerTable,
+    pub(crate) peers: PeerTable,
     /// The per-peer connection driver, so the registry can (re-)register a
     /// network's accept handler (coordinator promotion) or unregister it on
     /// teardown directly.
-    conn: Arc<ConnectionManager>,
+    pub(crate) conn: Arc<ConnectionManager>,
     /// Magic-DNS service, to clear a torn-down network's `.ray` entries.
-    dns: Arc<DnsService>,
+    pub(crate) dns: Arc<DnsService>,
     /// The TUN interface name, shared with the daemon (which sets it once the TUN
     /// is up), for refreshing DNS search domains after a network is torn down.
-    tun_name: Arc<Mutex<String>>,
+    pub(crate) tun_name: Arc<Mutex<String>>,
     /// This device's cert loaded at boot, the in-memory fallback for the paired
     /// check when the on-disk cert read errors (see [`Self::current_device_cert`]).
-    device_cert: Option<control::DeviceCert>,
+    pub(crate) device_cert: Option<control::DeviceCert>,
     /// Daemon-wide shutdown token; each network's cancel is a child of it.
-    shutdown_token: CancellationToken,
+    pub(crate) shutdown_token: CancellationToken,
     /// Per-device firewall, threaded into the [`MeshCtx`] handler bundle.
-    firewall: SharedFirewall,
+    pub(crate) firewall: SharedFirewall,
     /// Transport-key -> user-identity map, threaded into the [`MeshCtx`] bundle.
-    device_user_map: peers::DeviceUserMap,
+    pub(crate) device_user_map: peers::DeviceUserMap,
     /// Sender to the single TUN writer, threaded into peer readers via [`MeshCtx`].
-    tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
+    pub(crate) tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
     /// Roster-pruned peers to skip on reconnect (see [`MeshCtx::pruned_peers`]).
-    pruned_peers: Arc<DashSet<(String, EndpointId)>>,
+    pub(crate) pruned_peers: Arc<DashSet<(String, EndpointId)>>,
     /// Daemon-wide disconnect channel drained by the connection supervisor.
-    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+    pub(crate) disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+    /// The inbound QUIC router, needed to drive a freshly (re)dialed connection's
+    /// control demux. Built after the registry (it depends on FileService /
+    /// ConnectService, which depend on the registry), so it is set once at boot
+    /// via [`Self::set_protocol_router`] rather than passed to `new`.
+    protocol_router: OnceLock<Arc<ProtocolRouter>>,
 }
 
 impl NetworkRegistry {
@@ -79,7 +89,22 @@ impl NetworkRegistry {
             tun_tx,
             pruned_peers,
             disconnect_tx,
+            protocol_router: OnceLock::new(),
         }
+    }
+
+    /// Install the inbound QUIC router. Called once at boot after the router is
+    /// built; the network (re)connect paths use it to drive a dialed connection's
+    /// control demux.
+    pub(crate) fn set_protocol_router(&self, router: Arc<ProtocolRouter>) {
+        let _ = self.protocol_router.set(router);
+    }
+
+    /// The inbound QUIC router (panics if used before [`Self::set_protocol_router`]).
+    pub(crate) fn protocol_router(&self) -> &Arc<ProtocolRouter> {
+        self.protocol_router
+            .get()
+            .expect("protocol_router set at boot")
     }
 
     /// Build the [`MeshCtx`] handler bundle from the registry's own handles. This
@@ -106,7 +131,7 @@ impl NetworkRegistry {
     /// This device's pairing cert. The on-disk cert is authoritative: a cleanly
     /// absent file (`Ok(None)`, e.g. after `unpair_self` deletes it) means
     /// unpaired, so only a genuine read error falls back to the in-memory copy.
-    fn current_device_cert(&self) -> Option<control::DeviceCert> {
+    pub(crate) fn current_device_cert(&self) -> Option<control::DeviceCert> {
         match identity::load_device_cert() {
             Ok(cert) => cert,
             Err(_) => self.device_cert.clone(),

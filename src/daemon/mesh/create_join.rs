@@ -574,7 +574,9 @@ impl MeshManager {
                 if m.identity == me {
                     continue;
                 }
-                self.clone().spawn_reconnect(m.identity, m.ip, vec![net.clone()]);
+                self.registry
+                    .clone()
+                    .spawn_reconnect(m.identity, m.ip, vec![net.clone()]);
             }
         }
 
