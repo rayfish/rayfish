@@ -1,7 +1,6 @@
 //! File-sharing and device-pairing handlers for `MeshManager`: `send_file`,
 //! `list_files`, `accept_file`, pairing. Split out of `daemon/mod.rs`.
 
-use std::path::Path;
 
 use super::super::*;
 
@@ -22,79 +21,7 @@ impl MeshManager {
     }
 
     pub async fn send_file(&self, path: &str, peer: &str) -> IpcMessage {
-        let peer_id = match self.resolve_peer_flexible(peer).await {
-            Some(id) => id,
-            None => {
-                return IpcMessage::Error {
-                    message: format!("unknown peer '{peer}'"),
-                };
-            }
-        };
-
-        let file_path = Path::new(path);
-        let file_bytes = match std::fs::read(file_path) {
-            Ok(b) => b,
-            Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("cannot read '{}': {e}", file_path.display()),
-                };
-            }
-        };
-
-        let filename = file_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "file".to_string());
-        let size = file_bytes.len() as u64;
-        let mime_type = guess_mime_type(&filename);
-        let hash = blake3::hash(&file_bytes);
-
-        if let Err(e) = self.blob_store.blobs().add_slice(&file_bytes).await {
-            return IpcMessage::Error {
-                message: format!("blob store error: {e}"),
-            };
-        }
-
-        let msg = control::ControlMsg::FileOffer {
-            from: self.endpoint.id(),
-            filename: filename.clone(),
-            size,
-            mime_type: mime_type.clone(),
-            blob_hash: hash,
-        };
-
-        match transport::connect_to_peer_with_alpn(&self.endpoint, peer_id, transport::FILES_ALPN)
-            .await
-        {
-            Ok(conn) => match conn.open_bi().await {
-                Ok((mut send, _)) => {
-                    // File offers ride the separate FILES_ALPN, not the mesh demux,
-                    // so they carry no network scope.
-                    if let Err(e) = control::send_msg(&mut send, None, &msg).await {
-                        return IpcMessage::Error {
-                            message: format!("failed to send offer: {e}"),
-                        };
-                    }
-                    // send_msg already finished the stream; wait for the peer to
-                    // read the offer so it flushes before this `conn` is dropped.
-                    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
-                }
-                Err(e) => {
-                    return IpcMessage::Error {
-                        message: format!("failed to open stream: {e}"),
-                    };
-                }
-            },
-            Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("cannot reach peer '{peer}': {e}"),
-                };
-            }
-        }
-
-        IpcMessage::Ok {
-            message: format!("offered {} ({}) to {}", filename, format_size(size), peer),
-        }
+        self.files.send_file(path, peer).await
     }
 
     pub fn list_files(&self) -> IpcMessage {

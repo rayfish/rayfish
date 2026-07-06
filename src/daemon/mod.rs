@@ -1154,13 +1154,13 @@ impl MeshManager {
     }
 }
 
-fn guess_mime_type(filename: &str) -> String {
+pub(crate) fn guess_mime_type(filename: &str) -> String {
     mime_guess::from_path(filename)
         .first_or_octet_stream()
         .to_string()
 }
 
-fn format_size(bytes: u64) -> String {
+pub(crate) fn format_size(bytes: u64) -> String {
     humansize::format_size(bytes, humansize::BINARY)
 }
 
