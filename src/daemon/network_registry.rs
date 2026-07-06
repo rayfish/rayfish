@@ -22,6 +22,9 @@ pub(crate) struct NetworkRegistry {
     transport: Arc<Transport>,
     /// Live peer routing table, for severing / notifying peers on roster change.
     peers: PeerTable,
+    /// The per-peer connection driver, so the registry can (re-)register a
+    /// network's accept handler (coordinator promotion) directly.
+    conn: Arc<ConnectionManager>,
 }
 
 impl NetworkRegistry {
@@ -29,11 +32,13 @@ impl NetworkRegistry {
         networks: Arc<DashMap<String, NetworkHandle>>,
         transport: Arc<Transport>,
         peers: PeerTable,
+        conn: Arc<ConnectionManager>,
     ) -> Self {
         Self {
             networks,
             transport,
             peers,
+            conn,
         }
     }
 
@@ -60,6 +65,68 @@ impl NetworkRegistry {
             }
         }
         false
+    }
+
+    /// Register (or replace) `network`'s accept handler with a
+    /// [`CoordinatorAcceptState`], so any node holding the network key admits
+    /// fresh joiners instead of dropping their `JoinRequest`s. The daemon-wide
+    /// `ctx` (identical for every network) is supplied by the caller: the daemon
+    /// passes `self.mesh_ctx()`, a promoting control reader passes its own `ctx`.
+    /// Also flips the stored role so `ray status` reports Coordinator at once.
+    #[allow(clippy::too_many_arguments)] // the params are the handler's own fields
+    pub(crate) fn register_coordinator_handler(
+        &self,
+        ctx: &MeshCtx,
+        network: &str,
+        state: SharedNetworkState,
+        invite_lock: Arc<tokio::sync::Mutex<()>>,
+        dht_notify: Option<Arc<Notify>>,
+        network_key: EndpointId,
+        cancel: CancellationToken,
+    ) {
+        self.conn.register(
+            network_key,
+            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
+                ctx: ctx.clone(),
+                network_name: network.to_string(),
+                state,
+                token: cancel,
+                dht_notify,
+                invite_lock,
+            })),
+        );
+        if let Some(mut handle) = self.networks.get_mut(network) {
+            handle.role = NetworkRole::Coordinator;
+        }
+    }
+
+    /// Swap a live member to a coordinator accept handler after it is granted the
+    /// per-network key (via `AdminGrant`), so it can admit fresh joiners. Called
+    /// directly by the granted member's control reader (was the `promote_tx`
+    /// hand-off to the daemon loop). Idempotent: a network already coordinating is
+    /// left untouched ([`should_promote`]). No `refresh_alpns` is needed: the mesh
+    /// ALPN is static and promotion adds no network, so the advertised set and the
+    /// DNS search domains are unchanged.
+    pub(crate) fn promote_to_coordinator(&self, ctx: &MeshCtx, network: &str) {
+        let parts = {
+            let Some(h) = self.networks.get(network) else {
+                return;
+            };
+            if !should_promote(h.role.clone()) {
+                return;
+            }
+            (
+                h.state.clone(),
+                h.invite_lock.clone(),
+                h.dht_notify.clone(),
+                h.network_key,
+                h.cancel.clone(),
+            )
+        }; // DashMap ref dropped before the registration below.
+        self.register_coordinator_handler(
+            ctx, network, parts.0, parts.1, parts.2, parts.3, parts.4,
+        );
+        tracing::info!(network, "promoted to coordinator accept handler");
     }
 
     /// Clear a re-paired device's nullifier (the inverse of `unpair`). Invoked

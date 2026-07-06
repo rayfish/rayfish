@@ -70,10 +70,10 @@ pub(crate) async fn join_mesh_shared(
     params: JoinParams,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
-    // Promotion signal: the per-peer control reader sends this network's name
-    // here after persisting an `AdminGrant` key, so the daemon loop can swap in
-    // the coordinator accept handler (see `MeshManager::promote_to_coordinator`).
-    promote_tx: mpsc::Sender<String>,
+    // The network-owning service: the per-peer control reader calls
+    // `registry.promote_to_coordinator` on itself after persisting an
+    // `AdminGrant` key (was the `promote_tx` hand-off to the daemon loop).
+    registry: Arc<NetworkRegistry>,
     // Guards the single-use invite ledger. Shared with the NetworkHandle so the
     // member accept handler's `InviteShare`/`InviteUsed` handling (a co-coordinator
     // learning of invites it didn't mint) is serialized with mint/redeem.
@@ -188,7 +188,7 @@ pub(crate) async fn join_mesh_shared(
             net_pubkey,
             my_identity,
             endpoint: ep.clone(),
-            promote_tx: promote_tx.clone(),
+            registry: registry.clone(),
             invite_lock: invite_lock.clone(),
             reconverge_notify: reconverge_notify.clone(),
         })),
