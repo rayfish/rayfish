@@ -269,6 +269,49 @@ impl NetworkRegistry {
         }
     }
 
+    /// Spawn a coordinated network's background tasks: the pkarr network publisher
+    /// and the ephemeral stale-member pruner. Dead-peer cleanup/reconnect is
+    /// daemon-wide (the connection supervisor), so no per-network disconnect task.
+    /// Returns the task handles plus the daemon-wide disconnect sender (taken from
+    /// the supplied `ctx`) the caller uses to build peer readers.
+    pub(crate) fn spawn_coordinator_background_tasks(
+        &self,
+        ctx: &MeshCtx,
+        name: &str,
+        net_secret_key: &SecretKey,
+        state: &SharedNetworkState,
+        dht_notify: &Arc<tokio::sync::Notify>,
+        cancel: &CancellationToken,
+    ) -> (
+        Vec<tokio::task::JoinHandle<()>>,
+        mpsc::Sender<forward::DisconnectEvent>,
+    ) {
+        let mut tasks = Vec::new();
+
+        if let Ok(pkarr_client) = dht::create_pkarr_client(&self.transport.endpoint) {
+            tasks.push(spawn_network_publisher(
+                pkarr_client,
+                net_secret_key.clone(),
+                state.clone(),
+                self.transport.endpoint.id(),
+                self.peers.clone(),
+                name.to_string(),
+                dht_notify.clone(),
+                cancel.clone(),
+            ));
+        }
+
+        tasks.push(spawn_stale_member_pruner(
+            ctx.clone(),
+            name.to_string(),
+            state.clone(),
+            Some(dht_notify.clone()),
+            cancel.clone(),
+        ));
+
+        (tasks, ctx.disconnect_tx.clone())
+    }
+
     /// Store a network's current blob snapshot in the blob store and publish the
     /// signed pkarr record (hash + seed peers). No-op if the network is gone or
     /// has no snapshot / secret key (only a coordinator holds the key).

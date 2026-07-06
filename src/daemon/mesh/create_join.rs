@@ -79,38 +79,14 @@ impl MeshManager {
         Vec<tokio::task::JoinHandle<()>>,
         mpsc::Sender<forward::DisconnectEvent>,
     ) {
-        let mut tasks = Vec::new();
-
-        // Network publisher (single pkarr record: blob hash + seed peers)
-        if let Ok(pkarr_client) = dht::create_pkarr_client(&self.endpoint) {
-            tasks.push(spawn_network_publisher(
-                pkarr_client,
-                net_secret_key.clone(),
-                state.clone(),
-                self.endpoint.id(),
-                self.peers.clone(),
-                name.to_string(),
-                dht_notify.clone(),
-                cancel.clone(),
-            ));
-        }
-
-        // Dead-peer cleanup + reconnect are handled daemon-wide by the single
-        // connection supervisor (see `MeshManager::run_connection_supervisor`), so
-        // there is no per-network disconnect task any more. Callers still receive
-        // the daemon-wide disconnect sender to build peer readers.
-
-        // Ephemeral policy pruner (coordinator-only): auto-remove members
-        // offline longer than the network's configured TTL. No-op while unset.
-        tasks.push(spawn_stale_member_pruner(
-            self.mesh_ctx(),
-            name.to_string(),
-            state.clone(),
-            Some(dht_notify.clone()),
-            cancel.clone(),
-        ));
-
-        (tasks, self.disconnect_tx.clone())
+        self.registry.spawn_coordinator_background_tasks(
+            &self.mesh_ctx(),
+            name,
+            net_secret_key,
+            state,
+            dht_notify,
+            cancel,
+        )
     }
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
