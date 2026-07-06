@@ -4,6 +4,34 @@
 use super::super::*;
 
 impl MeshManager {
+    // Thin delegates kept for the ray-mobile FFI surface (a separate crate, so it
+    // can only call public MeshManager methods). The bodies live on NetworkRegistry.
+    pub async fn invite_create(
+        &self,
+        network: &str,
+        expires_secs: u64,
+        hostname: Option<String>,
+        reusable: bool,
+    ) -> IpcMessage {
+        self.registry
+            .invite_create(network, expires_secs, hostname, reusable)
+            .await
+    }
+
+    pub fn list_requests(&self, network: &str) -> IpcMessage {
+        self.registry.list_requests(network)
+    }
+
+    pub async fn accept_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
+        self.registry.accept_request(network, id_prefix).await
+    }
+
+    pub fn deny_request(&self, network: &str, id_prefix: &str) -> IpcMessage {
+        self.registry.deny_request(network, id_prefix)
+    }
+}
+
+impl NetworkRegistry {
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     pub async fn invite_create(
         &self,
@@ -31,7 +59,7 @@ impl MeshManager {
         match minted {
             Ok((secret, id)) => {
                 let code =
-                    crate::invite::encode_invite_code(&net_pubkey, &self.endpoint.id(), &secret);
+                    crate::invite::encode_invite_code(&net_pubkey, &self.transport.endpoint.id(), &secret);
                 // Gossip the new invite (hash only, never the secret) to other
                 // coordinators so any of them can later redeem it. The wire field
                 // carries the hex hash's UTF-8 bytes; receivers decode back to the
@@ -48,7 +76,7 @@ impl MeshManager {
                         .into_iter()
                         .cloned()
                         .collect();
-                    let me = self.endpoint.id();
+                    let me = self.transport.endpoint.id();
                     let net_pubkey = handle.network_key;
                     drop(handle);
                     gossip_to_coordinators(
@@ -124,8 +152,8 @@ impl MeshManager {
             let mut s = state.write().unwrap();
             s.reusable_keys.insert(hash, key);
         }
-        update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
-        let code = crate::invite::encode_invite_code(&net_pubkey, &self.endpoint.id(), &secret);
+        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
+        let code = crate::invite::encode_invite_code(&net_pubkey, &self.transport.endpoint.id(), &secret);
         IpcMessage::InviteCreated {
             code,
             id,
@@ -227,7 +255,7 @@ impl MeshManager {
             crate::membership::revoke_reusable(&mut s.reusable_keys, id).is_ok()
         };
         if revoked_reusable {
-            update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+            update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
             return IpcMessage::Ok {
                 message: format!("revoked reusable key '{id}' (propagating to all admins)"),
             };

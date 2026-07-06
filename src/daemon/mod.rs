@@ -935,16 +935,23 @@ impl MeshManager {
                 hostname,
                 reusable,
             } => {
-                self.invite_create(&network, expires_secs, hostname, reusable)
+                self.registry
+                    .invite_create(&network, expires_secs, hostname, reusable)
                     .await
             }
-            IpcMessage::InviteList { network } => self.invite_list(&network).await,
-            IpcMessage::InviteRevoke { network, id } => self.invite_revoke(&network, &id).await,
-            IpcMessage::Requests { network } => self.list_requests(&network),
-            IpcMessage::AcceptRequest { network, id } => self.accept_request(&network, &id).await,
-            IpcMessage::DenyRequest { network, id } => self.deny_request(&network, &id),
-            IpcMessage::AdminAdd { network, identity } => self.admin_add(&network, &identity).await,
-            IpcMessage::AdminList { network } => self.admin_list(&network),
+            IpcMessage::InviteList { network } => self.registry.invite_list(&network).await,
+            IpcMessage::InviteRevoke { network, id } => {
+                self.registry.invite_revoke(&network, &id).await
+            }
+            IpcMessage::Requests { network } => self.registry.list_requests(&network),
+            IpcMessage::AcceptRequest { network, id } => {
+                self.registry.accept_request(&network, &id).await
+            }
+            IpcMessage::DenyRequest { network, id } => self.registry.deny_request(&network, &id),
+            IpcMessage::AdminAdd { network, identity } => {
+                self.registry.admin_add(&network, &identity).await
+            }
+            IpcMessage::AdminList { network } => self.registry.admin_list(&network),
             IpcMessage::Connect {
                 contact_id,
                 hostname,
@@ -1111,33 +1118,10 @@ impl MeshManager {
         );
     }
 
-    pub(crate) fn resolve_short_id_any_network(&self, short: &str) -> Option<EndpointId> {
-        self.registry.resolve_short_id_any_network(short)
-    }
-
     // -----------------------------------------------------------------------
     // Invite + join-request handlers (coordinator only)
     // -----------------------------------------------------------------------
 
-    /// Look up an active network we coordinate, returning its public key and
-    /// invite lock, or an error response if it's absent or we're only a member.
-    #[allow(clippy::result_large_err)]
-    pub(crate) fn coordinator_handle(
-        &self,
-        network: &str,
-    ) -> std::result::Result<(EndpointId, Arc<tokio::sync::Mutex<()>>), IpcMessage> {
-        let Some(handle) = self.networks.get(network) else {
-            return Err(IpcMessage::Error {
-                message: format!("network '{network}' not active"),
-            });
-        };
-        if !handle.role.is_coordinator() {
-            return Err(IpcMessage::Error {
-                message: format!("only the coordinator of '{network}' can manage invites/requests"),
-            });
-        }
-        Ok((handle.network_key, handle.invite_lock.clone()))
-    }
 }
 
 pub(crate) fn guess_mime_type(filename: &str) -> String {

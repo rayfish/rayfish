@@ -3,7 +3,7 @@
 
 use super::super::*;
 
-impl MeshManager {
+impl NetworkRegistry {
     /// Coordinator-only: grant the per-network secret key to a member over an
     /// authenticated mesh stream, making it a co-coordinator (can publish /
     /// suggest firewall rules). The key is shared (shared-key model), so this is
@@ -116,7 +116,7 @@ impl MeshManager {
     /// List this network's key-holders: the local node (if it holds the key) plus
     /// every identity it has granted the key to (`ray admin add`).
     pub(crate) fn admin_list(&self, network: &str) -> IpcMessage {
-        let self_id = self.endpoint.id();
+        let self_id = self.transport.endpoint.id();
         let mut admins = Vec::new();
         let self_holds_key = match self.networks.get(network) {
             Some(h) => h.state.read().unwrap().network_secret_key.is_some(),

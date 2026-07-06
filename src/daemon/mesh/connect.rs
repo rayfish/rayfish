@@ -32,12 +32,6 @@ impl MeshManager {
         self.connect.rotate_contact().await
     }
 
-    /// Store the current group snapshot as a blob and re-publish the pkarr record
-    /// so members reconcile the new membership (used after `ray accept`).
-    pub(crate) async fn store_and_publish_group(&self, network: &str) {
-        self.registry.store_and_publish_group(network).await
-    }
-
     // -----------------------------------------------------------------------
     // File sharing
     // -----------------------------------------------------------------------
