@@ -112,6 +112,10 @@ pub(crate) use foundation::Transport;
 mod connection_manager;
 pub(crate) use connection_manager::{ConnectionManager, MeshDispatch};
 
+// The service that owns the set of active networks (M5 migration seam).
+mod network_registry;
+pub(crate) use network_registry::NetworkRegistry;
+
 // Domain satellites with their own owned state (and ALPN accept arms), held by
 // `MeshManager` as fields rather than loose on the core. See each module.
 mod dns_service;
@@ -430,6 +434,10 @@ pub struct MeshManager {
     /// its whole life and is never swapped.
     tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
     networks: Arc<DashMap<String, NetworkHandle>>,
+    /// The network-owning service. Shares the same `networks` map (M5 seam); the
+    /// daemon delegates membership queries and, progressively, the network
+    /// methods to it.
+    registry: Arc<NetworkRegistry>,
     shutdown_token: CancellationToken,
     blob_store: FsStore,
     firewall: SharedFirewall,

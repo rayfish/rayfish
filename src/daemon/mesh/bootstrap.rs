@@ -327,15 +327,20 @@ async fn build_daemon(
         stats.clone(),
         contact_public,
     ));
+    // Networks map is shared with the NetworkRegistry service (M5 seam): both
+    // hold the same `Arc<DashMap>` so methods migrate to the registry gradually.
+    let networks = Arc::new(DashMap::new());
+    let registry = Arc::new(NetworkRegistry::new(networks.clone()));
     let daemon = Arc::new(MeshManager {
         transport,
+        registry,
         endpoint: ep,
         identity,
         peers,
         stats: stats.clone(),
         start: Instant::now(),
         tun_tx,
-        networks: Arc::new(DashMap::new()),
+        networks,
         shutdown_token: token.clone(),
         blob_store,
         firewall: shared_firewall,

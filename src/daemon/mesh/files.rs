@@ -311,28 +311,7 @@ impl MeshManager {
         }
 
         // Network gate: the sender must be a member of a network we've enabled.
-        let mut on_enabled_network = false;
-        for entry in self.networks.iter() {
-            let enabled = config::load_network(entry.key())
-                .ok()
-                .flatten()
-                .map(|nc| nc.auto_accept_files)
-                .unwrap_or(false);
-            if !enabled {
-                continue;
-            }
-            let is_member = entry
-                .value()
-                .state
-                .read()
-                .map(|s| s.members.all().iter().any(|m| m.identity == from))
-                .unwrap_or(false);
-            if is_member {
-                on_enabled_network = true;
-                break;
-            }
-        }
-        if !on_enabled_network {
+        if !self.registry.member_on_autoaccept_network(from) {
             return;
         }
 
