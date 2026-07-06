@@ -166,6 +166,109 @@ impl NetworkRegistry {
         self.networks.contains_key(name)
     }
 
+    /// Build the initial [`NetworkState`] for a network we're minting: a member
+    /// list holding just us (as coordinator), plus an optional pre-approved peer
+    /// (used by `ray connect` to admit the requester without a live prompt).
+    pub(crate) fn build_initial_roster(
+        &self,
+        name: &str,
+        my_ip: Ipv4Addr,
+        my_hostname: &str,
+        mode: GroupMode,
+        net_secret_key: &SecretKey,
+        pre_approve: Option<(EndpointId, Option<String>)>,
+    ) -> Result<NetworkState> {
+        let mut member_list = MemberList::new();
+        member_list
+            .add(Member {
+                identity: self.transport.identity.local_identity(),
+                ip: my_ip,
+                is_coordinator: true,
+                hostname: Some(my_hostname.to_string()),
+                user_identity: None,
+                device_cert: None,
+                collision_index: 0,
+                last_seen: None,
+            })
+            .expect("self-add cannot collide");
+
+        let mut approved = ApprovedList::new();
+        if let Some((peer_id, peer_hostname)) = pre_approve {
+            let peer_ip = self.transport.identity.derive_ip(&peer_id);
+            approved
+                .approve(
+                    ApprovedEntry {
+                        identity: peer_id,
+                        ip: peer_ip,
+                        hostname: peer_hostname,
+                        user_identity: None,
+                        device_cert: None,
+                        collision_index: 0,
+                    },
+                    &member_list,
+                )
+                .map_err(|e| anyhow::anyhow!("failed to pre-approve peer: {e:?}"))?;
+        }
+
+        Ok(NetworkState {
+            members: member_list,
+            approved,
+            snapshot: None,
+            network_secret_key: Some(net_secret_key.clone()),
+            network_public_key: net_secret_key.public(),
+            network_name: Some(name.to_string()),
+            mode,
+            suggested_firewall: SuggestedFirewall::default(),
+            reusable_keys: BTreeMap::new(),
+            // Seeded from persisted `revoked_devices` by `seal_and_publish`.
+            nullifiers: BTreeSet::new(),
+            pending_suggestions: Vec::new(),
+            pending: HashMap::new(),
+        })
+    }
+
+    /// Seed a coordinated network's nullifiers from our durable `revoked_devices`,
+    /// refresh its blob snapshot, store the bytes, and publish the signed pkarr
+    /// record. The coordinator-setup counterpart to [`Self::store_and_publish_group`].
+    pub(crate) async fn seal_and_publish(
+        &self,
+        net_state: &mut NetworkState,
+        net_secret_key: &SecretKey,
+    ) {
+        {
+            let cfg = config::load().unwrap_or_default();
+            net_state
+                .nullifiers
+                .extend(config::revoked_device_ids(&cfg));
+        }
+        net_state.refresh_snapshot();
+        if let Some(snap) = &net_state.snapshot {
+            let _ = self
+                .transport
+                .blob_store
+                .blobs()
+                .add_slice(&snap.msgpack_bytes)
+                .await;
+        }
+        if let Ok(pkarr_client) = dht::create_pkarr_client(&self.transport.endpoint) {
+            let blob_hash = net_state
+                .snapshot
+                .as_ref()
+                .map(|s| s.hash)
+                .expect("snapshot set");
+            if let Err(e) = dht::publish_network(
+                &pkarr_client,
+                net_secret_key,
+                &blob_hash,
+                &[self.transport.endpoint.id()],
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "failed to publish network record");
+            }
+        }
+    }
+
     /// Store a network's current blob snapshot in the blob store and publish the
     /// signed pkarr record (hash + seed peers). No-op if the network is gone or
     /// has no snapshot / secret key (only a coordinator holds the key).
