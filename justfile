@@ -22,6 +22,11 @@ apk:
 release:
     cargo -q build --release
 
+fmt:
+    cargo fmt
+    cargo clippy --all-targets --all-features -- -D warnings
+    # cargo shear --fix # cargo install shear
+
 cross:
     cross -q build --release --target {{target}}
 
