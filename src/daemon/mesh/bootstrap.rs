@@ -55,7 +55,11 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         let daemon = daemon.clone();
         let token = token.clone();
         tokio::spawn(async move {
-            daemon.run_connection_supervisor(disconnect_rx, token).await;
+            daemon
+                .registry
+                .clone()
+                .run_connection_supervisor(disconnect_rx, token)
+                .await;
         });
     }
 
@@ -300,6 +304,9 @@ async fn build_daemon(
         connect.clone(),
         conn.clone(),
     ));
+    // The registry (re)connect paths drive a dialed connection's demux through the
+    // router; install it now that it exists (the registry was built before it).
+    registry.set_protocol_router(protocol_router.clone());
     let auto_update = app_config.auto_update;
     let daemon = Arc::new(MeshManager {
         transport,

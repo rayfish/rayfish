@@ -7,7 +7,7 @@
 
 use super::super::*;
 
-impl MeshManager {
+impl NetworkRegistry {
     /// Single daemon-wide loop consuming every data reader's disconnect. For each
     /// dropped identity it removes the peer from the table, prunes it from every
     /// network we coordinate on a deliberate leave, and otherwise reconnects it
@@ -99,7 +99,7 @@ impl MeshManager {
             ev.ip,
         )
         .await;
-        update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
         broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
         tracing::info!(peer = %member_id.fmt_short(), network, "pruned member after leave");
     }
@@ -137,7 +137,7 @@ impl MeshManager {
 
         let this = self.clone();
         let token = self.shutdown_token.clone();
-        let my_identity = self.identity.local_identity();
+        let my_identity = self.transport.identity.local_identity();
         let device_cert = self.current_device_cert();
         use tracing::Instrument as _;
         let span = tracing::info_span!("reconnect", peer = %peer_id.fmt_short());
@@ -177,7 +177,7 @@ impl MeshManager {
                     }
 
                     let conn = match transport::connect_to_peer_with_alpn(
-                        &this.endpoint,
+                        &this.transport.endpoint,
                         peer_id,
                         &transport::mesh_alpn(),
                     )
@@ -217,7 +217,7 @@ impl MeshManager {
                     }
                     tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "reconnected to peer");
                     // Drive the new connection's control demux + announce handles.
-                    let router = this.protocol_router.clone();
+                    let router = this.protocol_router().clone();
                     let dconn = conn.clone();
                     tokio::spawn(async move { router.drive_mesh_connection(dconn).await });
                     announce_network_handles(&this.peers, &conn, peer_ip).await;
