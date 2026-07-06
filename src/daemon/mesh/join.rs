@@ -910,7 +910,9 @@ pub(crate) fn spawn_reconnect_loop(
             // old connection: ignore it entirely rather than tearing down the
             // live link and redialing on top of it (see conn_stable_id).
             let removed = match event.conn_stable_id {
-                Some(id) => peers.remove_peer_from_network_if(&peer_ip, &peer_ipv6, &event.network, id),
+                Some(id) => {
+                    peers.remove_peer_from_network_if(&peer_ip, &peer_ipv6, &event.network, id)
+                }
                 None => {
                     // Synthetic cold-restore kick: nothing is registered yet, so
                     // force the reconnect dial below.

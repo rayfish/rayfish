@@ -464,7 +464,13 @@ pub(crate) fn spawn_stale_member_pruner(
                     .all()
                     .into_iter()
                     .filter(|m| {
-                        should_prune(m, connected.contains(&m.identity), m.identity == me, ttl, now)
+                        should_prune(
+                            m,
+                            connected.contains(&m.identity),
+                            m.identity == me,
+                            ttl,
+                            now,
+                        )
                     })
                     .map(|m| (m.identity, m.ip))
                     .collect()
@@ -523,14 +529,32 @@ mod prune_tests {
     #[test]
     fn prunes_only_past_the_ttl_strictly() {
         // exactly at TTL boundary -> not yet (strict `>`)
-        assert!(!should_prune(&mk(5, false, Some(NOW - TTL)), false, false, TTL, NOW));
+        assert!(!should_prune(
+            &mk(5, false, Some(NOW - TTL)),
+            false,
+            false,
+            TTL,
+            NOW
+        ));
         // one second past the TTL -> prune
-        assert!(should_prune(&mk(6, false, Some(NOW - TTL - 1)), false, false, TTL, NOW));
+        assert!(should_prune(
+            &mk(6, false, Some(NOW - TTL - 1)),
+            false,
+            false,
+            TTL,
+            NOW
+        ));
     }
 
     #[test]
     fn backwards_clock_does_not_prune() {
         // last_seen in the "future" (clock went backwards) -> saturating_sub = 0
-        assert!(!should_prune(&mk(7, false, Some(NOW + 100)), false, false, TTL, NOW));
+        assert!(!should_prune(
+            &mk(7, false, Some(NOW + 100)),
+            false,
+            false,
+            TTL,
+            NOW
+        ));
     }
 }

@@ -135,6 +135,10 @@ sudo ray start           # back online: daemon restarts with both planes on
 
 Run `ray --help` to discover the rest: `invite`, `requests`/`accept`/`deny`, `firewall`, `apply`, `send`, `pair`, `mdns`, and more.
 
+Prefer buttons and forms? Run `ray gui` to open a local browser GUI. It wraps
+the same CLI commands, so anything available in `ray --help` is available there
+too; commands that need root still need the GUI to be launched with `sudo`.
+
 ## Who can join
 
 The **room id** (a network's public key) is a discovery key. It's published so peers can find the network, but on a closed network it is not an admission credential. Admission is always the coordinator's job:

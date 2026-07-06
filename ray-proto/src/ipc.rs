@@ -629,6 +629,7 @@ pub struct PeerStatus {
     pub user_identity: Option<EndpointId>,
     /// True when this peer is another of the local user's own paired devices
     /// (its resolved user identity equals ours).
+    #[serde(default)]
     pub is_own_device: bool,
     pub connection: Option<ConnectionInfo>,
 }

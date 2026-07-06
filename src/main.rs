@@ -162,6 +162,15 @@ pub(crate) enum Command {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
     },
+    /// Start a local browser GUI for common workflows and every CLI command
+    Gui {
+        /// Localhost port to listen on (0 chooses a free port)
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Print the URL without trying to open a browser
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Mint and manage one-time invite codes for a network (coordinator only)
     Invite {
         /// Network name to issue/manage invites for
@@ -1013,6 +1022,7 @@ async fn main() -> Result<()> {
             clap_complete::generate(shell, &mut Cli::command(), "ray", &mut std::io::stdout());
             Ok(())
         }
+        Command::Gui { port, no_open } => cmd_gui(port, no_open),
         Command::Invite { network, action } => ipc_invite(&network, action).await,
         Command::Requests { network } => ipc_requests(&network).await,
         Command::Accept { network, id } => ipc_accept_request(&network, &id).await,
