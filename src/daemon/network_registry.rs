@@ -237,6 +237,26 @@ impl NetworkRegistry {
         self.networks.contains_key(name)
     }
 
+    /// Look up an active network we coordinate, returning its public key and
+    /// invite lock, or an error response if it's absent or we're only a member.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn coordinator_handle(
+        &self,
+        network: &str,
+    ) -> std::result::Result<(EndpointId, Arc<tokio::sync::Mutex<()>>), IpcMessage> {
+        let Some(handle) = self.networks.get(network) else {
+            return Err(IpcMessage::Error {
+                message: format!("network '{network}' not active"),
+            });
+        };
+        if !handle.role.is_coordinator() {
+            return Err(IpcMessage::Error {
+                message: format!("only the coordinator of '{network}' can manage invites/requests"),
+            });
+        }
+        Ok((handle.network_key, handle.invite_lock.clone()))
+    }
+
     /// The name of an existing direct (`ray connect`) network already linking us
     /// to `peer` (as a member or approved), if any. Used to keep `approve` /
     /// re-connect idempotent.
