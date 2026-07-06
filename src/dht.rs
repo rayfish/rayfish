@@ -45,14 +45,6 @@ pub fn effective_pkarr_url() -> String {
 /// EndpointId so a peer can dial them without knowing the transport id.
 const CONTACT_RECORD_NAME: &str = "_rayfish_contact";
 
-/// pkarr record name for a user's **revoked device set** (`ray unpair`). Published
-/// under the user's own key (the identity that signs device certs), it carries a
-/// monotonic version plus the list of device keys the user has revoked. Any peer
-/// that sees a `DeviceCert` resolves this record for `cert.user_identity` and
-/// rejects the cert if `cert.device_key` is listed. Because the pkarr address *is*
-/// the user public key, the record is self-authenticating and cannot be forged.
-const REVOKED_RECORD_NAME: &str = "_rayfish_revoked";
-
 // ---------------------------------------------------------------------------
 // Pkarr client
 // ---------------------------------------------------------------------------
@@ -174,47 +166,6 @@ pub fn decode_contact_record(packet: &SignedPacket) -> Result<EndpointId> {
 }
 
 // ---------------------------------------------------------------------------
-// Cert-generation floor encoding / decoding (ray unpair / rotation)
-// ---------------------------------------------------------------------------
-
-/// Encode a revoked-device-set record: a monotonic `version` plus one entry per
-/// revoked device key. Signed by (and published under) the user's own key, so only
-/// the identity that issued the certs can change it. The `version` gives the set
-/// monotonicity so a stale/replayed copy can't resurrect or drop a revocation.
-pub fn encode_revoked_record(
-    user_secret: &SecretKey,
-    version: u64,
-    devices: &[EndpointId],
-) -> Result<SignedPacket> {
-    let mut values = vec![RECORD_VERSION.to_string(), format!("v,{version}")];
-    values.extend(devices.iter().map(|d| format!("d,{d}")));
-    SignedPacket::from_txt_strings(user_secret, REVOKED_RECORD_NAME, values, RECORD_TTL)
-        .map_err(|e| anyhow::anyhow!("failed to build revoked-device record: {e}"))
-}
-
-/// Decode a revoked-device-set record into `(version, device keys)`.
-pub fn decode_revoked_record(packet: &SignedPacket) -> Result<(u64, Vec<EndpointId>)> {
-    let records = packet.txt_records(REVOKED_RECORD_NAME);
-    ensure!(!records.is_empty(), "no revoked-device records found");
-    ensure!(
-        records[0] == RECORD_VERSION,
-        "unsupported record version: {}",
-        records[0]
-    );
-    let mut version: Option<u64> = None;
-    let mut devices = Vec::new();
-    for record in &records[1..] {
-        if let Some(v) = record.strip_prefix("v,") {
-            version = Some(v.parse::<u64>().context("invalid revocation version")?);
-        } else if let Some(d) = record.strip_prefix("d,") {
-            devices.push(d.parse::<EndpointId>().context("invalid revoked device key")?);
-        }
-    }
-    let version = version.context("missing revocation version (v,)")?;
-    Ok((version, devices))
-}
-
-// ---------------------------------------------------------------------------
 // Publish / resolve
 // ---------------------------------------------------------------------------
 
@@ -276,36 +227,6 @@ pub async fn resolve_contact(
         .await
         .map_err(|e| anyhow::anyhow!("failed to resolve contact record: {e}"))?;
     decode_contact_record(&packet)
-}
-
-/// Publish this user's revoked device set (`user_key -> {version, devices}`).
-/// Republished on a TTL/2 cadence by `spawn_revocation_publisher` so the set stays
-/// resolvable while the primary's daemon runs.
-pub async fn publish_revoked(
-    client: &PkarrRelayClient,
-    user_secret: &SecretKey,
-    version: u64,
-    devices: &[EndpointId],
-) -> Result<()> {
-    let packet = encode_revoked_record(user_secret, version, devices)?;
-    client
-        .publish(&packet)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to publish revoked-device record: {e}"))
-}
-
-/// Resolve a user's revoked device set. A missing record (never published, or
-/// TTL-expired) surfaces as an `Err`, which callers treat as an empty set and fail
-/// open — see `RevocationCache`.
-pub async fn resolve_revoked(
-    client: &PkarrRelayClient,
-    user_pubkey: EndpointId,
-) -> Result<(u64, Vec<EndpointId>)> {
-    let packet = client
-        .resolve(user_pubkey)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to resolve revoked-device record: {e}"))?;
-    decode_revoked_record(&packet)
 }
 
 // ---------------------------------------------------------------------------
@@ -446,52 +367,6 @@ mod tests {
                 .to_string()
                 .contains("missing contact endpoint")
         );
-    }
-
-    #[test]
-    fn revoked_record_roundtrip() {
-        let user = SecretKey::generate();
-        let d1 = SecretKey::generate().public();
-        let d2 = SecretKey::generate().public();
-        let packet = encode_revoked_record(&user, 42, &[d1, d2]).unwrap();
-        let (version, devices) = decode_revoked_record(&packet).unwrap();
-        assert_eq!(version, 42);
-        assert_eq!(devices.len(), 2);
-        assert!(devices.contains(&d1) && devices.contains(&d2));
-    }
-
-    #[test]
-    fn revoked_record_empty_set_is_valid() {
-        let user = SecretKey::generate();
-        let packet = encode_revoked_record(&user, 3, &[]).unwrap();
-        let (version, devices) = decode_revoked_record(&packet).unwrap();
-        assert_eq!(version, 3);
-        assert!(devices.is_empty());
-    }
-
-    #[test]
-    fn revoked_record_rejects_unknown_version() {
-        let key = SecretKey::generate();
-        let values = vec!["v99".to_string(), "v,5".to_string()];
-        let packet =
-            SignedPacket::from_txt_strings(&key, REVOKED_RECORD_NAME, values, 300).unwrap();
-        let result = decode_revoked_record(&packet);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("unsupported record version")
-        );
-    }
-
-    #[test]
-    fn revoked_record_rejects_missing_version() {
-        let key = SecretKey::generate();
-        let values = vec!["v1".to_string()];
-        let packet =
-            SignedPacket::from_txt_strings(&key, REVOKED_RECORD_NAME, values, 300).unwrap();
-        assert!(decode_revoked_record(&packet).is_err());
     }
 
     #[test]

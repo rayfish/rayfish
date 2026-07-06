@@ -33,16 +33,27 @@ pub(crate) struct FileService {
     /// daemon-wide worker (`spawn_file_auto_accept`) can evaluate it for
     /// own-device auto-accept without waiting for a manual `ray files accept`.
     new_file_tx: mpsc::UnboundedSender<u64>,
+    /// Re-auth nudge: a (re-)pair signs a fresh cert for the device, so its key is
+    /// sent here for the daemon loop to clear from the durable nullifier seed and
+    /// from every coordinated network's blob (see `MeshManager::reauth_device`).
+    /// The accept arm holds only field clones, so it hands the work off rather than
+    /// touching `MeshManager` (mirrors `MeshCtx::self_unpair_tx`).
+    reauth_tx: mpsc::Sender<EndpointId>,
 }
 
 impl FileService {
-    pub(crate) fn new(secret_key: SecretKey, new_file_tx: mpsc::UnboundedSender<u64>) -> Self {
+    pub(crate) fn new(
+        secret_key: SecretKey,
+        new_file_tx: mpsc::UnboundedSender<u64>,
+        reauth_tx: mpsc::Sender<EndpointId>,
+    ) -> Self {
         Self {
             pending_files: Arc::new(std::sync::Mutex::new(Vec::new())),
             file_id_counter: Arc::new(AtomicU64::new(1)),
             pairing_secret: Arc::new(std::sync::Mutex::new(None)),
             secret_key,
             new_file_tx,
+            reauth_tx,
         }
     }
 
@@ -149,27 +160,14 @@ impl FileService {
                                         .collect(),
                                     Err(_) => Vec::new(),
                                 };
-                                // A deliberate (re-)pair re-authorizes this device,
-                                // so drop it from the `revoked_devices` set and bump
-                                // the revocation version — otherwise `cert_decision`
-                                // would keep rejecting its fresh cert and the device
-                                // would reconnect-loop against us, and remote peers
-                                // (which adopt the set only on a newer version) would
-                                // never learn it is trusted again.
-                                let generation = {
-                                    let mut cfg = config::load().unwrap_or_default();
-                                    let hex = device_pubkey.to_string();
-                                    if let Some(pos) =
-                                        cfg.revoked_devices.iter().position(|d| *d == hex)
-                                    {
-                                        cfg.revoked_devices.remove(pos);
-                                        cfg.revocation_version += 1;
-                                        if let Err(e) = config::save_settings(&cfg) {
-                                            tracing::warn!(error = %e, "pair: failed to clear device from revoked set");
-                                        }
-                                    }
-                                    cfg.cert_generation
-                                };
+                                // A deliberate (re-)pair re-authorizes this device.
+                                // Hand its key to the daemon loop so it clears any
+                                // nullifier for it (durable seed + every coordinated
+                                // blob); otherwise admission would keep rejecting the
+                                // fresh cert and the device would reconnect-loop.
+                                let _ = self.reauth_tx.try_send(device_pubkey);
+                                let generation =
+                                    config::load().map(|c| c.cert_generation).unwrap_or(0);
                                 let cert = control::DeviceCert::create(
                                     &secret_key,
                                     &device_pubkey,

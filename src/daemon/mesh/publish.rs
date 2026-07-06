@@ -29,6 +29,7 @@ pub(crate) fn spawn_network_publisher(
                             &s.suggested_firewall,
                             s.network_name.as_deref(),
                             &s.reusable_keys,
+                            &s.nullifiers,
                         )
                     })
             };
@@ -84,105 +85,6 @@ pub(crate) fn spawn_contact_publisher(
     })
 }
 
-/// Republish this user's revoked device set (`ray unpair`). Publishes
-/// `user_key -> {version, devices}` on a TTL/2 interval so the set stays
-/// resolvable while this daemon runs (not gated by the data-plane `active` flag,
-/// so a standby node still advertises it). Only the primary signs it — its
-/// endpoint secret *is* the user identity that signed the certs. A secondary
-/// never revokes, so its set stays empty and nothing is published. Reads config
-/// fresh each cycle so a new revoke/re-auth takes effect without a restart.
-pub(crate) fn spawn_revocation_publisher(
-    client: PkarrRelayClient,
-    token: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let is_primary = crate::identity::load_device_cert().ok().flatten().is_none();
-            let cfg = config::load().unwrap_or_default();
-            let devices = config::revoked_device_ids(&cfg);
-            // Publish whenever we have ever revoked (version > 0), even if the set
-            // is now empty: a re-auth clears the set at a newer version, and remote
-            // peers only un-revoke when they see that newer (empty) record.
-            if is_primary
-                && cfg.revocation_version > 0
-                && let Ok(secret) = crate::identity::load_or_create()
-            {
-                match dht::publish_revoked(&client, &secret, cfg.revocation_version, &devices).await
-                {
-                    Ok(()) => tracing::debug!(
-                        version = cfg.revocation_version,
-                        count = devices.len(),
-                        "published revoked-device set"
-                    ),
-                    Err(e) => tracing::warn!(error = %e, "failed to publish revoked-device record"),
-                }
-            }
-            tokio::select! {
-                _ = token.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(150)) => {},
-            }
-        }
-    })
-}
-
-/// Keep the [`RevocationCache`] warm. Every 60s, resolve the revoked device set
-/// for each user identity visible in any roster (plus our own), so a revoked
-/// device's cert is rejected at admission and severed on the next reconverge even
-/// when the revoking user is a *different* user we share a network with. This only
-/// supplies the facts; the per-network group poller's reconverge does the actual
-/// pruning (`prune_departed_peers`).
-pub(crate) fn spawn_revocation_poller(
-    daemon: Arc<MeshManager>,
-    client: PkarrRelayClient,
-    token: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(60)) => {},
-            }
-            let mut users: std::collections::HashSet<EndpointId> = std::collections::HashSet::new();
-            let own_user = daemon
-                .device_cert
-                .as_ref()
-                .map(|c| c.user_identity)
-                .unwrap_or_else(|| daemon.endpoint.id());
-            users.insert(own_user);
-            for handle in daemon.networks.iter() {
-                let roster = handle.state.read().unwrap().roster();
-                for m in roster {
-                    if let Some(u) = m.user_identity {
-                        users.insert(u);
-                    }
-                }
-            }
-            let mut raised = false;
-            for user in users {
-                if !daemon.revocation.needs_refresh(&user) {
-                    continue;
-                }
-                match dht::resolve_revoked(&client, user).await {
-                    // A newer version means the revoked set changed (a device was
-                    // just unpaired): prune any now-revoked peer right away instead
-                    // of waiting for the next 60s group poll on each network.
-                    Ok((version, devices)) => {
-                        raised |= daemon
-                            .revocation
-                            .record(user, version, devices.into_iter().collect())
-                    }
-                    // No record (never published / TTL-expired) is the common case;
-                    // fail open (leave the cache as-is) rather than clear it.
-                    Err(e) => tracing::trace!(user = %user.fmt_short(), error = %e, "no revoked-device record"),
-                }
-            }
-            if raised {
-                daemon.prune_revoked_across_networks();
-            }
-        }
-    })
-}
-
 /// A polling publisher for a *granted* co-coordinator (a member that received
 /// the network key via `AdminGrant`). Unlike [`spawn_network_publisher`] (which
 /// is notify-driven and spawned at create/restore time), this is spawned at
@@ -216,6 +118,7 @@ pub(crate) fn spawn_lazy_publisher(
                             &s.suggested_firewall,
                             s.network_name.as_deref(),
                             &s.reusable_keys,
+                            &s.nullifiers,
                         )
                     })
             };

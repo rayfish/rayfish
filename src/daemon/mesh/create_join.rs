@@ -62,6 +62,16 @@ impl MeshManager {
         net_state: &mut NetworkState,
         net_secret_key: &SecretKey,
     ) {
+        // Seed this coordinated network's nullifiers from our durable
+        // `revoked_devices` set so past `ray unpair`s survive a restart and reach
+        // every network we coordinate. Union (never clears) so a nullifier adopted
+        // from a co-coordinator's blob is preserved.
+        {
+            let cfg = config::load().unwrap_or_default();
+            net_state
+                .nullifiers
+                .extend(config::revoked_device_ids(&cfg));
+        }
         net_state.refresh_snapshot();
         if let Some(snap) = &net_state.snapshot {
             let _ = self.blob_store.blobs().add_slice(&snap.msgpack_bytes).await;
@@ -228,6 +238,8 @@ impl MeshManager {
             mode,
             suggested_firewall: SuggestedFirewall::default(),
             reusable_keys: BTreeMap::new(),
+            // Seeded from persisted `revoked_devices` by `seal_and_publish`.
+            nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         })
@@ -608,7 +620,17 @@ impl MeshManager {
         // coordinator_dial_order filters it out (minter != me), so we just get
         // all blob coordinators in order.
         let minter = ctx.coordinator.unwrap_or(my_id);
-        let order = coordinator_dial_order(minter, &data.members, my_id);
+        let mut order = coordinator_dial_order(minter, &data.members, my_id);
+        // An explicitly-provided coordinator (from an invite, or the primary we
+        // just paired with) is a trusted dial target even if the fetched blob's
+        // roster does not flag it `is_coordinator` — a stale roster must not
+        // strand the join. Try it first.
+        if let Some(coord) = ctx.coordinator
+            && coord != my_id
+            && !order.contains(&coord)
+        {
+            order.insert(0, coord);
+        }
         if order.is_empty() {
             anyhow::bail!("no coordinator found in network record");
         }
@@ -721,6 +743,7 @@ impl MeshManager {
                 mode: GroupMode::Restricted,
                 suggested_firewall: data.suggested_firewall.clone(),
                 reusable_keys: data.reusable_keys.clone(),
+                nullifiers: data.nullifiers.clone(),
                 pending_suggestions: Vec::new(),
                 pending: HashMap::new(),
             };
@@ -859,6 +882,7 @@ impl MeshManager {
                 invite_secret,
                 suggested_firewall: data.suggested_firewall.clone(),
                 reusable_keys: data.reusable_keys.clone(),
+                nullifiers: data.nullifiers.clone(),
                 auto_accept_firewall: ctx.auto_accept_firewall,
                 auto_accept_files: ctx.auto_accept_files,
                 initial,
@@ -1194,6 +1218,7 @@ impl MeshManager {
                 mode: GroupMode::Restricted,
                 suggested_firewall: SuggestedFirewall::default(),
                 reusable_keys: data.reusable_keys.clone(),
+                nullifiers: data.nullifiers.clone(),
                 pending_suggestions: Vec::new(),
                 pending: HashMap::new(),
             };
