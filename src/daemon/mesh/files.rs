@@ -6,6 +6,11 @@ use std::path::Path;
 
 use super::super::*;
 
+/// Upper bound on the pairing dial to a primary device. `Endpoint::connect`
+/// retries discovery/relay with no timeout of its own, so without this an
+/// unreachable primary hangs the pairing call forever.
+const PAIR_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
 impl MeshManager {
     pub(crate) async fn resolve_peer_name(&self, name: &str) -> Option<EndpointId> {
         let suffix = format!(".{}", crate::DNS_DOMAIN);
@@ -35,7 +40,7 @@ impl MeshManager {
     /// Resolve a firewall `--peer` argument to a peer's **device** endpoint id,
     /// accepting far more forms than [`resolve_peer_name`]: hostname (bare or
     /// `host.net.ray`), mesh IPv4 (also for offline members, since the roster
-    /// stores v4), mesh IPv6 (connected peers only — the roster carries no v6),
+    /// stores v4), mesh IPv6 (connected peers only, the roster carries no v6),
     /// short id / full endpoint id, or a paired **user identity** (resolved to
     /// that user's joined device). Returns the device id `D`; `firewall_add`
     /// normalizes it to the user identity for inbound rules. Kept separate from
@@ -68,8 +73,23 @@ impl MeshManager {
         None
     }
 
-    pub(crate) async fn send_file(&self, path: &str, peer: &str) -> IpcMessage {
-        let peer_id = match self.resolve_peer_name(peer).await {
+    /// Resolve whether a pending offer's sender is one of *our own* paired
+    /// devices: the sender's resolved user identity must equal ours (our device
+    /// cert's `user_identity`, or on the primary (which holds no cert) our own
+    /// endpoint id). A non-paired peer resolves to its own transport id and so
+    /// can never match. Shared by `try_auto_accept_file` and `list_files` (which
+    /// surfaces it as `PendingFileInfo.own_device` for the mobile UI).
+    pub(crate) fn is_own_device_sender(&self, from: EndpointId) -> bool {
+        let own_user = self
+            .device_cert
+            .as_ref()
+            .map(|c| c.user_identity)
+            .unwrap_or_else(|| self.endpoint.id());
+        self.device_user_map.resolve(&from) == own_user
+    }
+
+    pub async fn send_file(&self, path: &str, peer: &str) -> IpcMessage {
+        let peer_id = match self.resolve_peer_flexible(peer).await {
             Some(id) => id,
             None => {
                 return IpcMessage::Error {
@@ -152,6 +172,7 @@ impl MeshManager {
                 filename: f.filename.clone(),
                 size: f.size,
                 mime_type: f.mime_type.clone(),
+                own_device: self.is_own_device_sender(f.from),
             })
             .collect();
         IpcMessage::FileList { files }
@@ -283,17 +304,9 @@ impl MeshManager {
             }
         };
 
-        // Own-device gate: the sender's resolved user identity must match ours.
-        // Our identity is our device cert's user_identity, or (on the primary,
-        // which has no cert) our own endpoint id. A non-paired peer resolves to
-        // its own transport id and so can never match.
-        let own_user = self
-            .device_cert
-            .as_ref()
-            .map(|c| c.user_identity)
-            .unwrap_or_else(|| self.endpoint.id());
-        let sender_user = self.device_user_map.resolve(&from);
-        if sender_user != own_user {
+        // Own-device gate: the sender must resolve to one of our own paired
+        // devices (see `is_own_device_sender`).
+        if !self.is_own_device_sender(from) {
             return;
         }
 
@@ -426,22 +439,46 @@ impl MeshManager {
 
         *self.files.pairing_secret.lock().unwrap() = Some(secret);
 
+        tracing::info!("pairing session opened; awaiting a secondary to scan the ticket");
         IpcMessage::PairingTicket { ticket }
     }
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// pair this device with a primary device using a scanned ticket.
+    #[tracing::instrument(skip_all, fields(primary = %endpoint_id.fmt_short()))]
     pub async fn pair_with_device(
         self: &Arc<Self>,
         endpoint_id: EndpointId,
         secret: Vec<u8>,
     ) -> IpcMessage {
         let addr: iroh::EndpointAddr = endpoint_id.into();
-        let conn = match self.endpoint.connect(addr, PAIR_ALPN).await {
-            Ok(c) => c,
-            Err(e) => {
+        tracing::info!(primary = %endpoint_id.fmt_short(), "dialing primary device for pairing");
+        // `Endpoint::connect` has no built-in timeout: if a path to the primary
+        // never establishes (primary offline, no open pairing session, or an
+        // unreachable relay/NAT path) it keeps retrying discovery and the caller
+        // hangs indefinitely. Bound it so pairing fails fast with a clear message.
+        let conn = match tokio::time::timeout(
+            PAIR_CONNECT_TIMEOUT,
+            self.endpoint.connect(addr, PAIR_ALPN),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "pairing: could not connect to primary device");
                 return IpcMessage::Error {
                     message: format!("failed to connect to primary device: {e}"),
+                };
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = PAIR_CONNECT_TIMEOUT.as_secs(),
+                    "pairing: timed out connecting to primary device"
+                );
+                return IpcMessage::Error {
+                    message: "timed out reaching the primary device. Make sure it is online and \
+                              that you opened pairing on it (run `ray pair` there)."
+                        .to_string(),
                 };
             }
         };
@@ -524,7 +561,12 @@ impl MeshManager {
                 }
                 // Auto-join every network the primary shared. Each join attaches the
                 // freshly stored cert (see current_device_cert) so the coordinator,
-                // which owns this device, admits it without manual approval.
+                // which owns this device, admits it without manual approval. Dial
+                // the primary itself as the coordinator: it just shared these
+                // networks (so it is online and either coordinates them or knows a
+                // coordinator), and this does not depend on the fetched blob's
+                // roster flagging it `is_coordinator`. Falls back to the blob's
+                // coordinators if the primary does not admit.
                 for net in networks {
                     if self.networks.contains_key(&net.network_key) {
                         continue;
@@ -534,7 +576,15 @@ impl MeshManager {
                     let net_key = net.network_key.clone();
                     tokio::spawn(async move {
                         match me
-                            .join_network(&net_key, Some(&net_name), None, None, None, false, false)
+                            .join_network(
+                                &net_key,
+                                Some(&net_name),
+                                None,
+                                None,
+                                Some(endpoint_id),
+                                false,
+                                false,
+                            )
                             .await
                         {
                             IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => {
@@ -549,6 +599,7 @@ impl MeshManager {
                         }
                     });
                 }
+                tracing::info!("pairing complete; device certificate stored");
                 IpcMessage::PairingComplete {
                     user_identity: cert.user_identity,
                 }
@@ -612,12 +663,13 @@ impl MeshManager {
 
     /// Revoke one of this user's paired devices (`ray unpair`). Primary-only.
     ///
-    /// Persists + publishes a signed revocation record for the device key,
-    /// enforces it locally right away, best-effort tells the device to wipe its
-    /// own cert, and — on every network this node coordinates — removes the
-    /// device from the roster and republishes so the blob stops carrying its
-    /// cert. Live links to the device are severed everywhere; other nodes drop it
-    /// when they reconverge (or resolve the revocation record).
+    /// Records the device key as a durable nullifier (`revoked_devices`), then, on
+    /// every network this node coordinates, adds it to the signed blob's nullifier
+    /// set, removes it from the roster, and republishes, so the blob stops
+    /// honoring its cert. Best-effort tells the device to wipe its own cert. Live
+    /// links to the device are severed everywhere; other nodes reject its cert and
+    /// prune it when they reconverge from the republished blob. Networks this node
+    /// does not coordinate are unaffected in Phase 1 (see the amendments design).
     pub(crate) async fn unpair(self: &Arc<Self>, device: &str) -> IpcMessage {
         // Only the primary holds the user identity secret that signs both the
         // certs and their revocation. A secondary carries a device cert.
@@ -675,72 +727,33 @@ impl MeshManager {
             };
         }
 
-        // 1. Rotate: bump our generation, remember the device locally so it can
-        //    never refresh its way back in, and persist both.
+        // 1. Record the nullified device durably. `revoked_devices` is the
+        //    coordinator's persistent nullifier seed: it survives a restart and is
+        //    unioned into every coordinated network's blob at seal time. Per-cert:
+        //    only this device is nullified; every other device we keep is untouched.
         let mut cfg = config::load().unwrap_or_default();
-        let new_generation = cfg.cert_generation + 1;
-        cfg.cert_generation = new_generation;
         let hex = target.to_string();
         if !cfg.revoked_devices.contains(&hex) {
             cfg.revoked_devices.push(hex);
         }
         if let Err(e) = config::save_settings(&cfg) {
             return IpcMessage::Error {
-                message: format!("failed to persist rotation: {e}"),
+                message: format!("failed to persist nullifier: {e}"),
             };
         }
-        self.revocation.set_local(own_user, new_generation);
         self.device_user_map.remove(&target);
 
-        // 2. Publish the new generation floor, so every peer rejects certs below
-        //    it (the revoked device is the only one not re-issued past it).
-        if let Ok(client) = dht::create_pkarr_client(&self.endpoint)
-            && let Ok(secret) = crate::identity::load_or_create()
-            && let Err(e) = dht::publish_cert_floor(&client, &secret, new_generation).await
-        {
-            tracing::warn!(error = %e, "failed to publish cert-floor record");
-        }
-
-        // 3. Re-issue the devices we keep: mint a fresh cert at the new
-        //    generation for every other paired device and push it to each online
-        //    one. Offline keepers refresh via the admission `Reissue` path when
-        //    they next reconnect. (A stranger can't be re-issued — we only sign
-        //    for keys carrying our own user identity in the roster.)
-        if let Ok(secret) = crate::identity::load_or_create() {
-            let mut keepers: std::collections::HashSet<EndpointId> = std::collections::HashSet::new();
-            for entry in self.networks.iter() {
-                for m in entry.value().state.read().unwrap().roster() {
-                    if m.user_identity == Some(own_user)
-                        && m.identity != own_user
-                        && m.identity != target
-                    {
-                        keepers.insert(m.identity);
-                    }
-                }
-            }
-            for device in keepers {
-                let fresh = control::DeviceCert::create(&secret, &device, new_generation);
-                // Push over any one live connection to that device.
-                'nets: for entry in self.networks.iter() {
-                    let net = entry.key().clone();
-                    for (pid, _ip, conn) in self.peers.peers_for_network_with_conn(&net) {
-                        if pid == device {
-                            push_cert_refresh(&conn, fresh.clone()).await;
-                            break 'nets;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 4. Best-effort: ask the revoked device to wipe its own cert if online.
+        // 2. Best-effort: ask the device to wipe its own cert if online.
         self.send_unpaired_notice(target).await;
 
-        // 5. Drop the device from every network we coordinate, and sever links.
+        // 3. Nullify the device on every network we coordinate (add to the signed
+        //    blob's nullifier set + drop it from the roster), republish, and sever
+        //    links. Other nodes reject its cert and prune it on reconverge.
         for (net, state, dht_notify, has_key) in nets {
             if has_key {
                 let member_ip = {
                     let mut s = state.write().unwrap();
+                    s.nullifiers.insert(target);
                     let ip = s
                         .members
                         .all()
@@ -776,13 +789,57 @@ impl MeshManager {
 
         tracing::info!(device = %target.fmt_short(), "unpaired device");
         IpcMessage::Ok {
-            message: format!("unpaired '{display}' and revoked its device certificate"),
+            message: format!("unpaired '{display}' and nullified its device certificate"),
+        }
+    }
+
+    /// Clear a re-paired device's nullifier (the inverse of [`unpair`]). Invoked by
+    /// the daemon loop when the pairing accept arm re-authorizes a device: drops it
+    /// from the durable `revoked_devices` seed and from every coordinated network's
+    /// blob nullifier set, republishing so the device's fresh cert is honored mesh
+    /// wide again. Non-coordinated networks clear on their own coordinator's next
+    /// reseal. Best-effort; a persist/publish failure is logged, not surfaced.
+    pub(crate) async fn reauth_device(self: &Arc<Self>, device: EndpointId) {
+        // Drop from the durable nullifier seed so a later reseal won't re-add it.
+        let mut cfg = config::load().unwrap_or_default();
+        let hex = device.to_string();
+        if let Some(pos) = cfg.revoked_devices.iter().position(|d| *d == hex) {
+            cfg.revoked_devices.remove(pos);
+            if let Err(e) = config::save_settings(&cfg) {
+                tracing::warn!(error = %e, "reauth: failed to clear device from nullifier seed");
+            }
+        }
+        // Collect coordinated networks (clone the handles) before awaiting.
+        let mut nets: Vec<(String, SharedNetworkState, Option<Arc<Notify>>)> = Vec::new();
+        for entry in self.networks.iter() {
+            if entry.value().state.read().unwrap().network_secret_key.is_some() {
+                nets.push((
+                    entry.key().clone(),
+                    entry.value().state.clone(),
+                    entry.value().dht_notify.clone(),
+                ));
+            }
+        }
+        let mut changed = false;
+        for (_net, state, dht_notify) in nets {
+            let removed = {
+                let mut s = state.write().unwrap();
+                s.nullifiers.remove(&device)
+            };
+            if removed {
+                changed = true;
+                update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+            }
+        }
+        if changed {
+            broadcast_member_sync(&self.peers, None).await;
+            tracing::info!(device = %device.fmt_short(), "re-authorized device (cleared nullifier)");
         }
     }
 
     /// Best-effort `ControlMsg::Unpaired` to a device over any shared live mesh
     /// connection, asking it to wipe its own cert. Never blocks unpair on success
-    /// — the authoritative revocation is the signed pkarr record.
+    /// the authoritative revocation is the signed pkarr record.
     async fn send_unpaired_notice(&self, target: EndpointId) {
         for entry in self.networks.iter() {
             let net = entry.key().clone();
@@ -798,51 +855,59 @@ impl MeshManager {
             }
         }
     }
-}
 
-/// Device-side handler for an inbound `ControlMsg::Unpaired` from `sender`. Acts
-/// only when this device holds a cert signed by `sender` (so a stranger can't
-/// trigger a wipe): deletes the stored device cert best-effort. The authoritative
-/// revocation is the signed pkarr record; this just completes a cooperative wipe.
-/// The in-memory cert copy clears on the next daemon restart.
-/// This node's cert-issuing authority for [`revocation::cert_decision`]:
-/// `(issuing_identity, generation, do_not_reissue_set)`. The issuing identity is
-/// `Some(my_identity)` only on the **primary** (holds the user secret + the
-/// authoritative generation); on a secondary it is `None`, so every cert is
-/// judged by the published floor instead. Reads config fresh so a rotation takes
-/// effect without a restart.
-pub(crate) fn cert_authority(
-    my_identity: EndpointId,
-) -> (Option<EndpointId>, u64, std::collections::HashSet<EndpointId>) {
-    let is_primary = crate::identity::load_device_cert().ok().flatten().is_none();
-    if is_primary {
-        let cfg = config::load().unwrap_or_default();
-        (
-            Some(my_identity),
-            cfg.cert_generation,
-            config::revoked_device_ids(&cfg).into_iter().collect(),
-        )
-    } else {
-        (None, 0, std::collections::HashSet::new())
+    /// Unpair *this* device from its primary, locally. Deletes the stored device
+    /// cert and leaves every network this device joined under the shared identity,
+    /// closing each connection with the leave code so coordinators prune us and
+    /// every peer drops us right away (rather than waiting on the revocation
+    /// floor). Used by the phone's "unpair this device" control and by the
+    /// device-side handler when its primary sends `ControlMsg::Unpaired`. A device
+    /// with no cert (a primary) has nothing to unpair.
+    pub async fn unpair_self(self: &Arc<Self>) -> IpcMessage {
+        if self.current_device_cert().is_none() {
+            return IpcMessage::Error {
+                message: "this device is not paired to a primary".to_string(),
+            };
+        }
+        // Leave every network first (graceful LEAVE_CODE close + config removal),
+        // so peers see an intentional departure and prune us immediately.
+        let networks: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
+        for net in &networks {
+            self.leave_network(net).await;
+        }
+        // Also purge any saved-but-inactive network configs. When a device is
+        // unpaired while offline it discovers this at startup restore, before its
+        // networks are added to `self.networks` (the join bails on the nullifier
+        // check first), so the loop above sees none, yet the config files remain
+        // and would make the node churn trying to rejoin networks it was removed
+        // from. Delete them directly.
+        if let Ok(cfg) = config::load() {
+            for net in &cfg.networks {
+                let _ = config::delete_network(&net.name);
+            }
+        }
+        // Then wipe the cert so this device is no longer one of its user's devices.
+        match crate::identity::delete_device_cert() {
+            Ok(()) => tracing::warn!("unpaired this device: deleted device certificate and left all networks"),
+            Err(e) => {
+                tracing::warn!(error = %e, "unpair: failed to delete device cert");
+                return IpcMessage::Error {
+                    message: format!("left all networks but failed to delete device cert: {e}"),
+                };
+            }
+        }
+        IpcMessage::Ok {
+            message: format!("unpaired this device (left {} network(s))", networks.len()),
+        }
     }
 }
 
-/// Best-effort push of a freshly-signed cert to a device over an existing mesh
-/// connection (a fresh `open_bi`, like a Pong reply). Used by the rotation path
-/// (`unpair`) for online keepers and by the admission `Reissue` branch for a
-/// keeper that reconnects after being offline during the bump.
-pub(crate) async fn push_cert_refresh(conn: &Connection, cert: control::DeviceCert) {
-    if let Ok((mut send, _recv)) = conn.open_bi().await {
-        let _ = control::send_msg(&mut send, &ControlMsg::CertRefresh { cert }).await;
-        let _ = send.finish();
-    }
-}
-
-/// Device-side handler for an inbound `ControlMsg::CertRefresh`. Stores the new
-/// cert only when it is signed by our own user identity, binds our own device
-/// key, verifies, and is at a generation no lower than the one we already hold
-/// (so a replayed old cert can't downgrade us). `current_device_cert()` reads
-/// disk-first, so the new generation takes effect on the next outbound join.
+/// Device-side handler for an inbound `ControlMsg::CertRefresh`. Retained for
+/// wire-compat with older peers that may still send it (the per-cert revocation
+/// model no longer re-issues certs, so nothing sends `CertRefresh` now). Stores
+/// the new cert only when it is signed by our own user identity, binds our own
+/// device key, verifies, and is at a generation no lower than the one we already
+/// hold (so a replayed old cert can't downgrade us).
 pub(crate) fn store_refreshed_cert(cert: &control::DeviceCert) {
     let Ok(Some(current)) = crate::identity::load_device_cert() else {
         return;
@@ -862,19 +927,15 @@ pub(crate) fn store_refreshed_cert(cert: &control::DeviceCert) {
     }
 }
 
-pub(crate) fn wipe_cert_if_unpaired_by(sender: EndpointId) {
-    match crate::identity::load_device_cert() {
-        Ok(Some(cert)) if cert.user_identity == sender => {
-            match crate::identity::delete_device_cert() {
-                Ok(()) => tracing::warn!(
-                    user = %sender.fmt_short(),
-                    "this device was unpaired by its primary; deleted device certificate"
-                ),
-                Err(e) => tracing::warn!(error = %e, "failed to delete device cert after unpair"),
-            }
-        }
-        _ => {}
-    }
+/// Returns true when `sender` is this device's primary (it signed our cert), so
+/// the caller can also tear the device out of the mesh. The cert deletion itself
+/// is deferred to [`MeshManager::unpair_self`] (called by the caller) so the
+/// leave-all runs first while the cert still identifies our networks.
+pub(crate) fn is_unpaired_by(sender: EndpointId) -> bool {
+    matches!(
+        crate::identity::load_device_cert(),
+        Ok(Some(cert)) if cert.user_identity == sender
+    )
 }
 
 /// (gid, home) for a uid via the passwd db, or None if it can't be resolved.

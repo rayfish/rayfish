@@ -2,7 +2,7 @@
 //!
 //! Answers A, AAAA, PTR, and SOA queries for `*.ray` names. The resolver is
 //! reached via a magic IP (`MAGIC_DNS_V4` = 100.100.100.53) routed through the
-//! TUN — no host-level port 53 bind is made. `handle_query` is called directly
+//! TUN, no host-level port 53 bind is made. `handle_query` is called directly
 //! by `forward::run_mesh` when it intercepts a UDP DNS packet destined for the
 //! magic IP.
 
@@ -23,7 +23,7 @@ use crate::DNS_DOMAIN;
 /// Reserved virtual IPv4 for the in-daemon Magic DNS resolver. It lives in the
 /// `100.64.0.0/10` peer range (so the existing TUN route delivers packets to it)
 /// but is NEVER assigned to a member and NEVER bound as a local interface
-/// address — it is reachable only by being routed into the TUN, which is what
+/// address, it is reachable only by being routed into the TUN, which is what
 /// lets us answer DNS without competing for the host's port 53. Distinct from
 /// Tailscale's 100.100.100.100 so both can coexist.
 pub const MAGIC_DNS_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 53);
@@ -108,7 +108,7 @@ pub async fn remove_hostname_by_ip(
 /// Replace all hostname entries for a network with `entries`, rebuilding the
 /// reverse-lookup entries to match. Used when a roster update (MemberSync or
 /// group blob) arrives so renamed, added, and removed peers all reflect
-/// immediately — the roster is the single source of truth for DNS.
+/// immediately: the roster is the single source of truth for DNS.
 pub async fn sync_network_hostnames(
     table: &HostnameTable,
     reverse: &ReverseLookupTable,
@@ -205,7 +205,7 @@ pub(crate) async fn handle_query(
         return Some(make_nodata(&packet));
     }
 
-    // Bare network name that didn't resolve — check if the TLD is a known network
+    // Bare network name that didn't resolve, check if the TLD is a known network
     {
         let tld = name_lower
             .rsplit_once('.')

@@ -1,7 +1,7 @@
 //! Reusable self-update engine shared by the `ray update` CLI and the daemon's
 //! opt-in auto-updater. Pure GitHub-release plumbing: resolve a release, fetch
 //! and verify its SHA-256 sidecar, and atomically swap the running binary. No
-//! printing, no root checks, no service restart — those belong to the callers
+//! printing, no root checks, no service restart - those belong to the callers
 //! (the CLI in `src/cli/update.rs`, the daemon task in `src/daemon`).
 
 use std::process::{Command, Stdio};
@@ -49,7 +49,7 @@ pub fn version_is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
-/// SHA-256 of a byte slice as lowercase hex — used both to verify a download
+/// SHA-256 of a byte slice as lowercase hex, used both to verify a download
 /// and to fingerprint the running binary on the nightly channel.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -84,7 +84,7 @@ pub fn github_token() -> Option<String> {
 
 /// Attach `Authorization: Bearer <token>` to a GitHub REST request when a token
 /// is present; otherwise leave the request anonymous. Only used for the
-/// api.github.com calls — the release-asset downloads on github.com aren't
+/// api.github.com calls: the release-asset downloads on github.com aren't
 /// subject to the API rate limit and are left unauthenticated.
 pub fn authed(req: RequestBuilder, token: &Option<String>) -> RequestBuilder {
     match token {
@@ -115,7 +115,7 @@ pub struct GhRelease {
 /// Build the HTTP client used for all release queries + downloads. reqwest is
 /// built with `rustls-no-provider`, so it relies on a process-level default
 /// CryptoProvider; install ring (already in the tree via iroh) before building.
-/// `install_default` errors only if one is already set — harmless, so ignore it.
+/// `install_default` errors only if one is already set (harmless, so ignore it).
 pub fn build_http_client() -> Result<Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Client::builder()
@@ -172,7 +172,7 @@ pub async fn fetch_checksum(client: &Client, tag: &str, asset: &str) -> Result<S
 /// checksum, and atomically swap it in for the running binary. Stages the new
 /// binary in a temp file, marks it executable, then `self_replace`s (handles the
 /// "can't overwrite a running executable" problem via rename). Does NOT restart
-/// any service and prints nothing — callers own presentation and restart.
+/// any service and prints nothing: callers own presentation and restart.
 pub async fn download_and_swap(
     client: &Client,
     bin_url: &str,

@@ -50,6 +50,18 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         .unwrap()
         .take()
         .expect("promote_rx present after build");
+    let self_unpair_rx = daemon
+        .self_unpair_rx
+        .lock()
+        .unwrap()
+        .take()
+        .expect("self_unpair_rx present after build");
+    let reauth_rx = daemon
+        .reauth_rx
+        .lock()
+        .unwrap()
+        .take()
+        .expect("reauth_rx present after build");
 
     // Opt-in automatic updates: a single daemon-wide task that periodically
     // checks for a newer stable release and swaps + restarts onto it. Desktop-only
@@ -59,12 +71,12 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         spawn_auto_update(daemon.shutdown_token.clone());
     }
 
-    let result = serve_ipc(&daemon, promote_rx, token).await;
+    let result = serve_ipc(&daemon, promote_rx, self_unpair_rx, reauth_rx, token).await;
 
     // Close the iroh endpoint before returning. Dropping it on return logs
     // "Endpoint dropped without calling `Endpoint::close`. Aborting
     // ungracefully." and can leave the process lingering until the service
-    // manager escalates to SIGKILL — which delays the relaunch on
+    // manager escalates to SIGKILL, which delays the relaunch on
     // `ray restart`/`ray update` past the client's reachability probe. Closing
     // it here lets QUIC connections terminate cleanly and the process exit
     // promptly so the new daemon comes up fast.
@@ -75,8 +87,8 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 
 /// Construct all always-on daemon infrastructure: identity, iroh endpoint, blob
 /// store, TUN device, forwarding loop, DNS resolver, mDNS discovery, protocol
-/// router, and metrics server. Returns the shared [`MeshManager`] — still on
-/// standby, so the caller is expected to run [`MeshManager::activate`] — and the
+/// router, and metrics server. Returns the shared [`MeshManager`] (still on
+/// standby, so the caller is expected to run [`MeshManager::activate`]) and the
 /// metrics-server guard, which must outlive the process.
 /// The ALPNs the endpoint advertises at boot: one per saved network plus the
 /// network-independent blobs / file-transfer / pairing / connect ALPNs. A
@@ -108,7 +120,48 @@ pub async fn build_headless() -> Result<Arc<MeshManager>> {
     let daemon = build_daemon(token, stats).await?;
     // Bring the saved networks' control plane up, matching `run_daemon`.
     daemon.connect_all_networks().await;
+    // Desktop drives the promote/self-unpair/reauth hand-off channels from
+    // `serve_ipc`; a headless embedder (Android) has no IPC loop, so drain them
+    // here. Without this a control reader's or join path's signal (e.g. this
+    // device discovering it was nullified by its primary) is sent but never
+    // acted on, so `unpair_self` never runs and the stale cert lingers.
+    spawn_headless_signal_drain(daemon.clone());
     Ok(daemon)
+}
+
+/// Drain the promote/self-unpair/reauth hand-off channels on an embedder that has
+/// no `serve_ipc` loop. Mirrors the matching arms in [`serve_ipc`]; the channels
+/// are stashed on the daemon by `build_daemon`, so take them here exactly once.
+fn spawn_headless_signal_drain(daemon: Arc<MeshManager>) {
+    let mut promote_rx = daemon
+        .promote_rx
+        .lock()
+        .unwrap()
+        .take()
+        .expect("promote_rx present after build");
+    let mut self_unpair_rx = daemon
+        .self_unpair_rx
+        .lock()
+        .unwrap()
+        .take()
+        .expect("self_unpair_rx present after build");
+    let mut reauth_rx = daemon
+        .reauth_rx
+        .lock()
+        .unwrap()
+        .take()
+        .expect("reauth_rx present after build");
+    let token = daemon.shutdown_token.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                Some(net) = promote_rx.recv() => { daemon.promote_to_coordinator(&net).await; }
+                Some(()) = self_unpair_rx.recv() => { let _ = daemon.unpair_self().await; }
+                Some(dev) = reauth_rx.recv() => { daemon.reauth_device(dev).await; }
+            }
+        }
+    });
 }
 
 /// Build all always-on daemon infrastructure WITHOUT a packet interface or the
@@ -227,7 +280,10 @@ async fn build_daemon(
     // Auto-accept worker channel: the file service nudges this with each newly-
     // queued offer id; the worker (spawned once the daemon exists) evaluates it.
     let (new_file_tx, new_file_rx) = mpsc::unbounded_channel::<u64>();
-    let files = Arc::new(FileService::new(key.clone(), new_file_tx));
+    // Re-auth channel: the pairing accept arm nudges this with a re-paired device's
+    // key so the daemon loop clears its nullifier (see `MeshManager::reauth_device`).
+    let (reauth_tx, reauth_rx) = mpsc::channel::<EndpointId>(4);
+    let files = Arc::new(FileService::new(key.clone(), new_file_tx, reauth_tx));
     let connect = Arc::new(ConnectService::new());
     let protocol_router = Arc::new(ProtocolRouter::new(
         blobs_proto,
@@ -238,6 +294,9 @@ async fn build_daemon(
     // Promotion channel: a co-coordinator's control reader signals the main
     // daemon loop to swap in the coordinator accept handler on `AdminGrant`.
     let (promote_tx, promote_rx) = mpsc::channel::<String>(16);
+    // Self-unpair channel: a control reader that received `Unpaired` from our
+    // primary signals the daemon loop to leave all networks + wipe our cert.
+    let (self_unpair_tx, self_unpair_rx) = mpsc::channel::<()>(4);
     let daemon = Arc::new(MeshManager {
         endpoint: ep,
         identity,
@@ -261,7 +320,6 @@ async fn build_daemon(
         connect,
         device_cert,
         device_user_map,
-        revocation: crate::revocation::RevocationCache::new(),
         pruned_peers: Arc::new(DashSet::new()),
         contact_public,
         active: active.clone(),
@@ -269,6 +327,9 @@ async fn build_daemon(
         ssh_authz: crate::ssh::new_authz(),
         ssh_token: std::sync::Mutex::new(None),
         promote_tx,
+        self_unpair_tx,
+        self_unpair_rx: std::sync::Mutex::new(Some(self_unpair_rx)),
+        reauth_rx: std::sync::Mutex::new(Some(reauth_rx)),
     });
 
     // --- Accept loop (ALPN dispatch) + Prometheus metrics ---
@@ -284,27 +345,10 @@ async fn build_daemon(
         spawn_contact_publisher(pkarr_client, daemon.endpoint.id(), token.clone());
     }
 
-    // --- Device-cert revocation (ray unpair) ---
-    // Seed the floor cache from this user's persisted generation so it is
-    // enforced locally the instant the daemon comes up, ahead of any pkarr fetch.
-    // A primary's endpoint id is the user identity that signed the certs.
-    {
-        let cfg = config::load().unwrap_or_default();
-        let own_user = daemon
-            .device_cert
-            .as_ref()
-            .map(|c| c.user_identity)
-            .unwrap_or_else(|| daemon.endpoint.id());
-        if cfg.cert_generation > 0 {
-            daemon.revocation.set_local(own_user, cfg.cert_generation);
-        }
-    }
-    if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
-        spawn_revocation_publisher(pkarr_client, token.clone());
-    }
-    if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
-        spawn_revocation_poller(daemon.clone(), pkarr_client, token.clone());
-    }
+    // Device-cert revocation is now carried per-network in the signed blob's
+    // nullifier set (`ray unpair`); no separate pkarr record or background
+    // publisher/poller is needed. Coordinated networks seed their nullifiers from
+    // the persisted `revoked_devices` set at seal time (see `seal_and_publish`).
     let metrics_server =
         spawn_metrics_server(stats, daemon.peers.clone(), &daemon.endpoint, token).await;
     // Keep the metrics-server guard alive for the daemon's whole lifetime.
@@ -398,6 +442,8 @@ async fn spawn_metrics_server(
 async fn serve_ipc(
     daemon: &Arc<MeshManager>,
     mut promote_rx: mpsc::Receiver<String>,
+    mut self_unpair_rx: mpsc::Receiver<()>,
+    mut reauth_rx: mpsc::Receiver<EndpointId>,
     token: CancellationToken,
 ) -> Result<()> {
     let socket_path = ipc::socket_path();
@@ -426,6 +472,17 @@ async fn serve_ipc(
             Some(net) = promote_rx.recv() => {
                 daemon.promote_to_coordinator(&net).await;
             }
+            // Our primary unpaired us: leave all networks + wipe the cert so we
+            // drop out of the mesh right away. Hand-off from a control reader that
+            // holds only field clones (see `MeshCtx::self_unpair_tx`).
+            Some(()) = self_unpair_rx.recv() => {
+                let _ = daemon.unpair_self().await;
+            }
+            // A device just (re-)paired to us: clear its nullifier from the durable
+            // seed and every coordinated blob so its fresh cert is honored again.
+            Some(dev) = reauth_rx.recv() => {
+                daemon.reauth_device(dev).await;
+            }
             result = listener.accept() => match result {
                 Ok((stream, _)) => {
                     let daemon = daemon.clone();
@@ -442,9 +499,9 @@ async fn serve_ipc(
 }
 
 /// Make the IPC socket connectable by any local user. Authority is not granted
-/// by reaching the socket — every mutating request is authorized per-connection
+/// by reaching the socket: every mutating request is authorized per-connection
 /// in `check_authorized` via `SO_PEERCRED` (root or the configured operator
-/// UID), Tailscale's model — so the file mode only has to permit the connect().
+/// UID), Tailscale's model, so the file mode only has to permit the connect().
 fn set_socket_permissions(path: &std::path::Path) {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -523,7 +580,7 @@ fn spawn_auto_update(token: CancellationToken) -> tokio::task::JoinHandle<()> {
 
 /// One auto-update cycle: check for a newer stable release and, if found and not
 /// backed off, swap the binary and trigger a self-restart. `Ok(())` means nothing
-/// needed doing (or the swap+restart was scheduled — the daemon is torn down and
+/// needed doing (or the swap+restart was scheduled, the daemon is torn down and
 /// relaunched onto the new binary shortly after).
 #[cfg(feature = "desktop")]
 async fn auto_update_once() -> Result<()> {

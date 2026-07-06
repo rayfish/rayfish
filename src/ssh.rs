@@ -11,7 +11,7 @@
 //!
 //! Authorization is the only gate; SSH auth itself is the `none` method (the
 //! identity is already proven). For now an authorized peer may log in as any
-//! local unix user, including root — tighter user-mapping is future work.
+//! local unix user, including root; tighter user-mapping is future work.
 //!
 //! Authorization is evaluated once, when the connection is accepted, so
 //! `ray firewall ssh allow/deny` changes apply to *new* sessions; an
@@ -457,7 +457,7 @@ fn resolve_login(login_user: &str) -> Result<LoginInfo> {
 }
 
 /// Build a `pre_exec` closure that drops the root daemon's privileges to the
-/// target user **completely** — supplementary groups first (`initgroups`, so the
+/// target user **completely**: supplementary groups first (`initgroups`, so the
 /// child does NOT inherit root's groups like gid 0/wheel), then `setgid`, then
 /// `setuid`, in that order. It runs as root in the forked child just before
 /// `exec`. **Fails closed:** if any step errors, the closure returns an error so
@@ -572,8 +572,8 @@ async fn run_pty_session(
 
 /// Run a command (or shell) with **pipes** instead of a PTY, for a non-`-t`
 /// `ssh host cmd`. stdout goes to the channel's data stream and stderr to the
-/// extended-data (code 1) stream — kept separate and untranslated, as a
-/// conventional sshd delivers them — so piped/binary output isn't corrupted.
+/// extended-data (code 1) stream, kept separate and untranslated, as a
+/// conventional sshd delivers them, so piped/binary output isn't corrupted.
 async fn run_pipe_session(
     channel: Channel<Msg>,
     handle: Handle,

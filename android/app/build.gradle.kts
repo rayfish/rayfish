@@ -33,6 +33,12 @@ android {
         versionCode = 2
         versionName = "0.1.4"
 
+        // App-name placeholders substituted into the manifest labels. The debug
+        // build type overrides these (see below) so the dev build installs as a
+        // separate app with a distinct name in the launcher and share sheet.
+        manifestPlaceholders["appName"] = "Rayfish"
+        manifestPlaceholders["shareLabel"] = "Share with Rayfish"
+
         // ray-mobile only builds these two ABIs for now (device + emulator).
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -60,6 +66,18 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Install the debug build as a separate app alongside a release/Play
+            // install, so testing never uninstalls the real app (which would wipe
+            // the on-device identity key). Distinct applicationId => distinct data,
+            // identity, and signing space; distinct labels so the two are
+            // distinguishable in the launcher and the system share sheet.
+            // A build type can only suffix the applicationId (a full override
+            // needs product flavors), so the dev package is xyz.rayfish.android.dev.
+            applicationIdSuffix = ".dev"
+            manifestPlaceholders["appName"] = "Rayfish Dev"
+            manifestPlaceholders["shareLabel"] = "Share with Rayfish Dev"
+        }
         release {
             isMinifyEnabled = false
             isDebuggable = false

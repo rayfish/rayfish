@@ -512,7 +512,7 @@ async fn try_networkmanager_dbus(tun_name: &str) -> Option<NetworkManagerDns> {
     .await
     .ok()?;
 
-    // Check NM DNS mode — if "systemd-resolved" or "none", skip (resolved handles it)
+    // Check NM DNS mode: if "systemd-resolved" or "none", skip (resolved handles it)
     let dns_reply = conn
         .call_method(
             Some("org.freedesktop.NetworkManager"),
@@ -525,13 +525,13 @@ async fn try_networkmanager_dbus(tun_name: &str) -> Option<NetworkManagerDns> {
         .ok()?;
 
     // Extract the mode string. If we can't read it at all, conservatively
-    // return None — safer to fall through to direct /etc/resolv.conf than
+    // return None - safer to fall through to direct /etc/resolv.conf than
     // to claim NM supports split-DNS when we can't confirm it.
     let body = dns_reply.body();
     let mode_val = body.deserialize::<Value>().ok()?;
     let mode = mode_val.downcast_ref::<String>().ok()?.to_string();
 
-    // If NM delegates to systemd-resolved, skip — the resolved D-Bus path handles it.
+    // If NM delegates to systemd-resolved, skip: the resolved D-Bus path handles it.
     // If NM DNS is "none", it's not managing DNS at all.
     if mode == "systemd-resolved" || mode == "none" {
         return None;
@@ -597,7 +597,7 @@ impl DnsConfigurator for NetworkManagerDns {
         if let Ok(config_path) = <&zbus::zvariant::ObjectPath>::try_from(&*config_val)
             && config_path.as_str() != "/"
         {
-            // Set DNS nameservers via D-Bus Properties — magic DNS IP as u32 (NM host u32 of network-order bytes)
+            // Set DNS nameservers via D-Bus Properties: magic DNS IP as u32 (NM host u32 of network-order bytes)
             let dns_servers: Vec<u32> = vec![u32::from_le_bytes(crate::dns::MAGIC_DNS_V4.octets())]; // NM wants the address as a host u32 of its network-order bytes
             let _ = conn
                 .call_method(
@@ -802,7 +802,7 @@ impl DnsConfigurator for Resolvconf {
 // Linux fallback: direct /etc/resolv.conf
 // ---------------------------------------------------------------------------
 
-// Pure helpers — NOT cfg-gated so their unit tests run on macOS (the dev host).
+// Pure helpers, NOT cfg-gated so their unit tests run on macOS (the dev host).
 
 /// Extract IPv4 `nameserver` entries from resolv.conf contents, excluding our
 /// own magic IP (so we never capture ourselves as an upstream → no forward loop).
@@ -927,7 +927,7 @@ pub async fn run_resolv_reassert(search: Vec<String>, token: tokio_util::sync::C
 // NetworkManager quieting (direct mode): stop NM regenerating resolv.conf.
 //
 // When we fall to the direct /etc/resolv.conf takeover it's because no
-// split-DNS backend was found — on an NM host that means NM is in plain
+// split-DNS backend was found: on an NM host that means NM is in plain
 // `default` mode and owns resolv.conf, regenerating it on every connection /
 // DHCP-lease event and trampling our `nameserver 100.100.100.53`. Dropping a
 // `dns=none` config snippet makes NM leave resolv.conf entirely to us
@@ -1004,7 +1004,7 @@ async fn nm_quiet_remove() {
     let path = Path::new(NM_DROPIN);
     match tokio::fs::read_to_string(path).await {
         Ok(c) if resolv_conf_is_ours(&c) => {}
-        _ => return, // absent or not ours — leave it
+        _ => return, // absent or not ours, leave it
     }
     if let Err(e) = tokio::fs::remove_file(path).await {
         tracing::warn!(error = %e, "failed to remove NetworkManager dns=none drop-in");

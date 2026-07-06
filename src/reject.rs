@@ -1,7 +1,7 @@
 //! Synthesis of "fail fast" REJECT replies for firewall-denied packets.
 //!
 //! When the firewall denies a packet and `reject` mode is enabled (opt-in,
-//! default off — see [`crate::firewall::FirewallConfig`]), the data path builds a
+//! default off, see [`crate::firewall::FirewallConfig`]), the data path builds a
 //! reply here instead of silently dropping: a TCP RST for TCP, or an ICMP
 //! destination-unreachable for UDP / everything else. The reply has its src/dst
 //! (and ports) swapped so it looks like it came back from the destination, which
@@ -46,7 +46,7 @@ const TCP_ACK: u8 = 0x10;
 /// would risk a reject storm), a multicast/broadcast source, or a packet too
 /// short to parse the fields we need.
 pub fn build_reject(packet: &[u8], info: &PacketInfo) -> Option<Bytes> {
-    // Never answer a packet whose source isn't a normal unicast host — a reply
+    // Never answer a packet whose source isn't a normal unicast host: a reply
     // would go nowhere useful and could amplify.
     if is_multicast_or_unspecified(info.src_ip) {
         return None;
@@ -66,7 +66,7 @@ pub fn build_reject(packet: &[u8], info: &PacketInfo) -> Option<Bytes> {
     }
 }
 
-/// IPv4 link-local broadcast, any multicast, or the unspecified address — never a
+/// IPv4 link-local broadcast, any multicast, or the unspecified address: never a
 /// legitimate REJECT target.
 fn is_multicast_or_unspecified(ip: IpAddr) -> bool {
     match ip {
@@ -201,7 +201,7 @@ fn build_icmp_message(icmp_type: u8, code: u8, quote: &[u8]) -> Vec<u8> {
     let mut msg = vec![0u8; ICMP_HEADER_LEN + quote.len()];
     msg[0] = icmp_type;
     msg[1] = code;
-    // msg[2..4] checksum, msg[4..8] unused — left zero.
+    // msg[2..4] checksum, msg[4..8] unused, left zero.
     msg[ICMP_HEADER_LEN..].copy_from_slice(quote);
     msg
 }

@@ -22,7 +22,7 @@ pub type FastDashMap<K, V> = dashmap::DashMap<K, V, ahash::RandomState>;
 /// [`lookup_v4`](Self::lookup_v4) / [`lookup_v6`](Self::lookup_v6) to find the
 /// connection to send it over.
 ///
-/// There is a single `PeerTable` for the whole daemon, not one per network — a
+/// There is a single `PeerTable` for the whole daemon, not one per network: a
 /// peer is reachable iff we share at least one network with it, and that fact is
 /// captured by the peer holding a live connection in [`PeerEntry::conns`]. A
 /// multi-homed peer therefore has one entry (one IP) with several connections,
@@ -48,7 +48,7 @@ pub struct PeerTable {
 ///
 /// A peer has one virtual IP (derived from its identity, stable across every
 /// network it joins), so the same peer can be reachable through several networks
-/// at once — one QUIC connection per shared network. Reachability is simply
+/// at once, one QUIC connection per shared network. Reachability is simply
 /// "we share at least one live connection", which is why connections are keyed
 /// by network rather than overwriting a single slot.
 pub struct PeerEntry {
@@ -117,7 +117,7 @@ impl PeerTable {
         network: &str,
     ) {
         let net = SmolStr::new(network);
-        // Whether this is the peer's *first* connection in `network` — a true
+        // Whether this is the peer's *first* connection in `network`: a true
         // connect rather than a refresh of an existing link (which happens on
         // reconnect churn). Drives the audit `connect` event below.
         let newly_connected;
@@ -183,7 +183,7 @@ impl PeerTable {
     }
 
     /// Drops a peer's connection in a single `network`. The peer entry is removed
-    /// only once it has no connections left in any network — so losing the `dev`
+    /// only once it has no connections left in any network, so losing the `dev`
     /// link doesn't unroute a peer still reachable via `db`.
     pub fn remove_peer_from_network(&self, ip: &Ipv4Addr, ipv6: &Ipv6Addr, network: &str) {
         let mut dropped = None;

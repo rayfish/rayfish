@@ -49,6 +49,9 @@ pub(crate) struct JoinParams {
     /// From the fetched blob: reusable join keys, so this node can validate
     /// redemptions if it later holds the network key (HA admission).
     pub(crate) reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
+    /// From the fetched blob: device keys nullified on this network (`ray unpair`),
+    /// so a joined member enforces them locally until the next reconverge.
+    pub(crate) nullifiers: BTreeSet<EndpointId>,
     /// Consent: auto-install suggested rules without a manual review queue.
     pub(crate) auto_accept_firewall: bool,
     /// Seed for per-network auto-accept of file offers from own devices
@@ -99,6 +102,7 @@ pub(crate) async fn join_mesh_shared(
         invite_secret,
         suggested_firewall,
         reusable_keys,
+        nullifiers,
         auto_accept_firewall,
         auto_accept_files,
         initial,
@@ -166,21 +170,25 @@ pub(crate) async fn join_mesh_shared(
         remote_ip,
         network_name,
     );
-    connect_to_roster_peers(
-        ep,
-        alpn,
-        &members,
-        network_name,
+    // Dial the rest of the roster in the background. The coordinator link is
+    // already registered above, so the network is usable now; blocking the join
+    // on the full mesh means one slow or dead member (e.g. a stale offline peer
+    // whose discovery record still resolves) stalls boot for the whole
+    // per-dial handshake timeout. Peer links fill in as they connect, and the
+    // reconnect loop recovers any that are down.
+    spawn_roster_peer_dials(
+        ep.clone(),
+        alpn.to_vec(),
+        members.clone(),
+        network_name.to_string(),
         my_identity,
         my_ip,
         remote_id,
-        &device_cert,
-        &peers,
-        &worker_ctx,
-        &disconnect_tx,
-        &token,
-    )
-    .await?;
+        device_cert.clone(),
+        worker_ctx.clone(),
+        disconnect_tx.clone(),
+        token.clone(),
+    );
 
     let live_state = build_member_state(
         members,
@@ -189,6 +197,7 @@ pub(crate) async fn join_mesh_shared(
         network_name,
         suggested_firewall,
         reusable_keys,
+        nullifiers,
         &blob_store,
     )
     .await;
@@ -200,6 +209,7 @@ pub(crate) async fn join_mesh_shared(
     // Reconverge worker: `MemberSync`/`BlobUpdated` triggers fan into this single
     // debounced task (see `spawn_reconverge_worker`).
     let reconverge_notify = Arc::new(tokio::sync::Notify::new());
+    let self_unpair_tx = worker_ctx.self_unpair_tx.clone();
     spawn_reconverge_worker(
         reconverge_notify.clone(),
         token.clone(),
@@ -228,6 +238,7 @@ pub(crate) async fn join_mesh_shared(
         invite_lock.clone(),
         reconverge_notify.clone(),
         pending_pongs.clone(),
+        self_unpair_tx,
     );
 
     Ok(JoinResult::Joined(live_state))
@@ -320,6 +331,7 @@ async fn send_reconnect_hello(
 /// Build the in-memory `NetworkState` cell for a joined member from the admitted
 /// roster + blob-derived firewall/keys, refresh its snapshot, and seed the local
 /// blob store with those bytes.
+#[allow(clippy::too_many_arguments)]
 async fn build_member_state(
     members: Vec<crate::membership::Member>,
     approved: Vec<ApprovedEntry>,
@@ -327,6 +339,7 @@ async fn build_member_state(
     network_name: &str,
     suggested_firewall: SuggestedFirewall,
     reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
+    nullifiers: BTreeSet<EndpointId>,
     blob_store: &FsStore,
 ) -> SharedNetworkState {
     let mut ns = NetworkState {
@@ -339,6 +352,7 @@ async fn build_member_state(
         mode: GroupMode::Restricted,
         suggested_firewall,
         reusable_keys,
+        nullifiers,
         pending_suggestions: Vec::new(),
         pending: HashMap::new(),
     };
@@ -378,62 +392,109 @@ fn register_mesh_peer(
 /// coordinator), send each a `MeshHello`, and register it as a peer. A member
 /// that's offline is logged and skipped; a stream-open/send failure aborts the
 /// join (propagated to the caller).
+/// Upper bound on a single background roster dial. Generous on purpose: the dial
+/// runs off the boot path, so a slow-but-live member (relay + NAT holepunch on a
+/// mobile link) is worth waiting for, while a truly dead member is still bounded
+/// instead of lingering on iroh's own internal handshake timeout.
+const MESH_PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Dial every other roster member concurrently in the background, sending each a
+/// `MeshHello` and registering it as a peer. Best-effort and non-blocking: this
+/// is spawned so the join completes as soon as the coordinator link is up, and a
+/// member that's offline (or stale) is bounded by [`MESH_PEER_DIAL_TIMEOUT`] and
+/// simply logged. The owned arguments let the task outlive the join call.
 #[allow(clippy::too_many_arguments)]
-async fn connect_to_roster_peers(
-    ep: &Endpoint,
-    alpn: &[u8],
-    members: &[crate::membership::Member],
-    network_name: &str,
+fn spawn_roster_peer_dials(
+    ep: Endpoint,
+    alpn: Vec<u8>,
+    members: Vec<crate::membership::Member>,
+    network_name: String,
     my_identity: EndpointId,
     my_ip: Ipv4Addr,
     skip_id: EndpointId,
-    device_cert: &Option<control::DeviceCert>,
-    peers: &PeerTable,
-    ctx: &MeshCtx,
-    disconnect_tx: &mpsc::Sender<forward::DisconnectEvent>,
-    token: &CancellationToken,
-) -> Result<()> {
-    for member in members {
-        if member.identity == my_identity || member.identity == skip_id {
-            continue;
-        }
-        match transport::connect_to_peer_with_alpn(ep, member.identity, alpn).await {
-            Ok(conn) => {
-                let (mut send, _recv) = conn.open_bi().await?;
-                control::send_msg(
-                    &mut send,
-                    &ControlMsg::MeshHello {
-                        identity: my_identity,
-                        ip: my_ip,
-                        hostname: outgoing_hostname(network_name),
-                        device_cert: device_cert.clone(),
-                    },
-                )
-                .await?;
-                register_mesh_peer(
-                    peers,
-                    ctx,
-                    disconnect_tx,
-                    token,
-                    conn,
-                    member.identity,
-                    member.ip,
-                    network_name,
-                );
-                tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
+    device_cert: Option<control::DeviceCert>,
+    ctx: MeshCtx,
+    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+    token: CancellationToken,
+) {
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        let mut dials = futures::stream::FuturesUnordered::new();
+        for member in &members {
+            if member.identity == my_identity || member.identity == skip_id {
+                continue;
             }
-            Err(e) => {
-                tracing::warn!(peer_ip = %member.ip, error = %e, "mesh peer unavailable");
-            }
+            // Borrow the owned task-locals into each future; the values live for
+            // the whole `while dials.next()` drain below.
+            let (ep, alpn, ctx) = (&ep, &alpn, &ctx);
+            let (disconnect_tx, token) = (&disconnect_tx, &token);
+            let (network_name, device_cert) = (&network_name, &device_cert);
+            dials.push(async move {
+                // Bound the dial and honor cancellation so one unreachable member
+                // can't keep this task alive far longer than the dial is worth.
+                let conn = tokio::select! {
+                    _ = token.cancelled() => return,
+                    r = tokio::time::timeout(
+                        MESH_PEER_DIAL_TIMEOUT,
+                        transport::connect_to_peer_with_alpn(ep, member.identity, alpn),
+                    ) => r,
+                };
+                match conn {
+                    Ok(Ok(conn)) => {
+                        let mut send = match conn.open_bi().await {
+                            Ok((send, _recv)) => send,
+                            Err(e) => {
+                                tracing::warn!(peer_ip = %member.ip, error = %e, "mesh peer stream open failed");
+                                return;
+                            }
+                        };
+                        if let Err(e) = control::send_msg(
+                            &mut send,
+                            &ControlMsg::MeshHello {
+                                identity: my_identity,
+                                ip: my_ip,
+                                hostname: outgoing_hostname(network_name),
+                                device_cert: device_cert.clone(),
+                            },
+                        )
+                        .await
+                        {
+                            tracing::warn!(peer_ip = %member.ip, error = %e, "mesh peer hello failed");
+                            return;
+                        }
+                        register_mesh_peer(
+                            &ctx.peers,
+                            ctx,
+                            disconnect_tx,
+                            token,
+                            conn,
+                            member.identity,
+                            member.ip,
+                            network_name,
+                        );
+                        tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(peer_ip = %member.ip, error = %e, "mesh peer unavailable");
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            peer_ip = %member.ip,
+                            timeout_secs = MESH_PEER_DIAL_TIMEOUT.as_secs(),
+                            "mesh peer dial timed out"
+                        );
+                    }
+                }
+            });
         }
-    }
-    Ok(())
+        while dials.next().await.is_some() {}
+    });
 }
 
 /// Run one coordinator handshake. A fresh join (`initial`) opens a stream, sends
 /// a `JoinRequest` (invite secret + hostname), and reads the verdict on the same
 /// stream. A reconnect/restore keeps the legacy handshake where the coordinator
-/// speaks first (Welcome/JoinApproved/MemberSync) — on a `MemberSync` trigger the
+/// speaks first (Welcome/JoinApproved/MemberSync): on a `MemberSync` trigger the
 /// roster comes from the network-key-signed pkarr record, never peer-supplied
 /// membership. Returns the admitted roster, or `Pending` on a closed network.
 #[allow(clippy::too_many_arguments)]
@@ -507,7 +568,7 @@ async fn perform_join_handshake(
                 (members, vec![])
             }
             ControlMsg::MemberSync => {
-                // Reconnected via a peer. The message is only a trigger — fetch
+                // Reconnected via a peer. The message is only a trigger, fetch
                 // the authoritative roster from the network-key-signed pkarr
                 // record. If it's briefly unreachable, fall back to our last
                 // persisted roster rather than trusting peer-supplied membership.
@@ -624,6 +685,7 @@ fn spawn_member_control_listener(
     invite_lock: Arc<tokio::sync::Mutex<()>>,
     reconverge_notify: Arc<tokio::sync::Notify>,
     pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
+    self_unpair_tx: mpsc::Sender<()>,
 ) {
     tokio::spawn(async move {
         let mut gate = crate::ratelimit::ControlGate::new();
@@ -664,7 +726,7 @@ fn spawn_member_control_listener(
                                 }
                                 ControlMsg::BlobUpdated => {
                                     // Trigger only. Reconverge from the network-key-signed
-                                    // pkarr record — a malicious member can't inject a
+                                    // pkarr record, a malicious member can't inject a
                                     // forged roster/firewall blob via this message. Coalesced
                                     // into the debounced reconverge worker.
                                     reconverge_notify.notify_one();
@@ -779,10 +841,14 @@ fn spawn_member_control_listener(
                                     }
                                 }
                                 ControlMsg::Unpaired => {
-                                    // Our primary is unpairing this device. The
-                                    // helper verifies the sender signed our cert,
-                                    // so a stranger is a no-op.
-                                    wipe_cert_if_unpaired_by(initial_conn.remote_id());
+                                    // Our primary is unpairing this device. Only
+                                    // act if it actually signed our cert (a
+                                    // stranger is a no-op), then hand off to the
+                                    // daemon loop to leave all networks + wipe the
+                                    // cert so we drop out of the mesh right away.
+                                    if is_unpaired_by(initial_conn.remote_id()) {
+                                        let _ = self_unpair_tx.try_send(());
+                                    }
                                 }
                                 ControlMsg::CertRefresh { cert } => {
                                     // Our primary rotated and re-issued us.
@@ -858,14 +924,14 @@ pub(crate) fn spawn_reconnect_loop(
             }
 
             // A deliberate `ray leave` (graceful close with the leave code) means
-            // the peer is gone for good — don't spin a reconnect task against it.
+            // the peer is gone for good, don't spin a reconnect task against it.
             // The coordinator's MemberSync will prune it from our roster.
             if event.intentional {
                 tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "peer left, not reconnecting");
                 continue;
             }
             // We just pruned this peer from the roster (it was kicked or departed)
-            // and closed the connection ourselves — that close is what woke this
+            // and closed the connection ourselves, that close is what woke this
             // loop. The peer still lists us, so re-dialing would re-form the link.
             // Consume the one-shot suppression entry and skip.
             if pruned_peers

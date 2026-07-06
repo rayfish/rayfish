@@ -99,7 +99,7 @@ pub(crate) fn spawn_peer_cleanup(
 
 /// Coordinator-side per-member control reader. Continuously accepts control
 /// streams from one member and processes `MeshHello`s as live create-or-update
-/// signals — the only path by which a member's hostname (or device cert) reaches
+/// signals: the only path by which a member's hostname (or device cert) reaches
 /// the coordinator after the initial handshake. On a hostname that differs from
 /// the stored one, the coordinator resolves collisions authoritatively, updates
 /// the roster + DNS, republishes the group blob, and broadcasts `MemberSync` so
@@ -121,16 +121,14 @@ pub(crate) fn spawn_coordinator_control_reader(
     pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
 ) {
     let MeshCtx {
-        identity,
         peers,
         blob_store,
         hostname_table,
         reverse_table,
         device_user_map,
-        revocation,
+        self_unpair_tx,
         ..
     } = ctx;
-    let my_identity = identity.local_identity();
     tokio::spawn(async move {
         let mut gate = crate::ratelimit::ControlGate::new();
         loop {
@@ -206,10 +204,13 @@ pub(crate) fn spawn_coordinator_control_reader(
                     continue;
                 }
                 ControlMsg::Unpaired => {
-                    // The peer claims to be our primary unpairing us. Verified
-                    // inside against our own cert's signer, so a stranger is a
-                    // no-op.
-                    wipe_cert_if_unpaired_by(remote_id);
+                    // The peer claims to be our primary unpairing us. Only act if
+                    // it actually signed our cert (a stranger is a no-op), then
+                    // hand off to the daemon loop to leave all networks + wipe the
+                    // cert so we drop out of the mesh right away.
+                    if is_unpaired_by(remote_id) {
+                        let _ = self_unpair_tx.try_send(());
+                    }
                     continue;
                 }
                 ControlMsg::CertRefresh { cert } => {
@@ -229,18 +230,15 @@ pub(crate) fn spawn_coordinator_control_reader(
                 continue;
             };
 
-            // Verify and store device cert if present, unless it is below the
-            // issuing user's generation floor (`ray unpair`) — a revoked/stale
-            // cert is not recorded as a paired device, so it stops resolving to
-            // the user's identity. (A `Reissue` verdict — our own stale device —
-            // is treated as fine to record; the admission path pushes its refresh.)
+            // Verify and store device cert if present, unless the device key is
+            // nullified on this network (`ray unpair`), a nullified cert is not
+            // recorded as a paired device, so it stops resolving to the user's
+            // identity.
             let cert_ok = device_cert.as_ref().is_some_and(|cert| {
                 if !cert.verify() || cert.device_key != remote_id {
                     return false;
                 }
-                let (issuing, my_gen, revoked) = cert_authority(my_identity);
-                revocation::cert_decision(cert, issuing, my_gen, &|d| revoked.contains(d), &revocation)
-                    != revocation::CertDecision::Reject
+                !state.read().unwrap().nullifiers.contains(&cert.device_key)
             });
             if let Some(ref cert) = device_cert
                 && cert_ok
@@ -322,7 +320,7 @@ pub(crate) fn spawn_coordinator_control_reader(
 /// Send `msg` to each coordinator peer (per [`gossip_targets`]) that has a live
 /// connection on `network`. Best-effort: a target without a live connection is
 /// skipped (it will reconverge invite state from a future share/redeem or, for
-/// reusable keys, the signed blob). Never carries the raw secret — only its hash.
+/// reusable keys, the signed blob). Never carries the raw secret, only its hash.
 pub(crate) async fn gossip_to_coordinators(
     peers: &PeerTable,
     network: &str,
