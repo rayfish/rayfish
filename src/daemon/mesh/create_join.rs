@@ -124,14 +124,7 @@ impl MeshManager {
         pre_approve: Option<(EndpointId, Option<String>)>,
     ) -> Result<IpcMessage> {
         self.registry
-            .create_network_inner(
-                &self.mesh_ctx(),
-                mode,
-                custom_name,
-                hostname,
-                direct,
-                pre_approve,
-            )
+            .create_network_inner(mode, custom_name, hostname, direct, pre_approve)
             .await
     }
 
