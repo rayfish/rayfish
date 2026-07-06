@@ -127,11 +127,14 @@ impl ConnectionManager {
                 }
                 ControlMsg::Unpaired => {
                     // Our primary is unpairing this device. Act only if the sender
-                    // actually signed our cert (a stranger is a no-op), then hand
-                    // off to the daemon loop, which leaves every network + wipes the
-                    // cert. The reader holds only field clones, hence the channel.
+                    // actually signed our cert (a stranger is a no-op). Leaving
+                    // every network is heavy, so spawn it off the demux loop rather
+                    // than awaiting inline.
                     if is_unpaired_by(peer_id) {
-                        let _ = mesh.ctx.self_unpair_tx.try_send(());
+                        let registry = mesh.ctx.registry.clone();
+                        tokio::spawn(async move {
+                            let _ = registry.unpair_self().await;
+                        });
                     }
                     continue;
                 }

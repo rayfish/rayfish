@@ -31,6 +31,9 @@ pub(crate) struct NetworkRegistry {
     /// The TUN interface name, shared with the daemon (which sets it once the TUN
     /// is up), for refreshing DNS search domains after a network is torn down.
     tun_name: Arc<Mutex<String>>,
+    /// This device's cert loaded at boot, the in-memory fallback for the paired
+    /// check when the on-disk cert read errors (see [`Self::current_device_cert`]).
+    device_cert: Option<control::DeviceCert>,
 }
 
 impl NetworkRegistry {
@@ -41,6 +44,7 @@ impl NetworkRegistry {
         conn: Arc<ConnectionManager>,
         dns: Arc<DnsService>,
         tun_name: Arc<Mutex<String>>,
+        device_cert: Option<control::DeviceCert>,
     ) -> Self {
         Self {
             networks,
@@ -49,6 +53,58 @@ impl NetworkRegistry {
             conn,
             dns,
             tun_name,
+            device_cert,
+        }
+    }
+
+    /// This device's pairing cert. The on-disk cert is authoritative: a cleanly
+    /// absent file (`Ok(None)`, e.g. after `unpair_self` deletes it) means
+    /// unpaired, so only a genuine read error falls back to the in-memory copy.
+    fn current_device_cert(&self) -> Option<control::DeviceCert> {
+        match identity::load_device_cert() {
+            Ok(cert) => cert,
+            Err(_) => self.device_cert.clone(),
+        }
+    }
+
+    /// Unpair *this* device from its primary, locally: leave every network this
+    /// device joined (graceful `LEAVE_CODE` close so peers prune us at once),
+    /// purge any saved-but-inactive network configs, then delete the stored cert.
+    /// Called by the phone's unpair control, the IPC path, and the device-side
+    /// `ControlMsg::Unpaired` / self-nullify handlers (was the `self_unpair_tx`
+    /// hand-off to the daemon loop). A device with no cert (a primary) is a no-op.
+    pub(crate) async fn unpair_self(&self) -> IpcMessage {
+        if self.current_device_cert().is_none() {
+            return IpcMessage::Error {
+                message: "this device is not paired to a primary".to_string(),
+            };
+        }
+        // Leave every live network first (graceful close + config removal).
+        let networks: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
+        for net in &networks {
+            self.leave_network(net).await;
+        }
+        // Purge saved-but-inactive network configs too: a device unpaired while
+        // offline discovers this at startup restore, before its networks are added
+        // to `self.networks` (the join bails on the nullifier check first), so the
+        // loop above sees none yet the config files remain and would make the node
+        // churn trying to rejoin networks it was removed from.
+        if let Ok(cfg) = config::load() {
+            for net in &cfg.networks {
+                let _ = config::delete_network(&net.name);
+            }
+        }
+        match crate::identity::delete_device_cert() {
+            Ok(()) => tracing::warn!("unpaired this device: deleted device certificate and left all networks"),
+            Err(e) => {
+                tracing::warn!(error = %e, "unpair: failed to delete device cert");
+                return IpcMessage::Error {
+                    message: format!("left all networks but failed to delete device cert: {e}"),
+                };
+            }
+        }
+        IpcMessage::Ok {
+            message: format!("unpaired this device (left {} network(s))", networks.len()),
         }
     }
 

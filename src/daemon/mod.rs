@@ -165,11 +165,10 @@ pub(crate) struct MeshCtx {
     /// connection per identity a drop tears the peer down across every shared
     /// network at once, so this is node-wide rather than per-network.
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
-    /// Signal from a per-peer control reader that this device's primary sent
-    /// `ControlMsg::Unpaired`. The reader holds only field clones (not the full
-    /// `MeshManager`), so it hands off to the daemon loop, which runs
-    /// [`MeshManager::unpair_self`] (leave all networks + wipe the cert).
-    self_unpair_tx: mpsc::Sender<()>,
+    /// The network-owning service. Control readers reach it through the ctx to
+    /// run network ops directly (e.g. `unpair_self` on a `ControlMsg::Unpaired` or
+    /// a self-nullify during reconverge) instead of signalling the daemon loop.
+    registry: Arc<NetworkRegistry>,
 }
 
 impl MeshCtx {
@@ -502,13 +501,6 @@ pub struct MeshManager {
     /// Receiver half of the daemon-wide disconnect channel, handed to
     /// [`run_daemon`] to drive the single [`MeshManager::run_connection_supervisor`].
     disconnect_rx: std::sync::Mutex<Option<mpsc::Receiver<forward::DisconnectEvent>>>,
-    /// Self-unpair signal (see [`MeshCtx::self_unpair_tx`]): a control reader that
-    /// received `ControlMsg::Unpaired` from our primary sends here, and the daemon
-    /// loop drains it into [`MeshManager::unpair_self`]. The reader holds only field
-    /// clones (not the full `MeshManager`), so it hands off to the loop that does.
-    self_unpair_tx: mpsc::Sender<()>,
-    /// Receiver half of the self-unpair channel, taken once by the daemon loop.
-    self_unpair_rx: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 /// Map key-holding status to a [`NetworkRole`].
@@ -599,7 +591,7 @@ impl MeshManager {
             device_user_map: self.device_user_map.clone(),
             pruned_peers: self.pruned_peers.clone(),
             disconnect_tx: self.disconnect_tx.clone(),
-            self_unpair_tx: self.self_unpair_tx.clone(),
+            registry: self.registry.clone(),
         }
     }
 
@@ -1371,7 +1363,11 @@ mod accept_handler_tests {
 
     /// Throwaway [`MeshCtx`] for accept-handler tests: a fresh blob store and
     /// dummy handles, none of which the constructed handlers exercise here.
-    fn sample_mesh_ctx(identity: IrohIdentityProvider, blob_store: FsStore) -> MeshCtx {
+    fn sample_mesh_ctx(
+        identity: IrohIdentityProvider,
+        blob_store: FsStore,
+        registry: Arc<NetworkRegistry>,
+    ) -> MeshCtx {
         let (tun_tx, _) = tokio::sync::mpsc::channel(1);
         let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
         MeshCtx {
@@ -1386,7 +1382,7 @@ mod accept_handler_tests {
             device_user_map: peers::DeviceUserMap::new(),
             pruned_peers: Arc::new(DashSet::new()),
             disconnect_tx,
-            self_unpair_tx: tokio::sync::mpsc::channel(1).0,
+            registry,
         }
     }
 
@@ -1395,8 +1391,14 @@ mod accept_handler_tests {
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
         let my_key = SecretKey::from_bytes(&[2u8; 32]);
         let my_id = my_key.public();
+        let registry = sample_registry(
+            sample_test_endpoint().await,
+            IrohIdentityProvider::new(my_id, 0),
+            blob_store.clone(),
+            my_id,
+        );
         AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store),
+            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store, registry),
             network_name: "test-net".to_string(),
             state: make_network_state(),
             token: CancellationToken::new(),
@@ -1434,6 +1436,7 @@ mod accept_handler_tests {
             Arc::new(ConnectionManager::new()),
             dns,
             Arc::new(Mutex::new(String::from("test"))),
+            None,
         ))
     }
 
@@ -1450,7 +1453,11 @@ mod accept_handler_tests {
             my_id,
         );
         AcceptHandler::Member(Arc::new(MemberAcceptState {
-            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store.clone()),
+            ctx: sample_mesh_ctx(
+                IrohIdentityProvider::new(my_id, 0),
+                blob_store.clone(),
+                registry.clone(),
+            ),
             network_name: "test-net".to_string(),
             state: make_network_state(),
             token: CancellationToken::new(),
