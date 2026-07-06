@@ -1423,6 +1423,7 @@ mod accept_handler_tests {
             dns,
             Arc::new(Mutex::new(String::from("test"))),
             None,
+            CancellationToken::new(),
         ))
     }
 
