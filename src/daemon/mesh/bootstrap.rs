@@ -223,7 +223,9 @@ async fn build_daemon(
     // creates the real device and calls `attach_tun`; on embedders (mobile) the
     // `VpnService` fd is attached the same way. `tun_name` starts as a placeholder
     // and is overwritten when a real interface is attached.
-    let tun_name = String::from("rayfish");
+    // Shared with NetworkRegistry (for the leave/teardown DNS search-domain
+    // refresh); run_daemon overwrites the string in place once the real TUN is up.
+    let tun_name = Arc::new(std::sync::Mutex::new(String::from("rayfish")));
     // Append-only audit log of peer connect/disconnect events. If it can't be
     // opened (e.g. unwritable config dir) the daemon still runs without auditing.
     let peers = match audit::AuditLog::open() {
@@ -257,6 +259,9 @@ async fn build_daemon(
         hostname_table.clone(),
         reverse_table.clone(),
     ));
+    // Built here (not in the struct literal) so NetworkRegistry can share it for
+    // the leave/teardown DNS cleanup.
+    let dns = Arc::new(DnsService::new(hostname_table, reverse_table, dns_resolver.clone()));
     let mdns_enabled = app_config.mdns_enabled;
     if mdns_enabled {
         spawn_mdns_discovery(&ep, token.clone());
@@ -288,6 +293,8 @@ async fn build_daemon(
         transport.clone(),
         peers.clone(),
         conn.clone(),
+        dns.clone(),
+        tun_name.clone(),
     ));
     // FileService owns file transfer + pairing. It evaluates own-device auto-accept
     // directly (no worker channel) and clears a re-paired device's nullifier by
@@ -328,14 +335,10 @@ async fn build_daemon(
         blob_store,
         firewall: shared_firewall,
         protocol_router: protocol_router.clone(),
-        dns: Arc::new(DnsService::new(
-            hostname_table,
-            reverse_table,
-            dns_resolver.clone(),
-        )),
+        dns,
         mdns_enabled,
         auto_update,
-        tun_name: std::sync::Mutex::new(tun_name),
+        tun_name,
         tun_tasks: std::sync::Mutex::new(None),
         _metrics_server: std::sync::Mutex::new(None),
         files,

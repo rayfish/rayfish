@@ -870,51 +870,10 @@ impl MeshManager {
         }
     }
 
-    /// Tear down a network's runtime state (connections, ALPN, DNS entries,
-    /// background tasks) without touching its persisted config. Returns whether
-    /// the network was active. Used by `leave_network` (which also forgets the
-    /// config); standby (`deactivate`) no longer tears connections down.
-    pub(crate) async fn teardown_network_runtime(&self, name: &str) -> bool {
-        let Some(handle) = self.networks.remove(name).map(|(_, v)| v) else {
-            return false;
-        };
-        handle.cancel.cancel();
-        for task in handle.tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-        }
-
-        self.peers.remove_by_network(name);
-        self.dns.clear_network(name).await;
-        self.protocol_router.unregister(&handle.network_key);
-        self.refresh_alpns().await;
-        true
-    }
-
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    /// leave a network (close connections, tear down runtime, forget config).
     #[tracing::instrument(skip(self), fields(net = name))]
     pub async fn leave_network(&self, name: &str) -> IpcMessage {
-        // Gracefully close our connections with the leave code BEFORE teardown
-        // drops them, so each peer's reader sees an intentional close and the
-        // coordinator prunes us from the roster (rather than waiting for an
-        // idle timeout that only ever clears the green dot).
-        for (_eid, _ip, conn) in self.peers.peers_for_network_with_conn(name) {
-            conn.close(VarInt::from_u32(forward::LEAVE_CODE), b"leave");
-        }
-
-        let was_active = self.teardown_network_runtime(name).await;
-
-        // Remove from config even if the network wasn't active
-        let removed_from_config = config::delete_network(name).unwrap_or(false);
-
-        if was_active || removed_from_config {
-            tracing::info!(network = %name, "left network");
-            IpcMessage::Ok {
-                message: format!("left network '{}'", name),
-            }
-        } else {
-            IpcMessage::Error {
-                message: format!("network '{}' not found", name),
-            }
-        }
+        self.registry.leave_network(name).await
     }
 }

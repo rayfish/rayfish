@@ -454,8 +454,9 @@ pub struct MeshManager {
     /// Name of the OS TUN device (desktop) or a placeholder until a packet
     /// interface is attached. Interior-mutable because on embedders (mobile) the
     /// interface is attached after construction via [`MeshManager::attach_tun`],
-    /// while on desktop it is set once at boot.
-    tun_name: Mutex<String>,
+    /// while on desktop it is set once at boot. `Arc` so [`NetworkRegistry`] shares
+    /// it for the leave/teardown DNS search-domain refresh.
+    tun_name: Arc<Mutex<String>>,
     /// Handles for the packet-forwarding tasks spawned by
     /// [`MeshManager::attach_tun`], kept so a future `down()`/detach can stop them.
     tun_tasks: Mutex<Option<TunTasks>>,
@@ -1419,11 +1420,20 @@ mod accept_handler_tests {
             Arc::new(ForwardMetrics::default()),
             contact,
         ));
+        let hostname_table = dns::new_hostname_table();
+        let reverse_table = dns::new_reverse_table();
+        let dns_resolver = Arc::new(crate::dns_resolver::Resolver::new(
+            hostname_table.clone(),
+            reverse_table.clone(),
+        ));
+        let dns = Arc::new(DnsService::new(hostname_table, reverse_table, dns_resolver));
         Arc::new(NetworkRegistry::new(
             Arc::new(DashMap::new()),
             transport,
             PeerTable::new(),
             Arc::new(ConnectionManager::new()),
+            dns,
+            Arc::new(Mutex::new(String::from("test"))),
         ))
     }
 
