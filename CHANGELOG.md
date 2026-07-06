@@ -32,6 +32,59 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Unpair this device (Android)**: a paired phone can now unpair itself from the
+  You screen. It leaves every network it joined, deletes its pairing certificate,
+  and other peers disconnect from it right away. Re-pair from your primary device
+  to rejoin. (This is the device-side counterpart to running `ray unpair` on your
+  primary.)
+- **Share with Rayfish (Android)**: photos, videos, and any file can now be shared
+  straight to a mesh peer from the Android system share sheet. Pick an online peer
+  and the file is delivered in the background (a notification confirms it was sent),
+  so you are never left waiting. Sharing several items at once is supported. Files
+  sent to one of your **own** paired devices are auto-accepted there and saved to
+  Downloads with no tap — this is on by default and can be turned off under
+  "Auto-accept from my devices" in the You screen. (Own-device is determined from
+  the device pairing certificate, so a file from someone else always asks first.)
+- **Ephemeral peer auto-kick**: a per-network policy that automatically removes
+  members which stay offline longer than a configured time, the same as
+  `ray kick`. Set it with `ray ephemeral <net> <duration>` (`12h`, `7d`, `1w`;
+  minimum 1 hour), turn it off with `ray ephemeral <net> off`, and read it with
+  `ray ephemeral <net> show`. Off by default; the current TTL shows on the
+  network's line in `ray status`. Only the coordinator enforces it, and only
+  offline peers are pruned, so it applies to open and closed networks alike (a
+  removed peer can simply re-join or re-request later).
+- **`ray unpair <device>`**: revoke one of your paired devices, for example a
+  lost or stolen laptop. Run it from your **primary** device (the one you paired
+  the others from). Revocation is **per device**: unpairing adds just that
+  device's key to each affected network's signed membership record, so every peer
+  rejects its certificate the moment it reconverges. Your **other** devices are
+  completely untouched (no fleet-wide certificate rotation, nothing to re-issue).
+  The removed device is dropped from your networks, stops being treated as one of
+  your own devices (no silent auto-admit, no own-device file auto-accept), and, if
+  online and cooperative, is told to leave the mesh and delete its own certificate.
+  **Re-authorize later** by simply re-pairing the device: that clears the
+  revocation and issues a fresh certificate. List your paired devices first with
+  `ray pair list` (`--json` supported). Note: revocation currently applies to the
+  networks **you coordinate**; to retire a device from a network someone else
+  runs, ask that network's coordinator to remove it too.
+- **Consistent Android device name**: the phone now uses one device name across
+  every network instead of a different random name per network. It is seeded from
+  your device model on first run and can be changed in the You screen (the change
+  applies to all your networks and to any you join later).
+- **Android app exclusions and mesh IPv6 on the phone**: apps that break behind a
+  VPN (Android Auto, Chromecast/Google Home, RCS messaging, GoPro, Sonos) now
+  bypass the tunnel, so wireless Android Auto keeps working with Rayfish on. The
+  Android tunnel also routes mesh IPv6 (the `200::/7` range), which previously did
+  not work on mobile.
+- **Android diagnostics**: the app now captures the mesh core's recent logs and
+  reports lightweight health (networks, peers online, transport, and a WARN/ERROR
+  count) to crash reporting automatically when the tunnel goes up or down and when
+  the connection changes between wifi and cellular. A new "Send diagnostics" button
+  in the You screen attaches the full recent log to a report so connection problems
+  can be diagnosed. All of this respects the existing crash-reporting toggle; the
+  toggle now reads "diagnostics". Diagnostic data (the log lines and recent errors)
+  can include network addresses such as relay hosts and your device's public IP, so
+  it is only sent while crash reporting is on.
 - **Device ownership in `ray status`**: peer rows that are your own paired
   devices are now tagged `(your device)`, and a paired device belonging to
   another user is labelled `(user <id>)` (or shows that user's alias when you
@@ -45,14 +98,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   daemon, which briefly drops the VPN (peers reconnect automatically), so it stays
   opt-in. A backoff guard means a bad release is retried at most once a day
   instead of looping. `ray status` shows when auto-update is on.
-- **Auto-accept files from your own devices**: turn on
-  `ray files auto-accept <network> on` (or join with
-  `ray join <net> --auto-accept-files`) and incoming file transfers from your
+- **Auto-accept files from your own devices**: incoming file transfers from your
   own paired devices land automatically in your `~/Downloads`, with no manual
   `ray files accept`. Only offers whose sender is one of your own devices (same
   paired identity) on that network are accepted; files from anyone else still
-  queue for review. Turning it on also accepts any offers already waiting from
-  your devices. Off by default; `ray files auto-accept <net> off` disables it.
+  queue for review. This is now **on by default** (it is identity-checked, so it
+  only ever accepts your own devices). Opt out for a network with
+  `ray files auto-accept <net> off`, or when joining with
+  `ray join <net> --no-auto-accept-files`.
 - **Configurable auto-accept download location**: `ray files download-dir <path>`
   sends auto-accepted files to an absolute directory (owned by the dir's owner or
   `download-user`); `ray files download-user <user>` routes them to that user's
@@ -84,6 +137,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Own-device file receipt is on by default**: accepting files from your own
+  paired devices (identity-checked, so never anyone else) no longer needs a flag.
+  New joins get it automatically; opt out with `ray join --no-auto-accept-files`
+  or `ray files auto-accept <net> off`. The old `ray join --auto-accept-files`
+  flag is replaced by `--no-auto-accept-files`.
 - **`ray firewall show` clarifies the firewall is separate from your host
   firewall**: the output now notes that this is a mesh firewall applied on top of
   your host/kernel firewall (both must allow a packet), so it is not forgotten
@@ -104,9 +162,59 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   beats drop-oldest for a VPN), and the QUIC transport is tuned for the one
   datagram stream per peer shape. Keeps the send path non-blocking with no
   cross-peer head-of-line blocking.
+- **Faster reconnect on startup**: when a coordinator rejoins its networks it now
+  dials all known members concurrently instead of one at a time, so restore no
+  longer slows down with roster size or stalls on the first unreachable peer.
+- **No boot stall when a member is offline**: joining or reconnecting to a network
+  no longer waits to dial the whole roster before the network comes up. A single
+  unreachable member (for example a stale, offline device still on the roster)
+  used to block startup for the full per-peer connection timeout, tens of seconds,
+  before any other peer connected. The network is now usable as soon as the
+  coordinator link is up, and the remaining peers connect concurrently in the
+  background. This was most visible on the Android app as a long delay before
+  peers showed online.
 
 ### Fixed
 
+- **An unpaired device now removes itself even if it missed the live signal**: a
+  device no longer relies only on the best-effort "you were unpaired" message. When
+  it reconverges the signed membership record (on startup, reconnect, or the
+  periodic refresh) and finds its own certificate on the deny-list, it deletes the
+  certificate and leaves every network on its own. On Android this also stops the
+  app from still showing the device as paired after the fact.
+- **Peers now disconnect from an unpaired device right away**: after `ray unpair`
+  (or a device unpairing itself), other peers could stay connected to it for a
+  while. The unpaired device now tears itself out of the mesh (leaves its networks)
+  as soon as it learns it was unpaired, and coordinators/members drop a revoked
+  device the moment they see the updated deny-list, instead of waiting up to a
+  minute for the next roster refresh.
+- **Re-pairing a previously-unpaired device no longer flaps**: after unpairing and
+  then re-pairing the same device, it could rapidly connect and drop over and over
+  (its old key was still on your deny-list, so your primary kept rejecting the
+  fresh certificate). Re-pairing now clears the device from the deny-list, so it
+  reconnects cleanly and stays connected.
+- **`ray status` no longer flashes "no active networks" right after a daemon
+  (re)start**: the daemon began answering commands a moment before it finished
+  restoring your saved networks, so a `ray status` in that window (common right
+  after `ray restart` or an update) wrongly reported no networks even though they
+  were intact on disk. Coordinator networks are now registered before the daemon
+  accepts commands, so they show up immediately; connecting to peers still happens
+  in the background.
+- **QR scanner no longer opens sideways (including on foldables)**: the
+  pairing/join camera scanner followed the rotation sensor and came up in
+  landscape. Locking it to the launch orientation was not enough on foldables
+  (Galaxy Z Fold), which report landscape at launch, so the scanner is now pinned
+  to portrait outright.
+- **"Send diagnostics" (Android) now reliably delivers each report**: repeat
+  sends folded into a single report and the send was fire-and-forget, so a tap
+  could look like it did nothing. Each report is now delivered before the "sent"
+  confirmation and recorded separately.
+- **Pairing no longer hangs forever when the primary is unreachable**: scanning a
+  pairing code dialed the primary device with no timeout, so if it could not be
+  reached (offline, no open pairing session, or an unreachable network path) the
+  pairing call hung indefinitely with no feedback. It now fails within 20 seconds
+  with a clear message telling you to check that the primary is online and that
+  you opened pairing on it.
 - **`ray status` peer traffic counters now line up**: the per-peer up/down
   columns were packed into a single field, so the `↓` counter drifted from row to
   row and the block did not read as a table. Up and down are now their own

@@ -73,11 +73,12 @@ impl MeshManager {
         };
         // Node-local aliases (display-only) come straight from config; status is
         // not a hot path, so a per-network read is fine.
-        let aliases = config::load_network(&h.name)
-            .ok()
-            .flatten()
-            .map(|n| n.aliases)
+        let net_cfg = config::load_network(&h.name).ok().flatten();
+        let aliases = net_cfg
+            .as_ref()
+            .map(|n| n.aliases.clone())
             .unwrap_or_default();
+        let ephemeral_ttl_secs = net_cfg.as_ref().and_then(|n| n.ephemeral_ttl_secs);
         // Resolve a mesh IPv4 back to its `.ray` hostname via the DNS snapshot.
         let lookup_hostname = |ip| {
             hostname_snapshot.and_then(|table| {
@@ -106,6 +107,7 @@ impl MeshManager {
                         pending_suggestions: 0,
                         pending_requests: 0,
                         aliases,
+                        ephemeral_ttl_secs,
                     };
                 }
             };
@@ -162,6 +164,7 @@ impl MeshManager {
             pending_suggestions,
             pending_requests,
             aliases,
+            ephemeral_ttl_secs,
         }
     }
 
@@ -170,7 +173,7 @@ impl MeshManager {
     /// daemon-side because the log files are root-owned; the resulting bundle is
     /// chowned to the calling user so an unprivileged `ray report` can attach it.
     ///
-    /// Sanitization: the bundle is built only from already-public material — the
+    /// Sanitization: the bundle is built only from already-public material: the
     /// `StatusResponse` (which never carries secret keys), counters, and the log
     /// files. It never touches `secret_key` or `network_secret_key`.
     pub(crate) fn build_report(&self, peer_cred: Option<(u32, u32)>) -> IpcMessage {

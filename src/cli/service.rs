@@ -26,7 +26,7 @@ pub(crate) fn ensure_rayfish_group() {
 
 /// Write the system service unit/plist, substituting the path of the binary
 /// currently running so the service execs the same `ray` the user invoked
-/// (rather than a hardcoded /usr/local/bin/ray). Idempotent — safe to call on
+/// (rather than a hardcoded /usr/local/bin/ray). Idempotent, safe to call on
 /// every `ray up`, keeping the exec path fresh if the binary moves.
 /// Strip the `" (deleted)"` marker Linux appends to `/proc/self/exe` once the
 /// running binary's inode has been unlinked. `ray update` calls `self_replace`,
@@ -51,7 +51,7 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
     {
         // Ensure the `rayfish` system group exists before the daemon writes its
         // config tree under /etc/rayfish (owned root:rayfish). Idempotent;
-        // best-effort — the daemon falls back to root:root if the group is
+        // best-effort: the daemon falls back to root:root if the group is
         // absent (see config::set_owner).
         ensure_rayfish_group();
         let path = Path::new("/etc/systemd/system/rayfish.service");
@@ -81,7 +81,7 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
 
 /// `ray up`: activate the VPN.
 ///
-/// If the daemon is already running (the common case — the system service
+/// If the daemon is already running (the common case, the system service
 /// starts it at boot), this is just an unprivileged IPC call asking the daemon
 /// to bring the TUN up, configure DNS, and reconnect networks. Only when no
 /// daemon is reachable do we fall back to installing/starting the system
@@ -97,7 +97,7 @@ pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
         return Ok(());
     }
 
-    // No daemon reachable — install and start the system service (needs root).
+    // No daemon reachable, install and start the system service (needs root).
     if unsafe { libc::geteuid() } != 0 {
         eprintln!(
             "rayfish service is not running. Start it with: sudo ray up\n\

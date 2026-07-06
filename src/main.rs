@@ -88,11 +88,12 @@ pub(crate) enum Command {
         /// it, suggestions queue for `ray firewall accept`.
         #[arg(long)]
         auto_accept_firewall: bool,
-        /// Auto-accept incoming file transfers from your own paired devices on
-        /// this network (no manual `ray files accept`). Only offers whose sender
-        /// is one of your own devices are accepted.
+        /// Opt out of auto-accepting file transfers from your own paired devices
+        /// on this network. By default own-device offers are accepted without a
+        /// manual `ray files accept` (only offers whose sender is one of your own
+        /// devices, identity-checked); pass this to require manual acceptance.
         #[arg(long)]
-        auto_accept_files: bool,
+        no_auto_accept_files: bool,
     },
     /// Leave a network (remove from saved config)
     #[command(visible_alias = "rm")]
@@ -115,6 +116,14 @@ pub(crate) enum Command {
         network: String,
         /// Member to remove: hostname, mesh IP, or short id
         peer: String,
+    },
+    /// Set or show a per-network ephemeral policy: auto-remove members offline
+    /// longer than the given duration (coordinator only)
+    Ephemeral {
+        /// Network name
+        network: String,
+        /// `Nh`/`Nd`/`Nw` to enable, `off` to disable, or `show` to print
+        arg: String,
     },
     /// Show status of all networks (active + saved)
     #[command(visible_aliases = ["st", "ls"])]
@@ -181,7 +190,7 @@ pub(crate) enum Command {
     },
     /// Request a direct 2-peer connection to someone by their contact id. They
     /// approve it with `ray connections approve`, forming a private 2-peer
-    /// network — no room id or invite code needed.
+    /// network, no room id or invite code needed.
     Connect {
         /// The peer's contact id (from their `ray contact id` / `ray status`)
         contact_id: String,
@@ -316,6 +325,12 @@ pub(crate) enum Command {
         /// Pairing ticket from the primary device (shorthand for `rayfish pair accept <ticket>`)
         ticket: Option<String>,
     },
+    /// Revoke a paired device: invalidate its certificate mesh-wide (primary only)
+    Unpair {
+        /// Device to revoke: hostname, mesh IP, short id, or full endpoint id
+        /// (see `ray pair list`)
+        device: String,
+    },
     /// Handle a rayfish:// deep link (join or pair)
     Open {
         /// The rayfish:// URI, e.g. rayfish://join/<code> or rayfish://pair/<ticket>
@@ -365,7 +380,7 @@ pub(crate) enum InviteAction {
         /// `ray invite <net> revoke <id>`.
         #[arg(long)]
         reusable: bool,
-        /// Also render the invite as a scannable QR code (off by default — it
+        /// Also render the invite as a scannable QR code (off by default, it
         /// takes up a lot of terminal space).
         #[arg(long)]
         qr: bool,
@@ -388,6 +403,9 @@ pub(crate) enum PairAction {
         /// The pairing ticket
         ticket: String,
     },
+    /// List this user's paired devices
+    #[command(visible_alias = "ls")]
+    List,
     /// Export an encrypted backup of the signing key
     Backup {
         /// Store the backup in 1Password (via the `op` CLI) instead of printing it
@@ -499,7 +517,7 @@ pub(crate) enum ContactAction {
 #[derive(Subcommand)]
 pub(crate) enum FirewallAction {
     /// Add a firewall rule. A new rule is inserted at the front, so it
-    /// supersedes any contradicting rule under first-match — e.g. `deny in icmp`
+    /// supersedes any contradicting rule under first-match, e.g. `deny in icmp`
     /// overrides the seeded `allow in icmp` (and re-adding `allow` flips it back).
     /// A rule with the same selector (direction/proto/port/peer/network) replaces
     /// the old one rather than stacking, so toggling never accumulates dead rules.
@@ -572,7 +590,7 @@ pub(crate) enum FirewallAction {
         subject: String,
         /// Allow inbound traffic, e.g. `--allow tcp:22` (any peer) or
         /// `--allow earn01:tcp:9000,tcp:8123` (repeatable). The `PEER:` prefix is
-        /// optional — omit it (start with a protocol) to mean "any peer".
+        /// optional: omit it (start with a protocol) to mean "any peer".
         /// Spec grammar: `proto:ports` or bare proto (`icmp`, `any`, `tcp`).
         #[arg(long, value_name = "[PEER:]SPEC")]
         allow: Vec<String>,
@@ -734,11 +752,11 @@ fn init_tracing(to_file: bool) -> LogGuard {
     let console_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    // Console layer — human text on stdout, held at `info` so CLI output and the
+    // Console layer: human text on stdout, held at `info` so CLI output and the
     // daemon console stay readable while the file keeps the `debug` detail.
     let console_layer = tracing_subscriber::fmt::layer().with_filter(console_filter);
 
-    // File layer — daemon only, human text with ANSI stripped, rotated daily.
+    // File layer: daemon only, human text with ANSI stripped, rotated daily.
     let (file_layer, appender_guard) = if to_file {
         match std::fs::create_dir_all(logdir::log_dir()) {
             Ok(()) => {
@@ -783,7 +801,7 @@ fn init_tracing(to_file: bool) -> LogGuard {
         otel_provider: None,
     };
 
-    // OTLP span export layer — only built when the feature is on AND an endpoint
+    // OTLP span export layer: only built when the feature is on AND an endpoint
     // is configured. Type-erased to `Box<dyn Layer>` so the `None` case has a
     // concrete type; the daemon flushes the provider on shutdown via `LogGuard`.
     let otel_layer = build_otel_layer(&mut guard);
@@ -845,14 +863,14 @@ fn build_otel_layer(_guard: &mut LogGuard) -> Option<tracing_subscriber::layer::
     None
 }
 
-/// Install a fail-fast panic hook (daemon only). On any panic — including in a
-/// spawned tokio task, which the runtime would otherwise swallow — it records the
+/// Install a fail-fast panic hook (daemon only). On any panic (including in a
+/// spawned tokio task, which the runtime would otherwise swallow) it records the
 /// crash (message, location, thread, backtrace) via `tracing::error!` (rolling file
 /// log + any OTLP exporter) and synchronously appends it to `panic.log` in the log
 /// dir, then **aborts the process**.
 ///
 /// Rationale: a panic is an invariant violation. For a VPN daemon, limping on with
-/// a dead subsystem (e.g. a stalled forwarding loop) is worse than a clean restart —
+/// a dead subsystem (e.g. a stalled forwarding loop) is worse than a clean restart,
 /// and a live-but-broken process won't trip the service manager's restart. Aborting
 /// lets systemd/launchd restart from known-good state; peers then reconnect. The
 /// crash is captured (durably in `panic.log`) and bundled by `ray report`.
@@ -880,7 +898,7 @@ fn install_panic_hook() {
             thread = %thread,
             "panic: {message}\n{backtrace}"
         );
-        // Durable, synchronous capture — survives even though abort() skips the
+        // Durable, synchronous capture: survives even though abort() skips the
         // async log appender's flush.
         if let Err(e) = append_panic_log(&location, &thread, &message, &backtrace) {
             eprintln!("failed to write panic log: {e}");
@@ -959,7 +977,7 @@ async fn main() -> Result<()> {
             hostname,
             tor,
             auto_accept_firewall,
-            auto_accept_files,
+            no_auto_accept_files,
         } => {
             ipc_join(
                 &network_key,
@@ -967,12 +985,13 @@ async fn main() -> Result<()> {
                 hostname,
                 tor,
                 auto_accept_firewall,
-                auto_accept_files,
+                !no_auto_accept_files,
             )
             .await
         }
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Kick { network, peer } => ipc_kick(&network, &peer).await,
+        Command::Ephemeral { network, arg } => ipc_ephemeral(&network, &arg).await,
         Command::Status => ipc_status().await,
         Command::Report => ipc_report().await,
         Command::Daemon => {
@@ -1031,6 +1050,7 @@ async fn main() -> Result<()> {
         Command::Send { file, peer } => ipc_send_file(&file, &peer).await,
         Command::Files { action } => ipc_files(action).await,
         Command::Pair { action, ticket } => cmd_pair(action, ticket).await,
+        Command::Unpair { device } => ipc_unpair(&device).await,
         Command::Open { uri } => cmd_open(&uri).await,
         Command::Version => {
             println!("ray {FULL_VERSION}");

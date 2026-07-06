@@ -576,6 +576,13 @@ impl DeviceUserMap {
             .map(|e| *e.value())
             .unwrap_or(*transport_key)
     }
+
+    /// Drop a device's mapping so it stops resolving to a user identity. Used by
+    /// `ray unpair` to demote a revoked device to a plain peer immediately (its
+    /// user's firewall rules and own-device file auto-accept no longer apply).
+    pub fn remove(&self, device_key: &EndpointId) {
+        self.inner.remove(device_key);
+    }
 }
 
 #[cfg(test)]

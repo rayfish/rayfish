@@ -1,14 +1,14 @@
 //! Per-connection rate limiting for inbound control streams.
 //!
 //! Control-plane messages (`MemberSync`/`BlobUpdated` triggers, `MeshHello`,
-//! invite gossip) are cheap to send but can be expensive to process — a single
+//! invite gossip) are cheap to send but can be expensive to process: a single
 //! `MemberSync` drives a pkarr resolve and, on a hash change, a blob fetch + DNS
 //! rebuild + firewall re-materialize. They carry no per-message authentication,
 //! so any peer sharing a network can spam them. [`ControlGate`] guards each
 //! control-listener task with a token bucket (the `ratelimit` crate) plus a
 //! strike counter: over-budget messages are dropped, and a peer that sustains a
 //! flood eventually trips [`Verdict::Close`] so the caller can drop the
-//! connection. A peer that only bursts briefly is never penalized — strikes
+//! connection. A peer that only bursts briefly is never penalized: strikes
 //! decay on every admitted message.
 //!
 //! One [`ControlGate`] lives per listener task (each task owns exactly one
@@ -28,11 +28,11 @@ const STRIKE_LIMIT: u32 = 100;
 /// What to do with one inbound control message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// A token was available — dispatch the message normally.
+    /// A token was available, dispatch the message normally.
     Allow,
-    /// Over budget — drop the message; the connection is still healthy.
+    /// Over budget, drop the message; the connection is still healthy.
     Drop,
-    /// Sustained flood — drop the message and close the connection.
+    /// Sustained flood: drop the message and close the connection.
     Close,
 }
 
@@ -99,7 +99,7 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(gate.check(), Verdict::Allow);
         }
-        // The next message has no token left this instant — dropped, not closed.
+        // The next message has no token left this instant: dropped, not closed.
         assert_eq!(gate.check(), Verdict::Drop);
     }
 

@@ -16,26 +16,52 @@ use crate::membership::{ApprovedEntry, Member};
 ///
 /// The user's private key signs the device's public key. Any peer can verify
 /// the binding using only the user's public key.
+///
+/// `generation` is the cert's issuance epoch (`ray unpair`). A user publishes a
+/// current "floor" generation to pkarr; verifiers reject any cert below it, so a
+/// bump revokes every device at once and the ones you keep are re-issued fresh
+/// certs at the new generation. The signature covers the generation, so it can't
+/// be edited to jump the floor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceCert {
     pub user_identity: EndpointId,
     pub device_key: EndpointId,
+    /// Issuance epoch. `0` for certs minted before the epoch scheme existed
+    /// (back-compat) and for the pre-rotation baseline.
+    #[serde(default)]
+    pub generation: u64,
     pub signature: Signature,
 }
 
 impl DeviceCert {
-    pub fn create(user_secret: &SecretKey, device_pubkey: &EndpointId) -> Self {
-        let signature = user_secret.sign(device_pubkey.as_bytes());
+    /// Bytes the signature covers. For `generation == 0` this is the device key
+    /// alone, exactly the pre-epoch scheme, so certs issued before this field
+    /// existed (deserialized as generation 0) still verify. For `generation > 0`
+    /// the little-endian generation is appended, binding it into the signature.
+    fn signing_bytes(device_pubkey: &EndpointId, generation: u64) -> Vec<u8> {
+        let mut bytes = device_pubkey.as_bytes().to_vec();
+        if generation > 0 {
+            bytes.extend_from_slice(&generation.to_le_bytes());
+        }
+        bytes
+    }
+
+    pub fn create(user_secret: &SecretKey, device_pubkey: &EndpointId, generation: u64) -> Self {
+        let signature = user_secret.sign(&Self::signing_bytes(device_pubkey, generation));
         Self {
             user_identity: user_secret.public(),
             device_key: *device_pubkey,
+            generation,
             signature,
         }
     }
 
     pub fn verify(&self) -> bool {
         self.user_identity
-            .verify(self.device_key.as_bytes(), &self.signature)
+            .verify(
+                &Self::signing_bytes(&self.device_key, self.generation),
+                &self.signature,
+            )
             .is_ok()
     }
 }
@@ -181,7 +207,7 @@ pub enum ControlMsg {
     Pong {
         nonce: u64,
     },
-    /// Connection-level announcement of *this sender's* per-connection network →
+    /// Connection-level announcement of *this sender's* per-connection network to
     /// handle table. Since a single mesh connection now carries every network the
     /// two peers share, each datagram is prefixed with a small `u16` handle
     /// identifying its network; this message tells the peer which handle maps to
@@ -192,6 +218,21 @@ pub enum ControlMsg {
     /// network (its frame carries `net = None`).
     NetworkHandles {
         entries: Vec<NetworkHandle>,
+    },
+    /// Primary to secondary: this device has been unpaired (`ray unpair`). Sent
+    /// best-effort over a shared network's mesh connection. The receiver acts on
+    /// it only when the sender's identity is the `user_identity` in its own device
+    /// cert (so a stranger cannot trigger a wipe): it deletes its stored device
+    /// cert and leaves the networks it holds only by that cert. The authoritative
+    /// revocation is the per-network blob nullifier set; this is just a courtesy
+    /// wipe for a cooperative device.
+    Unpaired,
+    /// Primary to secondary: a freshly-signed cert at a new generation, pushed
+    /// after a rotation (`ray unpair`) so a kept device stays above the floor.
+    /// Accepted only when it is signed by the device's own user identity and
+    /// binds the device's own key at a generation no lower than the current one.
+    CertRefresh {
+        cert: DeviceCert,
     },
 }
 
@@ -254,7 +295,7 @@ pub async fn send_msg(
     // exactly one message per bidirectional stream (the reader does
     // `accept_bi → recv_msg` in a loop), so finishing here is always correct.
     // Without it, dropping the `SendStream` resets it (RESET_STREAM) and the
-    // peer loses any data not yet acknowledged — e.g. roster broadcasts sent
+    // peer loses any data not yet acknowledged, e.g. roster broadcasts sent
     // over a persistent connection. (Delivery before a *connection* drop still
     // needs the caller to wait on `conn.closed()`.)
     let _ = stream.finish();
@@ -355,6 +396,7 @@ mod tests {
                 user_identity: None,
                 device_cert: None,
                 collision_index: 0,
+                last_seen: None,
             }],
         };
         let bytes = encode_msg(None, &msg);
@@ -474,6 +516,7 @@ mod tests {
                 user_identity: None,
                 device_cert: None,
                 collision_index: 0,
+                last_seen: None,
             }],
             approved: vec![ApprovedEntry {
                 identity: test_id(2),
@@ -536,10 +579,45 @@ mod tests {
     fn test_device_cert_sign_verify() {
         let user_key = test_key(1);
         let device_key = test_key(2);
-        let cert = DeviceCert::create(&user_key, &device_key.public());
+        let cert = DeviceCert::create(&user_key, &device_key.public(), 0);
         assert!(cert.verify());
         assert_eq!(cert.user_identity, user_key.public());
         assert_eq!(cert.device_key, device_key.public());
+    }
+
+    #[test]
+    fn test_device_cert_generation_sign_verify() {
+        let user_key = test_key(1);
+        let device_key = test_key(2);
+        let cert = DeviceCert::create(&user_key, &device_key.public(), 7);
+        assert!(cert.verify());
+        assert_eq!(cert.generation, 7);
+    }
+
+    #[test]
+    fn test_device_cert_generation_tamper_fails() {
+        // Editing the generation to jump a floor breaks the signature.
+        let user_key = test_key(1);
+        let device_key = test_key(2);
+        let mut cert = DeviceCert::create(&user_key, &device_key.public(), 3);
+        cert.generation = 9;
+        assert!(!cert.verify());
+    }
+
+    #[test]
+    fn test_device_cert_gen0_backcompat() {
+        // A generation-0 cert signs over the device key alone, so a cert minted
+        // before the field existed (deserialized as generation 0) still verifies.
+        let user_key = test_key(1);
+        let device_key = test_key(2);
+        let legacy_sig = user_key.sign(device_key.public().as_bytes());
+        let cert = DeviceCert {
+            user_identity: user_key.public(),
+            device_key: device_key.public(),
+            generation: 0,
+            signature: legacy_sig,
+        };
+        assert!(cert.verify());
     }
 
     #[test]
@@ -547,7 +625,7 @@ mod tests {
         let user_key = test_key(1);
         let device_key = test_key(2);
         let wrong_key = test_key(3);
-        let mut cert = DeviceCert::create(&user_key, &device_key.public());
+        let mut cert = DeviceCert::create(&user_key, &device_key.public(), 0);
         cert.user_identity = wrong_key.public();
         assert!(!cert.verify());
     }
@@ -556,7 +634,7 @@ mod tests {
     fn test_roundtrip_mesh_hello_with_cert() {
         let user_key = test_key(1);
         let device_key = test_key(2);
-        let cert = DeviceCert::create(&user_key, &device_key.public());
+        let cert = DeviceCert::create(&user_key, &device_key.public(), 0);
         let msg = ControlMsg::MeshHello {
             identity: device_key.public(),
             ip: Ipv4Addr::new(100, 64, 0, 5),
@@ -636,7 +714,7 @@ mod tests {
         }
         let user = SecretKey::generate();
         let device = SecretKey::generate().public();
-        let cert = DeviceCert::create(&user, &device);
+        let cert = DeviceCert::create(&user, &device, 0);
         let bytes = rmp_serde::to_vec_named(&OldPairMsg::Response { cert: cert.clone() }).unwrap();
 
         let decoded: PairMsg = rmp_serde::from_slice(&bytes).unwrap();

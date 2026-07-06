@@ -102,7 +102,7 @@ pub(crate) async fn ipc_join(
     )
     .await?;
     // Joining dials the coordinator and runs the handshake daemon-side, so this
-    // can take a few seconds — show a spinner while we wait.
+    // can take a few seconds, show a spinner while we wait.
     let spinner = progress::spinner("joining…");
     let resp = ipc::recv(&mut stream).await?;
     spinner.finish_and_clear();
@@ -197,4 +197,114 @@ pub(crate) async fn ipc_leave(name: &str) -> Result<()> {
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
+}
+
+/// Render a TTL in seconds back to the largest whole `Nw`/`Nd`/`Nh` unit
+/// (falling back to seconds), for display in `ray ephemeral show` and status.
+pub(crate) fn format_ttl(secs: u64) -> String {
+    if secs.is_multiple_of(604_800) {
+        format!("{}w", secs / 604_800)
+    } else if secs.is_multiple_of(86_400) {
+        format!("{}d", secs / 86_400)
+    } else if secs.is_multiple_of(3_600) {
+        format!("{}h", secs / 3_600)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// `ray ephemeral <net> <duration|off|show>`: set, clear, or print a network's
+/// ephemeral auto-kick TTL.
+pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    if arg == "show" {
+        ipc::send(
+            &mut stream,
+            ipc::IpcMessage::GetEphemeral {
+                network: network.to_string(),
+            },
+        )
+        .await?;
+        match ipc::recv(&mut stream).await? {
+            ipc::IpcMessage::EphemeralStatus { ttl_secs, .. } => match ttl_secs {
+                Some(s) => println!("ephemeral policy on '{network}': {}", format_ttl(s)),
+                None => println!("ephemeral policy on '{network}': off"),
+            },
+            ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+            other => eprintln!("Unexpected response: {:?}", other),
+        }
+        return Ok(());
+    }
+    let ttl_secs = if arg == "off" {
+        None
+    } else {
+        match parse_ephemeral_duration(arg) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                print_error("error", &e, None);
+                return Ok(());
+            }
+        }
+    };
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::SetEphemeral {
+            network: network.to_string(),
+            ttl_secs,
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+/// Parse a human duration (`Nh`/`Nd`/`Nw`) into seconds, enforcing a 1-hour
+/// floor. Returns the TTL in seconds or a user-facing error string. Used by
+/// `ray ephemeral <net> <duration>` to set the per-network policy.
+pub(crate) fn parse_ephemeral_duration(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let split = s
+        .find(|c: char| c.is_alphabetic())
+        .ok_or_else(|| format!("invalid duration '{s}' (use Nh, Nd, or Nw)"))?;
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("invalid duration '{s}' (use Nh, Nd, or Nw)"))?;
+    let secs = match unit {
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        "w" => n * 604_800,
+        other => return Err(format!("unknown unit '{other}' (use h, d, or w)")),
+    };
+    if secs < 3600 {
+        return Err("minimum ephemeral TTL is 1h".to_string());
+    }
+    Ok(secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ephemeral_duration;
+
+    #[test]
+    fn parses_valid_durations() {
+        assert_eq!(parse_ephemeral_duration("12h"), Ok(43_200));
+        assert_eq!(parse_ephemeral_duration("7d"), Ok(604_800));
+        assert_eq!(parse_ephemeral_duration("1w"), Ok(604_800));
+        assert_eq!(parse_ephemeral_duration("1h"), Ok(3_600));
+        assert_eq!(parse_ephemeral_duration(" 2d "), Ok(172_800));
+    }
+
+    #[test]
+    fn rejects_sub_hour_and_garbage() {
+        assert!(parse_ephemeral_duration("30m").is_err()); // unknown unit
+        assert!(parse_ephemeral_duration("0h").is_err()); // below floor
+        assert!(parse_ephemeral_duration("garbage").is_err());
+        assert!(parse_ephemeral_duration("5").is_err()); // no unit
+        assert!(parse_ephemeral_duration("").is_err());
+    }
 }

@@ -175,7 +175,7 @@ impl MeshManager {
                 }
             }
         }
-        // Reusable keys from the signed blob — known to every network-key holder.
+        // Reusable keys from the signed blob, known to every network-key holder.
         let now = now_secs();
         for k in reusable.values() {
             let status = if k.revoked {

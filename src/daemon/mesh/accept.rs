@@ -126,7 +126,23 @@ impl CoordinatorAcceptState {
                 tracing::warn!(peer = %remote_id.fmt_short(), "invalid device certificate");
                 return None;
             }
-            self.ctx.device_user_map.insert(remote_id, cert.user_identity);
+            // Reject a cert nullified on this network (`ray unpair`). This one check
+            // covers every admission branch below: owner auto-admit, invite,
+            // live-approved, and open. A nullified device key is refused; every
+            // other device is admitted unchanged (no fleet rotation).
+            if self
+                .state
+                .read()
+                .unwrap()
+                .nullifiers
+                .contains(&cert.device_key)
+            {
+                tracing::warn!(peer = %remote_id.fmt_short(), "rejecting nullified device certificate");
+                return None;
+            }
+            self.ctx
+                .device_user_map
+                .insert(remote_id, cert.user_identity);
         }
 
         // A peer pre-approved via `ray accept` is admitted directly.
@@ -162,8 +178,9 @@ impl CoordinatorAcceptState {
                         .await;
                 }
                 // Queue for live operator approval, bounded by MAX_PENDING_JOINS
-                // (oldest-evicted) so a peer churning fresh identities can't grow it
-                // without limit.
+                // (oldest-evicted) so a peer churning fresh identities can't grow
+                // it without limit. Still no per-peer concurrent-stream cap, the
+                // control-flood rate limiter covers sustained message floods.
                 {
                     let mut s = self.state.write().unwrap();
                     if let Some(dropped) =
@@ -212,10 +229,14 @@ impl CoordinatorAcceptState {
         self.ctx
             .register_peer_conn(conn, remote_id, peer_ip, &self.network_name, &self.token);
 
-        // Verify and store device cert if present.
+        // Verify and store device cert if present, unless the device key is
+        // nullified on this network (`ray unpair`): a nullified cert is not
+        // recorded as a paired device, so it stops resolving to the user's
+        // identity.
         if let Some(ref cert) = device_cert
             && cert.verify()
             && cert.device_key == remote_id
+            && !self.state.read().unwrap().nullifiers.contains(&cert.device_key)
         {
             {
                 let mut s = self.state.write().unwrap();
@@ -385,7 +406,7 @@ impl CoordinatorAcceptState {
                 admitted
             }
             Err(single_use_err) => {
-                // Not a single-use invite — it may be a reusable key, which
+                // Not a single-use invite, it may be a reusable key, which
                 // lives in the signed blob and is redeemable by any network-key
                 // holder (no burn). The blob is the verified source of truth.
                 let reusable_id = {
@@ -474,6 +495,7 @@ impl CoordinatorAcceptState {
                 user_identity: user_id_opt,
                 device_cert: device_cert.clone(),
                 collision_index,
+                last_seen: Some(crate::membership::now_secs()),
             });
             s.refresh_snapshot();
             s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
@@ -869,6 +891,7 @@ impl MemberAcceptState {
                 user_identity: user_id_opt,
                 device_cert: device_cert.clone(),
                 collision_index: member_idx,
+                last_seen: Some(crate::membership::now_secs()),
             });
             s.refresh_snapshot();
             (
@@ -1180,6 +1203,22 @@ impl ProtocolRouter {
                     }
                     continue;
                 }
+                ControlMsg::Unpaired => {
+                    // Our primary is unpairing this device. Act only if the sender
+                    // actually signed our cert (a stranger is a no-op), then hand
+                    // off to the daemon loop, which leaves every network + wipes the
+                    // cert. The reader holds only field clones, hence the channel.
+                    if is_unpaired_by(peer_id) {
+                        let _ = mesh.ctx.self_unpair_tx.try_send(());
+                    }
+                    continue;
+                }
+                ControlMsg::CertRefresh { cert } => {
+                    // Our primary rotated and re-issued us; verified inside against
+                    // our own cert (signer + device key + generation).
+                    store_refreshed_cert(cert);
+                    continue;
+                }
                 _ => {}
             }
             let Some(net_pubkey) = frame.net else {
@@ -1256,7 +1295,7 @@ mod pending_cap_tests {
         let owner = iroh::SecretKey::from([7u8; 32]);
         let owner_id = owner.public();
         let device = iroh::SecretKey::from([9u8; 32]).public();
-        let cert = control::DeviceCert::create(&owner, &device);
+        let cert = control::DeviceCert::create(&owner, &device, 0);
 
         // Cert signed by this owner -> admit.
         assert!(owner_admits(Some(&cert), owner_id));

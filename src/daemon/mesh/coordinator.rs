@@ -60,8 +60,20 @@ impl MeshManager {
             }
             return;
         }
-        // Transient drop: reconnect across every shared network, skipping any we
-        // just pruned this peer from (a one-shot suppression via pruned_peers).
+        // Transient drop: stamp `last_seen` on each network we coordinate so the
+        // ephemeral pruner ages the member from when it actually went offline
+        // (not its admit time), then reconnect across every shared network,
+        // skipping any we just pruned this peer from (one-shot via pruned_peers).
+        let member_id = self.device_user_map.resolve(&ev.endpoint_id);
+        let now = crate::membership::now_secs();
+        for net in &nets {
+            if let Some(h) = self.networks.get(net.as_str())
+                && h.role.is_coordinator()
+                && let Some(m) = h.state.write().unwrap().members.get_mut(&member_id)
+            {
+                m.last_seen = Some(now);
+            }
+        }
         self.spawn_reconnect(ev.endpoint_id, ev.ip, nets);
     }
 
@@ -220,7 +232,7 @@ impl MeshManager {
 /// Send `msg` to each coordinator peer (per [`gossip_targets`]) that has a live
 /// connection on `network`. Best-effort: a target without a live connection is
 /// skipped (it will reconverge invite state from a future share/redeem or, for
-/// reusable keys, the signed blob). Never carries the raw secret — only its hash.
+/// reusable keys, the signed blob). Never carries the raw secret, only its hash.
 pub(crate) async fn gossip_to_coordinators(
     peers: &PeerTable,
     network: &str,
@@ -254,4 +266,192 @@ pub(crate) fn sender_is_coordinator(state: &SharedNetworkState, peer: EndpointId
         .all()
         .iter()
         .any(|m| m.identity == peer && m.is_coordinator)
+}
+
+/// Pure prune decision for one member under the ephemeral policy. Never prunes
+/// a coordinator, self, a currently-connected peer, or one with no `last_seen`.
+/// Otherwise prunes once the offline window exceeds the TTL. `saturating_sub`
+/// guards a clock that moved backwards.
+pub(crate) fn should_prune(
+    m: &Member,
+    connected: bool,
+    is_self: bool,
+    ttl_secs: u64,
+    now: u64,
+) -> bool {
+    if m.is_coordinator || is_self || connected {
+        return false;
+    }
+    match m.last_seen {
+        None => false,
+        Some(t) => now.saturating_sub(t) > ttl_secs,
+    }
+}
+/// Interval between stale-member sweeps. Well under the 1-hour TTL floor so a
+/// member that crosses the threshold is evicted within one interval.
+const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Remove one identity from the roster + approved list and drop its DNS
+/// entries. Does NOT publish or broadcast; the caller batches that via
+/// [`finalize_removal`] so several removals collapse into one publish. Shared by
+/// the manual kick handler and the ephemeral pruner.
+pub(crate) async fn remove_member_roster_only(
+    ctx: &MeshCtx,
+    network: &str,
+    state: &SharedNetworkState,
+    member_id: EndpointId,
+    member_ip: Ipv4Addr,
+) {
+    {
+        let mut s = state.write().unwrap();
+        s.members.remove(&member_id);
+        s.approved.remove(&member_id);
+    }
+    dns::remove_hostname_by_ip(&ctx.hostname_table, &ctx.reverse_table, network, member_ip).await;
+}
+
+/// Republish the signed blob, broadcast a payload-free `MemberSync`, and sever
+/// our own link(s) to every `victim` with `KICK_CODE`. Call once after one or
+/// more [`remove_member_roster_only`] edits. Other members drop the victims when
+/// they reconverge from the freshly published record (`prune_departed_peers`).
+pub(crate) async fn finalize_removal(
+    ctx: &MeshCtx,
+    network: &str,
+    state: &SharedNetworkState,
+    dht_notify: &Option<Arc<tokio::sync::Notify>>,
+    victims: &[EndpointId],
+) {
+    update_snapshot_and_publish(state, &ctx.blob_store, dht_notify).await;
+    let net_pubkey = state.read().unwrap().network_public_key;
+    broadcast_member_sync(&ctx.peers, net_pubkey, network, None).await;
+    for (pid, ip, _conn) in ctx.peers.peers_for_network_with_conn(network) {
+        let resolved = ctx.device_user_map.resolve(&pid);
+        if victims.iter().any(|v| *v == pid || *v == resolved) {
+            // One connection carries every shared network, so only close it when
+            // this was the peer's last network with us; otherwise just drop this
+            // network's route (`remove_peer_from_network` returns the connection
+            // iff its network set emptied).
+            if let Some(conn) =
+                ctx.peers
+                    .remove_peer_from_network(&ip, &derive_ipv6(&pid), network)
+            {
+                conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
+            }
+        }
+    }
+}
+
+/// Coordinator-only: periodically evict members that have been offline longer
+/// than the network's `ephemeral_ttl_secs` (off by default). Ticks every
+/// [`PRUNE_INTERVAL`] plus once shortly after spawn, reading the TTL fresh from
+/// config each tick so `ray ephemeral` takes effect without a restart. Reuses
+/// the exact kick teardown, batched into one publish per sweep.
+pub(crate) fn spawn_stale_member_pruner(
+    ctx: MeshCtx,
+    network: String,
+    state: SharedNetworkState,
+    dht_notify: Option<Arc<tokio::sync::Notify>>,
+    token: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut first = true;
+        loop {
+            let delay = if first {
+                std::time::Duration::from_secs(60)
+            } else {
+                PRUNE_INTERVAL
+            };
+            first = false;
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            let ttl = match config::load_network(&network) {
+                Ok(Some(c)) => c.ephemeral_ttl_secs,
+                _ => None,
+            };
+            let Some(ttl) = ttl else { continue };
+            let now = crate::membership::now_secs();
+            let me = ctx.identity.local_identity();
+            let connected: std::collections::HashSet<EndpointId> = ctx
+                .peers
+                .peers_for_network_with_conn(&network)
+                .into_iter()
+                .map(|(eid, _, _)| eid)
+                .collect();
+            let victims: Vec<(EndpointId, Ipv4Addr)> = {
+                let s = state.read().unwrap();
+                s.members
+                    .all()
+                    .into_iter()
+                    .filter(|m| {
+                        should_prune(m, connected.contains(&m.identity), m.identity == me, ttl, now)
+                    })
+                    .map(|m| (m.identity, m.ip))
+                    .collect()
+            };
+            if victims.is_empty() {
+                continue;
+            }
+            for (id, ip) in &victims {
+                remove_member_roster_only(&ctx, &network, &state, *id, *ip).await;
+                tracing::info!(peer = %id.fmt_short(), network = %network, ttl_secs = ttl, "auto-kicked stale member (ephemeral TTL)");
+            }
+            let ids: Vec<EndpointId> = victims.iter().map(|(id, _)| *id).collect();
+            finalize_removal(&ctx, &network, &state, &dht_notify, &ids).await;
+        }
+    })
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    fn mk(seed: u8, is_coordinator: bool, last_seen: Option<u64>) -> Member {
+        let mut key_bytes = [0u8; 32];
+        key_bytes[0] = seed;
+        let id = SecretKey::from(key_bytes).public();
+        Member {
+            identity: id,
+            ip: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            is_coordinator,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+            last_seen,
+        }
+    }
+
+    const TTL: u64 = 3600;
+    const NOW: u64 = 1_000_000;
+
+    #[test]
+    fn never_prunes_coordinator_self_or_connected() {
+        // coordinator, even if long offline
+        assert!(!should_prune(&mk(1, true, Some(0)), false, false, TTL, NOW));
+        // self
+        assert!(!should_prune(&mk(2, false, Some(0)), false, true, TTL, NOW));
+        // currently connected
+        assert!(!should_prune(&mk(3, false, Some(0)), true, false, TTL, NOW));
+    }
+
+    #[test]
+    fn never_prunes_when_last_seen_none() {
+        assert!(!should_prune(&mk(4, false, None), false, false, TTL, NOW));
+    }
+
+    #[test]
+    fn prunes_only_past_the_ttl_strictly() {
+        // exactly at TTL boundary -> not yet (strict `>`)
+        assert!(!should_prune(&mk(5, false, Some(NOW - TTL)), false, false, TTL, NOW));
+        // one second past the TTL -> prune
+        assert!(should_prune(&mk(6, false, Some(NOW - TTL - 1)), false, false, TTL, NOW));
+    }
+
+    #[test]
+    fn backwards_clock_does_not_prune() {
+        // last_seen in the "future" (clock went backwards) -> saturating_sub = 0
+        assert!(!should_prune(&mk(7, false, Some(NOW + 100)), false, false, TTL, NOW));
+    }
 }

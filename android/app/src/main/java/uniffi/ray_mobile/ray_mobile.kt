@@ -774,6 +774,18 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -797,6 +809,8 @@ fun uniffi_ray_mobile_checksum_method_node_approve_connect_request(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_create(
 ): Short
+fun uniffi_ray_mobile_checksum_method_node_default_hostname(
+): Short
 fun uniffi_ray_mobile_checksum_method_node_deny_join_request(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_down(
@@ -810,6 +824,8 @@ fun uniffi_ray_mobile_checksum_method_node_firewall_set_default_inbound(
 fun uniffi_ray_mobile_checksum_method_node_firewall_show(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_handle_link(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_health_snapshot(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_invite(
 ): Short
@@ -825,11 +841,17 @@ fun uniffi_ray_mobile_checksum_method_node_list_file_offers(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_list_join_requests(
 ): Short
+fun uniffi_ray_mobile_checksum_method_node_log_snapshot(
+): Short
 fun uniffi_ray_mobile_checksum_method_node_pair(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_reject_connect_request(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_reject_file_offer(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_send_file(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_set_default_hostname(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_set_dns_upstreams(
 ): Short
@@ -844,6 +866,8 @@ fun uniffi_ray_mobile_checksum_method_node_status(
 fun uniffi_ray_mobile_checksum_method_node_stop(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_submit_code(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_unpair(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_up(
 ): Short
@@ -912,6 +936,8 @@ fun uniffi_ray_mobile_fn_method_node_approve_connect_request(`ptr`: Pointer,`sho
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_create(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_default_hostname(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_deny_join_request(`ptr`: Pointer,`network`: RustBuffer.ByValue,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_down(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -925,6 +951,8 @@ fun uniffi_ray_mobile_fn_method_node_firewall_set_default_inbound(`ptr`: Pointer
 fun uniffi_ray_mobile_fn_method_node_firewall_show(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_handle_link(`ptr`: Pointer,`uri`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_health_snapshot(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_invite(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -940,11 +968,17 @@ fun uniffi_ray_mobile_fn_method_node_list_file_offers(`ptr`: Pointer,uniffi_out_
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_list_join_requests(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_log_snapshot(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_pair(`ptr`: Pointer,`ticket`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_reject_connect_request(`ptr`: Pointer,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_reject_file_offer(`ptr`: Pointer,`id`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_ray_mobile_fn_method_node_send_file(`ptr`: Pointer,`path`: RustBuffer.ByValue,`peer`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_ray_mobile_fn_method_node_set_default_hostname(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_set_dns_upstreams(`ptr`: Pointer,`servers`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -960,6 +994,8 @@ fun uniffi_ray_mobile_fn_method_node_stop(`ptr`: Pointer,uniffi_out_err: UniffiR
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_submit_code(`ptr`: Pointer,`input`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_unpair(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_ray_mobile_fn_method_node_up(`ptr`: Pointer,`tunFd`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun ffi_ray_mobile_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1100,6 +1136,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_create() != 50208.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_default_hostname() != 59357.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_deny_join_request() != 27631.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1119,6 +1158,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_handle_link() != 17267.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_health_snapshot() != 25816.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_invite() != 59156.toShort()) {
@@ -1142,6 +1184,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_list_join_requests() != 56409.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_log_snapshot() != 20955.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_pair() != 22172.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1149,6 +1194,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_reject_file_offer() != 10539.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_send_file() != 31964.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_set_default_hostname() != 40200.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_set_dns_upstreams() != 50178.toShort()) {
@@ -1170,6 +1221,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_submit_code() != 26371.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_unpair() != 28871.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_up() != 62370.toShort()) {
@@ -1597,6 +1651,12 @@ public interface NodeInterface {
     fun `create`(`name`: kotlin.String?): NetworkInfo
     
     /**
+     * The device's default hostname (seeds every join, incl. pairing
+     * auto-joins). Empty when unset. Config-only; safe before `start`.
+     */
+    fun `defaultHostname`(): kotlin.String
+    
+    /**
      * Deny a pending join request on a network we coordinate.
      */
     fun `denyJoinRequest`(`network`: kotlin.String, `shortId`: kotlin.String)
@@ -1633,6 +1693,13 @@ public interface NodeInterface {
      * dispatching to [`Node::join`] / [`Node::pair`]. Requires [`Node::start`].
      */
     fun `handleLink`(`uri`: kotlin.String): LinkAction
+    
+    /**
+     * Lightweight health vitals for auto-telemetry. Reuses `status()` for mesh
+     * state and reads the diagnostics counters. Cumulative WARN/ERROR counts
+     * (since process start); reading does not reset them.
+     */
+    fun `healthSnapshot`(): HealthSnapshot
     
     /**
      * Mint a single-use invite code for `network` (default 7d TTL), to share.
@@ -1674,6 +1741,11 @@ public interface NodeInterface {
     fun `listJoinRequests`(`network`: kotlin.String): List<PendingRequest>
     
     /**
+     * The full buffered core log, for the "Send diagnostics" button.
+     */
+    fun `logSnapshot`(): kotlin.String
+    
+    /**
      * Pair this device with a primary device using a scanned/pasted pairing
      * ticket (`bs58(endpoint_id[32] || secret[32])`).
      */
@@ -1688,6 +1760,25 @@ public interface NodeInterface {
      * Decline a file offer without downloading it.
      */
     fun `rejectFileOffer`(`id`: kotlin.ULong)
+    
+    /**
+     * Send a file to a peer. `path` is a readable file path (the core reads its
+     * bytes and adds them to the blob store); `peer` is any identifier the core
+     * resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+     * Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
+     * (or auto-accepts if it is one of the sender's own paired devices). Needs
+     * only the control plane ([`Node::start`]), not the tunnel, but the peer must
+     * be reachable. Runs to completion synchronously; callers drive it off the UI
+     * thread (Android's share flow runs it in a foreground service).
+     */
+    fun `sendFile`(`path`: kotlin.String, `peer`: kotlin.String)
+    
+    /**
+     * Set the device's default hostname. Validated with the core's hostname
+     * rules; rejected names leave the stored value untouched. Config-only;
+     * safe before `start`.
+     */
+    fun `setDefaultHostname`(`name`: kotlin.String)
     
     /**
      * Point the Magic DNS resolver at the phone's real DNS servers so
@@ -1745,6 +1836,14 @@ public interface NodeInterface {
      * `join`, which still handles both a full invite and a bare room id.
      */
     fun `submitCode`(`input`: kotlin.String): LinkAction
+    
+    /**
+     * Unpair this device from its primary: leave every network it joined under
+     * the shared identity (peers drop it right away) and delete the stored
+     * device cert. Only meaningful when [`Node::is_paired`] is true; a node with
+     * no cert returns an error. Requires [`Node::start`].
+     */
+    fun `unpair`()
     
     /**
      * Bring the data plane up over the `VpnService` fd: attach the fd's
@@ -1918,6 +2017,22 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
+     * The device's default hostname (seeds every join, incl. pairing
+     * auto-joins). Empty when unset. Config-only; safe before `start`.
+     */override fun `defaultHostname`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_default_hostname(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Deny a pending join request on a network we coordinate.
      */
     @Throws(RayException::class)override fun `denyJoinRequest`(`network`: kotlin.String, `shortId`: kotlin.String)
@@ -2020,6 +2135,23 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     uniffiRustCallWithError(RayException) { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_handle_link(
         it, FfiConverterString.lower(`uri`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Lightweight health vitals for auto-telemetry. Reuses `status()` for mesh
+     * state and reads the diagnostics counters. Cumulative WARN/ERROR counts
+     * (since process start); reading does not reset them.
+     */override fun `healthSnapshot`(): HealthSnapshot {
+            return FfiConverterTypeHealthSnapshot.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_health_snapshot(
+        it, _status)
 }
     }
     )
@@ -2142,6 +2274,21 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
+     * The full buffered core log, for the "Send diagnostics" button.
+     */override fun `logSnapshot`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_log_snapshot(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Pair this device with a primary device using a scanned/pasted pairing
      * ticket (`bs58(endpoint_id[32] || secret[32])`).
      */
@@ -2181,6 +2328,45 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     uniffiRustCallWithError(RayException) { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_reject_file_offer(
         it, FfiConverterULong.lower(`id`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Send a file to a peer. `path` is a readable file path (the core reads its
+     * bytes and adds them to the blob store); `peer` is any identifier the core
+     * resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+     * Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
+     * (or auto-accepts if it is one of the sender's own paired devices). Needs
+     * only the control plane ([`Node::start`]), not the tunnel, but the peer must
+     * be reachable. Runs to completion synchronously; callers drive it off the UI
+     * thread (Android's share flow runs it in a foreground service).
+     */
+    @Throws(RayException::class)override fun `sendFile`(`path`: kotlin.String, `peer`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_send_file(
+        it, FfiConverterString.lower(`path`),FfiConverterString.lower(`peer`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Set the device's default hostname. Validated with the core's hostname
+     * rules; rejected names leave the stored value untouched. Config-only;
+     * safe before `start`.
+     */
+    @Throws(RayException::class)override fun `setDefaultHostname`(`name`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_set_default_hostname(
+        it, FfiConverterString.lower(`name`),_status)
 }
     }
     
@@ -2316,6 +2502,24 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
+     * Unpair this device from its primary: leave every network it joined under
+     * the shared identity (peers drop it right away) and delete the stored
+     * device cert. Only meaningful when [`Node::is_paired`] is true; a node with
+     * no cert returns an error. Requires [`Node::start`].
+     */
+    @Throws(RayException::class)override fun `unpair`()
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_unpair(
+        it, _status)
+}
+    }
+    
+    
+
+    
+    /**
      * Bring the data plane up over the `VpnService` fd: attach the fd's
      * reader/writer to the running daemon and mark the data plane active.
      * Requires [`Node::start`] first.
@@ -2377,7 +2581,12 @@ data class FileOffer (
     var `from`: kotlin.String, 
     var `filename`: kotlin.String, 
     var `size`: kotlin.ULong, 
-    var `mimeType`: kotlin.String
+    var `mimeType`: kotlin.String, 
+    /**
+     * True when the sender is one of this user's own paired devices. The UI
+     * auto-accepts these (own-device shares) without a manual tap.
+     */
+    var `ownDevice`: kotlin.Boolean
 ) {
     
     companion object
@@ -2394,6 +2603,7 @@ public object FfiConverterTypeFileOffer: FfiConverterRustBuffer<FileOffer> {
             FfiConverterString.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -2402,7 +2612,8 @@ public object FfiConverterTypeFileOffer: FfiConverterRustBuffer<FileOffer> {
             FfiConverterString.allocationSize(value.`from`) +
             FfiConverterString.allocationSize(value.`filename`) +
             FfiConverterULong.allocationSize(value.`size`) +
-            FfiConverterString.allocationSize(value.`mimeType`)
+            FfiConverterString.allocationSize(value.`mimeType`) +
+            FfiConverterBoolean.allocationSize(value.`ownDevice`)
     )
 
     override fun write(value: FileOffer, buf: ByteBuffer) {
@@ -2411,6 +2622,7 @@ public object FfiConverterTypeFileOffer: FfiConverterRustBuffer<FileOffer> {
             FfiConverterString.write(value.`filename`, buf)
             FfiConverterULong.write(value.`size`, buf)
             FfiConverterString.write(value.`mimeType`, buf)
+            FfiConverterBoolean.write(value.`ownDevice`, buf)
     }
 }
 
@@ -2511,6 +2723,74 @@ public object FfiConverterTypeFirewallStateInfo: FfiConverterRustBuffer<Firewall
 
 
 /**
+ * Lightweight health vitals for auto-telemetry. Cheap to build (reads a status
+ * snapshot + the diagnostics counters); safe to call before `start`.
+ */
+data class HealthSnapshot (
+    var `running`: kotlin.Boolean, 
+    var `networkCount`: kotlin.UInt, 
+    var `peersOnline`: kotlin.UInt, 
+    var `networks`: List<NetworkHealth>, 
+    var `meshUp`: kotlin.Boolean, 
+    var `nodeId`: kotlin.String, 
+    var `meshIpv4`: kotlin.String, 
+    var `warnCount`: kotlin.ULong, 
+    var `errorCount`: kotlin.ULong, 
+    var `recentErrors`: List<kotlin.String>
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeHealthSnapshot: FfiConverterRustBuffer<HealthSnapshot> {
+    override fun read(buf: ByteBuffer): HealthSnapshot {
+        return HealthSnapshot(
+            FfiConverterBoolean.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterSequenceTypeNetworkHealth.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterSequenceString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: HealthSnapshot) = (
+            FfiConverterBoolean.allocationSize(value.`running`) +
+            FfiConverterUInt.allocationSize(value.`networkCount`) +
+            FfiConverterUInt.allocationSize(value.`peersOnline`) +
+            FfiConverterSequenceTypeNetworkHealth.allocationSize(value.`networks`) +
+            FfiConverterBoolean.allocationSize(value.`meshUp`) +
+            FfiConverterString.allocationSize(value.`nodeId`) +
+            FfiConverterString.allocationSize(value.`meshIpv4`) +
+            FfiConverterULong.allocationSize(value.`warnCount`) +
+            FfiConverterULong.allocationSize(value.`errorCount`) +
+            FfiConverterSequenceString.allocationSize(value.`recentErrors`)
+    )
+
+    override fun write(value: HealthSnapshot, buf: ByteBuffer) {
+            FfiConverterBoolean.write(value.`running`, buf)
+            FfiConverterUInt.write(value.`networkCount`, buf)
+            FfiConverterUInt.write(value.`peersOnline`, buf)
+            FfiConverterSequenceTypeNetworkHealth.write(value.`networks`, buf)
+            FfiConverterBoolean.write(value.`meshUp`, buf)
+            FfiConverterString.write(value.`nodeId`, buf)
+            FfiConverterString.write(value.`meshIpv4`, buf)
+            FfiConverterULong.write(value.`warnCount`, buf)
+            FfiConverterULong.write(value.`errorCount`, buf)
+            FfiConverterSequenceString.write(value.`recentErrors`, buf)
+    }
+}
+
+
+
+/**
  * One network this node belongs to, with its peers.
  */
 data class NetworkDetail (
@@ -2556,6 +2836,41 @@ public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetai
             FfiConverterString.write(value.`hostname`, buf)
             FfiConverterBoolean.write(value.`isCoordinator`, buf)
             FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
+    }
+}
+
+
+
+/**
+ * One network's liveness, for the health snapshot.
+ */
+data class NetworkHealth (
+    var `name`: kotlin.String, 
+    var `connected`: kotlin.Boolean
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNetworkHealth: FfiConverterRustBuffer<NetworkHealth> {
+    override fun read(buf: ByteBuffer): NetworkHealth {
+        return NetworkHealth(
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: NetworkHealth) = (
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterBoolean.allocationSize(value.`connected`)
+    )
+
+    override fun write(value: NetworkHealth, buf: ByteBuffer) {
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterBoolean.write(value.`connected`, buf)
     }
 }
 
@@ -3110,6 +3425,34 @@ public object FfiConverterSequenceTypeNetworkDetail: FfiConverterRustBuffer<List
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeNetworkDetail.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeNetworkHealth: FfiConverterRustBuffer<List<NetworkHealth>> {
+    override fun read(buf: ByteBuffer): List<NetworkHealth> {
+        val len = buf.getInt()
+        return List<NetworkHealth>(len) {
+            FfiConverterTypeNetworkHealth.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<NetworkHealth>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeNetworkHealth.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<NetworkHealth>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeNetworkHealth.write(it, buf)
         }
     }
 }
