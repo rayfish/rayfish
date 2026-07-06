@@ -227,6 +227,37 @@ cargo build --features otel  # optional OTLP span export
 
 Requires the Rust 2024 edition (Rust 1.85+).
 
+## FAQ
+
+> "You use LLMs? 🤯"
+
+Yes. Heavily. Claude and GLM-5.2 wrote a lot of this repo.
+
+> "So it's all vibe-coded slop."
+
+The idea is over 4 years old: a trustless, decentralized network with no
+central entity that can censor who you connect with. 
+I sketched it for years. What an LLM changed was the *speed*: the prototype came together in a day.
+The trigger was the release of [iroh v1](https://www.iroh.computer/blog/v1).
+
+> "Is it actually trustless and serverless?"
+
+Yes. By using iroh.
+
+> ☝️🤓 actually, it is wrong to describe these P2P products as server-less.
+> In order to connect two peers over WAN it needs a form of coordination server.
+
+Who cares? To connect to the internet you need to go to through your ISP, the FBI, the NSA, the IRS, and any other 3 letter agency you can imagine in the world. But you care about n0 computer's servers... Sure.
+
+You can also host your own relay and pkarr servers. Check [ansible-iroh](https://github.com/rayfish/ansible-iroh).
+Your data is encrypted anyway. You own your identity.
+
+> "Is rayfish production ready?"
+
+NO. Don't use it in your company (yet!). Don't ditch tailscale or anything else to use it.
+
+Use it in your homelab, with friends on a discord server or just to connect your android (in very alpha stage) and your laptop.
+
 ## Contributing & security
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and [SECURITY.md](SECURITY.md) to report vulnerabilities privately.
