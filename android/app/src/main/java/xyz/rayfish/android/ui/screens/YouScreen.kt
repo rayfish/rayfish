@@ -35,6 +35,7 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
     }
     var pairingTicket by remember { mutableStateOf<String?>(null) }
     var paired by remember { mutableStateOf(false) }
+    var confirmUnpair by remember { mutableStateOf(false) }
     // A device that already holds a cert cannot pair again (it must not mint new
     // certs). Refresh whenever status changes so the card flips right after a pair.
     LaunchedEffect(status?.nodeId) {
@@ -86,6 +87,8 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             } else if (paired) {
                 Text("This device is paired. Add new devices from your primary device.",
                     fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
+                Spacer(Modifier.height(10.dp))
+                OutlinePillButton("Unpair this device", onClick = { confirmUnpair = true }, modifier = Modifier.fillMaxWidth())
             } else {
                 Text("Pair another of your devices: show it a code, or scan the code it shows.",
                     fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
@@ -169,6 +172,30 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 }) { Text("Save", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
             },
             dismissButton = { TextButton(onClick = { editing = false }) { Text("Cancel", color = Rf.Body, fontFamily = Chakra) } },
+        )
+    }
+    if (confirmUnpair) {
+        AlertDialog(
+            onDismissRequest = { confirmUnpair = false },
+            containerColor = Rf.Sheet,
+            title = { Text("Unpair this device?", fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
+            text = {
+                Text("This device leaves all your networks and deletes its pairing certificate. Peers disconnect from it right away. Re-pair from your primary device to rejoin.",
+                    fontFamily = Chakra, fontSize = 12.sp, color = Rf.Body)
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmUnpair = false
+                    scope.launch {
+                        try {
+                            withContext(Dispatchers.IO) { NodeHolder.get(context).unpair() }
+                            paired = false
+                            onToast("Unpaired this device"); onChanged()
+                        } catch (t: Throwable) { onToast("Unpair failed: ${t.message}") }
+                    }
+                }) { Text("Unpair", color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = { TextButton(onClick = { confirmUnpair = false }) { Text("Cancel", color = Rf.Body, fontFamily = Chakra) } },
         )
     }
     pairingTicket?.let { t -> QrCodeSheet("Show this to your other device", t, context, onToast) { pairingTicket = null } }

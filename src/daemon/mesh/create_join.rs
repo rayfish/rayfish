@@ -315,7 +315,8 @@ impl MeshManager {
             network_public_key: Some(net_public_key),
             transport: None,
             auto_accept_firewall: false,
-            auto_accept_files: false,
+            // Own-device file offers are auto-accepted by default (identity-checked).
+            auto_accept_files: true,
             admins: vec![],
             direct,
             ssh_allow: vec![],

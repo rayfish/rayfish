@@ -88,11 +88,12 @@ pub(crate) enum Command {
         /// it, suggestions queue for `ray firewall accept`.
         #[arg(long)]
         auto_accept_firewall: bool,
-        /// Auto-accept incoming file transfers from your own paired devices on
-        /// this network (no manual `ray files accept`). Only offers whose sender
-        /// is one of your own devices are accepted.
+        /// Opt out of auto-accepting file transfers from your own paired devices
+        /// on this network. By default own-device offers are accepted without a
+        /// manual `ray files accept` (only offers whose sender is one of your own
+        /// devices, identity-checked); pass this to require manual acceptance.
         #[arg(long)]
-        auto_accept_files: bool,
+        no_auto_accept_files: bool,
     },
     /// Leave a network (remove from saved config)
     #[command(visible_alias = "rm")]
@@ -976,7 +977,7 @@ async fn main() -> Result<()> {
             hostname,
             tor,
             auto_accept_firewall,
-            auto_accept_files,
+            no_auto_accept_files,
         } => {
             ipc_join(
                 &network_key,
@@ -984,7 +985,7 @@ async fn main() -> Result<()> {
                 hostname,
                 tor,
                 auto_accept_firewall,
-                auto_accept_files,
+                !no_auto_accept_files,
             )
             .await
         }

@@ -204,6 +204,7 @@ pub(crate) async fn join_mesh_shared(
     // Reconverge worker: `MemberSync`/`BlobUpdated` triggers fan into this single
     // debounced task (see `spawn_reconverge_worker`).
     let reconverge_notify = Arc::new(tokio::sync::Notify::new());
+    let self_unpair_tx = worker_ctx.self_unpair_tx.clone();
     spawn_reconverge_worker(
         reconverge_notify.clone(),
         token.clone(),
@@ -232,6 +233,7 @@ pub(crate) async fn join_mesh_shared(
         invite_lock.clone(),
         reconverge_notify.clone(),
         pending_pongs.clone(),
+        self_unpair_tx,
     );
 
     Ok(JoinResult::Joined(live_state))
@@ -675,6 +677,7 @@ fn spawn_member_control_listener(
     invite_lock: Arc<tokio::sync::Mutex<()>>,
     reconverge_notify: Arc<tokio::sync::Notify>,
     pending_pongs: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
+    self_unpair_tx: mpsc::Sender<()>,
 ) {
     tokio::spawn(async move {
         let mut gate = crate::ratelimit::ControlGate::new();
@@ -830,10 +833,14 @@ fn spawn_member_control_listener(
                                     }
                                 }
                                 ControlMsg::Unpaired => {
-                                    // Our primary is unpairing this device. The
-                                    // helper verifies the sender signed our cert,
-                                    // so a stranger is a no-op.
-                                    wipe_cert_if_unpaired_by(initial_conn.remote_id());
+                                    // Our primary is unpairing this device. Only
+                                    // act if it actually signed our cert (a
+                                    // stranger is a no-op), then hand off to the
+                                    // daemon loop to leave all networks + wipe the
+                                    // cert so we drop out of the mesh right away.
+                                    if is_unpaired_by(initial_conn.remote_id()) {
+                                        let _ = self_unpair_tx.try_send(());
+                                    }
                                 }
                                 ControlMsg::CertRefresh { cert } => {
                                     // Our primary rotated and re-issued us.

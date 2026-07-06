@@ -151,6 +151,11 @@ pub(crate) struct MeshCtx {
     /// re-form the link. The reconnect loop consumes an entry here to skip that
     /// one reconnect. Populated in [`reconverge_and_apply`] and the kick handler.
     pruned_peers: Arc<DashSet<(String, EndpointId)>>,
+    /// Signal from a per-peer control reader that this device's primary sent
+    /// `ControlMsg::Unpaired`. The reader holds only field clones (not the full
+    /// `MeshManager`), so it hands off to the daemon loop, which runs
+    /// [`MeshManager::unpair_self`] (leave all networks + wipe the cert).
+    self_unpair_tx: mpsc::Sender<()>,
 }
 
 impl MeshCtx {
@@ -421,6 +426,13 @@ pub struct MeshManager {
     /// clones (not the full `MeshManager`), so it can't promote itself — hence
     /// the channel hand-off to the loop that does hold the `Arc<MeshManager>`.
     promote_tx: mpsc::Sender<String>,
+    /// Self-unpair signal (see [`MeshCtx::self_unpair_tx`]): a control reader that
+    /// received `ControlMsg::Unpaired` from our primary sends here, and the daemon
+    /// loop drains it into [`MeshManager::unpair_self`]. Same reader-can't-hold-the
+    /// -`Arc` hand-off pattern as `promote_tx`.
+    self_unpair_tx: mpsc::Sender<()>,
+    /// Receiver half of the self-unpair channel, taken once by the daemon loop.
+    self_unpair_rx: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 /// Map key-holding status to a [`NetworkRole`].
@@ -498,6 +510,7 @@ impl MeshManager {
             device_user_map: self.device_user_map.clone(),
             revocation: self.revocation.clone(),
             pruned_peers: self.pruned_peers.clone(),
+            self_unpair_tx: self.self_unpair_tx.clone(),
         }
     }
 
@@ -1305,6 +1318,7 @@ mod accept_handler_tests {
             device_user_map: peers::DeviceUserMap::new(),
             revocation: RevocationCache::new(),
             pruned_peers: Arc::new(DashSet::new()),
+            self_unpair_tx: tokio::sync::mpsc::channel(1).0,
         }
     }
 

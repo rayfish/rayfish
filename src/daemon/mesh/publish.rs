@@ -84,13 +84,13 @@ pub(crate) fn spawn_contact_publisher(
     })
 }
 
-/// Republish this user's cert-generation floor (`ray unpair` / rotation).
-/// Publishes `user_key -> generation` on a TTL/2 interval so the floor stays
+/// Republish this user's revoked device set (`ray unpair`). Publishes
+/// `user_key -> {version, devices}` on a TTL/2 interval so the set stays
 /// resolvable while this daemon runs (not gated by the data-plane `active` flag,
 /// so a standby node still advertises it). Only the primary signs it — its
 /// endpoint secret *is* the user identity that signed the certs. A secondary
-/// never rotates, so its generation stays 0 and nothing is published. Reads
-/// config fresh each cycle so a new rotation takes effect without a restart.
+/// never revokes, so its set stays empty and nothing is published. Reads config
+/// fresh each cycle so a new revoke/re-auth takes effect without a restart.
 pub(crate) fn spawn_revocation_publisher(
     client: PkarrRelayClient,
     token: CancellationToken,
@@ -98,14 +98,23 @@ pub(crate) fn spawn_revocation_publisher(
     tokio::spawn(async move {
         loop {
             let is_primary = crate::identity::load_device_cert().ok().flatten().is_none();
-            let generation = config::load().map(|c| c.cert_generation).unwrap_or(0);
+            let cfg = config::load().unwrap_or_default();
+            let devices = config::revoked_device_ids(&cfg);
+            // Publish whenever we have ever revoked (version > 0), even if the set
+            // is now empty: a re-auth clears the set at a newer version, and remote
+            // peers only un-revoke when they see that newer (empty) record.
             if is_primary
-                && generation > 0
+                && cfg.revocation_version > 0
                 && let Ok(secret) = crate::identity::load_or_create()
             {
-                match dht::publish_cert_floor(&client, &secret, generation).await {
-                    Ok(()) => tracing::debug!(generation, "published cert-generation floor"),
-                    Err(e) => tracing::warn!(error = %e, "failed to publish cert-floor record"),
+                match dht::publish_revoked(&client, &secret, cfg.revocation_version, &devices).await
+                {
+                    Ok(()) => tracing::debug!(
+                        version = cfg.revocation_version,
+                        count = devices.len(),
+                        "published revoked-device set"
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "failed to publish revoked-device record"),
                 }
             }
             tokio::select! {
@@ -116,12 +125,12 @@ pub(crate) fn spawn_revocation_publisher(
     })
 }
 
-/// Keep the [`RevocationCache`] warm. Every 60s, resolve the cert-generation
-/// floor for each user identity visible in any roster (plus our own), so a cert
-/// below the floor is rejected at admission and severed on the next reconverge
-/// even when the revoking user is a *different* user we share a network with.
-/// This only supplies the facts; the per-network group poller's reconverge does
-/// the actual pruning (`prune_departed_peers`).
+/// Keep the [`RevocationCache`] warm. Every 60s, resolve the revoked device set
+/// for each user identity visible in any roster (plus our own), so a revoked
+/// device's cert is rejected at admission and severed on the next reconverge even
+/// when the revoking user is a *different* user we share a network with. This only
+/// supplies the facts; the per-network group poller's reconverge does the actual
+/// pruning (`prune_departed_peers`).
 pub(crate) fn spawn_revocation_poller(
     daemon: Arc<MeshManager>,
     client: PkarrRelayClient,
@@ -148,16 +157,27 @@ pub(crate) fn spawn_revocation_poller(
                     }
                 }
             }
+            let mut raised = false;
             for user in users {
                 if !daemon.revocation.needs_refresh(&user) {
                     continue;
                 }
-                match dht::resolve_cert_floor(&client, user).await {
-                    Ok(floor) => daemon.revocation.record(user, floor),
+                match dht::resolve_revoked(&client, user).await {
+                    // A newer version means the revoked set changed (a device was
+                    // just unpaired): prune any now-revoked peer right away instead
+                    // of waiting for the next 60s group poll on each network.
+                    Ok((version, devices)) => {
+                        raised |= daemon
+                            .revocation
+                            .record(user, version, devices.into_iter().collect())
+                    }
                     // No record (never published / TTL-expired) is the common case;
                     // fail open (leave the cache as-is) rather than clear it.
-                    Err(e) => tracing::trace!(user = %user.fmt_short(), error = %e, "no cert-floor record"),
+                    Err(e) => tracing::trace!(user = %user.fmt_short(), error = %e, "no revoked-device record"),
                 }
+            }
+            if raised {
+                daemon.prune_revoked_across_networks();
             }
         }
     })

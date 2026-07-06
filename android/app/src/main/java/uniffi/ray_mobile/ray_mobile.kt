@@ -784,6 +784,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -864,6 +866,8 @@ fun uniffi_ray_mobile_checksum_method_node_status(
 fun uniffi_ray_mobile_checksum_method_node_stop(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_submit_code(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_unpair(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_up(
 ): Short
@@ -990,6 +994,8 @@ fun uniffi_ray_mobile_fn_method_node_stop(`ptr`: Pointer,uniffi_out_err: UniffiR
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_submit_code(`ptr`: Pointer,`input`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_unpair(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_ray_mobile_fn_method_node_up(`ptr`: Pointer,`tunFd`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun ffi_ray_mobile_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1215,6 +1221,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_submit_code() != 26371.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_unpair() != 28871.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_up() != 62370.toShort()) {
@@ -1827,6 +1836,14 @@ public interface NodeInterface {
      * `join`, which still handles both a full invite and a bare room id.
      */
     fun `submitCode`(`input`: kotlin.String): LinkAction
+    
+    /**
+     * Unpair this device from its primary: leave every network it joined under
+     * the shared identity (peers drop it right away) and delete the stored
+     * device cert. Only meaningful when [`Node::is_paired`] is true; a node with
+     * no cert returns an error. Requires [`Node::start`].
+     */
+    fun `unpair`()
     
     /**
      * Bring the data plane up over the `VpnService` fd: attach the fd's
@@ -2481,6 +2498,24 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     }
     )
     }
+    
+
+    
+    /**
+     * Unpair this device from its primary: leave every network it joined under
+     * the shared identity (peers drop it right away) and delete the stored
+     * device cert. Only meaningful when [`Node::is_paired`] is true; a node with
+     * no cert returns an error. Requires [`Node::start`].
+     */
+    @Throws(RayException::class)override fun `unpair`()
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_unpair(
+        it, _status)
+}
+    }
+    
     
 
     

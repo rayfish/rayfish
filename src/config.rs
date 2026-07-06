@@ -133,10 +133,10 @@ pub struct NetworkConfig {
     pub auto_accept_firewall: bool,
     /// Auto-accept incoming file offers from our own paired devices on this
     /// network (no manual `ray files accept`). Own-devices-only (the sender's
-    /// user identity must match ours); secure default off. Set per-network by
-    /// `ray join --auto-accept-files` or toggled with
-    /// `ray files auto-accept <net> on|off`.
-    #[serde(default)]
+    /// user identity must match ours), so it is safe on by default. Opt out per
+    /// network with `ray join --no-auto-accept-files` or `ray files auto-accept
+    /// <net> off`.
+    #[serde(default = "default_true")]
     pub auto_accept_files: bool,
     /// Identities this coordinator has granted the per-network secret key to
     /// (`ray admin add`). Local tracking only — the key is shared and not
@@ -436,18 +436,23 @@ pub struct AppConfig {
     /// admission. See [`PendingJoinEntry`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_joins: Vec<PendingJoinEntry>,
-    /// This user's current device-cert generation (`ray unpair` / rotation). A
-    /// bump revokes every device below it; the current value is published to
-    /// pkarr as the "floor" that verifiers reject certs beneath. `0` means no
-    /// rotation has happened. See [`crate::revocation`].
+    /// Legacy device-cert generation counter (pre per-cert revocation). No longer
+    /// used for revocation decisions (superseded by `revoked_devices` +
+    /// `revocation_version`); kept only so old `settings.toml` files still parse.
     #[serde(default)]
     pub cert_generation: u64,
-    /// Device keys this user has revoked via `ray unpair` (hex `EndpointId`).
-    /// **Local-only, never published** — the generation floor is what propagates.
-    /// The primary keeps this list so it can refuse to re-issue a revoked device
-    /// that reconnects with a stale cert, while re-issuing the devices it keeps.
+    /// Device keys this user has revoked via `ray unpair` (hex `EndpointId`). This
+    /// is the authoritative revoked set: it is published under the user's own key
+    /// (with `revocation_version`) so every peer rejects a listed device's cert,
+    /// and consulted locally so the primary refuses a revoked device. A device is
+    /// removed here when it re-pairs (re-auth). See [`crate::revocation`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revoked_devices: Vec<String>,
+    /// Monotonic version of the published revoked set. Bumped on every revoke and
+    /// re-auth so a stale/replayed record can't win; verifiers adopt a set only on
+    /// a strictly newer version. See [`crate::revocation`].
+    #[serde(default)]
+    pub revocation_version: u64,
 }
 
 impl Default for AppConfig {
@@ -470,6 +475,7 @@ impl Default for AppConfig {
             pending_joins: Vec::new(),
             cert_generation: 0,
             revoked_devices: Vec::new(),
+            revocation_version: 0,
         }
     }
 }
@@ -562,6 +568,8 @@ struct Settings {
     cert_generation: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     revoked_devices: Vec<String>,
+    #[serde(default)]
+    revocation_version: u64,
 }
 
 /// Look up the `rayfish` group's gid (Linux), if the group exists.
@@ -811,6 +819,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
             pending_joins: Vec::new(),
             cert_generation: 0,
             revoked_devices: Vec::new(),
+            revocation_version: 0,
         }
     };
 
@@ -856,6 +865,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         pending_joins: settings.pending_joins,
         cert_generation: settings.cert_generation,
         revoked_devices: settings.revoked_devices,
+        revocation_version: settings.revocation_version,
     })
 }
 
@@ -882,6 +892,7 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         pending_joins: config.pending_joins.clone(),
         cert_generation: config.cert_generation,
         revoked_devices: config.revoked_devices.clone(),
+        revocation_version: config.revocation_version,
     };
     let path = dir.join(SETTINGS_FILE);
     let contents = toml::to_string_pretty(&settings).context("serializing settings")?;
