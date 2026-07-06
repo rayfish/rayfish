@@ -289,7 +289,11 @@ async fn build_daemon(
         device_cert.clone(),
         device_user_map.clone(),
     ));
-    let connect = Arc::new(ConnectService::new(transport.clone(), active.clone()));
+    let connect = Arc::new(ConnectService::new(
+        transport.clone(),
+        active.clone(),
+        registry.clone(),
+    ));
     let protocol_router = Arc::new(ProtocolRouter::new(
         blobs_proto,
         files.clone(),

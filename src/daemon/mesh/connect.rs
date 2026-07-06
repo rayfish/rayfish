@@ -7,24 +7,7 @@ impl MeshManager {
     /// Name of a live direct (`ray connect`) network whose roster includes
     /// `peer`, if any, used to short-circuit duplicate connects.
     pub(crate) fn existing_direct_network_with(&self, peer: &EndpointId) -> Option<String> {
-        let direct: HashSet<String> = config::load()
-            .map(|c| {
-                c.networks
-                    .iter()
-                    .filter(|n| n.direct)
-                    .map(|n| n.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.networks.iter().find_map(|h| {
-            if !direct.contains(h.key()) {
-                return None;
-            }
-            let s = h.state.read().ok()?;
-            let has = s.members.all().iter().any(|m| &m.identity == peer)
-                || s.approved.all().iter().any(|a| &a.identity == peer);
-            has.then(|| h.key().clone())
-        })
+        self.registry.existing_direct_network_with(peer)
     }
 
     /// Send a single connect request to `peer` over `CONNECT_ALPN` and return the
@@ -203,25 +186,6 @@ impl MeshManager {
         self.connect.list_connections()
     }
 
-    /// Build a unique, valid network name for a direct connection from the two
-    /// hostnames (e.g. `bob-alice`), resolving collisions against live networks.
-    /// `my_host` is the minter's own hostname on the network, so the name and the
-    /// minter's member hostname stay consistent.
-    pub(crate) fn direct_network_name(&self, my_host: &str, peer_hostname: Option<&str>) -> String {
-        let peer = peer_hostname.unwrap_or("peer");
-        let mut base = format!("{my_host}-{peer}");
-        if base.len() > 63 {
-            base.truncate(63);
-            base = base.trim_end_matches('-').to_string();
-        }
-        if !crate::hostname::is_valid_hostname(&base) {
-            base = crate::network_name::generate_name();
-        }
-        let taken: Vec<String> = self.networks.iter().map(|h| h.key().clone()).collect();
-        let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
-        crate::hostname::resolve_collision(&base, &taken_refs)
-    }
-
     /// Decline a pending connect request: drop it without minting a network. The
     /// requester's retry loop eventually times out.
     pub fn reject_connect(&self, id_prefix: &str) -> IpcMessage {
@@ -230,78 +194,8 @@ impl MeshManager {
 
     /// `ray connections approve <id>`: approve a pending connect request, minting
     /// a 2-peer network with the requester pre-approved.
-    pub async fn approve_connection(self: &Arc<Self>, id_prefix: &str) -> IpcMessage {
-        let found = self
-            .connect
-            .pending_connects
-            .iter()
-            .find(|p| {
-                p.from_contact_id
-                    .fmt_short()
-                    .to_string()
-                    .starts_with(id_prefix)
-                    || p.from_contact_id.to_string().starts_with(id_prefix)
-            })
-            .map(|p| p.value().clone());
-        let Some(req) = found else {
-            return IpcMessage::Error {
-                message: format!("no pending connection request matching '{id_prefix}'"),
-            };
-        };
-        let peer = req.from_endpoint;
-
-        // Idempotency: already linked on a direct network → reuse it.
-        if let Some(name) = self.existing_direct_network_with(&peer) {
-            self.connect.pending_connects.remove(&peer);
-            return IpcMessage::Ok {
-                message: format!("already connected to this peer on '{name}'"),
-            };
-        }
-
-        // Concurrency tie-break: if we also initiated a connect to this peer and
-        // our endpoint id is the lower one, let the higher-id peer mint the
-        // network; our own connect retry loop will join it.
-        let we_initiated = self.connect.outgoing_connects.contains(&peer);
-        if we_initiated && self.endpoint.id().to_string() < peer.to_string() {
-            self.connect.pending_connects.remove(&peer);
-            return IpcMessage::Ok {
-                message: "connection will be established by the other peer".to_string(),
-            };
-        }
-
-        // Decide our own hostname once so the network name (`<me>-<peer>`) and our
-        // member hostname on it agree, instead of generating two different names.
-        let my_host = config::load()
-            .ok()
-            .and_then(|c| c.default_hostname)
-            .unwrap_or_else(crate::hostname::generate_hostname);
-        let name = self.direct_network_name(&my_host, req.hostname.as_deref());
-        match self
-            .create_network_inner(
-                GroupMode::Restricted,
-                Some(name),
-                Some(my_host),
-                true,
-                Some((peer, req.hostname.clone())),
-            )
-            .await
-        {
-            Ok(IpcMessage::Created {
-                name, network_key, ..
-            }) => {
-                self.connect.pending_connects.remove(&peer);
-                self.connect
-                    .approved_connects
-                    .insert(peer, (network_key, self.endpoint.id()));
-                IpcMessage::Ok {
-                    message: format!("approved — direct connection '{name}' created"),
-                }
-            }
-            Ok(other) => other,
-            Err(e) => IpcMessage::Error {
-                message: format!("failed to create direct network: {e:#}"),
-            },
-        }
+    pub async fn approve_connection(&self, id_prefix: &str) -> IpcMessage {
+        self.connect.approve_connection(id_prefix).await
     }
 
     /// `ray contact rotate`: replace this node's contact key. The old contact id

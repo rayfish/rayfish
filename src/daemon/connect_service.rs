@@ -38,16 +38,103 @@ pub(crate) struct ConnectService {
     /// Whether the data plane is active, gating immediate contact republish on
     /// key rotation.
     active: Arc<AtomicBool>,
+    /// The network-owning service, for minting/joining the 2-peer direct network
+    /// once a connect request is approved.
+    registry: Arc<NetworkRegistry>,
 }
 
 impl ConnectService {
-    pub(crate) fn new(transport: Arc<Transport>, active: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(
+        transport: Arc<Transport>,
+        active: Arc<AtomicBool>,
+        registry: Arc<NetworkRegistry>,
+    ) -> Self {
         Self {
             pending_connects: Arc::new(DashMap::new()),
             approved_connects: Arc::new(DashMap::new()),
             outgoing_connects: Arc::new(DashSet::new()),
             transport,
             active,
+            registry,
+        }
+    }
+
+    /// Approve a pending `ray connect` request by contact-id prefix: mint a
+    /// restricted 2-peer network with the requester pre-approved (idempotent if
+    /// already linked; defers to the higher endpoint id on a simultaneous
+    /// cross-connect). The initiator's connect-retry loop then joins it.
+    pub(crate) async fn approve_connection(&self, id_prefix: &str) -> IpcMessage {
+        let found = self
+            .pending_connects
+            .iter()
+            .find(|p| {
+                p.from_contact_id
+                    .fmt_short()
+                    .to_string()
+                    .starts_with(id_prefix)
+                    || p.from_contact_id.to_string().starts_with(id_prefix)
+            })
+            .map(|p| p.value().clone());
+        let Some(req) = found else {
+            return IpcMessage::Error {
+                message: format!("no pending connection request matching '{id_prefix}'"),
+            };
+        };
+        let peer = req.from_endpoint;
+
+        // Idempotency: already linked on a direct network -> reuse it.
+        if let Some(name) = self.registry.existing_direct_network_with(&peer) {
+            self.pending_connects.remove(&peer);
+            return IpcMessage::Ok {
+                message: format!("already connected to this peer on '{name}'"),
+            };
+        }
+
+        // Concurrency tie-break: if we also initiated a connect to this peer and
+        // our endpoint id is the lower one, let the higher-id peer mint the
+        // network; our own connect retry loop will join it.
+        let we_initiated = self.outgoing_connects.contains(&peer);
+        if we_initiated && self.transport.endpoint.id().to_string() < peer.to_string() {
+            self.pending_connects.remove(&peer);
+            return IpcMessage::Ok {
+                message: "connection will be established by the other peer".to_string(),
+            };
+        }
+
+        // Decide our own hostname once so the network name (`<me>-<peer>`) and our
+        // member hostname on it agree, instead of generating two different names.
+        let my_host = config::load()
+            .ok()
+            .and_then(|c| c.default_hostname)
+            .unwrap_or_else(crate::hostname::generate_hostname);
+        let name = self
+            .registry
+            .direct_network_name(&my_host, req.hostname.as_deref());
+        match self
+            .registry
+            .create_network_inner(
+                GroupMode::Restricted,
+                Some(name),
+                Some(my_host),
+                true,
+                Some((peer, req.hostname.clone())),
+            )
+            .await
+        {
+            Ok(IpcMessage::Created {
+                name, network_key, ..
+            }) => {
+                self.pending_connects.remove(&peer);
+                self.approved_connects
+                    .insert(peer, (network_key, self.transport.endpoint.id()));
+                IpcMessage::Ok {
+                    message: format!("approved — direct connection '{name}' created"),
+                }
+            }
+            Ok(other) => other,
+            Err(e) => IpcMessage::Error {
+                message: format!("failed to create direct network: {e:#}"),
+            },
         }
     }
 

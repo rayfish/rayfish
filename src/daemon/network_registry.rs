@@ -212,6 +212,46 @@ impl NetworkRegistry {
         self.networks.contains_key(name)
     }
 
+    /// The name of an existing direct (`ray connect`) network already linking us
+    /// to `peer` (as a member or approved), if any. Used to keep `approve` /
+    /// re-connect idempotent.
+    pub(crate) fn existing_direct_network_with(&self, peer: &EndpointId) -> Option<String> {
+        let direct: HashSet<String> = config::load()
+            .map(|c| {
+                c.networks
+                    .iter()
+                    .filter(|n| n.direct)
+                    .map(|n| n.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.networks.iter().find_map(|h| {
+            if !direct.contains(h.key()) {
+                return None;
+            }
+            let s = h.state.read().ok()?;
+            let has = s.members.all().iter().any(|m| &m.identity == peer)
+                || s.approved.all().iter().any(|a| &a.identity == peer);
+            has.then(|| h.key().clone())
+        })
+    }
+
+    /// Pick a collision-free `<me>-<peer>` name for a direct network.
+    pub(crate) fn direct_network_name(&self, my_host: &str, peer_hostname: Option<&str>) -> String {
+        let peer = peer_hostname.unwrap_or("peer");
+        let mut base = format!("{my_host}-{peer}");
+        if base.len() > 63 {
+            base.truncate(63);
+            base = base.trim_end_matches('-').to_string();
+        }
+        if !crate::hostname::is_valid_hostname(&base) {
+            base = crate::network_name::generate_name();
+        }
+        let taken: Vec<String> = self.networks.iter().map(|h| h.key().clone()).collect();
+        let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
+        crate::hostname::resolve_collision(&base, &taken_refs)
+    }
+
     /// Mint a new network: generate its keypair, build the initial roster, seal +
     /// publish the blob, persist config, spawn coordinator tasks, and register the
     /// coordinator accept handler. `direct`/`pre_approve` back the `ray connect`
