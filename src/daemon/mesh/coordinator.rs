@@ -99,7 +99,7 @@ pub(crate) fn spawn_peer_cleanup(
 
 /// Coordinator-side per-member control reader. Continuously accepts control
 /// streams from one member and processes `MeshHello`s as live create-or-update
-/// signals — the only path by which a member's hostname (or device cert) reaches
+/// signals: the only path by which a member's hostname (or device cert) reaches
 /// the coordinator after the initial handshake. On a hostname that differs from
 /// the stored one, the coordinator resolves collisions authoritatively, updates
 /// the roster + DNS, republishes the group blob, and broadcasts `MemberSync` so
@@ -231,7 +231,7 @@ pub(crate) fn spawn_coordinator_control_reader(
             };
 
             // Verify and store device cert if present, unless the device key is
-            // nullified on this network (`ray unpair`) — a nullified cert is not
+            // nullified on this network (`ray unpair`), a nullified cert is not
             // recorded as a paired device, so it stops resolving to the user's
             // identity.
             let cert_ok = device_cert.as_ref().is_some_and(|cert| {
@@ -320,7 +320,7 @@ pub(crate) fn spawn_coordinator_control_reader(
 /// Send `msg` to each coordinator peer (per [`gossip_targets`]) that has a live
 /// connection on `network`. Best-effort: a target without a live connection is
 /// skipped (it will reconverge invite state from a future share/redeem or, for
-/// reusable keys, the signed blob). Never carries the raw secret — only its hash.
+/// reusable keys, the signed blob). Never carries the raw secret, only its hash.
 pub(crate) async fn gossip_to_coordinators(
     peers: &PeerTable,
     network: &str,

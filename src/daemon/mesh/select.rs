@@ -63,7 +63,7 @@ pub(crate) fn pick_first_welcome(outcomes: &[DialOutcome]) -> (usize, bool) {
 }
 
 /// Last-known roster from persisted config. Used only as a fallback when the
-/// signed pkarr record is briefly unreachable during a reconnect — never trusts
+/// signed pkarr record is briefly unreachable during a reconnect, never trusts
 /// peer-supplied membership.
 pub(crate) fn persisted_roster(network_name: &str) -> Vec<Member> {
     config::load()
@@ -88,7 +88,7 @@ pub(crate) fn persisted_roster(network_name: &str) -> Vec<Member> {
 }
 
 /// Rebuild a network's DNS entries from its member roster (the single source of
-/// truth) and persist our own — possibly coordinator-corrected — hostname. Called
+/// truth) and persist our own (possibly coordinator-corrected) hostname. Called
 /// whenever a roster update arrives so renames, joins, and departures all reflect
 /// in `*.ray` resolution immediately.
 /// Pick which connection path to report in `ray status`. Prefers the path iroh

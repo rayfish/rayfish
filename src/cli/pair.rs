@@ -10,7 +10,7 @@ pub(crate) async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>)
         }
         // `rayfish pair list`
         (Some(PairAction::List), _) => ipc_pair_list().await,
-        // `rayfish pair` — start pairing on primary device
+        // `rayfish pair`: start pairing on primary device
         (None, None) => ipc_pair_start().await,
         // `rayfish pair backup`
         (
@@ -277,7 +277,7 @@ pub(crate) fn cmd_pair_restore(
     }
 
     // Write the restored key into the shared config tree (Linux: /etc/rayfish,
-    // root-owned — this command may need sudo there).
+    // root-owned, this command may need sudo there).
     let key_path = config::config_dir()?.join("secret_key");
     config::write_file(&key_path, &key.to_bytes(), true)?;
 

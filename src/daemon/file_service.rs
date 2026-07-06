@@ -192,7 +192,7 @@ impl FileService {
                                 }
                                 // Flush before the connection drops: finish the stream and wait
                                 // (briefly) for the joiner to close. Returning here drops `conn`,
-                                // which RSTs the stream — without this the joiner often sees
+                                // which RSTs the stream: without this the joiner often sees
                                 // "connection lost" and never receives the cert even though we
                                 // logged success below.
                                 let _ = send.finish();

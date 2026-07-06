@@ -3,7 +3,7 @@
 //! inherit the imports and private types declared in `daemon/mod.rs`.
 //!
 //! These live under `mesh/` (rather than as siblings of `daemon/mod.rs`) so the
-//! module names can be the clean domain names — `firewall`, `connect`, …  —
+//! module names can be the clean domain names (`firewall`, `connect`, …)
 //! without colliding with the `use crate::{firewall, dns, …}` aliases that
 //! `daemon/mod.rs` brings into its own namespace. The modules export no names of
 //! their own (only `impl MeshManager` blocks), so no re-export is needed; the

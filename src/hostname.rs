@@ -24,7 +24,7 @@ pub fn is_valid_hostname(name: &str) -> bool {
 ///
 /// `authoritative` names come from an invite binding (`ray invite --hostname`):
 /// they are assigned verbatim, and a clash with a *different* identity is
-/// rejected — no silent rename — so no peer can claim another's name to inherit
+/// rejected (no silent rename) so no peer can claim another's name to inherit
 /// its suggested firewall rules. A joiner-chosen (non-authoritative) name keeps
 /// collision-resolution (`alice` → `alice-1` → …).
 ///
@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn admission_authoritative_rejects_collision() {
         // An invite-bound (authoritative) name already taken by someone else is
-        // rejected — no silent rename — so a peer can't steal another's name.
+        // rejected (no silent rename) so a peer can't steal another's name.
         assert_eq!(
             admission_hostname("alice", &["alice"], true),
             Err("alice".to_string())

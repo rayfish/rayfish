@@ -287,7 +287,7 @@ impl MeshManager {
 
         // Full mesh: proactively dial every known member in the background so a
         // restarting coordinator/co-coordinator reconnects to peers that haven't
-        // (yet) dialed in — without blocking restore on peer connectivity. Without
+        // (yet) dialed in, without blocking restore on peer connectivity. Without
         // the dial, a co-coordinator that comes back up only learns about peers
         // that connect *to it*, so two co-coordinators restarting together each
         // show the other offline until one is disturbed. The accept handler is
@@ -603,7 +603,7 @@ impl MeshManager {
         }
 
         // Barrier: wait until every saved coordinator network has registered (its
-        // local restore — roster + accept handler — is done) before returning, so
+        // local restore (roster + accept handler) is done) before returning, so
         // `run_daemon` opens the IPC server only once these networks are visible to
         // `ray status`. Peer dialing runs in the background (see
         // `restore_coordinator_network`), so this never blocks on connectivity;
@@ -695,7 +695,7 @@ impl MeshManager {
     }
 
     /// Activate the VPN: bring the TUN interface up, configure system DNS.
-    /// Idempotent — a no-op if already active. Runs entirely inside the
+    /// Idempotent: a no-op if already active. Runs entirely inside the
     /// (root) daemon, so the IPC client needs no privileges.
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// bring the data plane up (mark active, configure Magic DNS). On Android the

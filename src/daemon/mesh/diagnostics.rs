@@ -173,7 +173,7 @@ impl MeshManager {
     /// daemon-side because the log files are root-owned; the resulting bundle is
     /// chowned to the calling user so an unprivileged `ray report` can attach it.
     ///
-    /// Sanitization: the bundle is built only from already-public material — the
+    /// Sanitization: the bundle is built only from already-public material: the
     /// `StatusResponse` (which never carries secret keys), counters, and the log
     /// files. It never touches `secret_key` or `network_secret_key`.
     pub(crate) fn build_report(&self, peer_cred: Option<(u32, u32)>) -> IpcMessage {

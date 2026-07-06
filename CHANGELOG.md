@@ -152,6 +152,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An unpaired device now removes itself even if it missed the live signal**: a
+  device no longer relies only on the best-effort "you were unpaired" message. When
+  it reconverges the signed membership record (on startup, reconnect, or the
+  periodic refresh) and finds its own certificate on the deny-list, it deletes the
+  certificate and leaves every network on its own. On Android this also stops the
+  app from still showing the device as paired after the fact.
 - **Peers now disconnect from an unpaired device right away**: after `ray unpair`
   (or a device unpairing itself), other peers could stay connected to it for a
   while. The unpaired device now tears itself out of the mesh (leaves its networks)

@@ -38,7 +38,7 @@ impl Resolution {
     }
 }
 
-/// Run the picker over `rules`. Returns `None` if the user aborted (Ctrl-C) — no
+/// Run the picker over `rules`. Returns `None` if the user aborted (Ctrl-C): no
 /// changes should be sent. Returns an empty resolution if the user quit without
 /// deciding anything.
 pub fn run(network: &str, rules: &[FirewallRuleView]) -> Result<Option<Resolution>> {

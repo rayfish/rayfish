@@ -4,8 +4,8 @@
 //!
 //! Each submodule opens with `use crate::*;` to inherit the crate-root imports
 //! and helpers, and this module flattens them back out with `pub use <m>::*;`.
-//! `main.rs` then does `use cli::*;`, so every handler — in root or any
-//! submodule — resolves the others through the crate-root namespace. Submodules
+//! `main.rs` then does `use cli::*;`, so every handler (in root or any
+//! submodule) resolves the others through the crate-root namespace. Submodules
 //! are kept private (`mod`, not `pub mod`) so only their *contents* are
 //! re-exported, avoiding a name clash with the `use rayfish::{firewall, …}`
 //! aliases in the crate root.

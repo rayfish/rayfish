@@ -5,8 +5,8 @@ use super::super::*;
 
 /// Upper bound on a single proactive full-mesh dial in `dial_all_members`. An
 /// offline peer's `connect` fails on its own (fast when it has no fresh
-/// discovery record, but up to iroh's internal handshake timeout — tens of
-/// seconds — when a stale record still points at it). We cap it so a
+/// discovery record, but up to iroh's internal handshake timeout (tens of
+/// seconds) when a stale record still points at it). We cap it so a
 /// restart/reconnect never blocks that long on a dead peer: the dial is
 /// best-effort and the peer's own reconnect loop re-establishes the link once it
 /// comes back online.
@@ -56,7 +56,7 @@ impl MeshManager {
     /// Refresh the network's blob snapshot, store its bytes in the local blob
     /// store, and publish the network-key-signed pkarr record (blob hash + this
     /// endpoint as the seed peer). Shared by network creation and coordinator
-    /// restore — both seal a freshly built `NetworkState` and announce it.
+    /// restore: both seal a freshly built `NetworkState` and announce it.
     pub(crate) async fn seal_and_publish(
         &self,
         net_state: &mut NetworkState,
@@ -181,7 +181,7 @@ impl MeshManager {
     /// `direct` marks an auto-minted 2-peer `ray connect` network (persisted so
     /// `ray status` can tag it). `pre_approve` adds a peer to the `ApprovedList`
     /// before the blob is signed/published, so the named peer can be welcomed
-    /// without a separate `ray accept` round-trip — used by `approve_connection`.
+    /// without a separate `ray accept` round-trip, used by `approve_connection`.
     /// Build the initial [`NetworkState`] for a freshly created network: the
     /// creator as sole coordinator, plus any `pre_approve` peer (a `ray connect`
     /// requester) admitted up front so the published blob already carries the
@@ -500,6 +500,22 @@ impl MeshManager {
 
         let data = self.resolve_and_fetch_blob(net_pubkey).await?;
 
+        // If our own primary has nullified this device in the signed blob
+        // (`ray unpair`), tear ourselves out instead of trying (and failing) to
+        // join. This is the reliable teardown path when the device was offline at
+        // unpair time (so it never got `ControlMsg::Unpaired`) and the coordinator
+        // now rejects its cert at the mesh handshake: the blob is fetched from the
+        // record's seed peers, needs no mesh admission, and this runs on every
+        // startup restore + reconnect. Hand off to the daemon loop, which runs
+        // `unpair_self` (delete the cert + leave every network).
+        if let Some(cert) = self.current_device_cert()
+            && self_is_nullified(&cert, &data.members, &data.nullifiers)
+        {
+            tracing::warn!(network = %network_key, "this device is nullified by its primary in the signed blob; unpairing self");
+            let _ = self.self_unpair_tx.try_send(());
+            anyhow::bail!("this device has been unpaired by its primary");
+        }
+
         let alpn = transport::network_alpn(&net_pubkey);
         let my_ip = self.identity.local_ip();
         // Use coordinator's network name from GroupBlob, or user alias, or truncated key as fallback
@@ -531,7 +547,7 @@ impl MeshManager {
         // One invite-ledger lock for this network, shared between the join's
         // control listener (which may handle InviteShare/InviteUsed once this
         // node is promoted to co-coordinator) and the coordinator handler we may
-        // register below — so all ledger access stays serialized.
+        // register below, so all ledger access stays serialized.
         let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
 
         let ctx = JoinContext {
@@ -551,7 +567,7 @@ impl MeshManager {
         // blob's dial order (minter first) until one welcomes us; a reconnect/
         // restore uses the legacy single-coordinator handshake where the
         // coordinator speaks first. Either may return `None` (closed network,
-        // queued for `ray accept`) — propagate that to the caller as `Pending`.
+        // queued for `ray accept`), propagate that to the caller as `Pending`.
         let established = if initial {
             self.dial_fresh_join(&ctx, &data).await?
         } else {
@@ -623,7 +639,7 @@ impl MeshManager {
         let mut order = coordinator_dial_order(minter, &data.members, my_id);
         // An explicitly-provided coordinator (from an invite, or the primary we
         // just paired with) is a trusted dial target even if the fetched blob's
-        // roster does not flag it `is_coordinator` — a stale roster must not
+        // roster does not flag it `is_coordinator`: a stale roster must not
         // strand the join. Try it first.
         if let Some(coord) = ctx.coordinator
             && coord != my_id
@@ -680,7 +696,7 @@ impl MeshManager {
                     }));
                 }
                 Ok(JoinResult::Pending) => {
-                    // This coordinator queued the request — don't try the next;
+                    // This coordinator queued the request, don't try the next;
                     // let the caller retry with backoff until accepted.
                     abort_join_tasks(&cancel, tasks);
                     return Ok(None);
@@ -923,7 +939,7 @@ impl MeshManager {
 
         // A node that already holds the network secret key (e.g. a
         // co-coordinator joining after a config-only restore) should run as
-        // Coordinator so it can admit future peers immediately — even though
+        // Coordinator so it can admit future peers immediately, even though
         // it arrived here via join rather than restore.
         let held_key = state.read().unwrap().network_secret_key.clone();
         match role_for_key_holder(held_key.is_some()) {
@@ -1041,7 +1057,7 @@ impl MeshManager {
     /// Fetch the authoritative GroupBlob for a network we coordinate, used to
     /// restore the roster across a daemon restart. Resolves the pkarr record to
     /// get the blob hash, reads the bytes back from the local blob store (where
-    /// we stored them before publishing — no network round-trip), and verifies +
+    /// we stored them before publishing, no network round-trip), and verifies +
     /// decodes. Falls back to fetching from a seed peer if the local store
     /// doesn't have them (e.g. blobs dir was wiped). Returns an error if the DHT
     /// is unreachable, so the caller can fall back to the (possibly stale)

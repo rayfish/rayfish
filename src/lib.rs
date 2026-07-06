@@ -1,4 +1,4 @@
-//! Internal library crate for the `ray` binary. **Not a stable public API** —
+//! Internal library crate for the `ray` binary. **Not a stable public API**,
 //! exposed only so Criterion benchmarks (see `benches/`) and integration tests
 //! can exercise the internal data path (the hot forwarding loop, firewall
 //! evaluation, packet parsing) without going through the binary. No semver

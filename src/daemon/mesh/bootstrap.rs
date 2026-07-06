@@ -76,7 +76,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // Close the iroh endpoint before returning. Dropping it on return logs
     // "Endpoint dropped without calling `Endpoint::close`. Aborting
     // ungracefully." and can leave the process lingering until the service
-    // manager escalates to SIGKILL — which delays the relaunch on
+    // manager escalates to SIGKILL, which delays the relaunch on
     // `ray restart`/`ray update` past the client's reachability probe. Closing
     // it here lets QUIC connections terminate cleanly and the process exit
     // promptly so the new daemon comes up fast.
@@ -87,8 +87,8 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 
 /// Construct all always-on daemon infrastructure: identity, iroh endpoint, blob
 /// store, TUN device, forwarding loop, DNS resolver, mDNS discovery, protocol
-/// router, and metrics server. Returns the shared [`MeshManager`] — still on
-/// standby, so the caller is expected to run [`MeshManager::activate`] — and the
+/// router, and metrics server. Returns the shared [`MeshManager`] (still on
+/// standby, so the caller is expected to run [`MeshManager::activate`]) and the
 /// metrics-server guard, which must outlive the process.
 /// The ALPNs the endpoint advertises at boot: one per saved network plus the
 /// network-independent blobs / file-transfer / pairing / connect ALPNs. A
@@ -120,7 +120,48 @@ pub async fn build_headless() -> Result<Arc<MeshManager>> {
     let daemon = build_daemon(token, stats).await?;
     // Bring the saved networks' control plane up, matching `run_daemon`.
     daemon.connect_all_networks().await;
+    // Desktop drives the promote/self-unpair/reauth hand-off channels from
+    // `serve_ipc`; a headless embedder (Android) has no IPC loop, so drain them
+    // here. Without this a control reader's or join path's signal (e.g. this
+    // device discovering it was nullified by its primary) is sent but never
+    // acted on, so `unpair_self` never runs and the stale cert lingers.
+    spawn_headless_signal_drain(daemon.clone());
     Ok(daemon)
+}
+
+/// Drain the promote/self-unpair/reauth hand-off channels on an embedder that has
+/// no `serve_ipc` loop. Mirrors the matching arms in [`serve_ipc`]; the channels
+/// are stashed on the daemon by `build_daemon`, so take them here exactly once.
+fn spawn_headless_signal_drain(daemon: Arc<MeshManager>) {
+    let mut promote_rx = daemon
+        .promote_rx
+        .lock()
+        .unwrap()
+        .take()
+        .expect("promote_rx present after build");
+    let mut self_unpair_rx = daemon
+        .self_unpair_rx
+        .lock()
+        .unwrap()
+        .take()
+        .expect("self_unpair_rx present after build");
+    let mut reauth_rx = daemon
+        .reauth_rx
+        .lock()
+        .unwrap()
+        .take()
+        .expect("reauth_rx present after build");
+    let token = daemon.shutdown_token.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                Some(net) = promote_rx.recv() => { daemon.promote_to_coordinator(&net).await; }
+                Some(()) = self_unpair_rx.recv() => { let _ = daemon.unpair_self().await; }
+                Some(dev) = reauth_rx.recv() => { daemon.reauth_device(dev).await; }
+            }
+        }
+    });
 }
 
 /// Build all always-on daemon infrastructure WITHOUT a packet interface or the
@@ -458,9 +499,9 @@ async fn serve_ipc(
 }
 
 /// Make the IPC socket connectable by any local user. Authority is not granted
-/// by reaching the socket — every mutating request is authorized per-connection
+/// by reaching the socket: every mutating request is authorized per-connection
 /// in `check_authorized` via `SO_PEERCRED` (root or the configured operator
-/// UID), Tailscale's model — so the file mode only has to permit the connect().
+/// UID), Tailscale's model, so the file mode only has to permit the connect().
 fn set_socket_permissions(path: &std::path::Path) {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -539,7 +580,7 @@ fn spawn_auto_update(token: CancellationToken) -> tokio::task::JoinHandle<()> {
 
 /// One auto-update cycle: check for a newer stable release and, if found and not
 /// backed off, swap the binary and trigger a self-restart. `Ok(())` means nothing
-/// needed doing (or the swap+restart was scheduled — the daemon is torn down and
+/// needed doing (or the swap+restart was scheduled, the daemon is torn down and
 /// relaunched onto the new binary shortly after).
 #[cfg(feature = "desktop")]
 async fn auto_update_once() -> Result<()> {
