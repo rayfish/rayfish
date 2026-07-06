@@ -18,11 +18,23 @@ pub(crate) struct NetworkRegistry {
     /// `MeshManager` during the transition (same `Arc`), so a method can move to
     /// the registry without splitting the map.
     networks: Arc<DashMap<String, NetworkHandle>>,
+    /// Foundation handles (endpoint + blob store) for reseal/publish.
+    transport: Arc<Transport>,
+    /// Live peer routing table, for severing / notifying peers on roster change.
+    peers: PeerTable,
 }
 
 impl NetworkRegistry {
-    pub(crate) fn new(networks: Arc<DashMap<String, NetworkHandle>>) -> Self {
-        Self { networks }
+    pub(crate) fn new(
+        networks: Arc<DashMap<String, NetworkHandle>>,
+        transport: Arc<Transport>,
+        peers: PeerTable,
+    ) -> Self {
+        Self {
+            networks,
+            transport,
+            peers,
+        }
     }
 
     /// Whether `identity` is a current member of at least one network that has
@@ -48,5 +60,51 @@ impl NetworkRegistry {
             }
         }
         false
+    }
+
+    /// Clear a re-paired device's nullifier (the inverse of `unpair`). Invoked
+    /// directly by the pairing accept arm when it re-authorizes a device: drops
+    /// it from the durable `revoked_devices` seed and from every coordinated
+    /// network's blob nullifier set, republishing so the device's fresh cert is
+    /// honored mesh wide again. Non-coordinated networks clear on their own
+    /// coordinator's next reseal. Best-effort; a persist/publish failure is
+    /// logged, not surfaced.
+    pub(crate) async fn reauth_device(&self, device: EndpointId) {
+        // Drop from the durable nullifier seed so a later reseal won't re-add it.
+        let mut cfg = config::load().unwrap_or_default();
+        let hex = device.to_string();
+        if let Some(pos) = cfg.revoked_devices.iter().position(|d| *d == hex) {
+            cfg.revoked_devices.remove(pos);
+            if let Err(e) = config::save_settings(&cfg) {
+                tracing::warn!(error = %e, "reauth: failed to clear device from nullifier seed");
+            }
+        }
+        // Collect coordinated networks (clone the handles) before awaiting.
+        let mut nets: Vec<(String, SharedNetworkState, Option<Arc<Notify>>)> = Vec::new();
+        for entry in self.networks.iter() {
+            if entry.value().state.read().unwrap().network_secret_key.is_some() {
+                nets.push((
+                    entry.key().clone(),
+                    entry.value().state.clone(),
+                    entry.value().dht_notify.clone(),
+                ));
+            }
+        }
+        let mut changed = false;
+        for (net, state, dht_notify) in nets {
+            let removed = {
+                let mut s = state.write().unwrap();
+                s.nullifiers.remove(&device)
+            };
+            if removed {
+                changed = true;
+                update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
+                let net_pubkey = state.read().unwrap().network_public_key;
+                broadcast_member_sync(&self.peers, net_pubkey, &net, None).await;
+            }
+        }
+        if changed {
+            tracing::info!(device = %device.fmt_short(), "re-authorized device (cleared nullifier)");
+        }
     }
 }
