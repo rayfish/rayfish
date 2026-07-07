@@ -483,6 +483,12 @@ impl PeerTable {
             if e.networks.is_empty() {
                 removed.push((*ip, e.conn.clone()));
                 self.by_id.remove(&e.endpoint_id);
+                // A peer losing its last shared network is a full disconnect, so
+                // audit it here too (matching `remove`/`remove_peer_from_network`);
+                // the audit contract is one `disconnect` per peer that fully drops.
+                if let Some(audit) = &self.audit {
+                    audit.log_disconnect(*ip, &e.endpoint_id.to_string());
+                }
                 false
             } else {
                 true
