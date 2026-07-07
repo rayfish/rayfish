@@ -182,11 +182,11 @@ impl PeerTable {
         let net = SmolStr::new(network);
         let stable = conn.stable_id();
         // Whether the peer had no prior entry at all (drives the audit connect
-        // event) and whether the stored connection just became current (drives the
-        // single data-reader spawn in `register_peer_conn`). Both are read from the
-        // entry's state *before* this add mutates it: an `or_insert_with` seeded
-        // with the incoming connection would report "unchanged" on a brand-new peer
-        // and the reader would never start (100% inbound loss).
+        // event) and whether the stored connection just became current (tells the
+        // dial side to drive a fresh control demux, which owns the data reader).
+        // Both are read from the entry's state *before* this add mutates it: an
+        // `or_insert_with` seeded with the incoming connection would report
+        // "unchanged" on a brand-new peer and the demux would never start.
         let first_ever;
         let conn_changed;
         {
@@ -672,9 +672,10 @@ mod tests {
     #[tokio::test]
     async fn add_reports_first_connection_as_new_so_reader_spawns() {
         // Regression: the *first* registration of a brand-new peer must return
-        // `true` (connection changed) so `register_peer_conn` spawns the single
-        // data reader. The old placeholder-seeded check returned `false` here,
-        // leaving the peer with no reader -> 100% inbound loss.
+        // `true` (connection changed) so the dial side drives a fresh control
+        // demux (which spawns the single data reader). The old placeholder-seeded
+        // check returned `false` here, leaving the peer with no reader -> 100%
+        // inbound loss.
         let (_srv, _cli, conn, _client_side) = connected_pair().await;
         let peer = conn.remote_id();
         let ip = crate::membership::derive_ip(&peer);
@@ -740,11 +741,9 @@ mod tests {
         peers.add_inbound_handle_by_id(&s_id, 1, SmolStr::new("net"));
 
         let (tun_tx, mut tun_rx) = mpsc::channel::<Bytes>(8);
-        let (disc_tx, _disc_rx) = mpsc::channel(8);
         let ctx = ForwardCtx {
             firewall: SharedFirewall::new(FirewallConfig::default()),
             tun_tx: Arc::new(arc_swap::ArcSwap::new(Arc::new(tun_tx))),
-            disconnect_tx: disc_tx,
             token: CancellationToken::new(),
             stats: Arc::new(ForwardMetrics::default()),
             device_user_map: DeviceUserMap::new(),
@@ -784,9 +783,10 @@ mod tests {
     #[test]
     fn connection_is_new_starts_reader_for_brand_new_peer() {
         // A peer with no prior entry: `add` must report the connection as new so
-        // `register_peer_conn` spawns the data reader. Regression for the bug where
-        // a placeholder seeded with the incoming connection made a first-ever add
-        // report "unchanged", leaving the peer with no reader and 100% inbound loss.
+        // the dial side drives a fresh control demux (which spawns the data
+        // reader). Regression for the bug where a placeholder seeded with the
+        // incoming connection made a first-ever add report "unchanged", leaving
+        // the peer with no reader and 100% inbound loss.
         assert!(connection_is_new(None, 7));
     }
 

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use iroh::EndpointId;
-use iroh::endpoint::{Connection, ConnectionError, VarInt};
+use iroh::endpoint::Connection;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -284,7 +284,6 @@ pub struct ForwardCtx {
     /// the new writer, so a reader spawned during the first `up()` keeps
     /// forwarding after the next one. See [`DaemonState::attach_tun`].
     pub tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
-    pub disconnect_tx: mpsc::Sender<DisconnectEvent>,
     pub token: CancellationToken,
     pub stats: Arc<ForwardMetrics>,
     pub device_user_map: DeviceUserMap,
@@ -428,8 +427,11 @@ pub async fn run_mesh<R: crate::tun::TunRead>(
 }
 
 /// Spawns a task that reads QUIC datagrams from a single peer connection and
-/// forwards them to the TUN writer via `tun_tx`. On connection loss, sends a
-/// [`DisconnectEvent`] and exits.
+/// forwards them to the TUN writer via `tun_tx`. On connection loss (or
+/// cancellation) it just exits; the owning [`MeshConnection`] observes the same
+/// close and reports the [`DisconnectEvent`] to the supervisor.
+///
+/// [`MeshConnection`]: crate::daemon::MeshConnection
 pub fn spawn_peer_reader(
     conn: Connection,
     peer_id: EndpointId,
@@ -439,7 +441,6 @@ pub fn spawn_peer_reader(
     let ForwardCtx {
         firewall,
         tun_tx,
-        disconnect_tx,
         token,
         stats,
         device_user_map,
@@ -466,28 +467,10 @@ pub fn spawn_peer_reader(
                 result = conn.read_datagram() => match result {
                     Ok(d) => d,
                     Err(e) => {
-                        let intentional = matches!(
-                            &e,
-                            ConnectionError::ApplicationClosed(ac)
-                                if ac.error_code == VarInt::from_u32(LEAVE_CODE)
-                                    || ac.error_code == VarInt::from_u32(KICK_CODE)
-                        );
-                        // The peer's collision-aware v4 comes from its roster
-                        // entry; fall back to the index-0 derivation if the peer
-                        // was never fully registered (dropped mid-handshake).
-                        let peer_ip = peers
-                            .v4_for_id(&peer_id)
-                            .unwrap_or_else(|| crate::membership::derive_ip(&peer_id));
-                        tracing::warn!(peer = %peer_id.fmt_short(), ip = %peer_ip, error = %e, intentional, "peer connection lost");
-                        let _ = disconnect_tx
-                            .send(DisconnectEvent {
-                                endpoint_id: peer_id,
-                                ip: peer_ip,
-                                ipv6: peer_ipv6,
-                                intentional,
-                                conn_stable_id: Some(conn.stable_id()),
-                            })
-                            .await;
+                        // Connection closed. The owning `MeshConnection` observes
+                        // the same close and reports the disconnect to the
+                        // supervisor; the reader just stops forwarding.
+                        tracing::debug!(peer = %peer_id.fmt_short(), error = %e, "peer datagram reader stopped");
                         return;
                     }
                 },

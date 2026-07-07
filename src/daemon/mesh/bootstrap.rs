@@ -8,6 +8,8 @@
 //! (a descendant of `daemon`) so they can still construct `Daemon` and reach
 //! its private fields without widening visibility.
 
+use std::sync::Mutex;
+
 use super::super::*;
 
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
@@ -28,9 +30,10 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     #[cfg(not(target_os = "android"))]
     {
         let my_ipv6 = derive_ipv6(&daemon.transport.identity.local_identity());
-        let (tun_reader, tun_writer, tun_name) = tun::create(daemon.transport.identity.local_ip(), my_ipv6)
-            .await
-            .context("failed to create TUN device")?;
+        let (tun_reader, tun_writer, tun_name) =
+            tun::create(daemon.transport.identity.local_ip(), my_ipv6)
+                .await
+                .context("failed to create TUN device")?;
         daemon.tun_name.store(Arc::new(tun_name));
         daemon.attach_tun(tun_reader, tun_writer).await;
     }
@@ -132,10 +135,7 @@ pub async fn build_headless() -> Result<Arc<Daemon>> {
 /// receiver and metrics-server guard are stashed on the state for the caller.
 ///
 /// Shared by [`run_daemon`] (desktop) and [`build_headless`] (embedders).
-async fn build_daemon(
-    token: CancellationToken,
-    stats: Arc<ForwardMetrics>,
-) -> Result<Arc<Daemon>> {
+async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<Arc<Daemon>> {
     // Relocate a pre-/etc config tree into /etc/rayfish (Linux upgrade path)
     // before anything reads identity or config. No-op on macOS / once migrated.
     config::migrate_location();
@@ -324,8 +324,8 @@ async fn build_daemon(
         mdns_enabled,
         auto_update,
         tun_name,
-        tun_tasks: std::sync::Mutex::new(None),
-        _metrics_server: std::sync::Mutex::new(None),
+        tun_tasks: Mutex::new(None),
+        _metrics_server: Mutex::new(None),
         files,
         connect,
         device_cert,
@@ -333,8 +333,8 @@ async fn build_daemon(
         active: active.clone(),
         #[cfg(feature = "desktop")]
         ssh_authz: crate::ssh::new_authz(),
-        ssh_token: std::sync::Mutex::new(None),
-        disconnect_rx: std::sync::Mutex::new(Some(disconnect_rx)),
+        ssh_token: Mutex::new(None),
+        disconnect_rx: Mutex::new(Some(disconnect_rx)),
     });
 
     // Install the daemon-wide mesh dispatch context so the per-connection demux
@@ -360,8 +360,13 @@ async fn build_daemon(
     // nullifier set (`ray unpair`); no separate pkarr record or background
     // publisher/poller is needed. Coordinated networks seed their nullifiers from
     // the persisted `revoked_devices` set at seal time (see `seal_and_publish`).
-    let metrics_server =
-        spawn_metrics_server(stats, daemon.registry.peers.clone(), &daemon.transport.endpoint, token).await;
+    let metrics_server = spawn_metrics_server(
+        stats,
+        daemon.registry.peers.clone(),
+        &daemon.transport.endpoint,
+        token,
+    )
+    .await;
     // Keep the metrics-server guard alive for the daemon's whole lifetime.
     *daemon._metrics_server.lock().unwrap() = metrics_server;
 

@@ -42,9 +42,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
@@ -114,6 +113,10 @@ pub(crate) use foundation::Transport;
 mod connection_manager;
 pub(crate) use connection_manager::{ConnectionManager, MeshDispatch};
 
+// One live mesh connection + its control-plane demux loop, built by the manager.
+mod mesh_connection;
+pub(crate) use mesh_connection::MeshConnection;
+
 // The service that owns the set of active networks (M5 migration seam).
 mod network_registry;
 pub(crate) use network_registry::NetworkRegistry;
@@ -161,11 +164,12 @@ pub(crate) struct MeshCtx {
     /// and re-form the link. The supervisor consumes an entry here to skip that
     /// one reconnect. Populated in [`reconverge_and_apply`] and the kick handler.
     pruned_peers: Arc<DashSet<(String, EndpointId)>>,
-    /// Daemon-wide disconnect channel. Every per-connection data reader
-    /// (`forward::spawn_peer_reader`) reports its peer's drop here, and a single
-    /// [`Daemon::run_connection_supervisor`] consumes it. Under one mesh
+    /// Daemon-wide disconnect channel. Every [`MeshConnection`] reports its peer's
+    /// drop here when its demux loop ends, and a single
+    /// [`NetworkRegistry::run_connection_supervisor`] consumes it. Under one mesh
     /// connection per identity a drop tears the peer down across every shared
-    /// network at once, so this is node-wide rather than per-network.
+    /// network at once, so this is node-wide rather than per-network. The channel
+    /// keeps disconnect handling serial (one check-then-act at a time).
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     /// The network-owning service. Control readers reach it through the ctx to
     /// run network ops directly (e.g. `unpair_self` on a `ControlMsg::Unpaired` or
@@ -175,43 +179,34 @@ pub(crate) struct MeshCtx {
 
 impl MeshCtx {
     /// Build the per-peer data-plane bundle for `forward::spawn_peer_reader`,
-    /// combining this context's shared handles with the caller's `token`. The
-    /// disconnect sender is the daemon-wide one carried on the context.
-    fn forward_ctx(&self, token: CancellationToken) -> forward::ForwardCtx {
+    /// combining this context's shared handles with the caller's `token`. Called
+    /// by [`MeshConnection`], which owns the reader for the connection's lifetime.
+    pub(crate) fn forward_ctx(&self, token: CancellationToken) -> forward::ForwardCtx {
         forward::ForwardCtx {
             firewall: self.firewall.clone(),
             tun_tx: self.tun_tx.clone(),
-            disconnect_tx: self.disconnect_tx.clone(),
             token,
             stats: self.stats.clone(),
             device_user_map: self.device_user_map.clone(),
         }
     }
 
-    /// Register a peer's connection for `network` in the peer table and, if this
-    /// is the connection's first registration (any network), start its single
-    /// data-plane reader. One reader serves every network the connection carries,
-    /// so subsequent networks over the same connection only add a route. Returns
-    /// whether the reader was started (i.e. the stored connection is new).
+    /// Register a peer's connection for `network` in the peer table: add its route
+    /// (and, on the first shared network, its audit connect event). The
+    /// connection's single data reader is not started here; [`MeshConnection`] owns
+    /// it for the connection's lifetime. Returns whether the stored connection is
+    /// new (the first shared network, or a reconnect that replaced a different
+    /// connection), which the dial side uses to decide whether to drive a fresh
+    /// control demux.
     pub(crate) fn register_peer_conn(
         &self,
         conn: &Connection,
         peer_id: EndpointId,
         ip: Ipv4Addr,
         network: &str,
-        token: &CancellationToken,
     ) -> bool {
         let ipv6 = derive_ipv6(&peer_id);
-        let conn_changed = self.peers.add(ip, ipv6, conn.clone(), peer_id, network);
-        if conn_changed {
-            forward::spawn_peer_reader(
-                conn.clone(),
-                peer_id,
-                self.peers.clone(),
-                self.forward_ctx(token.clone()),
-            );
-        }
-        conn_changed
+        self.peers.add(ip, ipv6, conn.clone(), peer_id, network)
     }
 }
 
@@ -496,7 +491,7 @@ pub struct Daemon {
     /// [`run_daemon`] to drive the single connection supervisor (now on the
     /// registry). The sender lives on [`NetworkRegistry`]; only the parked
     /// receiver remains here for bootstrap to take.
-    disconnect_rx: std::sync::Mutex<Option<mpsc::Receiver<forward::DisconnectEvent>>>,
+    disconnect_rx: Mutex<Option<mpsc::Receiver<forward::DisconnectEvent>>>,
 }
 
 /// Map key-holding status to a [`NetworkRole`].
@@ -1333,7 +1328,6 @@ mod accept_handler_tests {
             ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store, registry),
             network_name: "test-net".to_string(),
             state: make_network_state(),
-            token: CancellationToken::new(),
             dht_notify: None,
             invite_lock: Arc::new(tokio::sync::Mutex::new(())),
         }))

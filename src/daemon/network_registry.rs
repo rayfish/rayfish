@@ -426,7 +426,6 @@ impl NetworkRegistry {
             invite_lock,
             Some(dht_notify),
             net_public_key,
-            cancel,
         );
         self.refresh_search_domains().await;
 
@@ -733,7 +732,6 @@ impl NetworkRegistry {
         invite_lock: Arc<tokio::sync::Mutex<()>>,
         dht_notify: Option<Arc<Notify>>,
         network_key: EndpointId,
-        cancel: CancellationToken,
     ) {
         self.conn.register(
             network_key,
@@ -741,7 +739,6 @@ impl NetworkRegistry {
                 ctx: ctx.clone(),
                 network_name: network.to_string(),
                 state,
-                token: cancel,
                 dht_notify,
                 invite_lock,
             })),
@@ -775,7 +772,7 @@ impl NetworkRegistry {
             )
         }; // DashMap ref dropped before the registration below.
         self.register_coordinator_handler(
-            ctx, network, parts.0, parts.1, parts.2, parts.3, parts.4,
+            ctx, network, parts.0, parts.1, parts.2, parts.3,
         );
         tracing::info!(network, "promoted to coordinator accept handler");
     }
