@@ -858,7 +858,7 @@ impl Daemon {
         self.stop_ssh();
 
         // Clone the TUN name out of the lock before awaiting (see `activate`);
-        // the DnsManager reverts system DNS and clears the TUN search domains.
+        // the DnsService reverts system DNS and clears the TUN search domains.
         let tun_name = self.tun_name.load().as_str().to_owned();
         self.dns.revert(&tun_name).await;
 
