@@ -527,7 +527,11 @@ const NETWORKS_SUBDIR: &str = "networks";
 
 /// Globals persisted to `settings.toml` (everything in [`AppConfig`] except the
 /// per-network entries, which live in their own files).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` gives every field its type-default (so `mdns_enabled` is `false`);
+/// the fresh-install default that actually ships (`mdns` on) is built at the one
+/// `load_in` site with a `mdns_enabled: true` struct-update override.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Settings {
     #[serde(default = "default_true")]
     mdns_enabled: bool,
@@ -793,23 +797,11 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         let s = std::fs::read_to_string(&settings_path).context("reading settings.toml")?;
         toml::from_str(&s).context("parsing settings.toml")?
     } else {
+        // Fresh install: mDNS discovery is on by default, everything else is the
+        // type-default.
         Settings {
             mdns_enabled: true,
-            operator_uid: None,
-            default_hostname: None,
-            contact_secret_key: None,
-            relay: ServerOverride::default(),
-            discovery_dns: ServerOverride::default(),
-            dns_upstreams: ServerOverride::default(),
-            ssh_enabled: false,
-            auto_update: false,
-            auto_update_last_target: None,
-            auto_update_last_attempt: None,
-            download_dir: None,
-            download_user: None,
-            pending_joins: Vec::new(),
-            cert_generation: 0,
-            revoked_devices: Vec::new(),
+            ..Default::default()
         }
     };
 

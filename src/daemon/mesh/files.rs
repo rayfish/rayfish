@@ -108,34 +108,14 @@ impl Daemon {
             secret: secret_arr,
             device_pubkey: self.transport.endpoint.id(),
         };
-        let request_bytes = match rmp_serde::to_vec_named(&request) {
-            Ok(b) => b,
-            Err(e) => {
-                return ipc_err(format!("failed to encode pair request: {e}"));
-            }
-        };
-        let len = (request_bytes.len() as u32).to_be_bytes();
-        if let Err(e) = send.write_all(&len).await {
-            return ipc_err(format!("failed to send pair request: {e}"));
-        }
-        if let Err(e) = send.write_all(&request_bytes).await {
+        if let Err(e) = control::send_framed(&mut send, &request).await {
             return ipc_err(format!("failed to send pair request: {e}"));
         }
 
-        // Read PairResponse
-        let mut len_buf = [0u8; 4];
-        if let Err(e) = recv.read_exact(&mut len_buf).await {
-            return ipc_err(format!("failed to read pair response: {e}"));
-        }
-        let body_len = u32::from_be_bytes(len_buf) as usize;
-        let mut body = vec![0u8; body_len];
-        if let Err(e) = recv.read_exact(&mut body).await {
-            return ipc_err(format!("failed to read pair response body: {e}"));
-        }
-        let response: control::PairMsg = match rmp_serde::from_slice(&body) {
+        let response: control::PairMsg = match control::recv_framed(&mut recv).await {
             Ok(r) => r,
             Err(e) => {
-                return ipc_err(format!("failed to decode pair response: {e}"));
+                return ipc_err(format!("failed to read pair response: {e}"));
             }
         };
 
