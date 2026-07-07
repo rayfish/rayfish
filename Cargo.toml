@@ -17,6 +17,9 @@ categories = ["network-programming", "command-line-utilities"]
 [workspace]
 members = ["ray-proto", "ray-mobile"]
 
+[workspace.metadata.release]
+publish = false
+
 # Strip debug symbols from release builds. This is what shrinks the Android
 # release .so from hundreds of MiB down to tens of MiB. Do not add
 # `panic = "abort"` here: UniFFI's generated bindings need `panic = "unwind"`
