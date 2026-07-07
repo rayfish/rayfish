@@ -76,9 +76,7 @@ impl ConnectService {
             })
             .map(|p| p.value().clone());
         let Some(req) = found else {
-            return IpcMessage::Error {
-                message: format!("no pending connection request matching '{id_prefix}'"),
-            };
+            return ipc_err(format!("no pending connection request matching '{id_prefix}'"));
         };
         let peer = req.from_endpoint;
 
@@ -132,9 +130,7 @@ impl ConnectService {
                 }
             }
             Ok(other) => other,
-            Err(e) => IpcMessage::Error {
-                message: format!("failed to create direct network: {e:#}"),
-            },
+            Err(e) => ipc_err(format!("failed to create direct network: {e:#}")),
         }
     }
 
@@ -149,31 +145,23 @@ impl ConnectService {
         let contact_pubkey = match contact_id.parse::<EndpointId>() {
             Ok(id) => id,
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("invalid contact id: {e}"),
-                };
+                return ipc_err(format!("invalid contact id: {e}"));
             }
         };
         if contact_pubkey == self.transport.contact_public {
-            return IpcMessage::Error {
-                message: "cannot connect to your own contact id".to_string(),
-            };
+            return ipc_err("cannot connect to your own contact id".to_string());
         }
         let pkarr = match dht::create_pkarr_client(&self.transport.endpoint) {
             Ok(c) => c,
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to create pkarr client: {e}"),
-                };
+                return ipc_err(format!("failed to create pkarr client: {e}"));
             }
         };
         let peer = match dht::resolve_contact(&pkarr, contact_pubkey).await {
             Ok(id) => id,
             Err(_) => {
-                return IpcMessage::Error {
-                    message: "contact offline or unknown (could not resolve contact id)"
-                        .to_string(),
-                };
+                return ipc_err("contact offline or unknown (could not resolve contact id)"
+                        .to_string());
             }
         };
         if let Some(name) = self.registry.existing_direct_network_with(&peer) {
@@ -198,18 +186,12 @@ impl ConnectService {
             }
             Ok(control::ConnectMsg::Denied { reason }) => {
                 self.outgoing_connects.remove(&peer);
-                IpcMessage::Error {
-                    message: format!("connection denied: {reason}"),
-                }
+                ipc_err(format!("connection denied: {reason}"))
             }
-            Ok(_) => IpcMessage::Error {
-                message: "unexpected response from contact".to_string(),
-            },
+            Ok(_) => ipc_err("unexpected response from contact".to_string()),
             Err(e) => {
                 self.outgoing_connects.remove(&peer);
-                IpcMessage::Error {
-                    message: format!("failed to reach contact: {e}"),
-                }
+                ipc_err(format!("failed to reach contact: {e}"))
             }
         }
     }
@@ -349,9 +331,7 @@ impl ConnectService {
                     message: format!("declined connection request '{id_prefix}'"),
                 }
             }
-            None => IpcMessage::Error {
-                message: format!("no pending connection request matching '{id_prefix}'"),
-            },
+            None => ipc_err(format!("no pending connection request matching '{id_prefix}'")),
         }
     }
 
@@ -361,16 +341,12 @@ impl ConnectService {
         let mut cfg = match config::load() {
             Ok(c) => c,
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to load config: {e}"),
-                };
+                return ipc_err(format!("failed to load config: {e}"));
             }
         };
         let secret = config::rotate_contact_secret(&mut cfg);
         if let Err(e) = config::save_settings(&cfg) {
-            return IpcMessage::Error {
-                message: format!("failed to save config: {e}"),
-            };
+            return ipc_err(format!("failed to save config: {e}"));
         }
         if self.active.load(Ordering::SeqCst)
             && let Ok(client) = dht::create_pkarr_client(&self.transport.endpoint)

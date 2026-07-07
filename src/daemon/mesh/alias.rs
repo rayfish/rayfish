@@ -13,21 +13,15 @@ impl NetworkRegistry {
         let mut net = match config::load_network(network) {
             Ok(Some(n)) => n,
             Ok(None) => {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not found"),
-                };
+                return ipc_err(format!("network '{network}' not found"));
             }
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to load network config: {e}"),
-                };
+                return ipc_err(format!("failed to load network config: {e}"));
             }
         };
         net.aliases.insert(alias.to_string(), identity.to_string());
         if let Err(e) = config::save_network(&net) {
-            return IpcMessage::Error {
-                message: format!("failed to save config: {e}"),
-            };
+            return ipc_err(format!("failed to save config: {e}"));
         }
         IpcMessage::Ok {
             message: format!("alias '{alias}' -> {identity} on '{network}'"),
@@ -40,25 +34,17 @@ impl NetworkRegistry {
         let mut net = match config::load_network(network) {
             Ok(Some(n)) => n,
             Ok(None) => {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not found"),
-                };
+                return ipc_err(format!("network '{network}' not found"));
             }
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to load network config: {e}"),
-                };
+                return ipc_err(format!("failed to load network config: {e}"));
             }
         };
         if net.aliases.remove(alias).is_none() {
-            return IpcMessage::Error {
-                message: format!("no alias '{alias}' on '{network}'"),
-            };
+            return ipc_err(format!("no alias '{alias}' on '{network}'"));
         }
         if let Err(e) = config::save_network(&net) {
-            return IpcMessage::Error {
-                message: format!("failed to save config: {e}"),
-            };
+            return ipc_err(format!("failed to save config: {e}"));
         }
         IpcMessage::Ok {
             message: format!("removed alias '{alias}' from '{network}'"),
@@ -69,12 +55,8 @@ impl NetworkRegistry {
     pub(crate) fn list_aliases(&self, network: &str) -> IpcMessage {
         match config::load_network(network) {
             Ok(Some(n)) => IpcMessage::AliasListResponse { aliases: n.aliases },
-            Ok(None) => IpcMessage::Error {
-                message: format!("network '{network}' not found"),
-            },
-            Err(e) => IpcMessage::Error {
-                message: format!("failed to load network config: {e}"),
-            },
+            Ok(None) => ipc_err(format!("network '{network}' not found")),
+            Err(e) => ipc_err(format!("failed to load network config: {e}")),
         }
     }
 }

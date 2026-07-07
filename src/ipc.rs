@@ -5,3 +5,13 @@
 //! so the daemon/CLI continue to use their original paths unchanged.
 
 pub use ray_proto::ipc::*;
+
+/// Shorthand for the ubiquitous `IpcMessage::Error { message }` reply. Lets a
+/// handler write `return ipc_err(format!("..."))` (or `... ?` via the
+/// `Result<IpcMessage, IpcMessage>` handler alias) instead of the three-line
+/// struct literal.
+pub fn ipc_err(msg: impl Into<String>) -> IpcMessage {
+    IpcMessage::Error {
+        message: msg.into(),
+    }
+}

@@ -242,9 +242,7 @@ impl Daemon {
             .unwrap_or(0);
         let path = std::path::PathBuf::from("/tmp").join(format!("rayfish-report-{ts}.tgz"));
         if let Err(e) = write_bundle(&path, &files) {
-            return IpcMessage::Error {
-                message: format!("failed to write report bundle: {e}"),
-            };
+            return ipc_err(format!("failed to write report bundle: {e}"));
         }
 
         // Make it readable by, and owned by, the user who invoked `ray report`.
@@ -371,17 +369,13 @@ impl Daemon {
         let (ip, display) = match self.resolve_peer_ip(peer).await {
             Some(x) => x,
             None => {
-                return IpcMessage::Error {
-                    message: format!("unknown peer '{peer}'"),
-                };
+                return ipc_err(format!("unknown peer '{peer}'"));
             }
         };
         let route = match self.registry.peers.lookup_v4(&ip) {
             Some(r) => r,
             None => {
-                return IpcMessage::Error {
-                    message: format!("{display} is not connected (no live mesh link to {ip})"),
-                };
+                return ipc_err(format!("{display} is not connected (no live mesh link to {ip})"));
             }
         };
         let conn = route.conn;

@@ -193,9 +193,7 @@ impl FileService {
             match idx {
                 Some(i) => pending.remove(i),
                 None => {
-                    return IpcMessage::Error {
-                        message: format!("no pending file with id {id}"),
-                    };
+                    return ipc_err(format!("no pending file with id {id}"));
                 }
             }
         };
@@ -211,9 +209,7 @@ impl FileService {
         {
             Ok(c) => c,
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("cannot reach sender: {e}"),
-                };
+                return ipc_err(format!("cannot reach sender: {e}"));
             }
         };
 
@@ -224,17 +220,13 @@ impl FileService {
             .fetch(conn, iroh_blobs::HashAndFormat::raw(blob_hash))
             .await
         {
-            return IpcMessage::Error {
-                message: format!("blob fetch failed: {e}"),
-            };
+            return ipc_err(format!("blob fetch failed: {e}"));
         }
 
         let bytes = match self.transport.blob_store.blobs().get_bytes(blob_hash).await {
             Ok(b) => b,
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("blob read failed: {e}"),
-                };
+                return ipc_err(format!("blob read failed: {e}"));
             }
         };
 
@@ -248,16 +240,12 @@ impl FileService {
         };
 
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            return IpcMessage::Error {
-                message: format!("cannot create directory '{}': {e}", dir.display()),
-            };
+            return ipc_err(format!("cannot create directory '{}': {e}", dir.display()));
         }
 
         let dest = dir.join(&pending_file.filename);
         if let Err(e) = std::fs::write(&dest, &bytes) {
-            return IpcMessage::Error {
-                message: format!("write failed: {e}"),
-            };
+            return ipc_err(format!("write failed: {e}"));
         }
 
         if let Some((uid, gid)) = peer_cred {
@@ -337,9 +325,7 @@ impl FileService {
         let peer_id = match self.registry.resolve_peer_flexible(peer).await {
             Some(id) => id,
             None => {
-                return IpcMessage::Error {
-                    message: format!("unknown peer '{peer}'"),
-                };
+                return ipc_err(format!("unknown peer '{peer}'"));
             }
         };
 
@@ -347,9 +333,7 @@ impl FileService {
         let file_bytes = match std::fs::read(file_path) {
             Ok(b) => b,
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("cannot read '{}': {e}", file_path.display()),
-                };
+                return ipc_err(format!("cannot read '{}': {e}", file_path.display()));
             }
         };
 
@@ -368,9 +352,7 @@ impl FileService {
             .add_slice(&file_bytes)
             .await
         {
-            return IpcMessage::Error {
-                message: format!("blob store error: {e}"),
-            };
+            return ipc_err(format!("blob store error: {e}"));
         }
 
         let msg = control::ControlMsg::FileOffer {
@@ -393,24 +375,18 @@ impl FileService {
                     // File offers ride the separate FILES_ALPN, not the mesh demux,
                     // so they carry no network scope.
                     if let Err(e) = control::send_msg(&mut send, None, &msg).await {
-                        return IpcMessage::Error {
-                            message: format!("failed to send offer: {e}"),
-                        };
+                        return ipc_err(format!("failed to send offer: {e}"));
                     }
                     // send_msg already finished the stream; wait for the peer to
                     // read the offer so it flushes before this `conn` is dropped.
                     let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
                 }
                 Err(e) => {
-                    return IpcMessage::Error {
-                        message: format!("failed to open stream: {e}"),
-                    };
+                    return ipc_err(format!("failed to open stream: {e}"));
                 }
             },
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("cannot reach peer '{peer}': {e}"),
-                };
+                return ipc_err(format!("cannot reach peer '{peer}': {e}"));
             }
         }
 
@@ -448,9 +424,7 @@ impl FileService {
                     message: format!("declined file {id}"),
                 }
             }
-            None => IpcMessage::Error {
-                message: format!("no pending file with id {id}"),
-            },
+            None => ipc_err(format!("no pending file with id {id}")),
         }
     }
 
@@ -459,28 +433,20 @@ impl FileService {
     /// already-queued offers that now qualify.
     pub(crate) async fn files_auto_accept(&self, network: &str, enabled: bool) -> IpcMessage {
         if !self.registry.contains(network) {
-            return IpcMessage::Error {
-                message: format!("network '{network}' not found"),
-            };
+            return ipc_err(format!("network '{network}' not found"));
         }
         match config::load_network(network) {
             Ok(Some(mut nc)) => {
                 nc.auto_accept_files = enabled;
                 if let Err(e) = config::save_network(&nc) {
-                    return IpcMessage::Error {
-                        message: format!("failed to persist auto-accept setting: {e}"),
-                    };
+                    return ipc_err(format!("failed to persist auto-accept setting: {e}"));
                 }
             }
             Ok(None) => {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not found in config"),
-                };
+                return ipc_err(format!("network '{network}' not found in config"));
             }
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to load config: {e}"),
-                };
+                return ipc_err(format!("failed to load config: {e}"));
             }
         }
         // On enable, sweep any already-queued offers so a file that arrived
@@ -510,10 +476,8 @@ impl FileService {
     /// can't be bound to the wrong identity.
     pub(crate) fn start_pairing(&self) -> IpcMessage {
         if self.current_device_cert().is_some() {
-            return IpcMessage::Error {
-                message: "this device is already paired; add new devices from your primary device"
-                    .to_string(),
-            };
+            return ipc_err("this device is already paired; add new devices from your primary device"
+                    .to_string());
         }
 
         let secret: [u8; 32] = rand::random();
