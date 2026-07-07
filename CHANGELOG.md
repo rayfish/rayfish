@@ -26,6 +26,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A co-coordinator renaming itself now reaches the other coordinators.**
+  On a network with more than one coordinator (via `ray admin add` or a `ray
+  connect` link), when one coordinator changed its own hostname the other
+  coordinators never learned it: their `ray status` roster and `*.ray` DNS kept
+  showing the old name. The rename now propagates to peer coordinators
+  immediately, so every node converges on the new name.
 - **QR scanner preview no longer appears sideways** when pairing a device on
   Android: the scanner is now pinned to portrait so the camera preview stays
   upright.
