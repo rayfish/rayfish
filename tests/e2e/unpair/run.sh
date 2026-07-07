@@ -93,19 +93,21 @@ fi
 
 # ---------------------------------------------------------------------------
 step "4. srv-a unpairs srv-b"
-UNPAIR="$(on "$A" 'ray unpair srv-b' 2>&1 | strip)"
-echo "$UNPAIR" | sed 's/^/   a| /'
-if echo "$UNPAIR" | grep -qi 'revoked its device certificate'; then
-  pass "srv-a unpaired srv-b"
-else
-  fail "ray unpair srv-b did not report success"
-fi
-
-# A secondary cannot unpair (primary-only guard).
+# A secondary cannot unpair (primary-only guard). Assert this *before* srv-a
+# unpairs srv-b below: that unpair best-effort tells srv-b to wipe its own cert,
+# after which srv-b is no longer a secondary and the guard would no longer apply.
 SEC="$(on "$B" 'ray unpair srv-a' 2>&1 | strip || true)"
 echo "$SEC" | grep -qi 'only your primary device can unpair' \
   && pass "secondary refused to unpair (primary-only)" \
   || fail "secondary was not refused (expected primary-only error)"
+
+UNPAIR="$(on "$A" 'ray unpair srv-b' 2>&1 | strip)"
+echo "$UNPAIR" | sed 's/^/   a| /'
+if echo "$UNPAIR" | grep -qi 'nullified its device certificate'; then
+  pass "srv-a unpaired srv-b"
+else
+  fail "ray unpair srv-b did not report success"
+fi
 
 # ---------------------------------------------------------------------------
 step "5. floor propagates: srv-c drops srv-b"
