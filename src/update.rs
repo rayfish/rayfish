@@ -17,6 +17,11 @@ pub const REPO_SLUG: &str = "rayfish/rayfish";
 /// Map the host OS/arch to the release asset name CI publishes
 /// (`ray-{os}-{arch}`, e.g. `ray-linux-x86_64`). Errors on platforms we don't
 /// build binaries for, so the user falls back to building from source.
+///
+/// On Linux the libc flavour is a compile-time fact of the running binary, not
+/// of the host: a binary built against musl self-updates to the `-musl` asset
+/// (which runs on any Linux) and a glibc binary to the plain gnu asset. Getting
+/// this wrong would hand a musl-only host a glibc binary that can't start.
 pub fn release_asset_name(os: &str, arch: &str) -> Result<String> {
     let os = match os {
         "linux" => "linux",
@@ -30,7 +35,12 @@ pub fn release_asset_name(os: &str, arch: &str) -> Result<String> {
             anyhow::bail!("no rayfish release binary for architecture '{other}'; build from source")
         }
     };
-    Ok(format!("ray-{os}-{arch}"))
+    let libc = if cfg!(all(target_os = "linux", target_env = "musl")) {
+        "-musl"
+    } else {
+        ""
+    };
+    Ok(format!("ray-{os}-{arch}{libc}"))
 }
 
 /// Strip a leading `v` from a release tag for comparison with

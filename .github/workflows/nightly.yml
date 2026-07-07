@@ -81,6 +81,14 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
             name: ray-linux-aarch64
+          # Static builds: one binary that runs on any Linux regardless of glibc
+          # version. Deps are musl-clean (ring + hickory, no C/dlopen deps).
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+            name: ray-linux-x86_64-musl
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-22.04-arm
+            name: ray-linux-aarch64-musl
           - target: aarch64-apple-darwin
             runner: macos-latest
             name: ray-macos-aarch64
@@ -99,6 +107,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # musl-gcc, needed for ring's C stubs when linking the static musl target.
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
