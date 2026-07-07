@@ -1202,7 +1202,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_set_default_hostname() != 40200.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_set_dns_upstreams() != 50178.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_set_dns_upstreams() != 41955.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_set_hostname() != 56819.toShort()) {
@@ -1781,12 +1781,16 @@ public interface NodeInterface {
     fun `setDefaultHostname`(`name`: kotlin.String)
     
     /**
-     * Point the Magic DNS resolver at the phone's real DNS servers so
-     * non-`.ray` queries are forwarded instead of refused. On Android there is
-     * no `resolv.conf` to capture (the desktop path), so the platform reads the
-     * underlying network's DNS servers and passes them here before the tunnel
-     * captures all DNS. Non-IPv4 entries are ignored (the resolver forwards
-     * over IPv4). Requires [`Node::start`] first.
+     * Point the Magic DNS resolver at the phone's DNS so non-`.ray` queries are
+     * forwarded instead of refused. On Android there is no `resolv.conf` to
+     * capture (the desktop path), so the platform passes upstreams here before
+     * the tunnel captures all DNS. Requires [`Node::start`] first.
+     *
+     * Each entry may be a bare IPv4 (forwarded as cleartext UDP on port 53) or
+     * an `ip:port` socket address. The platform points this at a loopback
+     * `DnsResolver.rawQuery` proxy (`127.0.0.1:<port>`) so non-`.ray` lookups
+     * honor the system Private DNS (DoT/DoH); entries that parse as neither are
+     * ignored.
      */
     fun `setDnsUpstreams`(`servers`: List<kotlin.String>)
     
@@ -2374,12 +2378,16 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
-     * Point the Magic DNS resolver at the phone's real DNS servers so
-     * non-`.ray` queries are forwarded instead of refused. On Android there is
-     * no `resolv.conf` to capture (the desktop path), so the platform reads the
-     * underlying network's DNS servers and passes them here before the tunnel
-     * captures all DNS. Non-IPv4 entries are ignored (the resolver forwards
-     * over IPv4). Requires [`Node::start`] first.
+     * Point the Magic DNS resolver at the phone's DNS so non-`.ray` queries are
+     * forwarded instead of refused. On Android there is no `resolv.conf` to
+     * capture (the desktop path), so the platform passes upstreams here before
+     * the tunnel captures all DNS. Requires [`Node::start`] first.
+     *
+     * Each entry may be a bare IPv4 (forwarded as cleartext UDP on port 53) or
+     * an `ip:port` socket address. The platform points this at a loopback
+     * `DnsResolver.rawQuery` proxy (`127.0.0.1:<port>`) so non-`.ray` lookups
+     * honor the system Private DNS (DoT/DoH); entries that parse as neither are
+     * ignored.
      */
     @Throws(RayException::class)override fun `setDnsUpstreams`(`servers`: List<kotlin.String>)
         = 
