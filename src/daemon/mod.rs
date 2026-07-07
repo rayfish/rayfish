@@ -661,6 +661,14 @@ impl Daemon {
         self.dns.resolver.set_upstreams(servers);
     }
 
+    /// Point the Magic DNS resolver at explicit `ip:port` upstreams. Android uses
+    /// this to target a loopback `DnsResolver.rawQuery` proxy so non-`.ray`
+    /// lookups honor the system Private DNS (DoT/DoH) rather than being forwarded
+    /// as cleartext UDP on port 53.
+    pub fn set_dns_upstream_addrs(&self, servers: Vec<SocketAddr>) {
+        self.dns.resolver.set_upstream_addrs(servers);
+    }
+
     /// Register a [`CoordinatorAcceptState`] handler for `network` and update
     /// the network's role in `self.registry.networks` to [`NetworkRole::Coordinator`].
     ///

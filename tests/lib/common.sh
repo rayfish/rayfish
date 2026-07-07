@@ -89,14 +89,16 @@ reset_state(){
   done
 }
 
-# deploy_all <root> <ip...> : cross-build + rsync + ray up on each host; abort on failure.
+# deploy_all <root> <ip...> : cross-build once + rsync + ray up on each host; abort on failure.
 deploy_all(){
   local root="$1"; shift
-  step "deploy ray to all hosts (cross build + rsync + ray up)"
+  step "deploy ray to all hosts (cross build once + rsync + ray up)"
+  echo ">> just cross"
+  if ( cd "$root" && just cross ); then pass "cross build"; else fail "cross build"; echo "aborting"; exit 1; fi
   local ip
   for ip in "$@"; do
-    echo ">> just deploy $ip"
-    if ( cd "$root" && just deploy "$ip" ); then pass "deploy $ip"; else fail "deploy $ip"; echo "aborting"; exit 1; fi
+    echo ">> just scp $ip"
+    if ( cd "$root" && just scp "$ip" ); then pass "deploy $ip"; else fail "deploy $ip"; echo "aborting"; exit 1; fi
   done
 }
 
