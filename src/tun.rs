@@ -196,7 +196,7 @@ async fn configure_ipv6(tun_name: &str, addr: Ipv6Addr) -> Result<()> {
     result
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 async fn configure_ipv6(tun_name: &str, addr: Ipv6Addr) -> Result<()> {
     // macOS has no netlink; assign the address via the BSD tools. The peer-range
     // route is added separately by `route_peer_range` after link-up.
@@ -257,7 +257,7 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     result
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     // utun is point-to-point, so the address prefix alone does not reliably
     // create the range route, we add both families explicitly. The IPv4 `/10`
@@ -328,7 +328,7 @@ pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
     result
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
     let ip = crate::dns::MAGIC_DNS_V4.to_string();
     let _ = Command::new("route")
@@ -351,7 +351,7 @@ pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
 }
 
 #[cfg(all(
-    not(any(target_os = "linux", target_os = "macos")),
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")),
     not(target_os = "android")
 ))]
 pub async fn route_magic_dns(_tun_name: &str) -> Result<()> {
@@ -372,7 +372,7 @@ pub async fn route_magic_dns(_tun_name: &str) -> Result<()> {
 /// On Linux this is a no-op: assigning an address makes the kernel add a
 /// `local` route in the `local` table that already delivers self-traffic via
 /// loopback, so pinging your own TUN address works out of the box.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub async fn route_self_loopback(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<()> {
     for (family, addr) in [("-inet", v4.to_string()), ("-inet6", v6.to_string())] {
         let _ = Command::new("route")
@@ -390,7 +390,7 @@ pub async fn route_self_loopback(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "android"), not(target_os = "freebsd")))]
 pub async fn route_self_loopback(_v4: Ipv4Addr, _v6: Ipv6Addr) -> Result<()> {
     // Linux installs the loopback `local` route automatically on address
     // assignment; self-traffic already works without an explicit route.
@@ -413,7 +413,7 @@ pub fn set_link_down(tun_name: &str) -> Result<()> {
 
 #[cfg(not(target_os = "android"))]
 fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     {
         let state = if up { "up" } else { "down" };
         let status = Command::new("ifconfig")
