@@ -327,9 +327,13 @@ async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> R
     // Prometheus metrics server. Its guard is kept alive by the Daemon (dropping it
     // stops the export); built here from the local handles so it can be a plain
     // owned field. `None` if it failed to bind.
-    let metrics_server =
-        spawn_metrics_server(stats.clone(), peers.clone(), &transport.endpoint, token.clone())
-            .await;
+    let metrics_server = spawn_metrics_server(
+        stats.clone(),
+        peers.clone(),
+        &transport.endpoint,
+        token.clone(),
+    )
+    .await;
 
     let auto_update = app_config.auto_update;
     let daemon = Arc::new(Daemon {

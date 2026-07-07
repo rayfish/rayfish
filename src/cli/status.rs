@@ -3,6 +3,8 @@
 
 use std::collections::HashMap;
 
+use iroh::EndpointId;
+
 use crate::*;
 
 /// Human-readable byte size (GiB/MiB/KiB/B) for traffic and transfer counters.
@@ -314,11 +316,7 @@ fn print_network(net: &ipc::NetworkStatus) {
     };
     let up_w = counter_width(|c| c.bytes_tx);
     let down_w = counter_width(|c| c.bytes_rx);
-    let rows: Vec<Vec<layout::Cell>> = net
-        .peers
-        .iter()
-        .map(|p| render_peer_row(p, peer_alias(p, &alias_by_identity), up_w, down_w))
-        .collect();
+    let rows = grouped_peer_rows(net, &alias_by_identity, up_w, down_w);
     if rows.is_empty() {
         println!("    {}", style::faint("(no other members)"));
     } else {
@@ -347,13 +345,128 @@ fn peer_alias<'a>(
     alias_by_identity.get(identity.as_str()).copied()
 }
 
-/// Build one peer's status row (glyph · host · ipv4 · via · rtt · ↑tx · ↓rx). A
-/// local alias, when set, is shown inline after the host as `host [alias]`. The
-/// host is the bare hostname (no `.{network}.ray`): the network block header
-/// already names the network.
-fn render_peer_row(
+/// Build every peer row for a network, grouping paired devices (those sharing a
+/// `user_identity`) under a parent user row; standalone members render flat.
+/// Roster order is preserved: a group is anchored where its first device appears,
+/// and within a group connected devices come before offline ones. The tree branch
+/// lives inside each device row's first cell (before the glyph), so every following
+/// column stays on one aligned grid across flat, parent, and nested rows.
+fn grouped_peer_rows(
+    net: &ipc::NetworkStatus,
+    alias_by_identity: &HashMap<&str, &str>,
+    up_w: usize,
+    down_w: usize,
+) -> Vec<Vec<layout::Cell>> {
+    let mut rows = Vec::new();
+    let mut emitted: std::collections::HashSet<EndpointId> = std::collections::HashSet::new();
+    for peer in &net.peers {
+        match peer.user_identity {
+            // Standalone member: a flat row (its own alias, if any, keyed on its
+            // endpoint id).
+            None => rows.push(device_row(
+                peer,
+                peer_alias(peer, alias_by_identity),
+                "",
+                up_w,
+                down_w,
+            )),
+            // Paired device: emit the whole group the first time we reach one of
+            // its devices, then skip its later devices.
+            Some(uid) => {
+                if !emitted.insert(uid) {
+                    continue;
+                }
+                let mut devices: Vec<&ipc::PeerStatus> = net
+                    .peers
+                    .iter()
+                    .filter(|p| p.user_identity == Some(uid))
+                    .collect();
+                // Connected devices first (`false < true`); `sort_by_key` is stable
+                // so roster order is preserved within each half.
+                devices.sort_by_key(|p| p.connection.is_none());
+                rows.push(user_parent_row(net, uid, &devices, alias_by_identity));
+                for (i, d) in devices.iter().enumerate() {
+                    let branch = if i + 1 == devices.len() {
+                        "   └─ "
+                    } else {
+                        "   ├─ "
+                    };
+                    rows.push(device_row(d, None, branch, up_w, down_w));
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// The parent row for a group of paired devices: `<glyph> <name>   N devices,
+/// M online`. The glyph is online when any device in the group is. No ip/rtt on
+/// the parent; the device rows beneath carry that.
+fn user_parent_row(
+    net: &ipc::NetworkStatus,
+    uid: EndpointId,
+    devices: &[&ipc::PeerStatus],
+    alias_by_identity: &HashMap<&str, &str>,
+) -> Vec<layout::Cell> {
+    let online = devices.iter().filter(|d| d.connection.is_some()).count();
+    let any_online = online > 0;
+    let name = user_display_name(net, uid, devices, alias_by_identity);
+    let (glyph_plain, glyph_styled) = if any_online {
+        ("●", style::dot_online())
+    } else {
+        ("○", style::dot_offline())
+    };
+    let name_plain = format!("{glyph_plain} {name}");
+    let name_styled = format!("{glyph_styled} {}", style::value(&name));
+    let n = devices.len();
+    let rollup = format!(
+        "{n} device{}, {online} online",
+        if n == 1 { "" } else { "s" }
+    );
+    vec![
+        layout::Cell::new(name_plain, name_styled),
+        layout::Cell::new(rollup.clone(), style::faint(&rollup)),
+    ]
+}
+
+/// Resolve a paired-device group's display name: a local alias on the user
+/// identity, else your own hostname when it is your identity, else the primary
+/// device's hostname if it is itself a member, else a short `user <id>` fallback.
+fn user_display_name(
+    net: &ipc::NetworkStatus,
+    uid: EndpointId,
+    devices: &[&ipc::PeerStatus],
+    alias_by_identity: &HashMap<&str, &str>,
+) -> String {
+    if let Some(alias) = alias_by_identity.get(uid.to_string().as_str()) {
+        return (*alias).to_string();
+    }
+    if devices.iter().any(|d| d.is_own_device)
+        && let Some(h) = &net.my_hostname
+    {
+        return h.clone();
+    }
+    if let Some(h) = net
+        .peers
+        .iter()
+        .find(|p| p.endpoint_id == uid)
+        .and_then(|p| p.hostname.clone())
+    {
+        return h;
+    }
+    format!("user {}", uid.fmt_short())
+}
+
+/// One device's status row: a merged `prefix + glyph + host (+ marker)` first cell,
+/// then ipv4 · via · rtt · ↑tx · ↓rx. `prefix` is the tree branch when the device
+/// is nested under a user (empty for a top-level member). A local `alias`, when
+/// set, shows as `host [alias]` (only for standalone members; a paired device's
+/// alias rides its parent row). Own paired devices keep a `(your device)` marker.
+/// The host is the bare hostname (no `.{network}.ray`): the header names the network.
+fn device_row(
     peer: &ipc::PeerStatus,
     alias: Option<&str>,
+    prefix: &str,
     up_w: usize,
     down_w: usize,
 ) -> Vec<layout::Cell> {
@@ -362,32 +475,30 @@ fn render_peer_row(
         Some(a) => format!("{base} [{a}]"),
         None => base,
     };
-    // Ownership annotation, rendered as its own styled segment appended to the
-    // host (so it never nests inside the host's color). Mark our own paired
-    // devices; attribute an *unaliased* paired device to its owning user. When
-    // an alias is shown it already names the owner (it is keyed on the user
-    // identity for a paired device), so we skip the redundant segment.
-    let annotation: Option<(String, String)> = if peer.is_own_device {
-        Some(("(your device)".into(), style::green("(your device)")))
-    } else if alias.is_none() {
-        peer.user_identity.map(|uid| {
-            let s = format!("(user {})", uid.fmt_short());
-            let styled = style::faint(&s);
-            (s, styled)
-        })
+    // Mark our own paired devices. The old "(user X)" attribution is gone: the
+    // parent user row now names the owner, so it would be redundant here.
+    let marker = peer.is_own_device.then_some("(your device)");
+    let online = peer.connection.is_some();
+    let (glyph_plain, glyph_styled) = if online {
+        ("●", style::dot_online())
     } else {
-        None
+        ("○", style::dot_offline())
     };
-    // Plain text used for column width measurement includes the annotation.
-    let host_plain = match &annotation {
-        Some((plain, _)) => format!("{host} {plain}"),
-        None => host.clone(),
+    let host_style: fn(&str) -> String = if online { style::value } else { style::faint };
+    let (host_plain, host_styled) = match marker {
+        Some(m) => (
+            format!("{host} {m}"),
+            format!("{} {}", host_style(&host), style::green(m)),
+        ),
+        None => (host.clone(), host_style(&host)),
     };
-    // Build the styled host, keeping the base and annotation in distinct colors.
-    let host_styled = |base_style: fn(&str) -> String| match &annotation {
-        Some((_, styled)) => format!("{} {styled}", base_style(&host)),
-        None => base_style(&host),
-    };
+    // Merge branch + glyph + host into the first cell so the branch sits before
+    // the glyph and the columns after it (ip, via, …) still align across all rows.
+    let name = layout::Cell::new(
+        format!("{prefix}{glyph_plain} {host_plain}"),
+        format!("{prefix}{glyph_styled} {host_styled}"),
+    );
+    let ip = layout::Cell::new(peer.ip.to_string(), style::faint(&peer.ip.to_string()));
     match &peer.connection {
         Some(ci) => {
             let via = match ci.conn_type {
@@ -406,19 +517,26 @@ fn render_peer_row(
             let up = format!("↑ {:>up_w$}", format_bytes(ci.bytes_tx));
             let down = format!("↓ {:>down_w$}", format_bytes(ci.bytes_rx));
             vec![
-                layout::Cell::new("●", style::dot_online()),
-                layout::Cell::new(host_plain.clone(), host_styled(style::value)),
-                layout::Cell::new(peer.ip.to_string(), style::faint(&peer.ip.to_string())),
+                name,
+                ip,
                 layout::Cell::new(via, style::faint(via)),
                 layout::Cell::right(rtt_plain, rtt_styled),
                 layout::Cell::new(up.clone(), style::faint(&up)),
                 layout::Cell::new(down.clone(), style::faint(&down)),
             ]
         }
+        // Offline, but a dial hit the mesh-version gate: flag it as incompatible
+        // (with a `ray update` nudge) rather than a plain offline peer.
+        None if peer.incompatible => vec![
+            name,
+            ip,
+            layout::Cell::new("—", style::faint("—")),
+            layout::Cell::right("incompatible", style::red("incompatible")),
+            layout::Cell::new("ray update", style::faint("ray update")),
+        ],
         None => vec![
-            layout::Cell::new("○", style::dot_offline()),
-            layout::Cell::new(host_plain.clone(), host_styled(style::faint)),
-            layout::Cell::new(peer.ip.to_string(), style::faint(&peer.ip.to_string())),
+            name,
+            ip,
             layout::Cell::new("—", style::faint("—")),
             layout::Cell::right("offline", style::faint("offline")),
             layout::Cell::plain(""),
@@ -571,4 +689,107 @@ pub(crate) async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod grouping_tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    fn conn() -> ipc::ConnectionInfo {
+        ipc::ConnectionInfo {
+            conn_type: ipc::ConnType::Direct,
+            remote_addr: None,
+            rtt_ms: Some(20.0),
+            bytes_tx: 0,
+            bytes_rx: 0,
+            datagrams_tx: 0,
+            datagrams_rx: 0,
+            lost_packets: 0,
+        }
+    }
+
+    fn peer(
+        host: &str,
+        user: Option<EndpointId>,
+        own: bool,
+        online: bool,
+        incompatible: bool,
+    ) -> ipc::PeerStatus {
+        ipc::PeerStatus {
+            endpoint_id: iroh::SecretKey::generate().public(),
+            ip: Ipv4Addr::new(100, 64, 0, 2),
+            ipv6: None,
+            hostname: Some(host.to_string()),
+            user_identity: user,
+            is_own_device: own,
+            incompatible,
+            connection: online.then(conn),
+        }
+    }
+
+    fn net(my_hostname: &str, peers: Vec<ipc::PeerStatus>) -> ipc::NetworkStatus {
+        ipc::NetworkStatus {
+            name: "n".to_string(),
+            role: ipc::NetworkRole::Coordinator,
+            my_ip: Ipv4Addr::new(100, 64, 0, 1),
+            my_ipv6: None,
+            my_hostname: Some(my_hostname.to_string()),
+            network_key: None,
+            member_count: peers.len(),
+            peers,
+            pending_suggestions: 0,
+            pending_requests: 0,
+            aliases: Default::default(),
+            ephemeral_ttl_secs: None,
+        }
+    }
+
+    fn render(net: &ipc::NetworkStatus) -> String {
+        layout::columns(&grouped_peer_rows(net, &HashMap::new(), 0, 0), 3)
+    }
+
+    #[test]
+    fn nests_own_paired_devices_under_user() {
+        let me = iroh::SecretKey::generate().public();
+        // Two of my devices (one online, one offline) plus a standalone member.
+        let net = net(
+            "dario",
+            vec![
+                peer("phone", Some(me), true, true, false),
+                peer("tablet", Some(me), true, false, false),
+                peer("server", None, false, true, false),
+            ],
+        );
+        let out = render(&net);
+        // Parent row labelled by my hostname with a rollup, and a tree branch.
+        assert!(out.contains("dario"), "{out}");
+        assert!(out.contains("2 devices, 1 online"), "{out}");
+        assert!(out.contains("└─"), "{out}");
+        // Parent sits before its devices; connected device before the offline one.
+        let at = |s: &str| out.find(s).unwrap();
+        assert!(at("dario") < at("phone"));
+        assert!(at("phone") < at("tablet"));
+        // Standalone member still renders flat.
+        assert!(out.contains("server"));
+    }
+
+    #[test]
+    fn flags_incompatible_offline_peer() {
+        let net = net("dario", vec![peer("oldbox", None, false, false, true)]);
+        let out = render(&net);
+        assert!(out.contains("oldbox"));
+        assert!(out.contains("incompatible"), "{out}");
+        assert!(out.contains("ray update"), "{out}");
+        assert!(!out.contains("offline"), "{out}");
+    }
+
+    #[test]
+    fn single_device_group_reads_singular() {
+        let me = iroh::SecretKey::generate().public();
+        let net = net("dario", vec![peer("phone", Some(me), true, true, false)]);
+        let out = render(&net);
+        assert!(out.contains("1 device, 1 online"), "{out}");
+    }
 }

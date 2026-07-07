@@ -640,6 +640,34 @@ impl NetworkRegistry {
         }
     }
 
+    /// This coordinator's current network record, serialized as a signed pkarr
+    /// packet, for handing to a (re)connecting member over the mesh so it converges
+    /// to the live roster without waiting on a fresh (possibly stale) DHT lookup.
+    /// `None` when we are not a coordinator of `network` (no secret key) or have no
+    /// snapshot yet. Mirrors the record built by [`Self::store_and_publish_group`];
+    /// the receiver verifies it against the network key before trusting it.
+    pub(crate) fn current_signed_record(&self, network: &str) -> Option<Vec<u8>> {
+        let (hash, key) = {
+            let handle = self.networks.get(network)?;
+            let s = handle.state.read().unwrap();
+            (
+                s.snapshot.as_ref().map(|x| x.hash)?,
+                s.network_secret_key.clone()?,
+            )
+        };
+        let mut seed_peers: Vec<EndpointId> = self
+            .peers
+            .peers_for_network(network)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        seed_peers.push(self.transport.endpoint.id());
+        seed_peers.sort_by_key(|id| id.to_string());
+        seed_peers.dedup();
+        let packet = dht::encode_network_record(&key, &hash, &seed_peers).ok()?;
+        Some(packet.as_bytes().to_vec())
+    }
+
     /// Resolve a peer name (hostname, `host.net.ray`, or mesh IPv4) to its
     /// endpoint id: Magic DNS + connected-peer route first, then the member
     /// roster (offline peers / self), then a short-id / endpoint-id prefix scan.

@@ -248,6 +248,18 @@ impl CoordinatorAcceptState {
         self.ctx
             .register_peer_conn(conn, remote_id, peer_ip, &self.network_name);
 
+        // Hand this (re)connecting member our current signed record over the mesh
+        // so it converges to the live roster in ~1s instead of waiting out a stale
+        // DHT lookup plus the 60s group poll. Only a coordinator holds the network
+        // key, so only we can originate it; the member verifies the record against
+        // the network key before applying (see `MemberAcceptState::handle_frame`).
+        if let Some(record) = self.ctx.registry.current_signed_record(&self.network_name) {
+            let msg = ControlMsg::SignedRecord { packet: record };
+            if let Err(e) = open_and_send(conn, Some(self.net_pubkey()), &msg).await {
+                tracing::debug!(peer = %remote_id.fmt_short(), error = %e, "failed to hand signed record to reconnecting member");
+            }
+        }
+
         // Verify and store device cert if present, unless the device key is
         // nullified on this network (`ray unpair`): a nullified cert is not
         // recorded as a paired device, so it stops resolving to the user's
@@ -782,6 +794,15 @@ impl MemberAcceptState {
                 self.reconverge_notify.notify_one();
                 None
             }
+            // A coordinator handed us its current signed record over the mesh (fast
+            // path on (re)connect). Verify it against the network key and apply it
+            // directly, bypassing a possibly-stale DHT lookup. Still the same trust
+            // model: the record is network-key-signed and verified here, the peer is
+            // only its transport.
+            ControlMsg::SignedRecord { packet } => {
+                self.apply_signed_record(&packet).await;
+                None
+            }
             ControlMsg::AdminGrant {
                 network_pubkey,
                 secret_key,
@@ -818,6 +839,50 @@ impl MemberAcceptState {
             }
             _ => None,
         }
+    }
+
+    /// Apply a signed network record a coordinator handed us over the mesh (the
+    /// `SignedRecord` fast path). Verify it against this network's key, and if it
+    /// names a newer blob than we hold, fetch + apply it directly. This bypasses a
+    /// fresh DHT resolve (which can serve a stale record for ~60-90s right after a
+    /// restart), so a reconnecting member converges to the live roster in ~1s. The
+    /// trust model is unchanged: the record is network-key-signed and verified
+    /// here, exactly like the DHT copy; the peer is only its transport.
+    async fn apply_signed_record(&self, packet_bytes: &[u8]) {
+        let packet = match dht::verify_network_record(packet_bytes, self.net_pubkey) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "rejecting signed record handed over the mesh");
+                return;
+            }
+        };
+        let (remote_hash, seed_peers) = match dht::decode_network_record(&packet) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "undecodable signed record handed over the mesh");
+                return;
+            }
+        };
+        let current_hash = {
+            let s = self.state.read().unwrap();
+            s.snapshot.as_ref().map(|snap| snap.hash)
+        };
+        if current_hash == Some(remote_hash) {
+            return;
+        }
+        tracing::info!(old = ?current_hash, new = %remote_hash, "applying signed record handed by coordinator");
+        fetch_and_apply_blob(
+            &self.endpoint,
+            &self.ctx.blob_store,
+            &self.ctx.peers,
+            &self.ctx.firewall,
+            &self.registry,
+            &self.state,
+            &self.network_name,
+            remote_hash,
+            &seed_peers,
+        )
+        .await;
     }
 
     /// Another member (or an approved-but-not-yet-member peer) announced itself

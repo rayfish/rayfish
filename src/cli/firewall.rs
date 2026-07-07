@@ -860,6 +860,7 @@ mod tests {
             hostname: Some(hostname.to_string()),
             user_identity: user,
             is_own_device: false,
+            incompatible: false,
             connection: None,
         }
     }

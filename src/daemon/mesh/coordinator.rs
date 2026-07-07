@@ -229,6 +229,16 @@ impl NetworkRegistry {
                     {
                         Ok(c) => c,
                         Err(e) => {
+                            // Flag an incompatible-version peer (ALPN gate) so
+                            // `ray status` shows it instead of plain offline; a
+                            // different failure means we can't attribute it to the
+                            // version, so clear any prior flag. Success clears it in
+                            // `PeerTable::add`.
+                            if transport::is_alpn_mismatch(&format!("{e:#}")) {
+                                this.peers.mark_incompatible(peer_id);
+                            } else {
+                                this.peers.clear_incompatible(&peer_id);
+                            }
                             tracing::debug!(error = %e, "reconnect attempt failed");
                             continue;
                         }
