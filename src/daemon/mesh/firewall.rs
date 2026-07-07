@@ -431,6 +431,35 @@ impl NetworkRegistry {
 }
 
 impl MeshManager {
+    // Thin delegates so the `ray-mobile` FFI (which can only reach public
+    // MeshManager methods, not the pub(crate) registry) keeps its firewall
+    // surface. The logic lives on NetworkRegistry.
+    pub async fn firewall_add(
+        &self,
+        direction: firewall::Direction,
+        action: firewall::Action,
+        protocol: firewall::Protocol,
+        port: Option<&str>,
+        peer: Option<&str>,
+        network: Option<&str>,
+    ) -> IpcMessage {
+        self.registry
+            .firewall_add(direction, action, protocol, port, peer, network)
+            .await
+    }
+
+    pub fn firewall_remove(&self, index: usize) -> IpcMessage {
+        self.registry.firewall_remove(index)
+    }
+
+    pub fn firewall_show(&self) -> IpcMessage {
+        self.registry.firewall_show()
+    }
+
+    pub fn firewall_default(&self, action: firewall::Action) -> IpcMessage {
+        self.registry.firewall_default(action)
+    }
+
     /// Toggle the embedded mesh SSH server. Persists `ssh_enabled`, seeds/removes
     /// the `allow in tcp:22` passthrough so SSH packets reach the listener under
     /// the deny-inbound default, and starts/stops the listeners if the data plane
