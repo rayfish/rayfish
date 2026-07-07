@@ -58,7 +58,7 @@ otel = [
 ]
 
 [dependencies]
-ray-proto = { path = "ray-proto", version = "0.1.5" }
+ray-proto = { path = "ray-proto", version = "0.1.6" }
 anyhow = "1"
 blake3 = { version = "1", features = ["serde"] }
 bytes = "1"
