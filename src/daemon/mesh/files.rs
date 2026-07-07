@@ -33,6 +33,17 @@ impl MeshManager {
         self.files.reject_file(id)
     }
 
+    /// Accept a queued file offer (delegates to [`FileService`]). Kept as a
+    /// public MeshManager method for the `ray-mobile` FFI.
+    pub async fn accept_file(
+        &self,
+        id: u64,
+        output: Option<String>,
+        peer_cred: Option<(u32, u32)>,
+    ) -> IpcMessage {
+        self.files.accept_file(id, output, peer_cred).await
+    }
+
     /// Toggle per-network own-device file auto-accept (delegates to
     /// [`FileService`]).
     pub(crate) async fn files_auto_accept(&self, network: &str, enabled: bool) -> IpcMessage {
