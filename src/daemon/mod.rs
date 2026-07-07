@@ -581,20 +581,6 @@ impl MeshManager {
         self.registry.mesh_ctx()
     }
 
-    pub(crate) async fn refresh_alpns(&self) {
-        let alpns = self.protocol_router.alpns();
-        let alpn_strs: Vec<String> = alpns
-            .iter()
-            .map(|a| String::from_utf8_lossy(a).to_string())
-            .collect();
-        tracing::info!(alpns = ?alpn_strs, "refreshing ALPNs");
-        self.endpoint.set_alpns(alpns);
-
-        let network_names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
-        let tun_name = self.tun_name.lock().unwrap().clone();
-        dns_config::update_search_domains(&network_names, &tun_name).await;
-    }
-
     /// Attach a packet interface to a headless [`DaemonState`] and start the data
     /// plane's forwarding tasks: the TUN writer (`spawn_tun_writer`) and the mesh
     /// forwarding loop (`run_mesh`, reading `reader` and using the state's
@@ -697,28 +683,6 @@ impl MeshManager {
     /// swap; the caller is responsible for spawning the `disconnect_rx` cleanup
     /// task **before** calling this so the channel is live when the first
     /// incoming connection arrives.
-    pub(crate) fn register_coordinator_handler(
-        &self,
-        network: &str,
-        state: SharedNetworkState,
-        invite_lock: Arc<tokio::sync::Mutex<()>>,
-        dht_notify: Option<Arc<Notify>>,
-        network_key: EndpointId,
-        cancel: CancellationToken,
-    ) {
-        // The registration logic lives on NetworkRegistry (which owns the
-        // ConnectionManager + networks map); the daemon supplies its ctx.
-        self.registry.register_coordinator_handler(
-            &self.mesh_ctx(),
-            network,
-            state,
-            invite_lock,
-            dht_notify,
-            network_key,
-            cancel,
-        );
-    }
-
     /// Tailscale-style access control. Read-only queries are open to any local
     /// user; mutating commands require the caller to be root or the configured
     /// operator UID; setting the operator itself is root-only. Returns `None`
@@ -840,12 +804,14 @@ impl MeshManager {
                 .await
             }
             IpcMessage::Leave { name } => self.leave_network(&name).await,
-            IpcMessage::Nuke { name, force } => self.nuke_network(&name, force).await,
-            IpcMessage::Kick { network, peer } => self.kick_member(&network, &peer).await,
-            IpcMessage::SetEphemeral { network, ttl_secs } => {
-                self.set_ephemeral(&network, ttl_secs).await
+            IpcMessage::Nuke { name, force } => self.registry.nuke_network(&name, force).await,
+            IpcMessage::Kick { network, peer } => {
+                self.registry.kick_member(&network, &peer).await
             }
-            IpcMessage::GetEphemeral { network } => self.get_ephemeral(&network),
+            IpcMessage::SetEphemeral { network, ttl_secs } => {
+                self.registry.set_ephemeral(&network, ttl_secs).await
+            }
+            IpcMessage::GetEphemeral { network } => self.registry.get_ephemeral(&network),
             IpcMessage::Status => self.status(),
             IpcMessage::Report => self.build_report(peer_cred),
             IpcMessage::Up { hostname } => self.activate(hostname).await,
