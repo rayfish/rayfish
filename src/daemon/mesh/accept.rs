@@ -582,9 +582,16 @@ impl CoordinatorAcceptState {
         )
         .await;
 
-        let (members, approved) = {
+        // A direct (`ray connect`) link is symmetric, so the pre-approved requester
+        // is made a co-coordinator. Hand it the network key inside the Welcome it is
+        // already reading on the join stream (deterministic, no separate best-effort
+        // stream that could be dropped or race its handler setup).
+        let (members, approved, direct_key) = {
             let s = self.state.read().unwrap();
-            (s.roster(), s.approved_snapshot())
+            let direct_key = grant_direct
+                .then(|| s.network_secret_key.as_ref().map(|k| k.to_bytes()))
+                .flatten();
+            (s.roster(), s.approved_snapshot(), direct_key)
         };
 
         tracing::info!(ip = %peer_ip, "new member admitted and joined");
@@ -594,6 +601,7 @@ impl CoordinatorAcceptState {
             &ControlMsg::Welcome {
                 members: members.clone(),
                 approved,
+                direct_key,
             },
         )
         .await;
@@ -616,53 +624,17 @@ impl CoordinatorAcceptState {
         )
         .await;
 
-        // Direct link: hand the network key to the just-admitted peer so both
-        // sides are coordinators. Sent over its live mesh connection, where its
-        // demux handles `AdminGrant` -> persist key + promote to coordinator.
-        if grant_direct {
-            self.grant_direct_coordinator(conn, remote_id).await;
+        // The key rode the Welcome above (see `direct_key`). Record the grant
+        // locally (mirrors `admin_add`) so our own `ray admin list` shows the peer
+        // as a co-coordinator too.
+        if grant_direct
+            && let Ok(Some(mut net)) = config::load_network(&self.network_name)
+            && !net.admins.contains(&remote_id)
+        {
+            net.admins.push(remote_id);
+            let _ = config::save_network(&net);
         }
         Some(peer_ip)
-    }
-
-    /// Send an `AdminGrant` (the per-network secret key) to a peer over its live
-    /// mesh connection, making it a co-coordinator. Used for `ray connect` direct
-    /// networks, which are symmetric 2-peer links. Best-effort: a failure only
-    /// leaves the peer as a plain member (it was already marked coordinator in the
-    /// signed roster), so it can be re-granted with `ray admin add`.
-    async fn grant_direct_coordinator(&self, conn: &Connection, peer: EndpointId) {
-        let (net_pubkey, net_secret) = {
-            let s = self.state.read().unwrap();
-            (s.network_public_key, s.network_secret_key.clone())
-        };
-        let Some(net_secret) = net_secret else {
-            return;
-        };
-        let grant = ControlMsg::AdminGrant {
-            network_pubkey: net_pubkey,
-            secret_key: net_secret.to_bytes(),
-        };
-        match conn.open_bi().await {
-            Ok((mut send, _)) => {
-                if let Err(e) = control::send_msg(&mut send, Some(net_pubkey), &grant).await {
-                    tracing::warn!(peer = %peer.fmt_short(), error = %e,
-                        "failed to grant co-coordinator to direct peer");
-                    return;
-                }
-                tracing::info!(peer = %peer.fmt_short(),
-                    "granted co-coordinator to direct-connect peer");
-                // Record the grant locally (mirrors `admin_add`) so our own
-                // `ray admin list` shows the peer as a key-holder too.
-                if let Ok(Some(mut net)) = config::load_network(&self.network_name)
-                    && !net.admins.contains(&peer)
-                {
-                    net.admins.push(peer);
-                    let _ = config::save_network(&net);
-                }
-            }
-            Err(e) => tracing::warn!(peer = %peer.fmt_short(), error = %e,
-                "failed to open stream to grant direct co-coordinator"),
-        }
     }
 
     /// Decide a joiner's authoritative IP + hostname from the current roster, or
@@ -1052,6 +1024,9 @@ impl MemberAcceptState {
             &ControlMsg::Welcome {
                 members,
                 approved: approved_list,
+                // Reconnect path: a returning co-coordinator already holds the key
+                // (persisted in its config); only fresh direct admissions grant it.
+                direct_key: None,
             },
         )
         .await;

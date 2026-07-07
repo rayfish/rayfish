@@ -117,7 +117,7 @@ NET_A="$(status_json "$A" | jq -r '(.networks // [])[] | select((.role|ascii_dow
 NET_B="$(status_json "$B" | jq -r '(.networks // [])[] | select((.role|ascii_downcase)=="direct") | .name' | head -1)"
 echo "   net-a=$NET_A  net-b=$NET_B"
 holds_key(){  # <ip> <net> : exit 0 if this node holds the network key
-  on "$1" "ray admin list $2 --json" 2>/dev/null | jq -e 'any(.[]; .self == true)' >/dev/null 2>&1
+  on "$1" "ray admin $2 list --json" 2>/dev/null | jq -e 'any(.[]; .self == true)' >/dev/null 2>&1
 }
 if [[ -n "$NET_A" ]] && retry_until 30 "holds_key '$A' '$NET_A'"; then
   pass "srv-a holds the network key (co-coordinator)"

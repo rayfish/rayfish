@@ -175,6 +175,16 @@ pub enum ControlMsg {
     Welcome {
         members: Vec<Member>,
         approved: Vec<ApprovedEntry>,
+        /// The per-network secret key, present only when the coordinator admits a
+        /// pre-approved peer onto a `direct` (`ray connect`) 2-peer network. A
+        /// direct link is symmetric, so the requester is made a co-coordinator on
+        /// admission. Folding the key into the Welcome (delivered on the join
+        /// handshake stream the joiner already reads) makes the grant deterministic:
+        /// no separate best-effort `AdminGrant` stream that could be dropped or race
+        /// the joiner's handler setup. The joiner verifies it against the network
+        /// pubkey before adopting (see `admin_grant_key_valid`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direct_key: Option<[u8; 32]>,
     },
     /// Notify connected members that the signed group blob changed. Payload-free:
     /// a *trigger only*. Receivers reconverge from the network-key-signed pkarr
@@ -564,6 +574,7 @@ mod tests {
                 device_cert: None,
                 collision_index: 0,
             }],
+            direct_key: Some([7u8; 32]),
         };
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
