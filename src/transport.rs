@@ -56,7 +56,9 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// `ControlMsg::SignedRecord`, by which a coordinator hands a (re)connecting member
 /// its current network-key-signed pkarr record over the mesh so the member
 /// converges to the live roster in ~1s instead of waiting out a stale DHT lookup
-/// plus the 60s group poll.
+/// plus the 60s group poll; and `Welcome.direct_key`, which folds a direct
+/// (`ray connect`) network's co-coordinator key grant into the join handshake's
+/// Welcome (deterministic) instead of a separate best-effort `AdminGrant` stream.
 pub const MESH_PROTOCOL_VERSION: u32 = 2;
 
 /// The single mesh ALPN. Unlike the old per-network `rayfish/net/<v>/<prefix>`,

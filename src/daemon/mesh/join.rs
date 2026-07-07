@@ -28,6 +28,11 @@ enum HandshakeOutcome {
     Admitted {
         members: Vec<crate::membership::Member>,
         approved: Vec<ApprovedEntry>,
+        /// The per-network secret key, present only when we were admitted onto a
+        /// `direct` (`ray connect`) network as a co-coordinator. Already verified
+        /// against the network pubkey (`admin_grant_key_valid`); adopting it makes
+        /// this node a key-holder so `finalize_join` registers it as a coordinator.
+        direct_key: Option<[u8; 32]>,
     },
     Pending,
 }
@@ -106,7 +111,7 @@ pub(crate) async fn join_mesh_shared(
     let my_identity = identity.local_identity();
     let my_ip = identity.local_ip();
 
-    let (members, approved) = match perform_join_handshake(
+    let (members, approved, direct_key) = match perform_join_handshake(
         &initial_conn,
         ep,
         network_name,
@@ -122,7 +127,11 @@ pub(crate) async fn join_mesh_shared(
     )
     .await?
     {
-        HandshakeOutcome::Admitted { members, approved } => (members, approved),
+        HandshakeOutcome::Admitted {
+            members,
+            approved,
+            direct_key,
+        } => (members, approved, direct_key.map(SecretKey::from)),
         HandshakeOutcome::Pending => return Ok(JoinResult::Pending),
     };
 
@@ -136,6 +145,7 @@ pub(crate) async fn join_mesh_shared(
         &my_hostname,
         auto_accept_firewall,
         auto_accept_files,
+        direct_key.as_ref(),
     )?;
 
     let _ = disconnect_tx; // readers use the daemon-wide sender via `ctx`.
@@ -150,6 +160,7 @@ pub(crate) async fn join_mesh_shared(
         suggested_firewall,
         reusable_keys,
         &blob_store,
+        direct_key.as_ref(),
     )
     .await;
 
@@ -259,6 +270,10 @@ fn persist_join_config(
     my_hostname: &Option<String>,
     auto_accept_firewall: bool,
     auto_accept_files: bool,
+    // Present when we joined a `direct` network as a co-coordinator: persist the
+    // network key so we survive a restart as a key-holder (a plain member persists
+    // `None`).
+    direct_key: Option<&SecretKey>,
 ) -> Result<()> {
     let persisted_hostname = members
         .iter()
@@ -292,7 +307,7 @@ fn persist_join_config(
         pending_hostname,
         members: to_member_entries(members.iter()),
         approved: to_approved_entries(approved.iter()),
-        network_secret_key: None,
+        network_secret_key: direct_key.cloned(),
         network_public_key: Some(net_pubkey),
         transport: None,
         auto_accept_firewall,
@@ -308,6 +323,7 @@ fn persist_join_config(
 /// Build the in-memory `NetworkState` cell for a joined member from the admitted
 /// roster + blob-derived firewall/keys, refresh its snapshot, and seed the local
 /// blob store with those bytes.
+#[allow(clippy::too_many_arguments)]
 async fn build_member_state(
     members: &[crate::membership::Member],
     approved: Vec<ApprovedEntry>,
@@ -316,12 +332,16 @@ async fn build_member_state(
     suggested_firewall: SuggestedFirewall,
     reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
     blob_store: &FsStore,
+    // Present when we joined a `direct` network as a co-coordinator: seed the live
+    // state with the network key so `finalize_join` registers us as a coordinator
+    // (starts a publisher, admits future peers). `None` for a plain member.
+    direct_key: Option<&SecretKey>,
 ) -> SharedNetworkState {
     let mut ns = NetworkState {
         members: MemberList::from_members(members.to_vec()),
         approved: ApprovedList::from_entries(approved),
         snapshot: None,
-        network_secret_key: None,
+        network_secret_key: direct_key.cloned(),
         network_public_key: net_pubkey,
         network_name: Some(network_name.to_string()),
         mode: GroupMode::Restricted,
@@ -432,7 +452,11 @@ async fn perform_join_handshake(
             .await
             .context("timeout awaiting join response")??;
         match msg {
-            ControlMsg::Welcome { members, approved } => {
+            ControlMsg::Welcome {
+                members,
+                approved,
+                direct_key,
+            } => {
                 tracing::info!(network = %network_name, "welcomed to network");
                 if let Some(existing) = members
                     .iter()
@@ -444,7 +468,21 @@ async fn perform_join_handshake(
                         existing.identity
                     );
                 }
-                Ok(HandshakeOutcome::Admitted { members, approved })
+                // A direct-network Welcome grants us the network key (co-coordinator).
+                // Self-authenticating: adopt it only if its public half matches the
+                // network pubkey, so a forged key from a non-coordinator is dropped.
+                let direct_key = direct_key.filter(|k| {
+                    let valid = admin_grant_key_valid(*k, net_pubkey);
+                    if !valid {
+                        tracing::warn!(network = %network_name, "direct-network key in Welcome does not match network pubkey; ignoring");
+                    }
+                    valid
+                });
+                Ok(HandshakeOutcome::Admitted {
+                    members,
+                    approved,
+                    direct_key,
+                })
             }
             ControlMsg::JoinPending => {
                 tracing::info!(network = %network_name, "join pending operator approval");
@@ -484,7 +522,13 @@ async fn perform_join_handshake(
             }
             None => (persisted_roster(network_name), vec![]),
         };
-        Ok(HandshakeOutcome::Admitted { members, approved })
+        // Reconnect/restore: a co-coordinator's key is restored from config on the
+        // cold path, never re-granted here.
+        Ok(HandshakeOutcome::Admitted {
+            members,
+            approved,
+            direct_key: None,
+        })
     }
 }
 
