@@ -159,7 +159,7 @@ pub(crate) async fn reconverge_and_apply(
         reverse_table,
         device_user_map,
         pruned_peers,
-        self_unpair_tx,
+        registry,
         ..
     } = ctx;
     let current = state.read().unwrap().snapshot.as_ref().map(|s| s.hash);
@@ -181,7 +181,10 @@ pub(crate) async fn reconverge_and_apply(
             && self_is_nullified(cert, &roster, &nullifiers)
         {
             tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-            let _ = self_unpair_tx.try_send(());
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let _ = registry.unpair_self().await;
+            });
             return;
         }
         drain_pending_rename(
@@ -214,7 +217,10 @@ pub(crate) async fn reconverge_and_apply(
         && self_is_nullified(cert, &data.members, &data.nullifiers)
     {
         tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-        let _ = self_unpair_tx.try_send(());
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            let _ = registry.unpair_self().await;
+        });
         return;
     }
     // Two coordinators can independently admit a fresh joiner at the same
@@ -304,7 +310,7 @@ pub(crate) fn prune_departed_peers(
 ) {
     // Device keys nullified on this network (`ray unpair`), read once.
     let nullifiers = state.read().unwrap().nullifiers.clone();
-    for (peer_id, ip, conn) in peers.peers_for_network_with_conn(network_name) {
+    for (peer_id, ip, _conn) in peers.peers_for_network_with_conn(network_name) {
         // Membership is by roster identity, which for a paired peer is its user
         // identity, not the transport id the PeerTable is keyed on. Check both.
         let user_id = device_user_map.resolve(&peer_id);
@@ -322,11 +328,18 @@ pub(crate) fn prune_departed_peers(
         }
         tracing::info!(peer = %peer_id.fmt_short(), network = %network_name, "pruning peer no longer in roster");
         pruned_peers.insert((network_name.to_string(), peer_id));
-        conn.close(
-            VarInt::from_u32(forward::KICK_CODE),
-            b"removed from network",
-        );
-        peers.remove_peer_from_network(&ip, &derive_ipv6(&peer_id), network_name);
+        // One connection carries every shared network, so only close it when this
+        // was the peer's last network with us; otherwise just drop this network's
+        // route and leave the peer reachable on the others (`remove_peer_from_network`
+        // returns the connection iff its network set emptied).
+        if let Some(conn) =
+            peers.remove_peer_from_network(&ip, &derive_ipv6(&peer_id), network_name)
+        {
+            conn.close(
+                VarInt::from_u32(forward::KICK_CODE),
+                b"removed from network",
+            );
+        }
     }
 }
 
@@ -419,14 +432,19 @@ pub(crate) fn spawn_group_poller(
         peers,
         blob_store,
         firewall: fw,
-        self_unpair_tx,
+        registry,
         ..
     } = ctx;
     tokio::spawn(async move {
+        // `interval` fires its first tick immediately, so the poller does an
+        // at-start resolve (catching a blob that changed while we were offline or
+        // mid-restart) and then settles into the 60s cadence. Without this the
+        // first re-check was a full 60s after boot.
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(60)) => {},
+                _ = tick.tick() => {},
             }
 
             let current_hash = {
@@ -448,77 +466,129 @@ pub(crate) fn spawn_group_poller(
 
             tracing::info!(old = ?current_hash, new = %remote_hash, "group blob changed");
 
-            // Fetch the verified blob from any connected peer *or* the record's
-            // seed peers. Including the seeds is essential: a node that has been
-            // isolated (e.g. an unpaired device the coordinator already severed)
-            // has no connected peers, so a connected-only fetch could never
-            // discover its own removal/nullification.
-            let Some(data) = fetch_verified_blob(
-                &endpoint,
-                &blob_store,
-                &peers,
-                remote_hash,
-                &network_name,
-                &seed_peers,
-            )
-            .await
-            else {
-                tracing::warn!("could not fetch updated group blob from any peer");
-                continue;
-            };
-
-            // Self-unpair: our own primary listed this device in the signed blob's
-            // nullifiers (`ray unpair`). Tear ourselves out even though we never
-            // received `ControlMsg::Unpaired` (we were offline/severed). Rides the
-            // signed blob, so it needs no live mesh link. See `self_is_nullified`.
-            if let Some(cert) = crate::identity::load_device_cert().ok().flatten()
-                && self_is_nullified(&cert, &data.members, &data.nullifiers)
-            {
-                tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-                let _ = self_unpair_tx.try_send(());
+            if matches!(
+                fetch_and_apply_blob(
+                    &endpoint,
+                    &blob_store,
+                    &peers,
+                    &fw,
+                    &registry,
+                    &state,
+                    &network_name,
+                    remote_hash,
+                    &seed_peers,
+                )
+                .await,
+                ReconvergeOutcome::Departed
+            ) {
                 break;
             }
-
-            // Reconcile: find removed peers
-            let old_members: Vec<EndpointId> = {
-                let s = state.read().unwrap();
-                s.members.all().iter().map(|m| m.identity).collect()
-            };
-            let new_member_ids: std::collections::HashSet<EndpointId> =
-                data.members.iter().map(|m| m.identity).collect();
-
-            for old_id in &old_members {
-                if !new_member_ids.contains(old_id) {
-                    let s = state.read().unwrap();
-                    if let Some(member) = s.members.get(old_id) {
-                        peers.remove(&member.ip, &derive_ipv6(old_id));
-                        tracing::info!(peer = %old_id.fmt_short(), "removed kicked peer");
-                    }
-                }
-            }
-
-            let my_id = endpoint.id();
-            if !new_member_ids.contains(&my_id)
-                && !data.approved.iter().any(|a| a.identity == my_id)
-            {
-                tracing::warn!("we have been removed from the network");
-                break;
-            }
-
-            // Update state and re-materialize suggested firewall rules from the
-            // freshly verified blob. Suggestions ride in the blob, so they are
-            // refreshed here.
-            {
-                let mut s = state.write().unwrap();
-                s.members = MemberList::from_members(data.members.clone());
-                s.approved = ApprovedList::from_entries(data.approved.clone());
-                s.suggested_firewall = data.suggested_firewall.clone();
-                s.nullifiers = data.nullifiers.clone();
-                s.refresh_snapshot();
-            }
-            apply_suggested_firewall(&fw, endpoint.id(), &network_name, &state);
         }
     })
+}
+
+/// Outcome of applying a verified group blob at `remote_hash`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReconvergeOutcome {
+    /// Roster (and suggested firewall) updated from the new blob.
+    Applied,
+    /// The blob could not be fetched from any peer or seed; nothing changed.
+    Unfetched,
+    /// This node is no longer part of the network (kicked, or its own primary
+    /// nullified this device). The caller should stop polling this network.
+    Departed,
+}
+
+/// Fetch the verified group blob for `remote_hash` (from any connected peer or the
+/// record's seed peers) and apply it: honor a self-nullification, prune removed
+/// peers, detect our own removal, and refresh the roster + suggested firewall.
+///
+/// Shared by the 60s group poller and the `SignedRecord` fast path (a coordinator
+/// hands a reconnecting member the current signed record over the mesh), so both
+/// converge through identical, verified logic. The hash always arrives from a
+/// network-key-signed record; the blob itself is verified in `fetch_verified_blob`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fetch_and_apply_blob(
+    endpoint: &Endpoint,
+    blob_store: &FsStore,
+    peers: &PeerTable,
+    fw: &SharedFirewall,
+    registry: &Arc<NetworkRegistry>,
+    state: &SharedNetworkState,
+    network_name: &str,
+    remote_hash: blake3::Hash,
+    seed_peers: &[EndpointId],
+) -> ReconvergeOutcome {
+    // Fetch the verified blob from any connected peer *or* the record's seed
+    // peers. Including the seeds is essential: a node that has been isolated
+    // (e.g. an unpaired device the coordinator already severed) has no connected
+    // peers, so a connected-only fetch could never discover its own
+    // removal/nullification.
+    let Some(data) = fetch_verified_blob(
+        endpoint,
+        blob_store,
+        peers,
+        remote_hash,
+        network_name,
+        seed_peers,
+    )
+    .await
+    else {
+        tracing::warn!("could not fetch updated group blob from any peer");
+        return ReconvergeOutcome::Unfetched;
+    };
+
+    // Self-unpair: our own primary listed this device in the signed blob's
+    // nullifiers (`ray unpair`). Tear ourselves out even though we never
+    // received `ControlMsg::Unpaired` (we were offline/severed). Rides the
+    // signed blob, so it needs no live mesh link. See `self_is_nullified`.
+    if let Some(cert) = crate::identity::load_device_cert().ok().flatten()
+        && self_is_nullified(&cert, &data.members, &data.nullifiers)
+    {
+        tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            let _ = registry.unpair_self().await;
+        });
+        return ReconvergeOutcome::Departed;
+    }
+
+    // Reconcile: find removed peers
+    let old_members: Vec<EndpointId> = {
+        let s = state.read().unwrap();
+        s.members.all().iter().map(|m| m.identity).collect()
+    };
+    let new_member_ids: std::collections::HashSet<EndpointId> =
+        data.members.iter().map(|m| m.identity).collect();
+
+    for old_id in &old_members {
+        if !new_member_ids.contains(old_id) {
+            let s = state.read().unwrap();
+            if let Some(member) = s.members.get(old_id) {
+                peers.remove(&member.ip, &derive_ipv6(old_id));
+                tracing::info!(peer = %old_id.fmt_short(), "removed kicked peer");
+            }
+        }
+    }
+
+    let my_id = endpoint.id();
+    if !new_member_ids.contains(&my_id) && !data.approved.iter().any(|a| a.identity == my_id) {
+        tracing::warn!("we have been removed from the network");
+        return ReconvergeOutcome::Departed;
+    }
+
+    // Update state and re-materialize suggested firewall rules from the freshly
+    // verified blob. Suggestions ride in the blob, so they are refreshed here.
+    {
+        let mut s = state.write().unwrap();
+        s.members = MemberList::from_members(data.members.clone());
+        s.approved = ApprovedList::from_entries(data.approved.clone());
+        s.suggested_firewall = data.suggested_firewall.clone();
+        s.nullifiers = data.nullifiers.clone();
+        s.refresh_snapshot();
+    }
+    apply_suggested_firewall(fw, endpoint.id(), network_name, state);
+    ReconvergeOutcome::Applied
 }
 
 /// Current Unix time in seconds. Reusable-key expiry uses wall-clock time (the

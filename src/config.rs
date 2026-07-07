@@ -444,7 +444,7 @@ pub struct AppConfig {
     /// coordinator's durable nullifier seed: it survives a restart and is unioned
     /// into every coordinated network's signed blob (`GroupBlob.nullifiers`) at seal
     /// time, so a listed device's cert is rejected mesh-wide. A device is removed
-    /// here when it re-pairs (re-auth). See `MeshManager::unpair`/`reauth_device`.
+    /// here when it re-pairs (re-auth). See `Daemon::unpair`/`reauth_device`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revoked_devices: Vec<String>,
 }

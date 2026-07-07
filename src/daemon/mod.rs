@@ -13,8 +13,8 @@
 //!   (real shutdown / `IpcMessage::Shutdown`).
 //! - **Active VPN state**: the TUN link being *up*, system DNS being
 //!   configured, and the saved networks being connected. This is toggled at
-//!   runtime by [`MeshManager::activate`] / [`MeshManager::deactivate`], driven
-//!   by the `Up` / `Down` IPC commands, and tracked by [`MeshManager::active`].
+//!   runtime by [`Daemon::activate`] / [`Daemon::deactivate`], driven
+//!   by the `Up` / `Down` IPC commands, and tracked by [`Daemon::active`].
 //!
 //! This mirrors Tailscale's split between the always-running `tailscaled`
 //! daemon and the `tailscale up` / `tailscale down` client toggles: `down`
@@ -35,14 +35,15 @@
 //!   that network's background tasks. Because cancellation is one-shot, every
 //!   `activate` mints *fresh* child tokens, so `up → down → up` cycles work.
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
+use iroh_metrics::service::MetricsServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
@@ -50,7 +51,6 @@ use dashmap::{DashMap, DashSet};
 use anyhow::{Context, Result};
 use iroh::address_lookup::PkarrRelayClient;
 use iroh::endpoint::{Connection, Endpoint, VarInt};
-use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{EndpointId, SecretKey};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, HashAndFormat};
@@ -83,9 +83,10 @@ use crate::transport;
 #[cfg(not(target_os = "android"))]
 use crate::tun::{self, check_cgnat_conflict};
 use ray_proto::SuggestedFirewall;
+use smol_str::SmolStr;
 
-// `MeshManager`'s IPC operations are split by domain into the `mesh/` submodule;
-// see `mesh/mod.rs`. Each holds an additional `impl MeshManager` block. Nested a
+// `Daemon`'s IPC operations are split by domain into the `mesh/` submodule;
+// see `mesh/mod.rs`. Each holds an additional `impl Daemon` block. Nested a
 // level down so the module names can be the clean domain names without colliding
 // with the `use crate::{firewall, dns, …}` aliases above.
 mod mesh;
@@ -99,14 +100,30 @@ pub use mesh::run_daemon;
 // `build_headless` is the embedder (mobile) construction entry point.
 pub use mesh::build_headless;
 
-/// Legacy name for [`MeshManager`], kept so embedders (`ray-mobile`) that were
+/// Legacy name for [`Daemon`], kept so embedders (`ray-mobile`) that were
 /// written against `DaemonState` compile unchanged after the daemon refactor.
-pub type DaemonState = MeshManager;
+pub type DaemonState = Daemon;
+
+// The process-lifetime network + storage foundation every service depends on.
+mod foundation;
+pub(crate) use foundation::Transport;
+
+// The per-peer mesh connection driver (one connection per peer, frame demux).
+mod connection_manager;
+pub(crate) use connection_manager::{ConnectionManager, MeshDispatch};
+
+// One live mesh connection + its control-plane demux loop, built by the manager.
+mod mesh_connection;
+pub(crate) use mesh_connection::MeshConnection;
+
+// The service that owns the set of active networks (M5 migration seam).
+mod network_registry;
+pub(crate) use network_registry::NetworkRegistry;
 
 // Domain satellites with their own owned state (and ALPN accept arms), held by
-// `MeshManager` as fields rather than loose on the core. See each module.
-mod dns_manager;
-pub(crate) use dns_manager::DnsManager;
+// `Daemon` as fields rather than loose on the core. See each module.
+mod dns_service;
+pub(crate) use dns_service::DnsService;
 
 mod file_service;
 pub(crate) use file_service::FileService;
@@ -126,13 +143,13 @@ const PAIR_ALPN: &[u8] = b"rayfish/pair/1";
 /// background task. Every field is a cheap `Clone` (an `Arc`-backed handle, a
 /// channel sender, or a small wrapper), so the whole bundle is cloned by value
 /// instead of threaded as a dozen separate arguments/struct fields. Built once
-/// per daemon via [`MeshManager::mesh_ctx`]; a new daemon-wide dependency is one
+/// per daemon via [`Daemon::mesh_ctx`]; a new daemon-wide dependency is one
 /// field here rather than one parameter at every call site.
 #[derive(Clone)]
 pub(crate) struct MeshCtx {
     identity: IrohIdentityProvider,
     peers: PeerTable,
-    tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
+    tun_tx: Arc<ArcSwap<mpsc::Sender<Bytes>>>,
     stats: Arc<ForwardMetrics>,
     blob_store: FsStore,
     firewall: SharedFirewall,
@@ -141,36 +158,85 @@ pub(crate) struct MeshCtx {
     device_user_map: peers::DeviceUserMap,
     /// Peers removed from a network's roster (via `ray kick` or a stale-entry
     /// prune during reconverge), keyed by `(network, transport id)`. A member
-    /// closes such a peer's connection but can't see its own close code, so its
-    /// reconnect loop would re-dial the removed peer (which still lists it) and
-    /// re-form the link. The reconnect loop consumes an entry here to skip that
+    /// closes such a peer's connection but can't see its own close code, so the
+    /// connection supervisor would re-dial the removed peer (which still lists it)
+    /// and re-form the link. The supervisor consumes an entry here to skip that
     /// one reconnect. Populated in [`reconverge_and_apply`] and the kick handler.
     pruned_peers: Arc<DashSet<(String, EndpointId)>>,
-    /// Signal from a per-peer control reader that this device's primary sent
-    /// `ControlMsg::Unpaired`. The reader holds only field clones (not the full
-    /// `MeshManager`), so it hands off to the daemon loop, which runs
-    /// [`MeshManager::unpair_self`] (leave all networks + wipe the cert).
-    self_unpair_tx: mpsc::Sender<()>,
+    /// Daemon-wide disconnect channel. Every [`MeshConnection`] reports its peer's
+    /// drop here when its demux loop ends, and a single
+    /// [`NetworkRegistry::run_connection_supervisor`] consumes it. Under one mesh
+    /// connection per identity a drop tears the peer down across every shared
+    /// network at once, so this is node-wide rather than per-network. The channel
+    /// keeps disconnect handling serial (one check-then-act at a time).
+    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+    /// The network-owning service. Control readers reach it through the ctx to
+    /// run network ops directly (e.g. `unpair_self` on a `ControlMsg::Unpaired` or
+    /// a self-nullify during reconverge) instead of signalling the daemon loop.
+    registry: Arc<NetworkRegistry>,
 }
 
 impl MeshCtx {
     /// Build the per-peer data-plane bundle for `forward::spawn_peer_reader`,
-    /// combining this context's shared handles with the caller's per-connection
-    /// `disconnect_tx`/`token`.
-    fn forward_ctx(
-        &self,
-        disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
-        token: CancellationToken,
-    ) -> forward::ForwardCtx {
+    /// combining this context's shared handles with the caller's `token`. Called
+    /// by [`MeshConnection`], which owns the reader for the connection's lifetime.
+    pub(crate) fn forward_ctx(&self, token: CancellationToken) -> forward::ForwardCtx {
         forward::ForwardCtx {
             firewall: self.firewall.clone(),
             tun_tx: self.tun_tx.clone(),
-            disconnect_tx,
             token,
             stats: self.stats.clone(),
             device_user_map: self.device_user_map.clone(),
         }
     }
+
+    /// Register a peer's connection for `network` in the peer table: add its route
+    /// (and, on the first shared network, its audit connect event). The
+    /// connection's single data reader is not started here; [`MeshConnection`] owns
+    /// it for the connection's lifetime. Returns whether the stored connection is
+    /// new (the first shared network, or a reconnect that replaced a different
+    /// connection), which the dial side uses to decide whether to drive a fresh
+    /// control demux.
+    pub(crate) fn register_peer_conn(
+        &self,
+        conn: &Connection,
+        peer_id: EndpointId,
+        ip: Ipv4Addr,
+        network: &str,
+    ) -> bool {
+        let ipv6 = derive_ipv6(&peer_id);
+        self.peers.add(ip, ipv6, conn.clone(), peer_id, network)
+    }
+}
+
+/// Announce our outbound handle table to a peer over `conn` so it can decode the
+/// datagrams we tag for each shared network. Full snapshot (idempotent replace on
+/// the receiver); connection-level (`net = None`). Resolves each local network
+/// name to its public key from config, which is cheap and only runs when a
+/// connection's shared-network set changes.
+pub(crate) async fn announce_network_handles(
+    peers: &PeerTable,
+    conn: &Connection,
+    peer_ip: Ipv4Addr,
+) {
+    let entries: Vec<control::NetworkHandle> = peers
+        .outbound_handles(&peer_ip)
+        .into_iter()
+        .filter_map(|(name, handle)| {
+            let pubkey = config::load_network(&name)
+                .ok()
+                .flatten()
+                .and_then(|n| n.network_public_key)?;
+            Some(control::NetworkHandle {
+                network: pubkey,
+                handle,
+            })
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    let _ = open_and_send(conn, None, &ControlMsg::NetworkHandles { entries }).await;
 }
 
 /// Project a roster's `Member`s into the persistable `config::MemberEntry` form
@@ -331,10 +397,10 @@ pub struct NetworkHandle {
 /// and background task. Holds both the infrastructure that lives for the whole
 /// process and the handles for the currently-active networks. See the
 /// module-level docs for the two-lifecycle model.
-/// Handles for the packet-forwarding tasks a [`MeshManager::attach_tun`] call
+/// Handles for the packet-forwarding tasks a [`Daemon::attach_tun`] call
 /// spawns (the TUN writer and the `run_mesh` reader loop), plus a dedicated
 /// cancellation token so the data plane can be stopped independently of a full
-/// daemon shutdown (used by [`MeshManager::detach_tun`] / `ray-mobile`'s `down`).
+/// daemon shutdown (used by [`Daemon::detach_tun`] / `ray-mobile`'s `down`).
 struct TunTasks {
     /// Cancels the `run_mesh` reader loop without touching `shutdown_token`.
     cancel: CancellationToken,
@@ -344,10 +410,13 @@ struct TunTasks {
     mesh: JoinHandle<()>,
 }
 
-pub struct MeshManager {
-    endpoint: Endpoint,
-    identity: IrohIdentityProvider,
-    peers: PeerTable,
+pub struct Daemon {
+    /// The process-lifetime foundation (endpoint, identity, blob store, metrics,
+    /// contact id), grouped so extracted services can depend on `Arc<Transport>`
+    /// instead of the whole daemon. During the service-decomposition transition
+    /// this holds clones of the same handles the loose fields below still use;
+    /// the loose fields go away when `Daemon` is dissolved.
+    transport: Arc<Transport>,
     stats: Arc<ForwardMetrics>,
     /// When the daemon process started, used for uptime in diagnostics.
     start: Instant,
@@ -359,14 +428,19 @@ pub struct MeshManager {
     /// the next `attach_tun` swaps in a new sender feeding a fresh writer. On
     /// desktop the daemon attaches exactly once, so the cell holds one sender for
     /// its whole life and is never swapped.
-    tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
-    networks: Arc<DashMap<String, NetworkHandle>>,
+    tun_tx: Arc<ArcSwap<mpsc::Sender<Bytes>>>,
+    /// The network-owning service. Owns the `networks` map, `peers`, `firewall`,
+    /// `device_user_map`, and `pruned_peers`; Daemon reaches all of them
+    /// through `self.registry` rather than keeping its own copies. The
+    /// daemon delegates coordinator registration / promotion to it, and hands
+    /// clones to services (FileService) and control readers (MemberAcceptState)
+    /// so they call it directly instead of signalling the daemon over a channel.
+    registry: Arc<NetworkRegistry>,
     shutdown_token: CancellationToken,
-    blob_store: FsStore,
-    firewall: SharedFirewall,
     protocol_router: Arc<ProtocolRouter>,
-    /// Magic DNS naming tables, resolver, and OS-DNS configurator (see [`DnsManager`]).
-    dns: DnsManager,
+    /// Magic DNS leaf service: naming tables, resolver, and OS-DNS configurator
+    /// (see [`DnsService`]). Shared as `Arc` so extracted consumers can hold it.
+    dns: Arc<DnsService>,
     mdns_enabled: bool,
     /// Whether this node opted into automatic stable updates (`ray auto-update
     /// on` / `ray install --auto-update`). Read at startup; when set, `run_daemon`
@@ -374,19 +448,21 @@ pub struct MeshManager {
     auto_update: bool,
     /// Name of the OS TUN device (desktop) or a placeholder until a packet
     /// interface is attached. Interior-mutable because on embedders (mobile) the
-    /// interface is attached after construction via [`MeshManager::attach_tun`],
-    /// while on desktop it is set once at boot.
-    tun_name: Mutex<String>,
+    /// interface is attached after construction via [`Daemon::attach_tun`],
+    /// while on desktop it is set once at boot. `Arc` so [`NetworkRegistry`] shares
+    /// it for the leave/teardown DNS search-domain refresh.
+    tun_name: Arc<ArcSwap<String>>,
     /// Handles for the packet-forwarding tasks spawned by
-    /// [`MeshManager::attach_tun`], kept so a future `down()`/detach can stop them.
+    /// [`Daemon::attach_tun`], kept so a future `down()`/detach can stop them.
     tun_tasks: Mutex<Option<TunTasks>>,
-    /// Promotion-channel receiver drained by [`serve_ipc`]. Stored here so the
-    /// headless builder can construct the daemon and hand the receiver back to
-    /// [`run_daemon`] afterwards.
-    promote_rx: Mutex<Option<mpsc::Receiver<String>>>,
-    /// Prometheus metrics-server guard. Kept alive for the daemon's whole lifetime
-    /// (dropping it stops the export); `None` if the server failed to bind.
-    _metrics_server: Mutex<Option<iroh_metrics::service::MetricsServer>>,
+    /// Prometheus metrics-server guard. Owned so it lives for the daemon's whole
+    /// lifetime (dropping it stops the export); `None` if the server failed to bind.
+    _metrics_server: Option<MetricsServer>,
+    /// The iroh protocol [`Router`](iroh::protocol::Router): owns the endpoint
+    /// accept loop and dispatches each inbound connection by ALPN to its handler.
+    /// Owned for the daemon's whole lifetime (it aborts on drop); `run_daemon`
+    /// `shutdown()`s it on exit (which also closes the endpoint).
+    router: iroh::protocol::Router,
     /// File-transfer + pairing state and ALPN accept arms (see [`FileService`]).
     /// Shared with [`ProtocolRouter`], which runs the accept arms.
     files: Arc<FileService>,
@@ -394,10 +470,6 @@ pub struct MeshManager {
     /// [`ProtocolRouter`], which runs the accept arm.
     connect: Arc<ConnectService>,
     device_cert: Option<control::DeviceCert>,
-    device_user_map: peers::DeviceUserMap,
-    /// Peers removed from a roster whose reconnect should be suppressed once.
-    /// Shared into [`MeshCtx::pruned_peers`]; see that field for the mechanism.
-    pruned_peers: Arc<DashSet<(String, EndpointId)>>,
     /// This node's contact id (`ray connect`): the public half of the rotatable
     /// contact key. The secret lives in config (read fresh by the publisher and
     /// `rotate_contact` so rotation needs no restart); only the public id is
@@ -413,30 +485,12 @@ pub struct MeshManager {
     #[cfg(feature = "desktop")]
     ssh_authz: crate::ssh::SshAuthz,
     /// Cancellation token for the running SSH listeners (`None` when off / on
-    /// standby). Set by [`MeshManager::start_ssh`], cleared by `stop_ssh`.
+    /// standby). Set by [`Daemon::start_ssh`], cleared by `stop_ssh`.
     // The only readers/writers (`start_ssh`/`stop_ssh`) are desktop-only, so on a
     // `--no-default-features` (Android) build the field is inert; silence the
     // resulting dead-code warning there rather than dropping the field.
     #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
     ssh_token: Mutex<Option<CancellationToken>>,
-    /// Promotion signal: a co-coordinator's per-peer control reader sends the
-    /// network name here after persisting an `AdminGrant` key, and the main
-    /// daemon loop ([`serve_ipc`]) drains it into
-    /// [`MeshManager::promote_to_coordinator`]. The reader holds only field
-    /// clones (not the full `MeshManager`), so it can't promote itself, hence
-    /// the channel hand-off to the loop that does hold the `Arc<MeshManager>`.
-    promote_tx: mpsc::Sender<String>,
-    /// Self-unpair signal (see [`MeshCtx::self_unpair_tx`]): a control reader that
-    /// received `ControlMsg::Unpaired` from our primary sends here, and the daemon
-    /// loop drains it into [`MeshManager::unpair_self`]. Same reader-can't-hold-the
-    /// -`Arc` hand-off pattern as `promote_tx`.
-    self_unpair_tx: mpsc::Sender<()>,
-    /// Receiver half of the self-unpair channel, taken once by the daemon loop.
-    self_unpair_rx: Mutex<Option<mpsc::Receiver<()>>>,
-    /// Receiver half of the re-auth channel (see [`FileService`]): the pairing
-    /// accept arm sends a re-paired device's key here, and the daemon loop drains
-    /// it into [`MeshManager::reauth_device`] to clear the device's nullifier.
-    reauth_rx: Mutex<Option<mpsc::Receiver<EndpointId>>>,
 }
 
 /// Map key-holding status to a [`NetworkRole`].
@@ -472,7 +526,7 @@ fn should_promote(current: NetworkRole) -> bool {
     !current.is_coordinator()
 }
 
-impl MeshManager {
+impl Daemon {
     /// The device cert to present when joining, preferring the on-disk copy so a
     /// join issued right after pairing (same process, no restart) carries the
     /// freshly stored cert rather than the value loaded at startup.
@@ -497,43 +551,21 @@ impl MeshManager {
     /// the old endpoint's connections outlive `stop`, so a coordinator keeps the
     /// stale session while the rebuilt endpoint (same node key) comes up and the
     /// device shows offline until the race clears. Mirrors the shutdown tail of
-    /// `run_daemon`. After this the `MeshManager` is spent; build a new one to
+    /// `run_daemon`. After this the `Daemon` is spent; build a new one to
     /// come back online.
     pub async fn shutdown_and_close(&self) {
         self.shutdown_token.cancel();
-        self.endpoint.close().await;
+        self.transport.endpoint.close().await;
     }
 
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
     /// handlers and background tasks. Every field is a cheap `Clone`.
-    pub(crate) fn mesh_ctx(&self) -> MeshCtx {
-        MeshCtx {
-            identity: self.identity.clone(),
-            peers: self.peers.clone(),
-            tun_tx: self.tun_tx.clone(),
-            stats: self.stats.clone(),
-            blob_store: self.blob_store.clone(),
-            firewall: self.firewall.clone(),
-            hostname_table: self.dns.hostname_table.clone(),
-            reverse_table: self.dns.reverse_table.clone(),
-            device_user_map: self.device_user_map.clone(),
-            pruned_peers: self.pruned_peers.clone(),
-            self_unpair_tx: self.self_unpair_tx.clone(),
-        }
-    }
-
-    pub(crate) async fn refresh_alpns(&self) {
-        let alpns = self.protocol_router.alpns();
-        let alpn_strs: Vec<String> = alpns
-            .iter()
-            .map(|a| String::from_utf8_lossy(a).to_string())
-            .collect();
-        tracing::info!(alpns = ?alpn_strs, "refreshing ALPNs");
-        self.endpoint.set_alpns(alpns);
-
-        let network_names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
-        let tun_name = self.tun_name.lock().unwrap().clone();
-        dns_config::update_search_domains(&network_names, &tun_name).await;
+    /// The process-lifetime foundation (endpoint, identity, blob store, metrics,
+    /// contact id). Extracted services depend on this `Arc<Transport>` rather
+    /// than the whole daemon. First consumed in M2.
+    #[allow(dead_code)]
+    pub(crate) fn transport(&self) -> Arc<Transport> {
+        self.transport.clone()
     }
 
     /// Attach a packet interface to a headless [`DaemonState`] and start the data
@@ -569,8 +601,8 @@ impl MeshManager {
         let cancel = self.shutdown_token.child_token();
         let writer_handle = forward::spawn_tun_writer(writer, new_rx, self.active.clone());
         let mesh_handle = {
-            let peers = self.peers.clone();
-            let firewall = self.firewall.clone();
+            let peers = self.registry.peers.clone();
+            let firewall = self.registry.firewall.clone();
             let cancel = cancel.clone();
             let stats = self.stats.clone();
             let resolver = self.dns.resolver.clone();
@@ -630,7 +662,7 @@ impl MeshManager {
     }
 
     /// Register a [`CoordinatorAcceptState`] handler for `network` and update
-    /// the network's role in `self.networks` to [`NetworkRole::Coordinator`].
+    /// the network's role in `self.registry.networks` to [`NetworkRole::Coordinator`].
     ///
     /// Calling this at create, restore, and admin-promotion sites keeps the
     /// coordinator-registration logic in one place. The method is synchronous
@@ -638,69 +670,6 @@ impl MeshManager {
     /// swap; the caller is responsible for spawning the `disconnect_rx` cleanup
     /// task **before** calling this so the channel is live when the first
     /// incoming connection arrives.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn register_coordinator_handler(
-        &self,
-        network: &str,
-        state: SharedNetworkState,
-        invite_lock: Arc<tokio::sync::Mutex<()>>,
-        dht_notify: Option<Arc<Notify>>,
-        network_key: EndpointId,
-        disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
-        cancel: CancellationToken,
-    ) {
-        self.protocol_router.register(
-            transport::network_alpn(&network_key),
-            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-                ctx: self.mesh_ctx(),
-                network_name: network.to_string(),
-                state,
-                disconnect_tx,
-                token: cancel,
-                dht_notify,
-                invite_lock,
-                pending_pongs: self.protocol_router.pending_pongs.clone(),
-            })),
-        );
-        // Flip the stored role so `ray status` reports Coordinator immediately.
-        if let Some(mut handle) = self.networks.get_mut(network) {
-            handle.role = NetworkRole::Coordinator;
-        }
-    }
-
-    /// Re-register the [`CoordinatorAcceptState`] for `network` so a node just
-    /// granted the per-network key (via `AdminGrant`) can admit fresh joiners
-    /// instead of silently dropping their `JoinRequest`s under
-    /// `AcceptHandler::Member`.
-    ///
-    /// Idempotent: a network already running as coordinator is left untouched
-    /// ([`should_promote`]). The needed [`NetworkHandle`] fields are cloned
-    /// inside a scoped block so the `DashMap` ref is dropped before the
-    /// (synchronous) registration, never held across it.
-    pub(crate) async fn promote_to_coordinator(&self, network: &str) {
-        let parts = {
-            let Some(h) = self.networks.get(network) else {
-                return;
-            };
-            if !should_promote(h.role.clone()) {
-                return;
-            }
-            (
-                h.state.clone(),
-                h.invite_lock.clone(),
-                h.dht_notify.clone(),
-                h.network_key,
-                h.disconnect_tx.clone(),
-                h.cancel.clone(),
-            )
-        }; // DashMap ref dropped before the registration below.
-        self.register_coordinator_handler(
-            network, parts.0, parts.1, parts.2, parts.3, parts.4, parts.5,
-        );
-        self.refresh_alpns().await;
-        tracing::info!(network, "promoted to coordinator accept handler");
-    }
-
     /// Tailscale-style access control. Read-only queries are open to any local
     /// user; mutating commands require the caller to be root or the configured
     /// operator UID; setting the operator itself is root-only. Returns `None`
@@ -822,12 +791,12 @@ impl MeshManager {
                 .await
             }
             IpcMessage::Leave { name } => self.leave_network(&name).await,
-            IpcMessage::Nuke { name, force } => self.nuke_network(&name, force).await,
-            IpcMessage::Kick { network, peer } => self.kick_member(&network, &peer).await,
+            IpcMessage::Nuke { name, force } => self.registry.nuke_network(&name, force).await,
+            IpcMessage::Kick { network, peer } => self.registry.kick_member(&network, &peer).await,
             IpcMessage::SetEphemeral { network, ttl_secs } => {
-                self.set_ephemeral(&network, ttl_secs).await
+                self.registry.set_ephemeral(&network, ttl_secs).await
             }
-            IpcMessage::GetEphemeral { network } => self.get_ephemeral(&network),
+            IpcMessage::GetEphemeral { network } => self.registry.get_ephemeral(&network),
             IpcMessage::Status => self.status(),
             IpcMessage::Report => self.build_report(peer_cred),
             IpcMessage::Up { hostname } => self.activate(hostname).await,
@@ -846,36 +815,43 @@ impl MeshManager {
                 peer,
                 network,
             } => {
-                self.firewall_add(
-                    direction,
-                    action,
-                    protocol,
-                    port.as_deref(),
-                    peer.as_deref(),
-                    network.as_deref(),
-                )
-                .await
+                self.registry
+                    .firewall_add(
+                        direction,
+                        action,
+                        protocol,
+                        port.as_deref(),
+                        peer.as_deref(),
+                        network.as_deref(),
+                    )
+                    .await
             }
-            IpcMessage::FirewallRemove { index } => self.firewall_remove(index),
-            IpcMessage::FirewallShow => self.firewall_show(),
-            IpcMessage::FirewallDefault { action } => self.firewall_default(action),
-            IpcMessage::FirewallReject { enabled } => self.firewall_reject(enabled),
-            IpcMessage::FirewallSetEnabled { enabled } => self.firewall_set_enabled(enabled),
+            IpcMessage::FirewallRemove { index } => self.registry.firewall_remove(index),
+            IpcMessage::FirewallShow => self.registry.firewall_show(),
+            IpcMessage::FirewallDefault { action } => self.registry.firewall_default(action),
+            IpcMessage::FirewallReject { enabled } => self.registry.firewall_reject(enabled),
+            IpcMessage::FirewallSetEnabled { enabled } => {
+                self.registry.firewall_set_enabled(enabled)
+            }
             IpcMessage::FirewallSuggest {
                 network,
                 suggestions,
-            } => self.firewall_suggest(&network, suggestions).await,
-            IpcMessage::FirewallSuggestions { network } => self.firewall_suggestions(&network),
-            IpcMessage::FirewallPending { network } => self.firewall_pending(&network),
-            IpcMessage::FirewallAccept { network } => self.firewall_accept(&network),
-            IpcMessage::FirewallDeny { network } => self.firewall_deny(&network),
+            } => self.registry.firewall_suggest(&network, suggestions).await,
+            IpcMessage::FirewallSuggestions { network } => {
+                self.registry.firewall_suggestions(&network)
+            }
+            IpcMessage::FirewallPending { network } => self.registry.firewall_pending(&network),
+            IpcMessage::FirewallAccept { network } => self.registry.firewall_accept(&network),
+            IpcMessage::FirewallDeny { network } => self.registry.firewall_deny(&network),
             IpcMessage::FirewallResolveSuggestions {
                 network,
                 accept,
                 deny,
-            } => self.firewall_resolve_suggestions(&network, &accept, &deny),
+            } => self
+                .registry
+                .firewall_resolve_suggestions(&network, &accept, &deny),
             IpcMessage::FirewallAutoAccept { network, enabled } => {
-                self.firewall_auto_accept(&network, enabled)
+                self.registry.firewall_auto_accept(&network, enabled)
             }
             IpcMessage::FilesAutoAccept { network, enabled } => {
                 self.files_auto_accept(&network, enabled).await
@@ -895,12 +871,16 @@ impl MeshManager {
                 network,
                 identity,
                 alias,
-            } => self.set_alias(&network, &identity, &alias),
-            IpcMessage::AliasRemove { network, alias } => self.remove_alias(&network, &alias),
-            IpcMessage::AliasList { network } => self.list_aliases(&network),
+            } => self.registry.set_alias(&network, &identity, &alias),
+            IpcMessage::AliasRemove { network, alias } => {
+                self.registry.remove_alias(&network, &alias)
+            }
+            IpcMessage::AliasList { network } => self.registry.list_aliases(&network),
             IpcMessage::SendFile { path, peer } => self.send_file(&path, &peer).await,
             IpcMessage::ListFiles => self.list_files(),
-            IpcMessage::AcceptFile { id, output } => self.accept_file(id, output, peer_cred).await,
+            IpcMessage::AcceptFile { id, output } => {
+                self.files.accept_file(id, output, peer_cred).await
+            }
             IpcMessage::StartPairing => self.start_pairing(),
             IpcMessage::PairWithDevice {
                 endpoint_id,
@@ -915,16 +895,23 @@ impl MeshManager {
                 hostname,
                 reusable,
             } => {
-                self.invite_create(&network, expires_secs, hostname, reusable)
+                self.registry
+                    .invite_create(&network, expires_secs, hostname, reusable)
                     .await
             }
-            IpcMessage::InviteList { network } => self.invite_list(&network).await,
-            IpcMessage::InviteRevoke { network, id } => self.invite_revoke(&network, &id).await,
-            IpcMessage::Requests { network } => self.list_requests(&network),
-            IpcMessage::AcceptRequest { network, id } => self.accept_request(&network, &id).await,
-            IpcMessage::DenyRequest { network, id } => self.deny_request(&network, &id),
-            IpcMessage::AdminAdd { network, identity } => self.admin_add(&network, &identity).await,
-            IpcMessage::AdminList { network } => self.admin_list(&network),
+            IpcMessage::InviteList { network } => self.registry.invite_list(&network).await,
+            IpcMessage::InviteRevoke { network, id } => {
+                self.registry.invite_revoke(&network, &id).await
+            }
+            IpcMessage::Requests { network } => self.registry.list_requests(&network),
+            IpcMessage::AcceptRequest { network, id } => {
+                self.registry.accept_request(&network, &id).await
+            }
+            IpcMessage::DenyRequest { network, id } => self.registry.deny_request(&network, &id),
+            IpcMessage::AdminAdd { network, identity } => {
+                self.registry.admin_add(&network, &identity).await
+            }
+            IpcMessage::AdminList { network } => self.registry.admin_list(&network),
             IpcMessage::Connect {
                 contact_id,
                 hostname,
@@ -961,7 +948,7 @@ impl MeshManager {
             };
         }
 
-        let (my_ip, is_coord, state, dht_notify) = match self.networks.get(network) {
+        let (my_ip, is_coord, state, dht_notify) = match self.registry.networks.get(network) {
             Some(h) => (
                 h.my_ip,
                 h.role.is_coordinator(),
@@ -975,7 +962,7 @@ impl MeshManager {
             }
         };
 
-        let my_identity = self.endpoint.id();
+        let my_identity = self.transport.endpoint.id();
 
         // The coordinator is authoritative, so it resolves collisions against the
         // roster up front. A member applies its requested name optimistically and
@@ -1009,7 +996,7 @@ impl MeshManager {
             network,
             &new_hostname,
             my_ip,
-            derive_ipv6(&self.identity.local_identity()),
+            derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
 
@@ -1027,19 +1014,26 @@ impl MeshManager {
             let _ = config::save_network(&net);
         }
 
+        // Fast-path the rename to connected peers via `MeshHello`, regardless of
+        // role. A peer *coordinator* only learns a self-rename this way: it acts
+        // on another node's `MeshHello` (routed to `handle_member_hello`, which
+        // applies the rename and republishes) but not on a `MemberSync`/
+        // `BlobUpdated` trigger, and coordinators don't run the group poller. So
+        // without this, a co-coordinator's rename never reached its peer
+        // coordinators (roster + `.ray` DNS both stayed stale on them).
+        self.announce_rename_to_peers(network, my_identity, my_ip, &new_hostname)
+            .await;
         if is_coord {
-            // Authoritative: republish the group blob and push the new roster to
-            // every peer immediately.
+            // Authoritative: republish the signed blob so members reconverge from
+            // the record, and broadcast a `MemberSync` trigger to nudge them.
             tracing::info!(
                 network = %network,
                 hostname = %new_hostname,
                 "coordinator renamed self; republishing blob + broadcasting MemberSync"
             );
-            update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
-            broadcast_member_sync(&self.peers, None).await;
-        } else {
-            self.announce_rename_to_peers(network, my_identity, my_ip, &new_hostname)
-                .await;
+            update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
+            let net_pubkey = state.read().unwrap().network_public_key;
+            broadcast_member_sync(&self.registry.peers, net_pubkey, network, None).await;
         }
 
         let dns_name = format!("{}.{}.{}", new_hostname, network, crate::DNS_DOMAIN);
@@ -1059,7 +1053,8 @@ impl MeshManager {
         my_ip: Ipv4Addr,
         new_hostname: &str,
     ) {
-        let peers = self.peers.peers_for_network_with_conn(network);
+        let peers = self.registry.peers.peers_for_network_with_conn(network);
+        let net_pubkey = self.registry.networks.get(network).map(|h| h.network_key);
         tracing::info!(
             network = %network,
             hostname = %new_hostname,
@@ -1075,7 +1070,7 @@ impl MeshManager {
                     hostname: Some(new_hostname.to_string()),
                     device_cert: self.current_device_cert(),
                 };
-                if control::send_msg(&mut send, &msg).await.is_ok() {
+                if control::send_msg(&mut send, net_pubkey, &msg).await.is_ok() {
                     sent += 1;
                 }
             }
@@ -1089,56 +1084,18 @@ impl MeshManager {
         );
     }
 
-    pub(crate) fn resolve_short_id_any_network(&self, short: &str) -> Option<EndpointId> {
-        if short == "self" {
-            return Some(self.endpoint.id());
-        }
-        for entry in self.networks.iter() {
-            let state = entry.value().state.read().unwrap();
-            if let Some(m) = state
-                .members
-                .all()
-                .iter()
-                .find(|m| m.identity.to_string().starts_with(short))
-            {
-                return Some(m.identity);
-            }
-        }
-        None
-    }
-
     // -----------------------------------------------------------------------
     // Invite + join-request handlers (coordinator only)
     // -----------------------------------------------------------------------
-
-    /// Look up an active network we coordinate, returning its public key and
-    /// invite lock, or an error response if it's absent or we're only a member.
-    #[allow(clippy::result_large_err)]
-    pub(crate) fn coordinator_handle(
-        &self,
-        network: &str,
-    ) -> std::result::Result<(EndpointId, Arc<tokio::sync::Mutex<()>>), IpcMessage> {
-        let Some(handle) = self.networks.get(network) else {
-            return Err(IpcMessage::Error {
-                message: format!("network '{network}' not active"),
-            });
-        };
-        if !handle.role.is_coordinator() {
-            return Err(IpcMessage::Error {
-                message: format!("only the coordinator of '{network}' can manage invites/requests"),
-            });
-        }
-        Ok((handle.network_key, handle.invite_lock.clone()))
-    }
 }
 
-fn guess_mime_type(filename: &str) -> String {
+pub(crate) fn guess_mime_type(filename: &str) -> String {
     mime_guess::from_path(filename)
         .first_or_octet_stream()
         .to_string()
 }
 
-fn format_size(bytes: u64) -> String {
+pub(crate) fn format_size(bytes: u64) -> String {
     humansize::format_size(bytes, humansize::BINARY)
 }
 
@@ -1214,35 +1171,49 @@ fn write_bundle(path: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()>
 /// daemon-initiated control message rides its own `open_bi` (the control readers
 /// drop the request stream's send half, so a reply can't ride it back). Returns
 /// the result so callers can log per-peer failures.
-async fn open_and_send(conn: &Connection, msg: &ControlMsg) -> Result<()> {
+async fn open_and_send(conn: &Connection, net: Option<EndpointId>, msg: &ControlMsg) -> Result<()> {
     let (mut send, _recv) = conn.open_bi().await.context("open control stream")?;
-    control::send_msg(&mut send, msg).await
-}
-
-async fn send_member_sync(conn: &Connection) {
-    let _ = open_and_send(conn, &ControlMsg::MemberSync).await;
+    control::send_msg(&mut send, net, msg).await
 }
 
 /// Reply to a `ray ping` probe by echoing `Pong{nonce}` over a fresh stream
 /// (see [`open_and_send`] for why the reply can't ride the request stream back).
+/// Connection-level (`net = None`): the ping/pong path isn't tied to a network.
 async fn respond_pong(conn: &Connection, nonce: u64) {
-    let _ = open_and_send(conn, &ControlMsg::Pong { nonce }).await;
+    let _ = open_and_send(conn, None, &ControlMsg::Pong { nonce }).await;
 }
 
-async fn broadcast_member_sync(peers: &PeerTable, exclude_ip: Option<Ipv4Addr>) {
-    for (ip, conn) in peers.all_connections() {
+/// Broadcast a `MemberSync` trigger for one network to every peer that shares it,
+/// tagged with the network's public key so each receiver routes it correctly.
+/// A single mesh connection carries several networks now, so this filters to the
+/// network's own peers rather than blasting every connection.
+async fn broadcast_member_sync(
+    peers: &PeerTable,
+    net_pubkey: EndpointId,
+    network_name: &str,
+    exclude_ip: Option<Ipv4Addr>,
+) {
+    for (_id, ip, conn) in peers.peers_for_network_with_conn(network_name) {
         if Some(ip) == exclude_ip {
             continue;
         }
-        if let Err(e) = open_and_send(&conn, &ControlMsg::MemberSync).await {
+        if let Err(e) = open_and_send(&conn, Some(net_pubkey), &ControlMsg::MemberSync).await {
             tracing::warn!(peer_ip = %ip, error = %e, "failed to sync members");
         }
     }
 }
 
-async fn broadcast_control_msg(peers: &PeerTable, msg: &ControlMsg) {
-    for (_ip, conn) in peers.all_connections() {
-        let _ = open_and_send(&conn, msg).await;
+/// Broadcast a network-scoped control message to every peer that shares the
+/// network, tagged with its public key. Same per-network filtering as
+/// [`broadcast_member_sync`].
+async fn broadcast_control_msg(
+    peers: &PeerTable,
+    net_pubkey: EndpointId,
+    network_name: &str,
+    msg: &ControlMsg,
+) {
+    for (_id, _ip, conn) in peers.peers_for_network_with_conn(network_name) {
+        let _ = open_and_send(&conn, Some(net_pubkey), msg).await;
     }
 }
 
@@ -1313,8 +1284,13 @@ mod accept_handler_tests {
 
     /// Throwaway [`MeshCtx`] for accept-handler tests: a fresh blob store and
     /// dummy handles, none of which the constructed handlers exercise here.
-    fn sample_mesh_ctx(identity: IrohIdentityProvider, blob_store: FsStore) -> MeshCtx {
+    fn sample_mesh_ctx(
+        identity: IrohIdentityProvider,
+        blob_store: FsStore,
+        registry: Arc<NetworkRegistry>,
+    ) -> MeshCtx {
         let (tun_tx, _) = tokio::sync::mpsc::channel(1);
+        let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
         MeshCtx {
             identity,
             peers: PeerTable::new(),
@@ -1326,40 +1302,106 @@ mod accept_handler_tests {
             reverse_table: dns::new_reverse_table(),
             device_user_map: peers::DeviceUserMap::new(),
             pruned_peers: Arc::new(DashSet::new()),
-            self_unpair_tx: tokio::sync::mpsc::channel(1).0,
+            disconnect_tx,
+            registry,
         }
     }
 
     async fn sample_coordinator_handler() -> AcceptHandler {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
-        let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
         let my_key = SecretKey::from_bytes(&[2u8; 32]);
         let my_id = my_key.public();
+        let registry = sample_registry(
+            sample_test_endpoint().await,
+            IrohIdentityProvider::new(my_id, 0),
+            blob_store.clone(),
+            my_id,
+        );
         AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store),
+            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store, registry),
             network_name: "test-net".to_string(),
             state: make_network_state(),
-            disconnect_tx,
-            token: CancellationToken::new(),
             dht_notify: None,
             invite_lock: Arc::new(tokio::sync::Mutex::new(())),
-            pending_pongs: Arc::new(DashMap::new()),
         }))
+    }
+
+    /// Throwaway [`NetworkRegistry`] for accept-handler tests: empty networks map
+    /// and dummy foundation handles, none of which the constructed handlers touch.
+    fn sample_registry(
+        endpoint: Endpoint,
+        identity: IrohIdentityProvider,
+        blob_store: FsStore,
+        contact: EndpointId,
+    ) -> Arc<NetworkRegistry> {
+        let transport = Arc::new(Transport::new(
+            endpoint,
+            identity,
+            blob_store,
+            Arc::new(ForwardMetrics::default()),
+            contact,
+        ));
+        let hostname_table = dns::new_hostname_table();
+        let reverse_table = dns::new_reverse_table();
+        let dns_resolver = Arc::new(crate::dns_resolver::Resolver::new(
+            hostname_table.clone(),
+            reverse_table.clone(),
+        ));
+        let dns = Arc::new(DnsService::new(hostname_table, reverse_table, dns_resolver));
+        let (disconnect_tx, _disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(1);
+        let (placeholder_tx, _placeholder_rx) = mpsc::channel::<Bytes>(1);
+        Arc::new(NetworkRegistry::new(
+            Arc::new(DashMap::new()),
+            transport,
+            PeerTable::new(),
+            Arc::new(ConnectionManager::new()),
+            dns,
+            Arc::new(ArcSwap::from_pointee(String::from("test"))),
+            None,
+            CancellationToken::new(),
+            SharedFirewall::new(firewall::FirewallConfig::default()),
+            peers::DeviceUserMap::new(),
+            Arc::new(arc_swap::ArcSwap::from_pointee(placeholder_tx)),
+            Arc::new(DashSet::new()),
+            disconnect_tx,
+        ))
     }
 
     async fn sample_member_handler() -> AcceptHandler {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
-        let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
         let my_key = SecretKey::from_bytes(&[3u8; 32]);
+        let my_id = my_key.public();
+        let endpoint = sample_test_endpoint().await;
+        let registry = sample_registry(
+            endpoint.clone(),
+            IrohIdentityProvider::new(my_id, 0),
+            blob_store.clone(),
+            my_id,
+        );
         AcceptHandler::Member(Arc::new(MemberAcceptState {
-            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_key.public(), 0), blob_store),
+            ctx: sample_mesh_ctx(
+                IrohIdentityProvider::new(my_id, 0),
+                blob_store.clone(),
+                registry.clone(),
+            ),
             network_name: "test-net".to_string(),
             state: make_network_state(),
-            disconnect_tx,
             token: CancellationToken::new(),
+            net_pubkey: SecretKey::from_bytes(&[1u8; 32]).public(),
+            my_identity: my_id,
+            endpoint,
+            registry,
+            invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+            reconverge_notify: Arc::new(tokio::sync::Notify::new()),
         }))
+    }
+
+    /// A throwaway bound endpoint for constructing a `MemberAcceptState` in tests
+    /// (the handler is only inspected for its variant, never driven).
+    async fn sample_test_endpoint() -> Endpoint {
+        Endpoint::bind(iroh::endpoint::presets::N0).await.unwrap()
     }
 
     #[tokio::test]

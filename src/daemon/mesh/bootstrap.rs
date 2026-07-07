@@ -1,12 +1,14 @@
 //! Daemon process bootstrap and the IPC server. Moved out of `daemon/mod.rs`.
 //!
 //! `run_daemon` is the process entry point (called by the `ray daemon`
-//! command): it builds the shared [`MeshManager`], reconnects saved networks,
+//! command): it builds the shared [`Daemon`], reconnects saved networks,
 //! and runs the IPC accept loop until shutdown. `build_daemon` wires the endpoint
 //! / TUN / protocol router / metrics; `serve_ipc` + `handle_ipc_client` answer
 //! `ray` CLI requests over the Unix socket. These live in a `mesh/` submodule
-//! (a descendant of `daemon`) so they can still construct `MeshManager` and reach
+//! (a descendant of `daemon`) so they can still construct `Daemon` and reach
 //! its private fields without widening visibility.
+
+use std::sync::Mutex;
 
 use super::super::*;
 
@@ -27,11 +29,12 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // skipped here.
     #[cfg(not(target_os = "android"))]
     {
-        let my_ipv6 = derive_ipv6(&daemon.identity.local_identity());
-        let (tun_reader, tun_writer, tun_name) = tun::create(daemon.identity.local_ip(), my_ipv6)
-            .await
-            .context("failed to create TUN device")?;
-        *daemon.tun_name.lock().unwrap() = tun_name;
+        let my_ipv6 = derive_ipv6(&daemon.transport.identity.local_identity());
+        let (tun_reader, tun_writer, tun_name) =
+            tun::create(daemon.transport.identity.local_ip(), my_ipv6)
+                .await
+                .context("failed to create TUN device")?;
+        daemon.tun_name.store(Arc::new(tun_name));
         daemon.attach_tun(tun_reader, tun_writer).await;
     }
 
@@ -39,29 +42,8 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // whole lifetime, then bring the data plane up. `ray up`/`ray down` toggle
     // only the data plane after this; connections persist across `down` so the
     // node stays online to peers.
-    daemon.connect_all_networks().await;
+    daemon.registry.connect_all_networks().await;
     daemon.activate(None).await;
-
-    // The promotion receiver was stashed on the daemon by the builder; take it
-    // back to drive the IPC loop.
-    let promote_rx = daemon
-        .promote_rx
-        .lock()
-        .unwrap()
-        .take()
-        .expect("promote_rx present after build");
-    let self_unpair_rx = daemon
-        .self_unpair_rx
-        .lock()
-        .unwrap()
-        .take()
-        .expect("self_unpair_rx present after build");
-    let reauth_rx = daemon
-        .reauth_rx
-        .lock()
-        .unwrap()
-        .take()
-        .expect("reauth_rx present after build");
 
     // Opt-in automatic updates: a single daemon-wide task that periodically
     // checks for a newer stable release and swaps + restarts onto it. Desktop-only
@@ -71,24 +53,27 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         spawn_auto_update(daemon.shutdown_token.clone());
     }
 
-    let result = serve_ipc(&daemon, promote_rx, self_unpair_rx, reauth_rx, token).await;
+    let result = serve_ipc(&daemon, token).await;
 
-    // Close the iroh endpoint before returning. Dropping it on return logs
-    // "Endpoint dropped without calling `Endpoint::close`. Aborting
-    // ungracefully." and can leave the process lingering until the service
-    // manager escalates to SIGKILL, which delays the relaunch on
-    // `ray restart`/`ray update` past the client's reachability probe. Closing
-    // it here lets QUIC connections terminate cleanly and the process exit
-    // promptly so the new daemon comes up fast.
-    daemon.endpoint.close().await;
+    // Shut the protocol Router down, then close the iroh endpoint, before
+    // returning. `Router::shutdown` stops accepting, drains its handlers, and
+    // closes the endpoint itself; the explicit close is a harmless idempotent
+    // backstop. Dropping the endpoint without closing logs "Endpoint dropped
+    // without calling `Endpoint::close`. Aborting ungracefully." and can leave
+    // the process lingering until the service manager escalates to SIGKILL, which
+    // delays the relaunch on `ray restart`/`ray update` past the client's
+    // reachability probe. A clean close lets QUIC connections terminate and the
+    // process exit promptly so the new daemon comes up fast.
+    let _ = daemon.router.shutdown().await;
+    daemon.transport.endpoint.close().await;
 
     result
 }
 
 /// Construct all always-on daemon infrastructure: identity, iroh endpoint, blob
 /// store, TUN device, forwarding loop, DNS resolver, mDNS discovery, protocol
-/// router, and metrics server. Returns the shared [`MeshManager`] (still on
-/// standby, so the caller is expected to run [`MeshManager::activate`]) and the
+/// router, and metrics server. Returns the shared [`Daemon`] (still on
+/// standby, so the caller is expected to run [`Daemon::activate`]) and the
 /// metrics-server guard, which must outlive the process.
 /// The ALPNs the endpoint advertises at boot: one per saved network plus the
 /// network-independent blobs / file-transfer / pairing / connect ALPNs. A
@@ -96,85 +81,43 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 /// `ray send` / `ray connect`, otherwise the initial handshake fails with "peer
 /// doesn't support any known protocol" until the first create/join triggers
 /// `refresh_alpns()`. Mirrors `ProtocolRouter::alpns()`.
-fn initial_alpns(app_config: &config::AppConfig) -> Vec<Vec<u8>> {
-    let mut alpns: Vec<Vec<u8>> = app_config
-        .networks
-        .iter()
-        .filter_map(|net| net.network_public_key.as_ref().map(transport::network_alpn))
-        .collect();
-    alpns.push(iroh_blobs::protocol::ALPN.to_vec());
-    alpns.push(transport::FILES_ALPN.to_vec());
-    alpns.push(PAIR_ALPN.to_vec());
-    alpns.push(transport::CONNECT_ALPN.to_vec());
-    alpns
+fn initial_alpns(_app_config: &config::AppConfig) -> Vec<Vec<u8>> {
+    // A single mesh ALPN now carries every network (network selection is in-band),
+    // so the advertised set is static and independent of the saved networks.
+    vec![
+        transport::mesh_alpn(),
+        iroh_blobs::protocol::ALPN.to_vec(),
+        transport::FILES_ALPN.to_vec(),
+        PAIR_ALPN.to_vec(),
+        transport::CONNECT_ALPN.to_vec(),
+    ]
 }
 
-/// Construct a headless [`MeshManager`] for an embedder (used by `ray-mobile`
+/// Construct a headless [`Daemon`] for an embedder (used by `ray-mobile`
 /// and future embedders). Builds the same infrastructure as `run_daemon` minus
 /// the OS TUN device and the Unix-socket IPC server: the caller supplies a
-/// packet interface via [`MeshManager::attach_tun`]. The returned daemon is on
+/// packet interface via [`Daemon::attach_tun`]. The returned daemon is on
 /// standby (no data plane), with its saved networks' control plane connected.
-pub async fn build_headless() -> Result<Arc<MeshManager>> {
+pub async fn build_headless() -> Result<Arc<Daemon>> {
     let token = CancellationToken::new();
     let stats = Arc::new(ForwardMetrics::default());
     let daemon = build_daemon(token, stats).await?;
     // Bring the saved networks' control plane up, matching `run_daemon`.
-    daemon.connect_all_networks().await;
-    // Desktop drives the promote/self-unpair/reauth hand-off channels from
-    // `serve_ipc`; a headless embedder (Android) has no IPC loop, so drain them
-    // here. Without this a control reader's or join path's signal (e.g. this
-    // device discovering it was nullified by its primary) is sent but never
-    // acted on, so `unpair_self` never runs and the stale cert lingers.
-    spawn_headless_signal_drain(daemon.clone());
+    daemon.registry.connect_all_networks().await;
+    // Control readers and the join path now run their network ops (promotion,
+    // self-unpair) directly via NetworkRegistry, so a headless embedder needs no
+    // hand-off drain loop.
     Ok(daemon)
 }
 
-/// Drain the promote/self-unpair/reauth hand-off channels on an embedder that has
-/// no `serve_ipc` loop. Mirrors the matching arms in [`serve_ipc`]; the channels
-/// are stashed on the daemon by `build_daemon`, so take them here exactly once.
-fn spawn_headless_signal_drain(daemon: Arc<MeshManager>) {
-    let mut promote_rx = daemon
-        .promote_rx
-        .lock()
-        .unwrap()
-        .take()
-        .expect("promote_rx present after build");
-    let mut self_unpair_rx = daemon
-        .self_unpair_rx
-        .lock()
-        .unwrap()
-        .take()
-        .expect("self_unpair_rx present after build");
-    let mut reauth_rx = daemon
-        .reauth_rx
-        .lock()
-        .unwrap()
-        .take()
-        .expect("reauth_rx present after build");
-    let token = daemon.shutdown_token.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => break,
-                Some(net) = promote_rx.recv() => { daemon.promote_to_coordinator(&net).await; }
-                Some(()) = self_unpair_rx.recv() => { let _ = daemon.unpair_self().await; }
-                Some(dev) = reauth_rx.recv() => { daemon.reauth_device(dev).await; }
-            }
-        }
-    });
-}
-
 /// Build all always-on daemon infrastructure WITHOUT a packet interface or the
-/// Unix-socket IPC server. The returned [`MeshManager`] is on standby (no data
-/// plane); attach a TUN with [`MeshManager::attach_tun`], connect saved networks,
-/// then bring the data plane up with [`MeshManager::activate`]. The promotion
+/// Unix-socket IPC server. The returned [`Daemon`] is on standby (no data
+/// plane); attach a TUN with [`Daemon::attach_tun`], connect saved networks,
+/// then bring the data plane up with [`Daemon::activate`]. The promotion
 /// receiver and metrics-server guard are stashed on the state for the caller.
 ///
 /// Shared by [`run_daemon`] (desktop) and [`build_headless`] (embedders).
-async fn build_daemon(
-    token: CancellationToken,
-    stats: Arc<ForwardMetrics>,
-) -> Result<Arc<MeshManager>> {
+async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<Arc<Daemon>> {
     // Relocate a pre-/etc config tree into /etc/rayfish (Linux upgrade path)
     // before anything reads identity or config. No-op on macOS / once migrated.
     config::migrate_location();
@@ -203,7 +146,7 @@ async fn build_daemon(
     // before any record publish/resolve happens.
     dht::set_discovery_override(&app_config.discovery_dns);
     // Lazily generate + persist this node's contact key (`ray connect`). The
-    // secret stays in config; only its public id is held in `MeshManager`.
+    // secret stays in config; only its public id is held in `Daemon`.
     let contact_public = config::contact_secret(&mut app_config).public();
     if let Err(e) = config::save_settings(&app_config) {
         tracing::warn!(error = %e, "failed to persist contact key");
@@ -235,7 +178,9 @@ async fn build_daemon(
     // creates the real device and calls `attach_tun`; on embedders (mobile) the
     // `VpnService` fd is attached the same way. `tun_name` starts as a placeholder
     // and is overwritten when a real interface is attached.
-    let tun_name = String::from("rayfish");
+    // Shared with NetworkRegistry (for the leave/teardown DNS search-domain
+    // refresh); run_daemon overwrites the string in place once the real TUN is up.
+    let tun_name = Arc::new(arc_swap::ArcSwap::from_pointee(String::from("rayfish")));
     // Append-only audit log of peer connect/disconnect events. If it can't be
     // opened (e.g. unwritable config dir) the daemon still runs without auditing.
     let peers = match audit::AuditLog::open() {
@@ -269,6 +214,13 @@ async fn build_daemon(
         hostname_table.clone(),
         reverse_table.clone(),
     ));
+    // Built here (not in the struct literal) so NetworkRegistry can share it for
+    // the leave/teardown DNS cleanup.
+    let dns = Arc::new(DnsService::new(
+        hostname_table,
+        reverse_table,
+        dns_resolver.clone(),
+    ));
     let mdns_enabled = app_config.mdns_enabled;
     if mdns_enabled {
         spawn_mdns_discovery(&ep, token.clone());
@@ -276,85 +228,153 @@ async fn build_daemon(
         tracing::info!("mDNS discovery disabled");
     }
 
-    // --- Protocol router + the shared MeshManager ---
-    // Auto-accept worker channel: the file service nudges this with each newly-
-    // queued offer id; the worker (spawned once the daemon exists) evaluates it.
-    let (new_file_tx, new_file_rx) = mpsc::unbounded_channel::<u64>();
-    // Re-auth channel: the pairing accept arm nudges this with a re-paired device's
-    // key so the daemon loop clears its nullifier (see `MeshManager::reauth_device`).
-    let (reauth_tx, reauth_rx) = mpsc::channel::<EndpointId>(4);
-    let files = Arc::new(FileService::new(key.clone(), new_file_tx, reauth_tx));
-    let connect = Arc::new(ConnectService::new());
+    // --- Protocol router + the shared Daemon ---
+    // Group the foundation handles so extracted services can depend on
+    // `Arc<Transport>`. Clones here are cheap (all fields are `Arc`-backed); the
+    // loose `Daemon` fields below still hold the originals until the daemon
+    // god object is dissolved.
+    let transport = Arc::new(Transport::new(
+        ep.clone(),
+        identity.clone(),
+        blob_store.clone(),
+        stats.clone(),
+        contact_public,
+    ));
+    // The per-peer connection driver is built once here and shared by the
+    // ProtocolRouter (which delegates the mesh ALPN to it) and the
+    // NetworkRegistry (which re-registers a network's handler on promotion).
+    let conn = Arc::new(ConnectionManager::new());
+    // Networks map is shared with the NetworkRegistry service (M5 seam): both
+    // hold the same `Arc<DashMap>` so methods migrate to the registry gradually.
+    let networks = Arc::new(DashMap::new());
+    // Daemon-wide disconnect channel: every per-connection data reader reports
+    // peer drops here, drained by the single connection supervisor. Built here
+    // (before the registry) so both the registry's MeshCtx builder and the
+    // Daemon literal share the one sender.
+    let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(256);
+    let pruned_peers = Arc::new(DashSet::new());
+    let registry = Arc::new(NetworkRegistry::new(
+        networks.clone(),
+        transport.clone(),
+        peers.clone(),
+        conn.clone(),
+        dns.clone(),
+        tun_name.clone(),
+        device_cert.clone(),
+        token.clone(),
+        shared_firewall.clone(),
+        device_user_map.clone(),
+        tun_tx.clone(),
+        pruned_peers.clone(),
+        disconnect_tx.clone(),
+    ));
+    // FileService owns file transfer + pairing. It evaluates own-device auto-accept
+    // directly (no worker channel) and clears a re-paired device's nullifier by
+    // calling NetworkRegistry directly (was the reauth_tx hand-off channel), so it
+    // depends on Transport (endpoint + blobs) and NetworkRegistry.
+    let files = Arc::new(FileService::new(
+        key.clone(),
+        transport.clone(),
+        registry.clone(),
+        device_cert.clone(),
+        device_user_map.clone(),
+    ));
+    let connect = Arc::new(ConnectService::new(
+        transport.clone(),
+        active.clone(),
+        registry.clone(),
+    ));
     let protocol_router = Arc::new(ProtocolRouter::new(
         blobs_proto,
         files.clone(),
         connect.clone(),
+        conn.clone(),
     ));
+    // The registry (re)connect paths drive a dialed connection's demux through the
+    // router; install it now that it exists (the registry was built before it).
+    registry.set_protocol_router(protocol_router.clone());
+    // Single daemon-wide connection supervisor: consumes every data reader's
+    // disconnect and, per dropped identity, prunes departed peers we coordinate and
+    // reconnects the rest across all their shared networks. Spawned here (not in
+    // `run_daemon`) so embedders built via `build_headless` (mobile) get it too;
+    // without it a transient QUIC drop between two mobile peers would never
+    // reconnect and the bounded disconnect channel would eventually back up.
+    {
+        let registry = registry.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            registry
+                .run_connection_supervisor(disconnect_rx, token)
+                .await;
+        });
+    }
+
+    // Install the daemon-wide mesh dispatch context and spawn the protocol Router
+    // *before* building the Daemon. The dispatch is built from the registry (the
+    // single `MeshCtx` builder), and the Router only needs the services
+    // (registry/files/connect/blobs), not the Daemon struct, so ordering it here
+    // lets `router` be a plain owned field instead of a set-after-construction
+    // `Option`. Dispatch must be installed before the accept loop starts handing
+    // out connections, hence the order.
+    protocol_router.set_mesh_dispatch(MeshDispatch {
+        ctx: registry.mesh_ctx(),
+        token: token.clone(),
+    });
+    // The Router owns the endpoint accept loop and dispatches by ALPN. It aborts on
+    // drop, so the Daemon owns it for the process lifetime and shuts it down on exit.
+    let router = protocol_router.build_router(transport.endpoint.clone());
+
+    // Prometheus metrics server. Its guard is kept alive by the Daemon (dropping it
+    // stops the export); built here from the local handles so it can be a plain
+    // owned field. `None` if it failed to bind.
+    let metrics_server = spawn_metrics_server(
+        stats.clone(),
+        peers.clone(),
+        &transport.endpoint,
+        token.clone(),
+    )
+    .await;
+
     let auto_update = app_config.auto_update;
-    // Promotion channel: a co-coordinator's control reader signals the main
-    // daemon loop to swap in the coordinator accept handler on `AdminGrant`.
-    let (promote_tx, promote_rx) = mpsc::channel::<String>(16);
-    // Self-unpair channel: a control reader that received `Unpaired` from our
-    // primary signals the daemon loop to leave all networks + wipe our cert.
-    let (self_unpair_tx, self_unpair_rx) = mpsc::channel::<()>(4);
-    let daemon = Arc::new(MeshManager {
-        endpoint: ep,
-        identity,
-        peers,
+    let daemon = Arc::new(Daemon {
+        transport,
+        registry,
         stats: stats.clone(),
         start: Instant::now(),
         tun_tx,
-        networks: Arc::new(DashMap::new()),
         shutdown_token: token.clone(),
-        blob_store,
-        firewall: shared_firewall,
         protocol_router: protocol_router.clone(),
-        dns: DnsManager::new(hostname_table, reverse_table, dns_resolver.clone()),
+        dns,
         mdns_enabled,
         auto_update,
-        tun_name: std::sync::Mutex::new(tun_name),
-        tun_tasks: std::sync::Mutex::new(None),
-        promote_rx: std::sync::Mutex::new(Some(promote_rx)),
-        _metrics_server: std::sync::Mutex::new(None),
+        tun_name,
+        tun_tasks: Mutex::new(None),
+        _metrics_server: metrics_server,
+        router,
         files,
         connect,
         device_cert,
-        device_user_map,
-        pruned_peers: Arc::new(DashSet::new()),
         contact_public,
         active: active.clone(),
         #[cfg(feature = "desktop")]
         ssh_authz: crate::ssh::new_authz(),
-        ssh_token: std::sync::Mutex::new(None),
-        promote_tx,
-        self_unpair_tx,
-        self_unpair_rx: std::sync::Mutex::new(Some(self_unpair_rx)),
-        reauth_rx: std::sync::Mutex::new(Some(reauth_rx)),
+        ssh_token: Mutex::new(None),
     });
 
-    // --- Accept loop (ALPN dispatch) + Prometheus metrics ---
-    protocol_router.spawn_accept_loop(daemon.endpoint.clone(), token.clone());
-
-    // Auto-accept worker: evaluates each newly-queued file offer for own-device
-    // auto-accept (no-op unless the sender is our own paired device on an
-    // opted-in network).
-    spawn_file_auto_accept(daemon.clone(), new_file_rx, token.clone());
+    // File auto-accept is evaluated inline by `FileService::accept_file_offer`
+    // (no worker channel), so nothing to spawn here.
 
     // --- Contact record publisher (ray connect) ---
-    if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
-        spawn_contact_publisher(pkarr_client, daemon.endpoint.id(), token.clone());
+    if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.transport.endpoint) {
+        spawn_contact_publisher(pkarr_client, daemon.transport.endpoint.id(), token.clone());
     }
 
     // Device-cert revocation is now carried per-network in the signed blob's
     // nullifier set (`ray unpair`); no separate pkarr record or background
     // publisher/poller is needed. Coordinated networks seed their nullifiers from
     // the persisted `revoked_devices` set at seal time (see `seal_and_publish`).
-    let metrics_server =
-        spawn_metrics_server(stats, daemon.peers.clone(), &daemon.endpoint, token).await;
-    // Keep the metrics-server guard alive for the daemon's whole lifetime.
-    *daemon._metrics_server.lock().unwrap() = metrics_server;
 
-    tracing::info!(ip = %my_ip, id = %daemon.endpoint.id().fmt_short(), "daemon started");
+    tracing::info!(ip = %my_ip, id = %daemon.transport.endpoint.id().fmt_short(), "daemon started");
     Ok(daemon)
 }
 
@@ -439,13 +459,7 @@ async fn spawn_metrics_server(
 /// `token` is cancelled. On shutdown, put the VPN on standby (revert DNS, drop
 /// connections, bring the TUN down) and remove the socket file. Each request is
 /// handled on its own task so a slow client can't block the accept loop.
-async fn serve_ipc(
-    daemon: &Arc<MeshManager>,
-    mut promote_rx: mpsc::Receiver<String>,
-    mut self_unpair_rx: mpsc::Receiver<()>,
-    mut reauth_rx: mpsc::Receiver<EndpointId>,
-    token: CancellationToken,
-) -> Result<()> {
+async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()> {
     let socket_path = ipc::socket_path();
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -464,24 +478,6 @@ async fn serve_ipc(
                 daemon.deactivate().await;
                 let _ = std::fs::remove_file(&socket_path);
                 return Ok(());
-            }
-            // A co-coordinator just persisted an `AdminGrant` key: swap its
-            // accept handler to coordinator so it can admit fresh joiners.
-            // Idempotent and quick (a synchronous handler swap), so running it
-            // inline in the loop is fine.
-            Some(net) = promote_rx.recv() => {
-                daemon.promote_to_coordinator(&net).await;
-            }
-            // Our primary unpaired us: leave all networks + wipe the cert so we
-            // drop out of the mesh right away. Hand-off from a control reader that
-            // holds only field clones (see `MeshCtx::self_unpair_tx`).
-            Some(()) = self_unpair_rx.recv() => {
-                let _ = daemon.unpair_self().await;
-            }
-            // A device just (re-)paired to us: clear its nullifier from the durable
-            // seed and every coordinated blob so its fresh cert is honored again.
-            Some(dev) = reauth_rx.recv() => {
-                daemon.reauth_device(dev).await;
             }
             result = listener.accept() => match result {
                 Ok((stream, _)) => {
@@ -512,34 +508,13 @@ fn set_socket_permissions(path: &std::path::Path) {
     }
 }
 
-async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<MeshManager>) -> Result<()> {
+async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<()> {
     let peer_cred = stream.peer_cred().ok().map(|c| (c.uid(), c.gid()));
     let mut framed = ipc::framed(stream);
     let req = ipc::recv(&mut framed).await?;
     let resp = daemon.handle_request(req, peer_cred).await;
     ipc::send(&mut framed, resp).await?;
     Ok(())
-}
-
-/// Daemon-wide worker: drains newly-queued file-offer ids from the file service
-/// and evaluates each for own-device auto-accept (a no-op unless the sender is
-/// one of our own paired devices on a network with `auto_accept_files` on).
-fn spawn_file_auto_accept(
-    daemon: Arc<MeshManager>,
-    mut rx: mpsc::UnboundedReceiver<u64>,
-    token: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => return,
-                id = rx.recv() => match id {
-                    Some(id) => daemon.try_auto_accept_file(id).await,
-                    None => return,
-                },
-            }
-        }
-    })
 }
 
 /// First auto-update check runs ~5 min after boot (jittered), then every 6h.

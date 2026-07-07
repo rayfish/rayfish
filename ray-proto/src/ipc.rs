@@ -631,6 +631,13 @@ pub struct PeerStatus {
     /// (its resolved user identity equals ours).
     #[serde(default)]
     pub is_own_device: bool,
+    /// True when a mesh dial to this peer last failed because it speaks an
+    /// incompatible mesh protocol version (the ALPN gate rejected it). Such a
+    /// peer can't connect and would otherwise look identical to a plain offline
+    /// peer; status flags it so the user knows to run `ray update`. Cleared on any
+    /// successful (re)connection.
+    #[serde(default)]
+    pub incompatible: bool,
     pub connection: Option<ConnectionInfo>,
 }
 
@@ -1006,6 +1013,7 @@ mod tests {
                     hostname: None,
                     user_identity: None,
                     is_own_device: false,
+                    incompatible: false,
                     connection: None,
                 }],
                 pending_suggestions: 0,

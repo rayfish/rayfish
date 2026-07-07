@@ -145,6 +145,17 @@ pub enum ControlMsg {
     /// is a *trigger only*. Receivers reconverge from the network-key-signed
     /// pkarr record, never from any peer-supplied membership data.
     MemberSync,
+    /// Coordinator -> member: the current network-key-signed pkarr record
+    /// (`SignedPacket`, serialized), delivered over the mesh so a (re)connecting
+    /// member converges to the live roster without waiting on a fresh DHT lookup.
+    /// The receiver verifies the packet's signature and that its public key equals
+    /// the known network pubkey, and that it is newer than what it holds, before
+    /// applying. This is a *fresh signed record delivered over the link*, not
+    /// trusted peer-supplied membership: the record is self-verifying against the
+    /// network key exactly like the DHT copy, so the trust model is unchanged.
+    SignedRecord {
+        packet: Vec<u8>,
+    },
     MeshHello {
         identity: EndpointId,
         ip: Ipv4Addr,
@@ -207,7 +218,19 @@ pub enum ControlMsg {
     Pong {
         nonce: u64,
     },
-    /// Primary → secondary: this device has been unpaired (`ray unpair`). Sent
+    /// Connection-level announcement of *this sender's* per-connection network to
+    /// handle table. Since a single mesh connection now carries every network the
+    /// two peers share, each datagram is prefixed with a small `u16` handle
+    /// identifying its network; this message tells the peer which handle maps to
+    /// which network. Sender-authoritative: each side assigns handles in its own
+    /// namespace for the datagrams it sends, and the receiver caches this table to
+    /// decode inbound datagrams. Full snapshot, idempotent (replace on receipt),
+    /// re-sent whenever the shared-network set changes. Not scoped to a single
+    /// network (its frame carries `net = None`).
+    NetworkHandles {
+        entries: Vec<NetworkHandle>,
+    },
+    /// Primary to secondary: this device has been unpaired (`ray unpair`). Sent
     /// best-effort over a shared network's mesh connection. The receiver acts on
     /// it only when the sender's identity is the `user_identity` in its own device
     /// cert (so a stranger cannot trigger a wipe): it deletes its stored device
@@ -215,31 +238,75 @@ pub enum ControlMsg {
     /// revocation is the per-network blob nullifier set; this is just a courtesy
     /// wipe for a cooperative device.
     Unpaired,
-    /// Primary → secondary: a freshly-signed cert at a new generation, pushed
+    /// Primary to secondary: a freshly-signed cert at a new generation, pushed
     /// after a rotation (`ray unpair`) so a kept device stays above the floor.
     /// Accepted only when it is signed by the device's own user identity and
     /// binds the device's own key at a generation no lower than the current one.
     CertRefresh {
         cert: DeviceCert,
     },
+    /// A member deliberately leaving *this one* network (`ray leave`), signalled
+    /// in-band and scoped by the frame's `net`. Since one mesh connection now
+    /// carries every network two peers share, a plain connection close would sever
+    /// them all; this message lets the sender depart a single network while the
+    /// link stays up on the others. Payload-free: the departing identity is the
+    /// connection's authenticated remote, and the network is the frame tag. The
+    /// receiving coordinator prunes the member from the roster and republishes;
+    /// plain members learn of it from that republish on their next reconverge.
+    LeaveNetwork,
 }
 
-pub fn encode_msg(msg: &ControlMsg) -> Vec<u8> {
-    let body = rmp_serde::to_vec_named(msg).expect("serialize control message");
+/// One `network pubkey → u16 handle` binding in a [`ControlMsg::NetworkHandles`]
+/// announcement. `handle` is stamped on datagrams the announcer sends for
+/// `network`; `0` is reserved as invalid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkHandle {
+    /// The network's public key (stable, unambiguous identifier).
+    pub network: EndpointId,
+    pub handle: u16,
+}
+
+/// Envelope wrapping every mesh control message with the network it pertains to.
+///
+/// The mesh transport uses a single ALPN (`rayfish/mesh/<version>`), so a
+/// connection is no longer bound to one network — the network can't be inferred
+/// from the ALPN and must ride in-band. `net` is the network public key for
+/// network-scoped messages (join, hello, roster/firewall triggers, gossip,
+/// ping); it is `None` for connection-level messages ([`ControlMsg::NetworkHandles`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlFrame {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net: Option<EndpointId>,
+    pub msg: ControlMsg,
+}
+
+/// Encode a network-scoped mesh control message as a length-prefixed msgpack
+/// [`ControlFrame`]. `net` is the network public key the message pertains to
+/// (`None` for connection-level messages like [`ControlMsg::NetworkHandles`]).
+pub fn encode_msg(net: Option<EndpointId>, msg: &ControlMsg) -> Vec<u8> {
+    let frame = ControlFrame {
+        net,
+        msg: msg.clone(),
+    };
+    let body = rmp_serde::to_vec_named(&frame).expect("serialize control frame");
     let len = (body.len() as u32).to_be_bytes();
     [len.as_slice(), &body].concat()
 }
 
 #[cfg(test)]
-fn decode_msg(data: &[u8]) -> Result<ControlMsg> {
+fn decode_msg(data: &[u8]) -> Result<ControlFrame> {
     anyhow::ensure!(data.len() >= 4, "message too short");
     let len = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
     anyhow::ensure!(data.len() >= 4 + len, "incomplete message");
-    rmp_serde::from_slice(&data[4..4 + len]).context("invalid control message")
+    rmp_serde::from_slice(&data[4..4 + len]).context("invalid control frame")
 }
 
-pub async fn send_msg(stream: &mut SendStream, msg: &ControlMsg) -> Result<()> {
-    let data = encode_msg(msg);
+pub async fn send_msg(
+    stream: &mut SendStream,
+    net: Option<EndpointId>,
+    msg: &ControlMsg,
+) -> Result<()> {
+    let data = encode_msg(net, msg);
     stream
         .write_all(&data)
         .await
@@ -255,7 +322,19 @@ pub async fn send_msg(stream: &mut SendStream, msg: &ControlMsg) -> Result<()> {
     Ok(())
 }
 
+/// Read one mesh control message off a stream, discarding the frame envelope.
+/// Used by the handshake paths (join/reconnect/pair) that already know which
+/// network the stream belongs to. The per-connection demux uses [`recv_frame`]
+/// instead, since it must route by `ControlFrame.net`.
 pub async fn recv_msg(stream: &mut RecvStream) -> Result<ControlMsg> {
+    Ok(recv_frame(stream).await?.msg)
+}
+
+/// Read one mesh control message off a stream, keeping the frame envelope (the
+/// network it pertains to, or `None` for connection-level messages). Used by the
+/// per-connection demux (`ProtocolRouter::drive_mesh_connection`) to route each
+/// frame to the right per-network handler.
+pub async fn recv_frame(stream: &mut RecvStream) -> Result<ControlFrame> {
     recv_framed(stream).await
 }
 
@@ -340,9 +419,9 @@ mod tests {
                 last_seen: None,
             }],
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -353,9 +432,9 @@ mod tests {
             hostname: None,
             device_cert: None,
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -365,9 +444,9 @@ mod tests {
             hostname: Some("alice".to_string()),
             device_cert: None,
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -377,17 +456,17 @@ mod tests {
             hostname: None,
             device_cert: None,
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
     fn test_roundtrip_join_pending() {
         let msg = ControlMsg::JoinPending;
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -419,17 +498,17 @@ mod tests {
         let msg = ControlMsg::JoinDenied {
             reason: "not authorized".to_string(),
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
     fn test_roundtrip_member_sync() {
         let msg = ControlMsg::MemberSync;
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -440,9 +519,9 @@ mod tests {
             hostname: None,
             device_cert: None,
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -468,9 +547,9 @@ mod tests {
                 collision_index: 0,
             }],
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -482,17 +561,17 @@ mod tests {
             mime_type: "application/pdf".to_string(),
             blob_hash: blake3::hash(b"file contents"),
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
     fn test_roundtrip_blob_updated() {
         let msg = ControlMsg::BlobUpdated;
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
     }
 
     #[test]
@@ -502,10 +581,10 @@ mod tests {
             network_pubkey: test_id(1),
             secret_key: key.to_bytes(),
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
-        if let ControlMsg::AdminGrant { secret_key, .. } = decoded {
+        assert_eq!(msg, decoded.msg);
+        if let ControlMsg::AdminGrant { secret_key, .. } = decoded.msg {
             assert_eq!(SecretKey::from(secret_key).public(), key.public());
         }
     }
@@ -582,13 +661,13 @@ mod tests {
             hostname: Some("alice".to_string()),
             device_cert: Some(cert),
         };
-        let bytes = encode_msg(&msg);
+        let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(msg, decoded.msg);
         if let ControlMsg::MeshHello {
             device_cert: Some(c),
             ..
-        } = &decoded
+        } = &decoded.msg
         {
             assert!(c.verify());
         } else {
@@ -608,8 +687,8 @@ mod tests {
                 secret_hash: vec![4, 5, 6],
             },
         ] {
-            let bytes = encode_msg(&msg);
-            assert_eq!(decode_msg(&bytes).unwrap(), msg);
+            let bytes = encode_msg(None, &msg);
+            assert_eq!(decode_msg(&bytes).unwrap().msg, msg);
         }
     }
 
@@ -622,8 +701,8 @@ mod tests {
                 nonce: 0x0123_4567_89ab_cdef,
             },
         ] {
-            let bytes = encode_msg(&msg);
-            assert_eq!(decode_msg(&bytes).unwrap(), msg);
+            let bytes = encode_msg(None, &msg);
+            assert_eq!(decode_msg(&bytes).unwrap().msg, msg);
         }
     }
 

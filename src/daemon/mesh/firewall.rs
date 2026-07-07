@@ -1,4 +1,4 @@
-//! Firewall IPC handlers for [`MeshManager`]: per-device firewall rules and
+//! Firewall IPC handlers for [`Daemon`]: per-device firewall rules and
 //! coordinator-suggested rules. Split out of `daemon/mod.rs`.
 
 use super::super::*;
@@ -12,7 +12,7 @@ fn save_firewall_warn(config: &firewall::FirewallConfig) {
     }
 }
 
-impl MeshManager {
+impl NetworkRegistry {
     // -----------------------------------------------------------------------
     // Firewall handlers
     // -----------------------------------------------------------------------
@@ -172,17 +172,23 @@ impl MeshManager {
             let mut s = state.write().unwrap();
             s.suggested_firewall = suggestions;
         }
-        update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
         // Nudge connected members to reconverge from the freshly-published signed
         // record now, instead of waiting up to 60s for the group poller. Like the
         // rename flow, this is a payload-free trigger, the suggestions still come
         // exclusively from the network-key-signed blob, never from this message.
-        broadcast_member_sync(&self.peers, None).await;
+        let net_pubkey = state.read().unwrap().network_public_key;
+        broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
         // The coordinator is the blob's source, so the group poller's hash
         // check (local == published) short-circuits and it never re-applies its
         // own authored suggestions. Materialize them here so the coordinator is
         // subject to its own rules like any other member (auto-take or queue).
-        apply_suggested_firewall(&self.firewall, self.endpoint.id(), network, &state);
+        apply_suggested_firewall(
+            &self.firewall,
+            self.transport.endpoint.id(),
+            network,
+            &state,
+        );
         IpcMessage::Ok {
             message: format!("published firewall suggestions for '{network}' ({count} subjects)"),
         }
@@ -365,7 +371,12 @@ impl MeshManager {
         // Re-apply suggestions with the new consent setting. With auto-accept on
         // this installs the queued set; with it off it just (re)queues.
         if let Some(h) = self.networks.get(network) {
-            apply_suggested_firewall(&self.firewall, self.endpoint.id(), network, &h.state);
+            apply_suggested_firewall(
+                &self.firewall,
+                self.transport.endpoint.id(),
+                network,
+                &h.state,
+            );
         }
         IpcMessage::Ok {
             message: format!(
@@ -426,6 +437,37 @@ impl MeshManager {
     // -----------------------------------------------------------------------
     // Mesh SSH (`ray firewall ssh ...`)
     // -----------------------------------------------------------------------
+}
+
+impl Daemon {
+    // Thin delegates so the `ray-mobile` FFI (which can only reach public
+    // Daemon methods, not the pub(crate) registry) keeps its firewall
+    // surface. The logic lives on NetworkRegistry.
+    pub async fn firewall_add(
+        &self,
+        direction: firewall::Direction,
+        action: firewall::Action,
+        protocol: firewall::Protocol,
+        port: Option<&str>,
+        peer: Option<&str>,
+        network: Option<&str>,
+    ) -> IpcMessage {
+        self.registry
+            .firewall_add(direction, action, protocol, port, peer, network)
+            .await
+    }
+
+    pub fn firewall_remove(&self, index: usize) -> IpcMessage {
+        self.registry.firewall_remove(index)
+    }
+
+    pub fn firewall_show(&self) -> IpcMessage {
+        self.registry.firewall_show()
+    }
+
+    pub fn firewall_default(&self, action: firewall::Action) -> IpcMessage {
+        self.registry.firewall_default(action)
+    }
 
     /// Toggle the embedded mesh SSH server. Persists `ssh_enabled`, seeds/removes
     /// the `allow in tcp:22` passthrough so SSH packets reach the listener under
@@ -447,7 +489,7 @@ impl MeshManager {
             };
         }
         // Open/close port 22 at the packet layer; SSH-layer authz is the real gate.
-        let fw = self.firewall.set_ssh_passthrough(enabled);
+        let fw = self.registry.firewall.set_ssh_passthrough(enabled);
         if let Err(e) = firewall::save_firewall(&fw) {
             tracing::warn!(error = %e, "failed to persist firewall config");
         }
@@ -509,7 +551,7 @@ impl MeshManager {
             "*".to_string()
         } else {
             match self.resolve_peer_name(peer).await {
-                Some(id) => self.device_user_map.resolve(&id).to_string(),
+                Some(id) => self.registry.device_user_map.resolve(&id).to_string(),
                 None => {
                     return IpcMessage::Error {
                         message: format!("could not resolve peer: {peer}"),

@@ -1,4 +1,4 @@
-//! Network runtime handlers for `MeshManager`: coordinator restore, nuke,
+//! Network runtime handlers for `Daemon`: coordinator restore, nuke,
 //! connect-all, activate/deactivate (data plane), teardown, leave. Split out of `daemon/mod.rs`.
 
 use super::super::*;
@@ -17,7 +17,7 @@ struct RestoredRoster {
     nullifiers: BTreeSet<EndpointId>,
 }
 
-impl MeshManager {
+impl NetworkRegistry {
     /// Rebuild a network's roster for a coordinator restart. Prefers the
     /// published, network-key-signed `GroupBlob` (members + approved + suggested
     /// firewall + reusable keys); if the DHT is unreachable, falls back to the
@@ -89,10 +89,10 @@ impl MeshManager {
                 }
             }
         }
-        if !member_list.is_member(&self.identity.local_identity()) {
+        if !member_list.is_member(&self.transport.identity.local_identity()) {
             member_list
                 .add(Member {
-                    identity: self.identity.local_identity(),
+                    identity: self.transport.identity.local_identity(),
                     ip: my_ip,
                     is_coordinator: true,
                     hostname: persisted_hostname.clone(),
@@ -126,7 +126,7 @@ impl MeshManager {
             }
         }
 
-        let my_ip = self.identity.local_ip();
+        let my_ip = self.transport.identity.local_ip();
 
         // Load persisted network secret key from config
         let app_config = config::load()?;
@@ -210,7 +210,9 @@ impl MeshManager {
         let state = Arc::new(RwLock::new(net_state));
         let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
         let dht_notify = Arc::new(tokio::sync::Notify::new());
+        let ctx = self.mesh_ctx();
         let (tasks, disconnect_tx) = self.spawn_coordinator_background_tasks(
+            &ctx,
             name,
             &net_secret_key,
             &state,
@@ -219,13 +221,12 @@ impl MeshManager {
         );
 
         self.register_coordinator_handler(
+            &ctx,
             name,
             state.clone(),
             invite_lock.clone(),
             Some(dht_notify.clone()),
             net_public_key,
-            disconnect_tx.clone(),
-            cancel.clone(),
         );
 
         // Register hostnames in DNS table
@@ -263,7 +264,15 @@ impl MeshManager {
             .into_iter()
             .cloned()
             .collect();
-        let alpn = transport::network_alpn(&net_public_key);
+        self.dial_all_members(
+            &members_to_dial,
+            net_public_key,
+            name,
+            self.transport.identity.local_identity(),
+            my_ip,
+            persisted_hostname.clone(),
+        )
+        .await;
 
         // Register the network from its restored local state *before* dialing
         // peers, so `ray status` / IPC sees it the instant the local restore
@@ -283,7 +292,7 @@ impl MeshManager {
             disconnect_tx: disconnect_tx.clone(),
         };
         self.networks.insert(name.to_string(), handle);
-        self.refresh_alpns().await;
+        self.refresh_search_domains().await;
 
         // Full mesh: proactively dial every known member in the background so a
         // restarting coordinator/co-coordinator reconnects to peers that haven't
@@ -299,13 +308,11 @@ impl MeshManager {
             tokio::spawn(async move {
                 me.dial_all_members(
                     &members_to_dial,
-                    &alpn,
+                    net_public_key,
                     &network_name,
-                    me.identity.local_identity(),
+                    me.transport.identity.local_identity(),
                     my_ip,
                     persisted_hostname,
-                    disconnect_tx,
-                    cancel,
                 )
                 .await;
             });
@@ -317,7 +324,7 @@ impl MeshManager {
             name: name.to_string(),
             network_key: net_public_key,
             my_ip,
-            my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
+            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
         })
     }
 
@@ -334,7 +341,7 @@ impl MeshManager {
                 }
             };
             let state = handle.state.read().unwrap();
-            let my_id = self.endpoint.id();
+            let my_id = self.transport.endpoint.id();
             let is_coord = state
                 .members
                 .get(&my_id)
@@ -363,7 +370,7 @@ impl MeshManager {
             state.network_secret_key.clone()
         };
         if let Some(key) = net_secret_key
-            && let Ok(client) = dht::create_pkarr_client(&self.endpoint)
+            && let Ok(client) = dht::create_pkarr_client(&self.transport.endpoint)
         {
             let empty_hash = group_blob_hash(
                 &MemberList::new(),
@@ -452,7 +459,7 @@ impl MeshManager {
                 }
             }
         };
-        if member_id == self.endpoint.id() {
+        if member_id == self.transport.endpoint.id() {
             return IpcMessage::Error {
                 message: "cannot kick yourself — use `ray leave` or `ray nuke`".to_string(),
             };
@@ -466,10 +473,40 @@ impl MeshManager {
             };
         }
 
-        // Prune the roster + DNS, then publish + broadcast + sever the link.
-        let ctx = self.mesh_ctx();
-        remove_member_roster_only(&ctx, network, &state, member_id, member_ip).await;
-        finalize_removal(&ctx, network, &state, &dht_notify, &[member_id]).await;
+        // Prune the roster + approved list, then republish the signed blob so the
+        // removal is authoritative, and drop the target's DNS entries.
+        {
+            let mut s = state.write().unwrap();
+            s.members.remove(&member_id);
+            s.approved.remove(&member_id);
+        }
+        dns::remove_hostname_by_ip(
+            &self.dns.hostname_table,
+            &self.dns.reverse_table,
+            network,
+            member_ip,
+        )
+        .await;
+        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
+        let net_pubkey = state.read().unwrap().network_public_key;
+        broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
+
+        // Sever our own link(s) to the target now, rather than waiting for it to
+        // time out. Other members drop it when they reconverge from the freshly
+        // published record (`prune_departed_peers`).
+        for (pid, ip, _conn) in self.peers.peers_for_network_with_conn(network) {
+            if pid == member_id || self.device_user_map.resolve(&pid) == member_id {
+                // Only close the shared connection if this was the peer's last
+                // network with us; otherwise just drop this network's route so a
+                // peer we share other networks with stays reachable there.
+                if let Some(conn) =
+                    self.peers
+                        .remove_peer_from_network(&ip, &derive_ipv6(&pid), network)
+                {
+                    conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
+                }
+            }
+        }
 
         tracing::info!(peer = %member_id.fmt_short(), network = %network, "kicked member");
         IpcMessage::Ok {
@@ -630,9 +667,9 @@ impl MeshManager {
         // away, rather than waiting up to one publisher interval (the active-gated
         // `spawn_contact_publisher` only re-checks every TTL/2).
         if let Some(secret) = app_config.contact_secret_key.clone()
-            && let Ok(client) = dht::create_pkarr_client(&self.endpoint)
+            && let Ok(client) = dht::create_pkarr_client(&self.transport.endpoint)
         {
-            let endpoint_id = self.endpoint.id();
+            let endpoint_id = self.transport.endpoint.id();
             tokio::spawn(async move {
                 if let Err(e) = dht::publish_contact(&client, &secret, endpoint_id).await {
                     tracing::warn!(error = %e, "failed to publish contact record on connect");
@@ -642,7 +679,9 @@ impl MeshManager {
 
         tracing::info!(networks = count, "control plane connected");
     }
+}
 
+impl Daemon {
     /// Rebuild the live per-network SSH allow-list snapshot from persisted
     /// config, so a running listener authorizes against current rules. Cheap and
     /// only called on SSH config changes / activation (not the hot path).
@@ -672,11 +711,11 @@ impl MeshManager {
         *guard = Some(token.clone());
         drop(guard);
         self.rebuild_ssh_authz();
-        let my_v4 = self.identity.local_ip();
-        let my_v6 = derive_ipv6(&self.identity.local_identity());
+        let my_v4 = self.transport.identity.local_ip();
+        let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
         let server = crate::ssh::SshServer::new(
-            self.peers.clone(),
-            self.device_user_map.clone(),
+            self.registry.peers.clone(),
+            self.registry.device_user_map.clone(),
             self.ssh_authz.clone(),
         );
         server.spawn(vec![IpAddr::V4(my_v4), IpAddr::V6(my_v6)], token);
@@ -742,7 +781,7 @@ impl MeshManager {
         // Kotlin side, so these desktop route calls don't apply.
         #[cfg(not(target_os = "android"))]
         {
-            let tun_name = self.tun_name.lock().unwrap().clone();
+            let tun_name = self.tun_name.load().as_str().to_owned();
             if let Err(e) = tun::set_link_up(&tun_name) {
                 tracing::warn!(error = %e, "failed to bring TUN interface up");
                 warnings.push(format!("failed to bring TUN interface up: {e}"));
@@ -766,8 +805,8 @@ impl MeshManager {
             // the TUN, where the forwarding loop would drop it as "no peer for
             // dst". No-op on Linux (kernel installs the `local` route
             // automatically).
-            let my_v4 = self.identity.local_ip();
-            let my_v6 = derive_ipv6(&self.identity.local_identity());
+            let my_v4 = self.transport.identity.local_ip();
+            let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
             if let Err(e) = tun::route_self_loopback(my_v4, my_v6).await {
                 tracing::warn!(error = %e, "failed to install loopback self-route");
                 warnings.push(format!("failed to install loopback self-route: {e}"));
@@ -777,7 +816,7 @@ impl MeshManager {
         // Clone the TUN name out of the lock before awaiting: the embedder
         // (mobile) stores it behind a mutex, and a std guard can't be held across
         // an await point.
-        let dns_tun_name = self.tun_name.lock().unwrap().clone();
+        let dns_tun_name = self.tun_name.load().as_str().to_owned();
         self.dns.configure(&dns_tun_name, &mut warnings).await;
 
         // Start the embedded mesh SSH server if enabled. It binds the mesh IPs'
@@ -819,8 +858,8 @@ impl MeshManager {
         self.stop_ssh();
 
         // Clone the TUN name out of the lock before awaiting (see `activate`);
-        // the DnsManager reverts system DNS and clears the TUN search domains.
-        let tun_name = self.tun_name.lock().unwrap().clone();
+        // the DnsService reverts system DNS and clears the TUN search domains.
+        let tun_name = self.tun_name.load().as_str().to_owned();
         self.dns.revert(&tun_name).await;
 
         #[cfg(not(target_os = "android"))]
@@ -834,52 +873,10 @@ impl MeshManager {
         }
     }
 
-    /// Tear down a network's runtime state (connections, ALPN, DNS entries,
-    /// background tasks) without touching its persisted config. Returns whether
-    /// the network was active. Used by `leave_network` (which also forgets the
-    /// config); standby (`deactivate`) no longer tears connections down.
-    pub(crate) async fn teardown_network_runtime(&self, name: &str) -> bool {
-        let Some(handle) = self.networks.remove(name).map(|(_, v)| v) else {
-            return false;
-        };
-        handle.cancel.cancel();
-        for task in handle.tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-        }
-
-        self.peers.remove_by_network(name);
-        dns::remove_network(&self.dns.hostname_table, &self.dns.reverse_table, name).await;
-        self.protocol_router
-            .unregister(&transport::network_alpn(&handle.network_key));
-        self.refresh_alpns().await;
-        true
-    }
-
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
+    /// leave a network (close connections, tear down runtime, forget config).
     #[tracing::instrument(skip(self), fields(net = name))]
     pub async fn leave_network(&self, name: &str) -> IpcMessage {
-        // Gracefully close our connections with the leave code BEFORE teardown
-        // drops them, so each peer's reader sees an intentional close and the
-        // coordinator prunes us from the roster (rather than waiting for an
-        // idle timeout that only ever clears the green dot).
-        for (_eid, _ip, conn) in self.peers.peers_for_network_with_conn(name) {
-            conn.close(VarInt::from_u32(forward::LEAVE_CODE), b"leave");
-        }
-
-        let was_active = self.teardown_network_runtime(name).await;
-
-        // Remove from config even if the network wasn't active
-        let removed_from_config = config::delete_network(name).unwrap_or(false);
-
-        if was_active || removed_from_config {
-            tracing::info!(network = %name, "left network");
-            IpcMessage::Ok {
-                message: format!("left network '{}'", name),
-            }
-        } else {
-            IpcMessage::Error {
-                message: format!("network '{}' not found", name),
-            }
-        }
+        self.registry.leave_network(name).await
     }
 }

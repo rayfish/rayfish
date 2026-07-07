@@ -58,11 +58,12 @@ pub(crate) async fn drain_pending_rename(
 ) {
     // `apply_roster_to_dns` already cleared the intent if the blob confirmed it,
     // so a value here means it's genuinely still outstanding.
-    let Some(pending) = (match config::load_network(network_name) {
-        Ok(Some(net)) => net.pending_hostname,
-        _ => None,
-    }) else {
-        return;
+    let (pending, net_pubkey) = match config::load_network(network_name) {
+        Ok(Some(net)) => match (net.pending_hostname, net.network_public_key) {
+            (Some(p), Some(k)) => (p, k),
+            _ => return,
+        },
+        _ => return,
     };
 
     let coordinators: Vec<&Member> = roster
@@ -89,6 +90,7 @@ pub(crate) async fn drain_pending_rename(
                 if let Ok((mut send, _recv)) = conn.open_bi().await {
                     let _ = control::send_msg(
                         &mut send,
+                        Some(net_pubkey),
                         &ControlMsg::MeshHello {
                             identity: my_identity,
                             ip: my_ip,

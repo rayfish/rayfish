@@ -1,8 +1,5 @@
-//! File-sharing and device-pairing handlers for `MeshManager`: `send_file`,
+//! File-sharing and device-pairing handlers for `Daemon`: `send_file`,
 //! `list_files`, `accept_file`, pairing. Split out of `daemon/mod.rs`.
-
-use std::ffi::CString;
-use std::path::Path;
 
 use super::super::*;
 
@@ -11,436 +8,51 @@ use super::super::*;
 /// unreachable primary hangs the pairing call forever.
 const PAIR_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-impl MeshManager {
+impl Daemon {
     pub(crate) async fn resolve_peer_name(&self, name: &str) -> Option<EndpointId> {
-        let suffix = format!(".{}", crate::DNS_DOMAIN);
-        let qualified = if name.ends_with(&suffix) {
-            name.to_string()
-        } else {
-            format!("{name}{suffix}")
-        };
-        if let Some((ip, _)) =
-            dns::resolve_name(&qualified, &suffix, &self.dns.hostname_table).await
-        {
-            // Try connected peers first
-            if let Some(route) = self.peers.lookup_v4(&ip) {
-                return Some(route.endpoint_id);
-            }
-            // Fall back to member list (peer may be offline or it's us)
-            for entry in self.networks.iter() {
-                let state = entry.value().state.read().unwrap();
-                if let Some(m) = state.members.all().iter().find(|m| m.ip == ip) {
-                    return Some(m.identity);
-                }
-            }
-        }
-        self.resolve_short_id_any_network(name)
+        self.registry.resolve_peer_name(name).await
     }
 
-    /// Resolve a firewall `--peer` argument to a peer's **device** endpoint id,
-    /// accepting far more forms than [`resolve_peer_name`]: hostname (bare or
-    /// `host.net.ray`), mesh IPv4 (also for offline members, since the roster
-    /// stores v4), mesh IPv6 (connected peers only, the roster carries no v6),
-    /// short id / full endpoint id, or a paired **user identity** (resolved to
-    /// that user's joined device). Returns the device id `D`; `firewall_add`
-    /// normalizes it to the user identity for inbound rules. Kept separate from
-    /// `resolve_peer_name` so `ping`/`send` behaviour is unchanged; the extra
-    /// cases could later back those commands too.
+    /// Resolve a peer argument to its **device** endpoint id, accepting more
+    /// forms than [`Self::resolve_peer_name`] (delegates to [`NetworkRegistry`]).
     pub(crate) async fn resolve_peer_flexible(&self, name: &str) -> Option<EndpointId> {
-        // Hostname (Magic DNS) + short-id / endpoint-id-prefix fallback.
-        if let Some(id) = self.resolve_peer_name(name).await {
-            return Some(id);
-        }
-        // Mesh IP literal of a *connected* peer (fast path; also the only way to
-        // reach a peer by IPv6, since the roster carries no v6 address).
-        if let Ok(v4) = name.parse::<Ipv4Addr>()
-            && let Some(route) = self.peers.lookup_v4(&v4)
-        {
-            return Some(route.endpoint_id);
-        }
-        if let Ok(v6) = name.parse::<std::net::Ipv6Addr>()
-            && let Some(route) = self.peers.lookup_v6(&v6)
-        {
-            return Some(route.endpoint_id);
-        }
-        // Roster scan: an offline peer's mesh IPv4, or a paired user identity.
-        for entry in self.networks.iter() {
-            let state = entry.value().state.read().unwrap();
-            if let Some(id) = state.members.resolve_peer_literal(name) {
-                return Some(id);
-            }
-        }
-        None
-    }
-
-    /// Resolve whether a pending offer's sender is one of *our own* paired
-    /// devices: the sender's resolved user identity must equal ours (our device
-    /// cert's `user_identity`, or on the primary (which holds no cert) our own
-    /// endpoint id). A non-paired peer resolves to its own transport id and so
-    /// can never match. Shared by `try_auto_accept_file` and `list_files` (which
-    /// surfaces it as `PendingFileInfo.own_device` for the mobile UI).
-    pub(crate) fn is_own_device_sender(&self, from: EndpointId) -> bool {
-        let own_user = self
-            .device_cert
-            .as_ref()
-            .map(|c| c.user_identity)
-            .unwrap_or_else(|| self.endpoint.id());
-        self.device_user_map.resolve(&from) == own_user
+        self.registry.resolve_peer_flexible(name).await
     }
 
     pub async fn send_file(&self, path: &str, peer: &str) -> IpcMessage {
-        let peer_id = match self.resolve_peer_flexible(peer).await {
-            Some(id) => id,
-            None => {
-                return IpcMessage::Error {
-                    message: format!("unknown peer '{peer}'"),
-                };
-            }
-        };
-
-        let file_path = Path::new(path);
-        let file_bytes = match std::fs::read(file_path) {
-            Ok(b) => b,
-            Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("cannot read '{}': {e}", file_path.display()),
-                };
-            }
-        };
-
-        let filename = file_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "file".to_string());
-        let size = file_bytes.len() as u64;
-        let mime_type = guess_mime_type(&filename);
-        let hash = blake3::hash(&file_bytes);
-
-        if let Err(e) = self.blob_store.blobs().add_slice(&file_bytes).await {
-            return IpcMessage::Error {
-                message: format!("blob store error: {e}"),
-            };
-        }
-
-        let msg = control::ControlMsg::FileOffer {
-            from: self.endpoint.id(),
-            filename: filename.clone(),
-            size,
-            mime_type: mime_type.clone(),
-            blob_hash: hash,
-        };
-
-        match transport::connect_to_peer_with_alpn(&self.endpoint, peer_id, transport::FILES_ALPN)
-            .await
-        {
-            Ok(conn) => match conn.open_bi().await {
-                Ok((mut send, _)) => {
-                    if let Err(e) = control::send_msg(&mut send, &msg).await {
-                        return IpcMessage::Error {
-                            message: format!("failed to send offer: {e}"),
-                        };
-                    }
-                    // send_msg already finished the stream; wait for the peer to
-                    // read the offer so it flushes before this `conn` is dropped.
-                    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
-                }
-                Err(e) => {
-                    return IpcMessage::Error {
-                        message: format!("failed to open stream: {e}"),
-                    };
-                }
-            },
-            Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("cannot reach peer '{peer}': {e}"),
-                };
-            }
-        }
-
-        IpcMessage::Ok {
-            message: format!("offered {} ({}) to {}", filename, format_size(size), peer),
-        }
+        self.files.send_file(path, peer).await
     }
 
     pub fn list_files(&self) -> IpcMessage {
-        let pending = self.files.pending_files.lock().unwrap();
-        let files = pending
-            .iter()
-            .map(|f| ipc::PendingFileInfo {
-                id: f.id,
-                from: f.from.fmt_short().to_string(),
-                filename: f.filename.clone(),
-                size: f.size,
-                mime_type: f.mime_type.clone(),
-                own_device: self.is_own_device_sender(f.from),
-            })
-            .collect();
-        IpcMessage::FileList { files }
+        self.files.list_files()
     }
 
-    /// Decline a pending file offer: drop it from the queue without fetching the
-    /// blob. In-memory only, mirroring how `accept_file` consumes the entry.
+    /// Decline a pending file offer (delegates to [`FileService`]).
     pub fn reject_file(&self, id: u64) -> IpcMessage {
-        let mut pending = self.files.pending_files.lock().unwrap();
-        match pending.iter().position(|f| f.id == id) {
-            Some(i) => {
-                pending.remove(i);
-                IpcMessage::Ok {
-                    message: format!("declined file {id}"),
-                }
-            }
-            None => IpcMessage::Error {
-                message: format!("no pending file with id {id}"),
-            },
-        }
+        self.files.reject_file(id)
     }
 
+    /// Accept a queued file offer (delegates to [`FileService`]). Kept as a
+    /// public Daemon method for the `ray-mobile` FFI.
     pub async fn accept_file(
         &self,
         id: u64,
         output: Option<String>,
         peer_cred: Option<(u32, u32)>,
     ) -> IpcMessage {
-        let pending_file = {
-            let mut pending = self.files.pending_files.lock().unwrap();
-            let idx = pending.iter().position(|f| f.id == id);
-            match idx {
-                Some(i) => pending.remove(i),
-                None => {
-                    return IpcMessage::Error {
-                        message: format!("no pending file with id {id}"),
-                    };
-                }
-            }
-        };
-
-        let blob_hash = iroh_blobs::Hash::from_bytes(*pending_file.blob_hash.as_bytes());
-
-        let conn = match transport::connect_to_peer_with_alpn(
-            &self.endpoint,
-            pending_file.from,
-            iroh_blobs::protocol::ALPN,
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("cannot reach sender: {e}"),
-                };
-            }
-        };
-
-        if let Err(e) = self
-            .blob_store
-            .remote()
-            .fetch(conn, iroh_blobs::HashAndFormat::raw(blob_hash))
-            .await
-        {
-            return IpcMessage::Error {
-                message: format!("blob fetch failed: {e}"),
-            };
-        }
-
-        let bytes = match self.blob_store.blobs().get_bytes(blob_hash).await {
-            Ok(b) => b,
-            Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("blob read failed: {e}"),
-                };
-            }
-        };
-
-        let dir = match output {
-            Some(ref p) => PathBuf::from(p),
-            None => dirs::download_dir().unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("Downloads")
-            }),
-        };
-
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            return IpcMessage::Error {
-                message: format!("cannot create directory '{}': {e}", dir.display()),
-            };
-        }
-
-        let dest = dir.join(&pending_file.filename);
-        if let Err(e) = std::fs::write(&dest, &bytes) {
-            return IpcMessage::Error {
-                message: format!("write failed: {e}"),
-            };
-        }
-
-        if let Some((uid, gid)) = peer_cred {
-            use std::os::unix::ffi::OsStrExt;
-            if let Ok(c) = CString::new(dest.as_os_str().as_bytes()) {
-                unsafe { libc::chown(c.as_ptr(), uid, gid) };
-            }
-            if let Ok(c) = CString::new(dir.as_os_str().as_bytes()) {
-                unsafe { libc::chown(c.as_ptr(), uid, gid) };
-            }
-        }
-
-        IpcMessage::Ok {
-            message: format!("saved to {}", dest.display()),
-        }
+        self.files.accept_file(id, output, peer_cred).await
     }
 
-    /// Evaluate a newly-queued (or already-pending) file offer against the
-    /// own-devices auto-accept policy and, if it qualifies, accept it without
-    /// user action. A no-op (offer stays queued) unless: the sender resolves to
-    /// *our own* user identity (a paired device) **and** it is a member of at
-    /// least one network with `auto_accept_files` enabled. Never removes the
-    /// pending entry unless it actually accepts (via `accept_file`).
-    pub(crate) async fn try_auto_accept_file(&self, id: u64) {
-        // Peek the offer's sender without consuming the queue entry.
-        let from = {
-            let pending = self.files.pending_files.lock().unwrap();
-            match pending.iter().find(|f| f.id == id) {
-                Some(f) => f.from,
-                None => return,
-            }
-        };
-
-        // Own-device gate: the sender must resolve to one of our own paired
-        // devices (see `is_own_device_sender`).
-        if !self.is_own_device_sender(from) {
-            return;
-        }
-
-        // Network gate: the sender must be a member of a network we've enabled.
-        let mut on_enabled_network = false;
-        for entry in self.networks.iter() {
-            let enabled = config::load_network(entry.key())
-                .ok()
-                .flatten()
-                .map(|nc| nc.auto_accept_files)
-                .unwrap_or(false);
-            if !enabled {
-                continue;
-            }
-            let is_member = entry
-                .value()
-                .state
-                .read()
-                .map(|s| s.members.all().iter().any(|m| m.identity == from))
-                .unwrap_or(false);
-            if is_member {
-                on_enabled_network = true;
-                break;
-            }
-        }
-        if !on_enabled_network {
-            return;
-        }
-
-        // Placement must be explicitly resolvable (download-dir / download-user /
-        // operator). With none configured we do not write as root: leave the
-        // offer queued for manual `ray files accept`.
-        let (dir, cred) = match resolve_download_target() {
-            Some((dir, cred)) => (dir, cred),
-            None => {
-                tracing::warn!(
-                    from = %from.fmt_short(),
-                    "auto-accept: no download target configured (set `ray files download-dir` or `download-user`); leaving offer queued"
-                );
-                return;
-            }
-        };
-        let output = Some(dir.to_string_lossy().into_owned());
-
-        match self.accept_file(id, output, cred).await {
-            IpcMessage::Ok { message } => {
-                tracing::info!(from = %from.fmt_short(), %message, "file auto-accepted from own device");
-            }
-            IpcMessage::Error { message } => {
-                tracing::warn!(from = %from.fmt_short(), %message, "file auto-accept failed");
-            }
-            _ => {}
-        }
-    }
-
-    /// Toggle this node's per-network auto-accept of file offers from our own
-    /// paired devices (persisted in config). Turning it on also drains any
-    /// already-queued offers that now qualify.
+    /// Toggle per-network own-device file auto-accept (delegates to
+    /// [`FileService`]).
     pub(crate) async fn files_auto_accept(&self, network: &str, enabled: bool) -> IpcMessage {
-        if !self.networks.contains_key(network) {
-            return IpcMessage::Error {
-                message: format!("network '{network}' not found"),
-            };
-        }
-        match config::load_network(network) {
-            Ok(Some(mut nc)) => {
-                nc.auto_accept_files = enabled;
-                if let Err(e) = config::save_network(&nc) {
-                    return IpcMessage::Error {
-                        message: format!("failed to persist auto-accept setting: {e}"),
-                    };
-                }
-            }
-            Ok(None) => {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not found in config"),
-                };
-            }
-            Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to load config: {e}"),
-                };
-            }
-        }
-        // On enable, sweep any already-queued offers so a file that arrived
-        // before the toggle still lands.
-        if enabled {
-            let ids: Vec<u64> = self
-                .files
-                .pending_files
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|f| f.id)
-                .collect();
-            for id in ids {
-                self.try_auto_accept_file(id).await;
-            }
-        }
-        IpcMessage::Ok {
-            message: format!(
-                "auto-accept files from your own devices {} for '{network}'",
-                if enabled { "enabled" } else { "disabled" }
-            ),
-        }
+        self.files.files_auto_accept(network, enabled).await
     }
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
-    /// mint a pairing ticket for this device.
+    /// mint a pairing ticket for this device (delegates to [`FileService`]).
     pub fn start_pairing(&self) -> IpcMessage {
-        // Only a primary (a device that holds no cert of its own) may mint device
-        // certs. A device that already carries a cert is a secondary: its key is
-        // not the user identity, so any cert it signed would bind the new device
-        // to the wrong identity and fork the device group. Refuse to hand out a
-        // pairing ticket in that case; new devices must pair from the primary.
-        if self.current_device_cert().is_some() {
-            return IpcMessage::Error {
-                message: "this device is already paired; add new devices from your primary device"
-                    .to_string(),
-            };
-        }
-
-        let secret: [u8; 32] = rand::random();
-
-        let endpoint_id = self.endpoint.id();
-        let mut ticket_bytes = Vec::with_capacity(64);
-        ticket_bytes.extend_from_slice(endpoint_id.as_bytes());
-        ticket_bytes.extend_from_slice(&secret);
-        let ticket = bs58::encode(&ticket_bytes).into_string();
-
-        *self.files.pairing_secret.lock().unwrap() = Some(secret);
-
-        tracing::info!("pairing session opened; awaiting a secondary to scan the ticket");
-        IpcMessage::PairingTicket { ticket }
+        self.files.start_pairing()
     }
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
@@ -459,7 +71,7 @@ impl MeshManager {
         // hangs indefinitely. Bound it so pairing fails fast with a clear message.
         let conn = match tokio::time::timeout(
             PAIR_CONNECT_TIMEOUT,
-            self.endpoint.connect(addr, PAIR_ALPN),
+            self.transport.endpoint.connect(addr, PAIR_ALPN),
         )
         .await
         {
@@ -502,7 +114,7 @@ impl MeshManager {
 
         let request = control::PairMsg::Request {
             secret: secret_arr,
-            device_pubkey: self.endpoint.id(),
+            device_pubkey: self.transport.endpoint.id(),
         };
         let request_bytes = match rmp_serde::to_vec_named(&request) {
             Ok(b) => b,
@@ -568,7 +180,7 @@ impl MeshManager {
                 // roster flagging it `is_coordinator`. Falls back to the blob's
                 // coordinators if the primary does not admit.
                 for net in networks {
-                    if self.networks.contains_key(&net.network_key) {
+                    if self.registry.networks.contains_key(&net.network_key) {
                         continue;
                     }
                     let me = Arc::clone(self);
@@ -610,55 +222,9 @@ impl MeshManager {
         }
     }
 
-    /// This node's "user identity": our device cert's `user_identity` if we are a
-    /// paired secondary, else our own endpoint id (we are the primary). Matches
-    /// the own-device gate used by file auto-accept.
-    fn own_user_identity(&self) -> EndpointId {
-        self.current_device_cert()
-            .map(|c| c.user_identity)
-            .unwrap_or_else(|| self.endpoint.id())
-    }
-
-    /// Enumerate this user's paired secondary devices from the network rosters
-    /// (`ray pair list`). A paired device is any roster member whose
-    /// `user_identity` is ours but whose device id is neither ours nor the user
-    /// identity itself.
+    /// `ray pair list`: enumerate this user's other paired devices.
     pub(crate) fn list_paired_devices(&self) -> IpcMessage {
-        let own_user = self.own_user_identity();
-        let own_device = self.endpoint.id();
-        let mut by_device: HashMap<EndpointId, (Option<String>, Vec<String>)> = HashMap::new();
-        for entry in self.networks.iter() {
-            let net_name = entry.key().clone();
-            let roster = entry.value().state.read().unwrap().roster();
-            for m in roster {
-                if m.user_identity == Some(own_user)
-                    && m.identity != own_user
-                    && m.identity != own_device
-                {
-                    let e = by_device
-                        .entry(m.identity)
-                        .or_insert_with(|| (m.hostname.clone(), Vec::new()));
-                    if e.0.is_none() {
-                        e.0 = m.hostname.clone();
-                    }
-                    e.1.push(net_name.clone());
-                }
-            }
-        }
-        let devices = by_device
-            .into_iter()
-            .map(|(device_id, (hostname, mut networks))| {
-                networks.sort();
-                networks.dedup();
-                ipc::PairedDeviceInfo {
-                    device_id,
-                    short_id: device_id.fmt_short().to_string(),
-                    hostname,
-                    networks,
-                }
-            })
-            .collect();
-        IpcMessage::PairedDevices { devices }
+        self.files.list_paired_devices()
     }
 
     /// Revoke one of this user's paired devices (`ray unpair`). Primary-only.
@@ -678,7 +244,7 @@ impl MeshManager {
                 message: "only your primary device can unpair a device".to_string(),
             };
         }
-        let own_user = self.endpoint.id();
+        let own_user = self.transport.endpoint.id();
 
         let target = match self.resolve_peer_flexible(device).await {
             Some(id) => id,
@@ -700,7 +266,7 @@ impl MeshManager {
         let mut display = target.fmt_short().to_string();
         let mut is_paired = false;
         let mut nets: Vec<(String, SharedNetworkState, Option<Arc<Notify>>, bool)> = Vec::new();
-        for entry in self.networks.iter() {
+        for entry in self.registry.networks.iter() {
             let s = entry.value().state.read().unwrap();
             if let Some(m) = s.members.all().iter().find(|m| m.identity == target)
                 && m.user_identity == Some(own_user)
@@ -741,7 +307,7 @@ impl MeshManager {
                 message: format!("failed to persist nullifier: {e}"),
             };
         }
-        self.device_user_map.remove(&target);
+        self.registry.device_user_map.remove(&target);
 
         // 2. Best-effort: ask the device to wipe its own cert if online.
         self.send_unpaired_notice(target).await;
@@ -773,19 +339,22 @@ impl MeshManager {
                     )
                     .await;
                 }
-                update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+                update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
+                // Nudge this network's members to reconverge from the freshly
+                // republished record.
+                let net_pubkey = state.read().unwrap().network_public_key;
+                broadcast_member_sync(&self.registry.peers, net_pubkey, &net, None).await;
             }
-            for (pid, ip, conn) in self.peers.peers_for_network_with_conn(&net) {
+            for (pid, ip, conn) in self.registry.peers.peers_for_network_with_conn(&net) {
                 if pid == target {
-                    self.pruned_peers.insert((net.clone(), pid));
+                    self.registry.pruned_peers.insert((net.clone(), pid));
                     conn.close(VarInt::from_u32(forward::KICK_CODE), b"unpaired");
-                    self.peers
+                    self.registry
+                        .peers
                         .remove_peer_from_network(&ip, &derive_ipv6(&pid), &net);
                 }
             }
         }
-        // Nudge other members to reconverge from the freshly republished records.
-        broadcast_member_sync(&self.peers, None).await;
 
         tracing::info!(device = %target.fmt_short(), "unpaired device");
         IpcMessage::Ok {
@@ -793,69 +362,18 @@ impl MeshManager {
         }
     }
 
-    /// Clear a re-paired device's nullifier (the inverse of [`unpair`]). Invoked by
-    /// the daemon loop when the pairing accept arm re-authorizes a device: drops it
-    /// from the durable `revoked_devices` seed and from every coordinated network's
-    /// blob nullifier set, republishing so the device's fresh cert is honored mesh
-    /// wide again. Non-coordinated networks clear on their own coordinator's next
-    /// reseal. Best-effort; a persist/publish failure is logged, not surfaced.
-    pub(crate) async fn reauth_device(self: &Arc<Self>, device: EndpointId) {
-        // Drop from the durable nullifier seed so a later reseal won't re-add it.
-        let mut cfg = config::load().unwrap_or_default();
-        let hex = device.to_string();
-        if let Some(pos) = cfg.revoked_devices.iter().position(|d| *d == hex) {
-            cfg.revoked_devices.remove(pos);
-            if let Err(e) = config::save_settings(&cfg) {
-                tracing::warn!(error = %e, "reauth: failed to clear device from nullifier seed");
-            }
-        }
-        // Collect coordinated networks (clone the handles) before awaiting.
-        let mut nets: Vec<(String, SharedNetworkState, Option<Arc<Notify>>)> = Vec::new();
-        for entry in self.networks.iter() {
-            if entry
-                .value()
-                .state
-                .read()
-                .unwrap()
-                .network_secret_key
-                .is_some()
-            {
-                nets.push((
-                    entry.key().clone(),
-                    entry.value().state.clone(),
-                    entry.value().dht_notify.clone(),
-                ));
-            }
-        }
-        let mut changed = false;
-        for (_net, state, dht_notify) in nets {
-            let removed = {
-                let mut s = state.write().unwrap();
-                s.nullifiers.remove(&device)
-            };
-            if removed {
-                changed = true;
-                update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
-            }
-        }
-        if changed {
-            broadcast_member_sync(&self.peers, None).await;
-            tracing::info!(device = %device.fmt_short(), "re-authorized device (cleared nullifier)");
-        }
-    }
-
     /// Best-effort `ControlMsg::Unpaired` to a device over any shared live mesh
     /// connection, asking it to wipe its own cert. Never blocks unpair on success
     /// the authoritative revocation is the signed pkarr record.
     async fn send_unpaired_notice(&self, target: EndpointId) {
-        for entry in self.networks.iter() {
+        for entry in self.registry.networks.iter() {
             let net = entry.key().clone();
-            for (pid, _ip, conn) in self.peers.peers_for_network_with_conn(&net) {
+            for (pid, _ip, conn) in self.registry.peers.peers_for_network_with_conn(&net) {
                 if pid != target {
                     continue;
                 }
                 if let Ok((mut send, _recv)) = conn.open_bi().await {
-                    let _ = control::send_msg(&mut send, &ControlMsg::Unpaired).await;
+                    let _ = control::send_msg(&mut send, None, &ControlMsg::Unpaired).await;
                     let _ = send.finish();
                 }
                 return;
@@ -870,44 +388,8 @@ impl MeshManager {
     /// floor). Used by the phone's "unpair this device" control and by the
     /// device-side handler when its primary sends `ControlMsg::Unpaired`. A device
     /// with no cert (a primary) has nothing to unpair.
-    pub async fn unpair_self(self: &Arc<Self>) -> IpcMessage {
-        if self.current_device_cert().is_none() {
-            return IpcMessage::Error {
-                message: "this device is not paired to a primary".to_string(),
-            };
-        }
-        // Leave every network first (graceful LEAVE_CODE close + config removal),
-        // so peers see an intentional departure and prune us immediately.
-        let networks: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
-        for net in &networks {
-            self.leave_network(net).await;
-        }
-        // Also purge any saved-but-inactive network configs. When a device is
-        // unpaired while offline it discovers this at startup restore, before its
-        // networks are added to `self.networks` (the join bails on the nullifier
-        // check first), so the loop above sees none, yet the config files remain
-        // and would make the node churn trying to rejoin networks it was removed
-        // from. Delete them directly.
-        if let Ok(cfg) = config::load() {
-            for net in &cfg.networks {
-                let _ = config::delete_network(&net.name);
-            }
-        }
-        // Then wipe the cert so this device is no longer one of its user's devices.
-        match crate::identity::delete_device_cert() {
-            Ok(()) => tracing::warn!(
-                "unpaired this device: deleted device certificate and left all networks"
-            ),
-            Err(e) => {
-                tracing::warn!(error = %e, "unpair: failed to delete device cert");
-                return IpcMessage::Error {
-                    message: format!("left all networks but failed to delete device cert: {e}"),
-                };
-            }
-        }
-        IpcMessage::Ok {
-            message: format!("unpaired this device (left {} network(s))", networks.len()),
-        }
+    pub async fn unpair_self(&self) -> IpcMessage {
+        self.registry.unpair_self().await
     }
 }
 
@@ -938,7 +420,7 @@ pub(crate) fn store_refreshed_cert(cert: &control::DeviceCert) {
 
 /// Returns true when `sender` is this device's primary (it signed our cert), so
 /// the caller can also tear the device out of the mesh. The cert deletion itself
-/// is deferred to [`MeshManager::unpair_self`] (called by the caller) so the
+/// is deferred to [`Daemon::unpair_self`] (called by the caller) so the
 /// leave-all runs first while the cert still identifies our networks.
 pub(crate) fn is_unpaired_by(sender: EndpointId) -> bool {
     matches!(
@@ -981,7 +463,7 @@ fn dir_owner(path: &std::path::Path) -> Option<(u32, u32)> {
 /// [`pick_download_target`]. `None` means "no configured target": the caller
 /// must leave the offer queued rather than writing as root. The daemon runs as
 /// root, so its own `~/Downloads` is never a valid fallback.
-fn resolve_download_target() -> Option<(PathBuf, Option<(u32, u32)>)> {
+pub(crate) fn resolve_download_target() -> Option<(PathBuf, Option<(u32, u32)>)> {
     let cfg = config::load().ok()?;
     let dir = cfg.download_dir.map(PathBuf::from);
     let dir_owned = dir.as_deref().and_then(dir_owner);
