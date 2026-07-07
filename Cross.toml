@@ -1,0 +1,7 @@
+# Pin the Linux build container to Ubuntu 22.04 (glibc 2.35) instead of cross's
+# default `:main` image (Ubuntu 24.04, glibc 2.39). A 2.39-linked binary won't
+# start on our older Scaleway hosts (`GLIBC_2.39 not found`); 22.04 is the newest
+# Ubuntu they run and its binaries are forward-compatible with newer hosts.
+# See cross/Dockerfile.gnu.
+[target.x86_64-unknown-linux-gnu]
+dockerfile = "cross/Dockerfile.gnu"
