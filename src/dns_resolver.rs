@@ -2,7 +2,7 @@
 //! Answers `.ray` names from the hostname tables and forwards everything else
 //! to the captured system upstreams.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,12 +27,20 @@ impl Resolver {
         }
     }
 
-    /// Replace the upstream set, dropping the magic IP to avoid a forwarding loop.
+    /// Replace the upstream set (bare IPv4 on port 53), dropping the magic IP to
+    /// avoid a forwarding loop. The desktop capture path uses this.
     pub fn set_upstreams(&self, servers: Vec<Ipv4Addr>) {
-        let v: Vec<SocketAddr> = servers
+        self.set_upstream_addrs(servers.into_iter().map(|ip| SocketAddr::from((ip, 53u16))));
+    }
+
+    /// Replace the upstream set with explicit socket addresses (ip:port). Lets a
+    /// caller point the resolver at a loopback proxy on a non-53 port: Android
+    /// runs a local `DnsResolver.rawQuery` proxy so non-`.ray` lookups honor the
+    /// system Private DNS (DoT/DoH) instead of being downgraded to cleartext :53.
+    pub fn set_upstream_addrs(&self, addrs: impl IntoIterator<Item = SocketAddr>) {
+        let v: Vec<SocketAddr> = addrs
             .into_iter()
-            .filter(|ip| *ip != MAGIC_DNS_V4)
-            .map(|ip| SocketAddr::from((ip, 53u16)))
+            .filter(|a| a.ip() != IpAddr::V4(MAGIC_DNS_V4))
             .collect();
         self.upstreams.store(Arc::new(v));
     }
@@ -248,6 +256,24 @@ mod tests {
         assert_eq!(
             r.upstreams(),
             vec!["1.1.1.1:53".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_upstream_addrs_keeps_custom_port_and_drops_magic() {
+        let r = Resolver::new(
+            crate::dns::new_hostname_table(),
+            crate::dns::new_reverse_table(),
+        );
+        // A loopback rawQuery proxy on a non-53 port survives; the magic IP is
+        // still filtered regardless of the port it carries.
+        r.set_upstream_addrs([
+            "127.0.0.1:5353".parse::<SocketAddr>().unwrap(),
+            SocketAddr::from((crate::dns::MAGIC_DNS_V4, 5353)),
+        ]);
+        assert_eq!(
+            r.upstreams(),
+            vec!["127.0.0.1:5353".parse::<SocketAddr>().unwrap()]
         );
     }
 }

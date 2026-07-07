@@ -37,6 +37,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Android no longer downgrades public DNS to cleartext.** While the VPN was up,
+  non-`.ray` lookups were forwarded as plaintext UDP on port 53 to the network's
+  IPv4 resolvers, ignoring any Private DNS (DoT/DoH) the device had configured.
+  Rayfish now runs a small loopback proxy that forwards those lookups through the
+  Android platform resolver (`DnsResolver.rawQuery`), so they honor the system
+  Private DNS setting. The app is also excluded from its own tunnel so its
+  sockets use the real underlying network. Devices below Android 10 (no
+  `DnsResolver`) fall back to the previous plaintext behavior.
 - **A reconnecting peer shows the current roster within seconds, not up to a
   minute.** After a restart a node connected to its coordinator almost instantly
   but its own `ray status` could sit on a stale roster (peers missing or shown

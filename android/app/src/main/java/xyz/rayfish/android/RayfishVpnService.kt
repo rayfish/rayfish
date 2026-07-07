@@ -31,6 +31,9 @@ class RayfishVpnService : VpnService() {
 
     @Volatile
     private var tunnel: ParcelFileDescriptor? = null
+    // Loopback DNS proxy forwarding non-.ray lookups through DnsResolver.rawQuery
+    // (honors Private DNS / DoT). Null on API < 29 or if it failed to start.
+    private var dnsProxy: DnsProxy? = null
     // Polls for incoming own-device file offers and auto-accepts them, so files
     // shared to this device land in Downloads even with the app UI closed.
     private var autoAcceptPoller: java.util.concurrent.ScheduledExecutorService? = null
@@ -73,17 +76,29 @@ class RayfishVpnService : VpnService() {
         // still establishes.
         val tunnelAddr = meshIp.ifBlank { "100.64.0.2" }
 
-        // Point the resolver at the phone's real DNS servers before the tunnel
-        // captures all DNS on 100.100.100.53. Without this, non-.ray lookups are
-        // refused and public browsing breaks while the VPN is up. Read them from
-        // the underlying (non-VPN) network, which is still active pre-establish.
+        // Point the resolver at the phone's real DNS before the tunnel captures
+        // all DNS on 100.100.100.53. Without this, non-.ray lookups are refused
+        // and public browsing breaks while the VPN is up.
+        //
+        // Prefer a loopback DnsResolver.rawQuery proxy: it forwards through the
+        // platform resolver, so it honors the device's Private DNS (DoT/DoH)
+        // instead of downgrading to cleartext UDP:53. Only when the proxy is
+        // unavailable (API < 29 or bind failure) do we fall back to handing the
+        // underlying network's plaintext IPv4 resolvers straight to Rust.
         try {
-            val dns = systemDnsServers()
-            if (dns.isNotEmpty()) {
-                NodeHolder.get(applicationContext).setDnsUpstreams(dns)
-                Log.i(TAG, "DNS upstreams set: $dns")
+            val proxy = DnsProxy.start(applicationContext)
+            dnsProxy = proxy
+            if (proxy != null) {
+                NodeHolder.get(applicationContext).setDnsUpstreams(listOf("127.0.0.1:${proxy.port}"))
+                Log.i(TAG, "DNS upstream set to rawQuery proxy 127.0.0.1:${proxy.port}")
             } else {
-                Log.w(TAG, "no underlying IPv4 DNS servers found; only .ray will resolve")
+                val dns = systemDnsServers()
+                if (dns.isNotEmpty()) {
+                    NodeHolder.get(applicationContext).setDnsUpstreams(dns)
+                    Log.i(TAG, "DNS upstreams set (plaintext fallback): $dns")
+                } else {
+                    Log.w(TAG, "no underlying IPv4 DNS servers found; only .ray will resolve")
+                }
             }
         } catch (t: Throwable) {
             Log.e(TAG, "could not set DNS upstreams; only .ray will resolve", t)
@@ -103,6 +118,17 @@ class RayfishVpnService : VpnService() {
             builder.addAddress(meshV6, 128)
             builder.addRoute("200::", 7)
         }
+        // Exclude Rayfish itself from its own tunnel. Its sockets (the iroh mesh
+        // underlay, the DnsResolver.rawQuery proxy) then use the real underlying
+        // network directly, so DNS forwarding can't loop back through the TUN and
+        // Private DNS keeps working. Split routing already keeps mesh traffic on
+        // the tunnel via the Rust core's fd, not the app's normal sockets.
+        try {
+            builder.addDisallowedApplication(packageName)
+        } catch (_: PackageManager.NameNotFoundException) {
+            Log.w(TAG, "could not exclude self from VPN: $packageName")
+        }
+
         // Keep VPN-hostile apps (Android Auto, casting, RCS, Sonos) off the
         // tunnel. Each add is guarded: an uninstalled package must not abort setup.
         for (pkg in DISALLOWED_APPS) {
@@ -192,6 +218,9 @@ class RayfishVpnService : VpnService() {
 
         autoAcceptPoller?.shutdownNow()
         autoAcceptPoller = null
+
+        dnsProxy?.stop()
+        dnsProxy = null
 
         tunnel = null
     }
