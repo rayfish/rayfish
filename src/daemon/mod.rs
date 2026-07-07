@@ -1020,9 +1020,18 @@ impl MeshManager {
             let _ = config::save_network(&net);
         }
 
+        // Fast-path the rename to connected peers via `MeshHello`, regardless of
+        // role. A peer *coordinator* only learns a self-rename this way: it acts
+        // on another node's `MeshHello` (routed to `handle_member_hello`, which
+        // applies the rename and republishes) but not on a `MemberSync`/
+        // `BlobUpdated` trigger, and coordinators don't run the group poller. So
+        // without this, a co-coordinator's rename never reached its peer
+        // coordinators (roster + `.ray` DNS both stayed stale on them).
+        self.announce_rename_to_peers(network, my_identity, my_ip, &new_hostname)
+            .await;
         if is_coord {
-            // Authoritative: republish the group blob and push the new roster to
-            // every peer immediately.
+            // Authoritative: republish the signed blob so members reconverge from
+            // the record, and broadcast a `MemberSync` trigger to nudge them.
             tracing::info!(
                 network = %network,
                 hostname = %new_hostname,
@@ -1031,9 +1040,6 @@ impl MeshManager {
             update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
             let net_pubkey = state.read().unwrap().network_public_key;
             broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
-        } else {
-            self.announce_rename_to_peers(network, my_identity, my_ip, &new_hostname)
-                .await;
         }
 
         let dns_name = format!("{}.{}.{}", new_hostname, network, crate::DNS_DOMAIN);
