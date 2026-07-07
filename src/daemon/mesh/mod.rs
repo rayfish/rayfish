@@ -13,7 +13,6 @@ mod accept;
 mod admin;
 mod alias;
 mod bootstrap;
-mod connect;
 mod coordinator;
 mod create_join;
 mod diagnostics;
