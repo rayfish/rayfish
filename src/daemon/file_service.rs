@@ -1,11 +1,11 @@
 //! File-transfer and device-pairing state, owned as one unit instead of being
 //! split across `ProtocolRouter` (pending offers, id counter, pairing secret,
-//! signing key) and `MeshManager`.
+//! signing key) and `Daemon`.
 //!
 //! The two ALPN accept arms (`FILES_ALPN` file offers, `PAIR_ALPN` pairing) live
 //! here; the `ProtocolRouter` accept loop holds an `Arc<FileService>` and
 //! delegates to them. The IPC handlers (`send_file`/`accept_file`/`start_pairing`
-//! /…) stay on `MeshManager` since they orchestrate over core handles (endpoint,
+//! /…) stay on `Daemon` since they orchestrate over core handles (endpoint,
 //! peers, the shared blob store) and read this service's state.
 
 use super::*;

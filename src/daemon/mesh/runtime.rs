@@ -1,4 +1,4 @@
-//! Network runtime handlers for `MeshManager`: coordinator restore, nuke,
+//! Network runtime handlers for `Daemon`: coordinator restore, nuke,
 //! connect-all, activate/deactivate (data plane), teardown, leave. Split out of `daemon/mod.rs`.
 
 use super::super::*;
@@ -682,7 +682,7 @@ impl NetworkRegistry {
     }
 }
 
-impl MeshManager {
+impl Daemon {
     /// Rebuild the live per-network SSH allow-list snapshot from persisted
     /// config, so a running listener authorizes against current rules. Cheap and
     /// only called on SSH config changes / activation (not the hot path).

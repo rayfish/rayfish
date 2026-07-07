@@ -1,4 +1,4 @@
-//! File-sharing and device-pairing handlers for `MeshManager`: `send_file`,
+//! File-sharing and device-pairing handlers for `Daemon`: `send_file`,
 //! `list_files`, `accept_file`, pairing. Split out of `daemon/mod.rs`.
 
 
@@ -9,7 +9,7 @@ use super::super::*;
 /// unreachable primary hangs the pairing call forever.
 const PAIR_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-impl MeshManager {
+impl Daemon {
     pub(crate) async fn resolve_peer_name(&self, name: &str) -> Option<EndpointId> {
         self.registry.resolve_peer_name(name).await
     }
@@ -34,7 +34,7 @@ impl MeshManager {
     }
 
     /// Accept a queued file offer (delegates to [`FileService`]). Kept as a
-    /// public MeshManager method for the `ray-mobile` FFI.
+    /// public Daemon method for the `ray-mobile` FFI.
     pub async fn accept_file(
         &self,
         id: u64,
@@ -420,7 +420,7 @@ pub(crate) fn store_refreshed_cert(cert: &control::DeviceCert) {
 
 /// Returns true when `sender` is this device's primary (it signed our cert), so
 /// the caller can also tear the device out of the mesh. The cert deletion itself
-/// is deferred to [`MeshManager::unpair_self`] (called by the caller) so the
+/// is deferred to [`Daemon::unpair_self`] (called by the caller) so the
 /// leave-all runs first while the cert still identifies our networks.
 pub(crate) fn is_unpaired_by(sender: EndpointId) -> bool {
     matches!(

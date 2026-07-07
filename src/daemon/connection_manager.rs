@@ -49,7 +49,7 @@ impl ConnectionManager {
     }
 
     /// Install the daemon-wide mesh dispatch context. Called once by
-    /// `MeshManager` right after it is built.
+    /// `Daemon` right after it is built.
     pub(crate) fn set_mesh_dispatch(&self, dispatch: MeshDispatch) {
         let _ = self.mesh.set(dispatch);
     }
@@ -78,7 +78,7 @@ impl ConnectionManager {
     /// loops accepting control streams and routing each `ControlFrame` to the
     /// right per-network handler by `net`, or handling connection-level messages
     /// (`NetworkHandles`, `Ping`/`Pong`) inline. Shared by the accept side and the
-    /// dial side (`MeshManager::drive_dialed_connection`).
+    /// dial side (`Daemon::drive_dialed_connection`).
     pub(crate) async fn drive_mesh_connection(self: Arc<Self>, conn: Connection) {
         let peer_id = conn.remote_id();
         let Some(mesh) = self.mesh.get() else {

@@ -13,8 +13,8 @@
 //!   (real shutdown / `IpcMessage::Shutdown`).
 //! - **Active VPN state**: the TUN link being *up*, system DNS being
 //!   configured, and the saved networks being connected. This is toggled at
-//!   runtime by [`MeshManager::activate`] / [`MeshManager::deactivate`], driven
-//!   by the `Up` / `Down` IPC commands, and tracked by [`MeshManager::active`].
+//!   runtime by [`Daemon::activate`] / [`Daemon::deactivate`], driven
+//!   by the `Up` / `Down` IPC commands, and tracked by [`Daemon::active`].
 //!
 //! This mirrors Tailscale's split between the always-running `tailscaled`
 //! daemon and the `tailscale up` / `tailscale down` client toggles: `down`
@@ -87,8 +87,8 @@ use crate::tun::{self, check_cgnat_conflict};
 use ray_proto::SuggestedFirewall;
 use smol_str::SmolStr;
 
-// `MeshManager`'s IPC operations are split by domain into the `mesh/` submodule;
-// see `mesh/mod.rs`. Each holds an additional `impl MeshManager` block. Nested a
+// `Daemon`'s IPC operations are split by domain into the `mesh/` submodule;
+// see `mesh/mod.rs`. Each holds an additional `impl Daemon` block. Nested a
 // level down so the module names can be the clean domain names without colliding
 // with the `use crate::{firewall, dns, …}` aliases above.
 mod mesh;
@@ -102,9 +102,9 @@ pub use mesh::run_daemon;
 // `build_headless` is the embedder (mobile) construction entry point.
 pub use mesh::build_headless;
 
-/// Legacy name for [`MeshManager`], kept so embedders (`ray-mobile`) that were
+/// Legacy name for [`Daemon`], kept so embedders (`ray-mobile`) that were
 /// written against `DaemonState` compile unchanged after the daemon refactor.
-pub type DaemonState = MeshManager;
+pub type DaemonState = Daemon;
 
 // The process-lifetime network + storage foundation every service depends on.
 mod foundation;
@@ -119,7 +119,7 @@ mod network_registry;
 pub(crate) use network_registry::NetworkRegistry;
 
 // Domain satellites with their own owned state (and ALPN accept arms), held by
-// `MeshManager` as fields rather than loose on the core. See each module.
+// `Daemon` as fields rather than loose on the core. See each module.
 mod dns_service;
 pub(crate) use dns_service::DnsService;
 
@@ -141,7 +141,7 @@ const PAIR_ALPN: &[u8] = b"rayfish/pair/1";
 /// background task. Every field is a cheap `Clone` (an `Arc`-backed handle, a
 /// channel sender, or a small wrapper), so the whole bundle is cloned by value
 /// instead of threaded as a dozen separate arguments/struct fields. Built once
-/// per daemon via [`MeshManager::mesh_ctx`]; a new daemon-wide dependency is one
+/// per daemon via [`Daemon::mesh_ctx`]; a new daemon-wide dependency is one
 /// field here rather than one parameter at every call site.
 #[derive(Clone)]
 pub(crate) struct MeshCtx {
@@ -163,7 +163,7 @@ pub(crate) struct MeshCtx {
     pruned_peers: Arc<DashSet<(String, EndpointId)>>,
     /// Daemon-wide disconnect channel. Every per-connection data reader
     /// (`forward::spawn_peer_reader`) reports its peer's drop here, and a single
-    /// [`MeshManager::run_connection_supervisor`] consumes it. Under one mesh
+    /// [`Daemon::run_connection_supervisor`] consumes it. Under one mesh
     /// connection per identity a drop tears the peer down across every shared
     /// network at once, so this is node-wide rather than per-network.
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
@@ -403,10 +403,10 @@ pub struct NetworkHandle {
 /// and background task. Holds both the infrastructure that lives for the whole
 /// process and the handles for the currently-active networks. See the
 /// module-level docs for the two-lifecycle model.
-/// Handles for the packet-forwarding tasks a [`MeshManager::attach_tun`] call
+/// Handles for the packet-forwarding tasks a [`Daemon::attach_tun`] call
 /// spawns (the TUN writer and the `run_mesh` reader loop), plus a dedicated
 /// cancellation token so the data plane can be stopped independently of a full
-/// daemon shutdown (used by [`MeshManager::detach_tun`] / `ray-mobile`'s `down`).
+/// daemon shutdown (used by [`Daemon::detach_tun`] / `ray-mobile`'s `down`).
 struct TunTasks {
     /// Cancels the `run_mesh` reader loop without touching `shutdown_token`.
     cancel: CancellationToken,
@@ -416,12 +416,12 @@ struct TunTasks {
     mesh: JoinHandle<()>,
 }
 
-pub struct MeshManager {
+pub struct Daemon {
     /// The process-lifetime foundation (endpoint, identity, blob store, metrics,
     /// contact id), grouped so extracted services can depend on `Arc<Transport>`
     /// instead of the whole daemon. During the service-decomposition transition
     /// this holds clones of the same handles the loose fields below still use;
-    /// the loose fields go away when `MeshManager` is dissolved.
+    /// the loose fields go away when `Daemon` is dissolved.
     transport: Arc<Transport>,
     stats: Arc<ForwardMetrics>,
     /// When the daemon process started, used for uptime in diagnostics.
@@ -436,7 +436,7 @@ pub struct MeshManager {
     /// its whole life and is never swapped.
     tun_tx: Arc<ArcSwap<mpsc::Sender<Bytes>>>,
     /// The network-owning service. Owns the `networks` map, `peers`, `firewall`,
-    /// `device_user_map`, and `pruned_peers`; MeshManager reaches all of them
+    /// `device_user_map`, and `pruned_peers`; Daemon reaches all of them
     /// through `self.registry` rather than keeping its own copies. The
     /// daemon delegates coordinator registration / promotion to it, and hands
     /// clones to services (FileService) and control readers (MemberAcceptState)
@@ -454,12 +454,12 @@ pub struct MeshManager {
     auto_update: bool,
     /// Name of the OS TUN device (desktop) or a placeholder until a packet
     /// interface is attached. Interior-mutable because on embedders (mobile) the
-    /// interface is attached after construction via [`MeshManager::attach_tun`],
+    /// interface is attached after construction via [`Daemon::attach_tun`],
     /// while on desktop it is set once at boot. `Arc` so [`NetworkRegistry`] shares
     /// it for the leave/teardown DNS search-domain refresh.
     tun_name: Arc<ArcSwap<String>>,
     /// Handles for the packet-forwarding tasks spawned by
-    /// [`MeshManager::attach_tun`], kept so a future `down()`/detach can stop them.
+    /// [`Daemon::attach_tun`], kept so a future `down()`/detach can stop them.
     tun_tasks: Mutex<Option<TunTasks>>,
     /// Prometheus metrics-server guard. Kept alive for the daemon's whole lifetime
     /// (dropping it stops the export); `None` if the server failed to bind.
@@ -486,7 +486,7 @@ pub struct MeshManager {
     #[cfg(feature = "desktop")]
     ssh_authz: crate::ssh::SshAuthz,
     /// Cancellation token for the running SSH listeners (`None` when off / on
-    /// standby). Set by [`MeshManager::start_ssh`], cleared by `stop_ssh`.
+    /// standby). Set by [`Daemon::start_ssh`], cleared by `stop_ssh`.
     // The only readers/writers (`start_ssh`/`stop_ssh`) are desktop-only, so on a
     // `--no-default-features` (Android) build the field is inert; silence the
     // resulting dead-code warning there rather than dropping the field.
@@ -532,7 +532,7 @@ fn should_promote(current: NetworkRole) -> bool {
     !current.is_coordinator()
 }
 
-impl MeshManager {
+impl Daemon {
     /// The device cert to present when joining, preferring the on-disk copy so a
     /// join issued right after pairing (same process, no restart) carries the
     /// freshly stored cert rather than the value loaded at startup.
@@ -557,7 +557,7 @@ impl MeshManager {
     /// the old endpoint's connections outlive `stop`, so a coordinator keeps the
     /// stale session while the rebuilt endpoint (same node key) comes up and the
     /// device shows offline until the race clears. Mirrors the shutdown tail of
-    /// `run_daemon`. After this the `MeshManager` is spent; build a new one to
+    /// `run_daemon`. After this the `Daemon` is spent; build a new one to
     /// come back online.
     pub async fn shutdown_and_close(&self) {
         self.shutdown_token.cancel();

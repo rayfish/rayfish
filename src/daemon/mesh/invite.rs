@@ -1,11 +1,11 @@
-//! Invite + join-request handlers for `MeshManager`: mint/list/revoke invites and
+//! Invite + join-request handlers for `Daemon`: mint/list/revoke invites and
 //! reusable keys, list/accept/deny pending join requests. Split out of `daemon/mod.rs`.
 
 use super::super::*;
 
-impl MeshManager {
+impl Daemon {
     // Thin delegates kept for the ray-mobile FFI surface (a separate crate, so it
-    // can only call public MeshManager methods). The bodies live on NetworkRegistry.
+    // can only call public Daemon methods). The bodies live on NetworkRegistry.
     pub async fn invite_create(
         &self,
         network: &str,

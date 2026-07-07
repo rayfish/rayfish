@@ -1027,11 +1027,11 @@ impl AcceptHandler {
 pub(crate) struct ProtocolRouter {
     blobs: BlobsProtocol,
     /// File-transfer + pairing state and their ALPN accept arms. The accept loop
-    /// delegates the `FILES_ALPN`/`PAIR_ALPN` arms to this; `MeshManager` holds
+    /// delegates the `FILES_ALPN`/`PAIR_ALPN` arms to this; `Daemon` holds
     /// the same handle for the IPC-side file/pairing commands.
     files: Arc<FileService>,
     /// `ray connect` state (pending/approved/outgoing maps) and the `CONNECT_ALPN`
-    /// accept arm. The accept loop delegates to this; `MeshManager` holds the same
+    /// accept arm. The accept loop delegates to this; `Daemon` holds the same
     /// handle for the IPC-side connect commands.
     connect: Arc<ConnectService>,
     /// The per-peer mesh connection driver: owns the per-network handler registry,
@@ -1123,7 +1123,7 @@ impl ProtocolRouter {
     /// Drive one mesh connection for its whole lifetime. Passthrough to the
     /// connection manager, which owns the driver, demux, and handler registry.
     /// Used by the accept loop (above) and the dial side
-    /// (`MeshManager::drive_dialed_connection`).
+    /// (`Daemon::drive_dialed_connection`).
     pub(crate) async fn drive_mesh_connection(self: Arc<Self>, conn: Connection) {
         self.conn.clone().drive_mesh_connection(conn).await;
     }

@@ -1,4 +1,4 @@
-//! Firewall IPC handlers for [`MeshManager`]: per-device firewall rules and
+//! Firewall IPC handlers for [`Daemon`]: per-device firewall rules and
 //! coordinator-suggested rules. Split out of `daemon/mod.rs`.
 
 use super::super::*;
@@ -430,9 +430,9 @@ impl NetworkRegistry {
 
 }
 
-impl MeshManager {
+impl Daemon {
     // Thin delegates so the `ray-mobile` FFI (which can only reach public
-    // MeshManager methods, not the pub(crate) registry) keeps its firewall
+    // Daemon methods, not the pub(crate) registry) keeps its firewall
     // surface. The logic lives on NetworkRegistry.
     pub async fn firewall_add(
         &self,
