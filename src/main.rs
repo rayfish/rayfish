@@ -1,9 +1,10 @@
 // The daemon's modules live in the `rayfish` library crate (`src/lib.rs`) so
 // integration tests and benchmarks can reach them; this binary is the CLI/IPC
 // client built on top.
+use rayfish::term::{layout, picker, progress, style};
 use rayfish::{
-    DNS_DOMAIN, apply, config, daemon, firewall, hostname, identity, invite, ipc, layout, logdir,
-    membership, onepassword, picker, progress, shutdown, stats, style,
+    DNS_DOMAIN, apply, config, daemon, firewall, hostname, identity, invite, ipc, logdir,
+    membership, onepassword, shutdown, stats,
 };
 
 use std::sync::{Arc, atomic};

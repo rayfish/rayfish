@@ -1,7 +1,7 @@
 //! ANSI-aware column alignment for CLI tables.
 //!
 //! Hand-rolled (no `comfy-table`) to keep the lightweight, borderless "polished
-//! plain" look of [`crate::style`]. Each [`Cell`] carries the *plain* text used
+//! plain" look of [`super::style`]. Each [`Cell`] carries the *plain* text used
 //! for width math and the *styled* text actually printed, so ANSI escape bytes
 //! never inflate column widths. Padding spaces have no color, so they're simply
 //! appended (left-align) or prepended (right-align) to the styled string.
