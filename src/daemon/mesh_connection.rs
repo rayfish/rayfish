@@ -90,7 +90,7 @@ impl MeshConnection {
                 Err(e) => {
                     reader.abort();
                     if registered {
-                        self.report_disconnect(is_intentional_close(&e)).await;
+                        self.report_disconnect(close_reason(&e)).await;
                     }
                     return;
                 }
@@ -110,7 +110,7 @@ impl MeshConnection {
                     // A flood close is not a graceful leave, so the supervisor
                     // treats it as a transient drop and reconnects.
                     if registered {
-                        self.report_disconnect(false).await;
+                        self.report_disconnect(forward::CloseReason::Transient).await;
                     }
                     return;
                 }
@@ -150,6 +150,24 @@ impl MeshConnection {
                     store_refreshed_cert(cert);
                     continue;
                 }
+                ControlMsg::RequestUnpair => {
+                    // A paired secondary is unpairing itself and asks us (its
+                    // primary) to write the authoritative nullifier. Act only if we
+                    // are a primary (hold the network keys); `nullify_device`
+                    // rejects a requester that is not one of our paired devices, so
+                    // a stranger is a no-op. Off the demux loop: republish + prune
+                    // is heavy.
+                    if self.ctx.registry.current_device_cert().is_none() {
+                        let registry = self.ctx.registry.clone();
+                        let requester = self.peer_id;
+                        tokio::spawn(async move {
+                            if let Err(reason) = registry.nullify_device(requester).await {
+                                tracing::debug!(peer = %requester.fmt_short(), %reason, "ignoring unpair request");
+                            }
+                        });
+                    }
+                    continue;
+                }
                 _ => {}
             }
             let Some(net_pubkey) = frame.net else {
@@ -180,14 +198,14 @@ impl MeshConnection {
     /// collision-aware v4 comes from its roster entry (falling back to the index-0
     /// derivation if it was pruned already); `conn_stable_id` lets the supervisor's
     /// ABA guard ignore this event if the peer has since reconnected.
-    async fn report_disconnect(&self, intentional: bool) {
+    async fn report_disconnect(&self, reason: forward::CloseReason) {
         let ip = self
             .ctx
             .peers
             .v4_for_id(&self.peer_id)
             .unwrap_or_else(|| crate::membership::derive_ip(&self.peer_id));
         let ipv6 = crate::membership::derive_ipv6(&self.peer_id);
-        tracing::warn!(peer = %self.peer_id.fmt_short(), ip = %ip, intentional, "peer connection lost");
+        tracing::warn!(peer = %self.peer_id.fmt_short(), ip = %ip, reason = ?reason, "peer connection lost");
         let _ = self
             .ctx
             .disconnect_tx
@@ -195,20 +213,28 @@ impl MeshConnection {
                 endpoint_id: self.peer_id,
                 ip,
                 ipv6,
-                intentional,
+                reason,
                 conn_stable_id: Some(self.conn.stable_id()),
             })
             .await;
     }
 }
 
-/// A graceful leave/kick closes with [`forward::LEAVE_CODE`]/[`forward::KICK_CODE`];
-/// anything else (idle timeout, reset, local flood close) is a transient drop.
-fn is_intentional_close(e: &ConnectionError) -> bool {
-    matches!(
-        e,
+/// Classify a connection close: [`forward::LEAVE_CODE`] is a deliberate leave,
+/// [`forward::KICK_CODE`] is the peer removing us from its view, and anything else
+/// (idle timeout, reset, local flood close) is a transient drop.
+fn close_reason(e: &ConnectionError) -> forward::CloseReason {
+    match e {
         ConnectionError::ApplicationClosed(ac)
-            if ac.error_code == VarInt::from_u32(forward::LEAVE_CODE)
-                || ac.error_code == VarInt::from_u32(forward::KICK_CODE)
-    )
+            if ac.error_code == VarInt::from_u32(forward::LEAVE_CODE) =>
+        {
+            forward::CloseReason::Left
+        }
+        ConnectionError::ApplicationClosed(ac)
+            if ac.error_code == VarInt::from_u32(forward::KICK_CODE) =>
+        {
+            forward::CloseReason::Kicked
+        }
+        _ => forward::CloseReason::Transient,
+    }
 }

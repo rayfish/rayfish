@@ -260,105 +260,18 @@ impl Daemon {
             };
         }
 
-        // Confirm the target is actually one of our paired devices, and grab a
-        // display name. Collect the coordinated-network handles at the same time
-        // (cloning the Arc state) so we drop the DashMap guards before awaiting.
-        let mut display = target.fmt_short().to_string();
-        let mut is_paired = false;
-        let mut nets: Vec<(String, SharedNetworkState, Option<Arc<Notify>>, bool)> = Vec::new();
-        for entry in self.registry.networks.iter() {
-            let s = entry.value().state.read().unwrap();
-            if let Some(m) = s.members.all().iter().find(|m| m.identity == target)
-                && m.user_identity == Some(own_user)
-            {
-                is_paired = true;
-                if let Some(h) = &m.hostname {
-                    display = h.clone();
-                }
-            }
-            let has_key = s.network_secret_key.is_some();
-            drop(s);
-            nets.push((
-                entry.key().clone(),
-                entry.value().state.clone(),
-                entry.value().dht_notify.clone(),
-                has_key,
-            ));
-        }
-        if !is_paired {
-            return IpcMessage::Error {
-                message: format!(
-                    "'{device}' is not one of your paired devices (see `ray pair list`)"
-                ),
-            };
-        }
-
-        // 1. Record the nullified device durably. `revoked_devices` is the
-        //    coordinator's persistent nullifier seed: it survives a restart and is
-        //    unioned into every coordinated network's blob at seal time. Per-cert:
-        //    only this device is nullified; every other device we keep is untouched.
-        let mut cfg = config::load().unwrap_or_default();
-        let hex = target.to_string();
-        if !cfg.revoked_devices.contains(&hex) {
-            cfg.revoked_devices.push(hex);
-        }
-        if let Err(e) = config::save_settings(&cfg) {
-            return IpcMessage::Error {
-                message: format!("failed to persist nullifier: {e}"),
-            };
-        }
-        self.registry.device_user_map.remove(&target);
-
-        // 2. Best-effort: ask the device to wipe its own cert if online.
+        // Best-effort: ask the device to wipe its own cert while the link is still
+        // up (nullifying below severs it). A spurious notice to a non-secondary is
+        // a no-op on the receiver (`is_unpaired_by`), so it is safe to send before
+        // the paired-device check inside `nullify_device`.
         self.send_unpaired_notice(target).await;
 
-        // 3. Nullify the device on every network we coordinate (add to the signed
-        //    blob's nullifier set + drop it from the roster), republish, and sever
-        //    links. Other nodes reject its cert and prune it on reconverge.
-        for (net, state, dht_notify, has_key) in nets {
-            if has_key {
-                let member_ip = {
-                    let mut s = state.write().unwrap();
-                    s.nullifiers.insert(target);
-                    let ip = s
-                        .members
-                        .all()
-                        .iter()
-                        .find(|m| m.identity == target)
-                        .map(|m| m.ip);
-                    s.members.remove(&target);
-                    s.approved.remove(&target);
-                    ip
-                };
-                if let Some(ip) = member_ip {
-                    dns::remove_hostname_by_ip(
-                        &self.dns.hostname_table,
-                        &self.dns.reverse_table,
-                        &net,
-                        ip,
-                    )
-                    .await;
-                }
-                update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
-                // Nudge this network's members to reconverge from the freshly
-                // republished record.
-                let net_pubkey = state.read().unwrap().network_public_key;
-                broadcast_member_sync(&self.registry.peers, net_pubkey, &net, None).await;
-            }
-            for (pid, ip, conn) in self.registry.peers.peers_for_network_with_conn(&net) {
-                if pid == target {
-                    self.registry.pruned_peers.insert((net.clone(), pid));
-                    conn.close(VarInt::from_u32(forward::KICK_CODE), b"unpaired");
-                    self.registry
-                        .peers
-                        .remove_peer_from_network(&ip, &derive_ipv6(&pid), &net);
-                }
-            }
-        }
-
-        tracing::info!(device = %target.fmt_short(), "unpaired device");
-        IpcMessage::Ok {
-            message: format!("unpaired '{display}' and nullified its device certificate"),
+        // Write the authoritative nullifier across every network we coordinate.
+        match self.registry.nullify_device(target).await {
+            Ok(display) => IpcMessage::Ok {
+                message: format!("unpaired '{display}' and nullified its device certificate"),
+            },
+            Err(message) => IpcMessage::Error { message },
         }
     }
 
@@ -381,14 +294,42 @@ impl Daemon {
         }
     }
 
-    /// Unpair *this* device from its primary, locally. Deletes the stored device
-    /// cert and leaves every network this device joined under the shared identity,
-    /// closing each connection with the leave code so coordinators prune us and
-    /// every peer drops us right away (rather than waiting on the revocation
-    /// floor). Used by the phone's "unpair this device" control and by the
-    /// device-side handler when its primary sends `ControlMsg::Unpaired`. A device
-    /// with no cert (a primary) has nothing to unpair.
+    /// Best-effort `ControlMsg::RequestUnpair` to our primary over a shared live
+    /// mesh connection, asking it to write the authoritative nullifier for this
+    /// device. Sent while the link is up, before we tear ourselves down. If it is
+    /// not delivered (we are offline from the primary) the primary keeps a stale
+    /// roster entry until someone runs `ray unpair` on it; the local teardown still
+    /// happens either way. A device with no cert (a primary) has no primary to ask.
+    async fn request_primary_nullify(&self) {
+        let Some(cert) = self.registry.current_device_cert() else {
+            return;
+        };
+        let primary = cert.user_identity;
+        for entry in self.registry.networks.iter() {
+            let net = entry.key().clone();
+            for (pid, _ip, conn) in self.registry.peers.peers_for_network_with_conn(&net) {
+                if pid != primary {
+                    continue;
+                }
+                if let Ok((mut send, _recv)) = conn.open_bi().await {
+                    let _ = control::send_msg(&mut send, None, &ControlMsg::RequestUnpair).await;
+                    let _ = send.finish();
+                }
+                return;
+            }
+        }
+    }
+
+    /// Unpair *this* device from its primary. First asks the primary to write the
+    /// authoritative nullifier (`request_primary_nullify`, best-effort while the
+    /// link is up), then locally deletes the stored device cert and leaves every
+    /// network this device joined under the shared identity, closing each
+    /// connection with the leave code so coordinators prune us and every peer drops
+    /// us right away (rather than waiting on the revocation floor). Used by the
+    /// phone's "unpair this device" control. A device with no cert (a primary) has
+    /// nothing to unpair.
     pub async fn unpair_self(&self) -> IpcMessage {
+        self.request_primary_nullify().await;
         self.registry.unpair_self().await
     }
 }

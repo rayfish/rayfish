@@ -360,33 +360,70 @@ fn grouped_peer_rows(
     let mut rows = Vec::new();
     let mut emitted: std::collections::HashSet<EndpointId> = std::collections::HashSet::new();
     for peer in &net.peers {
-        match peer.user_identity {
-            // Standalone member: a flat row (its own alias, if any, keyed on its
-            // endpoint id).
-            None => rows.push(device_row(
+        // Group every device by the identity it belongs to: a paired secondary
+        // carries its primary's `user_identity`; a primary (or a plain member)
+        // carries none, so it groups under its own endpoint id.
+        let uid = peer.user_identity.unwrap_or(peer.endpoint_id);
+        let group: Vec<&ipc::PeerStatus> = net
+            .peers
+            .iter()
+            .filter(|p| p.user_identity.unwrap_or(p.endpoint_id) == uid)
+            .collect();
+
+        // A lone member with no paired devices renders as a flat row (its own
+        // alias, if any, keyed on its endpoint id).
+        if group.len() == 1 && peer.user_identity.is_none() {
+            rows.push(device_row(
                 peer,
                 peer_alias(peer, alias_by_identity),
                 "",
                 up_w,
                 down_w,
-            )),
-            // Paired device: emit the whole group the first time we reach one of
-            // its devices, then skip its later devices.
-            Some(uid) => {
-                if !emitted.insert(uid) {
-                    continue;
+            ));
+            continue;
+        }
+
+        // Paired identity: emit the whole group the first time we reach any of its
+        // devices, then skip its later devices.
+        if !emitted.insert(uid) {
+            continue;
+        }
+        // The primary is the device whose endpoint id *is* the user identity; the
+        // rest are secondaries. Connected devices first (`false < true`); stable
+        // sort preserves roster order within each half.
+        let primary = group.iter().find(|p| p.endpoint_id == uid).copied();
+        let mut secondaries: Vec<&ipc::PeerStatus> =
+            group.iter().filter(|p| p.endpoint_id != uid).copied().collect();
+        secondaries.sort_by_key(|p| p.connection.is_none());
+
+        match primary {
+            // The primary is itself a visible member: anchor the group on its own
+            // row (carrying its ip/rtt) and hang the secondaries beneath it, so the
+            // user is named once, not as a bare rollup header plus a flat row.
+            Some(primary) => {
+                rows.push(device_row(
+                    primary,
+                    peer_alias(primary, alias_by_identity),
+                    "",
+                    up_w,
+                    down_w,
+                ));
+                for (i, d) in secondaries.iter().enumerate() {
+                    let branch = if i + 1 == secondaries.len() {
+                        "   └─ "
+                    } else {
+                        "   ├─ "
+                    };
+                    rows.push(device_row(d, None, branch, up_w, down_w));
                 }
-                let mut devices: Vec<&ipc::PeerStatus> = net
-                    .peers
-                    .iter()
-                    .filter(|p| p.user_identity == Some(uid))
-                    .collect();
-                // Connected devices first (`false < true`); `sort_by_key` is stable
-                // so roster order is preserved within each half.
-                devices.sort_by_key(|p| p.connection.is_none());
-                rows.push(user_parent_row(net, uid, &devices, alias_by_identity));
-                for (i, d) in devices.iter().enumerate() {
-                    let branch = if i + 1 == devices.len() {
+            }
+            // The primary is not visible here (e.g. it is us, filtered out of our
+            // own status): fall back to a synthetic rollup header over the
+            // secondaries.
+            None => {
+                rows.push(user_parent_row(net, uid, &secondaries, alias_by_identity));
+                for (i, d) in secondaries.iter().enumerate() {
+                    let branch = if i + 1 == secondaries.len() {
                         "   └─ "
                     } else {
                         "   ├─ "
@@ -765,6 +802,36 @@ mod grouping_tests {
         assert!(at("phone") < at("tablet"));
         // Standalone member still renders flat.
         assert!(out.contains("server"));
+    }
+
+    #[test]
+    fn visible_primary_anchors_its_own_group() {
+        // Viewing a *foreign* user whose primary device is itself a visible member
+        // (endpoint id == user identity) plus one paired secondary. The primary
+        // must anchor the group on its own row, not appear once flat and once as a
+        // separate rollup header (the `dario ... / dario ...` duplication bug).
+        let dario = iroh::SecretKey::generate().public();
+        let primary = ipc::PeerStatus {
+            endpoint_id: dario,
+            ip: Ipv4Addr::new(100, 64, 0, 3),
+            ipv6: None,
+            hostname: Some("dario".to_string()),
+            user_identity: None,
+            is_own_device: false,
+            incompatible: false,
+            connection: Some(conn()),
+        };
+        let secondary = peer("sm-f966b", Some(dario), false, false, false);
+        let net = net("umbrel", vec![primary, secondary]);
+        let out = render(&net);
+
+        // "dario" is named exactly once, and there is no synthetic rollup header.
+        assert_eq!(out.matches("dario").count(), 1, "{out}");
+        assert!(!out.contains("device"), "unexpected rollup header:\n{out}");
+        // The secondary nests under the primary's row.
+        assert!(out.contains("└─"), "{out}");
+        let at = |s: &str| out.find(s).unwrap();
+        assert!(at("dario") < at("sm-f966b"), "{out}");
     }
 
     #[test]

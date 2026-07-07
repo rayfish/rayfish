@@ -254,6 +254,24 @@ pub enum ControlMsg {
     /// receiving coordinator prunes the member from the roster and republishes;
     /// plain members learn of it from that republish on their next reconverge.
     LeaveNetwork,
+    /// Secondary to primary: this device is unpairing itself and asks its primary
+    /// to write the authoritative nullifier (`ray unpair`-equivalent), since only
+    /// the primary holds the network key that signs the blob's nullifier set.
+    /// Payload-free: the requesting device is the connection's authenticated remote.
+    /// The primary acts only when the remote is one of its own paired secondaries
+    /// (a stranger is a no-op). Best-effort, sent while the link is still up; if it
+    /// is not delivered the device still self-tears-down and the primary can revoke
+    /// it later with `ray unpair`. Added after `LeaveNetwork`, so an older peer that
+    /// cannot decode this variant simply skips the frame (the pre-fix behavior).
+    RequestUnpair,
+    /// Coordinator to member: you have been removed from *this* network (`ray
+    /// kick`), the network scoped by the frame's `net`. A trigger, not authority:
+    /// the receiver confirms against the network-key-signed record and leaves the
+    /// network only if the record no longer lists it, so a stale or spurious kick
+    /// cannot evict a member. Acted on only when the sender is a coordinator; a
+    /// non-member/coordinator recipient ignores it. Best-effort, sent while the link
+    /// is up; a missed message falls back to the receiver's periodic reconverge.
+    KickedFromNetwork,
 }
 
 /// One `network pubkey → u16 handle` binding in a [`ControlMsg::NetworkHandles`]

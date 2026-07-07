@@ -52,13 +52,38 @@ impl NetworkRegistry {
         // One connection carried every network, so the drop removes the peer
         // everywhere at once.
         self.peers.remove(&ev.ip, &ev.ipv6);
-        tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, intentional = ev.intentional, "peer connection dropped");
+        tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, reason = ?ev.reason, "peer connection dropped");
 
-        if ev.intentional {
+        if ev.reason.prunes_member() {
             // Deliberate `ray leave` (graceful close with the leave code): prune
-            // the member from every network we coordinate.
+            // the member from every network we coordinate. Nobody reconnects it.
             for net in &nets {
                 self.prune_member_on_leave(net, &ev).await;
+            }
+            return;
+        }
+        if matches!(ev.reason, forward::CloseReason::Kicked) {
+            // A kick-coded close is transport teardown, not authority: we never
+            // evict the peer or leave a network on the close code. Membership is the
+            // signed roster's call, and the authoritative kick is the in-band,
+            // network-scoped `KickedFromNetwork` message, which drives a
+            // signed-record-confirmed leave. Here we only decide whether to
+            // reconnect: on a network we coordinate the kick is bogus (a member
+            // cannot evict the coordinator, e.g. a flapping link's mutual prune), so
+            // reconnect to heal; on one where we are a plain member we may have been
+            // kicked, so we don't reconnect (avoid churning the coordinator's pending
+            // queue) and let the in-band message plus reconverge settle it.
+            let reconnect_nets: Vec<SmolStr> = nets
+                .iter()
+                .filter(|net| {
+                    self.networks
+                        .get(net.as_str())
+                        .is_some_and(|h| h.role.is_coordinator())
+                })
+                .cloned()
+                .collect();
+            if !reconnect_nets.is_empty() {
+                self.clone().spawn_reconnect(ev.endpoint_id, ev.ip, reconnect_nets);
             }
             return;
         }
@@ -77,6 +102,43 @@ impl NetworkRegistry {
             }
         }
         self.spawn_reconnect(ev.endpoint_id, ev.ip, nets);
+    }
+
+    /// Confirm a coordinator's `ControlMsg::KickedFromNetwork` against `network`'s
+    /// signed record and leave the network (runtime teardown + local config removal,
+    /// so a re-invite is needed to return) only if the record no longer lists us.
+    /// Never leaves on the message alone: the network-key-signed blob is the sole
+    /// authority, so a stale or spurious kick cannot evict us. Reached from the
+    /// member frame handler; a coordinator's handler ignores the message, so a node
+    /// can never be made to leave a network it coordinates.
+    pub(crate) async fn confirm_kick_and_leave(&self, network: &str) {
+        let Some(net_pubkey) = self.networks.get(network).map(|h| h.network_key) else {
+            return; // no longer active locally; nothing to settle
+        };
+        let my_id = self.transport.endpoint.id();
+        // Resolve + fetch the current signed blob and leave only on a positive
+        // confirmation that it no longer lists us; on any failure (can't
+        // resolve/fetch) we stay, never leaving on uncertainty.
+        let removed = match resolve_signed(&self.transport.endpoint, net_pubkey).await {
+            Some((signed, seeds)) => fetch_verified_blob(
+                &self.transport.endpoint,
+                &self.transport.blob_store,
+                &self.peers,
+                signed,
+                network,
+                &seeds,
+            )
+            .await
+            .is_some_and(|data| {
+                !data.members.iter().any(|m| m.identity == my_id)
+                    && !data.approved.iter().any(|a| a.identity == my_id)
+            }),
+            None => false,
+        };
+        if removed {
+            tracing::info!(network = %network, "coordinator kicked us and the signed record confirms removal; leaving network");
+            self.leave_network(network).await;
+        }
     }
 
     /// Coordinator-authoritative prune of a member that left `network`: drop it
@@ -146,6 +208,105 @@ impl NetworkRegistry {
         update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
         broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
         tracing::info!(peer = %member_id.fmt_short(), network, "pruned member after in-band leave");
+    }
+
+    /// Nullify a paired secondary device across every network we coordinate: add
+    /// its key to the signed blob's nullifier set, drop it from the roster + `.ray`
+    /// DNS, republish, and sever its links; persist the key in `revoked_devices`
+    /// (the durable nullifier seed that survives a restart). Shared by `ray unpair
+    /// <device>` (primary-initiated) and the `ControlMsg::RequestUnpair` handler (a
+    /// secondary asking its primary to revoke it). Returns the device's display
+    /// name, or an error string if `target` is not one of our paired devices, so a
+    /// stranger's request is rejected. Only a network-key holder writes nullifiers,
+    /// so on a network we don't coordinate this is a no-op for that network.
+    pub(crate) async fn nullify_device(&self, target: EndpointId) -> Result<String, String> {
+        let own_user = self.transport.endpoint.id();
+        // Confirm the target is one of our paired devices, grab a display name, and
+        // snapshot each network's handles (cloning the Arc state) so the DashMap
+        // guards drop before any await.
+        let mut display = target.fmt_short().to_string();
+        let mut is_paired = false;
+        let mut nets: Vec<(String, SharedNetworkState, Option<Arc<Notify>>, bool)> = Vec::new();
+        for entry in self.networks.iter() {
+            let s = entry.value().state.read().unwrap();
+            if let Some(m) = s.members.all().iter().find(|m| m.identity == target)
+                && m.user_identity == Some(own_user)
+            {
+                is_paired = true;
+                if let Some(h) = &m.hostname {
+                    display = h.clone();
+                }
+            }
+            let has_key = s.network_secret_key.is_some();
+            drop(s);
+            nets.push((
+                entry.key().clone(),
+                entry.value().state.clone(),
+                entry.value().dht_notify.clone(),
+                has_key,
+            ));
+        }
+        if !is_paired {
+            return Err(format!(
+                "'{}' is not one of your paired devices (see `ray pair list`)",
+                target.fmt_short()
+            ));
+        }
+
+        // Persist the nullifier seed so it survives a restart and is unioned into
+        // every coordinated network's blob at seal time.
+        let mut cfg = config::load().unwrap_or_default();
+        let hex = target.to_string();
+        if !cfg.revoked_devices.contains(&hex) {
+            cfg.revoked_devices.push(hex);
+        }
+        if let Err(e) = config::save_settings(&cfg) {
+            return Err(format!("failed to persist nullifier: {e}"));
+        }
+        self.device_user_map.remove(&target);
+
+        // Nullify on every network we coordinate (add to the signed blob's
+        // nullifier set + drop it from the roster), republish, and sever links.
+        for (net, state, dht_notify, has_key) in nets {
+            if has_key {
+                let member_ip = {
+                    let mut s = state.write().unwrap();
+                    s.nullifiers.insert(target);
+                    let ip = s
+                        .members
+                        .all()
+                        .iter()
+                        .find(|m| m.identity == target)
+                        .map(|m| m.ip);
+                    s.members.remove(&target);
+                    s.approved.remove(&target);
+                    ip
+                };
+                if let Some(ip) = member_ip {
+                    dns::remove_hostname_by_ip(
+                        &self.dns.hostname_table,
+                        &self.dns.reverse_table,
+                        &net,
+                        ip,
+                    )
+                    .await;
+                }
+                update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
+                let net_pubkey = state.read().unwrap().network_public_key;
+                broadcast_member_sync(&self.peers, net_pubkey, &net, None).await;
+            }
+            for (pid, ip, conn) in self.peers.peers_for_network_with_conn(&net) {
+                if pid == target {
+                    self.pruned_peers.insert((net.clone(), pid));
+                    conn.close(VarInt::from_u32(forward::KICK_CODE), b"unpaired");
+                    self.peers
+                        .remove_peer_from_network(&ip, &derive_ipv6(&pid), &net);
+                }
+            }
+        }
+
+        tracing::info!(device = %target.fmt_short(), "nullified device");
+        Ok(display)
     }
 
     /// Reconnect a dropped peer with one dial that re-establishes every network we
@@ -364,10 +525,11 @@ pub(crate) async fn remove_member_roster_only(
     dns::remove_hostname_by_ip(&ctx.hostname_table, &ctx.reverse_table, network, member_ip).await;
 }
 
-/// Republish the signed blob, broadcast a payload-free `MemberSync`, and sever
-/// our own link(s) to every `victim` with `KICK_CODE`. Call once after one or
-/// more [`remove_member_roster_only`] edits. Other members drop the victims when
-/// they reconverge from the freshly published record (`prune_departed_peers`).
+/// Republish the signed blob, broadcast a payload-free `MemberSync`, and send each
+/// `victim` a network-scoped `ControlMsg::KickedFromNetwork` so it confirms against
+/// the signed record and leaves this network. Call once after one or more
+/// [`remove_member_roster_only`] edits. Other members drop the victims when they
+/// reconverge from the freshly published record (`prune_departed_peers`).
 pub(crate) async fn finalize_removal(
     ctx: &MeshCtx,
     network: &str,
@@ -378,19 +540,25 @@ pub(crate) async fn finalize_removal(
     update_snapshot_and_publish(state, &ctx.blob_store, dht_notify).await;
     let net_pubkey = state.read().unwrap().network_public_key;
     broadcast_member_sync(&ctx.peers, net_pubkey, network, None).await;
-    for (pid, ip, _conn) in ctx.peers.peers_for_network_with_conn(network) {
+    for (pid, ip, conn) in ctx.peers.peers_for_network_with_conn(network) {
         let resolved = ctx.device_user_map.resolve(&pid);
         if victims.iter().any(|v| *v == pid || *v == resolved) {
-            // One connection carries every shared network, so only close it when
-            // this was the peer's last network with us; otherwise just drop this
-            // network's route (`remove_peer_from_network` returns the connection
-            // iff its network set emptied).
-            if let Some(conn) = ctx
-                .peers
-                .remove_peer_from_network(&ip, &derive_ipv6(&pid), network)
-            {
-                conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
+            // Authoritative, network-scoped kick: tell the victim in-band that it
+            // was removed from *this* network, so it can confirm against the signed
+            // record and leave just this one (a connection close code cannot name
+            // the network). Best-effort; a missed message falls back to the victim's
+            // reconverge.
+            if let Ok((mut send, _recv)) = conn.open_bi().await {
+                let _ = control::send_msg(&mut send, Some(net_pubkey), &ControlMsg::KickedFromNetwork).await;
+                let _ = send.finish();
             }
+            // Drop this network's route to the victim. We do not close the
+            // connection: not closing keeps the kick message we just sent from
+            // racing a connection close, and the victim's message-triggered leave
+            // (or idle timeout) tears the link down. A link the victim still shares
+            // another network on stays up for those.
+            ctx.peers
+                .remove_peer_from_network(&ip, &derive_ipv6(&pid), network);
         }
     }
 }
