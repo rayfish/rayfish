@@ -135,6 +135,10 @@ sudo ray start           # back online: daemon restarts with both planes on
 
 Run `ray --help` to discover the rest: `invite`, `requests`/`accept`/`deny`, `firewall`, `apply`, `send`, `pair`, `mdns`, and more.
 
+Prefer buttons and forms? Run `ray gui` to open a local browser GUI. It wraps
+the same CLI commands, so anything available in `ray --help` is available there
+too; commands that need root still need the GUI to be launched with `sudo`.
+
 ## Who can join
 
 The **room id** (a network's public key) is a discovery key. It's published so peers can find the network, but on a closed network it is not an admission credential. Admission is always the coordinator's job:
@@ -226,6 +230,37 @@ cargo build --features otel  # optional OTLP span export
 ```
 
 Requires the Rust 2024 edition (Rust 1.85+).
+
+## FAQ
+
+> "You use LLMs? 🤯"
+
+Yes. Heavily. Claude and GLM-5.2 wrote a lot of this repo.
+
+> "So it's all vibe-coded slop."
+
+The idea is over 4 years old: a trustless, decentralized network with no
+central entity that can censor who you connect with. 
+I sketched it for years. What an LLM changed was the *speed*: the prototype came together in a day.
+The trigger was the release of [iroh v1](https://www.iroh.computer/blog/v1).
+
+> "Is it actually trustless and serverless?"
+
+Yes. By using iroh.
+
+> ☝️🤓 actually, it is wrong to describe these P2P products as server-less.
+> In order to connect two peers over WAN it needs a form of coordination server.
+
+Who cares? To connect to the internet you need to go to through your ISP, the FBI, the NSA, the IRS, and any other 3 letter agency you can imagine in the world. But you care about n0 computer's servers... Sure.
+
+You can also host your own relay and pkarr servers. Check [ansible-iroh](https://github.com/rayfish/ansible-iroh).
+Your data is encrypted anyway. You own your identity.
+
+> "Is rayfish production ready?"
+
+NO. Don't use it in your company (yet!). Don't ditch tailscale or anything else to use it.
+
+Use it in your homelab, with friends on a discord server or just to connect your android (in very alpha stage) and your laptop.
 
 ## Contributing & security
 

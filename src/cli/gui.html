@@ -1,0 +1,843 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rayfish</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f2;
+      --panel: #ffffff;
+      --ink: #202124;
+      --muted: #676b72;
+      --line: #d9ddd5;
+      --teal: #0f766e;
+      --coral: #c2410c;
+      --amber: #b7791f;
+      --green: #15803d;
+      --red: #b91c1c;
+      --code: #111827;
+      --shadow: 0 12px 30px rgba(32, 33, 36, .08);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-size: 15px;
+    }
+    button, input, select {
+      font: inherit;
+    }
+    button {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--ink);
+      min-height: 38px;
+      padding: 0 12px;
+      cursor: pointer;
+    }
+    button:hover { border-color: #aab2a7; }
+    button.primary {
+      background: var(--teal);
+      border-color: var(--teal);
+      color: #fff;
+    }
+    button.warn {
+      border-color: #fed7aa;
+      color: var(--coral);
+    }
+    input, select {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--ink);
+      padding: 8px 10px;
+    }
+    label {
+      display: grid;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    label.check {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      min-height: 38px;
+      color: var(--ink);
+      font-size: 14px;
+    }
+    label.check input { width: auto; min-height: auto; }
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 250px minmax(0, 1fr);
+    }
+    aside {
+      border-right: 1px solid var(--line);
+      background: #eef3ef;
+      padding: 22px 18px;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: auto;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 22px;
+    }
+    .mark {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, var(--teal), #22c55e 58%, #f59e0b);
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.38);
+    }
+    .brand strong { display: block; font-size: 18px; }
+    .brand span { color: var(--muted); font-size: 12px; }
+    nav {
+      display: grid;
+      gap: 7px;
+    }
+    nav button {
+      width: 100%;
+      justify-content: flex-start;
+      text-align: left;
+      background: transparent;
+      border-color: transparent;
+    }
+    nav button.active {
+      background: #fff;
+      border-color: var(--line);
+      box-shadow: var(--shadow);
+    }
+    main {
+      padding: 22px;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 18px;
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .topbar h1 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 700;
+    }
+    .topbar-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .content {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(330px, 40%);
+      gap: 18px;
+      align-items: start;
+    }
+    section.view {
+      display: none;
+    }
+    section.view.active {
+      display: grid;
+      gap: 14px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 14px;
+      display: grid;
+      align-content: start;
+      gap: 12px;
+    }
+    .panel h2 {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 700;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .row.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .status-card {
+      min-height: 94px;
+      display: grid;
+      gap: 9px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      min-height: 26px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .badge.good { color: var(--green); border-color: #bbf7d0; background: #f0fdf4; }
+    .badge.bad { color: var(--red); border-color: #fecaca; background: #fef2f2; }
+    .badge.warn { color: var(--amber); border-color: #fde68a; background: #fffbeb; }
+    #networks {
+      display: grid;
+      gap: 10px;
+    }
+    .network {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fbfcfa;
+    }
+    .network strong { display: block; margin-bottom: 5px; }
+    .meta {
+      color: var(--muted);
+      font-size: 13px;
+      word-break: break-word;
+    }
+    .output {
+      position: sticky;
+      top: 22px;
+      max-height: calc(100vh - 44px);
+      overflow: hidden;
+    }
+    .output-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .output pre {
+      margin: 0;
+      min-height: 420px;
+      max-height: calc(100vh - 170px);
+      overflow: auto;
+      border-radius: 8px;
+      background: var(--code);
+      color: #e5e7eb;
+      padding: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font: 13px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    .advanced {
+      display: grid;
+      gap: 10px;
+    }
+    .templates {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+    }
+    @media (max-width: 980px) {
+      .app { grid-template-columns: 1fr; }
+      aside {
+        position: static;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+      nav { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .content { grid-template-columns: 1fr; }
+      .output { position: static; max-height: none; }
+      .output pre { max-height: 460px; }
+    }
+    @media (max-width: 640px) {
+      main { padding: 14px; }
+      .grid, .row, .row.three { grid-template-columns: 1fr; }
+      nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .topbar { align-items: flex-start; flex-direction: column; }
+      .topbar-actions { justify-content: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div class="brand">
+        <div class="mark" aria-hidden="true"></div>
+        <div><strong>Rayfish</strong><span>mesh VPN control</span></div>
+      </div>
+      <nav aria-label="Sections">
+        <button class="active" data-view="overview">Overview</button>
+        <button data-view="networks">Networks</button>
+        <button data-view="security">Security</button>
+        <button data-view="files">Files</button>
+        <button data-view="devices">Devices</button>
+        <button data-view="advanced">Advanced</button>
+      </nav>
+    </aside>
+    <main>
+      <div class="topbar">
+        <h1 id="title">Overview</h1>
+        <div class="topbar-actions">
+          <button id="refresh" class="primary">Refresh</button>
+          <button data-run="up">Up</button>
+          <button data-run="down">Down</button>
+          <button data-run="netcheck" data-json="1">Netcheck</button>
+        </div>
+      </div>
+      <div class="content">
+        <div>
+          <section id="view-overview" class="view active">
+            <div class="grid">
+              <div class="panel status-card">
+                <h2>Daemon</h2>
+                <div id="daemonBadge" class="badge warn">unknown</div>
+                <div id="daemonMeta" class="meta">Run refresh to read status.</div>
+              </div>
+              <div class="panel status-card">
+                <h2>Identity</h2>
+                <div id="contact" class="meta">No contact id loaded.</div>
+                <div id="endpoint" class="meta"></div>
+              </div>
+            </div>
+            <div class="panel">
+              <h2>Networks</h2>
+              <div id="networks"></div>
+            </div>
+            <div class="panel">
+              <h2>Quick Actions</h2>
+              <div class="actions">
+                <button data-run="status" data-json="1">Status JSON</button>
+                <button data-run="contact id" data-json="1">Contact ID</button>
+                <button data-run="connections" data-json="1">Connection Requests</button>
+                <button data-run="files" data-json="1">File Offers</button>
+                <button data-run="firewall show" data-json="1">Firewall</button>
+                <button data-run="config" data-json="1">Config</button>
+              </div>
+            </div>
+          </section>
+
+          <section id="view-networks" class="view">
+            <div class="grid">
+              <form id="createForm" class="panel">
+                <h2>Create Network</h2>
+                <div class="row">
+                  <label>Name<input id="createName" autocomplete="off"></label>
+                  <label>Hostname<input id="createHost" autocomplete="off"></label>
+                </div>
+                <div class="actions">
+                  <label class="check"><input id="createOpen" type="checkbox"> Open</label>
+                  <label class="check"><input id="createTor" type="checkbox"> Tor</label>
+                  <button class="primary" type="submit">Create</button>
+                </div>
+              </form>
+              <form id="joinForm" class="panel">
+                <h2>Join Network</h2>
+                <label>Room ID or invite code<input id="joinKey" required autocomplete="off"></label>
+                <div class="row">
+                  <label>Alias<input id="joinName" autocomplete="off"></label>
+                  <label>Hostname<input id="joinHost" autocomplete="off"></label>
+                </div>
+                <div class="actions">
+                  <label class="check"><input id="joinFirewall" type="checkbox"> Auto firewall</label>
+                  <label class="check"><input id="joinManualFiles" type="checkbox"> Manual files</label>
+                  <label class="check"><input id="joinTor" type="checkbox"> Tor</label>
+                  <button class="primary" type="submit">Join</button>
+                </div>
+              </form>
+            </div>
+            <div class="grid">
+              <form id="inviteForm" class="panel">
+                <h2>Invites</h2>
+                <div class="row">
+                  <label>Network<input id="inviteNet" required autocomplete="off"></label>
+                  <label>Expires<input id="inviteExpires" placeholder="7d" autocomplete="off"></label>
+                </div>
+                <div class="row">
+                  <label>Bound hostname<input id="inviteHost" autocomplete="off"></label>
+                  <label>Revoke ID<input id="inviteRevoke" autocomplete="off"></label>
+                </div>
+                <div class="actions">
+                  <label class="check"><input id="inviteReusable" type="checkbox"> Reusable</label>
+                  <button class="primary" type="submit">Create</button>
+                  <button type="button" id="inviteList">List</button>
+                  <button type="button" id="inviteRevokeBtn" class="warn">Revoke</button>
+                </div>
+              </form>
+              <form id="membershipForm" class="panel">
+                <h2>Membership</h2>
+                <div class="row">
+                  <label>Network<input id="memberNet" required autocomplete="off"></label>
+                  <label>Peer or ID<input id="memberPeer" autocomplete="off"></label>
+                </div>
+                <div class="row">
+                  <label>TTL<input id="ephemeral" placeholder="show, off, 7d" autocomplete="off"></label>
+                  <label>New hostname<input id="renameHost" autocomplete="off"></label>
+                </div>
+                <div class="actions">
+                  <button type="button" id="requestsBtn">Requests</button>
+                  <button type="button" id="acceptBtn">Accept</button>
+                  <button type="button" id="denyBtn" class="warn">Deny</button>
+                  <button type="button" id="kickBtn" class="warn">Kick</button>
+                  <button type="button" id="leaveBtn" class="warn">Leave</button>
+                  <button type="button" id="ephemeralBtn">Ephemeral</button>
+                  <button type="button" id="renameBtn">Rename</button>
+                </div>
+              </form>
+            </div>
+          </section>
+
+          <section id="view-security" class="view">
+            <div class="grid">
+              <form id="firewallAddForm" class="panel">
+                <h2>Firewall Rule</h2>
+                <div class="row three">
+                  <label>Direction<select id="fwDir"><option>in</option><option>out</option></select></label>
+                  <label>Action<select id="fwAction"><option>allow</option><option>deny</option></select></label>
+                  <label>Protocol<select id="fwProto"><option>any</option><option>tcp</option><option>udp</option><option>icmp</option></select></label>
+                </div>
+                <div class="row">
+                  <label>Port<input id="fwPort" placeholder="22, 80-443, *" autocomplete="off"></label>
+                  <label>Peer<input id="fwPeer" autocomplete="off"></label>
+                </div>
+                <label>Network<input id="fwNet" autocomplete="off"></label>
+                <div class="actions">
+                  <button class="primary" type="submit">Add</button>
+                  <button type="button" data-run="firewall show" data-json="1">Show</button>
+                  <button type="button" data-run="firewall on">On</button>
+                  <button type="button" data-run="firewall off" class="warn">Off</button>
+                </div>
+              </form>
+              <form id="firewallManageForm" class="panel">
+                <h2>Firewall Manage</h2>
+                <div class="row">
+                  <label>Rule index<input id="fwRemove" type="number" min="0"></label>
+                  <label>Default<select id="fwDefault"><option>deny</option><option>allow</option></select></label>
+                </div>
+                <div class="row">
+                  <label>Network<input id="fwReviewNet" autocomplete="off"></label>
+                  <label>Reject<select id="fwReject"><option>on</option><option>off</option></select></label>
+                </div>
+                <div class="actions">
+                  <button type="button" id="fwRemoveBtn" class="warn">Remove</button>
+                  <button type="button" id="fwDefaultBtn">Set Default</button>
+                  <button type="button" id="fwRejectBtn">Reject Mode</button>
+                  <button type="button" id="fwPendingBtn">Pending</button>
+                  <button type="button" id="fwAcceptBtn">Accept Pending</button>
+                  <button type="button" id="fwDenyBtn" class="warn">Deny Pending</button>
+                </div>
+              </form>
+            </div>
+            <div class="grid">
+              <form id="sshForm" class="panel">
+                <h2>Mesh SSH</h2>
+                <div class="row">
+                  <label>Network<input id="sshNet" autocomplete="off"></label>
+                  <label>Peer<input id="sshPeer" autocomplete="off"></label>
+                </div>
+                <label>Users<input id="sshUsers" placeholder="alice,bob or *" autocomplete="off"></label>
+                <div class="actions">
+                  <button type="button" data-run="firewall ssh on">Server On</button>
+                  <button type="button" data-run="firewall ssh off" class="warn">Server Off</button>
+                  <button type="button" data-run="firewall ssh show" data-json="1">Show</button>
+                  <button type="button" id="sshAllowBtn">Allow</button>
+                  <button type="button" id="sshDenyBtn" class="warn">Deny</button>
+                </div>
+              </form>
+              <form id="suggestForm" class="panel">
+                <h2>Suggested Rules</h2>
+                <div class="row">
+                  <label>Network<input id="suggestNet" autocomplete="off"></label>
+                  <label>Subject<input id="suggestSubject" placeholder="host or *" autocomplete="off"></label>
+                </div>
+                <label>Allow<input id="suggestAllow" placeholder="tcp:22, alice:tcp:443" autocomplete="off"></label>
+                <label>Deny<input id="suggestDeny" placeholder="udp:53" autocomplete="off"></label>
+                <div class="actions">
+                  <button class="primary" type="submit">Suggest</button>
+                  <button type="button" id="fwAutoOn">Auto Accept On</button>
+                  <button type="button" id="fwAutoOff">Auto Accept Off</button>
+                </div>
+              </form>
+            </div>
+          </section>
+
+          <section id="view-files" class="view">
+            <div class="grid">
+              <form id="sendForm" class="panel">
+                <h2>Send File</h2>
+                <label>File path<input id="sendPath" required autocomplete="off"></label>
+                <label>Peer<input id="sendPeer" required autocomplete="off"></label>
+                <div class="actions">
+                  <button class="primary" type="submit">Send</button>
+                  <button type="button" data-run="files" data-json="1">Offers</button>
+                </div>
+              </form>
+              <form id="filesForm" class="panel">
+                <h2>Receive Files</h2>
+                <div class="row">
+                  <label>Offer ID<input id="fileId" type="number" min="0"></label>
+                  <label>Output dir<input id="fileOut" autocomplete="off"></label>
+                </div>
+                <div class="row">
+                  <label>Network<input id="fileNet" autocomplete="off"></label>
+                  <label>State<select id="fileAuto"><option>on</option><option>off</option></select></label>
+                </div>
+                <div class="actions">
+                  <button type="button" id="fileAcceptBtn">Accept</button>
+                  <button type="button" id="fileAutoBtn">Auto Accept</button>
+                </div>
+              </form>
+            </div>
+            <form id="downloadForm" class="panel">
+              <h2>Download Location</h2>
+              <div class="row">
+                <label>Directory<input id="downloadDir" autocomplete="off"></label>
+                <label>User<input id="downloadUser" autocomplete="off"></label>
+              </div>
+              <div class="actions">
+                <button type="button" id="downloadDirShow">Show Dir</button>
+                <button type="button" id="downloadDirSet">Set Dir</button>
+                <button type="button" id="downloadDirClear" class="warn">Clear Dir</button>
+                <button type="button" id="downloadUserShow">Show User</button>
+                <button type="button" id="downloadUserSet">Set User</button>
+                <button type="button" id="downloadUserClear" class="warn">Clear User</button>
+              </div>
+            </form>
+          </section>
+
+          <section id="view-devices" class="view">
+            <div class="grid">
+              <form id="connectForm" class="panel">
+                <h2>Direct Connections</h2>
+                <div class="row">
+                  <label>Contact ID<input id="connectId" autocomplete="off"></label>
+                  <label>Hostname<input id="connectHost" autocomplete="off"></label>
+                </div>
+                <label>Request ID<input id="connectReq" autocomplete="off"></label>
+                <div class="actions">
+                  <button class="primary" type="submit">Connect</button>
+                  <button type="button" data-run="connections" data-json="1">Requests</button>
+                  <button type="button" id="connectApprove">Approve</button>
+                  <button type="button" data-run="contact id" data-json="1">Contact ID</button>
+                  <button type="button" data-run="contact rotate" class="warn">Rotate Contact</button>
+                </div>
+              </form>
+              <form id="pairForm" class="panel">
+                <h2>Pairing</h2>
+                <label>Ticket / backup / device<input id="pairValue" autocomplete="off"></label>
+                <div class="actions">
+                  <button type="button" data-run="pair">Start Pairing</button>
+                  <button type="button" data-run="pair list" data-json="1">List Devices</button>
+                  <button type="button" id="pairAccept">Accept Ticket</button>
+                  <button type="button" data-run="pair backup">Backup</button>
+                  <button type="button" id="pairRestore">Restore</button>
+                  <button type="button" id="unpairBtn" class="warn">Unpair</button>
+                </div>
+              </form>
+            </div>
+            <div class="grid">
+              <form id="aliasForm" class="panel">
+                <h2>Aliases</h2>
+                <div class="row">
+                  <label>Network<input id="aliasNet" autocomplete="off"></label>
+                  <label>Key / host<input id="aliasKey" autocomplete="off"></label>
+                </div>
+                <label>Alias<input id="aliasName" autocomplete="off"></label>
+                <div class="actions">
+                  <button type="button" id="aliasSet">Set</button>
+                  <button type="button" id="aliasList">List</button>
+                  <button type="button" id="aliasRm" class="warn">Remove</button>
+                  <button type="button" id="identityOf">Identity Of</button>
+                </div>
+              </form>
+              <form id="probeForm" class="panel">
+                <h2>Probe Peer</h2>
+                <label>Peer<input id="probePeer" autocomplete="off"></label>
+                <div class="row">
+                  <label>Count<input id="probeCount" type="number" value="3" min="1"></label>
+                  <label>Interval ms<input id="probeInterval" type="number" value="1000" min="1"></label>
+                </div>
+                <div class="actions">
+                  <button class="primary" type="submit">Ping</button>
+                </div>
+              </form>
+            </div>
+          </section>
+
+          <section id="view-advanced" class="view">
+            <div class="panel advanced">
+              <h2>Run Any Ray Command</h2>
+              <div class="templates">
+                <select id="template"></select>
+                <button id="useTemplate" type="button">Use</button>
+              </div>
+              <label>Command<input id="commandLine" placeholder="status" autocomplete="off"></label>
+              <div class="actions">
+                <label class="check"><input id="advancedJson" type="checkbox"> JSON</label>
+                <button id="runCommand" class="primary" type="button">Run</button>
+              </div>
+            </div>
+            <div class="grid">
+              <form id="settingsForm" class="panel">
+                <h2>Settings</h2>
+                <div class="row">
+                  <label>Key<select id="configKey"><option>relay</option><option>discovery-dns</option><option>dns-upstreams</option></select></label>
+                  <label>Value<input id="configValue" autocomplete="off"></label>
+                </div>
+                <div class="actions">
+                  <label class="check"><input id="configReplace" type="checkbox"> Replace</label>
+                  <button type="button" data-run="config" data-json="1">Show</button>
+                  <button type="button" id="configSet">Set</button>
+                  <button type="button" id="configUnset" class="warn">Unset</button>
+                </div>
+              </form>
+              <div class="panel">
+                <h2>Service</h2>
+                <div class="actions">
+                  <button data-run="start">Start</button>
+                  <button data-run="stop" class="warn">Stop</button>
+                  <button data-run="restart">Restart</button>
+                  <button data-run="install">Install</button>
+                  <button data-run="uninstall" class="warn">Uninstall</button>
+                  <button data-run="report">Report</button>
+                  <button data-run="update --check">Check Update</button>
+                  <button data-run="update --list">List Releases</button>
+                  <button data-run="auto-update on">Auto Update On</button>
+                  <button data-run="auto-update off" class="warn">Auto Update Off</button>
+                  <button data-run="mdns on">mDNS On</button>
+                  <button data-run="mdns off" class="warn">mDNS Off</button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <section class="panel output">
+          <div class="output-head">
+            <h2>Output</h2>
+            <span id="lastStatus" class="badge">idle</span>
+          </div>
+          <pre id="output" aria-live="polite"></pre>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const token = "__TOKEN__";
+    const out = document.getElementById("output");
+    const lastStatus = document.getElementById("lastStatus");
+    const title = document.getElementById("title");
+    const templates = [
+      "status", "up", "down", "create --hostname alice", "join <code> --name gaming --hostname bob",
+      "invite <network>", "invite <network> list", "requests <network>", "accept <network> <id>",
+      "deny <network> <id>", "leave <network>", "kick <network> <peer>", "ephemeral <network> show",
+      "connect <contact-id>", "connections", "connections approve <id>", "contact id", "contact rotate",
+      "ping <peer> -c 3 -i 1000", "netcheck", "firewall show", "firewall add in allow -p tcp --port 22",
+      "firewall remove <index>", "firewall default deny", "firewall reject on", "firewall on", "firewall off",
+      "firewall pending <network>", "firewall accept <network>", "firewall deny <network>",
+      "firewall auto-accept <network> on", "firewall ssh show", "firewall ssh on",
+      "firewall ssh allow <network> <peer>", "apply <spec.yaml> --dry-run", "hostname <network> <name>",
+      "identityof <network> <host>", "alias <network> list", "alias <network> set <host> <alias>",
+      "send <file> <peer>", "files", "files accept <id>", "files auto-accept <network> on",
+      "files download-dir", "files download-user", "pair", "pair list", "pair backup", "pair restore <backup>",
+      "unpair <device>", "mdns on", "auto-update on", "config", "config set relay rayfish",
+      "set-operator <user>", "report", "update --check", "update --list", "version", "completions zsh"
+    ];
+
+    function $(id) { return document.getElementById(id); }
+    function val(id) { return ($(id).value || "").trim(); }
+    function add(args, flag, value) { if (value) args.push(flag, value); }
+    function addSwitch(args, on, flag) { if (on) args.push(flag); }
+    function esc(s) {
+      return String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    function splitArgs(input) {
+      const args = [];
+      let cur = "", quote = "", escNext = false;
+      for (const ch of input) {
+        if (escNext) { cur += ch; escNext = false; continue; }
+        if (ch === "\\") { escNext = true; continue; }
+        if (quote) {
+          if (ch === quote) quote = "";
+          else cur += ch;
+          continue;
+        }
+        if (ch === "'" || ch === '"') { quote = ch; continue; }
+        if (/\s/.test(ch)) {
+          if (cur) { args.push(cur); cur = ""; }
+          continue;
+        }
+        cur += ch;
+      }
+      if (quote) throw new Error("unterminated quote");
+      if (cur) args.push(cur);
+      return args;
+    }
+    async function run(args, opts = {}) {
+      lastStatus.className = "badge warn";
+      lastStatus.textContent = "running";
+      out.textContent = "$ ray " + args.join(" ") + "\n";
+      let res;
+      try {
+        const http = await fetch("/run", {
+          method: "POST",
+          headers: {"content-type": "application/json", "x-rayfish-token": token},
+          body: JSON.stringify({args, json: !!opts.json})
+        });
+        res = await http.json();
+      } catch (err) {
+        lastStatus.className = "badge bad";
+        lastStatus.textContent = "failed";
+        out.textContent += String(err);
+        return null;
+      }
+      const text = [res.stdout, res.stderr].filter(Boolean).join(res.stdout && res.stderr ? "\n" : "");
+      out.textContent = "$ ray " + res.command.join(" ") + "\n\n" + (text || "(no output)");
+      lastStatus.className = "badge " + (res.success ? "good" : "bad");
+      lastStatus.textContent = res.timed_out ? "timeout" : "exit " + res.status;
+      return res;
+    }
+    async function refresh() {
+      const res = await run(["status"], {json: true});
+      if (!res || !res.success) return;
+      try {
+        renderStatus(JSON.parse(res.stdout));
+      } catch (_) {}
+    }
+    function renderStatus(data) {
+      $("daemonBadge").className = "badge " + (data.active ? "good" : "warn");
+      $("daemonBadge").textContent = data.active ? "up" : "standby";
+      $("daemonMeta").textContent = [data.daemon_version && "daemon " + data.daemon_version, data.mdns ? "mDNS on" : "mDNS off", data.auto_update ? "auto-update on" : ""].filter(Boolean).join(" · ");
+      $("contact").textContent = data.contact_id ? "contact " + data.contact_id : "no contact id";
+      $("endpoint").textContent = data.endpoint ? "endpoint " + data.endpoint : "";
+      const nets = Array.isArray(data.networks) ? data.networks : [];
+      $("networks").innerHTML = nets.length ? nets.map(n => {
+        const peers = Array.isArray(n.peers) ? n.peers.length + " peers" : "";
+        const ip = n.my_ip || n.ipv4 || n.ip || "";
+        const mode = n.role || n.mode || "";
+        return `<div class="network"><strong>${esc(n.name || n.network || "network")}</strong><div class="meta">${esc([mode, ip, peers].filter(Boolean).join(" · "))}</div></div>`;
+      }).join("") : `<div class="meta">No active networks.</div>`;
+    }
+    function onForm(id, build) {
+      $(id).addEventListener("submit", ev => { ev.preventDefault(); run(build()); });
+    }
+    document.querySelectorAll("nav button").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll("nav button").forEach(b => b.classList.remove("active"));
+        document.querySelectorAll("section.view").forEach(v => v.classList.remove("active"));
+        btn.classList.add("active");
+        $("view-" + btn.dataset.view).classList.add("active");
+        title.textContent = btn.textContent;
+      });
+    });
+    document.querySelectorAll("[data-run]").forEach(btn => {
+      btn.addEventListener("click", () => run(splitArgs(btn.dataset.run), {json: btn.dataset.json === "1"}));
+    });
+    $("refresh").addEventListener("click", refresh);
+
+    onForm("createForm", () => {
+      const args = ["create"];
+      add(args, "--name", val("createName")); add(args, "--hostname", val("createHost"));
+      addSwitch(args, $("createOpen").checked, "--open"); addSwitch(args, $("createTor").checked, "--tor");
+      return args;
+    });
+    onForm("joinForm", () => {
+      const args = ["join", val("joinKey")];
+      add(args, "--name", val("joinName")); add(args, "--hostname", val("joinHost"));
+      addSwitch(args, $("joinFirewall").checked, "--auto-accept-firewall");
+      addSwitch(args, $("joinManualFiles").checked, "--no-auto-accept-files");
+      addSwitch(args, $("joinTor").checked, "--tor");
+      return args;
+    });
+    onForm("inviteForm", () => {
+      const args = ["invite", val("inviteNet")];
+      add(args, "--expires", val("inviteExpires")); add(args, "--hostname", val("inviteHost"));
+      addSwitch(args, $("inviteReusable").checked, "--reusable");
+      return args;
+    });
+    $("inviteList").onclick = () => run(["invite", val("inviteNet"), "list"], {json: true});
+    $("inviteRevokeBtn").onclick = () => run(["invite", val("inviteNet"), "revoke", val("inviteRevoke")]);
+    $("requestsBtn").onclick = () => run(["requests", val("memberNet")], {json: true});
+    $("acceptBtn").onclick = () => run(["accept", val("memberNet"), val("memberPeer")]);
+    $("denyBtn").onclick = () => run(["deny", val("memberNet"), val("memberPeer")]);
+    $("kickBtn").onclick = () => run(["kick", val("memberNet"), val("memberPeer")]);
+    $("leaveBtn").onclick = () => run(["leave", val("memberNet")]);
+    $("ephemeralBtn").onclick = () => run(["ephemeral", val("memberNet"), val("ephemeral") || "show"]);
+    $("renameBtn").onclick = () => run(["hostname", val("memberNet"), val("renameHost")]);
+    onForm("firewallAddForm", () => {
+      const args = ["firewall", "add", val("fwDir"), val("fwAction"), "-p", val("fwProto")];
+      add(args, "--port", val("fwPort")); add(args, "--peer", val("fwPeer")); add(args, "--network", val("fwNet"));
+      return args;
+    });
+    $("fwRemoveBtn").onclick = () => run(["firewall", "remove", val("fwRemove")]);
+    $("fwDefaultBtn").onclick = () => run(["firewall", "default", val("fwDefault")]);
+    $("fwRejectBtn").onclick = () => run(["firewall", "reject", val("fwReject")]);
+    $("fwPendingBtn").onclick = () => run(["firewall", "pending", val("fwReviewNet")], {json: true});
+    $("fwAcceptBtn").onclick = () => run(["firewall", "accept", val("fwReviewNet")]);
+    $("fwDenyBtn").onclick = () => run(["firewall", "deny", val("fwReviewNet")]);
+    $("sshAllowBtn").onclick = () => { const args = ["firewall", "ssh", "allow", val("sshNet"), val("sshPeer")]; add(args, "--user", val("sshUsers")); run(args); };
+    $("sshDenyBtn").onclick = () => run(["firewall", "ssh", "deny", val("sshNet"), val("sshPeer")]);
+    onForm("suggestForm", () => {
+      const args = ["firewall", "suggest", val("suggestNet"), "--subject", val("suggestSubject")];
+      val("suggestAllow").split(",").map(s => s.trim()).filter(Boolean).forEach(s => add(args, "--allow", s));
+      val("suggestDeny").split(",").map(s => s.trim()).filter(Boolean).forEach(s => add(args, "--deny", s));
+      return args;
+    });
+    $("fwAutoOn").onclick = () => run(["firewall", "auto-accept", val("suggestNet"), "on"]);
+    $("fwAutoOff").onclick = () => run(["firewall", "auto-accept", val("suggestNet"), "off"]);
+    onForm("sendForm", () => run(["send", val("sendPath"), val("sendPeer")]));
+    $("fileAcceptBtn").onclick = () => { const args = ["files", "accept", val("fileId")]; add(args, "--output", val("fileOut")); run(args); };
+    $("fileAutoBtn").onclick = () => run(["files", "auto-accept", val("fileNet"), val("fileAuto")]);
+    $("downloadDirShow").onclick = () => run(["files", "download-dir"]);
+    $("downloadDirSet").onclick = () => run(["files", "download-dir", val("downloadDir")]);
+    $("downloadDirClear").onclick = () => run(["files", "download-dir", "--clear"]);
+    $("downloadUserShow").onclick = () => run(["files", "download-user"]);
+    $("downloadUserSet").onclick = () => run(["files", "download-user", val("downloadUser")]);
+    $("downloadUserClear").onclick = () => run(["files", "download-user", "--clear"]);
+    onForm("connectForm", () => { const args = ["connect", val("connectId")]; add(args, "--hostname", val("connectHost")); return args; });
+    $("connectApprove").onclick = () => run(["connections", "approve", val("connectReq")]);
+    $("pairAccept").onclick = () => run(["pair", "accept", val("pairValue")]);
+    $("pairRestore").onclick = () => run(["pair", "restore", val("pairValue")]);
+    $("unpairBtn").onclick = () => run(["unpair", val("pairValue")]);
+    $("aliasSet").onclick = () => run(["alias", val("aliasNet"), "set", val("aliasKey"), val("aliasName")]);
+    $("aliasList").onclick = () => run(["alias", val("aliasNet"), "list"], {json: true});
+    $("aliasRm").onclick = () => run(["alias", val("aliasNet"), "rm", val("aliasName")]);
+    $("identityOf").onclick = () => run(["identityof", val("aliasNet"), val("aliasKey")], {json: true});
+    onForm("probeForm", () => ["ping", val("probePeer"), "-c", val("probeCount"), "-i", val("probeInterval")]);
+    $("configSet").onclick = () => { const args = ["config", "set", val("configKey"), val("configValue")]; addSwitch(args, $("configReplace").checked, "--replace"); run(args); };
+    $("configUnset").onclick = () => run(["config", "unset", val("configKey")]);
+    $("template").innerHTML = templates.map(t => `<option>${esc(t)}</option>`).join("");
+    $("useTemplate").onclick = () => { $("commandLine").value = $("template").value; $("commandLine").focus(); };
+    $("runCommand").onclick = () => {
+      try { run(splitArgs(val("commandLine")), {json: $("advancedJson").checked}); }
+      catch (err) { out.textContent = String(err); }
+    };
+    $("commandLine").addEventListener("keydown", ev => {
+      if (ev.key === "Enter") { ev.preventDefault(); $("runCommand").click(); }
+    });
+    refresh();
+  </script>
+</body>
+</html>

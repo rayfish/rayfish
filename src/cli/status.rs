@@ -317,14 +317,7 @@ fn print_network(net: &ipc::NetworkStatus) {
     let rows: Vec<Vec<layout::Cell>> = net
         .peers
         .iter()
-        .map(|p| {
-            render_peer_row(
-                p,
-                peer_alias(p, &alias_by_identity),
-                up_w,
-                down_w,
-            )
-        })
+        .map(|p| render_peer_row(p, peer_alias(p, &alias_by_identity), up_w, down_w))
         .collect();
     if rows.is_empty() {
         println!("    {}", style::faint("(no other members)"));
@@ -364,10 +357,7 @@ fn render_peer_row(
     up_w: usize,
     down_w: usize,
 ) -> Vec<layout::Cell> {
-    let base = peer
-        .hostname
-        .clone()
-        .unwrap_or_else(|| peer.ip.to_string());
+    let base = peer.hostname.clone().unwrap_or_else(|| peer.ip.to_string());
     let host = match alias {
         Some(a) => format!("{base} [{a}]"),
         None => base,

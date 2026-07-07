@@ -38,6 +38,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Desktop GUI**: `ray gui` now opens a local browser control panel with guided
+  forms for status, networks, invites, firewall, files, devices, settings, and
+  service actions, plus an advanced command box that runs any normal `ray`
+  subcommand through the same CLI engine.
 - **Unpair this device (Android)**: a paired phone can now unpair itself from the
   You screen. It leaves every network it joined, deletes its pairing certificate,
   and other peers disconnect from it right away. Re-pair from your primary device
