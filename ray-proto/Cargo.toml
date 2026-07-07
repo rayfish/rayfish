@@ -13,6 +13,9 @@ repository = "https://github.com/rayfish/rayfish"
 # messages reference. Intentionally light on dependencies so frontends
 # (e.g. the Tauri UI) don't pull in the daemon's TUN/DNS/blob stack.
 
+[workspace.metadata.release]
+publish = false
+
 [dependencies]
 anyhow = "1"
 bytes = "1"
