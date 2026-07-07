@@ -1,4 +1,4 @@
-//! Local alias handlers for `MeshManager`: `set_alias` / `remove_alias` /
+//! Local alias handlers for `Daemon`: `set_alias` / `remove_alias` /
 //! `list_aliases`. Aliases are a node-local, per-network convenience (`alias
 //! name -> identity string`) that show inline in `ray status` and seed `ray
 //! apply`'s `aliases:` map. They are never published in the signed GroupBlob.

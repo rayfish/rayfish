@@ -1,9 +1,9 @@
-//! Read-only diagnostics for `MeshManager`: `status`, `build_report`, `ping`,
+//! Read-only diagnostics for `Daemon`: `status`, `build_report`, `ping`,
 //! `netcheck`, and connection-info helpers. Split out of `daemon/mod.rs`.
 
 use super::super::*;
 
-impl MeshManager {
+impl Daemon {
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// snapshot the daemon's status (identity, networks, peers).
     pub fn status(&self) -> IpcMessage {

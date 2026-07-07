@@ -1,6 +1,6 @@
 //! `NetworkRegistry`: the service that owns the set of active networks.
 //!
-//! This is the seam that the `MeshManager` network methods (create / join /
+//! This is the seam that the `Daemon` network methods (create / join /
 //! leave / coordinator / reconverge / …) migrate onto over the course of the
 //! decomposition. It owns the per-network runtime handles keyed by name; during
 //! the transition it shares the same `Arc<DashMap>` the daemon still holds, so
@@ -17,12 +17,12 @@ use std::sync::OnceLock;
 
 pub(crate) struct NetworkRegistry {
     /// Per-network runtime handles, keyed by network name. Shared with
-    /// `MeshManager` during the transition (same `Arc`), so a method can move to
+    /// `Daemon` during the transition (same `Arc`), so a method can move to
     /// the registry without splitting the map.
     // Fields are `pub(crate)` because the network methods migrating onto the
     // registry live in their existing `daemon/mesh/*.rs` files (as `impl
     // NetworkRegistry` blocks), which are sibling modules and so cannot see
-    // module-private fields. Mirrors how `MeshManager`'s fields are reached.
+    // module-private fields. Mirrors how `Daemon`'s fields are reached.
     pub(crate) networks: Arc<DashMap<String, NetworkHandle>>,
     /// Foundation handles (endpoint + blob store) for reseal/publish.
     pub(crate) transport: Arc<Transport>,
@@ -109,7 +109,7 @@ impl NetworkRegistry {
     }
 
     /// Build the [`MeshCtx`] handler bundle from the registry's own handles. This
-    /// is the same bundle `MeshManager::mesh_ctx` produces; relocating the builder
+    /// is the same bundle `Daemon::mesh_ctx` produces; relocating the builder
     /// here lets the network methods (create/join/coordinator spawn) assemble it
     /// themselves instead of taking it as a threaded-in argument.
     pub(crate) fn mesh_ctx(self: &Arc<Self>) -> MeshCtx {

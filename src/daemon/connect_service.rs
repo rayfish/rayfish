@@ -3,7 +3,7 @@
 //!
 //! Holds the three connect maps (pending/approved/outgoing) and the
 //! `CONNECT_ALPN` accept arm. The `ProtocolRouter` accept loop holds an
-//! `Arc<ConnectService>` and delegates to it; `MeshManager` holds the same handle
+//! `Arc<ConnectService>` and delegates to it; `Daemon` holds the same handle
 //! for the IPC-side connect commands (`connect`/`connections approve`/…), which
 //! mint and join networks over the core registry.
 

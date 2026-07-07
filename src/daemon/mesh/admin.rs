@@ -1,4 +1,4 @@
-//! Admin (co-coordinator) handlers for `MeshManager`: `admin_add` / `admin_list`.
+//! Admin (co-coordinator) handlers for `Daemon`: `admin_add` / `admin_list`.
 //! Split out of `daemon/mod.rs`.
 
 use super::super::*;

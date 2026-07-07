@@ -1,11 +1,11 @@
 //! Daemon process bootstrap and the IPC server. Moved out of `daemon/mod.rs`.
 //!
 //! `run_daemon` is the process entry point (called by the `ray daemon`
-//! command): it builds the shared [`MeshManager`], reconnects saved networks,
+//! command): it builds the shared [`Daemon`], reconnects saved networks,
 //! and runs the IPC accept loop until shutdown. `build_daemon` wires the endpoint
 //! / TUN / protocol router / metrics; `serve_ipc` + `handle_ipc_client` answer
 //! `ray` CLI requests over the Unix socket. These live in a `mesh/` submodule
-//! (a descendant of `daemon`) so they can still construct `MeshManager` and reach
+//! (a descendant of `daemon`) so they can still construct `Daemon` and reach
 //! its private fields without widening visibility.
 
 use super::super::*;
@@ -87,8 +87,8 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 
 /// Construct all always-on daemon infrastructure: identity, iroh endpoint, blob
 /// store, TUN device, forwarding loop, DNS resolver, mDNS discovery, protocol
-/// router, and metrics server. Returns the shared [`MeshManager`] (still on
-/// standby, so the caller is expected to run [`MeshManager::activate`]) and the
+/// router, and metrics server. Returns the shared [`Daemon`] (still on
+/// standby, so the caller is expected to run [`Daemon::activate`]) and the
 /// metrics-server guard, which must outlive the process.
 /// The ALPNs the endpoint advertises at boot: one per saved network plus the
 /// network-independent blobs / file-transfer / pairing / connect ALPNs. A
@@ -108,12 +108,12 @@ fn initial_alpns(_app_config: &config::AppConfig) -> Vec<Vec<u8>> {
     ]
 }
 
-/// Construct a headless [`MeshManager`] for an embedder (used by `ray-mobile`
+/// Construct a headless [`Daemon`] for an embedder (used by `ray-mobile`
 /// and future embedders). Builds the same infrastructure as `run_daemon` minus
 /// the OS TUN device and the Unix-socket IPC server: the caller supplies a
-/// packet interface via [`MeshManager::attach_tun`]. The returned daemon is on
+/// packet interface via [`Daemon::attach_tun`]. The returned daemon is on
 /// standby (no data plane), with its saved networks' control plane connected.
-pub async fn build_headless() -> Result<Arc<MeshManager>> {
+pub async fn build_headless() -> Result<Arc<Daemon>> {
     let token = CancellationToken::new();
     let stats = Arc::new(ForwardMetrics::default());
     let daemon = build_daemon(token, stats).await?;
@@ -126,16 +126,16 @@ pub async fn build_headless() -> Result<Arc<MeshManager>> {
 }
 
 /// Build all always-on daemon infrastructure WITHOUT a packet interface or the
-/// Unix-socket IPC server. The returned [`MeshManager`] is on standby (no data
-/// plane); attach a TUN with [`MeshManager::attach_tun`], connect saved networks,
-/// then bring the data plane up with [`MeshManager::activate`]. The promotion
+/// Unix-socket IPC server. The returned [`Daemon`] is on standby (no data
+/// plane); attach a TUN with [`Daemon::attach_tun`], connect saved networks,
+/// then bring the data plane up with [`Daemon::activate`]. The promotion
 /// receiver and metrics-server guard are stashed on the state for the caller.
 ///
 /// Shared by [`run_daemon`] (desktop) and [`build_headless`] (embedders).
 async fn build_daemon(
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
-) -> Result<Arc<MeshManager>> {
+) -> Result<Arc<Daemon>> {
     // Relocate a pre-/etc config tree into /etc/rayfish (Linux upgrade path)
     // before anything reads identity or config. No-op on macOS / once migrated.
     config::migrate_location();
@@ -164,7 +164,7 @@ async fn build_daemon(
     // before any record publish/resolve happens.
     dht::set_discovery_override(&app_config.discovery_dns);
     // Lazily generate + persist this node's contact key (`ray connect`). The
-    // secret stays in config; only its public id is held in `MeshManager`.
+    // secret stays in config; only its public id is held in `Daemon`.
     let contact_public = config::contact_secret(&mut app_config).public();
     if let Err(e) = config::save_settings(&app_config) {
         tracing::warn!(error = %e, "failed to persist contact key");
@@ -246,10 +246,10 @@ async fn build_daemon(
         tracing::info!("mDNS discovery disabled");
     }
 
-    // --- Protocol router + the shared MeshManager ---
+    // --- Protocol router + the shared Daemon ---
     // Group the foundation handles so extracted services can depend on
     // `Arc<Transport>`. Clones here are cheap (all fields are `Arc`-backed); the
-    // loose `MeshManager` fields below still hold the originals until the daemon
+    // loose `Daemon` fields below still hold the originals until the daemon
     // god object is dissolved.
     let transport = Arc::new(Transport::new(
         ep.clone(),
@@ -268,7 +268,7 @@ async fn build_daemon(
     // Daemon-wide disconnect channel: every per-connection data reader reports
     // peer drops here, drained by the single connection supervisor. Built here
     // (before the registry) so both the registry's MeshCtx builder and the
-    // MeshManager literal share the one sender.
+    // Daemon literal share the one sender.
     let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(256);
     let pruned_peers = Arc::new(DashSet::new());
     let registry = Arc::new(NetworkRegistry::new(
@@ -312,7 +312,7 @@ async fn build_daemon(
     // router; install it now that it exists (the registry was built before it).
     registry.set_protocol_router(protocol_router.clone());
     let auto_update = app_config.auto_update;
-    let daemon = Arc::new(MeshManager {
+    let daemon = Arc::new(Daemon {
         transport,
         registry,
         stats: stats.clone(),
@@ -450,7 +450,7 @@ async fn spawn_metrics_server(
 /// `token` is cancelled. On shutdown, put the VPN on standby (revert DNS, drop
 /// connections, bring the TUN down) and remove the socket file. Each request is
 /// handled on its own task so a slow client can't block the accept loop.
-async fn serve_ipc(daemon: &Arc<MeshManager>, token: CancellationToken) -> Result<()> {
+async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()> {
     let socket_path = ipc::socket_path();
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -499,7 +499,7 @@ fn set_socket_permissions(path: &std::path::Path) {
     }
 }
 
-async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<MeshManager>) -> Result<()> {
+async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<()> {
     let peer_cred = stream.peer_cred().ok().map(|c| (c.uid(), c.gid()));
     let mut framed = ipc::framed(stream);
     let req = ipc::recv(&mut framed).await?;

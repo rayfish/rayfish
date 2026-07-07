@@ -1,4 +1,4 @@
-//! Network create + join handlers for `MeshManager`: `create_network*`, the join
+//! Network create + join handlers for `Daemon`: `create_network*`, the join
 //! handshake (`join_network*`, dial/fetch/restore-roster helpers). Split out of `daemon/mod.rs`.
 
 use super::super::*;
@@ -51,7 +51,7 @@ fn abort_join_tasks(cancel: &CancellationToken, tasks: Vec<tokio::task::JoinHand
     }
 }
 
-impl MeshManager {
+impl Daemon {
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// create a new network and register this node as its coordinator.

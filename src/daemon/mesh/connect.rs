@@ -1,9 +1,9 @@
-//! Direct-connection (`ray connect`) handlers for `MeshManager`, plus the shared
+//! Direct-connection (`ray connect`) handlers for `Daemon`, plus the shared
 //! `store_and_publish_group` helper. Split out of `daemon/mod.rs`.
 
 use super::super::*;
 
-impl MeshManager {
+impl Daemon {
     /// `ray connect <contact-id>`: request a direct connection by contact id.
     pub(crate) async fn connect(&self, contact_id: &str, hostname: Option<String>) -> IpcMessage {
         self.connect.connect(contact_id, hostname).await
