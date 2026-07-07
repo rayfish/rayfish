@@ -6,13 +6,12 @@
 
 use anyhow::{Context, Result};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
-    address_lookup::{AddrFilter, PkarrPublisher, PkarrResolver},
+    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey,
+    address_lookup::{PkarrPublisher, PkarrResolver},
     endpoint::Connection,
     endpoint::presets,
     endpoint::{Builder, DirectAddrFilter, QuicTransportConfig},
 };
-use std::borrow::Cow;
 
 use crate::config::ServerOverride;
 #[cfg(feature = "tor")]
@@ -140,16 +139,11 @@ async fn bind_endpoint(
         // `noq-proto` dependency to reach the config type, deferred to a measured
         // follow-up (see iroh-audit BASELINE.md, cross-parameter sweep).
         .transport_config(quic_transport_config())
-        // Keep rayfish overlay addresses out of the transport candidates we
-        // advertise (see `overlay_stripping_filter`).
-        .addr_filter(overlay_stripping_filter())
-        // The definitive fix: drop overlay addresses from the *gathered* local
-        // interface candidates, so a mesh IP bound on the TUN is never stored,
-        // published, or offered as a holepunch / NAT-traversal candidate (and so
-        // never dialed by a peer, which would loop the underlay back through the
-        // tunnel). This covers the in-band NAT-traversal path that `addr_filter`
-        // (publish-only) cannot reach. Stays bound to `0.0.0.0`, so multi-homing /
-        // roaming is unaffected.
+        // Drop overlay addresses from the gathered direct-address candidates, so a
+        // mesh IP bound on the TUN is never stored, published, or offered as a
+        // holepunch / NAT-traversal candidate (and so never dialed by a peer, which
+        // would loop the underlay back through the tunnel). Stays bound to `0.0.0.0`,
+        // so multi-homing / roaming is unaffected.
         .direct_addr_filter(OverlayAddrFilter);
 
     // Override the N0 preset's relay / discovery defaults when configured.
@@ -181,11 +175,10 @@ async fn bind_endpoint(
 }
 
 /// A [`DirectAddrFilter`] that drops rayfish overlay addresses (`100.64.0.0/10`,
-/// `200::/7`) from iroh's gathered local-interface candidates. The mesh IP is bound
+/// `200::/7`) from iroh's gathered direct-address candidates. The mesh IP is bound
 /// on the TUN device; without this iroh would discover it, advertise it (pkarr/DNS
-/// **and** in-band NAT-traversal), and peers would dial it, looping the underlay
-/// back through the tunnel we carry. This filters the candidate set at the source,
-/// so the overlay IP is never stored, published, or holepunched.
+/// and in-band NAT-traversal), and peers would dial it, looping the underlay back
+/// through the tunnel we carry.
 #[derive(Debug)]
 struct OverlayAddrFilter;
 
@@ -193,24 +186,6 @@ impl DirectAddrFilter for OverlayAddrFilter {
     fn keeps(&self, ip: std::net::IpAddr) -> bool {
         !crate::membership::is_overlay_ip(ip)
     }
-}
-
-/// An [`AddrFilter`] that strips rayfish overlay addresses (`100.64.0.0/10`,
-/// `200::/7`) from the transport candidates iroh publishes for this node. Kept as
-/// defense in depth alongside [`OverlayAddrFilter`], which already removes overlay
-/// IPs from the gathered candidate set (so they never reach the publish path).
-/// Relay and custom (Tor) addresses pass through untouched.
-fn overlay_stripping_filter() -> AddrFilter {
-    fn is_overlay(a: &TransportAddr) -> bool {
-        matches!(a, TransportAddr::Ip(s) if crate::membership::is_overlay_ip(s.ip()))
-    }
-    AddrFilter::new(|addrs| {
-        if addrs.iter().any(is_overlay) {
-            Cow::Owned(addrs.iter().filter(|a| !is_overlay(a)).cloned().collect())
-        } else {
-            Cow::Borrowed(addrs)
-        }
-    })
 }
 
 /// Builds the [`QuicTransportConfig`] for rayfish's data-plane shape (one stream
@@ -328,31 +303,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn overlay_filter_strips_only_mesh_ips() {
-        use std::net::SocketAddr;
-        let relay = TransportAddr::Relay("https://relay.example./".parse().unwrap());
-        let underlay = TransportAddr::Ip("51.15.139.151:41383".parse::<SocketAddr>().unwrap());
-        let lan = TransportAddr::Ip("192.168.1.104:41383".parse::<SocketAddr>().unwrap());
-        let mesh_v4 = TransportAddr::Ip("100.124.253.88:41383".parse::<SocketAddr>().unwrap());
-        let mesh_v6 = TransportAddr::Ip("[200::1]:41383".parse::<SocketAddr>().unwrap());
-
-        let filter = overlay_stripping_filter();
-        let input = vec![
-            relay.clone(),
-            underlay.clone(),
-            lan.clone(),
-            mesh_v4,
-            mesh_v6,
-        ];
-        let kept = filter.apply(&input).into_owned();
-        // The overlay v4/v6 candidates are dropped; relay + real underlay stay.
-        assert_eq!(kept, vec![relay, underlay, lan]);
-
-        // A candidate set with no overlay address is returned unchanged (borrowed).
-        let clean = vec![TransportAddr::Ip(
-            "51.15.139.151:41383".parse::<SocketAddr>().unwrap(),
-        )];
-        assert!(matches!(filter.apply(&clean), Cow::Borrowed(_)));
+    fn overlay_addr_filter_keeps_only_non_overlay() {
+        use std::net::IpAddr;
+        let keeps = |s: &str| OverlayAddrFilter.keeps(s.parse::<IpAddr>().unwrap());
+        // Real underlay / LAN addresses are kept.
+        assert!(keeps("51.15.139.151"));
+        assert!(keeps("192.168.1.104"));
+        // Overlay v4 (100.64.0.0/10) and v6 (200::/7) are dropped.
+        assert!(!keeps("100.124.253.88"));
+        assert!(!keeps("200::1"));
     }
 
     #[test]
