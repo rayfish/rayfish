@@ -1,4 +1,5 @@
 target := "x86_64-unknown-linux-gnu"
+musl_target := "x86_64-unknown-linux-musl"
 binary := "ray"
 user := "root"
 
@@ -29,6 +30,14 @@ fmt:
 
 cross:
     cross -q build --release --target {{target}}
+
+# Static musl build: one binary that runs on any Linux regardless of glibc
+# version (deps are musl-clean: ring + hickory, no C/dlopen dependencies).
+cross-musl:
+    cross -q build --release --target {{musl_target}}
+
+# Build both the glibc and static-musl release binaries.
+cross-all: cross cross-musl
 
 deploy ip:
     cross -q build --release --target {{target}}

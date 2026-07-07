@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Static musl Linux binaries.** Every release and nightly now also ships
+  `ray-linux-{x86_64,aarch64}-musl`: fully static builds with no glibc dependency
+  that run on any Linux, including musl distros (Alpine) and hosts with a glibc
+  older than the gnu build floor. The installer picks them automatically when the
+  glibc binary won't run on the host (and a musl asset exists for that version),
+  and `ray update` on a musl-built daemon self-updates to the musl asset.
+
+## [0.2.0] - 2026-07-08
+
 ### Changed
 
 - **`ray status` flags peers on an incompatible mesh version.** A peer running a
@@ -587,7 +598,8 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/rayfish/rayfish/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/rayfish/rayfish/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/rayfish/rayfish/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/rayfish/rayfish/compare/v0.1.1...v0.1.2
