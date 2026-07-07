@@ -60,7 +60,7 @@ mod android_jni {
     }
 }
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use android_tun::{AndroidTunReader, AndroidTunWriter};
@@ -837,16 +837,27 @@ impl Node {
         }
     }
 
-    /// Point the Magic DNS resolver at the phone's real DNS servers so
-    /// non-`.ray` queries are forwarded instead of refused. On Android there is
-    /// no `resolv.conf` to capture (the desktop path), so the platform reads the
-    /// underlying network's DNS servers and passes them here before the tunnel
-    /// captures all DNS. Non-IPv4 entries are ignored (the resolver forwards
-    /// over IPv4). Requires [`Node::start`] first.
+    /// Point the Magic DNS resolver at the phone's DNS so non-`.ray` queries are
+    /// forwarded instead of refused. On Android there is no `resolv.conf` to
+    /// capture (the desktop path), so the platform passes upstreams here before
+    /// the tunnel captures all DNS. Requires [`Node::start`] first.
+    ///
+    /// Each entry may be a bare IPv4 (forwarded as cleartext UDP on port 53) or
+    /// an `ip:port` socket address. The platform points this at a loopback
+    /// `DnsResolver.rawQuery` proxy (`127.0.0.1:<port>`) so non-`.ray` lookups
+    /// honor the system Private DNS (DoT/DoH); entries that parse as neither are
+    /// ignored.
     pub fn set_dns_upstreams(&self, servers: Vec<String>) -> Result<(), RayError> {
         let state = self.state()?;
-        let parsed: Vec<Ipv4Addr> = servers.iter().filter_map(|s| s.parse().ok()).collect();
-        state.set_dns_upstreams(parsed);
+        let parsed: Vec<SocketAddr> = servers
+            .iter()
+            .filter_map(|s| {
+                s.parse::<SocketAddr>()
+                    .ok()
+                    .or_else(|| s.parse::<Ipv4Addr>().ok().map(|ip| SocketAddr::from((ip, 53u16))))
+            })
+            .collect();
+        state.set_dns_upstream_addrs(parsed);
         Ok(())
     }
 
