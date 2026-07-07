@@ -26,6 +26,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Leaving one network no longer disconnects you from the others you share
+  with the same peer.** With one connection per peer now carrying every shared
+  network, `ray leave <net>` used to tear down the whole link, cutting the peer on
+  networks you never left, and if that peer coordinated one of them it could even
+  drop you from its roster. Departure is now signalled in-band and scoped to the
+  single network, so the rest stay up.
 - **A co-coordinator renaming itself now reaches the other coordinators.**
   On a network with more than one coordinator (via `ray admin add` or a `ray
   connect` link), when one coordinator changed its own hostname the other

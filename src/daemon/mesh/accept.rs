@@ -101,6 +101,16 @@ impl CoordinatorAcceptState {
                 self.handle_invite_used(peer_id, secret_hash).await;
                 None
             }
+            // A member left this one network in-band (`ray leave`). Prune it here
+            // (roster + republish) without disturbing the networks it still shares
+            // with us over the same connection.
+            ControlMsg::LeaveNetwork => {
+                self.ctx
+                    .registry
+                    .handle_member_leave(&self.network_name, peer_id)
+                    .await;
+                None
+            }
             _ => None,
         }
     }
@@ -201,7 +211,9 @@ impl CoordinatorAcceptState {
                 }
                 tracing::info!(peer = %remote_id.fmt_short(), "join queued for approval");
                 let mut send = send;
-                let _ = control::send_msg(&mut send, Some(self.net_pubkey()), &ControlMsg::JoinPending).await;
+                let _ =
+                    control::send_msg(&mut send, Some(self.net_pubkey()), &ControlMsg::JoinPending)
+                        .await;
                 None
             }
         }
@@ -223,7 +235,13 @@ impl CoordinatorAcceptState {
         hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
     ) -> Option<Ipv4Addr> {
-        let peer_ip = self.state.read().unwrap().members.get(&remote_id).map(|m| m.ip)?;
+        let peer_ip = self
+            .state
+            .read()
+            .unwrap()
+            .members
+            .get(&remote_id)
+            .map(|m| m.ip)?;
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
         self.ctx
             .register_peer_conn(conn, remote_id, peer_ip, &self.network_name);
@@ -235,7 +253,12 @@ impl CoordinatorAcceptState {
         if let Some(ref cert) = device_cert
             && cert.verify()
             && cert.device_key == remote_id
-            && !self.state.read().unwrap().nullifiers.contains(&cert.device_key)
+            && !self
+                .state
+                .read()
+                .unwrap()
+                .nullifiers
+                .contains(&cert.device_key)
         {
             {
                 let mut s = self.state.write().unwrap();
@@ -244,7 +267,9 @@ impl CoordinatorAcceptState {
                     m.device_cert = Some(cert.clone());
                 }
             }
-            self.ctx.device_user_map.insert(remote_id, cert.user_identity);
+            self.ctx
+                .device_user_map
+                .insert(remote_id, cert.user_identity);
         }
 
         let Some(desired) = hostname else {
@@ -302,7 +327,8 @@ impl CoordinatorAcceptState {
         if changed {
             tracing::info!(peer = %remote_id.fmt_short(), network = %self.network_name, hostname = %final_hostname, "peer hostname changed; republishing blob + broadcasting MemberSync");
             update_snapshot_and_publish(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
-            broadcast_member_sync(&self.ctx.peers, self.net_pubkey(), &self.network_name, None).await;
+            broadcast_member_sync(&self.ctx.peers, self.net_pubkey(), &self.network_name, None)
+                .await;
         }
         Some(peer_ip)
     }
@@ -376,7 +402,15 @@ impl CoordinatorAcceptState {
                 let authoritative = invite_hostname.is_some();
                 let assigned = invite_hostname.or(hostname);
                 let admitted = self
-                    .admit_peer(conn, send, remote_id, assigned, device_cert, false, authoritative)
+                    .admit_peer(
+                        conn,
+                        send,
+                        remote_id,
+                        assigned,
+                        device_cert,
+                        false,
+                        authoritative,
+                    )
                     .await;
                 // Admission can still be denied (hostname/IP collision) after
                 // the secret was burned; un-burn so the holder can retry.
@@ -436,7 +470,12 @@ impl CoordinatorAcceptState {
     /// Reply on the joiner's stream that the join was refused, then wait for the
     /// joiner to close so the JoinDenied flushes before `conn` is dropped.
     async fn deny(&self, conn: &Connection, mut send: iroh::endpoint::SendStream, reason: String) {
-        let _ = control::send_msg(&mut send, Some(self.net_pubkey()), &ControlMsg::JoinDenied { reason }).await;
+        let _ = control::send_msg(
+            &mut send,
+            Some(self.net_pubkey()),
+            &ControlMsg::JoinDenied { reason },
+        )
+        .await;
         let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
     }
 
@@ -555,7 +594,13 @@ impl CoordinatorAcceptState {
         self.ctx
             .register_peer_conn(conn, remote_id, peer_ip, &self.network_name);
 
-        broadcast_member_sync(&self.ctx.peers, net_pubkey, &self.network_name, Some(peer_ip)).await;
+        broadcast_member_sync(
+            &self.ctx.peers,
+            net_pubkey,
+            &self.network_name,
+            Some(peer_ip),
+        )
+        .await;
 
         // Direct link: hand the network key to the just-admitted peer so both
         // sides are coordinators. Sent over its live mesh connection, where its
@@ -929,8 +974,13 @@ impl MemberAcceptState {
         .await;
         self.ctx
             .register_peer_conn(conn, peer_identity, member_ip, &self.network_name);
-        broadcast_member_sync(&self.ctx.peers, self.net_pubkey, &self.network_name, Some(member_ip))
-            .await;
+        broadcast_member_sync(
+            &self.ctx.peers,
+            self.net_pubkey,
+            &self.network_name,
+            Some(member_ip),
+        )
+        .await;
         Some(member_ip)
     }
 
@@ -1036,7 +1086,7 @@ pub(crate) struct ProtocolRouter {
     /// The per-peer mesh connection driver: owns the per-network handler registry,
     /// the frame demux, and the ping-probe map. The mesh ALPN is delegated here;
     /// register/handler_for/`pending_pongs` calls pass through to it.
-    conn: Arc<ConnectionManager>,
+    conn_mngr: Arc<ConnectionManager>,
 }
 
 impl ProtocolRouter {
@@ -1050,29 +1100,29 @@ impl ProtocolRouter {
             blobs,
             files,
             connect,
-            conn,
+            conn_mngr: conn,
         }
     }
 
     /// Install the daemon-wide mesh dispatch context on the connection driver.
     pub(crate) fn set_mesh_dispatch(&self, dispatch: MeshDispatch) {
-        self.conn.set_mesh_dispatch(dispatch);
+        self.conn_mngr.set_mesh_dispatch(dispatch);
     }
 
     /// Register a network's accept handler under its public key. Passthrough to
     /// the connection driver, which owns the handler registry.
     pub(crate) fn register(&self, net_pubkey: EndpointId, handler: AcceptHandler) {
-        self.conn.register(net_pubkey, handler);
+        self.conn_mngr.register(net_pubkey, handler);
     }
 
     /// Whether a handler is registered for this network public key.
     pub(crate) fn is_registered(&self, net_pubkey: &EndpointId) -> bool {
-        self.conn.is_registered(net_pubkey)
+        self.conn_mngr.is_registered(net_pubkey)
     }
 
     /// In-flight `ray ping` probe map (nonce → oneshot), owned by the driver.
     pub(crate) fn pending_pongs(&self) -> &Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>> {
-        &self.conn.pending_pongs
+        &self.conn_mngr.pending_pongs
     }
 
     pub(crate) fn spawn_accept_loop(
@@ -1123,8 +1173,12 @@ impl ProtocolRouter {
     /// connection manager, which owns the driver, demux, and handler registry.
     /// Used by the accept loop (above, `pre_registered = false`) and the dial side
     /// (`pre_registered = true`).
-    pub(crate) async fn drive_mesh_connection(self: Arc<Self>, conn: Connection, pre_registered: bool) {
-        self.conn
+    pub(crate) async fn drive_mesh_connection(
+        self: Arc<Self>,
+        conn: Connection,
+        pre_registered: bool,
+    ) {
+        self.conn_mngr
             .clone()
             .drive_mesh_connection(conn, pre_registered)
             .await;

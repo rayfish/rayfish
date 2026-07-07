@@ -487,11 +487,6 @@ pub struct Daemon {
     // resulting dead-code warning there rather than dropping the field.
     #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
     ssh_token: Mutex<Option<CancellationToken>>,
-    /// Receiver half of the daemon-wide disconnect channel, handed to
-    /// [`run_daemon`] to drive the single connection supervisor (now on the
-    /// registry). The sender lives on [`NetworkRegistry`]; only the parked
-    /// receiver remains here for bootstrap to take.
-    disconnect_rx: Mutex<Option<mpsc::Receiver<forward::DisconnectEvent>>>,
 }
 
 /// Map key-holding status to a [`NetworkRole`].

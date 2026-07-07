@@ -234,6 +234,15 @@ pub enum ControlMsg {
     CertRefresh {
         cert: DeviceCert,
     },
+    /// A member deliberately leaving *this one* network (`ray leave`), signalled
+    /// in-band and scoped by the frame's `net`. Since one mesh connection now
+    /// carries every network two peers share, a plain connection close would sever
+    /// them all; this message lets the sender depart a single network while the
+    /// link stays up on the others. Payload-free: the departing identity is the
+    /// connection's authenticated remote, and the network is the frame tag. The
+    /// receiving coordinator prunes the member from the roster and republishes;
+    /// plain members learn of it from that republish on their next reconverge.
+    LeaveNetwork,
 }
 
 /// One `network pubkey → u16 handle` binding in a [`ControlMsg::NetworkHandles`]

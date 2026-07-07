@@ -207,14 +207,19 @@ impl PeerTable {
                 Entry::Vacant(v) => {
                     first_ever = true;
                     conn_changed = connection_is_new(None, stable);
-                    v.insert(first_conn_placeholder(endpoint_id, conn.clone(), net.clone()));
+                    v.insert(first_conn_placeholder(
+                        endpoint_id,
+                        conn.clone(),
+                        net.clone(),
+                    ));
                 }
             }
         }
         {
-            let mut e = self.v6.entry(ipv6).or_insert_with(|| {
-                first_conn_placeholder(endpoint_id, conn.clone(), net.clone())
-            });
+            let mut e = self
+                .v6
+                .entry(ipv6)
+                .or_insert_with(|| first_conn_placeholder(endpoint_id, conn.clone(), net.clone()));
             e.endpoint_id = endpoint_id;
             e.conn = conn.clone();
             e.networks.insert(net.clone());
@@ -245,7 +250,11 @@ impl PeerTable {
     /// shared-network set with this peer currently contains that network. An
     /// unknown peer/handle or a network we don't share drops the datagram
     /// (`None`).
-    pub fn resolve_inbound_by_id(&self, peer_id: &EndpointId, handle: u16) -> Option<(Ipv4Addr, SmolStr)> {
+    pub fn resolve_inbound_by_id(
+        &self,
+        peer_id: &EndpointId,
+        handle: u16,
+    ) -> Option<(Ipv4Addr, SmolStr)> {
         let ip = *self.by_id.get(peer_id)?.value();
         let e = self.v4.get(&ip)?;
         let network = e.in_handles.get(&handle)?;
@@ -271,22 +280,21 @@ impl PeerTable {
     /// IPv4 and the `u16` handle the peer stamped on it (looked up in the peer's
     /// announced inbound table). `None` if the peer or handle is unknown.
     pub fn inbound_network_v4(&self, ip: &Ipv4Addr, handle: u16) -> Option<SmolStr> {
-        self.v4.get(ip).and_then(|e| e.in_handles.get(&handle).cloned())
+        self.v4
+            .get(ip)
+            .and_then(|e| e.in_handles.get(&handle).cloned())
     }
 
     /// IPv6 counterpart of [`inbound_network_v4`](Self::inbound_network_v4).
     pub fn inbound_network_v6(&self, ip: &Ipv6Addr, handle: u16) -> Option<SmolStr> {
-        self.v6.get(ip).and_then(|e| e.in_handles.get(&handle).cloned())
+        self.v6
+            .get(ip)
+            .and_then(|e| e.in_handles.get(&handle).cloned())
     }
 
     /// Replace a peer's inbound decode table from its announced `NetworkHandles`.
     /// `entries` is `(handle, network)` pairs. Applied to both address maps.
-    pub fn set_inbound_handles(
-        &self,
-        ip: &Ipv4Addr,
-        ipv6: &Ipv6Addr,
-        entries: &[(u16, SmolStr)],
-    ) {
+    pub fn set_inbound_handles(&self, ip: &Ipv4Addr, ipv6: &Ipv6Addr, entries: &[(u16, SmolStr)]) {
         let table: HashMap<u16, SmolStr> = entries.iter().cloned().collect();
         if let Some(mut e) = self.v4.get_mut(ip) {
             e.in_handles = table.clone();
@@ -311,7 +319,9 @@ impl PeerTable {
     /// sharing it (the announcement is per-network, not a full snapshot, so
     /// networks are added to the peer's decode table incrementally).
     pub fn out_handle(&self, ip: &Ipv4Addr, network: &str) -> Option<u16> {
-        self.v4.get(ip).and_then(|e| e.out_handles.get(network).copied())
+        self.v4
+            .get(ip)
+            .and_then(|e| e.out_handles.get(network).copied())
     }
 
     /// Merge one `(handle → network)` mapping into a peer's inbound decode table,
@@ -423,6 +433,54 @@ impl PeerTable {
         last_conn
     }
 
+    /// Drop the peer identified by its transport `peer_id` from `network`. Used by
+    /// the in-band `ControlMsg::LeaveNetwork` handler, which knows the connection's
+    /// authenticated remote id but not the sender's (possibly collision-suffixed)
+    /// roster IP. Same contract as [`remove_peer_from_network`]: returns the
+    /// connection iff this removed the peer's last shared network (so the caller can
+    /// close the now-unused link); `None` otherwise or if the id is unknown. Keys
+    /// off the entry's stored `endpoint_id` for both maps, so no address derivation
+    /// is needed.
+    pub fn remove_peer_from_network_by_id(
+        &self,
+        peer_id: &EndpointId,
+        network: &str,
+    ) -> Option<Connection> {
+        let ip = *self.by_id.get(peer_id)?.value();
+        let mut last_conn = None;
+        let mut dropped = false;
+        if let Some(mut e) = self.v4.get_mut(&ip) {
+            e.networks.remove(network);
+            e.out_handles.remove(network);
+            if e.networks.is_empty() {
+                last_conn = Some(e.conn.clone());
+                dropped = true;
+            }
+        }
+        self.v4.remove_if(&ip, |_, e| e.networks.is_empty());
+        // The v6 entry is keyed separately (by the peer's `200::/7` address); find
+        // it by the same stored endpoint id and drop the network there too.
+        let v6_key = self
+            .v6
+            .iter()
+            .find(|e| e.endpoint_id == *peer_id)
+            .map(|e| *e.key());
+        if let Some(k) = v6_key {
+            if let Some(mut e) = self.v6.get_mut(&k) {
+                e.networks.remove(network);
+                e.out_handles.remove(network);
+            }
+            self.v6.remove_if(&k, |_, e| e.networks.is_empty());
+        }
+        if dropped {
+            self.by_id.remove(peer_id);
+            if let Some(audit) = &self.audit {
+                audit.log_disconnect(ip, &peer_id.to_string());
+            }
+        }
+        last_conn
+    }
+
     /// Connection-aware variant of [`remove_peer_from_network`]: drops the
     /// peer's membership in `network` only if the connection currently stored is
     /// the same one identified by `stable_id`. Returns the connection iff this
@@ -466,10 +524,7 @@ impl PeerTable {
 
     /// One connection per peer, for global broadcasts.
     pub fn all_connections(&self) -> Vec<(Ipv4Addr, Connection)> {
-        self.v4
-            .iter()
-            .map(|e| (*e.key(), e.conn.clone()))
-            .collect()
+        self.v4.iter().map(|e| (*e.key(), e.conn.clone())).collect()
     }
 
     /// Stops sharing `network` with every peer. Returns the IPs of peers left
@@ -534,11 +589,7 @@ impl PeerTable {
 
 /// Build a fresh [`PeerEntry`] for a peer's first shared network. Factored out so
 /// the v4/v6 `or_insert_with` closures in [`PeerTable::add`] agree.
-fn first_conn_placeholder(
-    endpoint_id: EndpointId,
-    conn: Connection,
-    net: SmolStr,
-) -> PeerEntry {
+fn first_conn_placeholder(endpoint_id: EndpointId, conn: Connection, net: SmolStr) -> PeerEntry {
     let mut out_handles = HashMap::new();
     out_handles.insert(net.clone(), 1u16);
     let mut networks = HashSet::new();
@@ -763,7 +814,11 @@ mod tests {
             .await
             .expect("reader forwarded a datagram before timeout")
             .expect("tun channel stayed open");
-        assert_eq!(&got[..], &icmp[..], "TUN packet must be the untagged IP packet");
+        assert_eq!(
+            &got[..],
+            &icmp[..],
+            "TUN packet must be the untagged IP packet"
+        );
     }
 
     /// Minimal IPv4/ICMP echo-request packet from `src` to `dst`, enough for

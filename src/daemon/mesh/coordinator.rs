@@ -106,6 +106,48 @@ impl NetworkRegistry {
         tracing::info!(peer = %member_id.fmt_short(), network, "pruned member after leave");
     }
 
+    /// Handle a member's deliberate in-band departure from one shared network
+    /// (`ControlMsg::LeaveNetwork`, `ray leave`). Drops it from this network's
+    /// routing, closing the shared connection only if this was the last network the
+    /// two peers had in common (so a multi-network link stays up on the rest). If we
+    /// coordinate the network, also prune it from the roster + `.ray` DNS, republish
+    /// the signed blob, and broadcast a `MemberSync` trigger; a plain member takes
+    /// no roster action and learns of the departure from the coordinator's republish
+    /// on its next reconverge. Mirrors [`prune_member_on_leave`], keyed by the
+    /// connection's remote id instead of a `DisconnectEvent`.
+    pub(crate) async fn handle_member_leave(&self, network: &str, peer_id: EndpointId) {
+        // Capture the leaver's mesh IP before removal (needed for the DNS prune);
+        // the by-id lookup is gone once this was its last shared network.
+        let leaver_ip = self.peers.v4_for_id(&peer_id);
+        if let Some(conn) = self.peers.remove_peer_from_network_by_id(&peer_id, network) {
+            conn.close(VarInt::from_u32(forward::LEAVE_CODE), b"leave");
+        }
+
+        let (state, net_pubkey, dht_notify) = {
+            let Some(h) = self.networks.get(network) else {
+                return;
+            };
+            if !h.role.is_coordinator() {
+                return;
+            }
+            (h.state.clone(), h.network_key, h.dht_notify.clone())
+        };
+        let member_id = self.device_user_map.resolve(&peer_id);
+        state.write().unwrap().members.remove(&member_id);
+        if let Some(ip) = leaver_ip {
+            dns::remove_hostname_by_ip(
+                &self.dns.hostname_table,
+                &self.dns.reverse_table,
+                network,
+                ip,
+            )
+            .await;
+        }
+        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
+        broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
+        tracing::info!(peer = %member_id.fmt_short(), network, "pruned member after in-band leave");
+    }
+
     /// Reconnect a dropped peer with one dial that re-establishes every network we
     /// still share with it. Backs off exponentially; on success re-registers the
     /// peer per network and drives the new connection's control demux. Also used
