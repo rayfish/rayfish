@@ -315,13 +315,10 @@ async fn build_daemon(
     let daemon = Arc::new(MeshManager {
         transport,
         registry,
-        peers,
         stats: stats.clone(),
         start: Instant::now(),
         tun_tx,
-        networks,
         shutdown_token: token.clone(),
-        firewall: shared_firewall,
         protocol_router: protocol_router.clone(),
         dns,
         mdns_enabled,
@@ -332,8 +329,6 @@ async fn build_daemon(
         files,
         connect,
         device_cert,
-        device_user_map,
-        pruned_peers,
         contact_public,
         active: active.clone(),
         #[cfg(feature = "desktop")]
@@ -366,7 +361,7 @@ async fn build_daemon(
     // publisher/poller is needed. Coordinated networks seed their nullifiers from
     // the persisted `revoked_devices` set at seal time (see `seal_and_publish`).
     let metrics_server =
-        spawn_metrics_server(stats, daemon.peers.clone(), &daemon.transport.endpoint, token).await;
+        spawn_metrics_server(stats, daemon.registry.peers.clone(), &daemon.transport.endpoint, token).await;
     // Keep the metrics-server guard alive for the daemon's whole lifetime.
     *daemon._metrics_server.lock().unwrap() = metrics_server;
 

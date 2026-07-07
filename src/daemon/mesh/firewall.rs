@@ -480,7 +480,7 @@ impl MeshManager {
             };
         }
         // Open/close port 22 at the packet layer; SSH-layer authz is the real gate.
-        let fw = self.firewall.set_ssh_passthrough(enabled);
+        let fw = self.registry.firewall.set_ssh_passthrough(enabled);
         if let Err(e) = firewall::save_firewall(&fw) {
             tracing::warn!(error = %e, "failed to persist firewall config");
         }
@@ -542,7 +542,7 @@ impl MeshManager {
             "*".to_string()
         } else {
             match self.resolve_peer_name(peer).await {
-                Some(id) => self.device_user_map.resolve(&id).to_string(),
+                Some(id) => self.registry.device_user_map.resolve(&id).to_string(),
                 None => {
                     return IpcMessage::Error {
                         message: format!("could not resolve peer: {peer}"),

@@ -715,8 +715,8 @@ impl MeshManager {
         let my_v4 = self.transport.identity.local_ip();
         let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
         let server = crate::ssh::SshServer::new(
-            self.peers.clone(),
-            self.device_user_map.clone(),
+            self.registry.peers.clone(),
+            self.registry.device_user_map.clone(),
             self.ssh_authz.clone(),
         );
         server.spawn(vec![IpAddr::V4(my_v4), IpAddr::V6(my_v6)], token);

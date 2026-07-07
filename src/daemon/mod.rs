@@ -423,7 +423,6 @@ pub struct MeshManager {
     /// this holds clones of the same handles the loose fields below still use;
     /// the loose fields go away when `MeshManager` is dissolved.
     transport: Arc<Transport>,
-    peers: PeerTable,
     stats: Arc<ForwardMetrics>,
     /// When the daemon process started, used for uptime in diagnostics.
     start: Instant,
@@ -436,14 +435,14 @@ pub struct MeshManager {
     /// desktop the daemon attaches exactly once, so the cell holds one sender for
     /// its whole life and is never swapped.
     tun_tx: Arc<ArcSwap<mpsc::Sender<Bytes>>>,
-    networks: Arc<DashMap<String, NetworkHandle>>,
-    /// The network-owning service. Shares the same `networks` map (M5 seam); the
+    /// The network-owning service. Owns the `networks` map, `peers`, `firewall`,
+    /// `device_user_map`, and `pruned_peers`; MeshManager reaches all of them
+    /// through `self.registry` rather than keeping its own copies. The
     /// daemon delegates coordinator registration / promotion to it, and hands
     /// clones to services (FileService) and control readers (MemberAcceptState)
     /// so they call it directly instead of signalling the daemon over a channel.
     registry: Arc<NetworkRegistry>,
     shutdown_token: CancellationToken,
-    firewall: SharedFirewall,
     protocol_router: Arc<ProtocolRouter>,
     /// Magic DNS leaf service: naming tables, resolver, and OS-DNS configurator
     /// (see [`DnsService`]). Shared as `Arc` so extracted consumers can hold it.
@@ -472,10 +471,6 @@ pub struct MeshManager {
     /// [`ProtocolRouter`], which runs the accept arm.
     connect: Arc<ConnectService>,
     device_cert: Option<control::DeviceCert>,
-    device_user_map: peers::DeviceUserMap,
-    /// Peers removed from a roster whose reconnect should be suppressed once.
-    /// Shared into [`MeshCtx::pruned_peers`]; see that field for the mechanism.
-    pruned_peers: Arc<DashSet<(String, EndpointId)>>,
     /// This node's contact id (`ray connect`): the public half of the rotatable
     /// contact key. The secret lives in config (read fresh by the publisher and
     /// `rotate_contact` so rotation needs no restart); only the public id is
@@ -617,8 +612,8 @@ impl MeshManager {
         let cancel = self.shutdown_token.child_token();
         let writer_handle = forward::spawn_tun_writer(writer, new_rx, self.active.clone());
         let mesh_handle = {
-            let peers = self.peers.clone();
-            let firewall = self.firewall.clone();
+            let peers = self.registry.peers.clone();
+            let firewall = self.registry.firewall.clone();
             let cancel = cancel.clone();
             let stats = self.stats.clone();
             let resolver = self.dns.resolver.clone();
@@ -678,7 +673,7 @@ impl MeshManager {
     }
 
     /// Register a [`CoordinatorAcceptState`] handler for `network` and update
-    /// the network's role in `self.networks` to [`NetworkRole::Coordinator`].
+    /// the network's role in `self.registry.networks` to [`NetworkRole::Coordinator`].
     ///
     /// Calling this at create, restore, and admin-promotion sites keeps the
     /// coordinator-registration logic in one place. The method is synchronous
@@ -964,7 +959,7 @@ impl MeshManager {
             };
         }
 
-        let (my_ip, is_coord, state, dht_notify) = match self.networks.get(network) {
+        let (my_ip, is_coord, state, dht_notify) = match self.registry.networks.get(network) {
             Some(h) => (
                 h.my_ip,
                 h.role.is_coordinator(),
@@ -1049,7 +1044,7 @@ impl MeshManager {
             );
             update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
             let net_pubkey = state.read().unwrap().network_public_key;
-            broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
+            broadcast_member_sync(&self.registry.peers, net_pubkey, network, None).await;
         }
 
         let dns_name = format!("{}.{}.{}", new_hostname, network, crate::DNS_DOMAIN);
@@ -1069,8 +1064,8 @@ impl MeshManager {
         my_ip: Ipv4Addr,
         new_hostname: &str,
     ) {
-        let peers = self.peers.peers_for_network_with_conn(network);
-        let net_pubkey = self.networks.get(network).map(|h| h.network_key);
+        let peers = self.registry.peers.peers_for_network_with_conn(network);
+        let net_pubkey = self.registry.networks.get(network).map(|h| h.network_key);
         tracing::info!(
             network = %network,
             hostname = %new_hostname,
