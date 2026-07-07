@@ -1,13 +1,13 @@
-//! [`MeshManager`]'s IPC operations, split by domain. Each submodule holds an
-//! additional `impl MeshManager` block and opens with `use super::super::*;` to
+//! [`Daemon`]'s IPC operations, split by domain. Each submodule holds an
+//! additional `impl Daemon` block and opens with `use super::super::*;` to
 //! inherit the imports and private types declared in `daemon/mod.rs`.
 //!
 //! These live under `mesh/` (rather than as siblings of `daemon/mod.rs`) so the
 //! module names can be the clean domain names (`firewall`, `connect`, …)
 //! without colliding with the `use crate::{firewall, dns, …}` aliases that
 //! `daemon/mod.rs` brings into its own namespace. The modules export no names of
-//! their own (only `impl MeshManager` blocks), so no re-export is needed; the
-//! methods attach to `MeshManager` and are called as `self.method()`.
+//! their own (only `impl Daemon` blocks), so no re-export is needed; the
+//! methods attach to `Daemon` and are called as `self.method()`.
 
 mod accept;
 mod admin;
@@ -35,7 +35,7 @@ mod select;
 pub(crate) use accept::*;
 pub(crate) use coordinator::*;
 // Device-side unpair wipe + cert-refresh helpers, reached by both control readers.
-pub(crate) use files::{is_unpaired_by, store_refreshed_cert};
+pub(crate) use files::{is_unpaired_by, resolve_download_target, store_refreshed_cert};
 pub(crate) use join::*;
 pub(crate) use publish::*;
 pub(crate) use reconverge::*;

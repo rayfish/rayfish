@@ -36,7 +36,7 @@ wait_daemons "$A" "$B" "$C"
 
 # ---------------------------------------------------------------------------
 step "2. pair srv-b into srv-a's identity (device cert)"
-A_ENDPOINT="$(on "$A" 'ray status' | strip | awk '/endpoint/{print $2}')"
+A_ENDPOINT="$(status_json "$A" | jq -r '.endpoint // empty')"
 echo "   srv-a endpoint/identity: $A_ENDPOINT"
 
 # `ray pair` on A arms the daemon's pairing accept loop and prints a ticket.
@@ -133,13 +133,15 @@ if [[ -n "$A_IP" && -n "$B_IP" && -n "$C_IP" \
 else
   fail "expected three distinct IPs (srv-a=$A_IP srv-b=$B_IP srv-c=$C_IP)"
 fi
-# Network-level device-cert recognition: the coordinator must resolve srv-b's
-# transport key to srv-a's USER IDENTITY (shown as a `user:<prefix>` tag).
-UPREFIX="$(echo "$A_ENDPOINT" | cut -c1-10)"
-if echo "$SA" | grep 'srv-b' | grep -q "user:$UPREFIX"; then
-  pass "coordinator resolves srv-b to srv-a's user identity (user:${UPREFIX}…) — device cert recognized"
+# Network-level device-cert recognition: the coordinator (srv-a) must resolve
+# srv-b's transport key to srv-a's own USER IDENTITY. Read it from the status
+# JSON peer schema (`.user_identity`) instead of scraping the coloured table.
+B_USER_SEEN="$(status_json "$A" | jq -r --arg h srv-b \
+  '[ (.networks // [])[].peers[] | select((.hostname // "") == $h) ] | .[0].user_identity // empty')"
+if [[ -n "$A_ENDPOINT" && "$B_USER_SEEN" == "$A_ENDPOINT" ]]; then
+  pass "coordinator resolves srv-b to srv-a's user identity (${B_USER_SEEN:0:10}…) — device cert recognized"
 else
-  fail "coordinator does not tag srv-b as user:$UPREFIX (device cert not recognized at join)"
+  fail "coordinator tags srv-b user_identity='$B_USER_SEEN', expected srv-a '$A_ENDPOINT' (device cert not recognized at join)"
 fi
 
 # ---------------------------------------------------------------------------

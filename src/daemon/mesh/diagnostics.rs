@@ -1,14 +1,14 @@
-//! Read-only diagnostics for `MeshManager`: `status`, `build_report`, `ping`,
+//! Read-only diagnostics for `Daemon`: `status`, `build_report`, `ping`,
 //! `netcheck`, and connection-info helpers. Split out of `daemon/mod.rs`.
 
 use super::super::*;
 
-impl MeshManager {
+impl Daemon {
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// snapshot the daemon's status (identity, networks, peers).
     pub fn status(&self) -> IpcMessage {
         let hostname_snapshot = self.dns.hostname_table.try_read().ok();
-        let my_id = self.endpoint.id();
+        let my_id = self.transport.endpoint.id();
         // Direct-connection networks are flagged in config; collect their names
         // so each NetworkStatus can be tagged `[direct]` in the CLI.
         let direct_names: HashSet<String> = config::load()
@@ -21,6 +21,7 @@ impl MeshManager {
             })
             .unwrap_or_default();
         let statuses: Vec<NetworkStatus> = self
+            .registry
             .networks
             .iter()
             .map(|h| self.network_status(&h, my_id, hostname_snapshot.as_deref(), &direct_names))
@@ -31,14 +32,14 @@ impl MeshManager {
             .map(|c| {
                 c.pending_joins
                     .into_iter()
-                    .filter(|p| !self.networks.contains_key(&p.network_key))
+                    .filter(|p| !self.registry.networks.contains_key(&p.network_key))
                     .map(|p| p.name.unwrap_or(p.network_key))
                     .collect()
             })
             .unwrap_or_default();
 
         IpcMessage::StatusResponse {
-            endpoint_id: self.endpoint.id(),
+            endpoint_id: self.transport.endpoint.id(),
             mdns_enabled: self.mdns_enabled,
             auto_update: self.auto_update,
             active: self.active.load(Ordering::SeqCst),
@@ -121,6 +122,7 @@ impl MeshManager {
         };
         // Index live connections by endpoint id for a fast lookup.
         let connected: HashMap<EndpointId, Connection> = self
+            .registry
             .peers
             .peers_for_network_with_conn(&h.name)
             .into_iter()
@@ -139,7 +141,7 @@ impl MeshManager {
             .map(|m| {
                 let hostname = m.hostname.clone().or_else(|| lookup_hostname(m.ip));
                 let connection = connected.get(&m.identity).map(Self::gather_conn_info);
-                let user_id = self.device_user_map.resolve(&m.identity);
+                let user_id = self.registry.device_user_map.resolve(&m.identity);
                 let user_identity = (user_id != m.identity).then_some(user_id);
                 PeerStatus {
                     endpoint_id: m.identity,
@@ -148,6 +150,11 @@ impl MeshManager {
                     hostname,
                     user_identity,
                     is_own_device: user_id == own_user,
+                    // Only meaningful for a peer with no live connection: a dial hit
+                    // the mesh-version ALPN gate. A connected peer is same-version by
+                    // definition, and `add` clears the flag on connect anyway.
+                    incompatible: connection.is_none()
+                        && self.registry.peers.is_incompatible(&m.identity),
                     connection,
                 }
             })
@@ -156,7 +163,7 @@ impl MeshManager {
             name: h.name.clone(),
             role,
             my_ip: h.my_ip,
-            my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
+            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
             my_hostname: lookup_hostname(h.my_ip),
             network_key: Some(h.network_key.to_string()),
             member_count,
@@ -198,10 +205,10 @@ impl MeshManager {
         if !uname.is_empty() {
             let _ = writeln!(sysinfo, "uname: {uname}");
         }
-        let _ = writeln!(sysinfo, "endpoint_id: {}", self.endpoint.id());
+        let _ = writeln!(sysinfo, "endpoint_id: {}", self.transport.endpoint.id());
         let _ = writeln!(sysinfo, "uptime_secs: {uptime}");
         let _ = writeln!(sysinfo, "active: {active}");
-        let _ = writeln!(sysinfo, "networks: {}", self.networks.len());
+        let _ = writeln!(sysinfo, "networks: {}", self.registry.networks.len());
 
         // --- metrics.txt ---
         let snap = self.stats.snapshot(self.start);
@@ -345,7 +352,7 @@ impl MeshManager {
     /// returns the address (so `lookup_v4` can yield a live connection).
     pub(crate) async fn resolve_peer_ip(&self, name: &str) -> Option<(Ipv4Addr, String)> {
         let id = self.resolve_peer_name(name).await?;
-        for entry in self.networks.iter() {
+        for entry in self.registry.networks.iter() {
             let state = entry.value().state.read().unwrap();
             if let Some(m) = state.members.all().iter().find(|m| m.identity == id) {
                 let display = m
@@ -369,7 +376,7 @@ impl MeshManager {
                 };
             }
         };
-        let route = match self.peers.lookup_v4(&ip) {
+        let route = match self.registry.peers.lookup_v4(&ip) {
             Some(r) => r,
             None => {
                 return IpcMessage::Error {
@@ -388,11 +395,11 @@ impl MeshManager {
             }
             let nonce: u64 = rand::random();
             let (tx, rx) = tokio::sync::oneshot::channel();
-            self.protocol_router.pending_pongs.insert(nonce, tx);
+            self.protocol_router.pending_pongs().insert(nonce, tx);
             let sent = Instant::now();
             let sent_ok = match conn.open_bi().await {
                 Ok((mut send, _)) => {
-                    control::send_msg(&mut send, &control::ControlMsg::Ping { nonce })
+                    control::send_msg(&mut send, None, &control::ControlMsg::Ping { nonce })
                         .await
                         .is_ok()
                 }
@@ -407,7 +414,7 @@ impl MeshManager {
                 None
             };
             // Drop the slot whether or not the Pong arrived (timeout / send error).
-            self.protocol_router.pending_pongs.remove(&nonce);
+            self.protocol_router.pending_pongs().remove(&nonce);
             probes.push(rtt);
         }
 
@@ -425,7 +432,7 @@ impl MeshManager {
     pub(crate) async fn netcheck(&self) -> IpcMessage {
         use iroh::Watcher as _;
 
-        let bound = self.endpoint.bound_sockets();
+        let bound = self.transport.endpoint.bound_sockets();
         let bound_port = bound.first().map(|a| a.port()).unwrap_or(0);
         let port_is_fixed = bound_port == transport::RAYFISH_LISTEN_PORT;
 
@@ -433,7 +440,7 @@ impl MeshManager {
         // flight, so wait briefly for an initialized report, then fall back to
         // whatever the watcher currently holds.
         let report = {
-            let mut w = self.endpoint.net_report();
+            let mut w = self.transport.endpoint.net_report();
             match tokio::time::timeout(Duration::from_secs(3), w.initialized()).await {
                 Ok(r) => Some(r),
                 Err(_) => w.get(),
@@ -467,7 +474,7 @@ impl MeshManager {
         // Fall back to the connection-status watcher for the relay URL if the net
         // report has not surfaced a preferred relay yet.
         if home_relay.is_none() {
-            let status = self.endpoint.home_relay_status().get();
+            let status = self.transport.endpoint.home_relay_status().get();
             home_relay = status.first().map(|s| s.url().to_string());
         }
 

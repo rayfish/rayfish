@@ -6,6 +6,62 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`ray status` flags peers on an incompatible mesh version.** A peer running a
+  mismatched mesh protocol can't connect (the version-gated ALPN rejects it) and
+  used to look like any other offline peer. Such a peer is now shown as
+  `incompatible` with a `ray update` nudge, instead of plain `offline`, so it is
+  clear the peer just needs updating. (Connected peers are same-version by
+  definition, so this only ever applies to unreachable ones.)
+- **`ray status` groups your paired devices under their user.** Devices that
+  share a user identity (multi-device pairing) now nest under a parent row for
+  that user showing a `N devices, M online` rollup, instead of listing flat with
+  a `(user …)` tag. Standalone members are unchanged. The device columns stay
+  aligned across the tree.
+- **One mesh connection per peer, not per network**: peers now hold a single
+  QUIC connection per device identity that carries traffic for every network they
+  share, instead of one connection per shared network. A host you share two
+  networks with is one connection with one round-trip estimate, so `ray status`
+  and `ray ping` report the **same** RTT for it everywhere (previously each could
+  read a different, sometimes-stale, per-network connection). Networks are now a
+  membership/policy layer decoupled from the transport. **This is a breaking
+  mesh-protocol change** — every peer must be on the new version to connect (older
+  peers are cleanly severed by the protocol-version gate; run `ray update`). A
+  peer kicked or removed from one shared network stays reachable on the others.
+- **`ray connect` links are now symmetric**: when a direct 2-peer connection is
+  approved, both peers become coordinators of the auto-created network (the
+  requester is granted the network key on admission). Either side can now manage
+  the link (rename, re-invite, keep it alive) instead of only the peer who
+  approved it.
+
+### Fixed
+
+- **A reconnecting peer shows the current roster within seconds, not up to a
+  minute.** After a restart a node connected to its coordinator almost instantly
+  but its own `ray status` could sit on a stale roster (peers missing or shown
+  offline) for ~60-90s, because it only learned the live membership from a DHT
+  lookup that can serve a stale record right after boot, plus a 60s poll. A
+  coordinator now hands a reconnecting member its current network-key-signed
+  record directly over the mesh, so the member converges to the live roster in
+  about a second. The record is still signature-verified against the network key,
+  so the trust model is unchanged.
+- **Leaving one network no longer disconnects you from the others you share
+  with the same peer.** With one connection per peer now carrying every shared
+  network, `ray leave <net>` used to tear down the whole link, cutting the peer on
+  networks you never left, and if that peer coordinated one of them it could even
+  drop you from its roster. Departure is now signalled in-band and scoped to the
+  single network, so the rest stay up.
+- **A co-coordinator renaming itself now reaches the other coordinators.**
+  On a network with more than one coordinator (via `ray admin add` or a `ray
+  connect` link), when one coordinator changed its own hostname the other
+  coordinators never learned it: their `ray status` roster and `*.ray` DNS kept
+  showing the old name. The rename now propagates to peer coordinators
+  immediately, so every node converges on the new name.
+- **QR scanner preview no longer appears sideways** when pairing a device on
+  Android: the scanner is now pinned to portrait so the camera preview stays
+  upright.
+
 ### Added
 
 - **Desktop GUI**: `ray gui` now opens a local browser control panel with guided
