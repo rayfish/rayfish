@@ -338,7 +338,7 @@ pub async fn run_mesh<R: crate::tun::TunRead>(
     firewall: SharedFirewall,
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
-    resolver: Arc<crate::dns_resolver::Resolver>,
+    resolver: Arc<crate::dns::resolver::Resolver>,
     tun_tx: mpsc::Sender<Bytes>,
 ) -> Result<()> {
     let mut pool = BytesMut::with_capacity(TX_POOL_CHUNK);

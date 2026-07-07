@@ -65,7 +65,7 @@ use crate::config;
 use crate::control::{self, ControlMsg};
 use crate::dht;
 use crate::dns;
-use crate::dns_config;
+use crate::dns::config as dns_config;
 use crate::firewall::{self, SharedFirewall};
 use crate::forward;
 use crate::identity;
@@ -1340,7 +1340,7 @@ mod accept_handler_tests {
         ));
         let hostname_table = dns::new_hostname_table();
         let reverse_table = dns::new_reverse_table();
-        let dns_resolver = Arc::new(crate::dns_resolver::Resolver::new(
+        let dns_resolver = Arc::new(crate::dns::resolver::Resolver::new(
             hostname_table.clone(),
             reverse_table.clone(),
         ));
