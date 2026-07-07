@@ -181,7 +181,7 @@ impl MeshManager {
                 // roster flagging it `is_coordinator`. Falls back to the blob's
                 // coordinators if the primary does not admit.
                 for net in networks {
-                    if self.networks.contains_key(&net.network_key) {
+                    if self.registry.networks.contains_key(&net.network_key) {
                         continue;
                     }
                     let me = Arc::clone(self);
@@ -267,7 +267,7 @@ impl MeshManager {
         let mut display = target.fmt_short().to_string();
         let mut is_paired = false;
         let mut nets: Vec<(String, SharedNetworkState, Option<Arc<Notify>>, bool)> = Vec::new();
-        for entry in self.networks.iter() {
+        for entry in self.registry.networks.iter() {
             let s = entry.value().state.read().unwrap();
             if let Some(m) = s.members.all().iter().find(|m| m.identity == target)
                 && m.user_identity == Some(own_user)
@@ -308,7 +308,7 @@ impl MeshManager {
                 message: format!("failed to persist nullifier: {e}"),
             };
         }
-        self.device_user_map.remove(&target);
+        self.registry.device_user_map.remove(&target);
 
         // 2. Best-effort: ask the device to wipe its own cert if online.
         self.send_unpaired_notice(target).await;
@@ -344,13 +344,13 @@ impl MeshManager {
                 // Nudge this network's members to reconverge from the freshly
                 // republished record.
                 let net_pubkey = state.read().unwrap().network_public_key;
-                broadcast_member_sync(&self.peers, net_pubkey, &net, None).await;
+                broadcast_member_sync(&self.registry.peers, net_pubkey, &net, None).await;
             }
-            for (pid, ip, conn) in self.peers.peers_for_network_with_conn(&net) {
+            for (pid, ip, conn) in self.registry.peers.peers_for_network_with_conn(&net) {
                 if pid == target {
-                    self.pruned_peers.insert((net.clone(), pid));
+                    self.registry.pruned_peers.insert((net.clone(), pid));
                     conn.close(VarInt::from_u32(forward::KICK_CODE), b"unpaired");
-                    self.peers
+                    self.registry.peers
                         .remove_peer_from_network(&ip, &derive_ipv6(&pid), &net);
                 }
             }
@@ -366,9 +366,9 @@ impl MeshManager {
     /// connection, asking it to wipe its own cert. Never blocks unpair on success
     /// the authoritative revocation is the signed pkarr record.
     async fn send_unpaired_notice(&self, target: EndpointId) {
-        for entry in self.networks.iter() {
+        for entry in self.registry.networks.iter() {
             let net = entry.key().clone();
-            for (pid, _ip, conn) in self.peers.peers_for_network_with_conn(&net) {
+            for (pid, _ip, conn) in self.registry.peers.peers_for_network_with_conn(&net) {
                 if pid != target {
                     continue;
                 }

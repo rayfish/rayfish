@@ -20,7 +20,7 @@ impl MeshManager {
                     .collect()
             })
             .unwrap_or_default();
-        let statuses: Vec<NetworkStatus> = self
+        let statuses: Vec<NetworkStatus> = self.registry
             .networks
             .iter()
             .map(|h| self.network_status(&h, my_id, hostname_snapshot.as_deref(), &direct_names))
@@ -31,7 +31,7 @@ impl MeshManager {
             .map(|c| {
                 c.pending_joins
                     .into_iter()
-                    .filter(|p| !self.networks.contains_key(&p.network_key))
+                    .filter(|p| !self.registry.networks.contains_key(&p.network_key))
                     .map(|p| p.name.unwrap_or(p.network_key))
                     .collect()
             })
@@ -120,7 +120,7 @@ impl MeshManager {
             )
         };
         // Index live connections by endpoint id for a fast lookup.
-        let connected: HashMap<EndpointId, Connection> = self
+        let connected: HashMap<EndpointId, Connection> = self.registry
             .peers
             .peers_for_network_with_conn(&h.name)
             .into_iter()
@@ -139,7 +139,7 @@ impl MeshManager {
             .map(|m| {
                 let hostname = m.hostname.clone().or_else(|| lookup_hostname(m.ip));
                 let connection = connected.get(&m.identity).map(Self::gather_conn_info);
-                let user_id = self.device_user_map.resolve(&m.identity);
+                let user_id = self.registry.device_user_map.resolve(&m.identity);
                 let user_identity = (user_id != m.identity).then_some(user_id);
                 PeerStatus {
                     endpoint_id: m.identity,
@@ -201,7 +201,7 @@ impl MeshManager {
         let _ = writeln!(sysinfo, "endpoint_id: {}", self.transport.endpoint.id());
         let _ = writeln!(sysinfo, "uptime_secs: {uptime}");
         let _ = writeln!(sysinfo, "active: {active}");
-        let _ = writeln!(sysinfo, "networks: {}", self.networks.len());
+        let _ = writeln!(sysinfo, "networks: {}", self.registry.networks.len());
 
         // --- metrics.txt ---
         let snap = self.stats.snapshot(self.start);
@@ -345,7 +345,7 @@ impl MeshManager {
     /// returns the address (so `lookup_v4` can yield a live connection).
     pub(crate) async fn resolve_peer_ip(&self, name: &str) -> Option<(Ipv4Addr, String)> {
         let id = self.resolve_peer_name(name).await?;
-        for entry in self.networks.iter() {
+        for entry in self.registry.networks.iter() {
             let state = entry.value().state.read().unwrap();
             if let Some(m) = state.members.all().iter().find(|m| m.identity == id) {
                 let display = m
@@ -369,7 +369,7 @@ impl MeshManager {
                 };
             }
         };
-        let route = match self.peers.lookup_v4(&ip) {
+        let route = match self.registry.peers.lookup_v4(&ip) {
             Some(r) => r,
             None => {
                 return IpcMessage::Error {
