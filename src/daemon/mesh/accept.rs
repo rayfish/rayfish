@@ -1076,18 +1076,6 @@ impl ProtocolRouter {
         &self.conn.pending_pongs
     }
 
-    /// The static ALPN set the endpoint advertises: the single mesh ALPN plus the
-    /// network-independent blobs / files / pairing / connect ALPNs.
-    pub(crate) fn alpns(&self) -> Vec<Vec<u8>> {
-        vec![
-            transport::mesh_alpn(),
-            iroh_blobs::protocol::ALPN.to_vec(),
-            transport::FILES_ALPN.to_vec(),
-            PAIR_ALPN.to_vec(),
-            transport::CONNECT_ALPN.to_vec(),
-        ]
-    }
-
     pub(crate) fn spawn_accept_loop(
         self: &Arc<Self>,
         endpoint: Endpoint,

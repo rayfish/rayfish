@@ -39,7 +39,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // whole lifetime, then bring the data plane up. `ray up`/`ray down` toggle
     // only the data plane after this; connections persist across `down` so the
     // node stays online to peers.
-    daemon.connect_all_networks().await;
+    daemon.registry.connect_all_networks().await;
     daemon.activate(None).await;
 
     // Single daemon-wide connection supervisor: consumes every data reader's
@@ -118,7 +118,7 @@ pub async fn build_headless() -> Result<Arc<MeshManager>> {
     let stats = Arc::new(ForwardMetrics::default());
     let daemon = build_daemon(token, stats).await?;
     // Bring the saved networks' control plane up, matching `run_daemon`.
-    daemon.connect_all_networks().await;
+    daemon.registry.connect_all_networks().await;
     // Control readers and the join path now run their network ops (promotion,
     // self-unpair) directly via NetworkRegistry, so a headless embedder needs no
     // hand-off drain loop.

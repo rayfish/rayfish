@@ -52,42 +52,6 @@ fn abort_join_tasks(cancel: &CancellationToken, tasks: Vec<tokio::task::JoinHand
 }
 
 impl MeshManager {
-    /// Refresh the network's blob snapshot, store its bytes in the local blob
-    /// store, and publish the network-key-signed pkarr record (blob hash + this
-    /// endpoint as the seed peer). Shared by network creation and coordinator
-    /// restore: both seal a freshly built `NetworkState` and announce it.
-    pub(crate) async fn seal_and_publish(
-        &self,
-        net_state: &mut NetworkState,
-        net_secret_key: &SecretKey,
-    ) {
-        self.registry.seal_and_publish(net_state, net_secret_key).await
-    }
-
-    /// Spawn the two background tasks every coordinator network needs: the pkarr
-    /// record publisher and the peer-disconnect cleanup (which republishes the
-    /// blob when a member drops). Returns the task handles plus the
-    /// `disconnect_tx` the accept handlers feed. Shared by create + restore.
-    pub(crate) fn spawn_coordinator_background_tasks(
-        &self,
-        name: &str,
-        net_secret_key: &SecretKey,
-        state: &SharedNetworkState,
-        dht_notify: &Arc<tokio::sync::Notify>,
-        cancel: &CancellationToken,
-    ) -> (
-        Vec<tokio::task::JoinHandle<()>>,
-        mpsc::Sender<forward::DisconnectEvent>,
-    ) {
-        self.registry.spawn_coordinator_background_tasks(
-            &self.mesh_ctx(),
-            name,
-            net_secret_key,
-            state,
-            dht_notify,
-            cancel,
-        )
-    }
 
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// create a new network and register this node as its coordinator.

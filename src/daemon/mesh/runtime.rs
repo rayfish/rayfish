@@ -17,7 +17,7 @@ struct RestoredRoster {
     nullifiers: BTreeSet<EndpointId>,
 }
 
-impl MeshManager {
+impl NetworkRegistry {
     /// Rebuild a network's roster for a coordinator restart. Prefers the
     /// published, network-key-signed `GroupBlob` (members + approved + suggested
     /// firewall + reusable keys); if the DHT is unreachable, falls back to the
@@ -39,7 +39,7 @@ impl MeshManager {
         // Reusable join keys are authoritative in the signed blob too.
         let mut reusable_keys = BTreeMap::new();
         let mut nullifiers = BTreeSet::new();
-        match self.registry.restore_roster_from_blob(net_public_key).await {
+        match self.restore_roster_from_blob(net_public_key).await {
             Ok(data) => {
                 suggested_firewall = data.suggested_firewall.clone();
                 reusable_keys = data.reusable_keys.clone();
@@ -89,10 +89,10 @@ impl MeshManager {
                 }
             }
         }
-        if !member_list.is_member(&self.identity.local_identity()) {
+        if !member_list.is_member(&self.transport.identity.local_identity()) {
             member_list
                 .add(Member {
-                    identity: self.identity.local_identity(),
+                    identity: self.transport.identity.local_identity(),
                     ip: my_ip,
                     is_coordinator: true,
                     hostname: persisted_hostname.clone(),
@@ -126,7 +126,7 @@ impl MeshManager {
             }
         }
 
-        let my_ip = self.identity.local_ip();
+        let my_ip = self.transport.identity.local_ip();
 
         // Load persisted network secret key from config
         let app_config = config::load()?;
@@ -210,7 +210,9 @@ impl MeshManager {
         let state = Arc::new(RwLock::new(net_state));
         let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
         let dht_notify = Arc::new(tokio::sync::Notify::new());
+        let ctx = self.mesh_ctx();
         let (tasks, disconnect_tx) = self.spawn_coordinator_background_tasks(
+            &ctx,
             name,
             &net_secret_key,
             &state,
@@ -219,6 +221,7 @@ impl MeshManager {
         );
 
         self.register_coordinator_handler(
+            &ctx,
             name,
             state.clone(),
             invite_lock.clone(),
@@ -262,11 +265,11 @@ impl MeshManager {
             .into_iter()
             .cloned()
             .collect();
-        self.registry.dial_all_members(
+        self.dial_all_members(
             &members_to_dial,
             net_public_key,
             name,
-            self.identity.local_identity(),
+            self.transport.identity.local_identity(),
             my_ip,
             persisted_hostname.clone(),
         )
@@ -290,7 +293,7 @@ impl MeshManager {
             disconnect_tx: disconnect_tx.clone(),
         };
         self.networks.insert(name.to_string(), handle);
-        self.refresh_alpns().await;
+        self.refresh_search_domains().await;
 
         // Full mesh: proactively dial every known member in the background so a
         // restarting coordinator/co-coordinator reconnects to peers that haven't
@@ -304,11 +307,11 @@ impl MeshManager {
             let me = Arc::clone(self);
             let network_name = name.to_string();
             tokio::spawn(async move {
-                me.registry.dial_all_members(
+                me.dial_all_members(
                     &members_to_dial,
                     net_public_key,
                     &network_name,
-                    me.identity.local_identity(),
+                    me.transport.identity.local_identity(),
                     my_ip,
                     persisted_hostname,
                 )
@@ -322,7 +325,7 @@ impl MeshManager {
             name: name.to_string(),
             network_key: net_public_key,
             my_ip,
-            my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
+            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
         })
     }
 
@@ -339,7 +342,7 @@ impl MeshManager {
                 }
             };
             let state = handle.state.read().unwrap();
-            let my_id = self.endpoint.id();
+            let my_id = self.transport.endpoint.id();
             let is_coord = state
                 .members
                 .get(&my_id)
@@ -368,7 +371,7 @@ impl MeshManager {
             state.network_secret_key.clone()
         };
         if let Some(key) = net_secret_key
-            && let Ok(client) = dht::create_pkarr_client(&self.endpoint)
+            && let Ok(client) = dht::create_pkarr_client(&self.transport.endpoint)
         {
             let empty_hash = group_blob_hash(
                 &MemberList::new(),
@@ -457,7 +460,7 @@ impl MeshManager {
                 }
             }
         };
-        if member_id == self.endpoint.id() {
+        if member_id == self.transport.endpoint.id() {
             return IpcMessage::Error {
                 message: "cannot kick yourself — use `ray leave` or `ray nuke`".to_string(),
             };
@@ -485,7 +488,7 @@ impl MeshManager {
             member_ip,
         )
         .await;
-        update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
         let net_pubkey = state.read().unwrap().network_public_key;
         broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
 
@@ -613,7 +616,6 @@ impl MeshManager {
                 let daemon_c = Arc::clone(self);
                 tokio::spawn(async move {
                     match daemon_c
-                        .registry
                         .join_network_inner(
                             &net_pubkey,
                             Some(&name),
@@ -667,9 +669,9 @@ impl MeshManager {
         // away, rather than waiting up to one publisher interval (the active-gated
         // `spawn_contact_publisher` only re-checks every TTL/2).
         if let Some(secret) = app_config.contact_secret_key.clone()
-            && let Ok(client) = dht::create_pkarr_client(&self.endpoint)
+            && let Ok(client) = dht::create_pkarr_client(&self.transport.endpoint)
         {
-            let endpoint_id = self.endpoint.id();
+            let endpoint_id = self.transport.endpoint.id();
             tokio::spawn(async move {
                 if let Err(e) = dht::publish_contact(&client, &secret, endpoint_id).await {
                     tracing::warn!(error = %e, "failed to publish contact record on connect");
@@ -679,7 +681,9 @@ impl MeshManager {
 
         tracing::info!(networks = count, "control plane connected");
     }
+}
 
+impl MeshManager {
     /// Rebuild the live per-network SSH allow-list snapshot from persisted
     /// config, so a running listener authorizes against current rules. Cheap and
     /// only called on SSH config changes / activation (not the hot path).
