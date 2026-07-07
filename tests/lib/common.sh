@@ -35,7 +35,10 @@ strip(){ sed -r 's/\x1B\[[0-9;]*[mGKH]//g'; }
 own_ip(){ echo "$1" | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
 
 # peer_host <status-text> : first peer row's `<host>.<net>.ray` hostname label.
-peer_host(){ echo "$1" | grep -E '●|○' | grep -oE '[a-z0-9-]+\.[a-z0-9-]+\.ray' | head -1 | cut -d. -f1; }
+# peer_host <status-text> : the first peer row's hostname. Peer rows carry a
+# status dot (●/○) and a mesh IP; the hostname is the token right after the dot.
+# (The status peer row prints the bare hostname, not the `.ray` FQDN.)
+peer_host(){ echo "$1" | sed 's/\x1b\[[0-9;]*m//g' | awk '/[●○]/ && /(100\.|200:)/ {for(i=1;i<=NF;i++) if($i=="●"||$i=="○"){print $(i+1); exit}}'; }
 
 # ping_loss <from-ip> <target-ip> : echo the packet-loss percentage (number only).
 ping_loss(){ on "$1" "ping -c 3 -W 2 $2" 2>&1 | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+'; }
