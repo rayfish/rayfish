@@ -234,14 +234,48 @@ pub const LEAVE_CODE: u32 = 0x1ea5e;
 /// treated as a non-intentional disconnect (the peer may reconnect; no quarantine).
 pub const ABUSE_CODE: u32 = 0xab05e;
 
-/// Application close code a coordinator (or any member pruning a stale roster
-/// entry) sends when it removes a peer from the network (`ray kick`). On the
-/// receiving (kicked) side it is treated like [`LEAVE_CODE`], an intentional
-/// disconnect, so the kicked node stops reconnecting instead of churning back
-/// into the coordinator's pending queue. The pruning side does not observe its
-/// own close code (that read is a local close), so it relies on the shared
-/// `pruned_peers` set to suppress its reconnect loop.
+/// Application close code that tears down a link to a peer our verified roster no
+/// longer lists (a nullified device, or a `prune_departed_peers` cleanup after
+/// reconverge). It is transport teardown, never authority: membership is decided
+/// only by the network-key-signed blob, and the authoritative per-network kick is
+/// the in-band `ControlMsg::KickedFromNetwork`, not this close. On the receiving
+/// side it is classified as [`CloseReason::Kicked`] and only affects reconnection:
+/// we never evict the peer or leave a network on it. A coordinator reconnects (a
+/// member cannot evict the coordinator, e.g. a flapping link's mutual prune); a
+/// plain member does not (avoiding churn) and lets the in-band kick plus reconverge
+/// settle its membership. The closing side does not observe its own close code
+/// (that read is a local close), so it relies on the shared `pruned_peers` set to
+/// suppress its reconnect loop.
 pub const KICK_CODE: u32 = 0x14ced;
+
+/// How a peer's connection ended, from the perspective of the side that observed
+/// the close. Membership is decided solely by the network-key-signed roster, so a
+/// close code is a hint about intent, never authority over who is a member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    /// Idle timeout, reset, control-flood close, or any non-graceful drop. The
+    /// peer may reconnect.
+    Transient,
+    /// The peer closed with [`LEAVE_CODE`] (`ray leave`): it deliberately departed
+    /// the last network we shared. A coordinator prunes it from the roster, and it
+    /// is not reconnected.
+    Left,
+    /// The peer closed with [`KICK_CODE`]: it removed *us* from *its* view (a
+    /// coordinator kicking us, or a member pruning what it believes is a stale
+    /// roster entry). We never treat this as the peer leaving: doing so would let a
+    /// member that wrongly kicks the coordinator during a flapping link evict a
+    /// valid member and desync the mesh. A network-key holder keeps the peer and
+    /// reconnects; the signed roster remains the sole authority.
+    Kicked,
+}
+
+impl CloseReason {
+    /// Whether a coordinator should prune the peer from the signed roster on this
+    /// close. Only a deliberate `ray leave` does; a kick never evicts the closer.
+    pub fn prunes_member(self) -> bool {
+        matches!(self, CloseReason::Left)
+    }
+}
 
 /// Sent by [`spawn_peer_reader`] when a peer connection drops,
 /// consumed by the reconnect loop (joiner) or cleanup task (coordinator).
@@ -255,10 +289,10 @@ pub struct DisconnectEvent {
     pub endpoint_id: EndpointId,
     pub ip: Ipv4Addr,
     pub ipv6: Ipv6Addr,
-    /// True when the peer closed gracefully with [`LEAVE_CODE`]/[`KICK_CODE`] (it
-    /// departed the last network we shared, or was kicked), as opposed to a
-    /// timeout/reset.
-    pub intentional: bool,
+    /// How the connection closed: a deliberate leave, a kick (the peer removed us
+    /// from its view), or a transient drop. Only [`CloseReason::Left`] prunes the
+    /// peer from a coordinated roster.
+    pub reason: CloseReason,
     /// [`Connection::stable_id`] of the connection that dropped, so a consumer
     /// can tell whether the connection currently stored for this peer is still
     /// the one that died. `None` for a synthetic kick that is not tied to a live
@@ -583,6 +617,18 @@ pub fn spawn_tun_writer<W: crate::tun::TunWrite>(
 mod tests {
     use super::*;
     use crate::firewall::Action;
+
+    #[test]
+    fn only_a_deliberate_leave_prunes_the_member() {
+        // A `ray leave` (LEAVE_CODE) is the only close a coordinator acts on by
+        // pruning the member from the signed roster.
+        assert!(CloseReason::Left.prunes_member());
+        // A kick (the peer removed *us* from its view) must never evict the
+        // closer: that is what let a flapping link's mutual prune desync the mesh.
+        assert!(!CloseReason::Kicked.prunes_member());
+        // A transient drop keeps the member (offline peers stay in the roster).
+        assert!(!CloseReason::Transient.prunes_member());
+    }
 
     #[derive(Default)]
     struct FakeTunWriter {

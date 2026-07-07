@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Result, bail};
 use iroh::EndpointId;
@@ -641,6 +641,24 @@ pub fn resolve_ip_tiebreak(mut members: Vec<Member>) -> Vec<Member> {
     list.all().into_iter().cloned().collect()
 }
 
+/// Whether `ip` is a rayfish overlay address: the IPv4 CGNAT range `100.64.0.0/10`
+/// or the IPv6 `200::/7` range that mesh IPs are derived into (see
+/// [`derive_ip`]/[`derive_ipv6`]). Used to keep the overlay's own addresses out of
+/// iroh's advertised transport candidates, so the tunnel is never asked to route
+/// over itself (a self-looping path that flaps open/closed and can cascade into
+/// spurious roster evictions).
+pub fn is_overlay_ip(ip: IpAddr) -> bool {
+    match ip {
+        // 100.64.0.0/10: first octet 100, top two bits of the second octet == 01.
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (o[1] & 0xC0) == 64
+        }
+        // 200::/7: the top 7 bits of the first hextet are `0000001`.
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0x0200,
+    }
+}
+
 fn ensure_in_cgnat_range(ip: Ipv4Addr) -> Result<()> {
     let o = ip.octets();
     anyhow::ensure!(
@@ -712,6 +730,26 @@ mod tests {
         key_bytes[0] = seed;
         let key = iroh::SecretKey::from(key_bytes);
         key.public()
+    }
+
+    #[test]
+    fn overlay_ip_covers_mesh_ranges_only() {
+        // IPv4 CGNAT 100.64.0.0/10 (the whole /10, not just Tailscale's usage).
+        assert!(is_overlay_ip("100.64.0.1".parse().unwrap()));
+        assert!(is_overlay_ip("100.127.255.255".parse().unwrap()));
+        assert!(is_overlay_ip(IpAddr::V4(derive_ip(&test_id(9)))));
+        // Just outside the /10 on either side.
+        assert!(!is_overlay_ip("100.63.255.255".parse().unwrap()));
+        assert!(!is_overlay_ip("100.128.0.0".parse().unwrap()));
+        // Ordinary underlay addresses pass through.
+        assert!(!is_overlay_ip("192.168.1.104".parse().unwrap()));
+        assert!(!is_overlay_ip("51.15.139.151".parse().unwrap()));
+        // IPv6 200::/7 (mesh range) vs a normal global v6.
+        assert!(is_overlay_ip(IpAddr::V6(derive_ipv6(&test_id(9)))));
+        assert!(is_overlay_ip("200::1".parse().unwrap()));
+        assert!(is_overlay_ip("03ff::1".parse().unwrap()));
+        assert!(!is_overlay_ip("2001:db8::1".parse().unwrap()));
+        assert!(!is_overlay_ip("fe80::1".parse().unwrap()));
     }
 
     #[test]

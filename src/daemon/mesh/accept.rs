@@ -837,6 +837,22 @@ impl MemberAcceptState {
                 }
                 None
             }
+            // Our coordinator says we have been removed from this network (`ray
+            // kick`). Act only on a kick from a coordinator (a stranger is ignored),
+            // and treat it as a trigger, not authority: confirm against the signed
+            // record and leave only if it no longer lists us. Off the demux loop:
+            // the confirm (a DHT resolve + blob fetch) and the leave are slow, and
+            // leaving tears down this very handler's network.
+            ControlMsg::KickedFromNetwork => {
+                if sender_is_coordinator(&self.state, peer_id) {
+                    let registry = self.registry.clone();
+                    let network = self.network_name.clone();
+                    tokio::spawn(async move {
+                        registry.confirm_kick_and_leave(&network).await;
+                    });
+                }
+                None
+            }
             _ => None,
         }
     }

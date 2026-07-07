@@ -37,6 +37,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A flapping connection no longer evicts a valid member from the network.** A
+  coordinator treated any graceful close (a `ray leave` *or* a kick) as a
+  departure, so when a peer closed a link with the *kick* code (it had pruned what
+  it thought was a stale roster entry, e.g. while a connection flapped), the
+  coordinator wrongly dropped that member from the signed roster and republished
+  without it. On a closed network the member then had to be re-admitted with `ray
+  accept`, and an unstable link could repeat this indefinitely. Membership is now
+  decided only by the signed record: a connection close never evicts a member and
+  never makes one leave. A `ray kick` is delivered as an explicit, network-scoped
+  message to the kicked member, which confirms it against the signed record and
+  leaves that network (only that one) when the record confirms the removal, so a
+  stale or spurious close can't evict anyone.
+- **The mesh no longer tries to reach peers over their own overlay IP.** A node's
+  rayfish mesh address (`100.64.0.0/10` or `200::/7`), bound on the TUN device,
+  could leak into the transport addresses it advertised, so peers tried to reach
+  it *through the tunnel it carries* — a self-looping path that flapped open and
+  closed and could cascade into the eviction above. Those overlay ranges are now
+  stripped from the addresses iroh publishes, so peers only dial real underlay
+  addresses and relays.
+- **`ray status` no longer lists a peer's primary device twice.** Viewed from
+  another node, a user whose primary device was itself a member showed up both as
+  a flat row and again as a separate group header for the same identity. The
+  primary's own row (with its address and RTT) now anchors the group, and the
+  paired devices nest beneath it.
+- **Unpairing a device from the device itself now revokes it on the primary.** A
+  secondary that unpaired itself only tore down locally; its primary kept it in
+  the roster with no nullifier written, so it lingered as an offline member until
+  you ran `ray unpair` on the primary. The device now asks its primary to write
+  the authoritative nullifier as it leaves (best-effort, while the link is still
+  up). If the device is offline from its primary at that moment, `ray unpair
+  <device>` on the primary is still the way to revoke it.
 - **Android no longer downgrades public DNS to cleartext.** While the VPN was up,
   non-`.ray` lookups were forwarded as plaintext UDP on port 53 to the network's
   IPv4 resolvers, ignoring any Private DNS (DoT/DoH) the device had configured.
