@@ -504,21 +504,10 @@ impl FileService {
         match conn.accept_bi().await {
             Ok((mut send, mut recv)) => {
                 // Read length-prefixed PairMsg::Request
-                let mut len_buf = [0u8; 4];
-                if let Err(e) = recv.read_exact(&mut len_buf).await {
-                    tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to read pair request length");
-                    return;
-                }
-                let body_len = u32::from_be_bytes(len_buf) as usize;
-                let mut body = vec![0u8; body_len];
-                if let Err(e) = recv.read_exact(&mut body).await {
-                    tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to read pair request body");
-                    return;
-                }
-                let request: control::PairMsg = match rmp_serde::from_slice(&body) {
+                let request: control::PairMsg = match control::recv_framed(&mut recv).await {
                     Ok(r) => r,
                     Err(e) => {
-                        tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to decode pair request");
+                        tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to read pair request");
                         return;
                     }
                 };
@@ -565,20 +554,8 @@ impl FileService {
                                     generation,
                                 );
                                 let response = control::PairMsg::Response { cert, networks };
-                                let response_bytes = match rmp_serde::to_vec_named(&response) {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "failed to encode pair response");
-                                        return;
-                                    }
-                                };
-                                let len = (response_bytes.len() as u32).to_be_bytes();
-                                if let Err(e) = send.write_all(&len).await {
-                                    tracing::warn!(error = %e, "failed to send pair response length");
-                                    return;
-                                }
-                                if let Err(e) = send.write_all(&response_bytes).await {
-                                    tracing::warn!(error = %e, "failed to send pair response body");
+                                if let Err(e) = control::send_framed(&mut send, &response).await {
+                                    tracing::warn!(error = %e, "failed to send pair response");
                                     return;
                                 }
                                 // Flush before the connection drops: finish the stream and wait
