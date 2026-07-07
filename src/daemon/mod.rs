@@ -35,7 +35,9 @@
 //!   that network's background tasks. Because cancellation is one-shot, every
 //!   `activate` mints *fresh* child tokens, so `up → down → up` cycles work.
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
+use iroh_metrics::service::MetricsServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -145,7 +147,7 @@ const PAIR_ALPN: &[u8] = b"rayfish/pair/1";
 pub(crate) struct MeshCtx {
     identity: IrohIdentityProvider,
     peers: PeerTable,
-    tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
+    tun_tx: Arc<ArcSwap<mpsc::Sender<Bytes>>>,
     stats: Arc<ForwardMetrics>,
     blob_store: FsStore,
     firewall: SharedFirewall,
@@ -218,7 +220,11 @@ impl MeshCtx {
 /// the receiver); connection-level (`net = None`). Resolves each local network
 /// name to its public key from config, which is cheap and only runs when a
 /// connection's shared-network set changes.
-pub(crate) async fn announce_network_handles(peers: &PeerTable, conn: &Connection, peer_ip: Ipv4Addr) {
+pub(crate) async fn announce_network_handles(
+    peers: &PeerTable,
+    conn: &Connection,
+    peer_ip: Ipv4Addr,
+) {
     let entries: Vec<control::NetworkHandle> = peers
         .outbound_handles(&peer_ip)
         .into_iter()
@@ -431,7 +437,7 @@ pub struct MeshManager {
     /// the next `attach_tun` swaps in a new sender feeding a fresh writer. On
     /// desktop the daemon attaches exactly once, so the cell holds one sender for
     /// its whole life and is never swapped.
-    tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
+    tun_tx: Arc<ArcSwap<mpsc::Sender<Bytes>>>,
     networks: Arc<DashMap<String, NetworkHandle>>,
     /// The network-owning service. Shares the same `networks` map (M5 seam); the
     /// daemon delegates coordinator registration / promotion to it, and hands
@@ -461,7 +467,7 @@ pub struct MeshManager {
     tun_tasks: Mutex<Option<TunTasks>>,
     /// Prometheus metrics-server guard. Kept alive for the daemon's whole lifetime
     /// (dropping it stops the export); `None` if the server failed to bind.
-    _metrics_server: Mutex<Option<iroh_metrics::service::MetricsServer>>,
+    _metrics_server: Mutex<Option<MetricsServer>>,
     /// File-transfer + pairing state and ALPN accept arms (see [`FileService`]).
     /// Shared with [`ProtocolRouter`], which runs the accept arms.
     files: Arc<FileService>,
@@ -805,9 +811,7 @@ impl MeshManager {
             }
             IpcMessage::Leave { name } => self.leave_network(&name).await,
             IpcMessage::Nuke { name, force } => self.registry.nuke_network(&name, force).await,
-            IpcMessage::Kick { network, peer } => {
-                self.registry.kick_member(&network, &peer).await
-            }
+            IpcMessage::Kick { network, peer } => self.registry.kick_member(&network, &peer).await,
             IpcMessage::SetEphemeral { network, ttl_secs } => {
                 self.registry.set_ephemeral(&network, ttl_secs).await
             }
@@ -830,26 +834,31 @@ impl MeshManager {
                 peer,
                 network,
             } => {
-                self.registry.firewall_add(
-                    direction,
-                    action,
-                    protocol,
-                    port.as_deref(),
-                    peer.as_deref(),
-                    network.as_deref(),
-                )
-                .await
+                self.registry
+                    .firewall_add(
+                        direction,
+                        action,
+                        protocol,
+                        port.as_deref(),
+                        peer.as_deref(),
+                        network.as_deref(),
+                    )
+                    .await
             }
             IpcMessage::FirewallRemove { index } => self.registry.firewall_remove(index),
             IpcMessage::FirewallShow => self.registry.firewall_show(),
             IpcMessage::FirewallDefault { action } => self.registry.firewall_default(action),
             IpcMessage::FirewallReject { enabled } => self.registry.firewall_reject(enabled),
-            IpcMessage::FirewallSetEnabled { enabled } => self.registry.firewall_set_enabled(enabled),
+            IpcMessage::FirewallSetEnabled { enabled } => {
+                self.registry.firewall_set_enabled(enabled)
+            }
             IpcMessage::FirewallSuggest {
                 network,
                 suggestions,
             } => self.registry.firewall_suggest(&network, suggestions).await,
-            IpcMessage::FirewallSuggestions { network } => self.registry.firewall_suggestions(&network),
+            IpcMessage::FirewallSuggestions { network } => {
+                self.registry.firewall_suggestions(&network)
+            }
             IpcMessage::FirewallPending { network } => self.registry.firewall_pending(&network),
             IpcMessage::FirewallAccept { network } => self.registry.firewall_accept(&network),
             IpcMessage::FirewallDeny { network } => self.registry.firewall_deny(&network),
@@ -857,7 +866,9 @@ impl MeshManager {
                 network,
                 accept,
                 deny,
-            } => self.registry.firewall_resolve_suggestions(&network, &accept, &deny),
+            } => self
+                .registry
+                .firewall_resolve_suggestions(&network, &accept, &deny),
             IpcMessage::FirewallAutoAccept { network, enabled } => {
                 self.registry.firewall_auto_accept(&network, enabled)
             }
@@ -879,9 +890,11 @@ impl MeshManager {
                 network,
                 identity,
                 alias,
-            } => self.set_alias(&network, &identity, &alias),
-            IpcMessage::AliasRemove { network, alias } => self.remove_alias(&network, &alias),
-            IpcMessage::AliasList { network } => self.list_aliases(&network),
+            } => self.registry.set_alias(&network, &identity, &alias),
+            IpcMessage::AliasRemove { network, alias } => {
+                self.registry.remove_alias(&network, &alias)
+            }
+            IpcMessage::AliasList { network } => self.registry.list_aliases(&network),
             IpcMessage::SendFile { path, peer } => self.send_file(&path, &peer).await,
             IpcMessage::ListFiles => self.list_files(),
             IpcMessage::AcceptFile { id, output } => {
@@ -1093,7 +1106,6 @@ impl MeshManager {
     // -----------------------------------------------------------------------
     // Invite + join-request handlers (coordinator only)
     // -----------------------------------------------------------------------
-
 }
 
 pub(crate) fn guess_mime_type(filename: &str) -> String {

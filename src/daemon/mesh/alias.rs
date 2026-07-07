@@ -5,7 +5,7 @@
 
 use super::super::*;
 
-impl MeshManager {
+impl NetworkRegistry {
     /// Bind a local alias to an identity for a network. The identity is already
     /// canonicalized CLI-side (the string `ray identityof` prints); this just
     /// persists the mapping. Overwrites any existing alias of the same name.
