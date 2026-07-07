@@ -1,16 +1,27 @@
 # Rayfish
 
-A peer-to-peer mesh VPN with zero infrastructure. Create a private network, share a code, and your machines reach each other as if they were on the same LAN. No servers to run, no ports to forward, no static IPs to manage.
+**Your machines, on one private network, anywhere.** Rayfish is a peer-to-peer
+mesh VPN that lets your laptop, phone, server, and your friends' machines talk
+to each other as if they were all plugged into the same router, even when
+they're scattered across the world behind different NATs.
+
+There's nothing to host and nothing to sign up for. You don't rent a server,
+open a port, or hand out IP addresses. One person runs a command, shares a code,
+and the network exists.
 
 ```bash
-ray create                 # you're now the coordinator of a private network
+ray create                 # you now have a private network of your own
 ray invite gaming          # mint a one-time code to hand out
 ray join <invite-code>     # a friend joins with the code
-ping alice.gaming.ray      # reach each other by name
+ping alice.gaming.ray      # you reach each other by name
 ```
+
+That's the whole idea. The rest of this README is the details.
 
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL%202.0-brightgreen.svg)](LICENSE)
 ![Status: experimental](https://img.shields.io/badge/status-experimental-orange.svg)
+
+**Jump to:** [Why](#why-rayfish) · [How it works](#how-it-works) · [Features](#features) · [Quick start](#quick-start) · [Managing your network](#managing-your-network) · [Who can join](#who-can-join) · [Firewall](#firewall) · [Provisioning](#declarative-provisioning) · [Permissions](#permissions) · [Custom relay & DNS](#custom-relay--dns) · [Troubleshooting](#troubleshooting) · [How it compares](#how-it-compares) · [FAQ](#faq)
 
 ---
 
@@ -33,28 +44,54 @@ Each machine runs a small daemon (comparable to Tailscale's `tailscaled`) that c
 
 ## Features
 
-- 🔒 **Closed-by-default networks** with one-time invites, reusable fleet keys, or live approval (`--open` for public ones)
-- 🤝 **Direct 2-peer connections.** `ray connect <contact-id>` links you to one person with no room id or invite, approved like a friend request
-- 🌐 **Magic DNS.** `name.network.ray`, updated live as peers join, leave, or rename
-- 🧱 **Per-device firewall.** A userspace firewall for mesh traffic, **separate from and layered on top of your host/kernel firewall** (both must allow a packet). Directional, per-port, per-network rules with stateful return traffic. Secure by default: unsolicited inbound TCP/UDP is denied, while inbound ICMP and all outbound traffic are allowed. `ray firewall add in allow -p tcp --port N` opens a port for a service you run yourself (e.g. your own sshd on `--port 22`), `--peer` scopes it to one peer, and `ray firewall reject on` makes blocked connections fail fast instead of hanging. Don't want a second firewall? `ray firewall off` disables it entirely on that device. See `ray firewall --help` for the full model.
-- 🔑 **Mesh SSH, no keys.** `ray firewall ssh on` runs an embedded SSH server on your mesh IPs; `ray firewall ssh allow <network> <peer>` authorizes a peer to log in. Connect with a stock client (`ssh user@host.ray`) — the peer is authenticated by its mesh identity, so there are no `authorized_keys` to distribute (Tailscale-style). For now an authorized peer may log in as any local user.
-- 🤝 **Coordinator firewall suggestions.** On any network the coordinator can suggest firewall rules that ride the signed network record (`*` targets all hosts); each node reviews them or opts into auto-install with `--auto-accept-firewall`.
-- 📜 **Declarative provisioning.** `ray apply deploy.yaml` stands up networks and firewall rules from a YAML spec. Define `aliases:` (a name for a user, expanding to all their devices) and `groups:` (a set of users/hosts) once, then reference them in firewall rules instead of repeating hostnames. `ray identityof <net> <host>` prints the identity string to alias. `ray alias <net> set <host> <name>` saves an alias on the node itself: it shows inline in `ray status` and seeds a spec's `aliases:` so you don't have to re-declare it.
-- 👥 **Multi-device identity.** Pair your laptop and phone under one identity; encrypted key backup (optionally to 1Password).
-- 📁 **File sharing.** `ray send file.zip bob`. Opt into `ray files auto-accept <net> on` to have transfers from your own paired devices land automatically; point them anywhere with `ray files download-dir <path>` or `download-user <user>`.
+Each of these has a fuller treatment further down; this is the one-line tour.
+
+- 🔒 **Closed-by-default networks.** One-time invites, reusable fleet keys, or live approval, with `--open` for public ones. See [Who can join](#who-can-join).
+- 🤝 **Direct 2-peer links.** `ray connect <contact-id>` ties you to one person with no room id or invite, approved like a friend request. See [Direct 2-peer connections](#direct-2-peer-connections).
+- 🌐 **Magic DNS.** Reach peers at `name.network.ray`, updated live as they join, leave, or rename.
+- 🧱 **Per-device firewall.** A userspace firewall for mesh traffic, secure by default, layered on top of your host firewall. See [Firewall](#firewall).
+- 🔑 **Mesh SSH, no keys.** Log in over the mesh with a stock `ssh` client; peers authenticate by identity. See [SSH, no keys](#ssh-no-keys).
+- 📜 **Declarative provisioning.** `ray apply deploy.yaml` stands up networks and firewall rules from a YAML spec, with reusable `aliases:` and `groups:` instead of repeated hostnames.
+- 👥 **Multi-device identity.** Pair your laptop and phone under one identity, with encrypted key backup (optionally to 1Password). See [Pairing your own devices](#pairing-your-own-devices).
+- 📁 **File sharing.** `ray send file.zip bob`, with optional auto-accept for transfers from your own paired devices.
 - 📡 **mDNS** local discovery, and optional **Tor** transport.
-- 🛠 **Operator model.** Like Tailscale, run day-to-day commands without `sudo`.
+- 🛠 **Operator model.** Run day-to-day commands without `sudo`, Tailscale-style. See [Permissions](#permissions).
 
 ## Quick start
 
+Here's the whole tour: install once, create a network, invite a friend, and
+reach each other by name. Two machines, about five minutes.
+
+Rayfish runs on **Linux and macOS** (Android is early and experimental).
+Building from source needs a Rust toolchain (2024 edition, Rust 1.85+); see
+[Building](#building). Once the service is installed, `ray update` keeps it
+current without rebuilding.
+
 ### 1. Install & start
+
+Build the binary, then bring the VPN up:
 
 ```bash
 cargo build
 sudo ray up    # installs the system service if needed, then activates the VPN
 ```
 
-The first `ray up` needs root: it installs the system service and starts the daemon, which owns the TUN device and the iroh endpoint. After that the daemon stays running and every command, including `ray up`/`ray down`, runs unprivileged over a local socket. `ray down` is standby: it takes only the data plane offline (TUN, DNS) while keeping peer connections alive, so `ray up` is near-instant. To stop the daemon entirely (fully offline, connections closed), use `sudo ray stop`; `sudo ray start` brings it back.
+Only this first `ray up` needs root. It installs a small background service (the
+daemon) that owns the network device and does the actual tunneling. From then on
+everything runs as your normal user, including `ray up` and `ray down`.
+
+Three levels of "on":
+
+- `ray up` / `ray down` toggle the VPN itself. `down` is a quick standby: it drops
+  the data plane (the tunnel and DNS) but keeps your peer connections warm, so
+  `up` comes back near-instantly and needs no root.
+- `sudo ray stop` / `sudo ray start` turn the whole daemon off and on. `stop` goes
+  fully offline and closes every connection; `start` brings it all back.
+  `sudo ray restart` is the two in one step (handy after changing config).
+
+To update later, `sudo ray update` grabs the latest stable release, or
+`sudo ray update --nightly` follows the bleeding edge. Both swap the binary and
+restart the daemon for you. More on this just below.
 
 #### Updating
 
@@ -121,6 +158,28 @@ why a link is slow. `ray netcheck` reports your own node's conditions: the bound
 UDP port (and whether it is the fixed, forwardable port), your home relay and its
 latency, your public addresses, and whether UDP is getting through.
 
+`ray status` is also where the daemon nudges you about things that need
+attention. A **pending** block at the bottom lists anything waiting on you, each
+row telling you the exact command to deal with it:
+
+```text
+  rayfish  ● up      mDNS on      endpoint k7f2…9abc
+
+  gentle-amber-fox  coordinator   alice   100.64.23.142   members 2/3
+    ● bob      100.64.7.201   direct   12ms   ↑ 1.2 MB   ↓ 3.4 MB
+    ○ carol    100.64.9.14
+    join  <room-id>
+
+  pending
+    (1)  join request           ray requests gentle-amber-fox
+    (1)  file offer             ray files
+```
+
+So if a friend runs `ray join <room-id>` and is sitting in your approval queue,
+you don't have to go looking: `ray status` shows `(1) join request` and points
+you straight at `ray requests gentle-amber-fox`. The same block surfaces
+incoming file offers, connection requests, and coordinator firewall suggestions.
+
 ### 6. Leave or pause
 
 ```bash
@@ -138,6 +197,68 @@ Run `ray --help` to discover the rest: `invite`, `requests`/`accept`/`deny`, `fi
 Prefer buttons and forms? Run `ray gui` to open a local browser GUI. It wraps
 the same CLI commands, so anything available in `ray --help` is available there
 too; commands that need root still need the GUI to be launched with `sudo`.
+
+## Managing your network
+
+Once a network exists, running it is a handful of commands. Here are the ones
+you'll actually reach for.
+
+### Public or private
+
+`ray create` makes a **private** (closed) network by default. People can discover
+it by its room id, but the id alone won't get them in: you decide who joins. Pass
+`--open` for a **public** network that anyone with the room id can enter.
+
+```bash
+ray create                    # private: you approve every join
+ray create --open             # public: anyone with the room id joins directly
+```
+
+Pick private for a homelab or a circle of friends, public for a community network
+you're happy to leave the door open on. The three ways into a private network
+(one-time invite, reusable key, live approval) are covered under
+[Who can join](#who-can-join).
+
+### Adding and removing people
+
+```bash
+ray invite <network>          # mint a one-time code to hand to one person
+ray requests <network>        # see who's asking to join
+ray accept <network> <id>     # let them in   (ray deny <id> to refuse)
+ray kick <network> <member>   # remove someone for good; they drop mesh-wide
+ray ephemeral <network> 7d    # auto-remove members offline longer than 7d
+```
+
+`ray kick` is the one to reach for when someone should lose access: it removes
+them from the network's signed roster and every other member disconnects them.
+`ray invite`, `ray requests`, `ray accept`, and `ray kick` are coordinator
+actions, so you run them on the machine that created the network (or on any
+co-coordinator you've added with `ray admin add`).
+
+### Pairing your own devices
+
+Pairing puts several of your own machines (laptop, desktop, phone) under a single
+identity. They then share every network you belong to and show up as *you*, not
+as separate members.
+
+On a device that's already set up, start pairing:
+
+```bash
+ray pair                      # prints a ticket and a QR code, then waits
+```
+
+On the new device, scan the QR or paste the ticket:
+
+```bash
+ray pair <ticket>            # join your identity
+ray pair list                # list the devices under your identity
+ray unpair <device>          # revoke one later
+```
+
+Once paired, both devices are members of everything you've joined, and transfers
+between them can land automatically (`ray files auto-accept <net> on`). Back the
+shared identity key up with `ray pair backup` (optionally into 1Password) and
+bring it onto a fresh machine with `ray pair restore`.
 
 ## Who can join
 
@@ -162,6 +283,115 @@ ray connections approve <id>       # …and approve it
 ```
 
 Approval creates a private **2-peer network** automatically (shown as `[direct]` in `ray status`). It's a real network, so firewall rules, Magic DNS, and the mesh all work the same. Approval is recipient-only: the requester consents by asking, the recipient consents by approving. Rotate your contact id anytime with `ray contact rotate` to stop new requests (existing links keep working). To stay unreachable, don't share the id.
+
+## Firewall
+
+Rayfish ships a small userspace firewall that governs **mesh traffic only**. It
+sits on top of your host/kernel firewall (a packet has to clear both), and it's
+secure by default: unsolicited inbound TCP and UDP are denied, while inbound ICMP
+(ping) and all outbound traffic are allowed. A stateful conntrack lets the return
+traffic for connections you started back in.
+
+So out of the box you can reach out to peers, but nothing reaches a port on your
+machine until you open it. To expose a service you run, add an inbound allow rule:
+
+```bash
+ray firewall add in allow -p tcp --port 22                   # let peers reach your sshd
+ray firewall add in allow -p tcp --port 8080 --peer alice    # only alice, only 8080
+ray firewall reject on                                       # blocked connections fail fast instead of hanging
+ray firewall                                                 # show the current rules
+```
+
+Rules are directional, per-port, and per-network; `--peer` scopes a rule to a
+single peer. Don't want a second firewall at all? `ray firewall off` disables it
+on that device. Full model: `ray firewall --help`.
+
+**Coordinator suggestions.** A network's coordinator can suggest firewall rules
+that ride the signed network record (a `*` subject targets every host). Each node
+sees the pending suggestions in `ray status` and applies them, or opts into
+auto-install with `--auto-accept-firewall`. Suggestions are advisory: your local
+rules are never overwritten.
+
+### SSH, no keys
+
+`ray firewall ssh on` runs an embedded SSH server bound to your mesh IPs, and
+`ray firewall ssh allow <network> <peer>` authorizes a peer to log in. Connect
+with a stock client:
+
+```bash
+ssh user@host.ray
+```
+
+The peer is authenticated by its mesh identity, so there are no `authorized_keys`
+to distribute (the same model as Tailscale SSH). One limitation to know: an
+authorized peer may currently log in as **any** local user, so only enable it on
+networks whose members you trust at that level.
+
+## Declarative provisioning
+
+For fleets and repeatable setups, `ray apply deploy.yaml` reconciles your
+networks against a YAML spec instead of running commands by hand. It creates any
+missing networks and publishes their firewall suggestions, so the spec is the
+source of truth you can keep in git.
+
+A spec has three top-level keys, all optional except `networks:`:
+
+```yaml
+# aliases: give a user a name that expands to all of their devices.
+# Copy the identity from `ray identityof <net> <host>`.
+aliases:
+  alice: 7f3a9c01...          # alice, on every device she's paired
+
+# groups: bundle aliases and/or literal hostnames under one name.
+groups:
+  admins: [alice, jumpbox]    # alice's devices plus a host named "jumpbox"
+
+# networks: the real payload. Each network maps hostnames (the "subject") to
+# the firewall rules other peers get toward that host.
+networks:
+  infra:
+    "*":                      # "*" subject = every node in the network
+      allows:
+        admins: "tcp:22"      # the admins group may reach SSH on every host
+  minecraft:
+    "*":
+      allows:
+        "*": "tcp:6969"       # "*" peer = anyone; open 6969 mesh-wide
+  gaming:
+    alice:                    # a named host, not a wildcard
+      allows:
+        bob: "tcp:9000,tcp:8123"   # comma-separated proto:port tokens
+      denies:
+        eve: "icmp"
+    carol: {}                 # empty subject = fully open, no rules
+```
+
+A few rules of thumb:
+
+- Subject and peer keys are **hostnames** (or an alias/group that expands to
+  them). `*` as a subject means every node; `*` as a peer means any peer.
+- If a subject has an `allows:` list, it's an allow-list: only the listed peers
+  get through, everything else is denied. `denies:` carves exceptions out.
+- Aliases and groups are coordinator-side shorthand, expanded before publishing.
+  They never travel over the mesh. An alias only resolves once that user has
+  joined; literal hostnames work before anyone joins.
+
+Run it, and iterate safely:
+
+```bash
+ray apply --example              # print a fully-commented starter spec
+ray apply deploy.yaml --dry-run  # show what would change, apply nothing
+ray apply deploy.yaml            # create missing networks, publish suggestions
+ray apply deploy.yaml --invite-missing   # also mint invites for expected-but-absent hosts
+ray apply deploy.yaml --prune            # drop suggestions for hosts no longer in the spec
+```
+
+Suggestions are still advisory on the receiving end: each node queues them for
+`ray firewall accept`, or auto-installs them if it joined with
+`--auto-accept-firewall`. `ray apply` never joins a node for you and never edits
+a peer's local rules. To seed a spec's `aliases:` from a machine you're on,
+`ray alias <net> set <host> <name>` saves the alias locally (it also shows inline
+in `ray status`) so you don't have to paste the identity by hand.
 
 ## Permissions
 
