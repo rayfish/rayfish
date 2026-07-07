@@ -457,12 +457,14 @@ fn user_display_name(
     format!("user {}", uid.fmt_short())
 }
 
-/// One device's status row: a merged `prefix + glyph + host (+ marker)` first cell,
-/// then ipv4 · via · rtt · ↑tx · ↓rx. `prefix` is the tree branch when the device
-/// is nested under a user (empty for a top-level member). A local `alias`, when
-/// set, shows as `host [alias]` (only for standalone members; a paired device's
-/// alias rides its parent row). Own paired devices keep a `(your device)` marker.
-/// The host is the bare hostname (no `.{network}.ray`): the header names the network.
+/// One device's status row: a merged `prefix + glyph + host` first cell, then
+/// ipv4 · via · rtt · ↑tx · ↓rx. `prefix` is the tree branch when the device is
+/// nested under a user (empty for a top-level member). A local `alias`, when set,
+/// shows as `host [alias]` (only for standalone members; a paired device's alias
+/// rides its parent row). No ownership marker: an own device always nests under
+/// your own parent row, which already names you, so a per-device `(your device)`
+/// would just repeat it. The host is the bare hostname (no `.{network}.ray`): the
+/// header names the network.
 fn device_row(
     peer: &ipc::PeerStatus,
     alias: Option<&str>,
@@ -475,9 +477,6 @@ fn device_row(
         Some(a) => format!("{base} [{a}]"),
         None => base,
     };
-    // Mark our own paired devices. The old "(user X)" attribution is gone: the
-    // parent user row now names the owner, so it would be redundant here.
-    let marker = peer.is_own_device.then_some("(your device)");
     let online = peer.connection.is_some();
     let (glyph_plain, glyph_styled) = if online {
         ("●", style::dot_online())
@@ -485,18 +484,11 @@ fn device_row(
         ("○", style::dot_offline())
     };
     let host_style: fn(&str) -> String = if online { style::value } else { style::faint };
-    let (host_plain, host_styled) = match marker {
-        Some(m) => (
-            format!("{host} {m}"),
-            format!("{} {}", host_style(&host), style::green(m)),
-        ),
-        None => (host.clone(), host_style(&host)),
-    };
     // Merge branch + glyph + host into the first cell so the branch sits before
     // the glyph and the columns after it (ip, via, …) still align across all rows.
     let name = layout::Cell::new(
-        format!("{prefix}{glyph_plain} {host_plain}"),
-        format!("{prefix}{glyph_styled} {host_styled}"),
+        format!("{prefix}{glyph_plain} {host}"),
+        format!("{prefix}{glyph_styled} {}", host_style(&host)),
     );
     let ip = layout::Cell::new(peer.ip.to_string(), style::faint(&peer.ip.to_string()));
     match &peer.connection {
