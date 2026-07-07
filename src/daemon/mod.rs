@@ -51,7 +51,6 @@ use dashmap::{DashMap, DashSet};
 use anyhow::{Context, Result};
 use iroh::address_lookup::PkarrRelayClient;
 use iroh::endpoint::{Connection, Endpoint, VarInt};
-use iroh::protocol::ProtocolHandler;
 use iroh::{EndpointId, SecretKey};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, HashAndFormat};
@@ -456,9 +455,14 @@ pub struct Daemon {
     /// Handles for the packet-forwarding tasks spawned by
     /// [`Daemon::attach_tun`], kept so a future `down()`/detach can stop them.
     tun_tasks: Mutex<Option<TunTasks>>,
-    /// Prometheus metrics-server guard. Kept alive for the daemon's whole lifetime
-    /// (dropping it stops the export); `None` if the server failed to bind.
-    _metrics_server: Mutex<Option<MetricsServer>>,
+    /// Prometheus metrics-server guard. Owned so it lives for the daemon's whole
+    /// lifetime (dropping it stops the export); `None` if the server failed to bind.
+    _metrics_server: Option<MetricsServer>,
+    /// The iroh protocol [`Router`](iroh::protocol::Router): owns the endpoint
+    /// accept loop and dispatches each inbound connection by ALPN to its handler.
+    /// Owned for the daemon's whole lifetime (it aborts on drop); `run_daemon`
+    /// `shutdown()`s it on exit (which also closes the endpoint).
+    router: iroh::protocol::Router,
     /// File-transfer + pairing state and ALPN accept arms (see [`FileService`]).
     /// Shared with [`ProtocolRouter`], which runs the accept arms.
     files: Arc<FileService>,
@@ -564,10 +568,6 @@ impl Daemon {
         self.transport.clone()
     }
 
-    pub(crate) fn mesh_ctx(&self) -> MeshCtx {
-        // The registry holds clones of the same handles; it is the single builder.
-        self.registry.mesh_ctx()
-    }
 
     /// Attach a packet interface to a headless [`DaemonState`] and start the data
     /// plane's forwarding tasks: the TUN writer (`spawn_tun_writer`) and the mesh

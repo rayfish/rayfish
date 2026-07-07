@@ -55,13 +55,16 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 
     let result = serve_ipc(&daemon, token).await;
 
-    // Close the iroh endpoint before returning. Dropping it on return logs
-    // "Endpoint dropped without calling `Endpoint::close`. Aborting
-    // ungracefully." and can leave the process lingering until the service
-    // manager escalates to SIGKILL, which delays the relaunch on
-    // `ray restart`/`ray update` past the client's reachability probe. Closing
-    // it here lets QUIC connections terminate cleanly and the process exit
-    // promptly so the new daemon comes up fast.
+    // Shut the protocol Router down, then close the iroh endpoint, before
+    // returning. `Router::shutdown` stops accepting, drains its handlers, and
+    // closes the endpoint itself; the explicit close is a harmless idempotent
+    // backstop. Dropping the endpoint without closing logs "Endpoint dropped
+    // without calling `Endpoint::close`. Aborting ungracefully." and can leave
+    // the process lingering until the service manager escalates to SIGKILL, which
+    // delays the relaunch on `ray restart`/`ray update` past the client's
+    // reachability probe. A clean close lets QUIC connections terminate and the
+    // process exit promptly so the new daemon comes up fast.
+    let _ = daemon.router.shutdown().await;
     daemon.transport.endpoint.close().await;
 
     result
@@ -306,6 +309,28 @@ async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> R
         });
     }
 
+    // Install the daemon-wide mesh dispatch context and spawn the protocol Router
+    // *before* building the Daemon. The dispatch is built from the registry (the
+    // single `MeshCtx` builder), and the Router only needs the services
+    // (registry/files/connect/blobs), not the Daemon struct, so ordering it here
+    // lets `router` be a plain owned field instead of a set-after-construction
+    // `Option`. Dispatch must be installed before the accept loop starts handing
+    // out connections, hence the order.
+    protocol_router.set_mesh_dispatch(MeshDispatch {
+        ctx: registry.mesh_ctx(),
+        token: token.clone(),
+    });
+    // The Router owns the endpoint accept loop and dispatches by ALPN. It aborts on
+    // drop, so the Daemon owns it for the process lifetime and shuts it down on exit.
+    let router = protocol_router.build_router(transport.endpoint.clone());
+
+    // Prometheus metrics server. Its guard is kept alive by the Daemon (dropping it
+    // stops the export); built here from the local handles so it can be a plain
+    // owned field. `None` if it failed to bind.
+    let metrics_server =
+        spawn_metrics_server(stats.clone(), peers.clone(), &transport.endpoint, token.clone())
+            .await;
+
     let auto_update = app_config.auto_update;
     let daemon = Arc::new(Daemon {
         transport,
@@ -320,7 +345,8 @@ async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> R
         auto_update,
         tun_name,
         tun_tasks: Mutex::new(None),
-        _metrics_server: Mutex::new(None),
+        _metrics_server: metrics_server,
+        router,
         files,
         connect,
         device_cert,
@@ -330,17 +356,6 @@ async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> R
         ssh_authz: crate::ssh::new_authz(),
         ssh_token: Mutex::new(None),
     });
-
-    // Install the daemon-wide mesh dispatch context so the per-connection demux
-    // (`drive_mesh_connection`) can build peer readers + route disconnects. Must
-    // happen before the accept loop starts handing it connections.
-    protocol_router.set_mesh_dispatch(MeshDispatch {
-        ctx: daemon.mesh_ctx(),
-        token: token.clone(),
-    });
-
-    // --- Accept loop (ALPN dispatch) + Prometheus metrics ---
-    protocol_router.spawn_accept_loop(daemon.transport.endpoint.clone(), token.clone());
 
     // File auto-accept is evaluated inline by `FileService::accept_file_offer`
     // (no worker channel), so nothing to spawn here.
@@ -354,15 +369,6 @@ async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> R
     // nullifier set (`ray unpair`); no separate pkarr record or background
     // publisher/poller is needed. Coordinated networks seed their nullifiers from
     // the persisted `revoked_devices` set at seal time (see `seal_and_publish`).
-    let metrics_server = spawn_metrics_server(
-        stats,
-        daemon.registry.peers.clone(),
-        &daemon.transport.endpoint,
-        token,
-    )
-    .await;
-    // Keep the metrics-server guard alive for the daemon's whole lifetime.
-    *daemon._metrics_server.lock().unwrap() = metrics_server;
 
     tracing::info!(ip = %my_ip, id = %daemon.transport.endpoint.id().fmt_short(), "daemon started");
     Ok(daemon)

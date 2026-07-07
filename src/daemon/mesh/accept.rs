@@ -7,6 +7,8 @@
 //! `blobs`/`files`/`pair`/`connect` arms). `MeshCtx` and the roster-projection
 //! helpers stay in `daemon/mod.rs` since they are shared infrastructure.
 
+use crate::daemon;
+
 use super::super::*;
 
 /// Upper bound on a closed network's in-memory pending-join queue. Keyed by peer
@@ -1073,6 +1075,77 @@ impl AcceptHandler {
     }
 }
 
+/// iroh [`ProtocolHandler`](iroh::protocol::ProtocolHandler) adapters: one per
+/// ALPN, each handing an accepted connection to the owning service. The iroh
+/// `Router` dispatches by ALPN and runs each `accept` on its own task, which
+/// replaces the hand-rolled accept loop + `match alpn`. Blobs ships its own
+/// handler (`BlobsProtocol`), so it needs no adapter. `FileService` backs *two*
+/// ALPNs (files + pair), hence two adapters over the same service. Each service
+/// method handles its own errors (logs, closes the connection), so `accept`
+/// always reports `Ok`.
+#[derive(Clone)]
+struct MeshProtocol(Arc<ConnectionManager>);
+
+#[derive(Clone)]
+struct FilesProtocol(Arc<FileService>);
+
+#[derive(Clone)]
+struct PairProtocol(Arc<FileService>);
+
+#[derive(Clone)]
+struct ConnectProtocol(Arc<ConnectService>);
+
+impl std::fmt::Debug for MeshProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MeshProtocol")
+    }
+}
+
+impl std::fmt::Debug for FilesProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FilesProtocol")
+    }
+}
+
+impl std::fmt::Debug for PairProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PairProtocol")
+    }
+}
+
+impl std::fmt::Debug for ConnectProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConnectProtocol")
+    }
+}
+
+impl iroh::protocol::ProtocolHandler for MeshProtocol {
+    async fn accept(&self, conn: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        self.0.clone().drive_mesh_connection(conn, false).await;
+        Ok(())
+    }
+}
+impl iroh::protocol::ProtocolHandler for FilesProtocol {
+    async fn accept(&self, conn: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        self.0.accept_file_offer(conn).await;
+        Ok(())
+    }
+}
+
+impl iroh::protocol::ProtocolHandler for PairProtocol {
+    async fn accept(&self, conn: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        self.0.accept_pair_request(conn).await;
+        Ok(())
+    }
+}
+
+impl iroh::protocol::ProtocolHandler for ConnectProtocol {
+    async fn accept(&self, conn: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        self.0.accept_connect_request(conn).await;
+        Ok(())
+    }
+}
+
 pub(crate) struct ProtocolRouter {
     blobs: BlobsProtocol,
     /// File-transfer + pairing state and their ALPN accept arms. The accept loop
@@ -1125,48 +1198,23 @@ impl ProtocolRouter {
         &self.conn_mngr.pending_pongs
     }
 
-    pub(crate) fn spawn_accept_loop(
-        self: &Arc<Self>,
-        endpoint: Endpoint,
-        cancel: CancellationToken,
-    ) -> tokio::task::JoinHandle<()> {
-        let router = self.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    incoming = endpoint.accept() => {
-                        let Some(incoming) = incoming else { return };
-                        let router = router.clone();
-                        tokio::spawn(async move {
-                            let conn = match incoming.await {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    tracing::debug!(error = ?e, "incoming handshake failed");
-                                    return;
-                                }
-                            };
-                            let alpn = conn.alpn().to_vec();
-                            match alpn.as_slice() {
-                                a if a == iroh_blobs::protocol::ALPN => {
-                                    let _ = router.blobs.clone().accept(conn).await;
-                                }
-                                a if a == transport::FILES_ALPN => router.files.accept_file_offer(conn).await,
-                                a if a == PAIR_ALPN => router.files.accept_pair_request(conn).await,
-                                a if a == transport::CONNECT_ALPN => router.connect.accept_connect_request(conn).await,
-                                a if a == transport::mesh_alpn() => router.drive_mesh_connection(conn, false).await,
-                                _ => {
-                                    tracing::warn!(
-                                        alpn = %String::from_utf8_lossy(&alpn),
-                                        "no handler for ALPN"
-                                    );
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-        })
+    /// Build and spawn the iroh protocol [`Router`](iroh::protocol::Router) for
+    /// this endpoint. It owns the accept loop and dispatches each inbound
+    /// connection by its negotiated ALPN to the matching handler (blobs, files,
+    /// pair, connect, mesh), running each on its own task. Replaces the
+    /// hand-rolled accept loop. The returned `Router` aborts when dropped, so the
+    /// caller must keep it alive (stashed on `Daemon`) and `shutdown()` it on exit.
+    pub(crate) fn build_router(&self, endpoint: Endpoint) -> iroh::protocol::Router {
+        iroh::protocol::Router::builder(endpoint)
+            .accept(iroh_blobs::protocol::ALPN, self.blobs.clone())
+            .accept(transport::FILES_ALPN, FilesProtocol(self.files.clone()))
+            .accept(daemon::PAIR_ALPN, PairProtocol(self.files.clone()))
+            .accept(
+                transport::CONNECT_ALPN,
+                ConnectProtocol(self.connect.clone()),
+            )
+            .accept(transport::mesh_alpn(), MeshProtocol(self.conn_mngr.clone()))
+            .spawn()
     }
 
     /// Drive one mesh connection for its whole lifetime. Passthrough to the
