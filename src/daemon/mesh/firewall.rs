@@ -183,7 +183,12 @@ impl NetworkRegistry {
         // check (local == published) short-circuits and it never re-applies its
         // own authored suggestions. Materialize them here so the coordinator is
         // subject to its own rules like any other member (auto-take or queue).
-        apply_suggested_firewall(&self.firewall, self.transport.endpoint.id(), network, &state);
+        apply_suggested_firewall(
+            &self.firewall,
+            self.transport.endpoint.id(),
+            network,
+            &state,
+        );
         IpcMessage::Ok {
             message: format!("published firewall suggestions for '{network}' ({count} subjects)"),
         }
@@ -366,7 +371,12 @@ impl NetworkRegistry {
         // Re-apply suggestions with the new consent setting. With auto-accept on
         // this installs the queued set; with it off it just (re)queues.
         if let Some(h) = self.networks.get(network) {
-            apply_suggested_firewall(&self.firewall, self.transport.endpoint.id(), network, &h.state);
+            apply_suggested_firewall(
+                &self.firewall,
+                self.transport.endpoint.id(),
+                network,
+                &h.state,
+            );
         }
         IpcMessage::Ok {
             message: format!(
@@ -427,7 +437,6 @@ impl NetworkRegistry {
     // -----------------------------------------------------------------------
     // Mesh SSH (`ray firewall ssh ...`)
     // -----------------------------------------------------------------------
-
 }
 
 impl Daemon {

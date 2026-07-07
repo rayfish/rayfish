@@ -141,7 +141,11 @@ impl ConnectService {
     /// `ray connect <contact-id>`: resolve the contact to an endpoint, dial it
     /// over CONNECT_ALPN, and send a request. If approved immediately we join the
     /// minted direct network; if pending we retry on a backoff.
-    pub(crate) async fn connect(self: &Arc<Self>, contact_id: &str, hostname: Option<String>) -> IpcMessage {
+    pub(crate) async fn connect(
+        self: &Arc<Self>,
+        contact_id: &str,
+        hostname: Option<String>,
+    ) -> IpcMessage {
         let contact_pubkey = match contact_id.parse::<EndpointId>() {
             Ok(id) => id,
             Err(e) => {
@@ -266,7 +270,11 @@ impl ConnectService {
     }
 
     /// Retry a pending connect request on a backoff until approved/denied.
-    pub(crate) fn spawn_connect_retry(self: &Arc<Self>, peer: EndpointId, hostname: Option<String>) {
+    pub(crate) fn spawn_connect_retry(
+        self: &Arc<Self>,
+        peer: EndpointId,
+        hostname: Option<String>,
+    ) {
         let me = Arc::clone(self);
         tokio::spawn(async move {
             let mut backoff = BACKOFF_INITIAL;

@@ -1,7 +1,6 @@
 //! File-sharing and device-pairing handlers for `Daemon`: `send_file`,
 //! `list_files`, `accept_file`, pairing. Split out of `daemon/mod.rs`.
 
-
 use super::super::*;
 
 /// Upper bound on the pairing dial to a primary device. `Endpoint::connect`
@@ -350,7 +349,8 @@ impl Daemon {
                 if pid == target {
                     self.registry.pruned_peers.insert((net.clone(), pid));
                     conn.close(VarInt::from_u32(forward::KICK_CODE), b"unpaired");
-                    self.registry.peers
+                    self.registry
+                        .peers
                         .remove_peer_from_network(&ip, &derive_ipv6(&pid), &net);
                 }
             }

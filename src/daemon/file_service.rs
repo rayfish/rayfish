@@ -361,7 +361,13 @@ impl FileService {
         let mime_type = guess_mime_type(&filename);
         let hash = blake3::hash(&file_bytes);
 
-        if let Err(e) = self.transport.blob_store.blobs().add_slice(&file_bytes).await {
+        if let Err(e) = self
+            .transport
+            .blob_store
+            .blobs()
+            .add_slice(&file_bytes)
+            .await
+        {
             return IpcMessage::Error {
                 message: format!("blob store error: {e}"),
             };

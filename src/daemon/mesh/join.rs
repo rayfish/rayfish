@@ -377,15 +377,8 @@ async fn connect_to_roster_peers(
                     },
                 )
                 .await?;
-                register_dialed_peer(
-                    ctx,
-                    router,
-                    conn,
-                    member.identity,
-                    member.ip,
-                    network_name,
-                )
-                .await;
+                register_dialed_peer(ctx, router, conn, member.identity, member.ip, network_name)
+                    .await;
                 tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
             }
             Err(e) => {
@@ -560,4 +553,3 @@ fn spawn_reconverge_worker(
         }
     });
 }
-

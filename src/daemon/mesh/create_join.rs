@@ -52,7 +52,6 @@ fn abort_join_tasks(cancel: &CancellationToken, tasks: Vec<tokio::task::JoinHand
 }
 
 impl Daemon {
-
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// create a new network and register this node as its coordinator.
     #[tracing::instrument(skip(self, hostname), fields(mode = ?mode))]
@@ -566,8 +565,7 @@ impl NetworkRegistry {
                 if m.identity == me {
                     continue;
                 }
-                self
-                    .clone()
+                self.clone()
                     .spawn_reconnect(m.identity, m.ip, vec![net.clone()]);
             }
         }
@@ -811,7 +809,8 @@ impl NetworkRegistry {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            if self.transport
+            if self
+                .transport
                 .blob_store
                 .remote()
                 .fetch(conn, HashAndFormat::raw(blob_hash))
@@ -840,12 +839,14 @@ impl NetworkRegistry {
             iroh_blobs::protocol::ALPN,
         )
         .await?;
-        self.transport.blob_store
+        self.transport
+            .blob_store
             .remote()
             .fetch(conn, HashAndFormat::raw(blob_hash))
             .await
             .map_err(|e| anyhow::anyhow!("blob fetch failed: {e}"))?;
-        let bytes = self.transport
+        let bytes = self
+            .transport
             .blob_store
             .blobs()
             .get_bytes(blob_hash)
@@ -892,7 +893,8 @@ impl NetworkRegistry {
                 Err(_) => continue,
             };
 
-            if self.transport
+            if self
+                .transport
                 .blob_store
                 .remote()
                 .fetch(blobs_conn, HashAndFormat::raw(blob_hash))
@@ -1015,7 +1017,11 @@ impl NetworkRegistry {
             // connection supervisor retries anything still unreachable.
             let dialed = tokio::time::timeout(
                 DIAL_TIMEOUT,
-                transport::connect_to_peer_with_alpn(&self.transport.endpoint, m.identity, &transport::mesh_alpn()),
+                transport::connect_to_peer_with_alpn(
+                    &self.transport.endpoint,
+                    m.identity,
+                    &transport::mesh_alpn(),
+                ),
             )
             .await;
             match dialed {
@@ -1041,7 +1047,9 @@ impl NetworkRegistry {
                     if conn_changed {
                         let router = self.protocol_router().clone();
                         let dconn = peer_conn.clone();
-                        tokio::spawn(async move { router.drive_mesh_connection(dconn, true).await });
+                        tokio::spawn(
+                            async move { router.drive_mesh_connection(dconn, true).await },
+                        );
                     }
                     announce_network_handles(&self.peers, &peer_conn, m.ip).await;
                     tracing::info!(
