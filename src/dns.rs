@@ -67,23 +67,6 @@ pub async fn update_hostname(
     );
 }
 
-/// Remove a hostname from both tables.
-#[allow(dead_code)]
-pub async fn remove_hostname(
-    table: &HostnameTable,
-    reverse: &ReverseLookupTable,
-    network: &str,
-    hostname: &str,
-) {
-    let mut t = table.write().await;
-    if let Some(hosts) = t.get_mut(network)
-        && let Some((ipv4, ipv6)) = hosts.remove(hostname)
-    {
-        reverse.remove(&IpAddr::V4(ipv4));
-        reverse.remove(&IpAddr::V6(ipv6));
-    }
-}
-
 /// Remove a hostname by IP address from both tables.
 pub async fn remove_hostname_by_ip(
     table: &HostnameTable,
@@ -590,18 +573,4 @@ mod tests {
         assert_eq!(rev6, Some(("alice".to_string(), "gaming".to_string())));
     }
 
-    #[tokio::test]
-    async fn test_remove_hostname() {
-        let table = new_hostname_table();
-        let reverse = new_reverse_table();
-        let v4 = Ipv4Addr::new(100, 64, 10, 5);
-        let v6 = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 1);
-
-        update_hostname(&table, &reverse, "gaming", "alice", v4, v6).await;
-        remove_hostname(&table, &reverse, "gaming", "alice").await;
-
-        assert_eq!(resolve_name("alice.gaming.ray", SUFFIX, &table).await, None);
-        assert!(reverse.get(&IpAddr::V4(v4)).is_none());
-        assert!(reverse.get(&IpAddr::V6(v6)).is_none());
-    }
 }

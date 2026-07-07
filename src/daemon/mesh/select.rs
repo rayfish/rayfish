@@ -39,29 +39,6 @@ pub(crate) fn gossip_targets(members: &[Member], me: EndpointId) -> Vec<Endpoint
         .collect()
 }
 
-/// Outcome of a single coordinator dial attempt during the join fallback loop.
-/// Used as a unit-testable specification of the loop termination policy.
-#[derive(Clone, Copy, PartialEq, Debug)]
-#[allow(dead_code)]
-pub(crate) enum DialOutcome {
-    Welcomed,
-    Denied,
-    Unreachable,
-}
-
-/// Returns `(index_of_last_tried, welcomed)`.
-/// Iterates `outcomes` left-to-right and stops at the first `Welcomed`.
-/// If none is found, returns the index of the last element and `false`.
-#[allow(dead_code)]
-pub(crate) fn pick_first_welcome(outcomes: &[DialOutcome]) -> (usize, bool) {
-    for (i, o) in outcomes.iter().enumerate() {
-        if *o == DialOutcome::Welcomed {
-            return (i, true);
-        }
-    }
-    (outcomes.len().saturating_sub(1), false)
-}
-
 /// Last-known roster from persisted config. Used only as a fallback when the
 /// signed pkarr record is briefly unreachable during a reconnect, never trusts
 /// peer-supplied membership.

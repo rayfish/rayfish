@@ -256,44 +256,6 @@ impl ApprovedList {
     }
 }
 
-/// Determines whether a given member is allowed to approve new peers.
-///
-/// Superseded at runtime by the per-network access mode gate in the daemon
-/// (open auto-admits; closed routes through the invite/approval flow); retained
-/// for reference and unit coverage.
-#[allow(dead_code)]
-pub trait MembershipPolicy: Send + Sync {
-    fn can_authorize(&self, acceptor: &Member) -> bool;
-}
-
-/// Any member can approve new peers.
-#[allow(dead_code)]
-pub struct OpenPolicy;
-
-impl MembershipPolicy for OpenPolicy {
-    fn can_authorize(&self, _acceptor: &Member) -> bool {
-        true
-    }
-}
-
-/// Only the coordinator can approve new peers.
-#[allow(dead_code)]
-pub struct RestrictedPolicy;
-
-impl MembershipPolicy for RestrictedPolicy {
-    fn can_authorize(&self, acceptor: &Member) -> bool {
-        acceptor.is_coordinator
-    }
-}
-
-#[allow(dead_code)]
-pub fn policy_for_mode(mode: GroupMode) -> Box<dyn MembershipPolicy> {
-    match mode {
-        GroupMode::Open => Box::new(OpenPolicy),
-        GroupMode::Restricted => Box::new(RestrictedPolicy),
-    }
-}
-
 /// Flag an existing member as a coordinator (idempotent; no-op if absent).
 pub fn mark_coordinator(members: &mut MemberList, identity: &EndpointId) {
     if let Some(m) = members.get_mut(identity) {
@@ -985,49 +947,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(list.all().len(), 2);
-    }
-
-    #[test]
-    fn test_open_policy_anyone_can_authorize() {
-        let policy = OpenPolicy;
-        let member = Member {
-            identity: test_id(1),
-            ip: Ipv4Addr::new(100, 64, 0, 5),
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-        };
-        assert!(policy.can_authorize(&member));
-    }
-
-    #[test]
-    fn test_restricted_policy_only_coordinators() {
-        let policy = RestrictedPolicy;
-        let coordinator = Member {
-            identity: test_id(1),
-            ip: Ipv4Addr::new(100, 64, 0, 2),
-            is_coordinator: true,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-        };
-        let regular = Member {
-            identity: test_id(2),
-            ip: Ipv4Addr::new(100, 64, 0, 3),
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-        };
-        assert!(policy.can_authorize(&coordinator));
-        assert!(!policy.can_authorize(&regular));
     }
 
     #[test]
