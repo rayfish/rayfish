@@ -5,13 +5,15 @@
 //! reader and coordinator/member accept handlers now live in the per-connection
 //! demux (`ProtocolRouter::drive_mesh_connection` → `AcceptHandler::handle_frame`).
 
+use std::net::IpAddr;
+
 use super::super::*;
 
 impl NetworkRegistry {
-    /// Single daemon-wide loop consuming every data reader's disconnect. For each
-    /// dropped identity it removes the peer from the table, prunes it from every
-    /// network we coordinate on a deliberate leave, and otherwise reconnects it
-    /// across all its shared networks.
+    /// Single daemon-wide loop consuming every [`MeshConnection`]'s disconnect
+    /// report. For each dropped identity it removes the peer from the table, prunes
+    /// it from every network we coordinate on a deliberate leave, and otherwise
+    /// reconnects it across all its shared networks.
     pub(crate) async fn run_connection_supervisor(
         self: Arc<Self>,
         mut disconnect_rx: mpsc::Receiver<forward::DisconnectEvent>,
@@ -43,7 +45,7 @@ impl NetworkRegistry {
         // The networks this peer was reachable on, captured before removal.
         let nets: Vec<SmolStr> = self
             .peers
-            .identity_and_networks(std::net::IpAddr::V4(ev.ip))
+            .identity_and_networks(IpAddr::V4(ev.ip))
             .map(|(_, nets)| nets)
             .unwrap_or_default();
 
@@ -209,7 +211,7 @@ impl NetworkRegistry {
                             continue;
                         }
                         this.mesh_ctx()
-                            .register_peer_conn(&conn, peer_id, peer_ip, name, &token);
+                            .register_peer_conn(&conn, peer_id, peer_ip, name);
                         any = true;
                     }
                     if !any {
@@ -219,7 +221,7 @@ impl NetworkRegistry {
                     // Drive the new connection's control demux + announce handles.
                     let router = this.protocol_router().clone();
                     let dconn = conn.clone();
-                    tokio::spawn(async move { router.drive_mesh_connection(dconn).await });
+                    tokio::spawn(async move { router.drive_mesh_connection(dconn, true).await });
                     announce_network_handles(&this.peers, &conn, peer_ip).await;
                     return;
                 }
@@ -331,9 +333,9 @@ pub(crate) async fn finalize_removal(
             // this was the peer's last network with us; otherwise just drop this
             // network's route (`remove_peer_from_network` returns the connection
             // iff its network set emptied).
-            if let Some(conn) =
-                ctx.peers
-                    .remove_peer_from_network(&ip, &derive_ipv6(&pid), network)
+            if let Some(conn) = ctx
+                .peers
+                .remove_peer_from_network(&ip, &derive_ipv6(&pid), network)
             {
                 conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
             }
@@ -385,7 +387,13 @@ pub(crate) fn spawn_stale_member_pruner(
                     .all()
                     .into_iter()
                     .filter(|m| {
-                        should_prune(m, connected.contains(&m.identity), m.identity == me, ttl, now)
+                        should_prune(
+                            m,
+                            connected.contains(&m.identity),
+                            m.identity == me,
+                            ttl,
+                            now,
+                        )
                     })
                     .map(|m| (m.identity, m.ip))
                     .collect()
@@ -444,14 +452,32 @@ mod prune_tests {
     #[test]
     fn prunes_only_past_the_ttl_strictly() {
         // exactly at TTL boundary -> not yet (strict `>`)
-        assert!(!should_prune(&mk(5, false, Some(NOW - TTL)), false, false, TTL, NOW));
+        assert!(!should_prune(
+            &mk(5, false, Some(NOW - TTL)),
+            false,
+            false,
+            TTL,
+            NOW
+        ));
         // one second past the TTL -> prune
-        assert!(should_prune(&mk(6, false, Some(NOW - TTL - 1)), false, false, TTL, NOW));
+        assert!(should_prune(
+            &mk(6, false, Some(NOW - TTL - 1)),
+            false,
+            false,
+            TTL,
+            NOW
+        ));
     }
 
     #[test]
     fn backwards_clock_does_not_prune() {
         // last_seen in the "future" (clock went backwards) -> saturating_sub = 0
-        assert!(!should_prune(&mk(7, false, Some(NOW + 100)), false, false, TTL, NOW));
+        assert!(!should_prune(
+            &mk(7, false, Some(NOW + 100)),
+            false,
+            false,
+            TTL,
+            NOW
+        ));
     }
 }

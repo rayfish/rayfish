@@ -45,7 +45,6 @@ pub(crate) struct CoordinatorAcceptState {
     pub(crate) ctx: MeshCtx,
     pub(crate) network_name: String,
     pub(crate) state: SharedNetworkState,
-    pub(crate) token: CancellationToken,
     pub(crate) dht_notify: Option<Arc<tokio::sync::Notify>>,
     /// Shared with this network's [`NetworkHandle`]; see its `invite_lock`.
     pub(crate) invite_lock: Arc<tokio::sync::Mutex<()>>,
@@ -227,7 +226,7 @@ impl CoordinatorAcceptState {
         let peer_ip = self.state.read().unwrap().members.get(&remote_id).map(|m| m.ip)?;
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
         self.ctx
-            .register_peer_conn(conn, remote_id, peer_ip, &self.network_name, &self.token);
+            .register_peer_conn(conn, remote_id, peer_ip, &self.network_name);
 
         // Verify and store device cert if present, unless the device key is
         // nullified on this network (`ray unpair`): a nullified cert is not
@@ -554,7 +553,7 @@ impl CoordinatorAcceptState {
         // demux already owns this connection's control loop).
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
         self.ctx
-            .register_peer_conn(conn, remote_id, peer_ip, &self.network_name, &self.token);
+            .register_peer_conn(conn, remote_id, peer_ip, &self.network_name);
 
         broadcast_member_sync(&self.ctx.peers, net_pubkey, &self.network_name, Some(peer_ip)).await;
 
@@ -856,7 +855,7 @@ impl MemberAcceptState {
                 .await;
             }
             self.ctx
-                .register_peer_conn(conn, peer_identity, member_ip, &self.network_name, &self.token);
+                .register_peer_conn(conn, peer_identity, member_ip, &self.network_name);
             return Some(member_ip);
         }
         None
@@ -929,7 +928,7 @@ impl MemberAcceptState {
         )
         .await;
         self.ctx
-            .register_peer_conn(conn, peer_identity, member_ip, &self.network_name, &self.token);
+            .register_peer_conn(conn, peer_identity, member_ip, &self.network_name);
         broadcast_member_sync(&self.ctx.peers, self.net_pubkey, &self.network_name, Some(member_ip))
             .await;
         Some(member_ip)
@@ -1105,7 +1104,7 @@ impl ProtocolRouter {
                                 a if a == transport::FILES_ALPN => router.files.accept_file_offer(conn).await,
                                 a if a == PAIR_ALPN => router.files.accept_pair_request(conn).await,
                                 a if a == transport::CONNECT_ALPN => router.connect.accept_connect_request(conn).await,
-                                a if a == transport::mesh_alpn() => router.drive_mesh_connection(conn).await,
+                                a if a == transport::mesh_alpn() => router.drive_mesh_connection(conn, false).await,
                                 _ => {
                                     tracing::warn!(
                                         alpn = %String::from_utf8_lossy(&alpn),
@@ -1122,10 +1121,13 @@ impl ProtocolRouter {
 
     /// Drive one mesh connection for its whole lifetime. Passthrough to the
     /// connection manager, which owns the driver, demux, and handler registry.
-    /// Used by the accept loop (above) and the dial side
-    /// (`Daemon::drive_dialed_connection`).
-    pub(crate) async fn drive_mesh_connection(self: Arc<Self>, conn: Connection) {
-        self.conn.clone().drive_mesh_connection(conn).await;
+    /// Used by the accept loop (above, `pre_registered = false`) and the dial side
+    /// (`pre_registered = true`).
+    pub(crate) async fn drive_mesh_connection(self: Arc<Self>, conn: Connection, pre_registered: bool) {
+        self.conn
+            .clone()
+            .drive_mesh_connection(conn, pre_registered)
+            .await;
     }
 }
 

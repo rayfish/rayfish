@@ -200,7 +200,6 @@ pub(crate) async fn join_mesh_shared(
     register_dialed_peer(
         &worker_ctx,
         &protocol_router,
-        &token,
         initial_conn,
         remote_id,
         remote_ip,
@@ -218,30 +217,29 @@ pub(crate) async fn join_mesh_shared(
         &device_cert,
         &worker_ctx,
         &protocol_router,
-        &token,
     )
     .await?;
 
     Ok(JoinResult::Joined(live_state))
 }
 
-/// Register a peer we dialed: add its route + data reader, spawn the control demux
-/// for the new connection, and announce our handle table so it can decode our
-/// tagged datagrams. Shared by the coordinator connection and each roster peer.
+/// Register a peer we dialed: add its route, drive the control demux for the new
+/// connection (which owns the data reader), and announce our handle table so it
+/// can decode our tagged datagrams. Shared by the coordinator connection and each
+/// roster peer.
 async fn register_dialed_peer(
     ctx: &MeshCtx,
     router: &Arc<ProtocolRouter>,
-    token: &CancellationToken,
     conn: Connection,
     peer_id: EndpointId,
     ip: Ipv4Addr,
     network_name: &str,
 ) {
-    let conn_changed = ctx.register_peer_conn(&conn, peer_id, ip, network_name, token);
+    let conn_changed = ctx.register_peer_conn(&conn, peer_id, ip, network_name);
     if conn_changed {
         let router = router.clone();
         let dconn = conn.clone();
-        tokio::spawn(async move { router.drive_mesh_connection(dconn).await });
+        tokio::spawn(async move { router.drive_mesh_connection(dconn, true).await });
     }
     announce_network_handles(&ctx.peers, &conn, ip).await;
 }
@@ -358,7 +356,6 @@ async fn connect_to_roster_peers(
     device_cert: &Option<control::DeviceCert>,
     ctx: &MeshCtx,
     router: &Arc<ProtocolRouter>,
-    token: &CancellationToken,
 ) -> Result<()> {
     for member in members {
         if member.identity == my_identity || member.identity == skip_id {
@@ -383,7 +380,6 @@ async fn connect_to_roster_peers(
                 register_dialed_peer(
                     ctx,
                     router,
-                    token,
                     conn,
                     member.identity,
                     member.ip,

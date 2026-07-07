@@ -658,7 +658,6 @@ impl NetworkRegistry {
                     invite_lock.clone(),
                     None,
                     net_public_key,
-                    cancel.clone(),
                 );
             }
             // `Direct` is a display-only role (set in `status`), never produced by
@@ -1007,7 +1006,6 @@ impl NetworkRegistry {
         // read fresh from config, rather than a value captured before a rename.
         let my_hostname = outgoing_hostname(network_name).or(my_hostname);
         let ctx = self.mesh_ctx();
-        let token = self.shutdown_token.clone();
         for m in members {
             if m.identity == my_identity {
                 continue;
@@ -1036,14 +1034,14 @@ impl NetworkRegistry {
                         .await;
                     }
                     crate::spawn_path_logger(peer_conn.clone(), m.identity.fmt_short().to_string());
-                    // Register the route + single data reader, then drive the new
-                    // connection's control demux and announce our handle table.
+                    // Register the route, then drive the new connection's control
+                    // demux (which owns the data reader) and announce our handles.
                     let conn_changed =
-                        ctx.register_peer_conn(&peer_conn, m.identity, m.ip, network_name, &token);
+                        ctx.register_peer_conn(&peer_conn, m.identity, m.ip, network_name);
                     if conn_changed {
                         let router = self.protocol_router().clone();
                         let dconn = peer_conn.clone();
-                        tokio::spawn(async move { router.drive_mesh_connection(dconn).await });
+                        tokio::spawn(async move { router.drive_mesh_connection(dconn, true).await });
                     }
                     announce_network_handles(&self.peers, &peer_conn, m.ip).await;
                     tracing::info!(

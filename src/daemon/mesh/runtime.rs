@@ -227,7 +227,6 @@ impl NetworkRegistry {
             invite_lock.clone(),
             Some(dht_notify.clone()),
             net_public_key,
-            cancel.clone(),
         );
 
         // Register hostnames in DNS table
