@@ -167,7 +167,9 @@ impl NetworkRegistry {
             }
         }
         match crate::identity::delete_device_cert() {
-            Ok(()) => tracing::warn!("unpaired this device: deleted device certificate and left all networks"),
+            Ok(()) => tracing::warn!(
+                "unpaired this device: deleted device certificate and left all networks"
+            ),
             Err(e) => {
                 tracing::warn!(error = %e, "unpair: failed to delete device cert");
                 return IpcMessage::Error {
@@ -194,7 +196,13 @@ impl NetworkRegistry {
             let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
         }
 
-        self.peers.remove_by_network(name);
+        // Drop this network from every peer's routing. A peer left sharing no
+        // network at all is fully disconnected, so close its now-unused link with
+        // the leave code (the peer treats it as intentional and stops reconnecting);
+        // a peer we still share another network with keeps its connection.
+        for (_ip, conn) in self.peers.remove_by_network(name) {
+            conn.close(VarInt::from_u32(forward::LEAVE_CODE), b"leave");
+        }
         self.dns.clear_network(name).await;
         self.conn.unregister(&handle.network_key);
         self.refresh_search_domains().await;
@@ -210,12 +218,23 @@ impl NetworkRegistry {
         dns_config::update_search_domains(&network_names, &tun_name).await;
     }
 
-    /// Leave a network: gracefully close our connections with the leave code (so
-    /// peers see an intentional departure and prune us), tear down the runtime,
+    /// Leave a network: announce our departure to its peers, tear down the runtime,
     /// and remove it from config.
+    ///
+    /// The departure is sent in-band and network-scoped (`ControlMsg::LeaveNetwork`)
+    /// rather than by closing the QUIC connection, because one connection now
+    /// carries every network two peers share: closing it would sever the peer on
+    /// networks we are *not* leaving (and, on a peer that coordinates one of them,
+    /// get us pruned from a network we never left). A coordinator that receives the
+    /// message prunes us from that one network's roster and republishes.
+    /// `teardown_network_runtime` then closes only the links left sharing no
+    /// network at all.
     pub(crate) async fn leave_network(&self, name: &str) -> IpcMessage {
-        for (_eid, _ip, conn) in self.peers.peers_for_network_with_conn(name) {
-            conn.close(VarInt::from_u32(forward::LEAVE_CODE), b"leave");
+        // Send the in-band leave while the peer entries still list this network
+        // (before teardown drops them). Best-effort: a peer that misses it converges
+        // from the coordinator's republish, or ages us out as an offline member.
+        if let Some(net_pubkey) = self.networks.get(name).map(|h| h.network_key) {
+            broadcast_control_msg(&self.peers, net_pubkey, name, &ControlMsg::LeaveNetwork).await;
         }
 
         let was_active = self.teardown_network_runtime(name).await;
@@ -771,9 +790,7 @@ impl NetworkRegistry {
                 h.cancel.clone(),
             )
         }; // DashMap ref dropped before the registration below.
-        self.register_coordinator_handler(
-            ctx, network, parts.0, parts.1, parts.2, parts.3,
-        );
+        self.register_coordinator_handler(ctx, network, parts.0, parts.1, parts.2, parts.3);
         tracing::info!(network, "promoted to coordinator accept handler");
     }
 
@@ -797,7 +814,14 @@ impl NetworkRegistry {
         // Collect coordinated networks (clone the handles) before awaiting.
         let mut nets: Vec<(String, SharedNetworkState, Option<Arc<Notify>>)> = Vec::new();
         for entry in self.networks.iter() {
-            if entry.value().state.read().unwrap().network_secret_key.is_some() {
+            if entry
+                .value()
+                .state
+                .read()
+                .unwrap()
+                .network_secret_key
+                .is_some()
+            {
                 nets.push((
                     entry.key().clone(),
                     entry.value().state.clone(),

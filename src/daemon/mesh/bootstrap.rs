@@ -45,27 +45,6 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     daemon.registry.connect_all_networks().await;
     daemon.activate(None).await;
 
-    // Single daemon-wide connection supervisor: consumes every data reader's
-    // disconnect and, per dropped identity, prunes departed peers we coordinate
-    // and reconnects the rest across all their shared networks.
-    let disconnect_rx = daemon
-        .disconnect_rx
-        .lock()
-        .unwrap()
-        .take()
-        .expect("disconnect_rx present after build");
-    {
-        let daemon = daemon.clone();
-        let token = token.clone();
-        tokio::spawn(async move {
-            daemon
-                .registry
-                .clone()
-                .run_connection_supervisor(disconnect_rx, token)
-                .await;
-        });
-    }
-
     // Opt-in automatic updates: a single daemon-wide task that periodically
     // checks for a newer stable release and swaps + restarts onto it. Desktop-only
     // (the self-replacing updater is not built into the Android lib).
@@ -311,6 +290,22 @@ async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> R
     // The registry (re)connect paths drive a dialed connection's demux through the
     // router; install it now that it exists (the registry was built before it).
     registry.set_protocol_router(protocol_router.clone());
+    // Single daemon-wide connection supervisor: consumes every data reader's
+    // disconnect and, per dropped identity, prunes departed peers we coordinate and
+    // reconnects the rest across all their shared networks. Spawned here (not in
+    // `run_daemon`) so embedders built via `build_headless` (mobile) get it too;
+    // without it a transient QUIC drop between two mobile peers would never
+    // reconnect and the bounded disconnect channel would eventually back up.
+    {
+        let registry = registry.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            registry
+                .run_connection_supervisor(disconnect_rx, token)
+                .await;
+        });
+    }
+
     let auto_update = app_config.auto_update;
     let daemon = Arc::new(Daemon {
         transport,
@@ -334,7 +329,6 @@ async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> R
         #[cfg(feature = "desktop")]
         ssh_authz: crate::ssh::new_authz(),
         ssh_token: Mutex::new(None),
-        disconnect_rx: Mutex::new(Some(disconnect_rx)),
     });
 
     // Install the daemon-wide mesh dispatch context so the per-connection demux
