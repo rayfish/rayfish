@@ -564,7 +564,6 @@ impl NetworkRegistry {
         }
     }
 
-
     /// Connect to every saved network (control plane). Run once at daemon
     /// startup so mesh connections follow the daemon lifecycle, not the data
     /// plane: `ray down` keeps these connected so the node stays online to
@@ -713,8 +712,8 @@ impl MeshManager {
         *guard = Some(token.clone());
         drop(guard);
         self.rebuild_ssh_authz();
-        let my_v4 = self.identity.local_ip();
-        let my_v6 = derive_ipv6(&self.identity.local_identity());
+        let my_v4 = self.transport.identity.local_ip();
+        let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
         let server = crate::ssh::SshServer::new(
             self.peers.clone(),
             self.device_user_map.clone(),
@@ -807,8 +806,8 @@ impl MeshManager {
             // the TUN, where the forwarding loop would drop it as "no peer for
             // dst". No-op on Linux (kernel installs the `local` route
             // automatically).
-            let my_v4 = self.identity.local_ip();
-            let my_v6 = derive_ipv6(&self.identity.local_identity());
+            let my_v4 = self.transport.identity.local_ip();
+            let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
             if let Err(e) = tun::route_self_loopback(my_v4, my_v6).await {
                 tracing::warn!(error = %e, "failed to install loopback self-route");
                 warnings.push(format!("failed to install loopback self-route: {e}"));

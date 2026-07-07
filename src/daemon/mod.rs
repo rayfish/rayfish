@@ -423,8 +423,6 @@ pub struct MeshManager {
     /// this holds clones of the same handles the loose fields below still use;
     /// the loose fields go away when `MeshManager` is dissolved.
     transport: Arc<Transport>,
-    endpoint: Endpoint,
-    identity: IrohIdentityProvider,
     peers: PeerTable,
     stats: Arc<ForwardMetrics>,
     /// When the daemon process started, used for uptime in diagnostics.
@@ -445,7 +443,6 @@ pub struct MeshManager {
     /// so they call it directly instead of signalling the daemon over a channel.
     registry: Arc<NetworkRegistry>,
     shutdown_token: CancellationToken,
-    blob_store: FsStore,
     firewall: SharedFirewall,
     protocol_router: Arc<ProtocolRouter>,
     /// Magic DNS leaf service: naming tables, resolver, and OS-DNS configurator
@@ -569,7 +566,7 @@ impl MeshManager {
     /// come back online.
     pub async fn shutdown_and_close(&self) {
         self.shutdown_token.cancel();
-        self.endpoint.close().await;
+        self.transport.endpoint.close().await;
     }
 
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
@@ -981,7 +978,7 @@ impl MeshManager {
             }
         };
 
-        let my_identity = self.endpoint.id();
+        let my_identity = self.transport.endpoint.id();
 
         // The coordinator is authoritative, so it resolves collisions against the
         // roster up front. A member applies its requested name optimistically and
@@ -1015,7 +1012,7 @@ impl MeshManager {
             network,
             &new_hostname,
             my_ip,
-            derive_ipv6(&self.identity.local_identity()),
+            derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
 
@@ -1050,7 +1047,7 @@ impl MeshManager {
                 hostname = %new_hostname,
                 "coordinator renamed self; republishing blob + broadcasting MemberSync"
             );
-            update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+            update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
             let net_pubkey = state.read().unwrap().network_public_key;
             broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
         }

@@ -27,8 +27,8 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // skipped here.
     #[cfg(not(target_os = "android"))]
     {
-        let my_ipv6 = derive_ipv6(&daemon.identity.local_identity());
-        let (tun_reader, tun_writer, tun_name) = tun::create(daemon.identity.local_ip(), my_ipv6)
+        let my_ipv6 = derive_ipv6(&daemon.transport.identity.local_identity());
+        let (tun_reader, tun_writer, tun_name) = tun::create(daemon.transport.identity.local_ip(), my_ipv6)
             .await
             .context("failed to create TUN device")?;
         *daemon.tun_name.lock().unwrap() = tun_name;
@@ -80,7 +80,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // `ray restart`/`ray update` past the client's reachability probe. Closing
     // it here lets QUIC connections terminate cleanly and the process exit
     // promptly so the new daemon comes up fast.
-    daemon.endpoint.close().await;
+    daemon.transport.endpoint.close().await;
 
     result
 }
@@ -234,7 +234,11 @@ async fn build_daemon(
     ));
     // Built here (not in the struct literal) so NetworkRegistry can share it for
     // the leave/teardown DNS cleanup.
-    let dns = Arc::new(DnsService::new(hostname_table, reverse_table, dns_resolver.clone()));
+    let dns = Arc::new(DnsService::new(
+        hostname_table,
+        reverse_table,
+        dns_resolver.clone(),
+    ));
     let mdns_enabled = app_config.mdns_enabled;
     if mdns_enabled {
         spawn_mdns_discovery(&ep, token.clone());
@@ -311,15 +315,12 @@ async fn build_daemon(
     let daemon = Arc::new(MeshManager {
         transport,
         registry,
-        endpoint: ep,
-        identity,
         peers,
         stats: stats.clone(),
         start: Instant::now(),
         tun_tx,
         networks,
         shutdown_token: token.clone(),
-        blob_store,
         firewall: shared_firewall,
         protocol_router: protocol_router.clone(),
         dns,
@@ -350,14 +351,14 @@ async fn build_daemon(
     });
 
     // --- Accept loop (ALPN dispatch) + Prometheus metrics ---
-    protocol_router.spawn_accept_loop(daemon.endpoint.clone(), token.clone());
+    protocol_router.spawn_accept_loop(daemon.transport.endpoint.clone(), token.clone());
 
     // File auto-accept is evaluated inline by `FileService::accept_file_offer`
     // (no worker channel), so nothing to spawn here.
 
     // --- Contact record publisher (ray connect) ---
-    if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
-        spawn_contact_publisher(pkarr_client, daemon.endpoint.id(), token.clone());
+    if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.transport.endpoint) {
+        spawn_contact_publisher(pkarr_client, daemon.transport.endpoint.id(), token.clone());
     }
 
     // Device-cert revocation is now carried per-network in the signed blob's
@@ -365,11 +366,11 @@ async fn build_daemon(
     // publisher/poller is needed. Coordinated networks seed their nullifiers from
     // the persisted `revoked_devices` set at seal time (see `seal_and_publish`).
     let metrics_server =
-        spawn_metrics_server(stats, daemon.peers.clone(), &daemon.endpoint, token).await;
+        spawn_metrics_server(stats, daemon.peers.clone(), &daemon.transport.endpoint, token).await;
     // Keep the metrics-server guard alive for the daemon's whole lifetime.
     *daemon._metrics_server.lock().unwrap() = metrics_server;
 
-    tracing::info!(ip = %my_ip, id = %daemon.endpoint.id().fmt_short(), "daemon started");
+    tracing::info!(ip = %my_ip, id = %daemon.transport.endpoint.id().fmt_short(), "daemon started");
     Ok(daemon)
 }
 
@@ -511,7 +512,6 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<MeshManager>) -> Res
     ipc::send(&mut framed, resp).await?;
     Ok(())
 }
-
 
 /// First auto-update check runs ~5 min after boot (jittered), then every 6h.
 #[cfg(feature = "desktop")]

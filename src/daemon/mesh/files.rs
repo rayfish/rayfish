@@ -72,7 +72,7 @@ impl MeshManager {
         // hangs indefinitely. Bound it so pairing fails fast with a clear message.
         let conn = match tokio::time::timeout(
             PAIR_CONNECT_TIMEOUT,
-            self.endpoint.connect(addr, PAIR_ALPN),
+            self.transport.endpoint.connect(addr, PAIR_ALPN),
         )
         .await
         {
@@ -115,7 +115,7 @@ impl MeshManager {
 
         let request = control::PairMsg::Request {
             secret: secret_arr,
-            device_pubkey: self.endpoint.id(),
+            device_pubkey: self.transport.endpoint.id(),
         };
         let request_bytes = match rmp_serde::to_vec_named(&request) {
             Ok(b) => b,
@@ -245,7 +245,7 @@ impl MeshManager {
                 message: "only your primary device can unpair a device".to_string(),
             };
         }
-        let own_user = self.endpoint.id();
+        let own_user = self.transport.endpoint.id();
 
         let target = match self.resolve_peer_flexible(device).await {
             Some(id) => id,
@@ -340,7 +340,7 @@ impl MeshManager {
                     )
                     .await;
                 }
-                update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+                update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
                 // Nudge this network's members to reconverge from the freshly
                 // republished record.
                 let net_pubkey = state.read().unwrap().network_public_key;

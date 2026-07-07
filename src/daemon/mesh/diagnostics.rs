@@ -8,7 +8,7 @@ impl MeshManager {
     /// snapshot the daemon's status (identity, networks, peers).
     pub fn status(&self) -> IpcMessage {
         let hostname_snapshot = self.dns.hostname_table.try_read().ok();
-        let my_id = self.endpoint.id();
+        let my_id = self.transport.endpoint.id();
         // Direct-connection networks are flagged in config; collect their names
         // so each NetworkStatus can be tagged `[direct]` in the CLI.
         let direct_names: HashSet<String> = config::load()
@@ -38,7 +38,7 @@ impl MeshManager {
             .unwrap_or_default();
 
         IpcMessage::StatusResponse {
-            endpoint_id: self.endpoint.id(),
+            endpoint_id: self.transport.endpoint.id(),
             mdns_enabled: self.mdns_enabled,
             auto_update: self.auto_update,
             active: self.active.load(Ordering::SeqCst),
@@ -156,7 +156,7 @@ impl MeshManager {
             name: h.name.clone(),
             role,
             my_ip: h.my_ip,
-            my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
+            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
             my_hostname: lookup_hostname(h.my_ip),
             network_key: Some(h.network_key.to_string()),
             member_count,
@@ -198,7 +198,7 @@ impl MeshManager {
         if !uname.is_empty() {
             let _ = writeln!(sysinfo, "uname: {uname}");
         }
-        let _ = writeln!(sysinfo, "endpoint_id: {}", self.endpoint.id());
+        let _ = writeln!(sysinfo, "endpoint_id: {}", self.transport.endpoint.id());
         let _ = writeln!(sysinfo, "uptime_secs: {uptime}");
         let _ = writeln!(sysinfo, "active: {active}");
         let _ = writeln!(sysinfo, "networks: {}", self.networks.len());
@@ -425,7 +425,7 @@ impl MeshManager {
     pub(crate) async fn netcheck(&self) -> IpcMessage {
         use iroh::Watcher as _;
 
-        let bound = self.endpoint.bound_sockets();
+        let bound = self.transport.endpoint.bound_sockets();
         let bound_port = bound.first().map(|a| a.port()).unwrap_or(0);
         let port_is_fixed = bound_port == transport::RAYFISH_LISTEN_PORT;
 
@@ -433,7 +433,7 @@ impl MeshManager {
         // flight, so wait briefly for an initialized report, then fall back to
         // whatever the watcher currently holds.
         let report = {
-            let mut w = self.endpoint.net_report();
+            let mut w = self.transport.endpoint.net_report();
             match tokio::time::timeout(Duration::from_secs(3), w.initialized()).await {
                 Ok(r) => Some(r),
                 Err(_) => w.get(),
@@ -467,7 +467,7 @@ impl MeshManager {
         // Fall back to the connection-status watcher for the relay URL if the net
         // report has not surfaced a preferred relay yet.
         if home_relay.is_none() {
-            let status = self.endpoint.home_relay_status().get();
+            let status = self.transport.endpoint.home_relay_status().get();
             home_relay = status.first().map(|s| s.url().to_string());
         }
 
