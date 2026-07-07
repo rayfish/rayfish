@@ -62,22 +62,19 @@ pub mod hostname;
 pub mod identity;
 pub mod invite;
 pub mod ipc;
-pub mod layout;
 pub mod logdir;
 pub mod membership;
 pub mod network_name;
 #[cfg(feature = "desktop")]
 pub mod onepassword;
 pub mod peers;
-pub mod picker;
-pub mod progress;
 pub mod ratelimit;
 pub mod reject;
 pub mod shutdown;
 #[cfg(feature = "desktop")]
 pub mod ssh;
 pub mod stats;
-pub mod style;
+pub mod term;
 pub mod transport;
 pub mod tun;
 // Self-replacing binary update relies on `self-replace` (a desktop-only dep) and

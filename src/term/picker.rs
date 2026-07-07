@@ -17,7 +17,7 @@ use crossterm::{
 };
 use ray_proto::ipc::FirewallRuleView;
 
-use crate::{layout, style};
+use super::{layout, style};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Decision {
