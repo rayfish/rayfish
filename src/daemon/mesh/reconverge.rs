@@ -335,7 +335,10 @@ pub(crate) fn prune_departed_peers(
         if let Some(conn) =
             peers.remove_peer_from_network(&ip, &derive_ipv6(&peer_id), network_name)
         {
-            conn.close(VarInt::from_u32(forward::KICK_CODE), b"removed from network");
+            conn.close(
+                VarInt::from_u32(forward::KICK_CODE),
+                b"removed from network",
+            );
         }
     }
 }

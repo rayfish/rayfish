@@ -20,7 +20,8 @@ impl Daemon {
                     .collect()
             })
             .unwrap_or_default();
-        let statuses: Vec<NetworkStatus> = self.registry
+        let statuses: Vec<NetworkStatus> = self
+            .registry
             .networks
             .iter()
             .map(|h| self.network_status(&h, my_id, hostname_snapshot.as_deref(), &direct_names))
@@ -120,7 +121,8 @@ impl Daemon {
             )
         };
         // Index live connections by endpoint id for a fast lookup.
-        let connected: HashMap<EndpointId, Connection> = self.registry
+        let connected: HashMap<EndpointId, Connection> = self
+            .registry
             .peers
             .peers_for_network_with_conn(&h.name)
             .into_iter()

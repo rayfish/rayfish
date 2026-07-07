@@ -58,8 +58,11 @@ impl NetworkRegistry {
         };
         match minted {
             Ok((secret, id)) => {
-                let code =
-                    crate::invite::encode_invite_code(&net_pubkey, &self.transport.endpoint.id(), &secret);
+                let code = crate::invite::encode_invite_code(
+                    &net_pubkey,
+                    &self.transport.endpoint.id(),
+                    &secret,
+                );
                 // Gossip the new invite (hash only, never the secret) to other
                 // coordinators so any of them can later redeem it. The wire field
                 // carries the hex hash's UTF-8 bytes; receivers decode back to the
@@ -153,7 +156,8 @@ impl NetworkRegistry {
             s.reusable_keys.insert(hash, key);
         }
         update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
-        let code = crate::invite::encode_invite_code(&net_pubkey, &self.transport.endpoint.id(), &secret);
+        let code =
+            crate::invite::encode_invite_code(&net_pubkey, &self.transport.endpoint.id(), &secret);
         IpcMessage::InviteCreated {
             code,
             id,
