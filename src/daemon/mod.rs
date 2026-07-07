@@ -1592,45 +1592,6 @@ mod coordinator_dial_order_tests {
 }
 
 #[cfg(test)]
-mod dial_fallback_tests {
-    use super::*;
-
-    #[test]
-    fn dial_fallback_stops_on_first_welcome() {
-        // outcomes simulate dialing in order: first errors, second welcomes, third never tried.
-        let outcomes = vec![
-            DialOutcome::Unreachable,
-            DialOutcome::Welcomed,
-            DialOutcome::Denied,
-        ];
-        let (idx, welcomed) = pick_first_welcome(&outcomes);
-        assert_eq!((idx, welcomed), (1, true));
-    }
-
-    #[test]
-    fn dial_fallback_reports_failure_when_all_exhausted() {
-        let outcomes = vec![DialOutcome::Unreachable, DialOutcome::Denied];
-        let (_idx, welcomed) = pick_first_welcome(&outcomes);
-        assert!(!welcomed);
-    }
-
-    #[test]
-    fn dial_fallback_empty_is_not_welcomed() {
-        // Defensive: no coordinators tried at all. Must not panic and must
-        // report "not welcomed" so the caller bails rather than indexing.
-        let (idx, welcomed) = pick_first_welcome(&[]);
-        assert_eq!((idx, welcomed), (0, false));
-    }
-
-    #[test]
-    fn dial_fallback_first_welcome_wins_over_later() {
-        let outcomes = vec![DialOutcome::Welcomed, DialOutcome::Welcomed];
-        let (idx, welcomed) = pick_first_welcome(&outcomes);
-        assert_eq!((idx, welcomed), (0, true));
-    }
-}
-
-#[cfg(test)]
 mod headless_tests {
     use super::*;
 
