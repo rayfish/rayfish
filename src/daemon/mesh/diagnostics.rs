@@ -150,6 +150,11 @@ impl Daemon {
                     hostname,
                     user_identity,
                     is_own_device: user_id == own_user,
+                    // Only meaningful for a peer with no live connection: a dial hit
+                    // the mesh-version ALPN gate. A connected peer is same-version by
+                    // definition, and `add` clears the flag on connect anyway.
+                    incompatible: connection.is_none()
+                        && self.registry.peers.is_incompatible(&m.identity),
                     connection,
                 }
             })

@@ -1059,6 +1059,15 @@ impl NetworkRegistry {
                     );
                 }
                 Ok(Err(e)) => {
+                    // Distinguish an incompatible-version peer (ALPN gate) from a
+                    // merely-unreachable one, so `ray status` can flag it instead
+                    // of showing plain offline. A success later clears this in
+                    // `PeerTable::add`.
+                    if transport::is_alpn_mismatch(&format!("{e:#}")) {
+                        self.peers.mark_incompatible(m.identity);
+                    } else {
+                        self.peers.clear_incompatible(&m.identity);
+                    }
                     tracing::debug!(
                         network = %network_name,
                         peer = %m.identity.fmt_short(),

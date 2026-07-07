@@ -49,7 +49,13 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// Bumped to 2 for the single-connection-per-identity change: one mesh ALPN carries
 /// every shared network (network selection is now in-band, a `ControlFrame.net`
 /// per control message and a `u16` handle tag per datagram, not encoded in the
-/// ALPN as it was in v1's `rayfish/net/<v>/<prefix>`).
+/// ALPN as it was in v1's `rayfish/net/<v>/<prefix>`). Version 2 is an unreleased,
+/// in-flight breaking batch (the last released version is 1), so later breaking
+/// wire changes on this branch fold into 2 rather than bumping again: e.g.
+/// `ControlMsg::SignedRecord`, by which a coordinator hands a (re)connecting member
+/// its current network-key-signed pkarr record over the mesh so the member
+/// converges to the live roster in ~1s instead of waiting out a stale DHT lookup
+/// plus the 60s group poll.
 pub const MESH_PROTOCOL_VERSION: u32 = 2;
 
 /// The single mesh ALPN. Unlike the old per-network `rayfish/net/<v>/<prefix>`,

@@ -145,6 +145,17 @@ pub enum ControlMsg {
     /// is a *trigger only*. Receivers reconverge from the network-key-signed
     /// pkarr record, never from any peer-supplied membership data.
     MemberSync,
+    /// Coordinator -> member: the current network-key-signed pkarr record
+    /// (`SignedPacket`, serialized), delivered over the mesh so a (re)connecting
+    /// member converges to the live roster without waiting on a fresh DHT lookup.
+    /// The receiver verifies the packet's signature and that its public key equals
+    /// the known network pubkey, and that it is newer than what it holds, before
+    /// applying. This is a *fresh signed record delivered over the link*, not
+    /// trusted peer-supplied membership: the record is self-verifying against the
+    /// network key exactly like the DHT copy, so the trust model is unchanged.
+    SignedRecord {
+        packet: Vec<u8>,
+    },
     MeshHello {
         identity: EndpointId,
         ip: Ipv4Addr,

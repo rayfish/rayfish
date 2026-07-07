@@ -568,7 +568,6 @@ impl Daemon {
         self.transport.clone()
     }
 
-
     /// Attach a packet interface to a headless [`DaemonState`] and start the data
     /// plane's forwarding tasks: the TUN writer (`spawn_tun_writer`) and the mesh
     /// forwarding loop (`run_mesh`, reading `reader` and using the state's

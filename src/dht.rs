@@ -99,6 +99,22 @@ pub fn mesh_version_from_record(packet: &SignedPacket) -> Option<u32> {
         .find_map(|r| r.strip_prefix("m,").and_then(|v| v.parse::<u32>().ok()))
 }
 
+/// Verify a signed network record received out-of-band (handed to us over the
+/// mesh, not resolved from the DHT) really is signed by `network_pubkey`.
+/// [`SignedPacket::from_bytes`] checks the ed25519 signature; this additionally
+/// pins the signer to the expected network key, so a peer can't hand us a
+/// validly-signed record for a *different* network. The returned packet is then
+/// safe to [`decode_network_record`] and trust exactly like the DHT copy.
+pub fn verify_network_record(bytes: &[u8], network_pubkey: EndpointId) -> Result<SignedPacket> {
+    let packet = SignedPacket::from_bytes(bytes)
+        .map_err(|e| anyhow::anyhow!("invalid signed record: {e}"))?;
+    ensure!(
+        packet.public_key() == network_pubkey,
+        "signed record is for a different network key"
+    );
+    Ok(packet)
+}
+
 pub fn decode_network_record(packet: &SignedPacket) -> Result<(blake3::Hash, Vec<EndpointId>)> {
     let records = packet.txt_records(RECORD_NAME);
     ensure!(!records.is_empty(), "no network records found");
@@ -292,6 +308,42 @@ mod tests {
         let values = vec![RECORD_VERSION.to_string(), format!("h,{hash}")];
         let packet = SignedPacket::from_txt_strings(&key, RECORD_NAME, values, RECORD_TTL).unwrap();
         assert_eq!(mesh_version_from_record(&packet), None);
+    }
+
+    #[test]
+    fn verify_network_record_round_trips() {
+        let key = SecretKey::generate();
+        let hash = blake3::hash(b"test");
+        let peer = SecretKey::generate().public();
+        let bytes = encode_network_record(&key, &hash, &[peer])
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        // Correct key: verifies and decodes to the same hash + seeds.
+        let packet = verify_network_record(&bytes, key.public()).unwrap();
+        let (got_hash, got_peers) = decode_network_record(&packet).unwrap();
+        assert_eq!(got_hash, hash);
+        assert_eq!(got_peers, vec![peer]);
+    }
+
+    #[test]
+    fn verify_network_record_rejects_wrong_key() {
+        let key = SecretKey::generate();
+        let hash = blake3::hash(b"test");
+        let bytes = encode_network_record(&key, &hash, &[])
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        // A validly-signed record for a *different* network must be refused, so a
+        // peer can't hand us a record for a network it controls.
+        let other = SecretKey::generate().public();
+        assert!(verify_network_record(&bytes, other).is_err());
+    }
+
+    #[test]
+    fn verify_network_record_rejects_garbage() {
+        let key = SecretKey::generate();
+        assert!(verify_network_record(b"not a signed packet", key.public()).is_err());
     }
 
     #[test]

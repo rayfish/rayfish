@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
+use dashmap::DashSet;
 use iroh::EndpointId;
 use iroh::endpoint::Connection;
 use smol_str::SmolStr;
@@ -51,6 +52,12 @@ pub struct PeerTable {
     /// connection logs a `connect` event and dropping its last shared network
     /// logs a `disconnect` event. `None` in tests.
     audit: Option<Arc<AuditLog>>,
+    /// Peers whose last mesh dial failed on the ALPN version gate (they run an
+    /// incompatible mesh protocol). Node-wide: the mesh version is a per-node
+    /// property, not per-network. Set by the dialer on an ALPN-mismatch failure,
+    /// cleared automatically in [`Self::add`] on any successful (re)connection.
+    /// `ray status` reads it to flag such peers instead of showing plain offline.
+    version_incompatible: Arc<DashSet<EndpointId>>,
 }
 
 /// A single peer's identity, its one shared connection, and the networks that
@@ -146,6 +153,7 @@ impl PeerTable {
             v6: Arc::new(FastDashMap::default()),
             by_id: Arc::new(FastDashMap::default()),
             audit: None,
+            version_incompatible: Arc::new(DashSet::default()),
         }
     }
 
@@ -158,7 +166,26 @@ impl PeerTable {
             v6: Arc::new(FastDashMap::default()),
             by_id: Arc::new(FastDashMap::default()),
             audit: Some(audit),
+            version_incompatible: Arc::new(DashSet::default()),
         }
+    }
+
+    /// Flag `id` as running an incompatible mesh version (its last mesh dial hit
+    /// the ALPN gate). Cleared automatically once the peer connects (see
+    /// [`Self::add`]) or explicitly via [`Self::clear_incompatible`].
+    pub fn mark_incompatible(&self, id: EndpointId) {
+        self.version_incompatible.insert(id);
+    }
+
+    /// Clear the incompatible flag for `id` (e.g. a later dial failed for a
+    /// different reason, so we can no longer attribute it to the version gate).
+    pub fn clear_incompatible(&self, id: &EndpointId) {
+        self.version_incompatible.remove(id);
+    }
+
+    /// Whether `id`'s last mesh dial failed on the version gate.
+    pub fn is_incompatible(&self, id: &EndpointId) -> bool {
+        self.version_incompatible.contains(id)
     }
 
     /// Registers the peer's shared connection and records that we share
@@ -229,6 +256,9 @@ impl PeerTable {
             }
         }
         self.by_id.insert(endpoint_id, ip);
+        // A live connection just formed, so any prior version-incompatibility flag
+        // is stale (the peer was updated / the ALPN now matches).
+        self.version_incompatible.remove(&endpoint_id);
         if first_ever && let Some(audit) = &self.audit {
             audit.log_connect(ip, &endpoint_id.to_string());
         }
