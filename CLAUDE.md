@@ -28,7 +28,7 @@ ray create | join | leave | nuke | kick | ephemeral | hostname | status
 ray invite | requests | accept | deny | admin        # admission + coordinators
 ray connect | connections | contact | pair | unpair  # direct links + multi-device identity
 ray firewall … | apply | alias | identityof          # policy
-ray send | files | config | mdns | auto-update | update | ping | netcheck | report
+ray send | files | config | gui | mdns | auto-update | update | ping | netcheck | report
 ```
 
 **Privilege (Tailscale operator model):** the always-root daemon does privileged work; clients are unprivileged. The IPC socket is `0666`; authority is a per-request `SO_PEERCRED` UID check (`Daemon::check_authorized`), not socket permissions. Reads are open to any local user; mutations need root or the configured `operator_uid`. Only service management (`install`/`start`/`stop`/`restart`/`uninstall`/`set-operator`/`daemon`) needs `sudo`; `up`/`down` and everything else is IPC. `ray up`/`install` auto-grant operator to `$SUDO_USER`.
