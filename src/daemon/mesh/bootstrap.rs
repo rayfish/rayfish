@@ -31,7 +31,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         let (tun_reader, tun_writer, tun_name) = tun::create(daemon.transport.identity.local_ip(), my_ipv6)
             .await
             .context("failed to create TUN device")?;
-        *daemon.tun_name.lock().unwrap() = tun_name;
+        daemon.tun_name.store(Arc::new(tun_name));
         daemon.attach_tun(tun_reader, tun_writer).await;
     }
 
@@ -198,7 +198,7 @@ async fn build_daemon(
     // and is overwritten when a real interface is attached.
     // Shared with NetworkRegistry (for the leave/teardown DNS search-domain
     // refresh); run_daemon overwrites the string in place once the real TUN is up.
-    let tun_name = Arc::new(std::sync::Mutex::new(String::from("rayfish")));
+    let tun_name = Arc::new(arc_swap::ArcSwap::from_pointee(String::from("rayfish")));
     // Append-only audit log of peer connect/disconnect events. If it can't be
     // opened (e.g. unwritable config dir) the daemon still runs without auditing.
     let peers = match audit::AuditLog::open() {

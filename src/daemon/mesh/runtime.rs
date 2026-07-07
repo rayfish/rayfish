@@ -782,7 +782,7 @@ impl MeshManager {
         // Kotlin side, so these desktop route calls don't apply.
         #[cfg(not(target_os = "android"))]
         {
-            let tun_name = self.tun_name.lock().unwrap().clone();
+            let tun_name = self.tun_name.load().as_str().to_owned();
             if let Err(e) = tun::set_link_up(&tun_name) {
                 tracing::warn!(error = %e, "failed to bring TUN interface up");
                 warnings.push(format!("failed to bring TUN interface up: {e}"));
@@ -817,7 +817,7 @@ impl MeshManager {
         // Clone the TUN name out of the lock before awaiting: the embedder
         // (mobile) stores it behind a mutex, and a std guard can't be held across
         // an await point.
-        let dns_tun_name = self.tun_name.lock().unwrap().clone();
+        let dns_tun_name = self.tun_name.load().as_str().to_owned();
         self.dns.configure(&dns_tun_name, &mut warnings).await;
 
         // Start the embedded mesh SSH server if enabled. It binds the mesh IPs'
@@ -860,7 +860,7 @@ impl MeshManager {
 
         // Clone the TUN name out of the lock before awaiting (see `activate`);
         // the DnsManager reverts system DNS and clears the TUN search domains.
-        let tun_name = self.tun_name.lock().unwrap().clone();
+        let tun_name = self.tun_name.load().as_str().to_owned();
         self.dns.revert(&tun_name).await;
 
         #[cfg(not(target_os = "android"))]
