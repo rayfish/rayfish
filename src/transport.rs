@@ -10,7 +10,7 @@ use iroh::{
     address_lookup::{AddrFilter, PkarrPublisher, PkarrResolver},
     endpoint::Connection,
     endpoint::presets,
-    endpoint::{Builder, QuicTransportConfig},
+    endpoint::{Builder, DirectAddrFilter, QuicTransportConfig},
 };
 use std::borrow::Cow;
 
@@ -142,7 +142,15 @@ async fn bind_endpoint(
         .transport_config(quic_transport_config())
         // Keep rayfish overlay addresses out of the transport candidates we
         // advertise (see `overlay_stripping_filter`).
-        .addr_filter(overlay_stripping_filter());
+        .addr_filter(overlay_stripping_filter())
+        // The definitive fix: drop overlay addresses from the *gathered* local
+        // interface candidates, so a mesh IP bound on the TUN is never stored,
+        // published, or offered as a holepunch / NAT-traversal candidate (and so
+        // never dialed by a peer, which would loop the underlay back through the
+        // tunnel). This covers the in-band NAT-traversal path that `addr_filter`
+        // (publish-only) cannot reach. Stays bound to `0.0.0.0`, so multi-homing /
+        // roaming is unaffected.
+        .direct_addr_filter(OverlayAddrFilter);
 
     // Override the N0 preset's relay / discovery defaults when configured.
     if let Some(mode) = build_relay_mode(relay)? {
@@ -172,13 +180,26 @@ async fn bind_endpoint(
     builder.bind().await.context("failed to bind iroh endpoint")
 }
 
+/// A [`DirectAddrFilter`] that drops rayfish overlay addresses (`100.64.0.0/10`,
+/// `200::/7`) from iroh's gathered local-interface candidates. The mesh IP is bound
+/// on the TUN device; without this iroh would discover it, advertise it (pkarr/DNS
+/// **and** in-band NAT-traversal), and peers would dial it, looping the underlay
+/// back through the tunnel we carry. This filters the candidate set at the source,
+/// so the overlay IP is never stored, published, or holepunched.
+#[derive(Debug)]
+struct OverlayAddrFilter;
+
+impl DirectAddrFilter for OverlayAddrFilter {
+    fn keeps(&self, ip: std::net::IpAddr) -> bool {
+        !crate::membership::is_overlay_ip(ip)
+    }
+}
+
 /// An [`AddrFilter`] that strips rayfish overlay addresses (`100.64.0.0/10`,
-/// `200::/7`) from the transport candidates iroh publishes for this node. The mesh
-/// IP is bound on the TUN interface, so without this filter iroh discovers it as a
-/// local direct address and advertises it via pkarr/DNS; peers then try to reach
-/// us *through the tunnel we carry*, a self-looping path that flaps open/closed and
-/// (before the coordinator's kick-vs-leave fix) could cascade into spurious roster
-/// evictions. Relay and custom (Tor) addresses pass through untouched.
+/// `200::/7`) from the transport candidates iroh publishes for this node. Kept as
+/// defense in depth alongside [`OverlayAddrFilter`], which already removes overlay
+/// IPs from the gathered candidate set (so they never reach the publish path).
+/// Relay and custom (Tor) addresses pass through untouched.
 fn overlay_stripping_filter() -> AddrFilter {
     fn is_overlay(a: &TransportAddr) -> bool {
         matches!(a, TransportAddr::Ip(s) if crate::membership::is_overlay_ip(s.ip()))
