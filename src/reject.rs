@@ -10,7 +10,7 @@
 //!
 //! Dual-stack: IPv4 (ICMP) and IPv6 (ICMPv6) are both handled. All headers and
 //! checksums are built by hand (no extra deps); the one's-complement folding
-//! mirrors [`crate::dns_packet`].
+//! mirrors [`crate::dns::packet`].
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

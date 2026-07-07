@@ -82,7 +82,7 @@ impl Resolver {
         let Some(resp) = self.resolve(dns_query).await else {
             return;
         };
-        if let Some(reply) = crate::dns_packet::build_udp_reply(info, &resp) {
+        if let Some(reply) = crate::dns::packet::build_udp_reply(info, &resp) {
             let _ = tun_tx.send(reply).await;
         }
     }
@@ -181,7 +181,7 @@ mod tests {
             icmp_type: 0,
             icmp_id: 0,
         };
-        let query_pkt = crate::dns_packet::build_udp_reply(
+        let query_pkt = crate::dns::packet::build_udp_reply(
             &crate::firewall::PacketInfo {
                 // reuse builder: swap so the produced packet is app->magic
                 src_ip: app.dst_ip,

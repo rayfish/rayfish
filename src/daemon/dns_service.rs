@@ -23,7 +23,7 @@ pub(crate) struct DnsService {
     /// `.ray` reverse lookup table (IP → hostname).
     pub(crate) reverse_table: dns::ReverseLookupTable,
     /// In-daemon Magic DNS resolver (answers `.ray` queries intercepted via TUN).
-    pub(crate) resolver: std::sync::Arc<crate::dns_resolver::Resolver>,
+    pub(crate) resolver: std::sync::Arc<crate::dns::resolver::Resolver>,
     /// The system-DNS configurator owned while active, so `revert` can undo it.
     configurator: Arc<std::sync::Mutex<Option<Box<dyn dns_config::DnsConfigurator>>>>,
     /// Cancellation token for the `run_resolv_reassert` task (Linux direct mode).
@@ -34,7 +34,7 @@ impl DnsService {
     pub(crate) fn new(
         hostname_table: dns::HostnameTable,
         reverse_table: dns::ReverseLookupTable,
-        resolver: std::sync::Arc<crate::dns_resolver::Resolver>,
+        resolver: std::sync::Arc<crate::dns::resolver::Resolver>,
     ) -> Self {
         Self {
             hostname_table,

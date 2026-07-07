@@ -1,10 +1,17 @@
-//! Magic DNS responder for the `.ray` TLD.
+//! Magic DNS for the `.ray` TLD.
 //!
-//! Answers A, AAAA, PTR, and SOA queries for `*.ray` names. The resolver is
-//! reached via a magic IP (`MAGIC_DNS_V4` = 100.100.100.53) routed through the
-//! TUN, no host-level port 53 bind is made. `handle_query` is called directly
-//! by `forward::run_mesh` when it intercepts a UDP DNS packet destined for the
-//! magic IP.
+//! This module (`mod.rs`) is the `.ray` responder: it answers A, AAAA, PTR, and
+//! SOA queries for `*.ray` names. The resolver is reached via a magic IP
+//! (`MAGIC_DNS_V4` = 100.100.100.53) routed through the TUN, no host-level port
+//! 53 bind is made. `handle_query` is called directly by `forward::run_mesh`
+//! when it intercepts a UDP DNS packet destined for the magic IP.
+//!
+//! Submodules: [`config`] (OS resolver integration), [`resolver`] (in-daemon
+//! resolver reached via the magic IP), [`packet`] (UDP reply synthesis).
+
+pub mod config;
+pub mod packet;
+pub mod resolver;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

@@ -210,7 +210,7 @@ async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> R
     // --- Magic DNS resolver + optional mDNS local discovery ---
     let hostname_table = dns::new_hostname_table();
     let reverse_table = dns::new_reverse_table();
-    let dns_resolver = std::sync::Arc::new(crate::dns_resolver::Resolver::new(
+    let dns_resolver = std::sync::Arc::new(crate::dns::resolver::Resolver::new(
         hostname_table.clone(),
         reverse_table.clone(),
     ));
