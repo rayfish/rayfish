@@ -183,3 +183,11 @@ core-foundation = "0.9"
 [target.'cfg(windows)'.dependencies]
 # Enables ANSI escape processing on legacy Windows consoles (no-op on modern terminals).
 enable-ansi-support = "0.3"
+
+[patch.crates-io]
+# iroh fork adding `Builder::direct_addr_filter` (upstream PR n0-computer/iroh#4397).
+# iroh-base/-dns/-relay are patched too so the fork and registry copies don't clash.
+iroh = { git = "https://github.com/rayfish/iroh", branch = "direct-addr-filter" }
+iroh-base = { git = "https://github.com/rayfish/iroh", branch = "direct-addr-filter" }
+iroh-dns = { git = "https://github.com/rayfish/iroh", branch = "direct-addr-filter" }
+iroh-relay = { git = "https://github.com/rayfish/iroh", branch = "direct-addr-filter" }
