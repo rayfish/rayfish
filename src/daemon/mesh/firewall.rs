@@ -12,7 +12,7 @@ fn save_firewall_warn(config: &firewall::FirewallConfig) {
     }
 }
 
-impl MeshManager {
+impl NetworkRegistry {
     // -----------------------------------------------------------------------
     // Firewall handlers
     // -----------------------------------------------------------------------
@@ -172,7 +172,7 @@ impl MeshManager {
             let mut s = state.write().unwrap();
             s.suggested_firewall = suggestions;
         }
-        update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
         // Nudge connected members to reconverge from the freshly-published signed
         // record now, instead of waiting up to 60s for the group poller. Like the
         // rename flow, this is a payload-free trigger, the suggestions still come
@@ -183,7 +183,7 @@ impl MeshManager {
         // check (local == published) short-circuits and it never re-applies its
         // own authored suggestions. Materialize them here so the coordinator is
         // subject to its own rules like any other member (auto-take or queue).
-        apply_suggested_firewall(&self.firewall, self.endpoint.id(), network, &state);
+        apply_suggested_firewall(&self.firewall, self.transport.endpoint.id(), network, &state);
         IpcMessage::Ok {
             message: format!("published firewall suggestions for '{network}' ({count} subjects)"),
         }
@@ -366,7 +366,7 @@ impl MeshManager {
         // Re-apply suggestions with the new consent setting. With auto-accept on
         // this installs the queued set; with it off it just (re)queues.
         if let Some(h) = self.networks.get(network) {
-            apply_suggested_firewall(&self.firewall, self.endpoint.id(), network, &h.state);
+            apply_suggested_firewall(&self.firewall, self.transport.endpoint.id(), network, &h.state);
         }
         IpcMessage::Ok {
             message: format!(
@@ -428,6 +428,9 @@ impl MeshManager {
     // Mesh SSH (`ray firewall ssh ...`)
     // -----------------------------------------------------------------------
 
+}
+
+impl MeshManager {
     /// Toggle the embedded mesh SSH server. Persists `ssh_enabled`, seeds/removes
     /// the `allow in tcp:22` passthrough so SSH packets reach the listener under
     /// the deny-inbound default, and starts/stops the listeners if the data plane

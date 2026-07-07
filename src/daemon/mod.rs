@@ -830,7 +830,7 @@ impl MeshManager {
                 peer,
                 network,
             } => {
-                self.firewall_add(
+                self.registry.firewall_add(
                     direction,
                     action,
                     protocol,
@@ -840,26 +840,26 @@ impl MeshManager {
                 )
                 .await
             }
-            IpcMessage::FirewallRemove { index } => self.firewall_remove(index),
-            IpcMessage::FirewallShow => self.firewall_show(),
-            IpcMessage::FirewallDefault { action } => self.firewall_default(action),
-            IpcMessage::FirewallReject { enabled } => self.firewall_reject(enabled),
-            IpcMessage::FirewallSetEnabled { enabled } => self.firewall_set_enabled(enabled),
+            IpcMessage::FirewallRemove { index } => self.registry.firewall_remove(index),
+            IpcMessage::FirewallShow => self.registry.firewall_show(),
+            IpcMessage::FirewallDefault { action } => self.registry.firewall_default(action),
+            IpcMessage::FirewallReject { enabled } => self.registry.firewall_reject(enabled),
+            IpcMessage::FirewallSetEnabled { enabled } => self.registry.firewall_set_enabled(enabled),
             IpcMessage::FirewallSuggest {
                 network,
                 suggestions,
-            } => self.firewall_suggest(&network, suggestions).await,
-            IpcMessage::FirewallSuggestions { network } => self.firewall_suggestions(&network),
-            IpcMessage::FirewallPending { network } => self.firewall_pending(&network),
-            IpcMessage::FirewallAccept { network } => self.firewall_accept(&network),
-            IpcMessage::FirewallDeny { network } => self.firewall_deny(&network),
+            } => self.registry.firewall_suggest(&network, suggestions).await,
+            IpcMessage::FirewallSuggestions { network } => self.registry.firewall_suggestions(&network),
+            IpcMessage::FirewallPending { network } => self.registry.firewall_pending(&network),
+            IpcMessage::FirewallAccept { network } => self.registry.firewall_accept(&network),
+            IpcMessage::FirewallDeny { network } => self.registry.firewall_deny(&network),
             IpcMessage::FirewallResolveSuggestions {
                 network,
                 accept,
                 deny,
-            } => self.firewall_resolve_suggestions(&network, &accept, &deny),
+            } => self.registry.firewall_resolve_suggestions(&network, &accept, &deny),
             IpcMessage::FirewallAutoAccept { network, enabled } => {
-                self.firewall_auto_accept(&network, enabled)
+                self.registry.firewall_auto_accept(&network, enabled)
             }
             IpcMessage::FilesAutoAccept { network, enabled } => {
                 self.files_auto_accept(&network, enabled).await
