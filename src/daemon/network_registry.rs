@@ -12,6 +12,7 @@
 //! signalling the daemon through a channel.
 
 use super::*;
+use arc_swap::ArcSwap;
 use std::sync::OnceLock;
 
 pub(crate) struct NetworkRegistry {
@@ -35,7 +36,7 @@ pub(crate) struct NetworkRegistry {
     pub(crate) dns: Arc<DnsService>,
     /// The TUN interface name, shared with the daemon (which sets it once the TUN
     /// is up), for refreshing DNS search domains after a network is torn down.
-    pub(crate) tun_name: Arc<Mutex<String>>,
+    pub(crate) tun_name: Arc<ArcSwap<String>>,
     /// This device's cert loaded at boot, the in-memory fallback for the paired
     /// check when the on-disk cert read errors (see [`Self::current_device_cert`]).
     pub(crate) device_cert: Option<control::DeviceCert>,
@@ -66,7 +67,7 @@ impl NetworkRegistry {
         peers: PeerTable,
         conn: Arc<ConnectionManager>,
         dns: Arc<DnsService>,
-        tun_name: Arc<Mutex<String>>,
+        tun_name: Arc<ArcSwap<String>>,
         device_cert: Option<control::DeviceCert>,
         shutdown_token: CancellationToken,
         firewall: SharedFirewall,
@@ -205,7 +206,7 @@ impl NetworkRegistry {
     /// the mesh ALPN is static) for the teardown path.
     pub(crate) async fn refresh_search_domains(&self) {
         let network_names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
-        let tun_name = self.tun_name.lock().unwrap().clone();
+        let tun_name = self.tun_name.load().as_str().to_owned();
         dns_config::update_search_domains(&network_names, &tun_name).await;
     }
 

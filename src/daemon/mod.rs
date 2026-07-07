@@ -458,7 +458,7 @@ pub struct MeshManager {
     /// interface is attached after construction via [`MeshManager::attach_tun`],
     /// while on desktop it is set once at boot. `Arc` so [`NetworkRegistry`] shares
     /// it for the leave/teardown DNS search-domain refresh.
-    tun_name: Arc<Mutex<String>>,
+    tun_name: Arc<ArcSwap<String>>,
     /// Handles for the packet-forwarding tasks spawned by
     /// [`MeshManager::attach_tun`], kept so a future `down()`/detach can stop them.
     tun_tasks: Mutex<Option<TunTasks>>,
@@ -1374,7 +1374,7 @@ mod accept_handler_tests {
             PeerTable::new(),
             Arc::new(ConnectionManager::new()),
             dns,
-            Arc::new(Mutex::new(String::from("test"))),
+            Arc::new(ArcSwap::from_pointee(String::from("test"))),
             None,
             CancellationToken::new(),
             SharedFirewall::new(firewall::FirewallConfig::default()),
