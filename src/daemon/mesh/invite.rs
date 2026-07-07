@@ -102,9 +102,7 @@ impl NetworkRegistry {
                     expires_secs,
                 }
             }
-            Err(e) => IpcMessage::Error {
-                message: format!("failed to mint invite: {e:#}"),
-            },
+            Err(e) => ipc_err(format!("failed to mint invite: {e:#}")),
         }
     }
 
@@ -119,11 +117,9 @@ impl NetworkRegistry {
         hostname: Option<String>,
     ) -> IpcMessage {
         if hostname.is_some() {
-            return IpcMessage::Error {
-                message: "a reusable key cannot bind a hostname (a multi-use key admits many \
+            return ipc_err("a reusable key cannot bind a hostname (a multi-use key admits many \
                           machines); drop --hostname or omit --reusable"
-                    .to_string(),
-            };
+                    .to_string());
         }
         let (state, dht_notify, net_pubkey, has_key) = match self.networks.get(network) {
             Some(h) => {
@@ -136,16 +132,12 @@ impl NetworkRegistry {
                 )
             }
             None => {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not active"),
-                };
+                return ipc_err(format!("network '{network}' not active"));
             }
         };
         if !has_key {
-            return IpcMessage::Error {
-                message: "only a coordinator (network key holder) can mint a reusable key"
-                    .to_string(),
-            };
+            return ipc_err("only a coordinator (network key holder) can mint a reusable key"
+                    .to_string());
         }
         let secret = crate::invite::generate_secret();
         let (hash, key) =
@@ -170,9 +162,7 @@ impl NetworkRegistry {
         // across `.await`).
         let (lock, has_key, reusable) = {
             let Some(handle) = self.networks.get(network) else {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not active"),
-                };
+                return ipc_err(format!("network '{network}' not active"));
             };
             let s = handle.state.read().unwrap();
             (
@@ -182,11 +172,9 @@ impl NetworkRegistry {
             )
         };
         if !has_key {
-            return IpcMessage::Error {
-                message: format!(
+            return ipc_err(format!(
                     "only a coordinator (network key holder) can list invites for '{network}'"
-                ),
-            };
+                ));
         }
         let mut invites: Vec<ipc::InviteInfo> = Vec::new();
         // Single-use invites from the local ledger (present on the minting node;
@@ -233,9 +221,7 @@ impl NetworkRegistry {
     pub(crate) async fn invite_revoke(&self, network: &str, id: &str) -> IpcMessage {
         let (state, dht_notify, lock, has_key) = {
             let Some(handle) = self.networks.get(network) else {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not active"),
-                };
+                return ipc_err(format!("network '{network}' not active"));
             };
             let has_key = handle.state.read().unwrap().network_secret_key.is_some();
             (
@@ -246,11 +232,9 @@ impl NetworkRegistry {
             )
         };
         if !has_key {
-            return IpcMessage::Error {
-                message: format!(
+            return ipc_err(format!(
                     "only a coordinator (network key holder) can revoke invites for '{network}'"
-                ),
-            };
+                ));
         }
         // A reusable key lives in the signed blob: revoke it there and republish
         // so the revocation propagates to every admin.
@@ -276,22 +260,16 @@ impl NetworkRegistry {
             Ok(()) => IpcMessage::Ok {
                 message: format!("revoked invite '{id}'"),
             },
-            Err(e) => IpcMessage::Error {
-                message: format!("{e:#}"),
-            },
+            Err(e) => ipc_err(format!("{e:#}")),
         }
     }
 
     pub fn list_requests(&self, network: &str) -> IpcMessage {
         let Some(handle) = self.networks.get(network) else {
-            return IpcMessage::Error {
-                message: format!("network '{network}' not active"),
-            };
+            return ipc_err(format!("network '{network}' not active"));
         };
         if !handle.role.is_coordinator() {
-            return IpcMessage::Error {
-                message: format!("only the coordinator of '{network}' has join requests"),
-            };
+            return ipc_err(format!("only the coordinator of '{network}' has join requests"));
         }
         let s = handle.state.read().unwrap();
         let requests = s
@@ -313,9 +291,7 @@ impl NetworkRegistry {
         // Find and remove the pending request matching the short id prefix.
         let pending = {
             let Some(handle) = self.networks.get(network) else {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not active"),
-                };
+                return ipc_err(format!("network '{network}' not active"));
             };
             let mut s = handle.state.write().unwrap();
             let found = s
@@ -329,17 +305,13 @@ impl NetworkRegistry {
             found.and_then(|id| s.pending.remove(&id).map(|pj| (id, pj)))
         };
         let Some((identity, pj)) = pending else {
-            return IpcMessage::Error {
-                message: format!("no pending request matching '{id_prefix}'"),
-            };
+            return ipc_err(format!("no pending request matching '{id_prefix}'"));
         };
 
         let user_id = pj.device_cert.as_ref().map(|c| c.user_identity);
         let (ip, net_pubkey) = {
             let Some(handle) = self.networks.get(network) else {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not active"),
-                };
+                return ipc_err(format!("network '{network}' not active"));
             };
             let net_pubkey = handle.network_key;
             let mut s = handle.state.write().unwrap();
@@ -384,9 +356,7 @@ impl NetworkRegistry {
             return e;
         }
         let Some(handle) = self.networks.get(network) else {
-            return IpcMessage::Error {
-                message: format!("network '{network}' not active"),
-            };
+            return ipc_err(format!("network '{network}' not active"));
         };
         let mut s = handle.state.write().unwrap();
         let found = s
@@ -404,9 +374,7 @@ impl NetworkRegistry {
                     message: format!("denied {}", id.fmt_short()),
                 }
             }
-            None => IpcMessage::Error {
-                message: format!("no pending request matching '{id_prefix}'"),
-            },
+            None => ipc_err(format!("no pending request matching '{id_prefix}'")),
         }
     }
 }

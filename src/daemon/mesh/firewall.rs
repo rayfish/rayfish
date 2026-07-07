@@ -34,9 +34,7 @@ impl NetworkRegistry {
             Some(s) => match firewall::parse_port_list(s) {
                 Ok(ranges) => ranges.into_iter().map(Some).collect(),
                 Err(e) => {
-                    return IpcMessage::Error {
-                        message: e.to_string(),
-                    };
+                    return ipc_err(e.to_string());
                 }
             },
             None => vec![None],
@@ -59,11 +57,9 @@ impl NetworkRegistry {
                     firewall::PeerFilter::Identity(id)
                 }
                 None => {
-                    return IpcMessage::Error {
-                        message: format!(
+                    return ipc_err(format!(
                             "unknown peer '{s}' (try a hostname, mesh IP, short id, or identity)"
-                        ),
-                    };
+                        ));
                 }
             },
             None => firewall::PeerFilter::Any,
@@ -117,9 +113,7 @@ impl NetworkRegistry {
     pub fn firewall_remove(&self, index: usize) -> IpcMessage {
         let len = self.firewall.get_config().rules.len();
         if index >= len {
-            return IpcMessage::Error {
-                message: format!("index {index} out of range (have {len} rules)"),
-            };
+            return ipc_err(format!("index {index} out of range (have {len} rules)"));
         }
         self.edit_firewall(|c| {
             c.rules.remove(index);
@@ -156,16 +150,12 @@ impl NetworkRegistry {
                 (h.state.clone(), h.dht_notify.clone(), has_key)
             }
             None => {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not found"),
-                };
+                return ipc_err(format!("network '{network}' not found"));
             }
         };
         if !has_key {
-            return IpcMessage::Error {
-                message: "only a coordinator (network key holder) can suggest firewall rules"
-                    .to_string(),
-            };
+            return ipc_err("only a coordinator (network key holder) can suggest firewall rules"
+                    .to_string());
         }
         let count: usize = suggestions.len();
         {
@@ -200,9 +190,7 @@ impl NetworkRegistry {
                 let suggestions = h.state.read().unwrap().suggested_firewall.clone();
                 IpcMessage::FirewallSuggestionsResponse { suggestions }
             }
-            None => IpcMessage::Error {
-                message: format!("network '{network}' not found"),
-            },
+            None => ipc_err(format!("network '{network}' not found")),
         }
     }
 
@@ -219,9 +207,7 @@ impl NetworkRegistry {
                     rules: firewall::rule_views(&pending, &short_id),
                 }
             }
-            None => IpcMessage::Error {
-                message: format!("network '{network}' not found"),
-            },
+            None => ipc_err(format!("network '{network}' not found")),
         }
     }
 
@@ -239,9 +225,7 @@ impl NetworkRegistry {
         let h = match self.networks.get(network) {
             Some(h) => h,
             None => {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not found"),
-                };
+                return ipc_err(format!("network '{network}' not found"));
             }
         };
         let accept_set: HashSet<&FirewallRuleView> = accept.iter().collect();
@@ -302,15 +286,11 @@ impl NetworkRegistry {
                 std::mem::take(&mut s.pending_suggestions)
             }
             None => {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not found"),
-                };
+                return ipc_err(format!("network '{network}' not found"));
             }
         };
         if rules.is_empty() {
-            return IpcMessage::Error {
-                message: format!("no pending suggested rules for '{network}'"),
-            };
+            return ipc_err(format!("no pending suggested rules for '{network}'"));
         }
         let count = rules.len();
         let config = self.firewall.replace_network_rules(network, rules);
@@ -331,9 +311,7 @@ impl NetworkRegistry {
                     message: format!("discarded {count} pending suggested rules for '{network}'"),
                 }
             }
-            None => IpcMessage::Error {
-                message: format!("network '{network}' not found"),
-            },
+            None => ipc_err(format!("network '{network}' not found")),
         }
     }
 
@@ -343,29 +321,21 @@ impl NetworkRegistry {
     /// leaves already-installed rules in place but stops future auto-install.
     pub(crate) fn firewall_auto_accept(&self, network: &str, enabled: bool) -> IpcMessage {
         if !self.networks.contains_key(network) {
-            return IpcMessage::Error {
-                message: format!("network '{network}' not found"),
-            };
+            return ipc_err(format!("network '{network}' not found"));
         }
         // Persist the per-network flag.
         match config::load_network(network) {
             Ok(Some(mut nc)) => {
                 nc.auto_accept_firewall = enabled;
                 if let Err(e) = config::save_network(&nc) {
-                    return IpcMessage::Error {
-                        message: format!("failed to persist auto-accept setting: {e}"),
-                    };
+                    return ipc_err(format!("failed to persist auto-accept setting: {e}"));
                 }
             }
             Ok(None) => {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not found in config"),
-                };
+                return ipc_err(format!("network '{network}' not found in config"));
             }
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to load config: {e}"),
-                };
+                return ipc_err(format!("failed to load config: {e}"));
             }
         }
         // Re-apply suggestions with the new consent setting. With auto-accept on
@@ -477,16 +447,12 @@ impl Daemon {
         let mut app_config = match config::load() {
             Ok(c) => c,
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to load config: {e}"),
-                };
+                return ipc_err(format!("failed to load config: {e}"));
             }
         };
         app_config.ssh_enabled = enabled;
         if let Err(e) = config::save_settings(&app_config) {
-            return IpcMessage::Error {
-                message: format!("failed to persist ssh setting: {e}"),
-            };
+            return ipc_err(format!("failed to persist ssh setting: {e}"));
         }
         // Open/close port 22 at the packet layer; SSH-layer authz is the real gate.
         let fw = self.registry.firewall.set_ssh_passthrough(enabled);
@@ -531,15 +497,11 @@ impl Daemon {
         let mut app_config = match config::load() {
             Ok(c) => c,
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to load config: {e}"),
-                };
+                return ipc_err(format!("failed to load config: {e}"));
             }
         };
         if !app_config.networks.iter().any(|n| n.name == network) {
-            return IpcMessage::Error {
-                message: format!("no such network: {network}"),
-            };
+            return ipc_err(format!("no such network: {network}"));
         }
         // Resolve the peer to a stored allow-entry: `*` stays literal, otherwise
         // resolve to the peer's **user identity** hex. `resolve_peer_name` may
@@ -553,9 +515,7 @@ impl Daemon {
             match self.resolve_peer_name(peer).await {
                 Some(id) => self.registry.device_user_map.resolve(&id).to_string(),
                 None => {
-                    return IpcMessage::Error {
-                        message: format!("could not resolve peer: {peer}"),
-                    };
+                    return ipc_err(format!("could not resolve peer: {peer}"));
                 }
             }
         };
@@ -580,9 +540,7 @@ impl Daemon {
         }
         let net = net.clone();
         if let Err(e) = config::save_network(&net) {
-            return IpcMessage::Error {
-                message: format!("failed to persist network config: {e}"),
-            };
+            return ipc_err(format!("failed to persist network config: {e}"));
         }
         // Push the change to any live listener.
         #[cfg(feature = "desktop")]

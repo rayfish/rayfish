@@ -120,9 +120,7 @@ impl NetworkRegistry {
     ) -> Result<IpcMessage> {
         {
             if self.networks.contains_key(name) {
-                return Ok(IpcMessage::Error {
-                    message: format!("network '{name}' already active"),
-                });
+                return Ok(ipc_err(format!("network '{name}' already active")));
             }
         }
 
@@ -335,9 +333,7 @@ impl NetworkRegistry {
             let handle = match self.networks.get(name) {
                 Some(h) => h,
                 None => {
-                    return IpcMessage::Error {
-                        message: format!("not in network '{name}'"),
-                    };
+                    return ipc_err(format!("not in network '{name}'"));
                 }
             };
             let state = handle.state.read().unwrap();
@@ -352,15 +348,11 @@ impl NetworkRegistry {
         };
 
         if !is_coordinator {
-            return IpcMessage::Error {
-                message: "only the coordinator can nuke a network".to_string(),
-            };
+            return ipc_err("only the coordinator can nuke a network".to_string());
         }
 
         if has_other_members && !force {
-            return IpcMessage::Error {
-                message: "network has other members — use --force to destroy, or transfer ownership first".to_string(),
-            };
+            return ipc_err("network has other members — use --force to destroy, or transfer ownership first".to_string());
         }
 
         // Publish empty pkarr record
@@ -405,23 +397,17 @@ impl NetworkRegistry {
                 (h.state.clone(), h.dht_notify.clone(), has_key, mode)
             }
             None => {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not found"),
-                };
+                return ipc_err(format!("network '{network}' not found"));
             }
         };
         if !has_key {
-            return IpcMessage::Error {
-                message: "only a coordinator (network key holder) can kick a member".to_string(),
-            };
+            return ipc_err("only a coordinator (network key holder) can kick a member".to_string());
         }
         if mode == GroupMode::Open {
-            return IpcMessage::Error {
-                message: format!(
+            return ipc_err(format!(
                     "'{network}' is an open network — a kicked peer can re-join immediately. \
                      Kicking only takes effect on a closed network."
-                ),
-            };
+                ));
         }
 
         // Resolve the argument to a roster member. `resolve_peer_name` may hand
@@ -430,9 +416,7 @@ impl NetworkRegistry {
         let candidate = match self.resolve_peer_name(peer).await {
             Some(id) => id,
             None => {
-                return IpcMessage::Error {
-                    message: format!("could not resolve peer '{peer}'"),
-                };
+                return ipc_err(format!("could not resolve peer '{peer}'"));
             }
         };
         let candidate_user = self.device_user_map.resolve(&candidate);
@@ -453,24 +437,18 @@ impl NetworkRegistry {
                         .unwrap_or_else(|| m.identity.fmt_short().to_string()),
                 ),
                 None => {
-                    return IpcMessage::Error {
-                        message: format!("'{peer}' is not a member of '{network}'"),
-                    };
+                    return ipc_err(format!("'{peer}' is not a member of '{network}'"));
                 }
             }
         };
         if member_id == self.transport.endpoint.id() {
-            return IpcMessage::Error {
-                message: "cannot kick yourself — use `ray leave` or `ray nuke`".to_string(),
-            };
+            return ipc_err("cannot kick yourself — use `ray leave` or `ray nuke`".to_string());
         }
         if is_coord {
-            return IpcMessage::Error {
-                message: format!(
+            return ipc_err(format!(
                     "'{display}' is a coordinator (holds the network key); kicking can't remove \
                      its access. Revoke the key instead."
-                ),
-            };
+                ));
         }
 
         // Prune the roster + approved list, then republish the signed blob so the
@@ -521,21 +499,15 @@ impl NetworkRegistry {
         let mut cfg = match config::load_network(network) {
             Ok(Some(c)) => c,
             Ok(None) => {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not found"),
-                };
+                return ipc_err(format!("network '{network}' not found"));
             }
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to load network '{network}': {e}"),
-                };
+                return ipc_err(format!("failed to load network '{network}': {e}"));
             }
         };
         cfg.ephemeral_ttl_secs = ttl_secs;
         if let Err(e) = config::save_network(&cfg) {
-            return IpcMessage::Error {
-                message: format!("failed to save network '{network}': {e}"),
-            };
+            return ipc_err(format!("failed to save network '{network}': {e}"));
         }
         match ttl_secs {
             Some(s) => IpcMessage::Ok {
@@ -554,12 +526,8 @@ impl NetworkRegistry {
                 network: network.to_string(),
                 ttl_secs: c.ephemeral_ttl_secs,
             },
-            Ok(None) => IpcMessage::Error {
-                message: format!("network '{network}' not found"),
-            },
-            Err(e) => IpcMessage::Error {
-                message: format!("failed to load network '{network}': {e}"),
-            },
+            Ok(None) => ipc_err(format!("network '{network}' not found")),
+            Err(e) => ipc_err(format!("failed to load network '{network}': {e}")),
         }
     }
 
@@ -746,11 +714,9 @@ impl Daemon {
         // creates/joins; doesn't rename networks already joined.
         if let Some(h) = hostname {
             if !crate::hostname::is_valid_hostname(&h) {
-                return IpcMessage::Error {
-                    message: format!(
+                return ipc_err(format!(
                         "invalid hostname '{h}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
-                    ),
-                };
+                    ));
             }
             match config::load() {
                 Ok(mut app_config) => {

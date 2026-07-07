@@ -66,9 +66,7 @@ impl Daemon {
             .await
         {
             Ok(resp) => resp,
-            Err(e) => IpcMessage::Error {
-                message: format!("{e:#}"),
-            },
+            Err(e) => ipc_err(format!("{e:#}")),
         }
     }
 
@@ -199,9 +197,7 @@ impl NetworkRegistry {
                         .to_string(),
                 }
             }
-            Err(e) => IpcMessage::Error {
-                message: format!("{e:#}"),
-            },
+            Err(e) => ipc_err(format!("{e:#}")),
         }
     }
 

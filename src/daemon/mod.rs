@@ -69,7 +69,9 @@ use crate::dns_config;
 use crate::firewall::{self, SharedFirewall};
 use crate::forward;
 use crate::identity;
-use crate::ipc::{self, FirewallRuleView, IpcMessage, NetworkRole, NetworkStatus, PeerStatus};
+use crate::ipc::{
+    self, ipc_err, FirewallRuleView, IpcMessage, NetworkRole, NetworkStatus, PeerStatus,
+};
 use crate::membership::{
     ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
     MemberList, canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
@@ -720,11 +722,9 @@ impl Daemon {
 
         // Granting operator access is reserved for root.
         if matches!(req, IpcMessage::SetOperator { .. }) {
-            return Some(IpcMessage::Error {
-                message: "permission denied: granting operator access requires root \
+            return Some(ipc_err("permission denied: granting operator access requires root \
                           (re-run with sudo)"
-                    .to_string(),
-            });
+                    .to_string()));
         }
 
         // Otherwise the caller must be the configured operator.
@@ -733,11 +733,9 @@ impl Daemon {
             return None;
         }
 
-        Some(IpcMessage::Error {
-            message: "permission denied: this user is not authorized to control rayfish.\n\
+        Some(ipc_err("permission denied: this user is not authorized to control rayfish.\n\
                       Grant access with: sudo ray set-operator <user>"
-                .to_string(),
-        })
+                .to_string()))
     }
 
     /// Persist the operator UID so that user can run mutating `ray` commands
@@ -746,16 +744,12 @@ impl Daemon {
         let mut app_config = match config::load() {
             Ok(c) => c,
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to load config: {e}"),
-                };
+                return ipc_err(format!("failed to load config: {e}"));
             }
         };
         app_config.operator_uid = Some(uid);
         if let Err(e) = config::save_settings(&app_config) {
-            return IpcMessage::Error {
-                message: format!("failed to save config: {e}"),
-            };
+            return ipc_err(format!("failed to save config: {e}"));
         }
         IpcMessage::Ok {
             message: format!("operator set to uid {uid}; that user can now run ray without sudo"),
@@ -936,9 +930,7 @@ impl Daemon {
                 interval_ms,
             } => self.ping(&peer, count, interval_ms).await,
             IpcMessage::Netcheck => self.netcheck().await,
-            other => IpcMessage::Error {
-                message: format!("unexpected message: {:?}", other),
-            },
+            other => ipc_err(format!("unexpected message: {:?}", other)),
         }
     }
 
@@ -951,9 +943,7 @@ impl Daemon {
         use crate::hostname;
 
         if !hostname::is_valid_hostname(hostname) {
-            return IpcMessage::Error {
-                message: "invalid hostname (lowercase ASCII, 1-63 chars)".to_string(),
-            };
+            return ipc_err("invalid hostname (lowercase ASCII, 1-63 chars)".to_string());
         }
 
         let (my_ip, is_coord, state, dht_notify) = match self.registry.networks.get(network) {
@@ -964,9 +954,7 @@ impl Daemon {
                 h.dht_notify.clone(),
             ),
             None => {
-                return IpcMessage::Error {
-                    message: format!("network '{}' not found", network),
-                };
+                return ipc_err(format!("network '{}' not found", network));
             }
         };
 

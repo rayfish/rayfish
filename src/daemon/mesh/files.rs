@@ -78,37 +78,29 @@ impl Daemon {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "pairing: could not connect to primary device");
-                return IpcMessage::Error {
-                    message: format!("failed to connect to primary device: {e}"),
-                };
+                return ipc_err(format!("failed to connect to primary device: {e}"));
             }
             Err(_) => {
                 tracing::warn!(
                     timeout_secs = PAIR_CONNECT_TIMEOUT.as_secs(),
                     "pairing: timed out connecting to primary device"
                 );
-                return IpcMessage::Error {
-                    message: "timed out reaching the primary device. Make sure it is online and \
+                return ipc_err("timed out reaching the primary device. Make sure it is online and \
                               that you opened pairing on it (run `ray pair` there)."
-                        .to_string(),
-                };
+                        .to_string());
             }
         };
         let (mut send, mut recv) = match conn.open_bi().await {
             Ok(pair) => pair,
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to open stream: {e}"),
-                };
+                return ipc_err(format!("failed to open stream: {e}"));
             }
         };
 
         let secret_arr: [u8; 32] = match secret.try_into() {
             Ok(a) => a,
             Err(_) => {
-                return IpcMessage::Error {
-                    message: "invalid secret length".to_string(),
-                };
+                return ipc_err("invalid secret length".to_string());
             }
         };
 
@@ -119,57 +111,41 @@ impl Daemon {
         let request_bytes = match rmp_serde::to_vec_named(&request) {
             Ok(b) => b,
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to encode pair request: {e}"),
-                };
+                return ipc_err(format!("failed to encode pair request: {e}"));
             }
         };
         let len = (request_bytes.len() as u32).to_be_bytes();
         if let Err(e) = send.write_all(&len).await {
-            return IpcMessage::Error {
-                message: format!("failed to send pair request: {e}"),
-            };
+            return ipc_err(format!("failed to send pair request: {e}"));
         }
         if let Err(e) = send.write_all(&request_bytes).await {
-            return IpcMessage::Error {
-                message: format!("failed to send pair request: {e}"),
-            };
+            return ipc_err(format!("failed to send pair request: {e}"));
         }
 
         // Read PairResponse
         let mut len_buf = [0u8; 4];
         if let Err(e) = recv.read_exact(&mut len_buf).await {
-            return IpcMessage::Error {
-                message: format!("failed to read pair response: {e}"),
-            };
+            return ipc_err(format!("failed to read pair response: {e}"));
         }
         let body_len = u32::from_be_bytes(len_buf) as usize;
         let mut body = vec![0u8; body_len];
         if let Err(e) = recv.read_exact(&mut body).await {
-            return IpcMessage::Error {
-                message: format!("failed to read pair response body: {e}"),
-            };
+            return ipc_err(format!("failed to read pair response body: {e}"));
         }
         let response: control::PairMsg = match rmp_serde::from_slice(&body) {
             Ok(r) => r,
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to decode pair response: {e}"),
-                };
+                return ipc_err(format!("failed to decode pair response: {e}"));
             }
         };
 
         match response {
             control::PairMsg::Response { cert, networks } => {
                 if !cert.verify() {
-                    return IpcMessage::Error {
-                        message: "received invalid device certificate".to_string(),
-                    };
+                    return ipc_err("received invalid device certificate".to_string());
                 }
                 if let Err(e) = identity::store_device_cert(&cert) {
-                    return IpcMessage::Error {
-                        message: format!("failed to store device certificate: {e}"),
-                    };
+                    return ipc_err(format!("failed to store device certificate: {e}"));
                 }
                 // Auto-join every network the primary shared. Each join attaches the
                 // freshly stored cert (see current_device_cert) so the coordinator,
@@ -216,9 +192,7 @@ impl Daemon {
                     user_identity: cert.user_identity,
                 }
             }
-            _ => IpcMessage::Error {
-                message: "unexpected pairing response".to_string(),
-            },
+            _ => ipc_err("unexpected pairing response".to_string()),
         }
     }
 
@@ -240,24 +214,18 @@ impl Daemon {
         // Only the primary holds the user identity secret that signs both the
         // certs and their revocation. A secondary carries a device cert.
         if self.current_device_cert().is_some() {
-            return IpcMessage::Error {
-                message: "only your primary device can unpair a device".to_string(),
-            };
+            return ipc_err("only your primary device can unpair a device".to_string());
         }
         let own_user = self.transport.endpoint.id();
 
         let target = match self.resolve_peer_flexible(device).await {
             Some(id) => id,
             None => {
-                return IpcMessage::Error {
-                    message: format!("could not resolve device '{device}'"),
-                };
+                return ipc_err(format!("could not resolve device '{device}'"));
             }
         };
         if target == own_user {
-            return IpcMessage::Error {
-                message: "that is your primary device, not a paired secondary".to_string(),
-            };
+            return ipc_err("that is your primary device, not a paired secondary".to_string());
         }
 
         // Best-effort: ask the device to wipe its own cert while the link is still
@@ -271,7 +239,7 @@ impl Daemon {
             Ok(display) => IpcMessage::Ok {
                 message: format!("unpaired '{display}' and nullified its device certificate"),
             },
-            Err(message) => IpcMessage::Error { message },
+            Err(message) => ipc_err(message),
         }
     }
 

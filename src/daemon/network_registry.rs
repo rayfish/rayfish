@@ -147,9 +147,7 @@ impl NetworkRegistry {
     /// hand-off to the daemon loop). A device with no cert (a primary) is a no-op.
     pub(crate) async fn unpair_self(&self) -> IpcMessage {
         if self.current_device_cert().is_none() {
-            return IpcMessage::Error {
-                message: "this device is not paired to a primary".to_string(),
-            };
+            return ipc_err("this device is not paired to a primary".to_string());
         }
         // Leave every live network first (graceful close + config removal).
         let networks: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
@@ -172,9 +170,7 @@ impl NetworkRegistry {
             ),
             Err(e) => {
                 tracing::warn!(error = %e, "unpair: failed to delete device cert");
-                return IpcMessage::Error {
-                    message: format!("left all networks but failed to delete device cert: {e}"),
-                };
+                return ipc_err(format!("left all networks but failed to delete device cert: {e}"));
             }
         }
         IpcMessage::Ok {
@@ -246,9 +242,7 @@ impl NetworkRegistry {
                 message: format!("left network '{}'", name),
             }
         } else {
-            IpcMessage::Error {
-                message: format!("network '{}' not found", name),
-            }
+            ipc_err(format!("network '{}' not found", name))
         }
     }
 
@@ -265,14 +259,10 @@ impl NetworkRegistry {
         network: &str,
     ) -> std::result::Result<(EndpointId, Arc<tokio::sync::Mutex<()>>), IpcMessage> {
         let Some(handle) = self.networks.get(network) else {
-            return Err(IpcMessage::Error {
-                message: format!("network '{network}' not active"),
-            });
+            return Err(ipc_err(format!("network '{network}' not active")));
         };
         if !handle.role.is_coordinator() {
-            return Err(IpcMessage::Error {
-                message: format!("only the coordinator of '{network}' can manage invites/requests"),
-            });
+            return Err(ipc_err(format!("only the coordinator of '{network}' can manage invites/requests")));
         }
         Ok((handle.network_key, handle.invite_lock.clone()))
     }
@@ -345,9 +335,7 @@ impl NetworkRegistry {
         let net_public_key = net_secret_key.public();
 
         if self.networks.contains_key(&name) {
-            return Ok(IpcMessage::Error {
-                message: format!("network '{name}' already active"),
-            });
+            return Ok(ipc_err(format!("network '{name}' already active")));
         }
 
         let my_ip = self.transport.identity.local_ip();

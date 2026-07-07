@@ -11,11 +11,9 @@ impl NetworkRegistry {
     /// grant is recorded locally for `ray admin list`.
     pub(crate) async fn admin_add(&self, network: &str, identity_str: &str) -> IpcMessage {
         let Some(identity) = self.resolve_short_id_any_network(identity_str) else {
-            return IpcMessage::Error {
-                message: format!(
+            return ipc_err(format!(
                     "could not resolve identity '{identity_str}' (use a short id of a joined member)"
-                ),
-            };
+                ));
         };
         let (net_pubkey, net_secret_key) = match self.networks.get(network) {
             Some(h) => {
@@ -24,23 +22,17 @@ impl NetworkRegistry {
                     s.network_secret_key.clone()
                 };
                 if key.is_none() {
-                    return IpcMessage::Error {
-                        message: "only a coordinator (network key holder) can grant admin"
-                            .to_string(),
-                    };
+                    return ipc_err("only a coordinator (network key holder) can grant admin"
+                            .to_string());
                 }
                 (h.network_key, key)
             }
             None => {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not active"),
-                };
+                return ipc_err(format!("network '{network}' not active"));
             }
         };
         let Some(net_secret_key) = net_secret_key else {
-            return IpcMessage::Error {
-                message: "network key not available".to_string(),
-            };
+            return ipc_err("network key not available".to_string());
         };
 
         // The target must be a member of this network. Send the grant over the
@@ -54,11 +46,9 @@ impl NetworkRegistry {
             .into_iter()
             .find(|(id, _, _)| *id == identity)
             .map(|(_, _, c)| c)
-            .ok_or_else(|| IpcMessage::Error {
-                message: format!(
+            .ok_or_else(|| ipc_err(format!(
                     "could not find an active connection to {identity} on '{network}'"
-                ),
-            });
+                )));
         let conn = match conn {
             Ok(c) => c,
             Err(e) => return e,
@@ -76,15 +66,11 @@ impl NetworkRegistry {
                     let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
                 }
                 Err(e) => {
-                    return IpcMessage::Error {
-                        message: format!("failed to send admin grant: {e}"),
-                    };
+                    return ipc_err(format!("failed to send admin grant: {e}"));
                 }
             },
             Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("failed to open stream to {identity}: {e}"),
-                };
+                return ipc_err(format!("failed to open stream to {identity}: {e}"));
             }
         }
 
@@ -92,9 +78,7 @@ impl NetworkRegistry {
         // joiners can discover co-coordinators to dial.
         {
             let Some(handle) = self.networks.get(network) else {
-                return IpcMessage::Error {
-                    message: format!("network '{network}' not active"),
-                };
+                return ipc_err(format!("network '{network}' not active"));
             };
             let mut s = handle.state.write().unwrap();
             crate::membership::mark_coordinator(&mut s.members, &identity);
@@ -140,9 +124,7 @@ impl NetworkRegistry {
             }
         }
         if !self_holds_key && admins.is_empty() {
-            return IpcMessage::Error {
-                message: format!("network '{network}' not found or not a coordinator"),
-            };
+            return ipc_err(format!("network '{network}' not found or not a coordinator"));
         }
         IpcMessage::AdminListResponse { admins }
     }
