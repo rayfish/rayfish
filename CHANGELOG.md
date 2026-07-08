@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Desktop data plane no longer wedges after an on-demand dial.** The desktop TUN
+  read grew the packet pool before its `await` and truncated after, so when
+  `run_mesh` cancelled the read (which it does the moment a lazy dial completes) the
+  pool kept stray bytes. Every subsequent packet was then read at the wrong offset
+  and parsed as garbage, silently killing all forwarding and Magic DNS until a
+  restart. The read is now cancel-safe (reads into an owned buffer, commits to the
+  pool only after the read returns).
+
 - **Android: disabling the VPN now fully tears the tunnel down.** Turning the
   tunnel off dropped the mesh connection but left the VPN interface up (the key
   icon stayed and the `tun` device lingered), because the offline path closed the
@@ -25,15 +33,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **On-demand mesh connections (near-zero idle battery), opt-in.** When enabled, a
-  node connects to a peer lazily, on the first packet that needs it, instead of
-  dialing every roster member at startup and holding those connections for the whole
-  session. A connection with no traffic for the idle timeout (default 120s) is
-  closed, so an idle node keeps zero peer connections and stops waking the radio for
-  QUIC keepalives; the link re-forms on the next packet either side sends. **Off by
-  default** (`ray config set on-demand on` to enable, `idle_timeout_secs` tunes the
-  window): idle teardown only holds when every peer honors the idle close, so a
-  mixed fleet would otherwise flap the link. The mobile app enables it automatically.
+- **On-demand mesh connections (near-zero idle battery).** A node connects to a
+  peer lazily, on the first packet that needs it, instead of dialing every roster
+  member at startup and holding those connections for the whole session. A
+  connection with no traffic for the idle timeout (default 120s) is closed, so an
+  idle node keeps zero peer connections and stops waking the radio for QUIC
+  keepalives; the link re-forms on the next packet either side sends. On by default;
+  turn it off with `ray config set on-demand off` (and `idle_timeout_secs` tunes the
+  window).
 - **`ray config` now covers the `auto-update` and `on-demand` toggles.** Both
   on/off daemon settings are settable through the standard config surface (e.g.
   `ray config set on-demand off`, `ray config set auto-update on`,

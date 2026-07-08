@@ -336,7 +336,7 @@ pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) ->
         // On/off toggles: `set <key> on|off`, or `unset <key>` (empty value) to
         // return to the default. `--replace` is meaningless here and ignored.
         "auto-update" => cfg.auto_update = parse_bool_setting(value, false)?,
-        "on-demand" => cfg.on_demand = parse_bool_setting(value, false)?,
+        "on-demand" => cfg.on_demand = parse_bool_setting(value, true)?,
         other => anyhow::bail!("unknown config key: {other} ({CONFIG_KEYS})"),
     }
     Ok(())
@@ -443,12 +443,9 @@ pub struct AppConfig {
     /// the roster locally, dials a peer lazily on the first outgoing packet that
     /// needs it, and tears down connections idle past [`idle_timeout_secs`].
     ///
-    /// **Off by default** (opt-in): idle teardown only holds if *every* peer honors
-    /// the idle close and declines to reconnect, so a mixed fleet (or a peer that
-    /// keeps re-dialing) flaps the link and churns the relay. Battery-constrained
-    /// nodes turn it on explicitly (`ray config set on-demand on`); the mobile
-    /// embedder forces it on regardless of this default.
-    #[serde(default)]
+    /// On by default; a latency-sensitive server or always-push coordinator can turn
+    /// it off (`ray config set on-demand off`) to stay eagerly connected.
+    #[serde(default = "default_true")]
     pub on_demand: bool,
     /// Seconds of no traffic before an on-demand node closes a peer connection.
     /// `None` uses [`DEFAULT_IDLE_TIMEOUT_SECS`]. Only consulted when `on_demand`.
@@ -507,7 +504,7 @@ impl Default for AppConfig {
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
             ssh_enabled: false,
-            on_demand: false,
+            on_demand: true,
             idle_timeout_secs: None,
             auto_update: false,
             auto_update_last_target: None,
