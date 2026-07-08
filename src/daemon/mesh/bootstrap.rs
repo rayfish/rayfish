@@ -21,7 +21,9 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // the desktop OS TUN device below. The headless builder is the same one
     // `build_headless()` exposes to embedders (mobile), so both paths share
     // identical construction.
-    let daemon = build_daemon(token.clone(), stats).await?;
+    // Desktop honors the persisted `on_demand` config (default off); the mobile
+    // embedder forces it on via `build_headless`.
+    let daemon = build_daemon(token.clone(), stats, None).await?;
 
     // Attach the real OS TUN device: create it, record its name, and spawn the
     // writer + `run_mesh` forwarding loop. On Android the packet interface is a
@@ -98,10 +100,10 @@ fn initial_alpns(_app_config: &config::AppConfig) -> Vec<Vec<u8>> {
 /// the OS TUN device and the Unix-socket IPC server: the caller supplies a
 /// packet interface via [`Daemon::attach_tun`]. The returned daemon is on
 /// standby (no data plane), with its saved networks' control plane connected.
-pub async fn build_headless() -> Result<Arc<Daemon>> {
+pub async fn build_headless(on_demand: bool) -> Result<Arc<Daemon>> {
     let token = CancellationToken::new();
     let stats = Arc::new(ForwardMetrics::default());
-    let daemon = build_daemon(token, stats).await?;
+    let daemon = build_daemon(token, stats, Some(on_demand)).await?;
     // Bring the saved networks' control plane up, matching `run_daemon`.
     daemon.registry.connect_all_networks().await;
     // Control readers and the join path now run their network ops (promotion,
@@ -117,7 +119,11 @@ pub async fn build_headless() -> Result<Arc<Daemon>> {
 /// receiver and metrics-server guard are stashed on the state for the caller.
 ///
 /// Shared by [`run_daemon`] (desktop) and [`build_headless`] (embedders).
-async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<Arc<Daemon>> {
+async fn build_daemon(
+    token: CancellationToken,
+    stats: Arc<ForwardMetrics>,
+    on_demand_override: Option<bool>,
+) -> Result<Arc<Daemon>> {
     // Relocate a pre-/etc config tree into /etc/rayfish (Linux upgrade path)
     // before anything reads identity or config. No-op on macOS / once migrated.
     config::migrate_location();
@@ -142,6 +148,9 @@ async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> R
 
     // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
     let mut app_config = config::load()?;
+    // On-demand mode: the platform (mobile embedder) may force it; otherwise honor
+    // config (on by default). Computed here so it can thread into the registry.
+    let on_demand = on_demand_override.unwrap_or(app_config.on_demand);
     // Point the pkarr client at the configured discovery-DNS server (if any)
     // before any record publish/resolve happens.
     dht::set_discovery_override(&app_config.discovery_dns);
@@ -267,6 +276,7 @@ async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> R
         tun_tx.clone(),
         pruned_peers.clone(),
         disconnect_tx.clone(),
+        on_demand,
     ));
     // FileService owns file transfer + pairing. It evaluates own-device auto-accept
     // directly (no worker channel) and clears a re-paired device's nullifier by
@@ -307,6 +317,15 @@ async fn build_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> R
                 .run_connection_supervisor(disconnect_rx, token)
                 .await;
         });
+    }
+
+    // On-demand idle reaper: closes peer connections idle past the timeout so the
+    // node returns to zero connections (no keepalive radio) when there's no
+    // traffic. Only on on-demand nodes; the link re-forms lazily on the next packet.
+    if on_demand {
+        registry
+            .clone()
+            .spawn_idle_reaper(app_config.idle_timeout());
     }
 
     // Install the daemon-wide mesh dispatch context and spawn the protocol Router

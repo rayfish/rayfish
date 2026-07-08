@@ -94,6 +94,13 @@ pub fn dot_offline() -> String {
     faint("○")
 }
 
+/// A muted filled dot for idle peers: a known roster member with no live link
+/// (dialed on demand). Distinct from the green online dot and the hollow offline
+/// dot: present, presumed reachable, just not currently connected.
+pub fn dot_idle() -> String {
+    paint("38;5;245", "●")
+}
+
 /// Success check mark.
 pub fn check() -> String {
     green("✓")

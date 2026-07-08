@@ -76,6 +76,12 @@ pub struct ForwardMetrics {
     pub drops: Family<DropLabels, Counter>,
     /// REJECT replies sent (TCP RST / ICMP unreachable) when fail-fast mode is on
     pub rejects_sent: Counter,
+    /// On-demand lazy dials triggered by an outgoing packet to an unconnected peer
+    pub lazy_dials: Counter,
+    /// On-demand lazy dials that failed or timed out (peer stayed unconnected)
+    pub lazy_dials_failed: Counter,
+    /// Peer connections closed by the on-demand idle reaper
+    pub idle_teardowns: Counter,
 }
 
 impl ForwardMetrics {
@@ -95,6 +101,20 @@ impl ForwardMetrics {
 
     pub fn record_reject(&self) {
         self.rejects_sent.inc();
+    }
+
+    /// Record an on-demand lazy dial attempt and, when `connected` is false, that it
+    /// failed to bring the peer up.
+    pub fn record_lazy_dial(&self, connected: bool) {
+        self.lazy_dials.inc();
+        if !connected {
+            self.lazy_dials_failed.inc();
+        }
+    }
+
+    /// Record a connection closed by the idle reaper.
+    pub fn record_idle_teardown(&self) {
+        self.idle_teardowns.inc();
     }
 
     fn drop_count(&self, reason: DropReason) -> u64 {

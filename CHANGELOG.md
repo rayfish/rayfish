@@ -25,6 +25,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **On-demand mesh connections (near-zero idle battery).** Nodes now connect to a
+  peer lazily, on the first packet that needs it, instead of dialing every roster
+  member at startup and holding those connections for the whole session. A
+  connection with no traffic for the idle timeout (default 120s) is closed, so an
+  idle node keeps zero peer connections and stops waking the radio for QUIC
+  keepalives. The link re-forms automatically on the next packet either side sends.
+  This is on by default; set `on_demand = false` in `settings.toml` to keep the old
+  eager-connect behavior, and `idle_timeout_secs` tunes the teardown window.
+- **`ray config` now covers the `auto-update` and `on-demand` toggles.** Both
+  on/off daemon settings are settable through the standard config surface (e.g.
+  `ray config set on-demand off`, `ray config set auto-update on`,
+  `ray config unset on-demand`), and bare `ray config` lists their current value
+  alongside relay/discovery-dns/dns-upstreams. `ray auto-update on|off` still works
+  as a shorthand.
+- **`ray status` shows peers as idle, active, or offline.** With on-demand
+  connections a reachable peer usually has no live link, so status now renders three
+  states (Tailscale-style): `active` (connected now), `idle` (a roster member with
+  no current link, presumed reachable), and `offline` (only after an actual reach
+  attempt failed). `ray ping <peer>` dials on demand and refreshes a peer's state.
+
 - **Static musl Linux binaries.** Every release and nightly now also ships
   `ray-linux-{x86_64,aarch64}-musl`: fully static builds with no glibc dependency
   that run on any Linux, including musl distros (Alpine) and hosts with a glibc
