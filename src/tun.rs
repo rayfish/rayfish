@@ -1,7 +1,8 @@
 //! TUN device creation and I/O.
 //!
-//! The device is immediately split into [`TunReader`] and [`TunWriter`] halves
-//! so that reads and writes can happen concurrently without locking.
+//! The device is a single `tun-rs` [`AsyncDevice`] shared (via `Arc`) between a
+//! [`TunReader`] and a [`TunWriter`]; its `recv`/`send` take `&self`, so reads
+//! and writes run concurrently without a split or a lock.
 
 // These support the desktop TUN setup (address/route/link configuration via
 // `ifconfig`/`ip`/netlink) and the CGNAT preflight, none of which compile on
@@ -10,15 +11,15 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(not(target_os = "android"))]
 use std::process::Command;
+#[cfg(not(target_os = "android"))]
+use std::sync::Arc;
 
 #[cfg(not(target_os = "android"))]
 use anyhow::{Context, Result, bail};
-// The desktop TUN device (the `tun` crate) and its async I/O helpers only exist
-// off Android, where the packet interface is a `VpnService` fd instead.
+// The desktop TUN device (the `tun-rs` crate) only exists off Android, where the
+// packet interface is a `VpnService` fd instead.
 #[cfg(not(target_os = "android"))]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(not(target_os = "android"))]
-use tun::{Configuration, DeviceReader, DeviceWriter};
+use tun_rs::{AsyncDevice, DeviceBuilder};
 
 /// Read side of a packet interface. Fills the spare capacity of `buf` with one
 /// IP packet and returns the number of bytes read. Abstracts the concrete TUN
@@ -49,23 +50,35 @@ pub trait TunWrite: Send + 'static {
 
 /// MTU for the TUN device. IPv6 mandates a minimum link MTU of 1280 bytes
 /// (RFC 8200 §5); Linux refuses to enable IPv6 on a device with a smaller MTU,
-/// which silently breaks IPv6 address/route installation (`configure_ipv6` /
-/// `route_peer_range` fail with `EINVAL`). 1280 is also the value WireGuard and
+/// which silently breaks IPv6 address/route installation (the builder's IPv6
+/// assignment / `route_peer_range` fail with `EINVAL`). 1280 is also the value
+/// WireGuard and
 /// Tailscale use for their TUN interfaces for the same reason, and it still
 /// fits within QUIC datagram limits.
 #[cfg(not(target_os = "android"))]
 const TUN_MTU: u16 = 1280;
 
-/// Read half of the TUN device. Owned by [`forward::run_mesh`].
+/// Bytes exposed for a single `recv`. A TUN read yields at most one MTU-bounded
+/// packet (offload is off), plus a few bytes of slack for any platform
+/// packet-info header. `recv` needs an initialised `&mut [u8]`, so we zero-fill
+/// this many bytes at the tail of the caller's pool before each read; a hand-set
+/// jumbo MTU beyond this would be truncated, but such a packet exceeds the path
+/// MTU and could not traverse a QUIC datagram anyway.
+#[cfg(not(target_os = "android"))]
+const READ_RESERVE: usize = TUN_MTU as usize + 4;
+
+/// Read half of the TUN device. Owned by [`forward::run_mesh`]. Holds a clone of
+/// the shared [`AsyncDevice`]; `recv` takes `&self`, so the reader and writer
+/// share one device without a lock.
 #[cfg(not(target_os = "android"))]
 pub struct TunReader {
-    reader: DeviceReader,
+    dev: Arc<AsyncDevice>,
 }
 
 /// Write half of the TUN device. Owned by [`forward::spawn_tun_writer`].
 #[cfg(not(target_os = "android"))]
 pub struct TunWriter {
-    writer: DeviceWriter,
+    dev: Arc<AsyncDevice>,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -114,98 +127,35 @@ pub fn check_cgnat_conflict() -> Result<()> {
     Ok(())
 }
 
-/// Creates a TUN device with the given virtual IPs and splits it into
-/// independent read/write halves. IPv4 gets a /10 netmask (100.64.0.0/10);
-/// IPv6 gets a /7 prefix (`200::/7`) so the kernel installs the connected
-/// route for the whole peer range, mirroring how the IPv4 /10 netmask works.
+/// Creates a TUN device with the given virtual IPs and shares it between
+/// independent read/write halves. IPv4 gets a /10 (100.64.0.0/10); IPv6 gets our
+/// own /128 address. The `200::/7` peer range is routed in separately by
+/// [`route_peer_range`] after link-up (the kernel does not reliably install an
+/// IPv6 connected route while the link is down), mirroring how the IPv4 /10 works.
 #[cfg(not(target_os = "android"))]
 pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
     let gateway = Ipv4Addr::new(100, 64, 0, 1);
-    let mut config = Configuration::default();
-    config
-        .address(v4)
-        .destination(gateway)
-        .netmask((255, 192, 0, 0)) // /10
+    // `10` is the /10 prefix (was the (255,192,0,0) netmask); `Some(gateway)` is
+    // the point-to-point destination. `ipv6(v6, 128)` assigns just our own
+    // address (a /128, no connected route) cross-platform, replacing the old
+    // netlink/`ifconfig` `configure_ipv6` shell-out. `enable(true)` brings the
+    // link up at creation (as the old `.up()` did); `set_link_up` and the
+    // peer-range route helpers still run later on activate.
+    let device = DeviceBuilder::new()
+        .ipv4(v4, 10, Some(gateway))
+        .ipv6(v6, 128)
         .mtu(TUN_MTU)
-        .up();
+        .enable(true)
+        .build_async()
+        .context("create tun-rs device")?;
 
-    #[cfg(target_os = "linux")]
-    config.platform_config(|p| {
-        p.ensure_root_privileges(true);
-    });
-
-    let device = tun::create_as_async(&config)?;
-    let tun_name = device
-        .as_ref()
-        .tun_name()
-        .unwrap_or_else(|_| "unknown".to_string());
+    let tun_name = device.name().unwrap_or_else(|_| "unknown".to_string());
     tracing::info!(addr = %v4, ipv6 = %v6, tun = %tun_name, "TUN device created");
 
-    if let Err(e) = configure_ipv6(&tun_name, v6).await {
-        tracing::warn!(error = %e, "failed to configure IPv6 on TUN (IPv6 routing will not work)");
-    }
-
-    let (writer, reader) = device.split()?;
-    Ok((TunReader { reader }, TunWriter { writer }, tun_name))
-}
-
-/// Assigns the TUN's own IPv6 address. The `200::/7` peer range is routed into
-/// the TUN separately by [`route_peer_range`], which must run *after* the link
-/// is up: assigning the address here at creation time (link still down) is not
-/// enough on Linux, where the kernel does not reliably install the connected
-/// route until the interface comes up.
-#[cfg(target_os = "linux")]
-async fn configure_ipv6(tun_name: &str, addr: Ipv6Addr) -> Result<()> {
-    use futures::TryStreamExt;
-    use std::net::IpAddr;
-
-    let (connection, handle, _) = rtnetlink::new_connection().context("open netlink socket")?;
-    // The connection future must be polled while we use the handle; abort it
-    // once configuration is done.
-    let conn = tokio::spawn(connection);
-
-    let result = async {
-        let index = handle
-            .link()
-            .get()
-            .match_name(tun_name.to_owned())
-            .execute()
-            .try_next()
-            .await
-            .context("query TUN link")?
-            .with_context(|| format!("TUN link {tun_name} not found"))?
-            .header
-            .index;
-
-        // /128: just our own address. The peer-range route is added explicitly
-        // after link-up in `route_peer_range`. `replace()` keeps it idempotent
-        // across daemon restarts.
-        handle
-            .address()
-            .add(index, IpAddr::V6(addr), 128)
-            .replace()
-            .execute()
-            .await
-            .context("add IPv6 address via netlink")?;
-
-        Ok(())
-    }
-    .await;
-
-    conn.abort();
-    result
-}
-
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-async fn configure_ipv6(tun_name: &str, addr: Ipv6Addr) -> Result<()> {
-    // macOS has no netlink; assign the address via the BSD tools. The peer-range
-    // route is added separately by `route_peer_range` after link-up.
-    let status = Command::new("ifconfig")
-        .args([tun_name, "inet6", &addr.to_string(), "prefixlen", "128"])
-        .status()
-        .context("run ifconfig")?;
-    anyhow::ensure!(status.success(), "ifconfig inet6 failed with {status}");
-    Ok(())
+    // `recv`/`send` take `&self`, so both halves share one device via `Arc`
+    // instead of splitting into independent read/write objects.
+    let dev = Arc::new(device);
+    Ok((TunReader { dev: dev.clone() }, TunWriter { dev }, tun_name))
 }
 
 /// Routes the peer ranges into the TUN. Must be called *after* the interface is
@@ -390,7 +340,11 @@ pub async fn route_self_loopback(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(not(target_os = "macos"), not(target_os = "android"), not(target_os = "freebsd")))]
+#[cfg(all(
+    not(target_os = "macos"),
+    not(target_os = "android"),
+    not(target_os = "freebsd")
+))]
 pub async fn route_self_loopback(_v4: Ipv4Addr, _v6: Ipv6Addr) -> Result<()> {
     // Linux installs the loopback `local` route automatically on address
     // assignment; self-traffic already works without an explicit route.
@@ -436,11 +390,17 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
 
 #[cfg(not(target_os = "android"))]
 impl TunRead for TunReader {
-    /// Reads one packet from the TUN device, appending into the spare capacity
-    /// of `buf` without zeroing or reallocating. The caller MUST ensure `buf`
-    /// has at least one MTU of spare capacity. Returns the number of bytes read.
+    /// Reads one packet from the TUN device, appending it to `buf`. tun-rs has no
+    /// `ReadBuf`/`AsyncRead` (what `read_buf` uses to fill uninitialised capacity),
+    /// only `recv(&mut [u8])`, so we expose an initialised `READ_RESERVE`-byte tail
+    /// on the caller's pool, read into it, then truncate to the packet length. The
+    /// packet lands directly in `buf`'s allocation, preserving the caller's
+    /// zero-copy `split_to(n).freeze()` hand-off.
     async fn read_into(&mut self, buf: &mut bytes::BytesMut) -> anyhow::Result<usize> {
-        let n = self.reader.read_buf(buf).await?;
+        let start = buf.len();
+        buf.resize(start + READ_RESERVE, 0);
+        let n = self.dev.recv(&mut buf[start..]).await?;
+        buf.truncate(start + n);
         Ok(n)
     }
 }
@@ -448,7 +408,7 @@ impl TunRead for TunReader {
 #[cfg(not(target_os = "android"))]
 impl TunWrite for TunWriter {
     async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
-        self.writer.write_all(packet).await?;
+        self.dev.send(packet).await?;
         Ok(())
     }
 }
