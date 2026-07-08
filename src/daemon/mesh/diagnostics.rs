@@ -375,7 +375,9 @@ impl Daemon {
         let route = match self.registry.peers.lookup_v4(&ip) {
             Some(r) => r,
             None => {
-                return ipc_err(format!("{display} is not connected (no live mesh link to {ip})"));
+                return ipc_err(format!(
+                    "{display} is not connected (no live mesh link to {ip})"
+                ));
             }
         };
         let conn = route.conn;

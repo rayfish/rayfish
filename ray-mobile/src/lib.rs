@@ -852,9 +852,11 @@ impl Node {
         let parsed: Vec<SocketAddr> = servers
             .iter()
             .filter_map(|s| {
-                s.parse::<SocketAddr>()
-                    .ok()
-                    .or_else(|| s.parse::<Ipv4Addr>().ok().map(|ip| SocketAddr::from((ip, 53u16))))
+                s.parse::<SocketAddr>().ok().or_else(|| {
+                    s.parse::<Ipv4Addr>()
+                        .ok()
+                        .map(|ip| SocketAddr::from((ip, 53u16)))
+                })
             })
             .collect();
         state.set_dns_upstream_addrs(parsed);

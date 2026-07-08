@@ -392,8 +392,11 @@ fn grouped_peer_rows(
         // rest are secondaries. Connected devices first (`false < true`); stable
         // sort preserves roster order within each half.
         let primary = group.iter().find(|p| p.endpoint_id == uid).copied();
-        let mut secondaries: Vec<&ipc::PeerStatus> =
-            group.iter().filter(|p| p.endpoint_id != uid).copied().collect();
+        let mut secondaries: Vec<&ipc::PeerStatus> = group
+            .iter()
+            .filter(|p| p.endpoint_id != uid)
+            .copied()
+            .collect();
         secondaries.sort_by_key(|p| p.connection.is_none());
 
         match primary {

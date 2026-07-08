@@ -58,8 +58,8 @@ impl NetworkRegistry {
                 }
                 None => {
                     return ipc_err(format!(
-                            "unknown peer '{s}' (try a hostname, mesh IP, short id, or identity)"
-                        ));
+                        "unknown peer '{s}' (try a hostname, mesh IP, short id, or identity)"
+                    ));
                 }
             },
             None => firewall::PeerFilter::Any,
@@ -154,8 +154,9 @@ impl NetworkRegistry {
             }
         };
         if !has_key {
-            return ipc_err("only a coordinator (network key holder) can suggest firewall rules"
-                    .to_string());
+            return ipc_err(
+                "only a coordinator (network key holder) can suggest firewall rules".to_string(),
+            );
         }
         let count: usize = suggestions.len();
         {

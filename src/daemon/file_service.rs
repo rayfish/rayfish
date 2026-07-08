@@ -476,8 +476,10 @@ impl FileService {
     /// can't be bound to the wrong identity.
     pub(crate) fn start_pairing(&self) -> IpcMessage {
         if self.current_device_cert().is_some() {
-            return ipc_err("this device is already paired; add new devices from your primary device"
-                    .to_string());
+            return ipc_err(
+                "this device is already paired; add new devices from your primary device"
+                    .to_string(),
+            );
         }
 
         let secret: [u8; 32] = rand::random();

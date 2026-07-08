@@ -117,9 +117,11 @@ impl NetworkRegistry {
         hostname: Option<String>,
     ) -> IpcMessage {
         if hostname.is_some() {
-            return ipc_err("a reusable key cannot bind a hostname (a multi-use key admits many \
+            return ipc_err(
+                "a reusable key cannot bind a hostname (a multi-use key admits many \
                           machines); drop --hostname or omit --reusable"
-                    .to_string());
+                    .to_string(),
+            );
         }
         let (state, dht_notify, net_pubkey, has_key) = match self.networks.get(network) {
             Some(h) => {
@@ -136,8 +138,9 @@ impl NetworkRegistry {
             }
         };
         if !has_key {
-            return ipc_err("only a coordinator (network key holder) can mint a reusable key"
-                    .to_string());
+            return ipc_err(
+                "only a coordinator (network key holder) can mint a reusable key".to_string(),
+            );
         }
         let secret = crate::invite::generate_secret();
         let (hash, key) =
@@ -173,8 +176,8 @@ impl NetworkRegistry {
         };
         if !has_key {
             return ipc_err(format!(
-                    "only a coordinator (network key holder) can list invites for '{network}'"
-                ));
+                "only a coordinator (network key holder) can list invites for '{network}'"
+            ));
         }
         let mut invites: Vec<ipc::InviteInfo> = Vec::new();
         // Single-use invites from the local ledger (present on the minting node;
@@ -233,8 +236,8 @@ impl NetworkRegistry {
         };
         if !has_key {
             return ipc_err(format!(
-                    "only a coordinator (network key holder) can revoke invites for '{network}'"
-                ));
+                "only a coordinator (network key holder) can revoke invites for '{network}'"
+            ));
         }
         // A reusable key lives in the signed blob: revoke it there and republish
         // so the revocation propagates to every admin.
@@ -269,7 +272,9 @@ impl NetworkRegistry {
             return ipc_err(format!("network '{network}' not active"));
         };
         if !handle.role.is_coordinator() {
-            return ipc_err(format!("only the coordinator of '{network}' has join requests"));
+            return ipc_err(format!(
+                "only the coordinator of '{network}' has join requests"
+            ));
         }
         let s = handle.state.read().unwrap();
         let requests = s

@@ -579,5 +579,4 @@ mod tests {
         let rev6 = reverse.get(&IpAddr::V6(v6)).map(|e| e.value().clone());
         assert_eq!(rev6, Some(("alice".to_string(), "gaming".to_string())));
     }
-
 }
