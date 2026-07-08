@@ -273,8 +273,10 @@ fn print_network(net: &ipc::NetworkStatus) {
     // Just the hostname: the network name is already the block header, so the
     // `.{network}.ray` suffix would only repeat it.
     let dns_name = net.my_hostname.clone();
-    // member count (self excluded) belongs on the network header row
-    let online = net.peers.iter().filter(|p| p.connection.is_some()).count();
+    // member count (self excluded) belongs on the network header row. Reachable =
+    // active + idle (everything not confirmed offline); on-demand nodes hold no
+    // connections when idle, so counting only live connections would read "0/N".
+    let reachable = net.peers.iter().filter(|p| !p.state.is_offline()).count();
     println!();
     print!("  {}  {}", style::bold(&net.name), style::marker(&role));
     if let Some(ref dns) = dns_name {
@@ -284,7 +286,7 @@ fn print_network(net: &ipc::NetworkStatus) {
     print!(
         "   {} {}",
         style::label("members"),
-        style::value(&format!("{online}/{}", net.peers.len())),
+        style::value(&format!("{reachable}/{}", net.peers.len())),
     );
     if let Some(ttl) = net.ephemeral_ttl_secs {
         print!(
@@ -448,21 +450,34 @@ fn user_parent_row(
     devices: &[&ipc::PeerStatus],
     alias_by_identity: &HashMap<&str, &str>,
 ) -> Vec<layout::Cell> {
-    let online = devices.iter().filter(|d| d.connection.is_some()).count();
-    let any_online = online > 0;
+    let active = devices
+        .iter()
+        .filter(|d| d.state.is_active())
+        .count();
+    let reachable = devices
+        .iter()
+        .filter(|d| !d.state.is_offline())
+        .count();
     let name = user_display_name(net, uid, devices, alias_by_identity);
-    let (glyph_plain, glyph_styled) = if any_online {
+    // Glyph rolls up the group: any active device is online, else any idle device
+    // is idle (presumed reachable), else offline.
+    let (glyph_plain, glyph_styled) = if active > 0 {
         ("●", style::dot_online())
+    } else if reachable > 0 {
+        ("●", style::dot_idle())
     } else {
         ("○", style::dot_offline())
     };
     let name_plain = format!("{glyph_plain} {name}");
     let name_styled = format!("{glyph_styled} {}", style::value(&name));
     let n = devices.len();
-    let rollup = format!(
-        "{n} device{}, {online} online",
-        if n == 1 { "" } else { "s" }
-    );
+    // Show connected devices when any, else the reachable (idle) count so an
+    // all-idle group doesn't read as "0 online".
+    let rollup = if active > 0 || reachable == 0 {
+        format!("{n} device{}, {active} online", if n == 1 { "" } else { "s" })
+    } else {
+        format!("{n} device{}, {reachable} idle", if n == 1 { "" } else { "s" })
+    };
     vec![
         layout::Cell::new(name_plain, name_styled),
         layout::Cell::new(rollup.clone(), style::faint(&rollup)),
@@ -517,13 +532,18 @@ fn device_row(
         Some(a) => format!("{base} [{a}]"),
         None => base,
     };
-    let online = peer.connection.is_some();
-    let (glyph_plain, glyph_styled) = if online {
-        ("●", style::dot_online())
-    } else {
-        ("○", style::dot_offline())
+    let (glyph_plain, glyph_styled) = match peer.state {
+        ipc::PeerState::Active => ("●", style::dot_online()),
+        ipc::PeerState::Idle => ("●", style::dot_idle()),
+        ipc::PeerState::Offline => ("○", style::dot_offline()),
     };
-    let host_style: fn(&str) -> String = if online { style::value } else { style::faint };
+    // Active + idle peers get bright names (idle is presumed reachable); only a
+    // confirmed-offline peer is faded.
+    let host_style: fn(&str) -> String = if peer.state.is_offline() {
+        style::faint
+    } else {
+        style::value
+    };
     // Merge branch + glyph + host into the first cell so the branch sits before
     // the glyph and the columns after it (ip, via, …) still align across all rows.
     let name = layout::Cell::new(
@@ -566,13 +586,22 @@ fn device_row(
             layout::Cell::right("incompatible", style::red("incompatible")),
             layout::Cell::new("ray update", style::faint("ray update")),
         ],
-        None => vec![
-            name,
-            ip,
-            layout::Cell::new("—", style::faint("—")),
-            layout::Cell::right("offline", style::faint("offline")),
-            layout::Cell::plain(""),
-        ],
+        // No live connection: idle (presumed reachable, dialed on demand) vs a
+        // confirmed-offline peer whose last reach failed.
+        None => {
+            let (label_plain, label_styled) = if peer.state.is_idle() {
+                ("idle", style::faint("idle"))
+            } else {
+                ("offline", style::faint("offline"))
+            };
+            vec![
+                name,
+                ip,
+                layout::Cell::new("—", style::faint("—")),
+                layout::Cell::right(label_plain, label_styled),
+                layout::Cell::plain(""),
+            ]
+        }
     }
 }
 
@@ -758,6 +787,14 @@ mod grouping_tests {
             is_own_device: own,
             incompatible,
             connection: online.then(conn),
+            // Mirror the daemon's derivation so the render tests see realistic state.
+            state: if online {
+                ipc::PeerState::Active
+            } else if incompatible {
+                ipc::PeerState::Offline
+            } else {
+                ipc::PeerState::Idle
+            },
         }
     }
 
@@ -823,6 +860,7 @@ mod grouping_tests {
             is_own_device: false,
             incompatible: false,
             connection: Some(conn()),
+            state: ipc::PeerState::Active,
         };
         let secondary = peer("sm-f966b", Some(dario), false, false, false);
         let net = net("umbrel", vec![primary, secondary]);

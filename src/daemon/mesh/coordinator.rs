@@ -62,6 +62,13 @@ impl NetworkRegistry {
             }
             return;
         }
+
+        if matches!(ev.reason, forward::CloseReason::Idle) {
+            // The peer let an idle connection go (on-demand teardown). Never
+            // reconnect on any node; the link comes back lazily on the next packet.
+            return;
+        }
+
         if matches!(ev.reason, forward::CloseReason::Kicked) {
             // A kick-coded close is transport teardown, not authority: we never
             // evict the peer or leave a network on the close code. Membership is the
@@ -82,16 +89,24 @@ impl NetworkRegistry {
                 })
                 .cloned()
                 .collect();
+            // A non-idle drop reconnects to heal even on on-demand nodes: we
+            // eager-connect the roster, and only an explicit idle close (handled
+            // above) is allowed to leave a peer disconnected. The idle timer will
+            // close the healed link again if it stays quiet.
             if !reconnect_nets.is_empty() {
                 self.clone()
                     .spawn_reconnect(ev.endpoint_id, ev.ip, reconnect_nets);
             }
             return;
         }
+
         // Transient drop: stamp `last_seen` on each network we coordinate so the
         // ephemeral pruner ages the member from when it actually went offline
         // (not its admit time), then reconnect across every shared network,
         // skipping any we just pruned this peer from (one-shot via pruned_peers).
+        // Reconnect runs on every node, on-demand included: a transient drop is a
+        // real link failure, not an idle teardown (which is handled above and never
+        // reconnects), so we heal it and let the idle timer close it again if quiet.
         let member_id = self.device_user_map.resolve(&ev.endpoint_id);
         let now = crate::membership::now_secs();
         for net in &nets {
@@ -102,6 +117,7 @@ impl NetworkRegistry {
                 m.last_seen = Some(now);
             }
         }
+
         self.spawn_reconnect(ev.endpoint_id, ev.ip, nets);
     }
 
@@ -310,6 +326,82 @@ impl NetworkRegistry {
         Ok(display)
     }
 
+    /// Dial a peer once (no backoff) over the mesh ALPN, send `MeshHello` on every
+    /// `target` network, register its route, and if the connection is newly stored
+    /// drive its control demux + announce handles. `targets` is one [`DialTarget`]
+    /// per shared network. Returns whether a live connection was established. Shared
+    /// by the reconnect loop and the on-demand lazy dialer.
+    pub(crate) async fn dial_peer_once(
+        self: &Arc<Self>,
+        peer_id: EndpointId,
+        peer_ip: Ipv4Addr,
+        targets: &[DialTarget],
+    ) -> bool {
+        let my_identity = self.transport.identity.local_identity();
+        let device_cert = self.current_device_cert();
+        let conn = match transport::connect_to_peer_with_alpn(
+            &self.transport.endpoint,
+            peer_id,
+            &transport::mesh_alpn(),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                // Flag an incompatible-version peer (ALPN gate) so `ray status`
+                // shows it instead of plain offline; a different failure can't be
+                // attributed to the version, so clear any prior flag. Success clears
+                // it in `PeerTable::add`.
+                if transport::is_alpn_mismatch(&format!("{e:#}")) {
+                    self.peers.mark_incompatible(peer_id);
+                } else {
+                    self.peers.clear_incompatible(&peer_id);
+                }
+                tracing::debug!(peer = %peer_id.fmt_short(), error = %e, "dial attempt failed");
+                self.reachability.note_fail(peer_id);
+                return false;
+            }
+        };
+        // Announce ourselves on every still-shared network over the one connection
+        // and register the peer's route per network. `conn_changed` accumulates
+        // whether the connection became newly current (it always is for a fresh
+        // dial / reconnect), which gates driving its demux.
+        let mut conn_changed = false;
+        for t in targets {
+            let Ok((mut send, _)) = conn.open_bi().await else {
+                continue;
+            };
+            let hello = ControlMsg::MeshHello {
+                identity: my_identity,
+                ip: t.my_ip,
+                hostname: outgoing_hostname(&t.network),
+                device_cert: device_cert.clone(),
+            };
+            if control::send_msg(&mut send, Some(t.network_key), &hello)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            conn_changed |= self
+                .mesh_ctx()
+                .register_peer_conn(&conn, peer_id, peer_ip, &t.network);
+        }
+        // A live connection now exists (either freshly stored, or already current
+        // when `conn_changed` is false), so the peer is reachable either way.
+        self.reachability.note_ok(peer_id);
+        if !conn_changed {
+            return false;
+        }
+        tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "dialed peer");
+        // Drive the new connection's control demux + announce handles.
+        let router = self.protocol_router().clone();
+        let dconn = conn.clone();
+        tokio::spawn(router.drive_mesh_connection(dconn, true));
+        announce_network_handles(&self.peers, &conn, peer_ip).await;
+        true
+    }
+
     /// Reconnect a dropped peer with one dial that re-establishes every network we
     /// still share with it. Backs off exponentially; on success re-registers the
     /// peer per network and drives the new connection's control demux. Also used
@@ -343,8 +435,6 @@ impl NetworkRegistry {
 
         let this = self.clone();
         let token = self.shutdown_token.clone();
-        let my_identity = self.transport.identity.local_identity();
-        let device_cert = self.current_device_cert();
         use tracing::Instrument as _;
         let span = tracing::info_span!("reconnect", peer = %peer_id.fmt_short());
         tokio::spawn(
@@ -366,12 +456,14 @@ impl NetworkRegistry {
                     // Re-resolve the live network handles each iteration: on cold
                     // restore the `NetworkHandle` is inserted just after the dial
                     // was scheduled, so it may be absent on the first pass.
-                    let targets: Vec<(String, EndpointId, Ipv4Addr)> = candidate_nets
+                    let targets: Vec<DialTarget> = candidate_nets
                         .iter()
                         .filter_map(|net| {
-                            this.networks
-                                .get(net.as_str())
-                                .map(|h| (net.to_string(), h.network_key, h.my_ip))
+                            this.networks.get(net.as_str()).map(|h| DialTarget {
+                                network: net.to_string(),
+                                network_key: h.network_key,
+                                my_ip: h.my_ip,
+                            })
                         })
                         .collect();
                     if targets.is_empty() {
@@ -382,62 +474,10 @@ impl NetworkRegistry {
                         continue;
                     }
 
-                    let conn = match transport::connect_to_peer_with_alpn(
-                        &this.transport.endpoint,
-                        peer_id,
-                        &transport::mesh_alpn(),
-                    )
-                    .await
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            // Flag an incompatible-version peer (ALPN gate) so
-                            // `ray status` shows it instead of plain offline; a
-                            // different failure means we can't attribute it to the
-                            // version, so clear any prior flag. Success clears it in
-                            // `PeerTable::add`.
-                            if transport::is_alpn_mismatch(&format!("{e:#}")) {
-                                this.peers.mark_incompatible(peer_id);
-                            } else {
-                                this.peers.clear_incompatible(&peer_id);
-                            }
-                            tracing::debug!(error = %e, "reconnect attempt failed");
-                            continue;
-                        }
-                    };
-                    // Announce ourselves on every still-shared network over the one
-                    // connection, and register the peer's route per network.
-                    let mut any = false;
-                    for (name, net_pubkey, my_ip) in &targets {
-                        let Ok((mut send, _)) = conn.open_bi().await else {
-                            continue;
-                        };
-                        let hello = ControlMsg::MeshHello {
-                            identity: my_identity,
-                            ip: *my_ip,
-                            hostname: outgoing_hostname(name),
-                            device_cert: device_cert.clone(),
-                        };
-                        if control::send_msg(&mut send, Some(*net_pubkey), &hello)
-                            .await
-                            .is_err()
-                        {
-                            continue;
-                        }
-                        this.mesh_ctx()
-                            .register_peer_conn(&conn, peer_id, peer_ip, name);
-                        any = true;
+                    if this.dial_peer_once(peer_id, peer_ip, &targets).await {
+                        return;
                     }
-                    if !any {
-                        continue;
-                    }
-                    tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "reconnected to peer");
-                    // Drive the new connection's control demux + announce handles.
-                    let router = this.protocol_router().clone();
-                    let dconn = conn.clone();
-                    tokio::spawn(async move { router.drive_mesh_connection(dconn, true).await });
-                    announce_network_handles(&this.peers, &conn, peer_ip).await;
-                    return;
+                    // Dial failed; back off and retry.
                 }
             }
             .instrument(span),

@@ -1,7 +1,14 @@
 //! Read-only diagnostics for `Daemon`: `status`, `build_report`, `ping`,
 //! `netcheck`, and connection-info helpers. Split out of `daemon/mod.rs`.
 
+use std::net::IpAddr;
+
 use super::super::*;
+
+/// How recent a failed reach must be to render a peer `Offline` in `ray status`.
+/// Older failures decay back to `Idle` (the optimistic default) so a peer that was
+/// briefly unreachable doesn't stay flagged offline forever without a re-probe.
+const STATUS_OFFLINE_WINDOW: Duration = Duration::from_secs(300);
 
 impl Daemon {
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
@@ -155,6 +162,22 @@ impl Daemon {
                     // definition, and `add` clears the flag on connect anyway.
                     incompatible: connection.is_none()
                         && self.registry.peers.is_incompatible(&m.identity),
+                    // Three-state liveness: a live connection is Active; otherwise a
+                    // recently-failed reach (or an incompatible version) is Offline;
+                    // anything else is Idle (a roster member we just have no live link
+                    // to). A fresh boot with no dial attempts shows every peer Idle.
+                    state: if connection.is_some() {
+                        PeerState::Active
+                    } else if self.registry.peers.is_incompatible(&m.identity)
+                        || self
+                            .registry
+                            .reachability
+                            .is_offline(&m.identity, STATUS_OFFLINE_WINDOW)
+                    {
+                        PeerState::Offline
+                    } else {
+                        PeerState::Idle
+                    },
                     connection,
                 }
             })
@@ -375,9 +398,23 @@ impl Daemon {
         let route = match self.registry.peers.lookup_v4(&ip) {
             Some(r) => r,
             None => {
-                return ipc_err(format!(
-                    "{display} is not connected (no live mesh link to {ip})"
-                ));
+                // No live link (an on-demand idle peer holds none): dial it on
+                // demand so ping works like a reach probe, then re-look up.
+                // `dial_target` stamps reachability, so a failure here also flips
+                // the peer's status to offline.
+                match self.registry.resolve_route(IpAddr::V4(ip)) {
+                    Some(target) if self.registry.dial_target(&target).await => {
+                        match self.registry.peers.lookup_v4(&ip) {
+                            Some(r) => r,
+                            None => {
+                                return ipc_err(format!("{display}: dialed but no route to {ip}"));
+                            }
+                        }
+                    }
+                    _ => {
+                        return ipc_err(format!("{display} is unreachable (no answer at {ip})"));
+                    }
+                }
             }
         };
         let conn = route.conn;

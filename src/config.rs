@@ -3,6 +3,7 @@ use std::fs::Permissions;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use iroh::{EndpointId, SecretKey};
@@ -213,6 +214,10 @@ pub const RELAY_PRESET_RAYFISH: &str = "http://relay.iroh.rayfish.xyz:3340";
 /// Preset URL for the rayfish-operated discovery-DNS / pkarr server.
 pub const DISCOVERY_PRESET_RAYFISH: &str = "http://dns.iroh.rayfish.xyz:8080";
 
+/// Default idle timeout for on-demand nodes: no data-plane or control traffic for
+/// this long closes a peer connection so the node returns to zero connections.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
+
 fn validate_http_url(s: &str) -> Result<()> {
     let u = url::Url::parse(s).with_context(|| format!("invalid URL: {s}"))?;
     anyhow::ensure!(
@@ -278,6 +283,12 @@ fn parse_entries(value: &str) -> Vec<String> {
 /// Apply a `ray config set`/`unset` to the in-memory config. An empty value or
 /// the lone keyword `n0` resets the key to its default (iroh n0). Validates
 /// every entry, so a bad URL/IP or unknown preset is rejected before persist.
+/// The recognized `ray config` keys, for error messages. The list values
+/// (relay/discovery-dns/dns-upstreams) are set via `config set`; the on/off
+/// toggles (auto-update/on-demand) via their own `config` subcommands.
+const CONFIG_KEYS: &str =
+    "expected relay, discovery-dns, dns-upstreams, auto-update, or on-demand";
+
 pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) -> Result<()> {
     let entries = parse_entries(value);
     let reset = entries.is_empty() || entries == ["n0"];
@@ -322,11 +333,28 @@ pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) ->
                 };
             }
         }
-        other => anyhow::bail!(
-            "unknown config key: {other} (expected relay, discovery-dns, or dns-upstreams)"
-        ),
+        // On/off toggles: `set <key> on|off`, or `unset <key>` (empty value) to
+        // return to the default. `--replace` is meaningless here and ignored.
+        "auto-update" => cfg.auto_update = parse_bool_setting(value, false)?,
+        "on-demand" => cfg.on_demand = parse_bool_setting(value, true)?,
+        other => anyhow::bail!("unknown config key: {other} ({CONFIG_KEYS})"),
     }
     Ok(())
+}
+
+/// Parse an on/off config value. An empty value (from `config unset`) resets to
+/// `default`.
+fn parse_bool_setting(value: &str, default: bool) -> Result<bool> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Ok(default);
+    }
+
+    match v.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(true),
+        "off" | "false" | "no" | "0" => Ok(false),
+        other => anyhow::bail!("'{other}' is not a valid on/off value (use 'on' or 'off')"),
+    }
 }
 
 fn render_override(o: &ServerOverride) -> String {
@@ -341,16 +369,17 @@ fn render_override(o: &ServerOverride) -> String {
 /// Render config settings as `(key, value)` rows for `ray config get`. With a
 /// key, returns just that one (error on unknown key); without, all three.
 pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, String)>> {
+    let on_off = |v: bool| if v { "on" } else { "off" }.to_string();
     let row = |k: &str| -> Result<(String, String)> {
-        let o = match k {
-            "relay" => &cfg.relay,
-            "discovery-dns" => &cfg.discovery_dns,
-            "dns-upstreams" => &cfg.dns_upstreams,
-            other => anyhow::bail!(
-                "unknown config key: {other} (expected relay, discovery-dns, or dns-upstreams)"
-            ),
+        let v = match k {
+            "relay" => render_override(&cfg.relay),
+            "discovery-dns" => render_override(&cfg.discovery_dns),
+            "dns-upstreams" => render_override(&cfg.dns_upstreams),
+            "auto-update" => on_off(cfg.auto_update),
+            "on-demand" => on_off(cfg.on_demand),
+            other => anyhow::bail!("unknown config key: {other} ({CONFIG_KEYS})"),
         };
-        Ok((k.to_string(), render_override(o)))
+        Ok((k.to_string(), v))
     };
     match key {
         Some(k) => Ok(vec![row(k)?]),
@@ -358,6 +387,8 @@ pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, Str
             row("relay")?,
             row("discovery-dns")?,
             row("dns-upstreams")?,
+            row("auto-update")?,
+            row("on-demand")?,
         ]),
     }
 }
@@ -407,6 +438,19 @@ pub struct AppConfig {
     /// authorized in a network's [`NetworkConfig::ssh_allow`] list. Off by default.
     #[serde(default)]
     pub ssh_enabled: bool,
+    /// On-demand connection mode (battery-minimizing, Tailscale-style). When on,
+    /// the node does not eagerly dial peers at startup: it restores memberships and
+    /// the roster locally, dials a peer lazily on the first outgoing packet that
+    /// needs it, and tears down connections idle past [`idle_timeout_secs`].
+    ///
+    /// On by default; a latency-sensitive server or always-push coordinator can turn
+    /// it off (`ray config set on-demand off`) to stay eagerly connected.
+    #[serde(default = "default_true")]
+    pub on_demand: bool,
+    /// Seconds of no traffic before an on-demand node closes a peer connection.
+    /// `None` uses [`DEFAULT_IDLE_TIMEOUT_SECS`]. Only consulted when `on_demand`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
     /// Opt-in automatic updates: when on, the daemon periodically checks for a
     /// newer stable release, swaps the binary, and restarts itself onto it. Off
     /// by default; enable via `ray install --auto-update` or `ray auto-update on`.
@@ -460,6 +504,8 @@ impl Default for AppConfig {
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
             ssh_enabled: false,
+            on_demand: true,
+            idle_timeout_secs: None,
             auto_update: false,
             auto_update_last_target: None,
             auto_update_last_attempt: None,
@@ -470,6 +516,14 @@ impl Default for AppConfig {
             cert_generation: 0,
             revoked_devices: Vec::new(),
         }
+    }
+}
+
+impl AppConfig {
+    /// Idle timeout for on-demand teardown, falling back to
+    /// [`DEFAULT_IDLE_TIMEOUT_SECS`] when unset.
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS))
     }
 }
 
@@ -549,6 +603,10 @@ struct Settings {
     dns_upstreams: ServerOverride,
     #[serde(default)]
     ssh_enabled: bool,
+    #[serde(default = "default_true")]
+    on_demand: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idle_timeout_secs: Option<u64>,
     #[serde(default)]
     auto_update: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -838,6 +896,8 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
         ssh_enabled: settings.ssh_enabled,
+        on_demand: settings.on_demand,
+        idle_timeout_secs: settings.idle_timeout_secs,
         auto_update: settings.auto_update,
         auto_update_last_target: settings.auto_update_last_target,
         auto_update_last_attempt: settings.auto_update_last_attempt,
@@ -865,6 +925,8 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
         ssh_enabled: config.ssh_enabled,
+        on_demand: config.on_demand,
+        idle_timeout_secs: config.idle_timeout_secs,
         auto_update: config.auto_update,
         auto_update_last_target: config.auto_update_last_target.clone(),
         auto_update_last_attempt: config.auto_update_last_attempt,
