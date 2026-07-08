@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Android: disabling the VPN now fully tears the tunnel down.** Turning the
+  tunnel off dropped the mesh connection but left the VPN interface up (the key
+  icon stayed and the `tun` device lingered), because the offline path closed the
+  endpoint without releasing the tunnel fd. Disable now detaches the data plane
+  first, so both the interface and the control plane go down and the device stops
+  using the radio.
+
 ### Added
 
 - **Static musl Linux binaries.** Every release and nightly now also ships

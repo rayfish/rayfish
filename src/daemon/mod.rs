@@ -556,8 +556,11 @@ impl Daemon {
     /// `run_daemon`. After this the `Daemon` is spent; build a new one to
     /// come back online.
     pub async fn shutdown_and_close(&self) {
+        let tun_attached = self.tun_tasks.lock().unwrap().is_some();
+        tracing::info!(tun_attached, "shutdown: cancelling token, closing endpoint");
         self.shutdown_token.cancel();
         self.transport.endpoint.close().await;
+        tracing::info!("shutdown: endpoint closed");
     }
 
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
@@ -649,9 +652,12 @@ impl Daemon {
         self.active
             .store(false, std::sync::atomic::Ordering::SeqCst);
         if let Some(tasks) = self.tun_tasks.lock().unwrap().take() {
+            tracing::info!("detach_tun: aborting TUN writer + mesh forwarding tasks");
             tasks.cancel.cancel();
             tasks.writer.abort();
             tasks.mesh.abort();
+        } else {
+            tracing::debug!("detach_tun: no TUN attached");
         }
     }
 
