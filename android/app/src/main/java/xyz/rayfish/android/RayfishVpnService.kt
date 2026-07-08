@@ -45,8 +45,10 @@ class RayfishVpnService : VpnService() {
                 // see us drop cleanly and re-enable rebuilds without a stale
                 // session). Run it off the main thread to avoid an ANR, then
                 // stop the service.
+                Log.i(TAG, "ACTION_STOP received; tearing tunnel down (tunnel fd present=${tunnel != null})")
                 thread(name = "rayfish-node-stop") {
                     stopTunnel()
+                    Log.i(TAG, "stopTunnel returned; calling stopSelf()")
                     stopSelf()
                 }
                 return START_NOT_STICKY
@@ -206,11 +208,17 @@ class RayfishVpnService : VpnService() {
         // the device drops out of the mesh immediately. stopNode also clears the
         // started flag so a later enable rebuilds the daemon.
         try {
+            Log.i(TAG, "stopTunnel: calling NodeHolder.stopNode (offline)")
             NodeHolder.stopNode(applicationContext)
+            Log.i(TAG, "stopTunnel: stopNode returned")
         } catch (t: Throwable) {
             Log.w(TAG, "Node stop failed (may not have been up)", t)
         }
         try {
+            // Detached to Rust via detachFd(), so this is a no-op; the fd is only
+            // closed when the Rust side aborts the TUN tasks. Logged to make that
+            // explicit while debugging the lingering interface.
+            Log.i(TAG, "stopTunnel: tunnel?.close() (no-op; fd owned by Rust after detachFd)")
             tunnel?.close()
         } catch (t: Throwable) {
             Log.w(TAG, "closing tunnel fd failed", t)
@@ -226,6 +234,7 @@ class RayfishVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        Log.i(TAG, "onDestroy: service being destroyed (tunnel fd present=${tunnel != null})")
         stopTunnel()
         super.onDestroy()
     }

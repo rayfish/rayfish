@@ -913,9 +913,19 @@ impl Node {
         // rebuilds a fresh daemon. Block until the endpoint has closed so the
         // rebuilt endpoint does not overlap the old one (which would leave a
         // coordinator holding a stale session and the device showing offline).
+        tracing::info!("Node.stop: taking node fully offline (mobile disable)");
         let state = self.state.lock().unwrap().take();
         if let Some(state) = state {
+            // Tear the data plane down first: abort the TUN writer + mesh tasks so
+            // both dups of the Android VPN fd close and the interface comes down.
+            // `shutdown_and_close` only cancels the token + closes the endpoint;
+            // the writer never observes the token, so without this the fd would
+            // leak and the tunnel would linger after disable.
+            state.detach_tun();
             self.runtime.block_on(state.shutdown_and_close());
+            tracing::info!("Node.stop: data plane detached and endpoint closed");
+        } else {
+            tracing::info!("Node.stop: no live state (already stopped)");
         }
     }
 
