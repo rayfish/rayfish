@@ -25,14 +25,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **On-demand mesh connections (near-zero idle battery).** Nodes now connect to a
-  peer lazily, on the first packet that needs it, instead of dialing every roster
-  member at startup and holding those connections for the whole session. A
-  connection with no traffic for the idle timeout (default 120s) is closed, so an
-  idle node keeps zero peer connections and stops waking the radio for QUIC
-  keepalives. The link re-forms automatically on the next packet either side sends.
-  This is on by default; set `on_demand = false` in `settings.toml` to keep the old
-  eager-connect behavior, and `idle_timeout_secs` tunes the teardown window.
+- **On-demand mesh connections (near-zero idle battery), opt-in.** When enabled, a
+  node connects to a peer lazily, on the first packet that needs it, instead of
+  dialing every roster member at startup and holding those connections for the whole
+  session. A connection with no traffic for the idle timeout (default 120s) is
+  closed, so an idle node keeps zero peer connections and stops waking the radio for
+  QUIC keepalives; the link re-forms on the next packet either side sends. **Off by
+  default** (`ray config set on-demand on` to enable, `idle_timeout_secs` tunes the
+  window): idle teardown only holds when every peer honors the idle close, so a
+  mixed fleet would otherwise flap the link. The mobile app enables it automatically.
 - **`ray config` now covers the `auto-update` and `on-demand` toggles.** Both
   on/off daemon settings are settable through the standard config surface (e.g.
   `ray config set on-demand off`, `ray config set auto-update on`,
