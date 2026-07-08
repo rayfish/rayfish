@@ -316,6 +316,50 @@ pub enum IpcMessage {
     /// `ray netcheck`: local endpoint diagnostics (bound port, home relay,
     /// reachability). Open read.
     Netcheck,
+    /// Persist the mDNS discovery toggle (`ray mdns on|off`). Routed through the
+    /// daemon (not written client-side) so the setting always lands in the config
+    /// dir the daemon reads: on non-Linux, `config_dir()` is derived from the
+    /// process environment, so a client-side write from a different `HOME` than
+    /// the service's would silently miss the daemon's config. The daemon reads
+    /// this at startup, so it takes effect on restart. Mutation (root/operator).
+    SetMdns {
+        enabled: bool,
+    },
+    /// Set a global config key (`ray config set`, `ray auto-update on|off`). The
+    /// daemon applies it to its own config and persists it. `value` uses the same
+    /// grammar as `config::config_set`. Same routing rationale as `SetMdns`.
+    /// Mutation.
+    ConfigSet {
+        key: String,
+        value: String,
+        #[serde(default)]
+        replace: bool,
+    },
+    /// Reset a global config key to its default (`ray config unset`). Mutation.
+    ConfigUnset {
+        key: String,
+    },
+    /// Read global config keys (`ray config get`), answered with `ConfigValues`.
+    /// `key = None` returns every key. Open read, like `Status` — routed through
+    /// the daemon so reads and writes agree on which config dir is authoritative.
+    ConfigGet {
+        key: Option<String>,
+    },
+    /// Set (or clear, with `None`) the directory accepted files land in
+    /// (`ray files download-dir`). Same daemon-writes-its-own-config rationale as
+    /// `SetMdns`; the path is validated absolute on the client. Mutation.
+    SetDownloadDir {
+        path: Option<String>,
+    },
+    /// Set (or clear, with `None`) the local UID that owns accepted files
+    /// (`ray files download-user`). The client resolves the username to a UID
+    /// (as it does for `SetOperator`) before sending. Mutation.
+    SetDownloadUser {
+        uid: Option<u32>,
+    },
+    /// Read the file-download settings (`ray files download-dir`/`download-user`
+    /// with no argument), answered with `DownloadSettings`. Open read.
+    GetDownloadSettings,
 
     // Responses
     Ok {
@@ -485,6 +529,15 @@ pub enum IpcMessage {
     /// This node's contact id (reply to `ContactId`/`RotateContact`).
     ContactIdResponse {
         contact_id: String,
+    },
+    /// Reply to `ConfigGet`: `(key, value)` rows as `config::config_get` renders.
+    ConfigValues {
+        rows: Vec<(String, String)>,
+    },
+    /// Reply to `GetDownloadSettings`: the daemon's current file-download config.
+    DownloadSettings {
+        dir: Option<String>,
+        uid: Option<u32>,
     },
 }
 
@@ -991,6 +1044,47 @@ mod tests {
                 assert_eq!(hostname.as_deref(), Some("dario"));
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn config_mutation_messages_roundtrip() {
+        // `ray mdns off` / `ray config set` route through the daemon; the wire
+        // types must survive the named-map codec.
+        for msg in [
+            IpcMessage::SetMdns { enabled: false },
+            IpcMessage::ConfigSet {
+                key: "auto-update".to_string(),
+                value: "off".to_string(),
+                replace: false,
+            },
+            IpcMessage::ConfigUnset {
+                key: "relay".to_string(),
+            },
+            IpcMessage::ConfigGet { key: None },
+            IpcMessage::SetDownloadDir {
+                path: Some("/srv/dl".to_string()),
+            },
+            IpcMessage::SetDownloadUser { uid: Some(501) },
+            IpcMessage::GetDownloadSettings,
+            IpcMessage::DownloadSettings {
+                dir: None,
+                uid: None,
+            },
+        ] {
+            let bytes = rmp_serde::to_vec_named(&msg).unwrap();
+            let _: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+        }
+
+        let resp = IpcMessage::ConfigValues {
+            rows: vec![("auto-update".to_string(), "off".to_string())],
+        };
+        let bytes = rmp_serde::to_vec_named(&resp).unwrap();
+        match rmp_serde::from_slice::<IpcMessage>(&bytes).unwrap() {
+            IpcMessage::ConfigValues { rows } => {
+                assert_eq!(rows, vec![("auto-update".to_string(), "off".to_string())]);
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 

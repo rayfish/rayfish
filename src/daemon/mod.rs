@@ -738,6 +738,8 @@ impl Daemon {
                 | IpcMessage::AliasList { .. }
                 | IpcMessage::GetEphemeral { .. }
                 | IpcMessage::ListPairedDevices
+                | IpcMessage::ConfigGet { .. }
+                | IpcMessage::GetDownloadSettings
         ) {
             return None;
         }
@@ -786,6 +788,116 @@ impl Daemon {
         }
         IpcMessage::Ok {
             message: format!("operator set to uid {uid}; that user can now run ray without sudo"),
+        }
+    }
+
+    /// Persist the mDNS discovery toggle (`ray mdns on|off`). The daemon reads
+    /// `mdns_enabled` at startup, so this takes effect on the next restart. Done
+    /// here rather than client-side so the write lands in the config dir the
+    /// daemon actually reads (see `IpcMessage::SetMdns`).
+    pub(crate) fn set_mdns(&self, enabled: bool) -> IpcMessage {
+        let mut app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => return ipc_err(format!("failed to load config: {e}")),
+        };
+        app_config.mdns_enabled = enabled;
+        if let Err(e) = config::save_settings(&app_config) {
+            return ipc_err(format!("failed to save config: {e}"));
+        }
+        IpcMessage::Ok {
+            message: format!(
+                "mDNS discovery {}. Restart the daemon for changes to take effect.",
+                if enabled { "enabled" } else { "disabled" }
+            ),
+        }
+    }
+
+    /// Apply a global config key change and persist it (`ray config set|unset`
+    /// and the `ray auto-update` alias). `reset` selects the "unset" wording; an
+    /// empty `value` (as `ConfigUnset` sends) resets the key to its default.
+    fn config_apply(&self, key: &str, value: &str, replace: bool, reset: bool) -> IpcMessage {
+        let mut app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => return ipc_err(format!("failed to load config: {e}")),
+        };
+        if let Err(e) = config::config_set(&mut app_config, key, value, replace) {
+            return ipc_err(e.to_string());
+        }
+        if let Err(e) = config::save_settings(&app_config) {
+            return ipc_err(format!("failed to save config: {e}"));
+        }
+        let action = if reset {
+            format!("Reset {key} to default")
+        } else {
+            format!("Set {key}")
+        };
+        IpcMessage::Ok {
+            message: format!("{action}. Restart the daemon for changes to take effect."),
+        }
+    }
+
+    /// Read global config rows for `ray config get` from the daemon's own config.
+    fn config_get(&self, key: Option<&str>) -> IpcMessage {
+        let app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => return ipc_err(format!("failed to load config: {e}")),
+        };
+        match config::config_get(&app_config, key) {
+            Ok(rows) => IpcMessage::ConfigValues { rows },
+            Err(e) => ipc_err(e.to_string()),
+        }
+    }
+
+    /// Set/clear the accepted-files download directory (`ray files download-dir`)
+    /// and persist it to the daemon's own config. Takes effect at the next start.
+    fn set_download_dir(&self, path: Option<String>) -> IpcMessage {
+        let mut app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => return ipc_err(format!("failed to load config: {e}")),
+        };
+        let cleared = path.is_none();
+        app_config.download_dir = path;
+        if let Err(e) = config::save_settings(&app_config) {
+            return ipc_err(format!("failed to save config: {e}"));
+        }
+        IpcMessage::Ok {
+            message: if cleared {
+                "download-dir cleared. Restart the daemon for changes to take effect.".to_string()
+            } else {
+                "download-dir set. Restart the daemon for changes to take effect.".to_string()
+            },
+        }
+    }
+
+    /// Set/clear the accepted-files owner UID (`ray files download-user`) and
+    /// persist it. The client resolves the username to a UID before sending.
+    fn set_download_user(&self, uid: Option<u32>) -> IpcMessage {
+        let mut app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => return ipc_err(format!("failed to load config: {e}")),
+        };
+        let cleared = uid.is_none();
+        app_config.download_user = uid;
+        if let Err(e) = config::save_settings(&app_config) {
+            return ipc_err(format!("failed to save config: {e}"));
+        }
+        IpcMessage::Ok {
+            message: if cleared {
+                "download-user cleared. Restart the daemon for changes to take effect.".to_string()
+            } else {
+                "download-user set. Restart the daemon for changes to take effect.".to_string()
+            },
+        }
+    }
+
+    /// Read the file-download settings for `ray files download-dir`/`download-user`.
+    fn get_download_settings(&self) -> IpcMessage {
+        match config::load() {
+            Ok(c) => IpcMessage::DownloadSettings {
+                dir: c.download_dir,
+                uid: c.download_user,
+            },
+            Err(e) => ipc_err(format!("failed to load config: {e}")),
         }
     }
 
@@ -924,6 +1036,17 @@ impl Daemon {
             IpcMessage::ListPairedDevices => self.list_paired_devices(),
             IpcMessage::Unpair { device } => self.unpair(&device).await,
             IpcMessage::SetOperator { uid } => self.set_operator(uid),
+            IpcMessage::SetMdns { enabled } => self.set_mdns(enabled),
+            IpcMessage::ConfigSet {
+                key,
+                value,
+                replace,
+            } => self.config_apply(&key, &value, replace, false),
+            IpcMessage::ConfigUnset { key } => self.config_apply(&key, "", false, true),
+            IpcMessage::ConfigGet { key } => self.config_get(key.as_deref()),
+            IpcMessage::SetDownloadDir { path } => self.set_download_dir(path),
+            IpcMessage::SetDownloadUser { uid } => self.set_download_user(uid),
+            IpcMessage::GetDownloadSettings => self.get_download_settings(),
             IpcMessage::InviteCreate {
                 network,
                 expires_secs,

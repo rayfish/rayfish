@@ -1056,9 +1056,9 @@ async fn main() -> Result<()> {
             cmd_identityof(&network, &hostname, cli.json).await
         }
         Command::Alias { network, action } => cmd_alias(&network, action, cli.json).await,
-        Command::Mdns { state } => cmd_mdns(&state),
-        Command::AutoUpdate { state } => cmd_auto_update(&state),
-        Command::Config { action } => cmd_config(action, cli.json),
+        Command::Mdns { state } => cmd_mdns(&state).await,
+        Command::AutoUpdate { state } => cmd_auto_update(&state).await,
+        Command::Config { action } => cmd_config(action, cli.json).await,
         Command::SetOperator { user } => cmd_set_operator(&user).await,
         Command::Send { file, peer } => ipc_send_file(&file, &peer).await,
         Command::Files { action } => ipc_files(action).await,
@@ -1080,10 +1080,34 @@ async fn main() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Client-side commands (daemon optional)
+// Config-writing commands
+//
+// These change global daemon settings (`settings.toml`). They route through the
+// daemon rather than writing the file client-side: on non-Linux, `config_dir()`
+// is derived from the process environment, so a CLI writing from a different
+// `HOME` than the service runs under would land the file where the daemon never
+// reads it (rayfish#94). The daemon writes its own config dir, sidestepping the
+// divergence. This makes a running daemon a prerequisite.
 // ---------------------------------------------------------------------------
 
-fn cmd_mdns(state: &str) -> Result<()> {
+/// Send a mutating IPC request and print its `Ok`/`Error` reply.
+pub(crate) async fn ipc_mutate(msg: ipc::IpcMessage) -> Result<()> {
+    let mut stream = ipc::connect()
+        .await
+        .context("rayfish daemon is not running; start it with: sudo ray up")?;
+    ipc::send(&mut stream, msg).await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Error { message } => {
+            print_error("error", &message, None);
+            std::process::exit(1);
+        }
+        other => eprintln!("Unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+async fn cmd_mdns(state: &str) -> Result<()> {
     let enabled = match state {
         "on" => true,
         "off" => false,
@@ -1092,69 +1116,67 @@ fn cmd_mdns(state: &str) -> Result<()> {
             std::process::exit(1);
         }
     };
-    let mut app_config = config::load()?;
-    app_config.mdns_enabled = enabled;
-    config::save_settings(&app_config)?;
-    println!(
-        "mDNS discovery {}. Restart the daemon for changes to take effect.",
-        if enabled { "enabled" } else { "disabled" }
-    );
-    Ok(())
+    ipc_mutate(ipc::IpcMessage::SetMdns { enabled }).await
 }
 
 /// `ray auto-update on|off`: back-compat alias for `ray config set auto-update
-/// <on|off>`. Writes `settings.toml` directly; the daemon reads it at startup, so
-/// the change takes effect on the next daemon restart.
-fn cmd_auto_update(state: &str) -> Result<()> {
-    let mut cfg = config::load()?;
-    config::config_set(&mut cfg, "auto-update", state, false)?;
-    config::save_settings(&cfg)?;
-    println!(
-        "auto-update {}. Run 'sudo ray restart' for changes to take effect.",
-        if cfg.auto_update { "enabled" } else { "disabled" }
-    );
-    Ok(())
+/// <on|off>`. The daemon persists it and reads it at startup, so the change
+/// takes effect on the next daemon restart.
+async fn cmd_auto_update(state: &str) -> Result<()> {
+    ipc_mutate(ipc::IpcMessage::ConfigSet {
+        key: "auto-update".to_string(),
+        value: state.to_string(),
+        replace: false,
+    })
+    .await
 }
 
-/// `ray config get/set/unset`: view or change global daemon settings. Writes
-/// `settings.toml` directly (like `cmd_mdns`); relay/discovery/dns-upstreams all
-/// take effect on the next daemon restart. On Linux the config tree is root-
-/// owned, so a write naturally requires sudo.
-fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
+/// `ray config get/set/unset`: view or change global daemon settings via the
+/// daemon (see the module note above on why writes are not client-side). Changes
+/// to relay/discovery/dns-upstreams all take effect on the next daemon restart.
+async fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
     match action.unwrap_or(ConfigAction::Get { key: None }) {
         ConfigAction::Get { key } => {
-            let cfg = config::load()?;
-            let rows = config::config_get(&cfg, key.as_deref())?;
-            if json {
-                let map: serde_json::Map<String, serde_json::Value> = rows
-                    .into_iter()
-                    .map(|(k, v)| (k, serde_json::Value::String(v)))
-                    .collect();
-                print_json(&serde_json::Value::Object(map));
-            } else {
-                for (k, v) in rows {
-                    println!("{k} = {v}");
+            let mut stream = ipc::connect()
+                .await
+                .context("rayfish daemon is not running; start it with: sudo ray up")?;
+            ipc::send(&mut stream, ipc::IpcMessage::ConfigGet { key }).await?;
+            match ipc::recv(&mut stream).await? {
+                ipc::IpcMessage::ConfigValues { rows } => {
+                    if json {
+                        let map: serde_json::Map<String, serde_json::Value> = rows
+                            .into_iter()
+                            .map(|(k, v)| (k, serde_json::Value::String(v)))
+                            .collect();
+                        print_json(&serde_json::Value::Object(map));
+                    } else {
+                        for (k, v) in rows {
+                            println!("{k} = {v}");
+                        }
+                    }
                 }
+                ipc::IpcMessage::Error { message } => {
+                    print_error("error", &message, None);
+                    std::process::exit(1);
+                }
+                other => eprintln!("Unexpected response: {other:?}"),
             }
+            Ok(())
         }
         ConfigAction::Set {
             key,
             value,
             replace,
         } => {
-            let mut cfg = config::load()?;
-            config::config_set(&mut cfg, &key, &value, replace)?;
-            config::save_settings(&cfg)?;
-            println!("Set {key}. Run 'sudo ray restart' for changes to take effect.");
+            ipc_mutate(ipc::IpcMessage::ConfigSet {
+                key,
+                value,
+                replace,
+            })
+            .await
         }
-        ConfigAction::Unset { key } => {
-            let mut cfg = config::load()?;
-            config::config_set(&mut cfg, &key, "", false)?;
-            config::save_settings(&cfg)?;
-            println!("Reset {key} to default. Run 'sudo ray restart' for changes to take effect.");
-        }
+        ConfigAction::Unset { key } => ipc_mutate(ipc::IpcMessage::ConfigUnset { key }).await,
     }
-    Ok(())
 }
 
 /// Resolve a username to its UID, falling back to parsing a numeric UID.

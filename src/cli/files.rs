@@ -22,51 +22,51 @@ pub(crate) async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
 }
 
 pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
-    // These subcommands only touch settings.toml (no daemon needed).
+    // These subcommands change (or read) global settings the daemon owns. They
+    // route through the daemon so the write lands in the config dir the daemon
+    // reads (see the config-writing commands note in main.rs / rayfish#94).
     match &action {
         Some(FilesAction::DownloadDir { path, clear }) => {
-            let mut cfg = config::load()?;
             if *clear {
-                cfg.download_dir = None;
-                config::save_settings(&cfg)?;
-                println!("  {} download-dir cleared", style::check());
+                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadDir { path: None }).await;
             } else if let Some(p) = path {
                 if !std::path::Path::new(p).is_absolute() {
                     anyhow::bail!("download-dir must be an absolute path: {p}");
                 }
-                cfg.download_dir = Some(p.clone());
-                config::save_settings(&cfg)?;
-                println!("  {} download-dir = {}", style::check(), style::value(p));
-            } else {
-                println!(
-                    "download-dir = {}",
-                    cfg.download_dir.as_deref().unwrap_or("<unset>")
-                );
+                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadDir {
+                    path: Some(p.clone()),
+                })
+                .await;
+            }
+            let mut stream = ipc::connect().await?;
+            ipc::send(&mut stream, ipc::IpcMessage::GetDownloadSettings).await?;
+            match ipc::recv(&mut stream).await? {
+                ipc::IpcMessage::DownloadSettings { dir, .. } => {
+                    println!("download-dir = {}", dir.as_deref().unwrap_or("<unset>"));
+                }
+                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+                other => eprintln!("Unexpected response: {other:?}"),
             }
             return Ok(());
         }
         Some(FilesAction::DownloadUser { user, clear }) => {
-            let mut cfg = config::load()?;
             if *clear {
-                cfg.download_user = None;
-                config::save_settings(&cfg)?;
-                println!("  {} download-user cleared", style::check());
+                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadUser { uid: None }).await;
             } else if let Some(u) = user {
                 let uid = crate::uid_for_user(u).ok_or_else(|| {
                     anyhow::anyhow!("unknown user '{u}' (pass a valid username or uid)")
                 })?;
-                cfg.download_user = Some(uid);
-                config::save_settings(&cfg)?;
-                println!(
-                    "  {} download-user = {} (uid {uid})",
-                    style::check(),
-                    style::value(u)
-                );
-            } else {
-                match cfg.download_user {
+                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadUser { uid: Some(uid) }).await;
+            }
+            let mut stream = ipc::connect().await?;
+            ipc::send(&mut stream, ipc::IpcMessage::GetDownloadSettings).await?;
+            match ipc::recv(&mut stream).await? {
+                ipc::IpcMessage::DownloadSettings { uid, .. } => match uid {
                     Some(uid) => println!("download-user = uid {uid}"),
                     None => println!("download-user = <unset>"),
-                }
+                },
+                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+                other => eprintln!("Unexpected response: {other:?}"),
             }
             return Ok(());
         }
