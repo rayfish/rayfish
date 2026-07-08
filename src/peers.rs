@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashSet;
@@ -23,13 +23,6 @@ fn now_ms() -> u64 {
     ACTIVITY_EPOCH.elapsed().as_millis() as u64
 }
 
-/// Whether a connection last active at `last_active` (ms) is idle for at least
-/// `idle_ms` as of `now` (ms). Age-based (`now - last_active >= idle_ms`) so a
-/// just-booted process, where `now` itself is smaller than `idle_ms`, never
-/// reports a peer idle before it could possibly have been.
-fn is_idle(now: u64, last_active: u64, idle_ms: u64) -> bool {
-    now.saturating_sub(last_active) >= idle_ms
-}
 
 /// A `DashMap` using ahash instead of the default SipHash. Used for the
 /// per-packet hot maps (routing table, conntrack, device→user resolution):
@@ -110,6 +103,11 @@ pub struct PeerEntry {
     /// whose last activity is older than the idle timeout. Shared as an `Arc` so the
     /// hot send path can bump it via a cloned handle on [`PeerRoute`].
     last_active: Arc<AtomicU64>,
+    /// Whether this peer advertised [`transport::FEATURE_IDLE_CLOSE`](crate::transport::FEATURE_IDLE_CLOSE)
+    /// in its `MeshHello`. We only idle-close a connection whose peer understands
+    /// the idle close code; a peer on a build that predates it (default `false`) is
+    /// held open like an eager node so it never flaps.
+    supports_idle_close: Arc<AtomicBool>,
 }
 
 /// Result of a routing lookup: the connection to send over, the peer identity,
@@ -314,62 +312,47 @@ impl PeerTable {
         self.by_id.get(peer_id).map(|e| *e.value())
     }
 
-    /// Record inbound traffic from `peer_id`, resetting its connection's idle timer.
-    /// Called by the per-connection data reader and control demux (which know only
-    /// the QUIC remote id) on every frame, so a connection carrying only control
-    /// traffic isn't reaped mid-exchange.
-    pub fn note_activity_by_id(&self, peer_id: &EndpointId) {
+    /// Record whether `peer_id` advertised idle-close support in its `MeshHello`
+    /// (`features & FEATURE_IDLE_CLOSE`). Drives whether the per-connection idle
+    /// timer is allowed to close this link.
+    pub fn note_idle_support_by_id(&self, peer_id: &EndpointId, supported: bool) {
         if let Some(ip) = self.by_id.get(peer_id).map(|e| *e.value())
             && let Some(e) = self.v4.get(&ip)
         {
-            e.last_active.store(now_ms(), Ordering::Relaxed);
+            e.supports_idle_close.store(supported, Ordering::Relaxed);
         }
     }
 
-    /// Peers whose connection has seen no traffic for at least `idle` — candidates
-    /// for on-demand teardown. Returns `(ipv4, ipv6, stable_id)`; the reaper closes
-    /// each via [`take_if_idle`](Self::take_if_idle), which re-checks under a lock so
-    /// a send or reconnect between the scan and the close can't lose a live link.
-    pub fn idle_candidates(&self, idle: Duration) -> Vec<(Ipv4Addr, Ipv6Addr, usize)> {
-        let idle_ms = idle.as_millis() as u64;
-        let now = now_ms();
-        self.v4
-            .iter()
-            .filter(|e| is_idle(now, e.last_active.load(Ordering::Relaxed), idle_ms))
-            .map(|e| {
-                (
-                    *e.key(),
-                    membership::derive_ipv6(&e.endpoint_id),
-                    e.conn.stable_id(),
-                )
-            })
-            .collect()
+    /// Whether `peer_id` understands the idle close code. `false` when the peer is
+    /// unknown or never advertised it, so an unregistered or pre-feature peer is
+    /// never idle-closed.
+    pub fn supports_idle_close(&self, peer_id: &EndpointId) -> bool {
+        self.by_id
+            .get(peer_id)
+            .map(|e| *e.value())
+            .and_then(|ip| self.v4.get(&ip).map(|e| e.supports_idle_close.load(Ordering::Relaxed)))
+            .unwrap_or(false)
     }
 
-    /// Remove the peer at `ip` and return its connection to close, but only if its
-    /// stored connection is still `stable_id` and still idle past `idle` — an atomic
-    /// re-check that guards against a send that bumped activity, or a reconnect that
-    /// installed a fresh connection, since the reaper's scan. `None` leaves the entry
-    /// untouched.
-    pub fn take_if_idle(
-        &self,
-        ip: &Ipv4Addr,
-        ipv6: &Ipv6Addr,
-        stable_id: usize,
-        idle: Duration,
-    ) -> Option<Connection> {
+    /// The shared last-activity clock for `peer_id`'s connection, so the
+    /// per-connection idle timer can watch it without repeated map lookups. `None`
+    /// if the peer is not registered.
+    pub fn last_active_of(&self, peer_id: &EndpointId) -> Option<Arc<AtomicU64>> {
+        self.by_id
+            .get(peer_id)
+            .map(|e| *e.value())
+            .and_then(|ip| self.v4.get(&ip).map(|e| e.last_active.clone()))
+    }
+
+    /// Time remaining until `peer_id`'s connection has been idle for `idle`
+    /// (`Duration::ZERO` once it already has). `None` if the peer is not registered.
+    /// Lets a per-connection idle timer sleep exactly the right amount and re-check
+    /// on wake without reaching into the activity clock's internals.
+    pub fn idle_remaining(&self, peer_id: &EndpointId, idle: Duration) -> Option<Duration> {
+        let last = self.last_active_of(peer_id)?;
+        let elapsed_ms = now_ms().saturating_sub(last.load(Ordering::Relaxed));
         let idle_ms = idle.as_millis() as u64;
-        let now = now_ms();
-        let (_, entry) = self.v4.remove_if(ip, |_, e| {
-            e.conn.stable_id() == stable_id
-                && is_idle(now, e.last_active.load(Ordering::Relaxed), idle_ms)
-        })?;
-        self.v6.remove(ipv6);
-        self.by_id.remove(&entry.endpoint_id);
-        if let Some(audit) = &self.audit {
-            audit.log_disconnect(*ip, &entry.endpoint_id.to_string());
-        }
-        Some(entry.conn)
+        Some(Duration::from_millis(idle_ms.saturating_sub(elapsed_ms)))
     }
 
     /// Resolve an inbound datagram from `peer_id` tagged with `handle` to the
@@ -390,6 +373,11 @@ impl PeerTable {
         if !e.networks.contains(network) {
             return None;
         }
+        // Reset the idle timer on the same entry we already hold, so a valid
+        // inbound datagram counts as activity with no extra lookup. Stamped only
+        // past the reachability wall above, so spoofed or out-of-network traffic
+        // can't hold an otherwise-idle connection open.
+        e.last_active.store(now_ms(), Ordering::Relaxed);
         Some((ip, network.clone()))
     }
 
@@ -931,6 +919,7 @@ fn first_conn_placeholder(endpoint_id: EndpointId, conn: Connection, net: SmolSt
         out_handles,
         in_handles: HashMap::new(),
         last_active: Arc::new(AtomicU64::new(now_ms())),
+        supports_idle_close: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -1181,47 +1170,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_candidates_and_guarded_take() {
+    async fn idle_support_capability_and_last_active_lookup() {
         let (_srv, _cli, conn, _client_side) = connected_pair().await;
         let peer = conn.remote_id();
         let ip = crate::membership::derive_ip(&peer);
         let ipv6 = crate::membership::derive_ipv6(&peer);
         let table = PeerTable::new();
+
+        // Unknown peer: not idle-close-capable, and no activity clock to watch.
+        assert!(!table.supports_idle_close(&peer));
+        assert!(table.last_active_of(&peer).is_none());
+
         assert!(table.add(ip, ipv6, conn.clone(), peer, "n1"));
-        let stable = conn.stable_id();
 
-        // With a long idle window the freshly-added peer is not a candidate.
+        // Registered but has not announced its capability yet: default is
+        // "unsupported" so we never idle-close a peer before it advertises.
+        assert!(!table.supports_idle_close(&peer));
+        assert!(table.last_active_of(&peer).is_some());
+
+        table.note_idle_support_by_id(&peer, true);
+        assert!(table.supports_idle_close(&peer));
+
+        table.note_idle_support_by_id(&peer, false);
+        assert!(!table.supports_idle_close(&peer));
+    }
+
+    #[tokio::test]
+    async fn idle_remaining_tracks_activity_clock() {
+        let (_srv, _cli, conn, _client_side) = connected_pair().await;
+        let peer = conn.remote_id();
+        let ip = crate::membership::derive_ip(&peer);
+        let ipv6 = crate::membership::derive_ipv6(&peer);
+        let table = PeerTable::new();
+        let window = Duration::from_secs(120);
+
+        // Unknown peer has no activity clock to watch.
+        assert!(table.idle_remaining(&peer, window).is_none());
+
+        assert!(table.add(ip, ipv6, conn.clone(), peer, "n1"));
+
+        // Freshly registered: nearly the whole window remains (slack for wall time).
+        let rem = table.idle_remaining(&peer, window).unwrap();
         assert!(
-            table.idle_candidates(Duration::from_secs(3600)).is_empty(),
-            "a just-registered peer is not idle"
-        );
-        // With a zero window it is stale immediately.
-        let cands = table.idle_candidates(Duration::ZERO);
-        assert_eq!(cands, vec![(ip, ipv6, stable)]);
-
-        // A stale-id guard: a mismatched stable id never takes the entry.
-        assert!(
-            table
-                .take_if_idle(&ip, &ipv6, stable.wrapping_add(1), Duration::ZERO)
-                .is_none(),
-            "a refreshed connection (different stable id) is not torn down"
-        );
-        assert!(table.lookup_v4(&ip).is_some(), "entry survives the guard");
-
-        // Recorded activity moves it out of the idle set (bump then re-check).
-        let route = table.lookup_v4(&ip).unwrap();
-        route.note_activity();
-        assert!(
-            table
-                .take_if_idle(&ip, &ipv6, stable, Duration::from_secs(3600))
-                .is_none(),
-            "an active connection past the guard window is kept"
+            rem > Duration::from_secs(115),
+            "a fresh peer keeps ~the full window, got {rem:?}"
         );
 
-        // The matching id + zero window takes and returns the connection to close.
-        let taken = table.take_if_idle(&ip, &ipv6, stable, Duration::ZERO);
-        assert!(taken.is_some(), "idle entry with matching id is taken");
-        assert!(table.lookup_v4(&ip).is_none(), "entry removed after take");
+        // A zero-length window means the connection is idle immediately (the same
+        // arithmetic the timer uses to decide it's time to close).
+        assert_eq!(table.idle_remaining(&peer, Duration::ZERO), Some(Duration::ZERO));
+
+        // A fresh activity bump keeps the full window (the timer would re-arm).
+        table.last_active_of(&peer).unwrap().store(now_ms(), Ordering::Relaxed);
+        assert!(table.idle_remaining(&peer, window).unwrap() > Duration::from_secs(115));
     }
 
     #[tokio::test]

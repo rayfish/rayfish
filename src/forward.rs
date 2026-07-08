@@ -626,9 +626,6 @@ pub fn spawn_peer_reader(
                     }
                 },
             };
-            // Any inbound datagram keeps the connection off the idle reaper's list.
-            peers.note_activity_by_id(&peer_id);
-
             if datagram.len() > MAX_PEER_DATAGRAM {
                 stats.record_drop(DropReason::Malformed);
                 continue;
