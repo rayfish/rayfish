@@ -277,6 +277,7 @@ async fn build_daemon(
         pruned_peers.clone(),
         disconnect_tx.clone(),
         on_demand,
+        app_config.idle_timeout(),
     ));
     // FileService owns file transfer + pairing. It evaluates own-device auto-accept
     // directly (no worker channel) and clears a re-paired device's nullifier by
@@ -319,14 +320,9 @@ async fn build_daemon(
         });
     }
 
-    // On-demand idle reaper: closes peer connections idle past the timeout so the
-    // node returns to zero connections (no keepalive radio) when there's no
-    // traffic. Only on on-demand nodes; the link re-forms lazily on the next packet.
-    if on_demand {
-        registry
-            .clone()
-            .spawn_idle_reaper(app_config.idle_timeout());
-    }
+    // Idle teardown is per-connection now: each `MeshConnection` closes itself when
+    // it goes idle (see its run loop), gated on `on_demand` + the peer advertising
+    // support. No separate reaper task.
 
     // Install the daemon-wide mesh dispatch context and spawn the protocol Router
     // *before* building the Daemon. The dispatch is built from the registry (the

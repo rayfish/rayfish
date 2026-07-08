@@ -81,9 +81,13 @@ pub(crate) struct NetworkRegistry {
     /// ConnectService, which depend on the registry), so it is set once at boot
     /// via [`Self::set_protocol_router`] rather than passed to `new`.
     protocol_router: OnceLock<Arc<ProtocolRouter>>,
-    /// On-demand mode: skip eager dialing at startup and never auto-reconnect (all
-    /// re-dialing is lazy). See [`Daemon::on_demand`](crate::daemon::Daemon).
+    /// On-demand mode: run the per-connection idle timer that closes a link idle
+    /// past [`idle_timeout`](Self::idle_timeout), and never auto-reconnect an
+    /// idle-closed peer (re-dialing is lazy). See [`Daemon::on_demand`](crate::daemon::Daemon).
     pub(crate) on_demand: bool,
+    /// How long a connection may sit with no traffic (either direction) before an
+    /// on-demand node idle-closes it. Read by each [`MeshConnection`]'s idle timer.
+    pub(crate) idle_timeout: Duration,
 }
 
 impl NetworkRegistry {
@@ -103,6 +107,7 @@ impl NetworkRegistry {
         pruned_peers: Arc<DashSet<(String, EndpointId)>>,
         disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
         on_demand: bool,
+        idle_timeout: Duration,
     ) -> Self {
         Self {
             networks,
@@ -122,6 +127,7 @@ impl NetworkRegistry {
             disconnect_tx,
             protocol_router: OnceLock::new(),
             on_demand,
+            idle_timeout,
         }
     }
 
@@ -171,37 +177,6 @@ impl NetworkRegistry {
         ok
     }
 
-    /// On-demand idle reaper: the teardown half of the lazy-dial machinery.
-    /// Periodically closes peer connections that have seen no traffic (data or
-    /// control) for `idle`, returning the node to zero connections so it draws no
-    /// keepalive radio. The close carries [`forward::IDLE_CODE`], which the remote
-    /// classifies as [`CloseReason::Idle`](forward::CloseReason::Idle) and does not
-    /// reconnect; the link is re-established lazily on the next packet either side
-    /// sends. Spawned only on on-demand nodes.
-    pub(crate) fn spawn_idle_reaper(self: Arc<Self>, idle: Duration) {
-        let interval = (idle / 2).max(Duration::from_secs(15));
-        let token = self.shutdown_token.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            // `interval` makes the first tick fire immediately; reset it so the first
-            // reap is a full period out (a just-started node shouldn't reap a
-            // connection before any traffic has had a chance to flow).
-            tick.reset();
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => return,
-                    _ = tick.tick() => {}
-                }
-                for (ip, ipv6, stable_id) in self.peers.idle_candidates(idle) {
-                    if let Some(conn) = self.peers.take_if_idle(&ip, &ipv6, stable_id, idle) {
-                        tracing::info!(ip = %ip, "closing idle connection (on-demand teardown)");
-                        conn.close(VarInt::from_u32(forward::IDLE_CODE), b"idle");
-                        self.transport.stats.record_idle_teardown();
-                    }
-                }
-            }
-        });
-    }
 
     /// Seed the route map from a restored roster so the on-demand data path can
     /// lazily dial members before the first reconverge (self excluded by the

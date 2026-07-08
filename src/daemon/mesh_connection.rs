@@ -75,11 +75,55 @@ impl MeshConnection {
         let mut registered = self.pre_registered;
 
         loop {
+            // On-demand idle teardown. Armed only when we run on-demand *and* the
+            // peer advertised idle-close support (recorded from its NetworkHandles):
+            // a peer on a build that predates the idle close code is held open, never
+            // flapped. Recomputed each iteration because the peer registers its
+            // capability just after connect and the clock advances as traffic flows.
+            let sleep_for = (self.ctx.registry.on_demand
+                && self.ctx.peers.supports_idle_close(&self.peer_id))
+            .then(|| {
+                self.ctx
+                    .peers
+                    .idle_remaining(&self.peer_id, self.ctx.registry.idle_timeout)
+            })
+            .flatten();
+
             let accepted = tokio::select! {
                 // Daemon shutdown: drop the reader and leave without reporting a
                 // disconnect (the peer isn't gone, we are).
                 _ = self.token.cancelled() => {
                     reader.abort();
+                    return;
+                }
+                // Idle timer. When disarmed (`None`) this branch parks forever, so it
+                // costs nothing. When it fires we re-check: a send or read may have
+                // bumped activity while we slept, in which case we re-arm.
+                _ = async {
+                    match sleep_for {
+                        Some(d) => tokio::time::sleep(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let still_idle = self
+                        .ctx
+                        .peers
+                        .idle_remaining(&self.peer_id, self.ctx.registry.idle_timeout)
+                        .is_some_and(|d| d.is_zero());
+                    if !still_idle {
+                        continue;
+                    }
+                    tracing::info!(peer = %self.peer_id.fmt_short(), "closing idle connection (on-demand teardown)");
+                    self.conn.close(VarInt::from_u32(forward::IDLE_CODE), b"idle");
+                    reader.abort();
+                    self.ctx.stats.record_idle_teardown();
+                    // We close, so our own loop only ever sees `LocallyClosed`, never
+                    // our IDLE_CODE. Report `Idle` explicitly so the supervisor removes
+                    // the peer and does not reconnect, matching the remote (which does
+                    // see IDLE_CODE). The link re-forms lazily on the next packet.
+                    if registered {
+                        self.report_disconnect(forward::CloseReason::Idle).await;
+                    }
                     return;
                 }
                 r = self.conn.accept_bi() => r,
@@ -99,9 +143,12 @@ impl MeshConnection {
                 Ok(f) => f,
                 Err(_) => continue,
             };
-            // Control traffic counts as activity, so a connection mid control
-            // exchange (e.g. a coordinator pushing roster updates) isn't idle-reaped.
-            self.ctx.peers.note_activity_by_id(&self.peer_id);
+            // Control traffic deliberately does NOT count as activity: "idle" means
+            // no data-plane (TUN) traffic. Counting control frames would let periodic
+            // chatter (pings, roster-sync/blob-update triggers) hold a connection open
+            // forever, defeating on-demand teardown. A control exchange racing the idle
+            // close is safe: frames are atomic and control is only ever a trigger, so a
+            // dropped push re-forms on the next lazy dial or the 60s poll reconverge.
             match self.gate.check() {
                 crate::ratelimit::Verdict::Allow => {}
                 crate::ratelimit::Verdict::Drop => continue,
@@ -121,8 +168,17 @@ impl MeshConnection {
             }
             // Connection-level messages (not scoped to a network).
             match &frame.msg {
-                ControlMsg::NetworkHandles { entries } => {
+                ControlMsg::NetworkHandles { entries, features } => {
                     self.manager.apply_network_handles(self.peer_id, entries);
+                    // The handle announcement is the one control message both ends
+                    // send right after connect, so it is where we learn the peer's
+                    // idle-close capability (the MeshHello handshake is one-way). Gate
+                    // the per-connection idle timer on it: a peer that does not
+                    // advertise support is held open, never idle-closed.
+                    self.ctx.peers.note_idle_support_by_id(
+                        &self.peer_id,
+                        features & crate::transport::FEATURE_IDLE_CLOSE != 0,
+                    );
                     continue;
                 }
                 ControlMsg::Ping { nonce } => {

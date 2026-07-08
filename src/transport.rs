@@ -60,6 +60,15 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// Welcome (deterministic) instead of a separate best-effort `AdminGrant` stream.
 pub const MESH_PROTOCOL_VERSION: u32 = 2;
 
+/// Capability bits a peer advertises in its `MeshHello.features`. These are
+/// negotiated *inside* the single mesh ALPN, so adding one needs no version bump:
+/// a peer acts on a bit only if the other side set it, and an absent `features`
+/// field decodes to `0` (a peer on a build that predates the bit). This is how
+/// idle-close coexists with v0.2.0 peers, which speak mesh v2 but do not
+/// understand [`forward::IDLE_CODE`](crate::forward::IDLE_CODE): we simply never
+/// idle-close a connection whose peer did not advertise `FEATURE_IDLE_CLOSE`.
+pub const FEATURE_IDLE_CLOSE: u64 = 1 << 0;
+
 /// The single mesh ALPN. Unlike the old per-network `rayfish/net/<v>/<prefix>`,
 /// every mesh connection now negotiates this one ALPN regardless of network — a
 /// peer holds exactly one QUIC connection to us, carrying all networks we share.

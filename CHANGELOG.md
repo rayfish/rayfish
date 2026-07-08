@@ -33,14 +33,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **On-demand mesh connections (near-zero idle battery).** A node connects to a
-  peer lazily, on the first packet that needs it, instead of dialing every roster
-  member at startup and holding those connections for the whole session. A
-  connection with no traffic for the idle timeout (default 120s) is closed, so an
-  idle node keeps zero peer connections and stops waking the radio for QUIC
-  keepalives; the link re-forms on the next packet either side sends. On by default;
-  turn it off with `ray config set on-demand off` (and `idle_timeout_secs` tunes the
-  window).
+- **On-demand mesh connections (near-zero idle battery).** A node connects to its
+  peers at startup (so it knows immediately who is reachable), then closes any
+  connection that sees no traffic in either direction for the idle timeout (default
+  120s), returning to zero peer connections so it stops waking the radio for QUIC
+  keepalives. The link re-forms on the next packet either side sends. Idle teardown
+  coexists with older peers: a node only closes an idle link to a peer whose build
+  also understands the idle close, so a peer on an earlier release is held open
+  instead of flapped. On by default; turn it off with `ray config set on-demand off`
+  (and `idle_timeout_secs` tunes the window).
 - **`ray config` now covers the `auto-update` and `on-demand` toggles.** Both
   on/off daemon settings are settable through the standard config surface (e.g.
   `ray config set on-demand off`, `ray config set auto-update on`,

@@ -89,9 +89,11 @@ impl NetworkRegistry {
                 })
                 .cloned()
                 .collect();
-            // On-demand nodes never eagerly re-dial: the link re-forms lazily on the
-            // next outgoing packet, so a bogus kick heals on demand instead.
-            if !self.on_demand && !reconnect_nets.is_empty() {
+            // A non-idle drop reconnects to heal even on on-demand nodes: we
+            // eager-connect the roster, and only an explicit idle close (handled
+            // above) is allowed to leave a peer disconnected. The idle timer will
+            // close the healed link again if it stays quiet.
+            if !reconnect_nets.is_empty() {
                 self.clone()
                     .spawn_reconnect(ev.endpoint_id, ev.ip, reconnect_nets);
             }
@@ -102,8 +104,9 @@ impl NetworkRegistry {
         // ephemeral pruner ages the member from when it actually went offline
         // (not its admit time), then reconnect across every shared network,
         // skipping any we just pruned this peer from (one-shot via pruned_peers).
-        // The `last_seen` stamp runs on every node (it feeds ephemeral aging); only
-        // the eager reconnect is suppressed on-demand (re-dial is lazy there).
+        // Reconnect runs on every node, on-demand included: a transient drop is a
+        // real link failure, not an idle teardown (which is handled above and never
+        // reconnects), so we heal it and let the idle timer close it again if quiet.
         let member_id = self.device_user_map.resolve(&ev.endpoint_id);
         let now = crate::membership::now_secs();
         for net in &nets {
@@ -115,9 +118,7 @@ impl NetworkRegistry {
             }
         }
 
-        if !self.on_demand {
-            self.spawn_reconnect(ev.endpoint_id, ev.ip, nets);
-        }
+        self.spawn_reconnect(ev.endpoint_id, ev.ip, nets);
     }
 
     /// Confirm a coordinator's `ControlMsg::KickedFromNetwork` against `network`'s

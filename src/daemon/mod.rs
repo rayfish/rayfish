@@ -247,7 +247,15 @@ pub(crate) async fn announce_network_handles(
     if entries.is_empty() {
         return;
     }
-    let _ = open_and_send(conn, None, &ControlMsg::NetworkHandles { entries }).await;
+    let _ = open_and_send(
+        conn,
+        None,
+        &ControlMsg::NetworkHandles {
+            entries,
+            features: transport::FEATURE_IDLE_CLOSE,
+        },
+    )
+    .await;
 }
 
 /// Project a roster's `Member`s into the persistable `config::MemberEntry` form
@@ -1388,6 +1396,7 @@ mod accept_handler_tests {
             Arc::new(DashSet::new()),
             disconnect_tx,
             false,
+            Duration::from_secs(config::DEFAULT_IDLE_TIMEOUT_SECS),
         ))
     }
 
