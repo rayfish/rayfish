@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ray mdns off` (and the other config-writing commands) now take effect on
+  non-Linux hosts.** `ray mdns`, `ray auto-update`, `ray config set|unset`, and
+  `ray files download-dir|download-user` wrote `settings.toml` from the CLI
+  process. On Linux the config dir is a fixed `/etc/rayfish`, so this was fine, but
+  on macOS/FreeBSD it is derived from the process environment: a CLI running under
+  a different `HOME` than the daemon service wrote a `settings.toml` the daemon
+  never read, so the setting silently reverted on restart. These commands now route
+  through the daemon, which writes (and reads) its own config dir. They now require
+  the daemon to be running.
+
 - **Desktop data plane no longer wedges after an on-demand dial.** The desktop TUN
   read grew the packet pool before its `await` and truncated after, so when
   `run_mesh` cancelled the read (which it does the moment a lazy dial completes) the

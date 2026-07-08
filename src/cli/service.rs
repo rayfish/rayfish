@@ -207,7 +207,11 @@ pub(crate) fn require_root() -> Result<()> {
 ///
 /// `--auto-update` opts this node into automatic stable updates: it is persisted
 /// to `settings.toml` *before* the (re)start so the freshly launched daemon
-/// reads it at boot and spawns the periodic update task.
+/// reads it at boot and spawns the periodic update task. Unlike the other
+/// config-writing commands (which route through the daemon, see main.rs), this
+/// one writes directly: there is no daemon to route to yet, and it runs as root
+/// immediately before starting the service, so it shares the service's config
+/// dir.
 pub(crate) async fn cmd_install(auto_update: bool) -> Result<()> {
     require_root()?;
     if auto_update {
