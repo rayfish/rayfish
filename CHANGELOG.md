@@ -15,6 +15,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first, so both the interface and the control plane go down and the device stops
   using the radio.
 
+### Changed
+
+- **Desktop TUN now runs on `tun-rs`.** Swapped the `tun` crate for `tun-rs` on
+  Linux, macOS, and the other desktop targets (Android is unaffected, it uses the
+  `VpnService` fd). Behavior is unchanged: same 1280 MTU, addresses and routes are
+  still installed by our own netlink/`ifconfig` helpers. This is the groundwork for
+  a later Linux GRO/GSO offload path that batches TUN writes.
+
 ### Added
 
 - **Static musl Linux binaries.** Every release and nightly now also ships
