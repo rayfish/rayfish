@@ -76,7 +76,9 @@ impl ConnectService {
             })
             .map(|p| p.value().clone());
         let Some(req) = found else {
-            return ipc_err(format!("no pending connection request matching '{id_prefix}'"));
+            return ipc_err(format!(
+                "no pending connection request matching '{id_prefix}'"
+            ));
         };
         let peer = req.from_endpoint;
 
@@ -160,8 +162,9 @@ impl ConnectService {
         let peer = match dht::resolve_contact(&pkarr, contact_pubkey).await {
             Ok(id) => id,
             Err(_) => {
-                return ipc_err("contact offline or unknown (could not resolve contact id)"
-                        .to_string());
+                return ipc_err(
+                    "contact offline or unknown (could not resolve contact id)".to_string(),
+                );
             }
         };
         if let Some(name) = self.registry.existing_direct_network_with(&peer) {
@@ -331,7 +334,9 @@ impl ConnectService {
                     message: format!("declined connection request '{id_prefix}'"),
                 }
             }
-            None => ipc_err(format!("no pending connection request matching '{id_prefix}'")),
+            None => ipc_err(format!(
+                "no pending connection request matching '{id_prefix}'"
+            )),
         }
     }
 

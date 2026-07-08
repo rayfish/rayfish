@@ -352,7 +352,10 @@ impl NetworkRegistry {
         }
 
         if has_other_members && !force {
-            return ipc_err("network has other members — use --force to destroy, or transfer ownership first".to_string());
+            return ipc_err(
+                "network has other members — use --force to destroy, or transfer ownership first"
+                    .to_string(),
+            );
         }
 
         // Publish empty pkarr record
@@ -401,13 +404,15 @@ impl NetworkRegistry {
             }
         };
         if !has_key {
-            return ipc_err("only a coordinator (network key holder) can kick a member".to_string());
+            return ipc_err(
+                "only a coordinator (network key holder) can kick a member".to_string(),
+            );
         }
         if mode == GroupMode::Open {
             return ipc_err(format!(
-                    "'{network}' is an open network — a kicked peer can re-join immediately. \
+                "'{network}' is an open network — a kicked peer can re-join immediately. \
                      Kicking only takes effect on a closed network."
-                ));
+            ));
         }
 
         // Resolve the argument to a roster member. `resolve_peer_name` may hand
@@ -446,9 +451,9 @@ impl NetworkRegistry {
         }
         if is_coord {
             return ipc_err(format!(
-                    "'{display}' is a coordinator (holds the network key); kicking can't remove \
+                "'{display}' is a coordinator (holds the network key); kicking can't remove \
                      its access. Revoke the key instead."
-                ));
+            ));
         }
 
         // Prune the roster + approved list, then republish the signed blob so the
@@ -715,8 +720,8 @@ impl Daemon {
         if let Some(h) = hostname {
             if !crate::hostname::is_valid_hostname(&h) {
                 return ipc_err(format!(
-                        "invalid hostname '{h}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
-                    ));
+                    "invalid hostname '{h}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
+                ));
             }
             match config::load() {
                 Ok(mut app_config) => {

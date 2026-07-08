@@ -70,7 +70,7 @@ use crate::firewall::{self, SharedFirewall};
 use crate::forward;
 use crate::identity;
 use crate::ipc::{
-    self, ipc_err, FirewallRuleView, IpcMessage, NetworkRole, NetworkStatus, PeerStatus,
+    self, FirewallRuleView, IpcMessage, NetworkRole, NetworkStatus, PeerStatus, ipc_err,
 };
 use crate::membership::{
     ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
@@ -728,9 +728,11 @@ impl Daemon {
 
         // Granting operator access is reserved for root.
         if matches!(req, IpcMessage::SetOperator { .. }) {
-            return Some(ipc_err("permission denied: granting operator access requires root \
+            return Some(ipc_err(
+                "permission denied: granting operator access requires root \
                           (re-run with sudo)"
-                    .to_string()));
+                    .to_string(),
+            ));
         }
 
         // Otherwise the caller must be the configured operator.
@@ -739,9 +741,11 @@ impl Daemon {
             return None;
         }
 
-        Some(ipc_err("permission denied: this user is not authorized to control rayfish.\n\
+        Some(ipc_err(
+            "permission denied: this user is not authorized to control rayfish.\n\
                       Grant access with: sudo ray set-operator <user>"
-                .to_string()))
+                .to_string(),
+        ))
     }
 
     /// Persist the operator UID so that user can run mutating `ray` commands

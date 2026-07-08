@@ -83,7 +83,8 @@ impl NetworkRegistry {
                 .cloned()
                 .collect();
             if !reconnect_nets.is_empty() {
-                self.clone().spawn_reconnect(ev.endpoint_id, ev.ip, reconnect_nets);
+                self.clone()
+                    .spawn_reconnect(ev.endpoint_id, ev.ip, reconnect_nets);
             }
             return;
         }
@@ -549,7 +550,9 @@ pub(crate) async fn finalize_removal(
             // the network). Best-effort; a missed message falls back to the victim's
             // reconverge.
             if let Ok((mut send, _recv)) = conn.open_bi().await {
-                let _ = control::send_msg(&mut send, Some(net_pubkey), &ControlMsg::KickedFromNetwork).await;
+                let _ =
+                    control::send_msg(&mut send, Some(net_pubkey), &ControlMsg::KickedFromNetwork)
+                        .await;
                 let _ = send.finish();
             }
             // Drop this network's route to the victim. We do not close the

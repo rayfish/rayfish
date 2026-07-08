@@ -110,7 +110,8 @@ impl MeshConnection {
                     // A flood close is not a graceful leave, so the supervisor
                     // treats it as a transient drop and reconnects.
                     if registered {
-                        self.report_disconnect(forward::CloseReason::Transient).await;
+                        self.report_disconnect(forward::CloseReason::Transient)
+                            .await;
                     }
                     return;
                 }

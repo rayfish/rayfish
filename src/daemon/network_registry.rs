@@ -170,7 +170,9 @@ impl NetworkRegistry {
             ),
             Err(e) => {
                 tracing::warn!(error = %e, "unpair: failed to delete device cert");
-                return ipc_err(format!("left all networks but failed to delete device cert: {e}"));
+                return ipc_err(format!(
+                    "left all networks but failed to delete device cert: {e}"
+                ));
             }
         }
         IpcMessage::Ok {
@@ -262,7 +264,9 @@ impl NetworkRegistry {
             return Err(ipc_err(format!("network '{network}' not active")));
         };
         if !handle.role.is_coordinator() {
-            return Err(ipc_err(format!("only the coordinator of '{network}' can manage invites/requests")));
+            return Err(ipc_err(format!(
+                "only the coordinator of '{network}' can manage invites/requests"
+            )));
         }
         Ok((handle.network_key, handle.invite_lock.clone()))
     }

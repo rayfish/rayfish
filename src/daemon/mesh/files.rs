@@ -85,9 +85,11 @@ impl Daemon {
                     timeout_secs = PAIR_CONNECT_TIMEOUT.as_secs(),
                     "pairing: timed out connecting to primary device"
                 );
-                return ipc_err("timed out reaching the primary device. Make sure it is online and \
+                return ipc_err(
+                    "timed out reaching the primary device. Make sure it is online and \
                               that you opened pairing on it (run `ray pair` there)."
-                        .to_string());
+                        .to_string(),
+                );
             }
         };
         let (mut send, mut recv) = match conn.open_bi().await {

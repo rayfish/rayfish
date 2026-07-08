@@ -12,8 +12,8 @@ impl NetworkRegistry {
     pub(crate) async fn admin_add(&self, network: &str, identity_str: &str) -> IpcMessage {
         let Some(identity) = self.resolve_short_id_any_network(identity_str) else {
             return ipc_err(format!(
-                    "could not resolve identity '{identity_str}' (use a short id of a joined member)"
-                ));
+                "could not resolve identity '{identity_str}' (use a short id of a joined member)"
+            ));
         };
         let (net_pubkey, net_secret_key) = match self.networks.get(network) {
             Some(h) => {
@@ -22,8 +22,9 @@ impl NetworkRegistry {
                     s.network_secret_key.clone()
                 };
                 if key.is_none() {
-                    return ipc_err("only a coordinator (network key holder) can grant admin"
-                            .to_string());
+                    return ipc_err(
+                        "only a coordinator (network key holder) can grant admin".to_string(),
+                    );
                 }
                 (h.network_key, key)
             }
@@ -46,9 +47,11 @@ impl NetworkRegistry {
             .into_iter()
             .find(|(id, _, _)| *id == identity)
             .map(|(_, _, c)| c)
-            .ok_or_else(|| ipc_err(format!(
+            .ok_or_else(|| {
+                ipc_err(format!(
                     "could not find an active connection to {identity} on '{network}'"
-                )));
+                ))
+            });
         let conn = match conn {
             Ok(c) => c,
             Err(e) => return e,
@@ -124,7 +127,9 @@ impl NetworkRegistry {
             }
         }
         if !self_holds_key && admins.is_empty() {
-            return ipc_err(format!("network '{network}' not found or not a coordinator"));
+            return ipc_err(format!(
+                "network '{network}' not found or not a coordinator"
+            ));
         }
         IpcMessage::AdminListResponse { admins }
     }
