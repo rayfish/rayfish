@@ -99,6 +99,9 @@ impl MeshConnection {
                 Ok(f) => f,
                 Err(_) => continue,
             };
+            // Control traffic counts as activity, so a connection mid control
+            // exchange (e.g. a coordinator pushing roster updates) isn't idle-reaped.
+            self.ctx.peers.note_activity_by_id(&self.peer_id);
             match self.gate.check() {
                 crate::ratelimit::Verdict::Allow => {}
                 crate::ratelimit::Verdict::Drop => continue,
@@ -236,6 +239,50 @@ fn close_reason(e: &ConnectionError) -> forward::CloseReason {
         {
             forward::CloseReason::Kicked
         }
+        ConnectionError::ApplicationClosed(ac)
+            if ac.error_code == VarInt::from_u32(forward::IDLE_CODE) =>
+        {
+            forward::CloseReason::Idle
+        }
         _ => forward::CloseReason::Transient,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::endpoint::{ApplicationClose, VarInt};
+
+    fn app_close(code: u32) -> ConnectionError {
+        ConnectionError::ApplicationClosed(ApplicationClose {
+            error_code: VarInt::from_u32(code),
+            reason: Vec::new().into(),
+        })
+    }
+
+    #[test]
+    fn close_code_classification() {
+        assert!(matches!(
+            close_reason(&app_close(forward::LEAVE_CODE)),
+            forward::CloseReason::Left
+        ));
+        assert!(matches!(
+            close_reason(&app_close(forward::KICK_CODE)),
+            forward::CloseReason::Kicked
+        ));
+        assert!(matches!(
+            close_reason(&app_close(forward::IDLE_CODE)),
+            forward::CloseReason::Idle
+        ));
+        // An unrelated application code is a transient drop (reconnected).
+        assert!(matches!(
+            close_reason(&app_close(0xdead)),
+            forward::CloseReason::Transient
+        ));
+        // A non-application close (timeout, reset) is transient too.
+        assert!(matches!(
+            close_reason(&ConnectionError::TimedOut),
+            forward::CloseReason::Transient
+        ));
     }
 }

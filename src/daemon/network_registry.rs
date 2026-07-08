@@ -13,7 +13,24 @@
 
 use super::*;
 use arc_swap::ArcSwap;
+use std::net::IpAddr;
 use std::sync::OnceLock;
+use std::time::Duration;
+
+/// Upper bound on a single on-demand dial. The first packets of a flow wait at
+/// most this long for the connection; past it the buffered packets are dropped and
+/// the peer is marked unreachable until a later packet retries the dial.
+const LAZY_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One network to (re)handshake when dialing a peer: its name, the per-network
+/// public key that signs the `MeshHello`, and our mesh IPv4 on it. A peer's single
+/// connection carries every shared network, so a dial takes a slice of these.
+#[derive(Clone)]
+pub(crate) struct DialTarget {
+    pub network: String,
+    pub network_key: EndpointId,
+    pub my_ip: Ipv4Addr,
+}
 
 pub(crate) struct NetworkRegistry {
     /// Per-network runtime handles, keyed by network name. Shared with
@@ -50,6 +67,13 @@ pub(crate) struct NetworkRegistry {
     pub(crate) tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
     /// Roster-pruned peers to skip on reconnect (see [`MeshCtx::pruned_peers`]).
     pub(crate) pruned_peers: Arc<DashSet<(String, EndpointId)>>,
+    /// IP -> roster member map (no connection required), so the on-demand data
+    /// path can turn a destination IP into the peer to lazily dial. Populated
+    /// wherever the roster is applied; queried by the forwarding loop + dialer.
+    pub(crate) route_map: peers::RosterRouteMap,
+    /// Per-peer dial outcome history: drives the on-demand dialer cooldown and the
+    /// idle/offline distinction in `ray status`.
+    pub(crate) reachability: peers::Reachability,
     /// Daemon-wide disconnect channel drained by the connection supervisor.
     pub(crate) disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     /// The inbound QUIC router, needed to drive a freshly (re)dialed connection's
@@ -57,6 +81,9 @@ pub(crate) struct NetworkRegistry {
     /// ConnectService, which depend on the registry), so it is set once at boot
     /// via [`Self::set_protocol_router`] rather than passed to `new`.
     protocol_router: OnceLock<Arc<ProtocolRouter>>,
+    /// On-demand mode: skip eager dialing at startup and never auto-reconnect (all
+    /// re-dialing is lazy). See [`Daemon::on_demand`](crate::daemon::Daemon).
+    pub(crate) on_demand: bool,
 }
 
 impl NetworkRegistry {
@@ -75,6 +102,7 @@ impl NetworkRegistry {
         tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
         pruned_peers: Arc<DashSet<(String, EndpointId)>>,
         disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+        on_demand: bool,
     ) -> Self {
         Self {
             networks,
@@ -89,9 +117,107 @@ impl NetworkRegistry {
             device_user_map,
             tun_tx,
             pruned_peers,
+            route_map: peers::RosterRouteMap::new(),
+            reachability: peers::Reachability::new(),
             disconnect_tx,
             protocol_router: OnceLock::new(),
+            on_demand,
         }
+    }
+
+    /// Resolve a destination mesh IP to a roster member the on-demand forwarding
+    /// loop can dial, if we know one. Just a route-map lookup; the loop owns the
+    /// packet buffering and dedup.
+    pub(crate) fn resolve_route(&self, dst: IpAddr) -> Option<peers::RouteTarget> {
+        match dst {
+            IpAddr::V4(v4) => self.route_map.resolve_v4(&v4),
+            IpAddr::V6(v6) => self.route_map.resolve_v6(&v6),
+        }
+    }
+
+    /// The raw on-demand dial mechanism: connect to `target` across every shared
+    /// network (bounded by [`LAZY_DIAL_TIMEOUT`]) and register its route, recording
+    /// the outcome for status + cooldown. Returns whether a connection was
+    /// established (the caller then flushes any buffered packets). The forwarding
+    /// loop owns the buffering/dedup and calls this from a spawned task.
+    pub(crate) async fn dial_target(self: &Arc<Self>, target: &peers::RouteTarget) -> bool {
+        let targets: Vec<DialTarget> = target
+            .networks
+            .iter()
+            .filter_map(|net| {
+                self.networks.get(net.as_str()).map(|h| DialTarget {
+                    network: net.to_string(),
+                    network_key: h.network_key,
+                    my_ip: h.my_ip,
+                })
+            })
+            .collect();
+        let id = target.endpoint_id;
+        let ok = !targets.is_empty()
+            && matches!(
+                tokio::time::timeout(
+                    LAZY_DIAL_TIMEOUT,
+                    self.dial_peer_once(id, target.ipv4, &targets),
+                )
+                .await,
+                Ok(true)
+            );
+        if ok {
+            self.reachability.note_ok(id);
+        } else {
+            self.reachability.note_fail(id);
+        }
+        self.transport.stats.record_lazy_dial(ok);
+        ok
+    }
+
+    /// On-demand idle reaper: the teardown half of the lazy-dial machinery.
+    /// Periodically closes peer connections that have seen no traffic (data or
+    /// control) for `idle`, returning the node to zero connections so it draws no
+    /// keepalive radio. The close carries [`forward::IDLE_CODE`], which the remote
+    /// classifies as [`CloseReason::Idle`](forward::CloseReason::Idle) and does not
+    /// reconnect; the link is re-established lazily on the next packet either side
+    /// sends. Spawned only on on-demand nodes.
+    pub(crate) fn spawn_idle_reaper(self: Arc<Self>, idle: Duration) {
+        let interval = (idle / 2).max(Duration::from_secs(15));
+        let token = self.shutdown_token.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            // `interval` makes the first tick fire immediately; reset it so the first
+            // reap is a full period out (a just-started node shouldn't reap a
+            // connection before any traffic has had a chance to flow).
+            tick.reset();
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => return,
+                    _ = tick.tick() => {}
+                }
+                for (ip, ipv6, stable_id) in self.peers.idle_candidates(idle) {
+                    if let Some(conn) = self.peers.take_if_idle(&ip, &ipv6, stable_id, idle) {
+                        tracing::info!(ip = %ip, "closing idle connection (on-demand teardown)");
+                        conn.close(VarInt::from_u32(forward::IDLE_CODE), b"idle");
+                        self.transport.stats.record_idle_teardown();
+                    }
+                }
+            }
+        });
+    }
+
+    /// Seed the route map from a restored roster so the on-demand data path can
+    /// lazily dial members before the first reconverge (self excluded by the
+    /// caller-provided list, which should already omit us).
+    pub(crate) fn seed_route_map(&self, network: &str, members: &[Member]) {
+        let my_id = self.transport.identity.local_identity();
+        let routes: Vec<peers::RouteMember> = members
+            .iter()
+            .filter(|m| m.identity != my_id)
+            .map(|m| peers::RouteMember {
+                endpoint_id: m.identity,
+                ipv4: m.ip,
+                ipv6: derive_ipv6(&m.identity),
+            })
+            .collect();
+        self.route_map.sync_network(network, &routes);
     }
 
     /// Install the inbound QUIC router. Called once at boot after the router is
@@ -124,6 +250,7 @@ impl NetworkRegistry {
             reverse_table: self.dns.reverse_table.clone(),
             device_user_map: self.device_user_map.clone(),
             pruned_peers: self.pruned_peers.clone(),
+            route_map: self.route_map.clone(),
             disconnect_tx: self.disconnect_tx.clone(),
             registry: self.clone(),
         }
@@ -202,6 +329,7 @@ impl NetworkRegistry {
             conn.close(VarInt::from_u32(forward::LEAVE_CODE), b"leave");
         }
         self.dns.clear_network(name).await;
+        self.route_map.remove_network(name);
         self.conn.unregister(&handle.network_key);
         self.refresh_search_domains().await;
         true

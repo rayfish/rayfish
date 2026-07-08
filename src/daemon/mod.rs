@@ -70,7 +70,7 @@ use crate::firewall::{self, SharedFirewall};
 use crate::forward;
 use crate::identity;
 use crate::ipc::{
-    self, FirewallRuleView, IpcMessage, NetworkRole, NetworkStatus, PeerStatus, ipc_err,
+    self, FirewallRuleView, IpcMessage, NetworkRole, NetworkStatus, PeerState, PeerStatus, ipc_err,
 };
 use crate::membership::{
     ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
@@ -120,7 +120,7 @@ pub(crate) use mesh_connection::MeshConnection;
 
 // The service that owns the set of active networks (M5 migration seam).
 mod network_registry;
-pub(crate) use network_registry::NetworkRegistry;
+pub(crate) use network_registry::{DialTarget, NetworkRegistry};
 
 // Domain satellites with their own owned state (and ALPN accept arms), held by
 // `Daemon` as fields rather than loose on the core. See each module.
@@ -165,6 +165,10 @@ pub(crate) struct MeshCtx {
     /// and re-form the link. The supervisor consumes an entry here to skip that
     /// one reconnect. Populated in [`reconverge_and_apply`] and the kick handler.
     pruned_peers: Arc<DashSet<(String, EndpointId)>>,
+    /// IP -> roster member map (no connection required), populated wherever the
+    /// roster is applied so the on-demand data path can resolve an unconnected
+    /// destination to the peer to lazily dial. See [`peers::RosterRouteMap`].
+    pub(crate) route_map: peers::RosterRouteMap,
     /// Daemon-wide disconnect channel. Every [`MeshConnection`] reports its peer's
     /// drop here when its demux loop ends, and a single
     /// [`NetworkRegistry::run_connection_supervisor`] consumes it. Under one mesh
@@ -207,6 +211,11 @@ impl MeshCtx {
         network: &str,
     ) -> bool {
         let ipv6 = derive_ipv6(&peer_id);
+        // Keep the roster route map current with every peer we connect to, so a
+        // later idle teardown can re-dial it on demand (reconverge covers the
+        // roster-wide sync + removals; this is the incremental add).
+        self.route_map
+            .sync_add(network, ip, ipv6, peer_id);
         self.peers.add(ip, ipv6, conn.clone(), peer_id, network)
     }
 }
@@ -611,10 +620,16 @@ impl Daemon {
             let cancel = cancel.clone();
             let stats = self.stats.clone();
             let resolver = self.dns.resolver.clone();
+            // The registry is the forwarding loop's on-demand dial mechanism: when a
+            // packet has no live route, the loop asks it to dial the roster member.
+            // Present on every node so any peer stays reachable-on-demand after a link
+            // idle-closes.
+            let dialer = Some(self.registry.clone());
             tokio::spawn(async move {
-                if let Err(e) =
-                    forward::run_mesh(reader, peers, firewall, cancel, stats, resolver, new_tx)
-                        .await
+                if let Err(e) = forward::run_mesh(
+                    reader, peers, firewall, cancel, stats, resolver, new_tx, dialer,
+                )
+                .await
                 {
                     tracing::warn!(error = %e, "mesh forwarding loop exited with error");
                 }
@@ -1308,6 +1323,7 @@ mod accept_handler_tests {
             reverse_table: dns::new_reverse_table(),
             device_user_map: peers::DeviceUserMap::new(),
             pruned_peers: Arc::new(DashSet::new()),
+            route_map: peers::RosterRouteMap::new(),
             disconnect_tx,
             registry,
         }
@@ -1371,6 +1387,7 @@ mod accept_handler_tests {
             Arc::new(arc_swap::ArcSwap::from_pointee(placeholder_tx)),
             Arc::new(DashSet::new()),
             disconnect_tx,
+            false,
         ))
     }
 
@@ -1667,7 +1684,7 @@ mod headless_tests {
         // on panic, so this can't poison later tests.
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon = tokio::time::timeout(std::time::Duration::from_secs(30), build_headless())
+        let daemon = tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
             .await
             .expect("build_headless should not hang")
             .expect("build_headless should succeed");
@@ -1737,7 +1754,7 @@ mod headless_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon = tokio::time::timeout(std::time::Duration::from_secs(30), build_headless())
+        let daemon = tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
             .await
             .expect("build_headless should not hang")
             .expect("build_headless should succeed");

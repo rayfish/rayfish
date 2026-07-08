@@ -366,7 +366,7 @@ impl Node {
 
         let state = self
             .runtime
-            .block_on(build_headless())
+            .block_on(build_headless(true))
             .map_err(RayError::network)?;
 
         // Commit under the lock, re-checking for a racing `start` that won while

@@ -3,6 +3,8 @@
 //! to DNS and re-materialize suggested firewall rules. The 60s group poller and
 //! the peer-cleanup-adjacent helpers that drive reconvergence live here.
 
+use std::net::Ipv6Addr;
+
 use super::super::*;
 
 /// Materialize this node's suggested firewall rules for `network` from the
@@ -159,6 +161,7 @@ pub(crate) async fn reconverge_and_apply(
         reverse_table,
         device_user_map,
         pruned_peers,
+        route_map,
         registry,
         ..
     } = ctx;
@@ -246,6 +249,7 @@ pub(crate) async fn reconverge_and_apply(
         my_identity,
         hostname_table,
         reverse_table,
+        route_map,
     )
     .await;
     // Drop any live connection to a peer the signed roster no longer lists (it was
@@ -349,8 +353,22 @@ pub(crate) async fn apply_roster_to_dns(
     my_identity: EndpointId,
     hostname_table: &dns::HostnameTable,
     reverse_table: &dns::ReverseLookupTable,
+    route_map: &peers::RosterRouteMap,
 ) {
-    let mut entries: Vec<(String, Ipv4Addr, std::net::Ipv6Addr)> = members
+    // Refresh the IP -> member map so the on-demand data path can lazily dial any
+    // roster member (self excluded). The roster is the source of truth, so a
+    // shrinking roster drops stale entries via the per-network replace.
+    let routes: Vec<peers::RouteMember> = members
+        .iter()
+        .filter(|m| m.identity != my_identity)
+        .map(|m| peers::RouteMember {
+            endpoint_id: m.identity,
+            ipv4: m.ip,
+            ipv6: derive_ipv6(&m.identity),
+        })
+        .collect();
+    route_map.sync_network(network_name, &routes);
+    let mut entries: Vec<(String, Ipv4Addr, Ipv6Addr)> = members
         .iter()
         .filter_map(|m| {
             m.hostname

@@ -862,6 +862,7 @@ mod tests {
             is_own_device: false,
             incompatible: false,
             connection: None,
+            state: ipc::PeerState::Idle,
         }
     }
 

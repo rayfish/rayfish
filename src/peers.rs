@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use dashmap::DashSet;
 use iroh::EndpointId;
@@ -8,6 +11,25 @@ use iroh::endpoint::Connection;
 use smol_str::SmolStr;
 
 use crate::audit::AuditLog;
+use crate::membership;
+
+/// Monotonic base for per-connection activity timestamps. Activity is stored as
+/// milliseconds since this instant in a plain `AtomicU64` (cheap to bump on the
+/// hot path); the idle reaper compares against [`now_ms`].
+static ACTIVITY_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Milliseconds since [`ACTIVITY_EPOCH`]. Wraps far past any process lifetime.
+fn now_ms() -> u64 {
+    ACTIVITY_EPOCH.elapsed().as_millis() as u64
+}
+
+/// Whether a connection last active at `last_active` (ms) is idle for at least
+/// `idle_ms` as of `now` (ms). Age-based (`now - last_active >= idle_ms`) so a
+/// just-booted process, where `now` itself is smaller than `idle_ms`, never
+/// reports a peer idle before it could possibly have been.
+fn is_idle(now: u64, last_active: u64, idle_ms: u64) -> bool {
+    now.saturating_sub(last_active) >= idle_ms
+}
 
 /// A `DashMap` using ahash instead of the default SipHash. Used for the
 /// per-packet hot maps (routing table, conntrack, device→user resolution):
@@ -83,6 +105,11 @@ pub struct PeerEntry {
     /// `NetworkHandles`. Used to resolve which network an inbound datagram from
     /// this peer belongs to.
     in_handles: HashMap<u16, SmolStr>,
+    /// Milliseconds ([`now_ms`]) of the last traffic on this connection in either
+    /// direction (data or control). The on-demand idle reaper closes connections
+    /// whose last activity is older than the idle timeout. Shared as an `Arc` so the
+    /// hot send path can bump it via a cloned handle on [`PeerRoute`].
+    last_active: Arc<AtomicU64>,
 }
 
 /// Result of a routing lookup: the connection to send over, the peer identity,
@@ -97,6 +124,16 @@ pub struct PeerRoute {
     pub network: SmolStr,
     /// The outbound datagram tag for `network` on this connection.
     pub handle: u16,
+    /// Shared last-activity clock for this peer's connection; the sender bumps it
+    /// after a successful send so the idle reaper sees the connection as active.
+    last_active: Arc<AtomicU64>,
+}
+
+impl PeerRoute {
+    /// Record that traffic just went out on this connection (resets its idle timer).
+    pub fn note_activity(&self) {
+        self.last_active.store(now_ms(), Ordering::Relaxed);
+    }
 }
 
 /// Whether installing a connection with stable id `incoming` as a peer's data
@@ -135,6 +172,7 @@ impl PeerEntry {
             endpoint_id: self.endpoint_id,
             network,
             handle,
+            last_active: self.last_active.clone(),
         })
     }
 }
@@ -230,6 +268,9 @@ impl PeerTable {
                         let h = next_free_handle(&e.out_handles);
                         e.out_handles.insert(net.clone(), h);
                     }
+                    // Registering a (re)connection counts as activity, so a fresh
+                    // link isn't immediately reaped as idle.
+                    e.last_active.store(now_ms(), Ordering::Relaxed);
                 }
                 Entry::Vacant(v) => {
                     first_ever = true;
@@ -271,6 +312,64 @@ impl PeerTable {
     /// handshake.
     pub fn v4_for_id(&self, peer_id: &EndpointId) -> Option<Ipv4Addr> {
         self.by_id.get(peer_id).map(|e| *e.value())
+    }
+
+    /// Record inbound traffic from `peer_id`, resetting its connection's idle timer.
+    /// Called by the per-connection data reader and control demux (which know only
+    /// the QUIC remote id) on every frame, so a connection carrying only control
+    /// traffic isn't reaped mid-exchange.
+    pub fn note_activity_by_id(&self, peer_id: &EndpointId) {
+        if let Some(ip) = self.by_id.get(peer_id).map(|e| *e.value())
+            && let Some(e) = self.v4.get(&ip)
+        {
+            e.last_active.store(now_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// Peers whose connection has seen no traffic for at least `idle` — candidates
+    /// for on-demand teardown. Returns `(ipv4, ipv6, stable_id)`; the reaper closes
+    /// each via [`take_if_idle`](Self::take_if_idle), which re-checks under a lock so
+    /// a send or reconnect between the scan and the close can't lose a live link.
+    pub fn idle_candidates(&self, idle: Duration) -> Vec<(Ipv4Addr, Ipv6Addr, usize)> {
+        let idle_ms = idle.as_millis() as u64;
+        let now = now_ms();
+        self.v4
+            .iter()
+            .filter(|e| is_idle(now, e.last_active.load(Ordering::Relaxed), idle_ms))
+            .map(|e| {
+                (
+                    *e.key(),
+                    membership::derive_ipv6(&e.endpoint_id),
+                    e.conn.stable_id(),
+                )
+            })
+            .collect()
+    }
+
+    /// Remove the peer at `ip` and return its connection to close, but only if its
+    /// stored connection is still `stable_id` and still idle past `idle` — an atomic
+    /// re-check that guards against a send that bumped activity, or a reconnect that
+    /// installed a fresh connection, since the reaper's scan. `None` leaves the entry
+    /// untouched.
+    pub fn take_if_idle(
+        &self,
+        ip: &Ipv4Addr,
+        ipv6: &Ipv6Addr,
+        stable_id: usize,
+        idle: Duration,
+    ) -> Option<Connection> {
+        let idle_ms = idle.as_millis() as u64;
+        let now = now_ms();
+        let (_, entry) = self.v4.remove_if(ip, |_, e| {
+            e.conn.stable_id() == stable_id
+                && is_idle(now, e.last_active.load(Ordering::Relaxed), idle_ms)
+        })?;
+        self.v6.remove(ipv6);
+        self.by_id.remove(&entry.endpoint_id);
+        if let Some(audit) = &self.audit {
+            audit.log_disconnect(*ip, &entry.endpoint_id.to_string());
+        }
+        Some(entry.conn)
     }
 
     /// Resolve an inbound datagram from `peer_id` tagged with `handle` to the
@@ -363,7 +462,7 @@ impl PeerTable {
         let Some(ip) = self.by_id.get(peer_id).map(|e| *e.value()) else {
             return;
         };
-        let ipv6 = crate::membership::derive_ipv6(peer_id);
+        let ipv6 = membership::derive_ipv6(peer_id);
         if let Some(mut e) = self.v4.get_mut(&ip) {
             e.in_handles.insert(handle, network.clone());
         }
@@ -617,6 +716,207 @@ impl PeerTable {
     }
 }
 
+/// A known roster member and the networks we share with it, resolvable by mesh IP
+/// **without** a live connection. Returned by [`RosterRouteMap::resolve_v4`] so the
+/// forwarding loop can turn a destination IP into the peer identity to lazily dial.
+#[derive(Clone, Debug)]
+pub struct RouteTarget {
+    pub endpoint_id: EndpointId,
+    pub ipv4: Ipv4Addr,
+    pub ipv6: Ipv6Addr,
+    /// Every network we currently share with this peer (so a lazy dial can
+    /// `MeshHello` on each, like a reconnect).
+    pub networks: Vec<SmolStr>,
+}
+
+/// A roster member's addresses + identity, the input unit to
+/// [`RosterRouteMap::sync_network`]. Carries only what routing needs (no
+/// hostname/roster metadata), built from a `Member` by the caller.
+#[derive(Clone, Copy, Debug)]
+pub struct RouteMember {
+    pub endpoint_id: EndpointId,
+    pub ipv4: Ipv4Addr,
+    pub ipv6: Ipv6Addr,
+}
+
+struct RouteEntry {
+    endpoint_id: EndpointId,
+    ipv4: Ipv4Addr,
+    ipv6: Ipv6Addr,
+    networks: HashSet<SmolStr>,
+}
+
+impl RouteEntry {
+    fn to_target(&self) -> RouteTarget {
+        RouteTarget {
+            endpoint_id: self.endpoint_id,
+            ipv4: self.ipv4,
+            ipv6: self.ipv6,
+            networks: self.networks.iter().cloned().collect(),
+        }
+    }
+}
+
+/// Node-wide map from a peer's stable mesh IP to its identity + shared networks,
+/// built from the roster (not from live connections). It exists so an on-demand
+/// node, which holds no connections while idle, can still turn an outgoing
+/// packet's destination IP into the peer to dial. A peer has one IP across every
+/// network it joins, so entries accumulate a per-peer network set; a network's
+/// contribution is replaced wholesale on each roster apply (mirroring
+/// [`dns::sync_network_hostnames`](crate::dns::sync_network_hostnames)).
+///
+/// Distinct from [`PeerTable`] on purpose: `PeerTable`'s invariant is "a lookup
+/// hit implies a live connection", relied on by the whole data path. This map is
+/// the opposite - it lists peers we could reach but currently don't.
+#[derive(Clone, Default)]
+pub struct RosterRouteMap {
+    v4: Arc<FastDashMap<Ipv4Addr, RouteEntry>>,
+    v6: Arc<FastDashMap<Ipv6Addr, RouteEntry>>,
+}
+
+impl RosterRouteMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace `network`'s contribution with `members`: peers no longer in
+    /// `network` lose that membership, and any left sharing no network are dropped.
+    /// Peers still reachable via another network keep their entry. Self is excluded
+    /// by the caller.
+    pub fn sync_network(&self, network: &str, members: &[RouteMember]) {
+        let net = SmolStr::new(network);
+        let fresh: HashSet<Ipv4Addr> = members.iter().map(|m| m.ipv4).collect();
+        // Drop this network from peers that used to be in it but no longer are.
+        let stale: Vec<(Ipv4Addr, Ipv6Addr)> = self
+            .v4
+            .iter()
+            .filter(|e| e.networks.contains(&net) && !fresh.contains(e.key()))
+            .map(|e| (*e.key(), e.ipv6))
+            .collect();
+        for (v4, v6) in stale {
+            self.drop_network(&v4, &v6, &net);
+        }
+        // Upsert the current members.
+        for m in members {
+            self.upsert(m.ipv4, m.ipv6, m.endpoint_id, net.clone());
+        }
+    }
+
+    fn upsert(&self, ipv4: Ipv4Addr, ipv6: Ipv6Addr, endpoint_id: EndpointId, net: SmolStr) {
+        let mut v4 = self.v4.entry(ipv4).or_insert_with(|| RouteEntry {
+            endpoint_id,
+            ipv4,
+            ipv6,
+            networks: HashSet::new(),
+        });
+        v4.endpoint_id = endpoint_id;
+        v4.ipv6 = ipv6;
+        v4.networks.insert(net.clone());
+        drop(v4);
+        let mut v6 = self.v6.entry(ipv6).or_insert_with(|| RouteEntry {
+            endpoint_id,
+            ipv4,
+            ipv6,
+            networks: HashSet::new(),
+        });
+        v6.endpoint_id = endpoint_id;
+        v6.ipv4 = ipv4;
+        v6.networks.insert(net);
+    }
+
+    fn drop_network(&self, ipv4: &Ipv4Addr, ipv6: &Ipv6Addr, net: &SmolStr) {
+        if let Some(mut e) = self.v4.get_mut(ipv4) {
+            e.networks.remove(net);
+        }
+        self.v4.remove_if(ipv4, |_, e| e.networks.is_empty());
+        if let Some(mut e) = self.v6.get_mut(ipv6) {
+            e.networks.remove(net);
+        }
+        self.v6.remove_if(ipv6, |_, e| e.networks.is_empty());
+    }
+
+    /// Drop `network` entirely (all its members) from the map. Members still in
+    /// another shared network keep their entry.
+    pub fn remove_network(&self, network: &str) {
+        let net = SmolStr::new(network);
+        let affected: Vec<(Ipv4Addr, Ipv6Addr)> = self
+            .v4
+            .iter()
+            .filter(|e| e.networks.contains(&net))
+            .map(|e| (*e.key(), e.ipv6))
+            .collect();
+        for (v4, v6) in affected {
+            self.drop_network(&v4, &v6, &net);
+        }
+    }
+
+    /// Add or refresh a single member's membership in `network` (incremental,
+    /// no replace). Used when we connect to a peer, so the map tracks it for a
+    /// later idle re-dial before the next full roster sync.
+    pub fn sync_add(&self, network: &str, ipv4: Ipv4Addr, ipv6: Ipv6Addr, endpoint_id: EndpointId) {
+        self.upsert(ipv4, ipv6, endpoint_id, SmolStr::new(network));
+    }
+
+    /// Resolve a destination mesh IPv4 to its roster target, if known.
+    pub fn resolve_v4(&self, ip: &Ipv4Addr) -> Option<RouteTarget> {
+        self.v4.get(ip).map(|e| e.to_target())
+    }
+
+    /// IPv6 counterpart of [`resolve_v4`](Self::resolve_v4).
+    pub fn resolve_v6(&self, ip: &Ipv6Addr) -> Option<RouteTarget> {
+        self.v6.get(ip).map(|e| e.to_target())
+    }
+}
+
+/// Per-peer reachability history, decoupled from live connections. The on-demand
+/// dialer stamps an outcome on every dial attempt; `ray status` reads it to tell
+/// an idle peer (never reached, or last reached fine) from an offline one (a
+/// recent reach attempt failed). Also serves as the dialer cooldown so a hard-down
+/// peer isn't re-dialed on every dropped packet.
+#[derive(Clone, Default)]
+pub struct Reachability {
+    inner: Arc<FastDashMap<EndpointId, ReachState>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ReachState {
+    last_ok: Option<Instant>,
+    last_fail: Option<Instant>,
+}
+
+impl ReachState {
+    /// True when the most recent outcome is a failure no older than `window`.
+    fn failing_within(&self, window: Duration) -> bool {
+        match self.last_fail {
+            Some(f) => f.elapsed() < window && self.last_ok.is_none_or(|ok| ok < f),
+            None => false,
+        }
+    }
+}
+
+impl Reachability {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn note_ok(&self, id: EndpointId) {
+        self.inner.entry(id).or_default().last_ok = Some(Instant::now());
+    }
+
+    pub fn note_fail(&self, id: EndpointId) {
+        self.inner.entry(id).or_default().last_fail = Some(Instant::now());
+    }
+
+    /// Whether the peer counts as offline for status: its most recent reach
+    /// attempt failed within `staleness`. A peer never dialed (or last reached
+    /// successfully) is not offline; `ray status` renders it idle.
+    pub fn is_offline(&self, id: &EndpointId, staleness: Duration) -> bool {
+        self.inner
+            .get(id)
+            .is_some_and(|s| s.failing_within(staleness))
+    }
+}
+
 /// Build a fresh [`PeerEntry`] for a peer's first shared network. Factored out so
 /// the v4/v6 `or_insert_with` closures in [`PeerTable::add`] agree.
 fn first_conn_placeholder(endpoint_id: EndpointId, conn: Connection, net: SmolStr) -> PeerEntry {
@@ -630,6 +930,7 @@ fn first_conn_placeholder(endpoint_id: EndpointId, conn: Connection, net: SmolSt
         networks,
         out_handles,
         in_handles: HashMap::new(),
+        last_active: Arc::new(AtomicU64::new(now_ms())),
     }
 }
 
@@ -691,6 +992,107 @@ mod tests {
     fn test_peer_table_empty_ids() {
         let table = PeerTable::new();
         assert!(table.all_peer_ids().is_empty());
+    }
+
+    // ---- RosterRouteMap --------------------------------------------------
+
+    fn member(seed: u8) -> RouteMember {
+        let id = iroh::SecretKey::from_bytes(&[seed; 32]).public();
+        RouteMember {
+            endpoint_id: id,
+            ipv4: crate::membership::derive_ip(&id),
+            ipv6: crate::membership::derive_ipv6(&id),
+        }
+    }
+
+    #[test]
+    fn route_map_sync_resolve_and_shrink() {
+        let map = RosterRouteMap::new();
+        let a = member(1);
+        let b = member(2);
+        map.sync_network("net", &[a, b]);
+
+        let ta = map.resolve_v4(&a.ipv4).expect("a resolvable");
+        assert_eq!(ta.endpoint_id, a.endpoint_id);
+        assert_eq!(ta.networks, vec![SmolStr::new("net")]);
+        assert_eq!(
+            map.resolve_v6(&b.ipv6).expect("b via v6").endpoint_id,
+            b.endpoint_id
+        );
+
+        // Re-sync with a shrunk roster: b is gone.
+        map.sync_network("net", &[a]);
+        assert!(map.resolve_v4(&a.ipv4).is_some());
+        assert!(
+            map.resolve_v4(&b.ipv4).is_none(),
+            "dropped member is unresolvable"
+        );
+        assert!(map.resolve_v6(&b.ipv6).is_none());
+    }
+
+    #[test]
+    fn route_map_multi_network_keeps_entry_until_last_network() {
+        let map = RosterRouteMap::new();
+        let a = member(7);
+        map.sync_network("dev", &[a]);
+        map.sync_network("db", &[a]);
+        let t = map.resolve_v4(&a.ipv4).expect("resolvable");
+        let mut nets = t.networks.clone();
+        nets.sort();
+        assert_eq!(nets, vec![SmolStr::new("db"), SmolStr::new("dev")]);
+
+        // Leaving one network keeps the peer reachable via the other.
+        map.remove_network("dev");
+        let t = map.resolve_v4(&a.ipv4).expect("still resolvable via db");
+        assert_eq!(t.networks, vec![SmolStr::new("db")]);
+
+        // Leaving the last network drops it entirely.
+        map.remove_network("db");
+        assert!(map.resolve_v4(&a.ipv4).is_none());
+    }
+
+    #[test]
+    fn route_map_sync_add_is_incremental() {
+        let map = RosterRouteMap::new();
+        let a = member(3);
+        let b = member(4);
+        map.sync_network("net", &[a]);
+        // Incremental add of b must not drop a (unlike a full sync_network).
+        map.sync_add("net", b.ipv4, b.ipv6, b.endpoint_id);
+        assert!(map.resolve_v4(&a.ipv4).is_some());
+        assert!(map.resolve_v4(&b.ipv4).is_some());
+    }
+
+    #[test]
+    fn reachability_offline_logic() {
+        let r = Reachability::new();
+        let id = member(9).endpoint_id;
+        // Never dialed: not offline (status renders it idle).
+        assert!(!r.is_offline(&id, Duration::from_secs(60)));
+        // A failed reach makes it offline within the window.
+        r.note_fail(id);
+        assert!(r.is_offline(&id, Duration::from_secs(60)));
+        // A later success clears it.
+        r.note_ok(id);
+        assert!(!r.is_offline(&id, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn lazy_dial_dedup_via_in_flight_set() {
+        // The forwarding loop dedups dials with an in-flight set keyed by peer id.
+        let map = RosterRouteMap::new();
+        let a = member(11);
+        map.sync_network("net", &[a]);
+        let in_flight: HashSet<EndpointId> = HashSet::new();
+        let mut in_flight = in_flight;
+
+        let t = map.resolve_v4(&a.ipv4).expect("known member resolves");
+        // First packet claims the in-flight slot; a duplicate is rejected.
+        assert!(in_flight.insert(t.endpoint_id));
+        assert!(!in_flight.insert(t.endpoint_id), "duplicate dial is deduped");
+
+        // Unknown destination doesn't resolve, so nothing is dialed.
+        assert!(map.resolve_v4(&Ipv4Addr::new(100, 64, 9, 9)).is_none());
     }
 
     // ---- In-process real-connection tests --------------------------------
@@ -776,6 +1178,50 @@ mod tests {
         // Both networks route over the one connection.
         let route = table.lookup_v4(&ip).expect("peer routable");
         assert_eq!(route.conn.stable_id(), conn.stable_id());
+    }
+
+    #[tokio::test]
+    async fn idle_candidates_and_guarded_take() {
+        let (_srv, _cli, conn, _client_side) = connected_pair().await;
+        let peer = conn.remote_id();
+        let ip = crate::membership::derive_ip(&peer);
+        let ipv6 = crate::membership::derive_ipv6(&peer);
+        let table = PeerTable::new();
+        assert!(table.add(ip, ipv6, conn.clone(), peer, "n1"));
+        let stable = conn.stable_id();
+
+        // With a long idle window the freshly-added peer is not a candidate.
+        assert!(
+            table.idle_candidates(Duration::from_secs(3600)).is_empty(),
+            "a just-registered peer is not idle"
+        );
+        // With a zero window it is stale immediately.
+        let cands = table.idle_candidates(Duration::ZERO);
+        assert_eq!(cands, vec![(ip, ipv6, stable)]);
+
+        // A stale-id guard: a mismatched stable id never takes the entry.
+        assert!(
+            table
+                .take_if_idle(&ip, &ipv6, stable.wrapping_add(1), Duration::ZERO)
+                .is_none(),
+            "a refreshed connection (different stable id) is not torn down"
+        );
+        assert!(table.lookup_v4(&ip).is_some(), "entry survives the guard");
+
+        // Recorded activity moves it out of the idle set (bump then re-check).
+        let route = table.lookup_v4(&ip).unwrap();
+        route.note_activity();
+        assert!(
+            table
+                .take_if_idle(&ip, &ipv6, stable, Duration::from_secs(3600))
+                .is_none(),
+            "an active connection past the guard window is kept"
+        );
+
+        // The matching id + zero window takes and returns the connection to close.
+        let taken = table.take_if_idle(&ip, &ipv6, stable, Duration::ZERO);
+        assert!(taken.is_some(), "idle entry with matching id is taken");
+        assert!(table.lookup_v4(&ip).is_none(), "entry removed after take");
     }
 
     #[tokio::test]

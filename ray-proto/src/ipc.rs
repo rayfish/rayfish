@@ -639,6 +639,26 @@ pub struct PeerStatus {
     #[serde(default)]
     pub incompatible: bool,
     pub connection: Option<ConnectionInfo>,
+    /// Coarse liveness for the three-state display (Tailscale-style). `Active`
+    /// when a live connection exists; `Offline` only after an actual reach attempt
+    /// failed and no later success cleared it; `Idle` otherwise (a known roster
+    /// member we simply have no live link to). On-demand nodes hold no connections
+    /// when idle, so a bare `connection.is_none()` must read as `Idle`, not offline.
+    #[serde(default)]
+    pub state: PeerState,
+}
+
+/// Three-state peer liveness for `ray status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, derive_more::IsVariant)]
+pub enum PeerState {
+    /// A live mesh connection to the peer exists right now.
+    Active,
+    /// No live connection, but no failed reach either: presumed reachable (dialed
+    /// lazily on demand). The optimistic default for a freshly booted node.
+    #[default]
+    Idle,
+    /// A recent reach attempt failed and wasn't cleared by a later success.
+    Offline,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1015,6 +1035,7 @@ mod tests {
                     is_own_device: false,
                     incompatible: false,
                     connection: None,
+                    state: PeerState::Idle,
                 }],
                 pending_suggestions: 0,
                 pending_requests: 0,

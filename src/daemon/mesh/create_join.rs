@@ -499,6 +499,24 @@ impl NetworkRegistry {
             Arc::new(std::sync::RwLock::new(ns))
         };
 
+        // On-demand: don't dial the coordinator (or spawn reconnect loops) at
+        // startup. We already hold the verified blob, so register the network from
+        // it and seed the route map; the coordinator and every peer are dialed
+        // lazily on the first outgoing packet, and control updates land on the 60s
+        // reconverge poll.
+        if self.on_demand {
+            self.seed_route_map(ctx.display_name, &data.members);
+            tracing::info!(
+                network = %ctx.display_name,
+                "on-demand: registered from blob without dialing (lazy connect)"
+            );
+            return Ok(Some(EstablishedMesh {
+                state: state_from_blob(),
+                cancel,
+                tasks,
+            }));
+        }
+
         tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
         let mut seed_from_blob = false;
         let state = match transport::connect_to_peer_with_alpn(

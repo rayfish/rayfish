@@ -262,15 +262,23 @@ impl NetworkRegistry {
             .into_iter()
             .cloned()
             .collect();
-        self.dial_all_members(
-            &members_to_dial,
-            net_public_key,
-            name,
-            self.transport.identity.local_identity(),
-            my_ip,
-            persisted_hostname.clone(),
-        )
-        .await;
+        // Seed the route map from the restored roster so the on-demand data path can
+        // lazily dial any member before the first reconverge (self excluded).
+        self.seed_route_map(name, &members_to_dial);
+        // On-demand nodes never eagerly dial: they restore local state + the accept
+        // handler and dial peers lazily on first outgoing traffic. Eager nodes
+        // proactively rebuild the full mesh here.
+        if !self.on_demand {
+            self.dial_all_members(
+                &members_to_dial,
+                net_public_key,
+                name,
+                self.transport.identity.local_identity(),
+                my_ip,
+                persisted_hostname.clone(),
+            )
+            .await;
+        }
 
         // Register the network from its restored local state *before* dialing
         // peers, so `ray status` / IPC sees it the instant the local restore
@@ -299,8 +307,9 @@ impl NetworkRegistry {
         // that connect *to it*, so two co-coordinators restarting together each
         // show the other offline until one is disturbed. The accept handler is
         // already registered so return traffic is handled, and the reconnect loop
-        // retries anything still unreachable.
-        {
+        // retries anything still unreachable. Skipped for on-demand nodes (they
+        // dial lazily).
+        if !self.on_demand {
             let me = Arc::clone(self);
             let network_name = name.to_string();
             tokio::spawn(async move {
