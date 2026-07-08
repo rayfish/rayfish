@@ -499,6 +499,11 @@ impl NetworkRegistry {
             Arc::new(std::sync::RwLock::new(ns))
         };
 
+        // Seed the route map from the verified blob so the data path can re-dial the
+        // coordinator or any member that has since been idle-closed, before the first
+        // reconverge poll populates it.
+        self.seed_route_map(ctx.display_name, &data.members);
+
         tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
         let mut seed_from_blob = false;
         let state = match transport::connect_to_peer_with_alpn(
@@ -915,6 +920,9 @@ impl NetworkRegistry {
                         );
                     }
                     announce_network_handles(&self.peers, &peer_conn, m.ip).await;
+                    // Eager-connect reachability: a successful dial marks the peer
+                    // reachable so `ray status` shows it active/idle, not offline.
+                    self.reachability.note_ok(m.identity);
                     tracing::info!(
                         network = %network_name,
                         peer = %m.identity.fmt_short(),
@@ -931,6 +939,9 @@ impl NetworkRegistry {
                     } else {
                         self.peers.clear_incompatible(&m.identity);
                     }
+                    // Record the failed reach so status shows the peer offline from
+                    // startup, not optimistically idle.
+                    self.reachability.note_fail(m.identity);
                     tracing::debug!(
                         network = %network_name,
                         peer = %m.identity.fmt_short(),
@@ -939,6 +950,7 @@ impl NetworkRegistry {
                     );
                 }
                 Err(_elapsed) => {
+                    self.reachability.note_fail(m.identity);
                     tracing::debug!(
                         network = %network_name,
                         peer = %m.identity.fmt_short(),

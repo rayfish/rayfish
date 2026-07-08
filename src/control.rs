@@ -239,6 +239,13 @@ pub enum ControlMsg {
     /// network (its frame carries `net = None`).
     NetworkHandles {
         entries: Vec<NetworkHandle>,
+        /// The sender's capability bitmask (see [`transport::FEATURE_IDLE_CLOSE`]).
+        /// Rides the handle announcement because that is sent by *both* ends right
+        /// after connect (the `MeshHello` handshake is one-directional, dialer to
+        /// acceptor, so it cannot carry a bidirectional capability). `#[serde(default)]`
+        /// so a peer on a build without this field decodes to `0` (no capabilities).
+        #[serde(default)]
+        features: u64,
     },
     /// Primary to secondary: this device has been unpaired (`ray unpair`). Sent
     /// best-effort over a shared network's mesh connection. The receiver acts on
@@ -463,6 +470,38 @@ mod tests {
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();
         assert_eq!(msg, decoded.msg);
+    }
+
+    #[test]
+    fn network_handles_missing_features_decodes_to_zero() {
+        // A v0.2.0 peer encodes NetworkHandles without the `features` field (it
+        // predates it). `#[serde(default)]` must decode that to `0` so we treat the
+        // peer as advertising no capabilities and never idle-close its link.
+        #[derive(serde::Serialize)]
+        enum LegacyMsg {
+            NetworkHandles { entries: Vec<NetworkHandle> },
+        }
+        #[derive(serde::Serialize)]
+        struct LegacyFrame {
+            msg: LegacyMsg,
+        }
+        let legacy = LegacyFrame {
+            msg: LegacyMsg::NetworkHandles {
+                entries: vec![NetworkHandle {
+                    network: test_id(2),
+                    handle: 1,
+                }],
+            },
+        };
+        let body = rmp_serde::to_vec_named(&legacy).unwrap();
+        let frame: ControlFrame = rmp_serde::from_slice(&body).unwrap();
+        match frame.msg {
+            ControlMsg::NetworkHandles { features, entries } => {
+                assert_eq!(features, 0);
+                assert_eq!(entries.len(), 1);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]

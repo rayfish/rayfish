@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Desktop data plane no longer wedges after an on-demand dial.** The desktop TUN
+  read grew the packet pool before its `await` and truncated after, so when
+  `run_mesh` cancelled the read (which it does the moment a lazy dial completes) the
+  pool kept stray bytes. Every subsequent packet was then read at the wrong offset
+  and parsed as garbage, silently killing all forwarding and Magic DNS until a
+  restart. The read is now cancel-safe (reads into an owned buffer, commits to the
+  pool only after the read returns).
+
 - **Android: disabling the VPN now fully tears the tunnel down.** Turning the
   tunnel off dropped the mesh connection but left the VPN interface up (the key
   icon stayed and the `tun` device lingered), because the offline path closed the
@@ -24,6 +32,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a later Linux GRO/GSO offload path that batches TUN writes.
 
 ### Added
+
+- **On-demand mesh connections (near-zero idle battery).** A node connects to its
+  peers at startup (so it knows immediately who is reachable), then closes any
+  connection that sees no traffic in either direction for the idle timeout (default
+  120s), returning to zero peer connections so it stops waking the radio for QUIC
+  keepalives. The link re-forms on the next packet either side sends. Idle teardown
+  coexists with older peers: a node only closes an idle link to a peer whose build
+  also understands the idle close, so a peer on an earlier release is held open
+  instead of flapped. On by default; turn it off with `ray config set on-demand off`
+  (and `idle_timeout_secs` tunes the window).
+- **`ray config` now covers the `auto-update` and `on-demand` toggles.** Both
+  on/off daemon settings are settable through the standard config surface (e.g.
+  `ray config set on-demand off`, `ray config set auto-update on`,
+  `ray config unset on-demand`), and bare `ray config` lists their current value
+  alongside relay/discovery-dns/dns-upstreams. `ray auto-update on|off` still works
+  as a shorthand.
+- **`ray status` shows peers as idle, active, or offline.** With on-demand
+  connections a reachable peer usually has no live link, so status now renders three
+  states (Tailscale-style): `active` (connected now), `idle` (a roster member with
+  no current link, presumed reachable), and `offline` (only after an actual reach
+  attempt failed). `ray ping <peer>` dials on demand and refreshes a peer's state.
 
 - **Static musl Linux binaries.** Every release and nightly now also ships
   `ray-linux-{x86_64,aarch64}-musl`: fully static builds with no glibc dependency

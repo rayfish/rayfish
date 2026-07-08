@@ -33,6 +33,14 @@ use tun_rs::{AsyncDevice, DeviceBuilder};
 /// Android `VpnService` fd whose descriptor is revoked/closed) MUST surface as
 /// `Err`, never as a perpetual `Ok(0)`, or `run_mesh` would busy-spin at 100%
 /// CPU. The desktop TUN never returns 0, so this only binds future impls.
+///
+/// **`read_into` MUST be cancel-safe.** `run_mesh` races it in a `select!` against
+/// dial-completion and shutdown, so the future can be dropped before it resolves.
+/// A dropped read MUST leave `buf` byte-for-byte as it was on entry: never append
+/// (or grow-then-not-truncate) before the `.await`, or a cancelled read leaves
+/// stray bytes in the pool that offset every later `split_to`, silently corrupting
+/// every subsequent packet. Read into owned scratch (or uninitialised spare
+/// capacity via `advance_mut`) and commit to `buf` only after the read returns.
 pub trait TunRead: Send + 'static {
     fn read_into(
         &mut self,
@@ -73,6 +81,9 @@ const READ_RESERVE: usize = TUN_MTU as usize + 4;
 #[cfg(not(target_os = "android"))]
 pub struct TunReader {
     dev: Arc<AsyncDevice>,
+    /// Owned landing buffer for one packet. `read_into` reads here first, then
+    /// copies into the caller's pool, which keeps it cancel-safe (see `read_into`).
+    scratch: Box<[u8]>,
 }
 
 /// Write half of the TUN device. Owned by [`forward::spawn_tun_writer`].
@@ -155,7 +166,14 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
     // `recv`/`send` take `&self`, so both halves share one device via `Arc`
     // instead of splitting into independent read/write objects.
     let dev = Arc::new(device);
-    Ok((TunReader { dev: dev.clone() }, TunWriter { dev }, tun_name))
+    Ok((
+        TunReader {
+            dev: dev.clone(),
+            scratch: vec![0u8; READ_RESERVE].into_boxed_slice(),
+        },
+        TunWriter { dev },
+        tun_name,
+    ))
 }
 
 /// Routes the peer ranges into the TUN. Must be called *after* the interface is
@@ -390,17 +408,19 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
 
 #[cfg(not(target_os = "android"))]
 impl TunRead for TunReader {
-    /// Reads one packet from the TUN device, appending it to `buf`. tun-rs has no
-    /// `ReadBuf`/`AsyncRead` (what `read_buf` uses to fill uninitialised capacity),
-    /// only `recv(&mut [u8])`, so we expose an initialised `READ_RESERVE`-byte tail
-    /// on the caller's pool, read into it, then truncate to the packet length. The
-    /// packet lands directly in `buf`'s allocation, preserving the caller's
-    /// zero-copy `split_to(n).freeze()` hand-off.
+    /// Reads one packet from the TUN device, appending it to `buf`.
+    ///
+    /// **Cancel-safety matters here:** `run_mesh` races this future in a `select!`
+    /// against dial-completion and shutdown, so it can be dropped mid-`recv`. We
+    /// therefore read into an owned `scratch` buffer and only append to the caller's
+    /// pool *after* `recv` returns. Growing `buf` before the await (and truncating
+    /// after) would leave stray bytes in the pool whenever a read is cancelled,
+    /// permanently offsetting every subsequent `split_to`, so every packet parses as
+    /// garbage and the whole data plane wedges. The one extra copy is a single
+    /// sub-MTU `memcpy`; correctness beats the zero-copy read.
     async fn read_into(&mut self, buf: &mut bytes::BytesMut) -> anyhow::Result<usize> {
-        let start = buf.len();
-        buf.resize(start + READ_RESERVE, 0);
-        let n = self.dev.recv(&mut buf[start..]).await?;
-        buf.truncate(start + n);
+        let n = self.dev.recv(&mut self.scratch[..]).await?;
+        buf.extend_from_slice(&self.scratch[..n]);
         Ok(n)
     }
 }

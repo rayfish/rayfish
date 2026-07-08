@@ -306,7 +306,8 @@ pub(crate) enum Command {
         /// "on" or "off"
         state: String,
     },
-    /// View or change global daemon settings (relay, discovery-dns, dns-upstreams)
+    /// View or change global daemon settings (relay, discovery-dns, dns-upstreams,
+    /// auto-update, on-demand)
     Config {
         #[command(subcommand)]
         action: Option<ConfigAction>,
@@ -495,23 +496,24 @@ pub(crate) enum ConfigAction {
     /// Show settings (all, or one key)
     #[command(visible_alias = "ls")]
     Get {
-        /// relay, discovery-dns, or dns-upstreams (omit for all)
+        /// relay, discovery-dns, dns-upstreams, auto-update, or on-demand (omit for all)
         key: Option<String>,
     },
-    /// Set a key. Value is a comma list of presets (rayfish/n0), URLs, or IPs.
+    /// Set a key. List keys take a comma list of presets/URLs/IPs; auto-update and
+    /// on-demand take on/off.
     Set {
-        /// relay, discovery-dns, or dns-upstreams
+        /// relay, discovery-dns, dns-upstreams, auto-update, or on-demand
         key: String,
-        /// Comma list of presets / URLs / IPv4s (use "n0" or empty to reset)
+        /// A comma list of presets / URLs / IPv4s ("n0" or empty resets), or on/off
         value: String,
-        /// Replace the defaults instead of augmenting them (can isolate the node)
+        /// Replace the defaults instead of augmenting them (list keys only)
         #[arg(long)]
         replace: bool,
     },
-    /// Reset a key to its default (iroh n0)
+    /// Reset a key to its default
     #[command(visible_alias = "rm")]
     Unset {
-        /// relay, discovery-dns, or dns-upstreams
+        /// relay, discovery-dns, dns-upstreams, auto-update, or on-demand
         key: String,
     },
 }
@@ -1100,24 +1102,16 @@ fn cmd_mdns(state: &str) -> Result<()> {
     Ok(())
 }
 
-/// `ray auto-update on|off`: toggle opt-in automatic stable updates. Writes
-/// `settings.toml` directly (like `cmd_mdns`); the daemon reads it at startup, so
+/// `ray auto-update on|off`: back-compat alias for `ray config set auto-update
+/// <on|off>`. Writes `settings.toml` directly; the daemon reads it at startup, so
 /// the change takes effect on the next daemon restart.
 fn cmd_auto_update(state: &str) -> Result<()> {
-    let enabled = match state {
-        "on" => true,
-        "off" => false,
-        _ => {
-            eprintln!("Usage: ray auto-update <on|off>");
-            std::process::exit(1);
-        }
-    };
-    let mut app_config = config::load()?;
-    app_config.auto_update = enabled;
-    config::save_settings(&app_config)?;
+    let mut cfg = config::load()?;
+    config::config_set(&mut cfg, "auto-update", state, false)?;
+    config::save_settings(&cfg)?;
     println!(
-        "automatic updates {}. Restart the daemon for changes to take effect.",
-        if enabled { "enabled" } else { "disabled" }
+        "auto-update {}. Run 'sudo ray restart' for changes to take effect.",
+        if cfg.auto_update { "enabled" } else { "disabled" }
     );
     Ok(())
 }

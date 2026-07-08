@@ -262,6 +262,14 @@ impl NetworkRegistry {
             .into_iter()
             .cloned()
             .collect();
+        // Seed the route map from the restored roster so the data path can re-dial
+        // any member that has since been idle-closed, before the first reconverge
+        // (self excluded).
+        self.seed_route_map(name, &members_to_dial);
+        // Eager-connect the roster at startup (all nodes): a failed dial marks a peer
+        // offline immediately, so status distinguishes offline from idle from boot.
+        // On-demand nodes then idle-close these links per connection and re-dial
+        // lazily; the route map above is what lets them come back.
         self.dial_all_members(
             &members_to_dial,
             net_public_key,
