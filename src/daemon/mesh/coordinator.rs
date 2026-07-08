@@ -358,6 +358,7 @@ impl NetworkRegistry {
                     self.peers.clear_incompatible(&peer_id);
                 }
                 tracing::debug!(peer = %peer_id.fmt_short(), error = %e, "dial attempt failed");
+                self.reachability.note_fail(peer_id);
                 return false;
             }
         };
@@ -386,6 +387,9 @@ impl NetworkRegistry {
                 .mesh_ctx()
                 .register_peer_conn(&conn, peer_id, peer_ip, &t.network);
         }
+        // A live connection now exists (either freshly stored, or already current
+        // when `conn_changed` is false), so the peer is reachable either way.
+        self.reachability.note_ok(peer_id);
         if !conn_changed {
             return false;
         }
