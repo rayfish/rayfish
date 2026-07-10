@@ -73,6 +73,7 @@ impl NetworkRegistry {
                             device_cert: None,
                             collision_index: 0,
                             last_seen: None,
+                            exit_node: false,
                         });
                     }
                     for entry in &nc.approved {
@@ -100,6 +101,7 @@ impl NetworkRegistry {
                     device_cert: None,
                     collision_index: 0,
                     last_seen: None,
+                    exit_node: false,
                 })
                 .expect("self-add cannot collide");
         }
@@ -202,6 +204,10 @@ impl NetworkRegistry {
                 .unwrap_or_default(),
             aliases: net_config.map(|nc| nc.aliases.clone()).unwrap_or_default(),
             ephemeral_ttl_secs: None,
+            // Local exit-node policy survives restarts (server allow-list and the
+            // client's selected exit peer); neither rides the signed blob.
+            exit_allow: net_config.map(|nc| nc.exit_allow.clone()).unwrap_or_default(),
+            exit_node_use: net_config.and_then(|nc| nc.exit_node_use.clone()),
         })?;
 
         let cancel = self.shutdown_token.child_token();

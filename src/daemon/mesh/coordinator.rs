@@ -691,6 +691,7 @@ mod prune_tests {
             device_cert: None,
             collision_index: 0,
             last_seen,
+            exit_node: false,
         }
     }
 

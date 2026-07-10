@@ -504,6 +504,8 @@ impl NetworkRegistry {
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
+            exit_allow: vec![],
+            exit_node_use: None,
         })?;
 
         let cancel = self.shutdown_token.child_token();
@@ -577,6 +579,7 @@ impl NetworkRegistry {
                 device_cert: None,
                 collision_index: 0,
                 last_seen: None,
+                exit_node: false,
             })
             .expect("self-add cannot collide");
 

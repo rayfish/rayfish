@@ -190,6 +190,17 @@ pub enum ControlMsg {
     /// a *trigger only*. Receivers reconverge from the network-key-signed pkarr
     /// record, never from any peer-supplied hash.
     BlobUpdated,
+    /// Member → coordinators: announce whether this sender currently offers itself
+    /// as an exit node on this network (`ray exit-node allow/none`). The
+    /// coordinator records the claim on the sender's roster entry
+    /// (`Member.exit_node`) and republishes the signed blob so peers can discover
+    /// the offer via `ray status`. A self-claim about the sender's own capability:
+    /// it only advertises availability; the exit node still gates real forwarding
+    /// with its local `exit_allow` list. Scoped to the enclosing
+    /// [`ControlFrame`]'s `net`.
+    ExitNodeOffer {
+        enabled: bool,
+    },
     /// Coordinator grants the per-network secret key to another member, making it
     /// a co-coordinator (can publish the signed blob / suggest firewall rules).
     /// Sent over the network's authenticated mesh ALPN, so only the targeted peer
@@ -452,6 +463,7 @@ mod tests {
                 device_cert: None,
                 collision_index: 0,
                 last_seen: None,
+                exit_node: false,
             }],
         };
         let bytes = encode_msg(None, &msg);
@@ -604,6 +616,7 @@ mod tests {
                 device_cert: None,
                 collision_index: 0,
                 last_seen: None,
+                exit_node: false,
             }],
             approved: vec![ApprovedEntry {
                 identity: test_id(2),
