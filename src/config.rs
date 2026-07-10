@@ -167,6 +167,21 @@ pub struct NetworkConfig {
     /// never rides the signed blob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ephemeral_ttl_secs: Option<u64>,
+    /// Users permitted to route their internet-bound traffic out through this
+    /// node as an exit node (`ray exit-node allow <net> <user|*>`). Each entry
+    /// is a peer's user-identity (hex [`EndpointId`]) or `"*"` (any member).
+    /// A non-empty list means this node offers itself as an exit node on this
+    /// network and is what gates real forwarding; the offer is also advertised
+    /// in the signed blob (`Member.exit_node`) so peers can discover it. Local
+    /// policy, never published as an allow-list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exit_allow: Vec<String>,
+    /// The peer this node routes all non-mesh traffic through as an exit node
+    /// (`ray exit-node use <net> <peer>`), stored as the peer's user-identity or
+    /// endpoint-id string. `None` = direct egress (default). Local only; drives
+    /// default-route install and forward-loop routing on `ray up`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_node_use: Option<String>,
 }
 
 /// One mesh-SSH authorization entry: a peer and the local unix users it may log
@@ -1096,6 +1111,8 @@ mod tests {
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
+                    exit_allow: vec![],
+                    exit_node_use: None,
                 },
                 NetworkConfig {
                     name: "work".to_string(),
@@ -1115,6 +1132,8 @@ mod tests {
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
+                    exit_allow: vec![],
+                    exit_node_use: None,
                 },
             ],
             ..Default::default()
@@ -1155,6 +1174,8 @@ mod tests {
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
+            exit_allow: vec![],
+            exit_node_use: None,
         };
         upsert_network(&mut config, net);
         assert_eq!(config.networks.len(), 1);
@@ -1183,6 +1204,8 @@ mod tests {
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
                 ephemeral_ttl_secs: None,
+                exit_allow: vec![],
+                exit_node_use: None,
             }],
             ..Default::default()
         };
@@ -1204,6 +1227,8 @@ mod tests {
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
+            exit_allow: vec![],
+            exit_node_use: None,
         };
         upsert_network(&mut config, updated.clone());
         assert_eq!(config.networks.len(), 1);
@@ -1236,6 +1261,8 @@ mod tests {
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
+                    exit_allow: vec![],
+                    exit_node_use: None,
                 },
                 NetworkConfig {
                     name: "remove-me".to_string(),
@@ -1255,6 +1282,8 @@ mod tests {
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
+                    exit_allow: vec![],
+                    exit_node_use: None,
                 },
             ],
             ..Default::default()
@@ -1302,6 +1331,8 @@ mod tests {
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
                 ephemeral_ttl_secs: None,
+                exit_allow: vec![],
+                exit_node_use: None,
             }],
             ..Default::default()
         };
@@ -1334,6 +1365,8 @@ mod tests {
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
                 ephemeral_ttl_secs: None,
+                exit_allow: vec![],
+                exit_node_use: None,
             }],
             ..Default::default()
         };
@@ -1420,6 +1453,8 @@ name = "test"
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
+            exit_allow: vec![],
+            exit_node_use: None,
         }
     }
 

@@ -317,6 +317,8 @@ fn persist_join_config(
         ssh_allow,
         aliases,
         ephemeral_ttl_secs: None,
+        exit_allow: vec![],
+        exit_node_use: None,
     })
 }
 

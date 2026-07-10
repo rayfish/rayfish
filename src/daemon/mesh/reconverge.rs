@@ -633,6 +633,7 @@ mod self_nullified_tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         }
     }
 

@@ -46,6 +46,14 @@ pub struct Member {
     /// to co-coordinators and survives a coordinator restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<u64>,
+    /// This member offers itself as an exit node on the network (advertised so
+    /// peers can discover it via `ray status` and `ray exit-node use`). Set by a
+    /// coordinator when the node signals intent (`ControlMsg::ExitNodeOffer`); a
+    /// self-claim that only advertises availability. The exit node still gates
+    /// actual forwarding with its local `exit_allow` list, so a false claim just
+    /// makes clients dial a node that drops them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exit_node: bool,
 }
 
 /// Controls who can approve new members joining the network.
@@ -817,6 +825,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         };
         list.add(member.clone()).unwrap();
         assert!(list.is_member(&id));
@@ -837,6 +846,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         };
         list.add(member).unwrap();
         let found = list.get_by_ip(Ipv4Addr::new(100, 64, 10, 5)).unwrap();
@@ -856,6 +866,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         })
         .unwrap();
         let result = list.add(Member {
@@ -867,6 +878,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         });
         assert!(result.is_err());
     }
@@ -884,6 +896,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         })
         .unwrap();
         list.add(Member {
@@ -895,6 +908,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         })
         .unwrap();
         assert!(list.get(&id).unwrap().is_coordinator);
@@ -913,6 +927,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         })
         .unwrap();
         let removed = list.remove(&id);
@@ -933,6 +948,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         })
         .unwrap();
         list.add(Member {
@@ -944,6 +960,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         })
         .unwrap();
         assert_eq!(list.all().len(), 2);
@@ -981,6 +998,7 @@ mod tests {
                 device_cert: None,
                 collision_index: 0,
                 last_seen: None,
+                exit_node: false,
             })
             .unwrap();
         let entry = ApprovedEntry {
@@ -1123,6 +1141,7 @@ mod tests {
                 device_cert: None,
                 collision_index: 0,
                 last_seen: None,
+                exit_node: false,
             });
         }
         list
@@ -1143,6 +1162,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         })
         .unwrap();
 
@@ -1340,6 +1360,7 @@ mod tests {
                 device_cert: None,
                 collision_index: 0,
                 last_seen: Some(12345),
+                exit_node: false,
             })
             .unwrap();
         let approved = ApprovedList::new();
@@ -1381,6 +1402,7 @@ mod tests {
                 device_cert: None,
                 collision_index: 0,
                 last_seen: None,
+                exit_node: false,
             })
             .unwrap();
         let approved = ApprovedList::new();
@@ -1679,6 +1701,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         };
         assert!(validate_member(&member).is_ok());
     }
@@ -1697,6 +1720,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         };
         let err = validate_member(&member).unwrap_err().to_string();
         assert!(err.contains("does not match"), "{err}");
@@ -1714,6 +1738,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         };
         assert!(validate_member(&member).is_err());
     }
@@ -1731,6 +1756,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         };
         let gw = Member {
             identity: id,
@@ -1741,6 +1767,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         };
         assert!(validate_member(&net).is_err());
         assert!(validate_member(&gw).is_err());
@@ -1774,6 +1801,7 @@ mod tests {
                 device_cert: None,
                 collision_index: 0,
                 last_seen: None,
+                exit_node: false,
             };
             assert!(
                 validate_member(&member).is_ok(),
@@ -1798,6 +1826,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         };
         let blob = GroupBlob {
             members: vec![bad_member],
@@ -1824,6 +1853,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         };
         let blob = GroupBlob {
             members: vec![bad_member],
@@ -1850,6 +1880,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         })
         .unwrap();
         mark_coordinator(&mut list, &id);
@@ -1894,11 +1925,13 @@ mod tests {
             device_cert: None,
             collision_index: 2,
             last_seen: None,
+            exit_node: false,
         };
         assert!(validate_member(&good).is_ok());
         let bad = Member {
             collision_index: 1,
             last_seen: None,
+            exit_node: false,
             ..good.clone()
         }; // ip is for index 2, claims 1
         assert!(validate_member(&bad).is_err());
@@ -1916,6 +1949,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         };
         let dup = derive_ip(&a);
         assert!(validate_no_duplicate_ips(&[m(a, dup), m(test_id(2), dup)]).is_err());
@@ -1943,6 +1977,7 @@ mod tests {
             device_cert: None,
             collision_index: idx_a,
             last_seen: None,
+            exit_node: false,
         })
         .unwrap();
 
@@ -1980,6 +2015,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
             last_seen: None,
+            exit_node: false,
         };
         let resolved = resolve_ip_tiebreak(vec![mk(hi), mk(lo)]);
         // lower identity keeps `ip`; higher re-rolls to a free index.
@@ -2013,6 +2049,7 @@ mod tests {
             user_identity: None,
             device_cert: None,
             last_seen: None,
+            exit_node: false,
         };
         assert!(validate_member(&m).is_err());
     }

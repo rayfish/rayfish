@@ -58,7 +58,12 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// plus the 60s group poll; and `Welcome.direct_key`, which folds a direct
 /// (`ray connect`) network's co-coordinator key grant into the join handshake's
 /// Welcome (deterministic) instead of a separate best-effort `AdminGrant` stream.
-pub const MESH_PROTOCOL_VERSION: u32 = 2;
+///
+/// Bumped to 3 for exit nodes: `ControlMsg::ExitNodeOffer` is a new control
+/// variant a member sends to coordinators to advertise itself as an exit node.
+/// A v2 (`v0.2.0`) peer cannot decode the new variant, so the version gate keeps
+/// the two apart rather than risking a decode failure on the wire.
+pub const MESH_PROTOCOL_VERSION: u32 = 3;
 
 /// Capability bits a peer advertises in its `MeshHello.features`. These are
 /// negotiated *inside* the single mesh ALPN, so adding one needs no version bump:
