@@ -88,6 +88,9 @@ pub(crate) struct NetworkRegistry {
     /// How long a connection may sit with no traffic (either direction) before an
     /// on-demand node idle-closes it. Read by each [`MeshConnection`]'s idle timer.
     pub(crate) idle_timeout: Duration,
+    /// Per-network exit-node allow policy, threaded into peer readers via the
+    /// [`MeshCtx`] forward context and populated on `activate()` from config.
+    pub(crate) exit_server: crate::exit_node::ExitServer,
 }
 
 impl NetworkRegistry {
@@ -128,6 +131,7 @@ impl NetworkRegistry {
             protocol_router: OnceLock::new(),
             on_demand,
             idle_timeout,
+            exit_server: crate::exit_node::ExitServer::new(),
         }
     }
 

@@ -193,6 +193,7 @@ impl MeshCtx {
             token,
             stats: self.stats.clone(),
             device_user_map: self.device_user_map.clone(),
+            exit_server: self.registry.exit_server.clone(),
         }
     }
 
@@ -1016,7 +1017,17 @@ impl Daemon {
                 network,
                 peer,
                 allow,
-            } => self.registry.exit_node_allow(&network, &peer, allow).await,
+            } => {
+                let resp = self.registry.exit_node_allow(&network, &peer, allow).await;
+                // If the data plane is up, reconcile the runtime policy and kernel
+                // forwarding/NAT now; otherwise `activate()` picks it up on `ray up`.
+                if self.active.load(Ordering::SeqCst) {
+                    self.registry.reload_exit_policy();
+                    let tun = self.tun_name.load().as_str().to_owned();
+                    self.registry.exit_server.apply_os(&tun);
+                }
+                resp
+            }
             IpcMessage::ExitNodeUse { network, peer } => {
                 self.registry.exit_node_use(&network, peer).await
             }

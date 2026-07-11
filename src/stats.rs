@@ -30,16 +30,22 @@ pub enum DropReason {
     /// assigned mesh address (ingress anti-spoofing). A peer may only inject
     /// packets sourced from its own mesh IP.
     Spoof,
+    /// Inbound datagram bound for a non-overlay (internet) destination that this
+    /// node dropped because it does not offer an exit node to the sender (exit
+    /// mode off, or the sender is not in the network's `exit_allow` list). Keeps
+    /// a non-exit node from silently transiting a peer's internet traffic.
+    ExitDenied,
 }
 
 impl DropReason {
-    const ALL: [DropReason; 6] = [
+    const ALL: [DropReason; 7] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
         DropReason::Malformed,
         DropReason::Backpressure,
         DropReason::Spoof,
+        DropReason::ExitDenied,
     ];
 }
 
