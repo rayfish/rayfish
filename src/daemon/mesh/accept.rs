@@ -826,6 +826,19 @@ impl MemberAcceptState {
                 }
                 None
             }
+            // A member tells us it does (or no longer does) offer itself as an exit
+            // node. Only meaningful to a coordinator (we hold the key and sign the
+            // roster); `record_exit_offer` no-ops otherwise. Records the self-claim
+            // on the sender's roster entry and republishes. Off the demux loop:
+            // signing + DHT publish are slow.
+            ControlMsg::ExitNodeOffer { enabled } => {
+                let registry = self.registry.clone();
+                let network = self.network_name.clone();
+                tokio::spawn(async move {
+                    registry.record_exit_offer(&network, peer_id, enabled).await;
+                });
+                None
+            }
             _ => None,
         }
     }
