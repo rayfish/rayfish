@@ -811,6 +811,13 @@ impl Daemon {
             self.start_ssh();
         }
 
+        // Exit-node server: load the runtime allow policy so the inbound data path
+        // gates transit, then install kernel forwarding/NAT if we offer an exit on
+        // any network (Linux only; a no-op elsewhere).
+        self.registry.reload_exit_policy();
+        let exit_tun_name = self.tun_name.load().as_str().to_owned();
+        self.registry.exit_server.apply_os(&exit_tun_name);
+
         tracing::info!("data plane activated");
         if warnings.is_empty() {
             IpcMessage::Ok {
@@ -851,6 +858,11 @@ impl Daemon {
         if let Err(e) = tun::set_link_down(&tun_name) {
             tracing::warn!(error = %e, "failed to bring TUN interface down");
         }
+
+        // Exit-node server: remove kernel forwarding/NAT and drop the allow policy
+        // so no transit happens while on standby.
+        self.registry.exit_server.teardown_os();
+        self.registry.exit_server.clear();
 
         tracing::info!("VPN on standby");
         IpcMessage::Ok {

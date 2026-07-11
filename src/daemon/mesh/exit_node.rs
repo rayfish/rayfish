@@ -125,6 +125,17 @@ impl NetworkRegistry {
         IpcMessage::Ok { message }
     }
 
+    /// Rebuild the runtime exit-node allow policy from the on-disk config, so the
+    /// inbound data path (`forward::evaluate_inbound`) sees the current allow-lists.
+    /// Cheap; called on `activate()` and after any allow-list change while up.
+    pub(crate) fn reload_exit_policy(&self) {
+        let networks = config::load().map(|c| c.networks).unwrap_or_default();
+        let entries = networks
+            .iter()
+            .map(|n| (n.name.as_str(), n.exit_allow.as_slice()));
+        self.exit_server.reload(entries);
+    }
+
     /// Report exit-node state per network: this node's own allow list + selection,
     /// and which roster peers advertise an exit node.
     pub(crate) fn exit_node_status(&self, network: Option<String>) -> IpcMessage {

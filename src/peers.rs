@@ -1275,6 +1275,7 @@ mod tests {
             token: CancellationToken::new(),
             stats: Arc::new(ForwardMetrics::default()),
             device_user_map: DeviceUserMap::new(),
+            exit_server: crate::exit_node::ExitServer::new(),
         };
         spawn_peer_reader(conn_r.clone(), s_id, peers.clone(), ctx);
 

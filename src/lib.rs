@@ -56,6 +56,7 @@ pub mod daemon;
 pub mod deeplink;
 pub mod dht;
 pub mod dns;
+pub mod exit_node;
 pub mod firewall;
 pub mod forward;
 pub mod hostname;

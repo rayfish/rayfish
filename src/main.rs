@@ -972,6 +972,10 @@ fn install_panic_hook() {
         // blackhole all DNS until the service restarts). Synchronous, best-effort.
         rayfish::dns::config::emergency_restore_resolv_conf();
 
+        // Remove the exit-node kernel forwarding/NAT and restore the forwarding
+        // sysctls, so a crash can't leave the host acting as an open router/NAT.
+        rayfish::exit_node::emergency_teardown();
+
         // Print the standard panic message to stderr (journal), then fail fast so
         // the service manager restarts the daemon cleanly.
         default_hook(info);
