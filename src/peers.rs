@@ -393,6 +393,26 @@ impl PeerTable {
         self.v6.get(ip).and_then(|e| e.route())
     }
 
+    /// Route to the peer holding mesh IPv4 `ip`, pinned to a specific `network`
+    /// (rather than [`route`](PeerEntry::route)'s lexically-smallest shared one).
+    /// Used by exit-node client routing, which must tag the datagram with the exit
+    /// network's handle so the exit peer attributes it to the network whose
+    /// allow-list permits us. `None` if the peer isn't connected on `network`.
+    pub fn route_on_network(&self, ip: &Ipv4Addr, network: &str) -> Option<PeerRoute> {
+        let e = self.v4.get(ip)?;
+        if !e.networks.contains(network) {
+            return None;
+        }
+        let handle = e.out_handles.get(network).copied().unwrap_or(0);
+        Some(PeerRoute {
+            conn: e.conn.clone(),
+            endpoint_id: e.endpoint_id,
+            network: SmolStr::new(network),
+            handle,
+            last_active: e.last_active.clone(),
+        })
+    }
+
     /// Resolve the network an inbound datagram belongs to from the peer's mesh
     /// IPv4 and the `u16` handle the peer stamped on it (looked up in the peer's
     /// announced inbound table). `None` if the peer or handle is unknown.
@@ -1276,6 +1296,9 @@ mod tests {
             stats: Arc::new(ForwardMetrics::default()),
             device_user_map: DeviceUserMap::new(),
             exit_server: crate::exit_node::ExitServer::new(),
+            exit_client: crate::exit_node::ExitClient::new(),
+            my_v4: Ipv4Addr::new(100, 64, 0, 1),
+            my_v6: Ipv6Addr::UNSPECIFIED,
         };
         spawn_peer_reader(conn_r.clone(), s_id, peers.clone(), ctx);
 

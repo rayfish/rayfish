@@ -194,6 +194,9 @@ impl MeshCtx {
             stats: self.stats.clone(),
             device_user_map: self.device_user_map.clone(),
             exit_server: self.registry.exit_server.clone(),
+            exit_client: self.registry.exit_client.clone(),
+            my_v4: self.identity.local_ip(),
+            my_v6: derive_ipv6(&self.identity.local_identity()),
         }
     }
 
@@ -1029,7 +1032,24 @@ impl Daemon {
                 resp
             }
             IpcMessage::ExitNodeUse { network, peer } => {
-                self.registry.exit_node_use(&network, peer).await
+                let resp = self.registry.exit_node_use(&network, peer).await;
+                // Reconcile the runtime selection + full-tunnel routing if up;
+                // otherwise `activate()` applies it on the next `ray up`.
+                if self.active.load(Ordering::SeqCst) {
+                    self.registry.reload_exit_client();
+                    #[cfg(target_os = "linux")]
+                    {
+                        let tun = self.tun_name.load().as_str().to_owned();
+                        if self.registry.exit_client.is_active() {
+                            if let Err(e) = crate::exit_node::install_client_routing(&tun) {
+                                tracing::warn!(error = %e, "failed to install exit-node client routing");
+                            }
+                        } else {
+                            crate::exit_node::teardown_client_routing();
+                        }
+                    }
+                }
+                resp
             }
             IpcMessage::ExitNodeStatus { network } => self.registry.exit_node_status(network),
             IpcMessage::SetHostname { network, hostname } => {

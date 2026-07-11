@@ -10,10 +10,34 @@
 //! / [`disable`]; the per-network allow decision lives in [`ExitServer`].
 
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use iroh::EndpointId;
+use smol_str::SmolStr;
+
+/// Linux fwmark set on iroh's underlay UDP sockets (via the forked
+/// `Endpoint::builder().socket_mark`). A matching `ip rule` sends marked packets
+/// to the main routing table, so the client's own transport bypasses the
+/// full-tunnel default route it installs (the standard WireGuard/Tailscale
+/// loop-prevention). Arbitrary non-zero value; must match the `ip rule` fwmark.
+pub const SOCKET_MARK: u32 = 0x7261; // "ra"
+
+/// Dedicated policy-routing table holding the client's full-tunnel default route
+/// (`default dev <tun>`), separate from `main` so marked iroh traffic can bypass
+/// it. Arbitrary id we fully own.
+#[cfg(target_os = "linux")]
+const EXIT_TABLE: &str = "29793"; // 0x7461
+
+/// `ip rule` preferences for the three-rule full-tunnel policy (lower = higher
+/// priority). Named so install and teardown stay in sync.
+#[cfg(target_os = "linux")]
+const PREF_BYPASS: &str = "100"; // marked (iroh) traffic -> main table (real routes)
+#[cfg(target_os = "linux")]
+const PREF_MAIN: &str = "101"; // main table except its default (LAN/overlay/connected)
+#[cfg(target_os = "linux")]
+const PREF_TUNNEL: &str = "102"; // everything else -> the exit tunnel table
 
 /// Per-network allow policy for peers using this node as an exit node, consulted
 /// on the server's inbound data path (`forward::evaluate_inbound`). Cheap to clone
@@ -136,6 +160,58 @@ impl ExitServer {
     }
 }
 
+/// Client-side exit-node selection: the peer this node routes all its non-mesh
+/// traffic through, on a specific network. Consulted by the forwarding loop
+/// (outbound routing to the exit peer) and the inbound path (accepting the exit
+/// peer's return traffic). Cheap to clone (Arc-backed); `None` == direct egress.
+#[derive(Clone, Default)]
+pub struct ExitClient {
+    inner: Arc<ArcSwapOption<ExitSelection>>,
+}
+
+/// The resolved exit peer for the client role.
+#[derive(Clone)]
+pub struct ExitSelection {
+    /// The exit peer's user identity, matched against a datagram sender to accept
+    /// its return traffic. (Folds multi-device peers via the device→user map.)
+    pub peer_user: EndpointId,
+    /// The exit peer's mesh IPv4, used to look up its live route and to dial it.
+    pub ipv4: Ipv4Addr,
+    /// The network we route through the exit peer on (so we tag the datagram with
+    /// that network's handle, which its allow-list is scoped to).
+    pub network: SmolStr,
+}
+
+impl ExitClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The current exit selection, if any.
+    pub fn selection(&self) -> Option<Arc<ExitSelection>> {
+        self.inner.load_full()
+    }
+
+    /// Whether we route non-mesh traffic through an exit peer.
+    pub fn is_active(&self) -> bool {
+        self.inner.load().is_some()
+    }
+
+    /// Whether a datagram arriving on `network` from sender `peer_user` is our own
+    /// exit-node return traffic (the sender is our chosen exit peer for it).
+    pub fn is_return_traffic(&self, network: &str, peer_user: &EndpointId) -> bool {
+        self.inner
+            .load()
+            .as_ref()
+            .is_some_and(|s| s.network == network && &s.peer_user == peer_user)
+    }
+
+    /// Set (or with `None`, clear) the exit selection.
+    pub fn set(&self, selection: Option<ExitSelection>) {
+        self.inner.store(selection.map(Arc::new));
+    }
+}
+
 /// The two overlay source ranges masqueraded when forwarding out an uplink.
 #[cfg(target_os = "linux")]
 const V4_OVERLAY: &str = "100.64.0.0/10";
@@ -255,6 +331,88 @@ fn delete_nft_table() {
         // A missing table is fine (never enabled, or already removed).
         tracing::debug!(error = %e, "exit-node nft table already absent");
     }
+}
+
+/// Install the client full-tunnel: route all non-mesh traffic through the TUN and
+/// policy-route the node's own iroh transport around it (the loop prevention).
+///
+/// A `default` route into `<tun>` lives in a dedicated table [`EXIT_TABLE`]; three
+/// `ip rule`s then select it: marked packets (iroh's own underlay, tagged with
+/// [`SOCKET_MARK`]) go to `main` and egress normally; `main`'s specific routes
+/// (LAN, connected, the overlay ranges) still win via `suppress_prefixlength 0`;
+/// everything else falls to the tunnel table. Applied for IPv4 and IPv6.
+/// Idempotent (routes use `replace`, rules are deleted before being re-added).
+/// Linux only.
+#[cfg(target_os = "linux")]
+pub fn install_client_routing(tun_name: &str) -> anyhow::Result<()> {
+    for family in ["-4", "-6"] {
+        // Default route into the TUN, in our own table.
+        run_ip(&[
+            family, "route", "replace", "default", "dev", tun_name, "table", EXIT_TABLE,
+        ])?;
+        // Rebuild the three rules idempotently (delete any stale copy first).
+        remove_client_rules(family);
+        run_ip(&[
+            family, "rule", "add", "fwmark", SOCKET_MARK_HEX, "table", "main", "pref", PREF_BYPASS,
+        ])?;
+        run_ip(&[
+            family,
+            "rule",
+            "add",
+            "table",
+            "main",
+            "suppress_prefixlength",
+            "0",
+            "pref",
+            PREF_MAIN,
+        ])?;
+        run_ip(&[
+            family, "rule", "add", "table", EXIT_TABLE, "pref", PREF_TUNNEL,
+        ])?;
+    }
+    tracing::info!(tun = tun_name, "exit-node client full-tunnel routing installed");
+    Ok(())
+}
+
+/// Remove the client full-tunnel policy routing installed by
+/// [`install_client_routing`]: drop the three rules and flush the tunnel table for
+/// both families. Best-effort (the TUN going down also drops its routes). Linux only.
+#[cfg(target_os = "linux")]
+pub fn teardown_client_routing() {
+    for family in ["-4", "-6"] {
+        remove_client_rules(family);
+        let _ = run_ip(&[family, "route", "flush", "table", EXIT_TABLE]);
+    }
+    tracing::info!("exit-node client full-tunnel routing removed");
+}
+
+/// Hex form of [`SOCKET_MARK`] as `ip rule` expects it.
+#[cfg(target_os = "linux")]
+const SOCKET_MARK_HEX: &str = "0x7261";
+
+/// Delete our three policy rules for one address family, ignoring "not found".
+#[cfg(target_os = "linux")]
+fn remove_client_rules(family: &str) {
+    for pref in [PREF_BYPASS, PREF_MAIN, PREF_TUNNEL] {
+        let _ = run_ip(&[family, "rule", "del", "pref", pref]);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_ip(args: &[&str]) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let out = std::process::Command::new("ip")
+        .args(args)
+        .output()
+        .with_context(|| format!("running `ip {}`", args.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`ip {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
