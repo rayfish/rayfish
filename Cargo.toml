@@ -188,9 +188,14 @@ core-foundation = "0.9"
 enable-ansi-support = "0.3"
 
 [patch.crates-io]
-# iroh fork adding `Builder::direct_addr_filter` (upstream PR n0-computer/iroh#4397).
+# iroh fork carrying two rayfish features on the `rayfish-integration` branch:
+#   - `Builder::direct_addr_filter` (upstream PR n0-computer/iroh#4397)
+#   - `Builder::socket_mark` for SO_MARK on the underlay sockets (draft PR #4406)
 # iroh-base/-dns/-relay are patched too so the fork and registry copies don't clash.
-iroh = { git = "https://github.com/rayfish/iroh", branch = "direct-addr-filter" }
-iroh-base = { git = "https://github.com/rayfish/iroh", branch = "direct-addr-filter" }
-iroh-dns = { git = "https://github.com/rayfish/iroh", branch = "direct-addr-filter" }
-iroh-relay = { git = "https://github.com/rayfish/iroh", branch = "direct-addr-filter" }
+iroh = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
+iroh-base = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
+iroh-dns = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
+iroh-relay = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
+# netwatch fork exposing `UdpSocket::bind_full_with_mark`, which the socket_mark
+# plumbing above calls (upstream PR n0-computer/net-tools#179).
+netwatch = { git = "https://github.com/rayfish/net-tools", branch = "feat/socket-mark" }
