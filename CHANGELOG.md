@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Exit nodes.** A Linux node can offer itself as an internet gateway for a
+  network so other members route all their non-mesh traffic through it (like a
+  Tailscale exit node). On the gateway: `ray exit-node allow <net> <peer|*>`
+  permits peers (and turns on kernel forwarding + NAT on `ray up`);
+  `ray exit-node disallow` revokes. On a client: `ray exit-node use <net> <peer>`
+  routes all internet-bound traffic out through that peer, `ray exit-node none`
+  restores direct egress. Availability is advertised in the signed roster, so
+  `ray status` flags exit-capable peers and `ray exit-node status` lists them.
+  Full-stack IPv4 + IPv6. The gateway (NAT/forwarding) and the client
+  (full-tunnel routing with fwmark loop-prevention) are Linux-only in this
+  release; the `allow` / advertise / `status` surface is cross-platform.
+
 ### Fixed
 
 - **`ray mdns off` (and the other config-writing commands) now take effect on

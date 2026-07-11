@@ -136,6 +136,33 @@ impl NetworkRegistry {
         self.exit_server.reload(entries);
     }
 
+    /// Rebuild the client-side exit selection from config + the live roster: the
+    /// first network with `exit_node_use` set whose selected peer is a resolvable
+    /// roster member. Resolves the stored identity to the peer's mesh IPv4 (for
+    /// routing) and user identity (for matching its return traffic). Clears the
+    /// selection when none applies. Called on `activate()` and after a `use`/`none`
+    /// change while up.
+    pub(crate) fn reload_exit_client(&self) {
+        let networks = config::load().map(|c| c.networks).unwrap_or_default();
+        let selection = networks.iter().find_map(|nc| {
+            let want = nc.exit_node_use.as_ref()?;
+            let id = want.parse::<EndpointId>().ok()?;
+            let handle = self.networks.get(&nc.name)?;
+            let s = handle.state.read().unwrap();
+            let member = s
+                .members
+                .all()
+                .into_iter()
+                .find(|m| m.identity == id || m.user_identity == Some(id))?;
+            Some(crate::exit_node::ExitSelection {
+                peer_user: self.device_user_map.resolve(&member.identity),
+                ipv4: member.ip,
+                network: smol_str::SmolStr::new(&nc.name),
+            })
+        });
+        self.exit_client.set(selection);
+    }
+
     /// Report exit-node state per network: this node's own allow list + selection,
     /// and which roster peers advertise an exit node.
     pub(crate) fn exit_node_status(&self, network: Option<String>) -> IpcMessage {

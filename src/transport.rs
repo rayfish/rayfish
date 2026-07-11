@@ -160,6 +160,16 @@ async fn bind_endpoint(
         // so multi-homing / roaming is unaffected.
         .direct_addr_filter(OverlayAddrFilter);
 
+    // Loop prevention for the exit-node client full-tunnel: mark iroh's own
+    // underlay UDP sockets (SO_MARK) so the `ip rule` installed on `ray up` routes
+    // them around the default route we point into the TUN, instead of looping the
+    // transport back through the tunnel. Harmless when no exit is in use (the rule
+    // simply isn't present). Linux only; SO_MARK has no equivalent elsewhere.
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.socket_mark(crate::exit_node::SOCKET_MARK);
+    }
+
     // Override the N0 preset's relay / discovery defaults when configured.
     if let Some(mode) = build_relay_mode(relay)? {
         builder = builder.relay_mode(mode);

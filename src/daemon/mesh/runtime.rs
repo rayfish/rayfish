@@ -818,6 +818,18 @@ impl Daemon {
         let exit_tun_name = self.tun_name.load().as_str().to_owned();
         self.registry.exit_server.apply_os(&exit_tun_name);
 
+        // Exit-node client: if we route through an exit peer, install the
+        // full-tunnel default route + loop-prevention policy routing (Linux only;
+        // client full-tunnel is unsupported elsewhere).
+        self.registry.reload_exit_client();
+        #[cfg(target_os = "linux")]
+        if self.registry.exit_client.is_active() {
+            if let Err(e) = crate::exit_node::install_client_routing(&exit_tun_name) {
+                tracing::warn!(error = %e, "failed to install exit-node client routing");
+                warnings.push(format!("failed to route traffic through exit node: {e}"));
+            }
+        }
+
         tracing::info!("data plane activated");
         if warnings.is_empty() {
             IpcMessage::Ok {
@@ -863,6 +875,12 @@ impl Daemon {
         // so no transit happens while on standby.
         self.registry.exit_server.teardown_os();
         self.registry.exit_server.clear();
+
+        // Exit-node client: remove the full-tunnel policy routing and clear the
+        // selection. The TUN going down also drops its default route.
+        #[cfg(target_os = "linux")]
+        crate::exit_node::teardown_client_routing();
+        self.registry.exit_client.set(None);
 
         tracing::info!("VPN on standby");
         IpcMessage::Ok {
