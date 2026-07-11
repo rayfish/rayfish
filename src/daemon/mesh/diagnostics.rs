@@ -116,6 +116,7 @@ impl Daemon {
                         pending_requests: 0,
                         aliases,
                         ephemeral_ttl_secs,
+                        my_exit_node: None,
                     };
                 }
             };
@@ -179,9 +180,24 @@ impl Daemon {
                         PeerState::Idle
                     },
                     connection,
+                    exit_node: m.exit_node,
                 }
             })
             .collect();
+        // The exit peer this node routes through (`ray exit-node use`), resolved
+        // to a hostname/short-id for display when it matches a roster member.
+        let my_exit_node = net_cfg.as_ref().and_then(|n| n.exit_node_use.clone()).map(|id| {
+            id.parse::<EndpointId>()
+                .ok()
+                .and_then(|eid| {
+                    members
+                        .iter()
+                        .find(|m| m.identity == eid)
+                        .and_then(|m| m.hostname.clone().or_else(|| lookup_hostname(m.ip)))
+                        .or_else(|| Some(eid.fmt_short().to_string()))
+                })
+                .unwrap_or(id)
+        });
         NetworkStatus {
             name: h.name.clone(),
             role,
@@ -195,6 +211,7 @@ impl Daemon {
             pending_requests,
             aliases,
             ephemeral_ttl_secs,
+            my_exit_node,
         }
     }
 

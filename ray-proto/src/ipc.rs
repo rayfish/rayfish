@@ -184,6 +184,29 @@ pub enum IpcMessage {
     },
     /// Read the SSH server state + per-network allow lists (open read).
     FirewallSshShow,
+    /// Add (`allow=true`) or remove (`allow=false`) a peer from a network's
+    /// exit-node allow list (`ray exit-node allow|disallow <net> <peer>`). `peer`
+    /// is a resolved peer identity (hex) or `"*"` (any member). A non-empty list
+    /// makes this node offer itself as an exit node and gates real forwarding;
+    /// the daemon also advertises the offer in the signed blob. Mutating.
+    ExitNodeAllow {
+        network: String,
+        peer: String,
+        allow: bool,
+    },
+    /// Select (`peer = Some`) or clear (`peer = None`) the exit node this node
+    /// routes all non-mesh traffic through (`ray exit-node use|none <net>`).
+    /// `peer` is a hostname / mesh IP / short id, validated against the roster
+    /// (must advertise `exit_node`). Mutating; takes effect on the next `ray up`.
+    ExitNodeUse {
+        network: String,
+        peer: Option<String>,
+    },
+    /// Read exit-node state: this node's own offer (allow list) and selection per
+    /// network, plus which roster peers advertise `exit_node` (open read).
+    ExitNodeStatus {
+        network: Option<String>,
+    },
     SetHostname {
         network: String,
         hostname: String,
@@ -486,6 +509,10 @@ pub enum IpcMessage {
         /// `(network, allow-entries)` for networks with at least one rule.
         networks: Vec<(String, Vec<SshAllowView>)>,
     },
+    /// Exit-node state (reply to `ExitNodeStatus`): one entry per network.
+    ExitNodeState {
+        networks: Vec<ExitNodeStatusView>,
+    },
     FileList {
         files: Vec<PendingFileInfo>,
     },
@@ -568,6 +595,21 @@ pub struct FirewallRuleView {
 pub struct SshAllowView {
     pub peer: String,
     pub users: Vec<String>,
+}
+
+/// Exit-node state for one network as shown by `ray exit-node status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitNodeStatusView {
+    pub network: String,
+    /// This node's own allow list (`ray exit-node allow`): `"*"` or peer
+    /// identities. Non-empty means this node offers itself as an exit node.
+    pub allow: Vec<String>,
+    /// The exit peer this node routes non-mesh traffic through (`ray exit-node
+    /// use`), as a display string, or `None` for direct egress.
+    pub using: Option<String>,
+    /// Roster peers advertising `exit_node` (display strings: hostname or short
+    /// id), so the user can see who is available to route through.
+    pub available: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -656,6 +698,10 @@ pub struct NetworkStatus {
     /// (`ray ephemeral <net> <dur>`). `None` = off. Shown on the network line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ephemeral_ttl_secs: Option<u64>,
+    /// The exit peer this node routes non-mesh traffic through on this network
+    /// (`ray exit-node use`), as a display string, or `None` for direct egress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub my_exit_node: Option<String>,
 }
 
 #[derive(
@@ -699,6 +745,10 @@ pub struct PeerStatus {
     /// when idle, so a bare `connection.is_none()` must read as `Idle`, not offline.
     #[serde(default)]
     pub state: PeerState,
+    /// True when this peer advertises itself as an exit node on this network
+    /// (`Member.exit_node` in the signed roster). Shown as a badge in status.
+    #[serde(default)]
+    pub exit_node: bool,
 }
 
 /// Three-state peer liveness for `ray status`.
@@ -853,6 +903,51 @@ mod tests {
                 assert_eq!(mode, GroupMode::Open);
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn exit_node_requests_roundtrip() {
+        for req in [
+            IpcMessage::ExitNodeAllow {
+                network: "n".into(),
+                peer: "*".into(),
+                allow: true,
+            },
+            IpcMessage::ExitNodeUse {
+                network: "n".into(),
+                peer: Some("host".into()),
+            },
+            IpcMessage::ExitNodeUse {
+                network: "n".into(),
+                peer: None,
+            },
+            IpcMessage::ExitNodeStatus { network: None },
+        ] {
+            let bytes = rmp_serde::to_vec_named(&req).unwrap();
+            let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(format!("{req:?}"), format!("{decoded:?}"));
+        }
+    }
+
+    #[test]
+    fn exit_node_state_roundtrips() {
+        let resp = IpcMessage::ExitNodeState {
+            networks: vec![ExitNodeStatusView {
+                network: "n".into(),
+                allow: vec!["*".into()],
+                using: Some("gw".into()),
+                available: vec!["gw".into()],
+            }],
+        };
+        let bytes = rmp_serde::to_vec_named(&resp).unwrap();
+        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded {
+            IpcMessage::ExitNodeState { networks } => {
+                assert_eq!(networks.len(), 1);
+                assert_eq!(networks[0].using.as_deref(), Some("gw"));
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 
@@ -1130,11 +1225,13 @@ mod tests {
                     incompatible: false,
                     connection: None,
                     state: PeerState::Idle,
+                    exit_node: false,
                 }],
                 pending_suggestions: 0,
                 pending_requests: 0,
                 aliases: BTreeMap::new(),
                 ephemeral_ttl_secs: None,
+                my_exit_node: None,
             }],
             packets_rx: 0,
             packets_tx: 0,

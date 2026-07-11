@@ -730,6 +730,7 @@ impl Daemon {
                 | IpcMessage::FirewallSuggestions { .. }
                 | IpcMessage::FirewallPending { .. }
                 | IpcMessage::FirewallSshShow
+                | IpcMessage::ExitNodeStatus { .. }
                 | IpcMessage::ListFiles
                 | IpcMessage::Connections
                 | IpcMessage::ContactId
@@ -1011,6 +1012,15 @@ impl Daemon {
                 allow,
             } => self.firewall_ssh_allow(&network, &peer, users, allow).await,
             IpcMessage::FirewallSshShow => self.firewall_ssh_show(),
+            IpcMessage::ExitNodeAllow {
+                network,
+                peer,
+                allow,
+            } => self.registry.exit_node_allow(&network, &peer, allow).await,
+            IpcMessage::ExitNodeUse { network, peer } => {
+                self.registry.exit_node_use(&network, peer).await
+            }
+            IpcMessage::ExitNodeStatus { network } => self.registry.exit_node_status(network),
             IpcMessage::SetHostname { network, hostname } => {
                 self.set_hostname(&network, &hostname).await
             }

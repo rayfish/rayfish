@@ -16,6 +16,7 @@ mod bootstrap;
 mod coordinator;
 mod create_join;
 mod diagnostics;
+mod exit_node;
 mod files;
 mod firewall;
 mod invite;

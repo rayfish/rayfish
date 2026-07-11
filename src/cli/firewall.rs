@@ -863,6 +863,7 @@ mod tests {
             incompatible: false,
             connection: None,
             state: ipc::PeerState::Idle,
+            exit_node: false,
         }
     }
 
@@ -880,6 +881,7 @@ mod tests {
             pending_requests: 0,
             aliases: Default::default(),
             ephemeral_ttl_secs: None,
+            my_exit_node: None,
         }
     }
 

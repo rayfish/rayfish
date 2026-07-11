@@ -295,6 +295,9 @@ fn print_network(net: &ipc::NetworkStatus) {
             style::value(&format_ttl(ttl)),
         );
     }
+    if let Some(ref gw) = net.my_exit_node {
+        print!("   {} {}", style::label("exit via"), style::value(gw));
+    }
     println!();
 
     // Invert the local alias map (alias -> identity) for identity -> alias
@@ -531,6 +534,13 @@ fn device_row(
     let host = match alias {
         Some(a) => format!("{base} [{a}]"),
         None => base,
+    };
+    // Flag a peer that advertises itself as an exit node so `ray exit-node use`
+    // has an obvious target.
+    let host = if peer.exit_node {
+        format!("{host} (exit)")
+    } else {
+        host
     };
     let (glyph_plain, glyph_styled) = match peer.state {
         ipc::PeerState::Active => ("●", style::dot_online()),
@@ -795,6 +805,7 @@ mod grouping_tests {
             } else {
                 ipc::PeerState::Idle
             },
+            exit_node: false,
         }
     }
 
@@ -812,6 +823,7 @@ mod grouping_tests {
             pending_requests: 0,
             aliases: Default::default(),
             ephemeral_ttl_secs: None,
+            my_exit_node: None,
         }
     }
 
@@ -861,6 +873,7 @@ mod grouping_tests {
             incompatible: false,
             connection: Some(conn()),
             state: ipc::PeerState::Active,
+            exit_node: false,
         };
         let secondary = peer("sm-f966b", Some(dario), false, false, false);
         let net = net("umbrel", vec![primary, secondary]);

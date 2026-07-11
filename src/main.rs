@@ -257,6 +257,12 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: FirewallAction,
     },
+    /// Offer this node as an internet gateway, or route traffic through one
+    #[command(name = "exit-node")]
+    ExitNode {
+        #[command(subcommand)]
+        action: ExitNodeAction,
+    },
     /// Reconcile trusted networks against a deploy spec file (Phase B). Creates
     /// missing trusted networks, publishes idempotent firewall suggestions, and
     /// reports the membership gap (expected vs joined hosts). Never joins.
@@ -682,6 +688,50 @@ pub(crate) enum SshAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum ExitNodeAction {
+    /// Permit a peer to route its internet-bound traffic out through this node.
+    /// The first `allow` turns this node into an exit node for the network;
+    /// activate it with `ray up`. `peer` is a hostname, mesh IP, short id, or
+    /// `*` (any peer on the network).
+    #[command(visible_alias = "ok")]
+    Allow {
+        /// Network name
+        network: String,
+        /// Peer (hostname / mesh IP / short id) or `*`
+        peer: String,
+    },
+    /// Revoke a peer's exit-node permission on a network. Removing the last peer
+    /// withdraws this node's exit-node offer.
+    #[command(visible_aliases = ["rm", "del", "deny"])]
+    Disallow {
+        /// Network name
+        network: String,
+        /// Peer (hostname / mesh IP / short id) or `*`
+        peer: String,
+    },
+    /// Route all this node's non-mesh traffic through an exit peer on a network.
+    /// The peer must advertise an exit node (see `ray exit-node status`). Takes
+    /// effect on the next `ray up`.
+    Use {
+        /// Network name
+        network: String,
+        /// Exit peer (hostname / mesh IP / short id)
+        peer: String,
+    },
+    /// Stop routing through an exit node on a network (restore direct egress).
+    None {
+        /// Network name
+        network: String,
+    },
+    /// Show exit-node state: this node's offer + selection, and available peers.
+    #[command(visible_aliases = ["ls", "list", "show"])]
+    Status {
+        /// Optional network to filter to
+        network: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum FilesAction {
     /// Accept a pending file transfer
     Accept {
@@ -1044,6 +1094,7 @@ async fn main() -> Result<()> {
         Command::Netcheck => ipc_netcheck().await,
         Command::Admin { network, action } => ipc_admin(&network, action).await,
         Command::Firewall { action } => ipc_firewall(action).await,
+        Command::ExitNode { action } => ipc_exit_node(action).await,
         Command::Apply {
             spec,
             prune,

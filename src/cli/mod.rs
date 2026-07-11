@@ -12,6 +12,7 @@
 
 mod alias;
 mod connect;
+mod exit_node;
 mod files;
 mod firewall;
 mod gui;
@@ -25,6 +26,7 @@ mod update;
 
 pub(crate) use alias::*;
 pub(crate) use connect::*;
+pub(crate) use exit_node::*;
 pub(crate) use files::*;
 pub(crate) use firewall::*;
 pub(crate) use gui::*;
