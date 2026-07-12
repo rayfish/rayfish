@@ -184,20 +184,22 @@ impl Daemon {
                 }
             })
             .collect();
-        // The exit peer this node routes through (`ray exit-node use`), resolved
-        // to a hostname/short-id for display when it matches a roster member.
-        let my_exit_node = net_cfg.as_ref().and_then(|n| n.exit_node_use.clone()).map(|id| {
-            id.parse::<EndpointId>()
-                .ok()
-                .and_then(|eid| {
-                    members
-                        .iter()
-                        .find(|m| m.identity == eid)
-                        .and_then(|m| m.hostname.clone().or_else(|| lookup_hostname(m.ip)))
-                        .or_else(|| Some(eid.fmt_short().to_string()))
-                })
-                .unwrap_or(id)
-        });
+        // The exit peer this node routes through (`ray exit-node use`), as a display
+        // string: its hostname if the roster knows it, else a short id, else the
+        // raw stored value.
+        let my_exit_node = net_cfg
+            .as_ref()
+            .and_then(|n| n.exit_node_use.clone())
+            .map(|stored| {
+                let Ok(id) = stored.parse::<EndpointId>() else {
+                    return stored;
+                };
+                members
+                    .iter()
+                    .find(|m| m.identity == id)
+                    .and_then(|m| m.hostname.clone().or_else(|| lookup_hostname(m.ip)))
+                    .unwrap_or_else(|| id.fmt_short().to_string())
+            });
         NetworkStatus {
             name: h.name.clone(),
             role,

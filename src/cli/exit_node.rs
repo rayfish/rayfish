@@ -4,7 +4,6 @@
 use crate::*;
 
 pub(crate) async fn ipc_exit_node(action: ExitNodeAction) -> Result<()> {
-    let mut filter: Option<String> = None;
     let req = match action {
         ExitNodeAction::Allow { network, peer } => ipc::IpcMessage::ExitNodeAllow {
             network,
@@ -24,30 +23,22 @@ pub(crate) async fn ipc_exit_node(action: ExitNodeAction) -> Result<()> {
             network,
             peer: None,
         },
-        ExitNodeAction::Status { network } => {
-            filter = network.clone();
-            ipc::IpcMessage::ExitNodeStatus { network }
-        }
+        ExitNodeAction::Status { network } => ipc::IpcMessage::ExitNodeStatus { network },
     };
     let mut stream = ipc::connect().await?;
     ipc::send(&mut stream, req).await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::ExitNodeState { networks } => {
-            render_exit_node_state(networks, filter.as_deref())
-        }
+        ipc::IpcMessage::ExitNodeState { networks } => render_exit_node_state(networks),
         ipc::IpcMessage::Error { message } => print_error("exit-node", &message, None),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
 }
 
-fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>, filter: Option<&str>) {
-    let networks: Vec<ipc::ExitNodeStatusView> = networks
-        .into_iter()
-        .filter(|n| filter.is_none_or(|f| f == n.network))
-        .collect();
+/// Render the daemon's reply (already filtered to the requested network, if any).
+fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>) {
     if json_enabled() {
         print_json(&serde_json::json!({
             "networks": networks.iter().map(|n| serde_json::json!({
@@ -69,15 +60,13 @@ fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>, filter: Option
         if n.allow.is_empty() {
             println!("  offering: no");
         } else {
+            // Allow entries are `*` or a 64-char identity hex; abbreviate the hex.
             let peers: Vec<String> = n
                 .allow
                 .iter()
-                .map(|p| {
-                    if p == "*" || p.len() <= 12 {
-                        p.clone()
-                    } else {
-                        format!("{}...", &p[..12])
-                    }
+                .map(|p| match p.len() > 12 {
+                    true => format!("{}...", &p[..12]),
+                    false => p.clone(),
                 })
                 .collect();
             println!("  offering: yes (allow: {})", peers.join(", "));

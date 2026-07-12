@@ -16,7 +16,11 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::{fs, path::PathBuf, process::Command};
 
+#[cfg(target_os = "linux")]
+use anyhow::{Context as _, Result};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use iroh::EndpointId;
 use smol_str::SmolStr;
@@ -217,8 +221,13 @@ use names::*;
 
 /// Turn this host into an exit node: enable IPv4/IPv6 forwarding and install an
 /// nftables table that masquerades overlay-sourced traffic leaving any non-TUN
-/// interface (plus a permissive forward chain, for the common case of no
-/// restrictive host firewall).
+/// interface, so replies come back to us and we can un-NAT them to the client.
+///
+/// Nothing here opens the forward path: with no other ruleset the kernel forwards
+/// once the sysctls are on, and a host firewall that drops forwarding (ufw,
+/// firewalld, Docker's iptables policy) cannot be overridden from our own table
+/// anyway (an `accept` ends only the chain it is in, never another chain's drop).
+/// Such a host must be told to permit forwarding on its own terms.
 ///
 /// Idempotent, and safe to re-run while already enabled: the prior sysctl values
 /// are snapshotted to disk exactly once (a re-apply must not capture the values we
@@ -226,7 +235,7 @@ use names::*;
 /// what [`disable`] restores from, including when it runs from the panic hook, so a
 /// crash can never leave the host acting as an open router. Linux only.
 #[cfg(target_os = "linux")]
-fn enable(tun_name: &str) -> anyhow::Result<()> {
+fn enable(tun_name: &str) -> Result<()> {
     if let Some(path) = snapshot_path() {
         if !path.exists() {
             let body = format!(
@@ -242,13 +251,6 @@ fn enable(tun_name: &str) -> anyhow::Result<()> {
     nft_load(&format!(
         "{reset}\
          table inet {t} {{\n\
-         \tchain forward {{\n\
-         \t\ttype filter hook forward priority filter; policy accept;\n\
-         \t\tip saddr {v4} accept\n\
-         \t\tip daddr {v4} accept\n\
-         \t\tip6 saddr {v6} accept\n\
-         \t\tip6 daddr {v6} accept\n\
-         \t}}\n\
          \tchain postrouting {{\n\
          \t\ttype nat hook postrouting priority srcnat; policy accept;\n\
          \t\tip saddr {v4} oifname != \"{tun}\" masquerade\n\
@@ -278,7 +280,7 @@ pub fn disable() {
         return;
     }
     let _ = nft_load(&drop_table(SERVER_TABLE));
-    if let Ok(body) = std::fs::read_to_string(&path) {
+    if let Ok(body) = fs::read_to_string(&path) {
         for line in body.lines() {
             match line.split_once('=') {
                 Some(("v4", v)) if !v.is_empty() => drop(write_sysctl(V4_FORWARD, v)),
@@ -287,7 +289,7 @@ pub fn disable() {
             }
         }
     }
-    let _ = std::fs::remove_file(&path);
+    let _ = fs::remove_file(&path);
     tracing::info!("exit node forwarding + NAT disabled");
 }
 
@@ -316,7 +318,7 @@ pub fn disable() {}
 /// Idempotent (routes use `replace`, rules are deleted before re-adding, the nft
 /// table is replaced wholesale). Linux only.
 #[cfg(target_os = "linux")]
-pub fn install_client_routing(tun_name: &str) -> anyhow::Result<()> {
+pub fn install_client_routing(tun_name: &str) -> Result<()> {
     let mark = format!("{SOCKET_MARK:#x}");
     for family in ["-4", "-6"] {
         run_ip(&[
@@ -400,10 +402,9 @@ fn drop_table(table: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn nft_load(script: &str) -> anyhow::Result<()> {
-    use anyhow::Context as _;
+fn nft_load(script: &str) -> Result<()> {
     use std::io::Write as _;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     let mut child = Command::new("nft")
         .args(["-f", "-"])
         .stdin(Stdio::piped())
@@ -428,9 +429,8 @@ fn nft_load(script: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn run_ip(args: &[&str]) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    let out = std::process::Command::new("ip")
+fn run_ip(args: &[&str]) -> Result<()> {
+    let out = Command::new("ip")
         .args(args)
         .output()
         .with_context(|| format!("running `ip {}`", args.join(" ")))?;
@@ -447,7 +447,7 @@ fn run_ip(args: &[&str]) -> anyhow::Result<()> {
 /// Where the pre-`enable` forwarding sysctls are stashed so [`disable`] (and the
 /// panic hook) can put them back.
 #[cfg(target_os = "linux")]
-fn snapshot_path() -> Option<std::path::PathBuf> {
+fn snapshot_path() -> Option<PathBuf> {
     crate::config::config_dir()
         .ok()
         .map(|d| d.join("exit-forward.snapshot"))
@@ -457,15 +457,14 @@ fn snapshot_path() -> Option<std::path::PathBuf> {
 /// restored on teardown).
 #[cfg(target_os = "linux")]
 fn read_sysctl(path: &str) -> String {
-    std::fs::read_to_string(format!("/proc/sys/{path}"))
+    fs::read_to_string(format!("/proc/sys/{path}"))
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
 }
 
 #[cfg(target_os = "linux")]
-fn write_sysctl(path: &str, value: &str) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    std::fs::write(format!("/proc/sys/{path}"), value)
+fn write_sysctl(path: &str, value: &str) -> Result<()> {
+    fs::write(format!("/proc/sys/{path}"), value)
         .with_context(|| format!("writing sysctl {path}={value}"))
 }
 

@@ -21,7 +21,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::daemon::NetworkRegistry;
 use crate::dns;
+use crate::exit_node::{ExitClient, ExitContext};
 use crate::firewall::{self, Direction, SharedFirewall};
+use crate::membership::is_overlay_ip;
 use crate::peers::{DeviceUserMap, PeerRoute, PeerTable};
 use crate::stats::{DropReason, ForwardMetrics};
 
@@ -199,7 +201,7 @@ pub(crate) enum InboundDecision {
 pub(crate) fn evaluate_inbound(
     packet: &[u8],
     firewall: &SharedFirewall,
-    exit: &crate::exit_node::ExitContext,
+    exit: &ExitContext,
     peer_id: &EndpointId,
     peer_ip: Ipv4Addr,
     peer_ipv6: Ipv6Addr,
@@ -244,7 +246,7 @@ pub(crate) fn evaluate_inbound(
     // drop it so a non-exit node never leaks a peer's traffic. `peer_id` is already
     // the sender's user identity, matching the allow-list. The normal inbound
     // firewall is bypassed: this is transit, not traffic addressed to us.
-    if !crate::membership::is_overlay_ip(info.dst_ip) {
+    if !is_overlay_ip(info.dst_ip) {
         return if exit.server.allows(network, peer_id) {
             InboundDecision::Accept
         } else {
@@ -373,7 +375,7 @@ pub struct ForwardCtx {
     /// for any datagram bound for a non-overlay destination), our own exit
     /// selection (whose return traffic bypasses the anti-spoof check), and our mesh
     /// addresses.
-    pub exit: crate::exit_node::ExitContext,
+    pub exit: ExitContext,
 }
 
 /// True when a parsed packet is a DNS query addressed to the magic resolver IP.
@@ -410,8 +412,11 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
     let mut in_flight: HashSet<EndpointId> = HashSet::new();
     let (done_tx, mut done_rx) = mpsc::channel::<(EndpointId, bool)>(64);
     // Client-side exit-node selection (cheap Arc-backed clone), consulted for
-    // internet-bound packets. `None` when this node has no dialer/registry.
-    let exit_client = dialer.as_ref().map(|r| r.exit_client.clone());
+    // internet-bound packets. Default (no selection) when there is no registry.
+    let exit_client = dialer
+        .as_ref()
+        .map(|r| r.exit_client.clone())
+        .unwrap_or_default();
     loop {
         // Ensure a full MTU of contiguous spare capacity before reading (a short
         // buffer would truncate the packet). `reserve` reuses the current chunk
@@ -429,16 +434,8 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
             Some((peer, connected)) = done_rx.recv() => {
                 in_flight.remove(&peer);
                 let pkts = buffered.remove(&peer).unwrap_or_default();
-                flush_or_drop(
-                    &peers,
-                    &firewall,
-                    &stats,
-                    &tun_tx,
-                    exit_client.as_ref(),
-                    connected,
-                    pkts,
-                )
-                .await;
+                flush_or_drop(&peers, &firewall, &stats, &tun_tx, &exit_client, connected, pkts)
+                    .await;
                 continue;
             }
         };
@@ -462,25 +459,16 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
             });
             continue; // do not fall through to peer routing
         }
-        let Some(route) = resolve_send_route(&peers, exit_client.as_ref(), info.dst_ip) else {
+        let Some(route) = resolve_send_route(&peers, &exit_client, info.dst_ip) else {
             // No live connection to this destination (direct or via the exit peer).
-            let Some(reg) = dialer.as_ref() else {
-                tracing::debug!(dst = %info.dst_ip, "no peer for dst");
-                stats.record_drop(DropReason::NoPeer);
-                continue;
-            };
-
-            // Pick the peer to dial: for overlay traffic the destination member
-            // itself; for internet-bound traffic the configured exit peer. Only
-            // known roster members are dialable.
-            let target = if crate::membership::is_overlay_ip(info.dst_ip) {
-                reg.resolve_route(info.dst_ip)
-            } else {
-                reg.exit_client
-                    .selection()
-                    .and_then(|s| reg.resolve_route(IpAddr::V4(s.ipv4)))
-            };
-            let Some(target) = target else {
+            // Dial the destination member itself for overlay traffic, or the
+            // configured exit peer for internet-bound traffic. Only known roster
+            // members are dialable.
+            let target = dialer.as_ref().and_then(|reg| {
+                let dst = dial_dst(&exit_client, info.dst_ip)?;
+                reg.resolve_route(dst)
+            });
+            let (Some(reg), Some(target)) = (dialer.as_ref(), target) else {
                 tracing::debug!(dst = %info.dst_ip, "no peer for dst");
                 stats.record_drop(DropReason::NoPeer);
                 continue;
@@ -508,28 +496,30 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
     }
 }
 
-/// Resolve the peer route to send an outbound packet over: the destination's own
+/// The mesh peer an outbound packet is sent to: the destination itself for overlay
+/// traffic, the selected exit peer for internet-bound traffic. `None` when a packet
+/// is internet-bound and no exit node is selected (it has nowhere to go).
+fn dial_dst(exit: &ExitClient, dst: IpAddr) -> Option<IpAddr> {
+    if is_overlay_ip(dst) {
+        return Some(dst);
+    }
+    Some(IpAddr::V4(exit.selection()?.ipv4))
+}
+
+/// Resolve the live route to send an outbound packet over: the destination's own
 /// mesh route for overlay traffic, or the configured exit peer's route for
-/// internet-bound traffic when an exit is selected and connected. `None` when the
-/// packet can't be routed (no direct route and no applicable exit).
-fn resolve_send_route(
-    peers: &PeerTable,
-    exit: Option<&crate::exit_node::ExitClient>,
-    dst: IpAddr,
-) -> Option<PeerRoute> {
-    let direct = match dst {
-        IpAddr::V4(v4) => peers.lookup_v4(&v4),
-        IpAddr::V6(v6) => peers.lookup_v6(&v6),
-    };
-    if direct.is_some() {
-        return direct;
+/// internet-bound traffic. `None` when the packet can't be routed (no live
+/// connection, or nothing to route it through).
+fn resolve_send_route(peers: &PeerTable, exit: &ExitClient, dst: IpAddr) -> Option<PeerRoute> {
+    if is_overlay_ip(dst) {
+        return match dst {
+            IpAddr::V4(v4) => peers.lookup_v4(&v4),
+            IpAddr::V6(v6) => peers.lookup_v6(&v6),
+        };
     }
-    // Non-overlay (internet) destination with no direct route: route it through
-    // the selected exit peer, tagged with the exit network's handle.
-    if crate::membership::is_overlay_ip(dst) {
-        return None;
-    }
-    let sel = exit?.selection()?;
+    // Internet-bound: route it through the selected exit peer, pinned to the exit
+    // network's handle (the network whose allow-list permits us).
+    let sel = exit.selection()?;
     peers.route_on_network(&sel.ipv4, &sel.network)
 }
 
@@ -542,7 +532,7 @@ async fn flush_or_drop(
     firewall: &SharedFirewall,
     stats: &ForwardMetrics,
     tun_tx: &mpsc::Sender<Bytes>,
-    exit: Option<&crate::exit_node::ExitClient>,
+    exit: &ExitClient,
     connected: bool,
     pkts: VecDeque<Bytes>,
 ) {
@@ -825,6 +815,7 @@ pub fn spawn_tun_writer<W: crate::tun::TunWrite>(
 mod tests {
     use super::*;
     use crate::firewall::Action;
+    use smol_str::SmolStr;
 
     #[test]
     fn only_a_deliberate_leave_prunes_the_member() {
@@ -936,8 +927,8 @@ mod tests {
 
     /// Exit state for the firewall/anti-spoof tests: no exit offered and none
     /// selected, so neither exit path fires (their destinations are overlay IPs).
-    fn no_exit() -> crate::exit_node::ExitContext {
-        crate::exit_node::ExitContext {
+    fn no_exit() -> ExitContext {
+        ExitContext {
             my_v4: MY_V4,
             my_v6: MY_V6,
             ..Default::default()
@@ -1227,12 +1218,12 @@ mod tests {
     }
 
     /// Exit state where `peer` is our selected exit node on `test-net`.
-    fn exit_via(peer: EndpointId) -> crate::exit_node::ExitContext {
+    fn exit_via(peer: EndpointId) -> ExitContext {
         let exit = no_exit();
         exit.client.set(Some(crate::exit_node::ExitSelection {
             peer_user: peer,
             ipv4: TEST_V4,
-            network: smol_str::SmolStr::new("test-net"),
+            network: SmolStr::new("test-net"),
         }));
         exit
     }

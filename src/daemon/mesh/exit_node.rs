@@ -12,7 +12,10 @@
 //! - **Client** (`exit_node_use`): the exit peer this node routes all non-mesh
 //!   traffic through. Set here; the data plane wiring happens on `ray up`.
 
+use smol_str::SmolStr;
+
 use super::super::*;
+use crate::exit_node::ExitSelection;
 
 impl NetworkRegistry {
     /// Add or remove a peer from a network's exit-node allow list, then advertise
@@ -28,9 +31,6 @@ impl NetworkRegistry {
             Ok(c) => c,
             Err(e) => return ipc_err(format!("failed to load config: {e}")),
         };
-        if !app_config.networks.iter().any(|n| n.name == network) {
-            return ipc_err(format!("no such network: {network}"));
-        }
         // Resolve to a stored allow-entry: `*` stays literal, otherwise the peer's
         // **user identity** hex, so a paired multi-device peer matches on any of
         // its devices (same normalization the SSH allow-list uses).
@@ -42,11 +42,9 @@ impl NetworkRegistry {
                 None => return ipc_err(format!("could not resolve peer: {peer}")),
             }
         };
-        let net = app_config
-            .networks
-            .iter_mut()
-            .find(|n| n.name == network)
-            .expect("network presence checked above");
+        let Some(net) = app_config.networks.iter_mut().find(|n| n.name == network) else {
+            return ipc_err(format!("no such network: {network}"));
+        };
         if allow {
             if !net.exit_allow.iter().any(|p| p == &entry) {
                 net.exit_allow.push(entry.clone());
@@ -80,9 +78,6 @@ impl NetworkRegistry {
             Ok(c) => c,
             Err(e) => return ipc_err(format!("failed to load config: {e}")),
         };
-        if !app_config.networks.iter().any(|n| n.name == network) {
-            return ipc_err(format!("no such network: {network}"));
-        }
         // Validate the selection against the live roster before persisting.
         let selection = match &peer {
             Some(name) => {
@@ -106,12 +101,10 @@ impl NetworkRegistry {
             }
             None => None,
         };
-        let net = app_config
-            .networks
-            .iter_mut()
-            .find(|n| n.name == network)
-            .expect("network presence checked above");
-        net.exit_node_use = selection.clone();
+        let Some(net) = app_config.networks.iter_mut().find(|n| n.name == network) else {
+            return ipc_err(format!("no such network: {network}"));
+        };
+        net.exit_node_use = selection;
         let net = net.clone();
         if let Err(e) = config::save_network(&net) {
             return ipc_err(format!("failed to persist network config: {e}"));
@@ -125,28 +118,23 @@ impl NetworkRegistry {
         IpcMessage::Ok { message }
     }
 
-    /// Rebuild the runtime exit-node allow policy from the on-disk config, so the
-    /// inbound data path (`forward::evaluate_inbound`) sees the current allow-lists.
-    /// Cheap; called on `activate()` and after any allow-list change while up.
-    pub(crate) fn reload_exit_policy(&self) {
+    /// Rebuild both halves of the runtime exit-node state from the on-disk config:
+    /// the gateway allow policy the inbound data path enforces
+    /// (`forward::evaluate_inbound`), and this node's own exit selection.
+    ///
+    /// The selection is the first network with `exit_node_use` set whose peer is a
+    /// resolvable roster member, resolved to its mesh IPv4 (to route to) and user
+    /// identity (to match its return traffic); it clears when none applies. Cheap;
+    /// called on `activate()` and after any `ray exit-node` change while up.
+    pub(crate) fn reload_exit_state(&self) {
         let networks = config::load().map(|c| c.networks).unwrap_or_default();
-        let entries = networks
-            .iter()
-            .map(|n| (n.name.as_str(), n.exit_allow.as_slice()));
-        self.exit_server.reload(entries);
-    }
-
-    /// Rebuild the client-side exit selection from config + the live roster: the
-    /// first network with `exit_node_use` set whose selected peer is a resolvable
-    /// roster member. Resolves the stored identity to the peer's mesh IPv4 (for
-    /// routing) and user identity (for matching its return traffic). Clears the
-    /// selection when none applies. Called on `activate()` and after a `use`/`none`
-    /// change while up.
-    pub(crate) fn reload_exit_client(&self) {
-        let networks = config::load().map(|c| c.networks).unwrap_or_default();
+        self.exit_server.reload(
+            networks
+                .iter()
+                .map(|n| (n.name.as_str(), n.exit_allow.as_slice())),
+        );
         let selection = networks.iter().find_map(|nc| {
-            let want = nc.exit_node_use.as_ref()?;
-            let id = want.parse::<EndpointId>().ok()?;
+            let id = nc.exit_node_use.as_ref()?.parse::<EndpointId>().ok()?;
             let handle = self.networks.get(&nc.name)?;
             let s = handle.state.read().unwrap();
             let member = s
@@ -154,10 +142,10 @@ impl NetworkRegistry {
                 .all()
                 .into_iter()
                 .find(|m| m.identity == id || m.user_identity == Some(id))?;
-            Some(crate::exit_node::ExitSelection {
+            Some(ExitSelection {
                 peer_user: self.device_user_map.resolve(&member.identity),
                 ipv4: member.ip,
-                network: smol_str::SmolStr::new(&nc.name),
+                network: SmolStr::new(&nc.name),
             })
         });
         self.exit_client.set(selection);

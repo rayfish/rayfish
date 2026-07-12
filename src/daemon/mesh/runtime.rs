@@ -848,9 +848,8 @@ impl Daemon {
     /// (the forwarding loop honours it) but no kernel routing is installed.
     pub(crate) fn apply_exit_node(&self) -> Option<String> {
         let tun_name = self.tun_name.load().as_str().to_owned();
-        self.registry.reload_exit_policy();
+        self.registry.reload_exit_state();
         self.registry.exit_server.apply_os(&tun_name);
-        self.registry.reload_exit_client();
         #[cfg(target_os = "linux")]
         {
             if self.registry.exit_client.is_active() {
