@@ -236,15 +236,15 @@ use names::*;
 /// crash can never leave the host acting as an open router. Linux only.
 #[cfg(target_os = "linux")]
 fn enable(tun_name: &str) -> Result<()> {
-    if let Some(path) = snapshot_path() {
-        if !path.exists() {
-            let body = format!(
-                "v4={}\nv6={}\n",
-                read_sysctl(V4_FORWARD),
-                read_sysctl(V6_FORWARD)
-            );
-            crate::config::write_file(&path, body.as_bytes(), false)?;
-        }
+    if let Some(path) = snapshot_path()
+        && !path.exists()
+    {
+        let body = format!(
+            "v4={}\nv6={}\n",
+            read_sysctl(V4_FORWARD),
+            read_sysctl(V6_FORWARD)
+        );
+        crate::config::write_file(&path, body.as_bytes(), false)?;
     }
     write_sysctl(V4_FORWARD, "1")?;
     write_sysctl(V6_FORWARD, "1")?;
