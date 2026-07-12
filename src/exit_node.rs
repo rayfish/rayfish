@@ -1,13 +1,18 @@
-//! Exit nodes: the runtime policy consulted on the data path, and the Linux kernel
-//! state (forwarding, NAT, policy routing) that a gateway and its clients need.
+//! Exit nodes: the runtime policy consulted on the data path, and the kernel state
+//! (forwarding, NAT, policy routing) that a gateway and its clients need.
 //!
 //! Rayfish's own firewall is entirely userspace (peer -> daemon -> TUN), but an
 //! exit node is a kernel job on both ends. On the **gateway**, once the daemon
 //! writes a client's packet to the TUN with a public destination the kernel has to
-//! route it out the uplink, which needs `ip_forward` plus a NAT masquerade so
+//! route it out the uplink, which needs IP forwarding plus a NAT masquerade so
 //! replies come back ([`ExitServer::apply_os`] -> [`enable`] / [`disable`]). On the
 //! **client**, a full tunnel means every route decision changes, including for the
 //! node's own iroh transport ([`install_client_routing`]).
+//!
+//! **Offering** an exit node works on Linux (nftables), macOS and FreeBSD (pf).
+//! **Using** one is Linux-only: it rests on marking iroh's underlay sockets so they
+//! can be policy-routed around the tunnel they are carrying, and neither BSD has an
+//! equivalent we can reach through iroh yet.
 //!
 //! The per-network allow decision ([`ExitServer`]) and the client's selection
 //! ([`ExitClient`]) are plain userspace state, live on every platform, and are
@@ -16,10 +21,10 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::{fs, path::PathBuf, process::Command};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use anyhow::{Context as _, Result};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use iroh::EndpointId;
@@ -113,7 +118,7 @@ impl ExitServer {
     /// everyone upstream. Returns a user-facing message when that happens.
     #[must_use]
     pub fn apply_os(&self, tun_name: &str) -> Option<String> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         if self.is_active() {
             if let Err(e) = enable(tun_name) {
                 disable();
@@ -124,7 +129,7 @@ impl ExitServer {
         } else {
             disable();
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
         let _ = tun_name;
         None
     }
@@ -250,19 +255,97 @@ impl Default for ExitContext {
 }
 
 // ---------------------------------------------------------------------------
-// Linux kernel state
+// Kernel state, shared across the platforms that implement a gateway
 // ---------------------------------------------------------------------------
 
-/// The overlay source ranges we masquerade when forwarding out an uplink, and the
-/// nftables tables we own (one per role, so gateway and client are independent).
+/// The overlay source ranges a gateway masquerades when forwarding out its uplink.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+const V4_OVERLAY: &str = "100.64.0.0/10";
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+const V6_OVERLAY: &str = "200::/7";
+
+/// The forwarding sysctls a gateway turns on: paths under `/proc/sys` on Linux,
+/// dotted names for `sysctl(8)` on the BSDs.
+#[cfg(target_os = "linux")]
+const V4_FORWARD: &str = "net/ipv4/ip_forward";
+#[cfg(target_os = "linux")]
+const V6_FORWARD: &str = "net/ipv6/conf/all/forwarding";
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const V4_FORWARD: &str = "net.inet.ip.forwarding";
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const V6_FORWARD: &str = "net.inet6.ip6.forwarding";
+
+/// What [`enable`] changed, so [`disable`] can put it back. Written to disk rather
+/// than kept in memory because the panic hook (which `abort()`s) has to be able to
+/// tear the gateway down, and because a crashed daemon must never leave the host
+/// forwarding: the next start, or a hand-run `ray down`, restores from this file.
+///
+/// Present-but-empty fields mean "we could not read the original, so do not touch
+/// it on the way out". `pf_token` is BSD-only (see [`pf_enable`]).
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+#[derive(Default)]
+struct Snapshot {
+    v4: String,
+    v6: String,
+    pf_token: Option<String>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+impl Snapshot {
+    /// Read the snapshot, or a default one if it does not exist / cannot be parsed.
+    fn load(path: &std::path::Path) -> Self {
+        let mut snap = Self::default();
+        let Ok(body) = fs::read_to_string(path) else {
+            return snap;
+        };
+        for line in body.lines() {
+            match line.split_once('=') {
+                Some(("v4", v)) => snap.v4 = v.to_string(),
+                Some(("v6", v)) => snap.v6 = v.to_string(),
+                Some(("pf_token", v)) if !v.is_empty() => snap.pf_token = Some(v.to_string()),
+                _ => {}
+            }
+        }
+        snap
+    }
+
+    fn save(&self, path: &std::path::Path) -> Result<()> {
+        let mut body = format!("v4={}\nv6={}\n", self.v4, self.v6);
+        if let Some(token) = &self.pf_token {
+            body.push_str(&format!("pf_token={token}\n"));
+        }
+        crate::config::write_file(path, body.as_bytes(), false)
+    }
+
+    /// Put the forwarding sysctls back, skipping any we never managed to read.
+    fn restore_sysctls(&self) {
+        for (name, value) in [(V4_FORWARD, &self.v4), (V6_FORWARD, &self.v6)] {
+            if !value.is_empty() {
+                let _ = write_sysctl(name, value);
+            }
+        }
+    }
+}
+
+/// Where the pre-`enable` state is stashed so [`disable`] (and the panic hook) can
+/// put it back.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+fn snapshot_path() -> Option<PathBuf> {
+    crate::config::config_dir()
+        .ok()
+        .map(|d| d.join("exit-forward.snapshot"))
+}
+
+// ---------------------------------------------------------------------------
+// Linux kernel state (nftables + policy routing)
+// ---------------------------------------------------------------------------
+
+/// The nftables tables we own (one per role, so gateway and client are
+/// independent) and the sysctls and routing state the two roles need.
 #[cfg(target_os = "linux")]
 mod names {
-    pub(super) const V4_OVERLAY: &str = "100.64.0.0/10";
-    pub(super) const V6_OVERLAY: &str = "200::/7";
     pub(super) const SERVER_TABLE: &str = "rayfish_exit";
     pub(super) const CLIENT_TABLE: &str = "rayfish_exit_client";
-    pub(super) const V4_FORWARD: &str = "net/ipv4/ip_forward";
-    pub(super) const V6_FORWARD: &str = "net/ipv6/conf/all/forwarding";
     /// Policy-routing table holding the client's full-tunnel default route
     /// (`default dev <tun>`), separate from `main` so marked traffic can bypass it.
     pub(super) const EXIT_TABLE: &str = "29793";
@@ -296,12 +379,12 @@ use names::*;
 fn enable(tun_name: &str) -> Result<()> {
     let path = snapshot_path().context("no config dir to snapshot the forwarding sysctls into")?;
     if !path.exists() {
-        let body = format!(
-            "v4={}\nv6={}\n",
-            read_sysctl(V4_FORWARD),
-            read_sysctl(V6_FORWARD)
-        );
-        crate::config::write_file(&path, body.as_bytes(), false)?;
+        Snapshot {
+            v4: read_sysctl(V4_FORWARD),
+            v6: read_sysctl(V6_FORWARD),
+            pf_token: None,
+        }
+        .save(&path)?;
     }
     write_sysctl(V4_FORWARD, "1")?;
     write_sysctl(V6_FORWARD, "1")?;
@@ -337,21 +420,13 @@ pub fn disable() {
         return;
     }
     let _ = nft_load(&drop_table(SERVER_TABLE));
-    if let Ok(body) = fs::read_to_string(&path) {
-        for line in body.lines() {
-            match line.split_once('=') {
-                Some(("v4", v)) if !v.is_empty() => drop(write_sysctl(V4_FORWARD, v)),
-                Some(("v6", v)) if !v.is_empty() => drop(write_sysctl(V6_FORWARD, v)),
-                _ => {}
-            }
-        }
-    }
+    Snapshot::load(&path).restore_sysctls();
     let _ = fs::remove_file(&path);
     tracing::info!("exit node forwarding + NAT disabled");
 }
 
-/// No-op off Linux: exit-node kernel state only exists there.
-#[cfg(not(target_os = "linux"))]
+/// No-op where we have no gateway implementation: there is no kernel state to undo.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 pub fn disable() {}
 
 /// No-op off Linux: client full-tunnel routing only exists there.
@@ -528,15 +603,6 @@ fn run_ip(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Where the pre-`enable` forwarding sysctls are stashed so [`disable`] (and the
-/// panic hook) can put them back.
-#[cfg(target_os = "linux")]
-fn snapshot_path() -> Option<PathBuf> {
-    crate::config::config_dir()
-        .ok()
-        .map(|d| d.join("exit-forward.snapshot"))
-}
-
 /// The sysctl's current value, or `""` if it can't be read (then it is not
 /// restored on teardown).
 #[cfg(target_os = "linux")]
@@ -550,6 +616,274 @@ fn read_sysctl(path: &str) -> String {
 fn write_sysctl(path: &str, value: &str) -> Result<()> {
     fs::write(format!("/proc/sys/{path}"), value)
         .with_context(|| format!("writing sysctl {path}={value}"))
+}
+
+// ---------------------------------------------------------------------------
+// macOS / FreeBSD kernel state (pf)
+// ---------------------------------------------------------------------------
+
+/// The pf anchor our NAT rules live in.
+///
+/// pf only evaluates an anchor that the *main* ruleset references, and the main
+/// ruleset belongs to the host, not to us: rewriting it would trample whatever
+/// firewall the operator (or another tool) already has loaded. So we never touch
+/// it, and instead load into an anchor it already points at.
+///
+/// macOS's stock `/etc/pf.conf` carries `nat-anchor "com.apple/*"`, so a sub-anchor
+/// beneath `com.apple` is evaluated with no change to any file we don't own.
+/// FreeBSD has no such convention: there, the operator adds `nat-anchor
+/// "rayfish_exit"` to `pf.conf` themselves. Either way [`ensure_anchor_referenced`]
+/// checks the reference is really there, because a rule loaded into an unreferenced
+/// anchor is silently never matched, and a gateway that forwards without
+/// masquerading is worse than one that refuses to start.
+/// Written as a `cfg!` rather than two `#[cfg]` definitions on purpose: nothing we
+/// have builds FreeBSD (it is in neither CI nor the release matrix), so a
+/// FreeBSD-only item would be code no compiler ever sees until it reaches a user.
+/// This way both arms are type-checked wherever this file builds at all.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const ANCHOR: &str = if cfg!(target_os = "macos") {
+    "com.apple/rayfish_exit"
+} else {
+    "rayfish_exit"
+};
+
+/// What the main ruleset has to name for [`ANCHOR`] to be reached. On macOS that is
+/// Apple's wildcard, which our anchor sits under; on FreeBSD it is our anchor itself.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const ANCHOR_REF: &str = if cfg!(target_os = "macos") {
+    "com.apple/*"
+} else {
+    "rayfish_exit"
+};
+
+/// Turn this host into an exit node: enable IPv4/IPv6 forwarding and load a pf
+/// anchor that NATs overlay-sourced traffic to the address of the uplink it leaves
+/// by, so replies come back to us and we can un-NAT them to the client.
+///
+/// Idempotent, and safe to re-run while already enabled: the prior sysctls are
+/// snapshotted exactly once (a re-apply must not capture the values we set
+/// ourselves), pf is only enabled if we are not already holding a token for it, and
+/// the anchor is replaced wholesale.
+///
+/// As on Linux, this does not open the forward path: a host whose pf ruleset blocks
+/// forwarding has to be told to permit it on its own terms.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn enable(_tun_name: &str) -> Result<()> {
+    let path = snapshot_path().context("no config dir to snapshot the forwarding sysctls into")?;
+    let mut snap = if path.exists() {
+        Snapshot::load(&path)
+    } else {
+        let snap = Snapshot {
+            v4: read_sysctl(V4_FORWARD),
+            v6: read_sysctl(V6_FORWARD),
+            pf_token: None,
+        };
+        snap.save(&path)?;
+        snap
+    };
+    write_sysctl(V4_FORWARD, "1")?;
+    write_sysctl(V6_FORWARD, "1")?;
+
+    // Enable pf before loading the anchor (an unloaded ruleset has no anchors to
+    // reference), and record the token first: if anything below fails, `disable`
+    // reads this file to give pf back, and a token we never wrote is a reference
+    // count we could never release.
+    if snap.pf_token.is_none() {
+        snap.pf_token = Some(pf_enable()?);
+        snap.save(&path)?;
+    }
+    ensure_anchor_referenced()?;
+
+    let v4 = default_interface("-inet");
+    let v6 = default_interface("-inet6");
+    let rules = nat_rules(v4.as_deref(), v6.as_deref())
+        .context("no default route, so there is no uplink to send an exit node's traffic out")?;
+    pf_load_anchor(&rules)?;
+    tracing::info!(v4 = ?v4, v6 = ?v6, "exit node forwarding + NAT enabled");
+    Ok(())
+}
+
+/// The pf ruleset masquerading overlay traffic out the given uplinks, or `None` if
+/// there is no uplink at all.
+///
+/// NAT is scoped to the interface each family's default route leaves by, and
+/// rewrites to that interface's *current* address: the parentheses tell pf to
+/// re-resolve it, so a DHCP renewal doesn't strand the rule on a stale IP. The two
+/// families are independent, because a host with no IPv6 default route is still a
+/// perfectly good IPv4 exit node.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn nat_rules(v4: Option<&str>, v6: Option<&str>) -> Option<String> {
+    let mut rules = String::new();
+    if let Some(iface) = v4 {
+        rules.push_str(&format!(
+            "nat on {iface} inet from {V4_OVERLAY} to any -> ({iface})\n"
+        ));
+    }
+    if let Some(iface) = v6 {
+        rules.push_str(&format!(
+            "nat on {iface} inet6 from {V6_OVERLAY} to any -> ({iface})\n"
+        ));
+    }
+    (!rules.is_empty()).then_some(rules)
+}
+
+/// Remove the exit-node gateway state: flush our pf anchor, release our reference on
+/// pf, and restore the forwarding sysctls to the values captured by [`enable`].
+/// Reads the on-disk snapshot rather than in-memory state, so the same call works
+/// from the panic hook (which `abort()`s, and must not leave the host an open
+/// router/NAT). Best-effort and idempotent: a no-op when no snapshot exists (never
+/// enabled, or already torn down).
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub fn disable() {
+    let Some(path) = snapshot_path() else { return };
+    if !path.exists() {
+        return;
+    }
+    let snap = Snapshot::load(&path);
+    let _ = pfctl(&["-a", ANCHOR, "-F", "all"]);
+    // `-X` drops our reference; pf itself only goes down if nobody else holds one.
+    if let Some(token) = &snap.pf_token {
+        let _ = pfctl(&["-X", token]);
+    }
+    snap.restore_sysctls();
+    let _ = fs::remove_file(&path);
+    tracing::info!("exit node forwarding + NAT disabled");
+}
+
+/// Enable pf and return our reference token. `pfctl -E` is reference-counted, so
+/// this neither disturbs a pf that is already up nor lets our [`disable`] take one
+/// down that somebody else still wants.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn pf_enable() -> Result<String> {
+    let out = pfctl(&["-E"])?;
+    out.lines()
+        .find_map(|l| l.split_once("Token :"))
+        .map(|(_, t)| t.trim().to_string())
+        .context("`pfctl -E` did not report a token")
+}
+
+/// Replace our anchor's ruleset with `rules`.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn pf_load_anchor(rules: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let mut child = Command::new("pfctl")
+        .args(["-a", ANCHOR, "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning `pfctl -f -`")?;
+    child
+        .stdin
+        .take()
+        .context("pfctl stdin unavailable")?
+        .write_all(rules.as_bytes())
+        .context("writing pf ruleset")?;
+    let out = child.wait_with_output().context("waiting for pfctl")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "pf ruleset load failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Fail unless pf's active ruleset actually reaches [`ANCHOR`].
+///
+/// On macOS pf is off by default and its ruleset starts out empty, so `pfctl -E`
+/// alone leaves nothing referencing anything. An empty ruleset is nobody's, so we
+/// load the host's own `/etc/pf.conf` (exactly what the system would have done) to
+/// get Apple's anchors in place. A *non*-empty ruleset that still doesn't reach us
+/// belongs to someone else and we refuse rather than overwrite it.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn ensure_anchor_referenced() -> Result<()> {
+    if pfctl(&["-sn"]).is_ok_and(|r| r.contains(ANCHOR_REF)) {
+        return Ok(());
+    }
+    let empty = pfctl(&["-sn"]).is_ok_and(|r| r.trim().is_empty())
+        && pfctl(&["-sr"]).is_ok_and(|r| r.trim().is_empty());
+    if empty && std::path::Path::new(PF_CONF).exists() {
+        let _ = pfctl(&["-f", PF_CONF]);
+    }
+    if pfctl(&["-sn"]).is_ok_and(|r| r.contains(ANCHOR_REF)) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "pf's active ruleset does not reference the `{ANCHOR_REF}` nat anchor, so an \
+         exit node's NAT rules would never be matched. Add `nat-anchor \"{ANCHOR_REF}\"` \
+         to {PF_CONF} and reload it (`pfctl -f {PF_CONF}`)."
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const PF_CONF: &str = "/etc/pf.conf";
+
+/// The interface the default route for one family (`-inet` / `-inet6`) leaves by,
+/// or `None` if there is no default route for it.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn default_interface(family: &str) -> Option<String> {
+    let out = Command::new("route")
+        .args(["-n", "get", family, "default"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("interface:"))
+        .map(|i| i.trim().to_string())
+        .filter(|i| !i.is_empty())
+}
+
+/// Run `pfctl` and return its combined output (it reports most of what we ask for on
+/// stderr). Errors if it exits non-zero.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn pfctl(args: &[&str]) -> Result<String> {
+    let out = Command::new("pfctl")
+        .args(args)
+        .output()
+        .with_context(|| format!("running `pfctl {}`", args.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`pfctl {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok(combined)
+}
+
+/// The sysctl's current value, or `""` if it can't be read (then it is not
+/// restored on teardown).
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn read_sysctl(name: &str) -> String {
+    Command::new("sysctl")
+        .args(["-n", name])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn write_sysctl(name: &str, value: &str) -> Result<()> {
+    let out = Command::new("sysctl")
+        .arg(format!("{name}={value}"))
+        .output()
+        .with_context(|| format!("running `sysctl {name}={value}`"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "setting sysctl {name}={value} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -622,6 +956,26 @@ mod tests {
                 "{ip} is reachable only from inside the gateway and must not transit"
             );
         }
+    }
+
+    /// The pf rule text is the whole of the BSD gateway, and nothing in CI ever runs
+    /// it: pin the syntax here so a typo shows up as a failing test rather than as a
+    /// gateway that comes up and quietly NATs nothing.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn nat_rules_masquerade_each_family_out_its_own_uplink() {
+        let both = nat_rules(Some("en0"), Some("en1")).unwrap();
+        assert_eq!(
+            both,
+            "nat on en0 inet from 100.64.0.0/10 to any -> (en0)\n\
+             nat on en1 inet6 from 200::/7 to any -> (en1)\n"
+        );
+        // A host with no IPv6 default route is still an IPv4 exit node.
+        let v4_only = nat_rules(Some("en0"), None).unwrap();
+        assert!(v4_only.contains("inet from 100.64.0.0/10"));
+        assert!(!v4_only.contains("inet6"));
+        // With no uplink at all there is nothing to be a gateway for.
+        assert!(nat_rules(None, None).is_none());
     }
 
     #[test]
