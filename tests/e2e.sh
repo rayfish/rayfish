@@ -14,6 +14,8 @@
 #   reliability   4-peer full-mesh packet-loss test (ping + iperf3 UDP) (tests/e2e/reliability)
 #   restore-offline 3-peer member-restore-with-coordinator-offline test (tests/e2e/restore-offline)
 #   unpair        3-peer `ray unpair` device-cert revocation test (tests/e2e/unpair)
+#   exit-node     3-peer internet-gateway test: forwarding/NAT, full-tunnel egress,
+#                 SO_MARK loop prevention, deny path (tests/e2e/exit-node)
 #   bench         throughput / latency benchmark        (tests/bench)
 #   all           every scenario above except bench: provision, run, then tear
 #                 each fleet down before the next (one fleet live at a time)
@@ -67,6 +69,9 @@ scenario_meta(){
     unpair)      DIR="$ROOT/tests/e2e/unpair"
                  NAMES=(rayfish-unpair-a rayfish-unpair-b rayfish-unpair-c)
                  LABELS=(srv-a srv-b srv-c) ;;
+    exit-node)   DIR="$ROOT/tests/e2e/exit-node"
+                 NAMES=(rayfish-exit-a rayfish-exit-b rayfish-exit-c)
+                 LABELS=(srv-a srv-b srv-c) ;;
     bench)       DIR="$ROOT/tests/bench"
                  NAMES=(rayfish-bench-a rayfish-bench-b)
                  LABELS=(srv-a srv-b) ;;
@@ -82,7 +87,7 @@ case "$scenario" in -h|--help|help|"") usage 0 ;; esac
 # dispatcher per scenario (provision-if-needed + run, then teardown). Prints a
 # pass/fail summary and exits non-zero if any scenario failed.
 if [[ "$scenario" == all ]]; then
-  all_scenarios=(device-cert connect firewall closed-net apply dns ssh reliability restore-offline unpair)
+  all_scenarios=(device-cert connect firewall closed-net apply dns ssh reliability restore-offline unpair exit-node)
   passed=(); failed=()
   for s in "${all_scenarios[@]}"; do
     echo "==================== $s ===================="
