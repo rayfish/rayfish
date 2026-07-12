@@ -16,9 +16,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   routes all internet-bound traffic out through that peer, `ray exit-node none`
   restores direct egress. Availability is advertised in the signed roster, so
   `ray status` flags exit-capable peers and `ray exit-node status` lists them.
-  Full-stack IPv4 + IPv6. The gateway (NAT/forwarding) and the client
-  (full-tunnel routing with fwmark loop-prevention) are Linux-only in this
-  release; the `allow` / advertise / `status` surface is cross-platform.
+  Full-stack IPv4 + IPv6. Connections that reach the client from outside the
+  tunnel keep answering out the interface they arrived on, so turning on a full
+  tunnel does not cut an existing SSH session to the host's public IP. The gateway
+  (NAT/forwarding) and the client (full-tunnel routing with fwmark loop-prevention)
+  are Linux-only in this release; the `allow` / advertise / `status` surface is
+  cross-platform.
 
 ### Fixed
 

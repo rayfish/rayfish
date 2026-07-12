@@ -1295,10 +1295,7 @@ mod tests {
             token: CancellationToken::new(),
             stats: Arc::new(ForwardMetrics::default()),
             device_user_map: DeviceUserMap::new(),
-            exit_server: crate::exit_node::ExitServer::new(),
-            exit_client: crate::exit_node::ExitClient::new(),
-            my_v4: Ipv4Addr::new(100, 64, 0, 1),
-            my_v6: Ipv6Addr::UNSPECIFIED,
+            exit: crate::exit_node::ExitContext::default(),
         };
         spawn_peer_reader(conn_r.clone(), s_id, peers.clone(), ctx);
 
