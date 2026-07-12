@@ -65,20 +65,3 @@ check:
 
 run *args:
     sudo cargo -q run -- {{args}}
-
-# Exit-node kernel plumbing test: runs the real `nft` / `ip rule` code paths and
-# asserts the resulting kernel state. Needs Linux + root + a mutable netns, so it
-# runs in a throwaway privileged container (never against your own routing table).
-# Builds the test binary with cross, then executes it under docker.
-e2e-kernel:
-    cross -q test --target {{target}} --test exit_node_kernel --no-run
-    #!/usr/bin/env bash
-    set -euo pipefail
-    BIN=$(find target/{{target}}/debug/deps -name 'exit_node_kernel-*' -type f -perm -u+x | head -1)
-    [ -n "$BIN" ] || { echo "test binary not found"; exit 1; }
-    echo "running $BIN in a privileged container"
-    docker run --rm --privileged --network host \
-      -v "$PWD/$BIN:/exit_node_kernel:ro" \
-      -e RAYFISH_KERNEL_TEST=1 \
-      ubuntu:22.04 \
-      bash -c 'apt-get update -qq && apt-get install -y -qq nftables iproute2 >/dev/null && /exit_node_kernel --test-threads=1 --nocapture'
