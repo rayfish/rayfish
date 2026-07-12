@@ -699,11 +699,13 @@ pub fn config_dir() -> Result<PathBuf> {
     }
     #[cfg(target_os = "linux")]
     let dir = PathBuf::from("/etc/rayfish");
+    #[cfg(target_os = "freebsd")]
+    let dir = PathBuf::from("/usr/local/etc/rayfish");
     // Android without the override falls back to a fixed app-private path so the
     // library still compiles/runs standalone.
     #[cfg(target_os = "android")]
     let dir = PathBuf::from("/data/local/tmp/rayfish");
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
     let dir = dirs::config_dir()
         .context("could not determine config directory")?
         .join("rayfish");
