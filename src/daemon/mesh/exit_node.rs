@@ -17,7 +17,42 @@ use smol_str::SmolStr;
 use super::super::*;
 use crate::exit_node::ExitSelection;
 
+/// How a member is named in `ray exit-node status`: its hostname, else a short id.
+fn display_name(m: &Member) -> String {
+    m.hostname
+        .clone()
+        .unwrap_or_else(|| m.identity.fmt_short().to_string())
+}
+
 impl NetworkRegistry {
+    /// A network's roster, or empty if we don't have that network. Keeps the
+    /// lookup-then-lock-then-walk dance (and the lock guard) out of the callers.
+    fn roster(&self, network: &str) -> Vec<Member> {
+        match self.networks.get(network) {
+            // Cloned out: `all()` borrows from the state lock, and callers must be
+            // free to work (and to await) without holding it.
+            Some(handle) => handle
+                .state
+                .read()
+                .unwrap()
+                .members
+                .all()
+                .into_iter()
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The roster member `id` names, matched the way the roster keys members: by
+    /// device identity, or by the user identity a paired multi-device peer is
+    /// stored under.
+    fn roster_member(&self, network: &str, id: EndpointId) -> Option<Member> {
+        self.roster(network)
+            .into_iter()
+            .find(|m| m.identity == id || m.user_identity == Some(id))
+    }
+
     /// Add or remove a peer from a network's exit-node allow list, then advertise
     /// the resulting offer state (offering iff the list is non-empty). `peer` is
     /// `*` (any member) or a name/ip/id resolved to the peer's user identity.
@@ -84,18 +119,9 @@ impl NetworkRegistry {
                 let Some(id) = self.resolve_peer_flexible(name).await else {
                     return ipc_err(format!("could not resolve peer: {name}"));
                 };
-                // Match the roster the same way `reload_exit_state` does: a paired
-                // multi-device peer is keyed by its user identity, not by the
-                // device id `resolve_peer_flexible` may hand back. Matching on
-                // `identity` alone would reject a selection the data path would
-                // then happily honour.
-                let advertises = self.networks.get(network).is_some_and(|h| {
-                    let s = h.state.read().unwrap();
-                    s.members
-                        .all()
-                        .iter()
-                        .any(|m| (m.identity == id || m.user_identity == Some(id)) && m.exit_node)
-                });
+                let advertises = self
+                    .roster_member(network, id)
+                    .is_some_and(|m| m.exit_node);
                 if !advertises {
                     return ipc_err(format!(
                         "{name} does not advertise an exit node on '{network}' \
@@ -154,15 +180,12 @@ impl NetworkRegistry {
                 names[0],
             );
         }
+        // Note this does not require the peer to still advertise `exit_node`: a
+        // roster that briefly loses the flag must not silently drop us back to
+        // direct egress, leaking out our own uplink the traffic we chose to tunnel.
         let selection = selected.into_iter().find_map(|nc| {
             let id = nc.exit_node_use.as_ref()?.parse::<EndpointId>().ok()?;
-            let handle = self.networks.get(&nc.name)?;
-            let s = handle.state.read().unwrap();
-            let member = s
-                .members
-                .all()
-                .into_iter()
-                .find(|m| m.identity == id || m.user_identity == Some(id))?;
+            let member = self.roster_member(&nc.name, id)?;
             Some(ExitSelection {
                 peer_user: self.device_user_map.resolve(&member.identity),
                 ipv4: member.ip,
@@ -179,36 +202,24 @@ impl NetworkRegistry {
             Ok(c) => c,
             Err(e) => return ipc_err(format!("failed to load config: {e}")),
         };
-        let networks = cfg
-            .networks
-            .into_iter()
-            .filter(|n| network.as_ref().is_none_or(|want| &n.name == want))
-            .map(|n| {
-                let available = self
-                    .networks
-                    .get(&n.name)
-                    .map(|h| {
-                        let s = h.state.read().unwrap();
-                        s.members
-                            .all()
-                            .iter()
-                            .filter(|m| m.exit_node)
-                            .map(|m| {
-                                m.hostname
-                                    .clone()
-                                    .unwrap_or_else(|| m.identity.fmt_short().to_string())
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                ipc::ExitNodeStatusView {
-                    network: n.name,
-                    allow: n.exit_allow,
-                    using: n.exit_node_use,
-                    available,
-                }
-            })
-            .collect();
+        let mut networks = Vec::new();
+        for n in cfg.networks {
+            if network.as_ref().is_some_and(|want| want != &n.name) {
+                continue;
+            }
+            let available = self
+                .roster(&n.name)
+                .iter()
+                .filter(|m| m.exit_node)
+                .map(display_name)
+                .collect();
+            networks.push(ipc::ExitNodeStatusView {
+                network: n.name,
+                allow: n.exit_allow,
+                using: n.exit_node_use,
+                available,
+            });
+        }
         IpcMessage::ExitNodeState { networks }
     }
 

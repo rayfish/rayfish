@@ -295,8 +295,13 @@ fn print_network(net: &ipc::NetworkStatus) {
             style::value(&format_ttl(ttl)),
         );
     }
+    // Both exit-node roles are worth seeing at a glance: the peer carrying our
+    // internet traffic, and whether we are carrying someone else's.
     if let Some(ref gw) = net.my_exit_node {
         print!("   {} {}", style::label("exit via"), style::value(gw));
+    }
+    if net.exit_offering {
+        print!("   {}", style::marker("exit node"));
     }
     println!();
 
@@ -535,13 +540,6 @@ fn device_row(
         Some(a) => format!("{base} [{a}]"),
         None => base,
     };
-    // Flag a peer that advertises itself as an exit node so `ray exit-node use`
-    // has an obvious target.
-    let host = if peer.exit_node {
-        format!("{host} (exit)")
-    } else {
-        host
-    };
     let (glyph_plain, glyph_styled) = match peer.state {
         ipc::PeerState::Active => ("●", style::dot_online()),
         ipc::PeerState::Idle => ("●", style::dot_idle()),
@@ -561,7 +559,7 @@ fn device_row(
         format!("{prefix}{glyph_styled} {}", host_style(&host)),
     );
     let ip = layout::Cell::new(peer.ip.to_string(), style::faint(&peer.ip.to_string()));
-    match &peer.connection {
+    let mut cells = match &peer.connection {
         Some(ci) => {
             let via = match ci.conn_type {
                 ipc::ConnType::Direct => "direct",
@@ -612,8 +610,24 @@ fn device_row(
                 layout::Cell::plain(""),
             ]
         }
+    };
+    // Trailing exit-node column: which peer is carrying our internet traffic, and
+    // which merely offer to. Short rows (no live connection) are padded to the
+    // connected width first, so the column lands in the same place on every row.
+    while cells.len() < CONNECTED_CELLS {
+        cells.push(layout::Cell::plain(""));
     }
+    cells.push(match (peer.exit_in_use, peer.exit_node) {
+        (true, _) => layout::Cell::new("in use", style::green("in use")),
+        (false, true) => layout::Cell::new("offers", style::faint("offers")),
+        (false, false) => layout::Cell::plain(""),
+    });
+    cells
 }
+
+/// Cells in a peer row with a live connection (name, ip, via, rtt, up, down): the
+/// widest row shape, and the width every row is padded to before the exit column.
+const CONNECTED_CELLS: usize = 6;
 
 /// Render the trailing "pending" summary: things waiting on the user, each with
 /// the command that clears it. Per-network items (firewall suggestions, join
@@ -806,6 +820,7 @@ mod grouping_tests {
                 ipc::PeerState::Idle
             },
             exit_node: false,
+            exit_in_use: false,
         }
     }
 
@@ -824,6 +839,7 @@ mod grouping_tests {
             aliases: Default::default(),
             ephemeral_ttl_secs: None,
             my_exit_node: None,
+            exit_offering: false,
         }
     }
 
@@ -874,6 +890,7 @@ mod grouping_tests {
             connection: Some(conn()),
             state: ipc::PeerState::Active,
             exit_node: false,
+            exit_in_use: false,
         };
         let secondary = peer("sm-f966b", Some(dario), false, false, false);
         let net = net("umbrel", vec![primary, secondary]);
@@ -886,6 +903,31 @@ mod grouping_tests {
         assert!(out.contains("└─"), "{out}");
         let at = |s: &str| out.find(s).unwrap();
         assert!(at("dario") < at("sm-f966b"), "{out}");
+    }
+
+    #[test]
+    fn names_the_exit_node_actually_carrying_our_traffic() {
+        // Two peers offer an exit; only one is carrying us. With several exit nodes
+        // on a network, "(exit)" on both would say nothing about where our packets
+        // are going, so the one in use is called out.
+        let mut offering = peer("gw-a", None, false, true, false);
+        offering.exit_node = true;
+        let mut in_use = peer("gw-b", None, false, true, false);
+        in_use.exit_node = true;
+        in_use.exit_in_use = true;
+        let plain = peer("srv", None, false, true, false);
+        let out = render(&net("dario", vec![offering, in_use, plain]));
+        let row = |host: &str| {
+            out.lines()
+                .find(|l| l.contains(host))
+                .unwrap_or_else(|| panic!("no row for {host}:\n{out}"))
+                .to_string()
+        };
+        assert!(row("gw-a").contains("offers"), "{out}");
+        assert!(row("gw-b").contains("in use"), "{out}");
+        // A peer with no exit role gets a blank cell, not a stray label.
+        let plain = row("srv");
+        assert!(!plain.contains("offers") && !plain.contains("in use"), "{out}");
     }
 
     #[test]

@@ -7,6 +7,10 @@
 // These support the desktop TUN setup (address/route/link configuration via
 // `ifconfig`/`ip`/netlink) and the CGNAT preflight, none of which compile on
 // Android where the packet interface is a `VpnService` fd.
+#[cfg(target_os = "linux")]
+use std::future::Future;
+#[cfg(target_os = "linux")]
+use std::net::IpAddr;
 #[cfg(not(target_os = "android"))]
 use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(not(target_os = "android"))]
@@ -176,17 +180,19 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
     ))
 }
 
-/// Re-assigns our own IPv6 `/128` to the TUN. The address is set once at device
-/// creation, but Linux flushes an interface's global IPv6 addresses when the link
-/// goes down (`keep_addr_on_down` defaults to 0) and never restores them, while
-/// IPv4 addresses survive. Without this, a `down`/`up` cycle leaves the node with
-/// a working IPv4 overlay and a silently dead IPv6 one: it still routes `200::/7`
-/// into the TUN, but owns no address in it, so peers get no answer. Must run after
-/// [`set_link_up`]; idempotent (netlink `replace`), safe on every `up` cycle.
+/// Run `f` with a netlink handle and the interface index of `tun_name`.
+///
+/// Every netlink call below needs the same preamble (open a socket, spawn the
+/// connection driver, resolve the link index) and must abort that driver task on
+/// every path out, success or error. Doing it here keeps each caller down to the
+/// one call it actually makes.
 #[cfg(target_os = "linux")]
-pub async fn ensure_ipv6_addr(tun_name: &str, v6: Ipv6Addr) -> Result<()> {
+async fn with_tun_link<F, Fut>(tun_name: &str, f: F) -> Result<()>
+where
+    F: FnOnce(rtnetlink::Handle, u32) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
     use futures::TryStreamExt;
-    use std::net::IpAddr;
 
     let (connection, handle, _) = rtnetlink::new_connection().context("open netlink socket")?;
     let conn = tokio::spawn(connection);
@@ -203,21 +209,33 @@ pub async fn ensure_ipv6_addr(tun_name: &str, v6: Ipv6Addr) -> Result<()> {
             .with_context(|| format!("TUN link {tun_name} not found"))?
             .header
             .index;
+        f(handle.clone(), index).await
+    }
+    .await;
 
+    conn.abort();
+    result
+}
+
+/// Re-assigns our own IPv6 `/128` to the TUN. The address is set once at device
+/// creation, but Linux flushes an interface's global IPv6 addresses when the link
+/// goes down (`keep_addr_on_down` defaults to 0) and never restores them, while
+/// IPv4 addresses survive. Without this, a `down`/`up` cycle leaves the node with
+/// a working IPv4 overlay and a silently dead IPv6 one: it still routes `200::/7`
+/// into the TUN, but owns no address in it, so peers get no answer. Must run after
+/// [`set_link_up`]; idempotent (netlink `replace`), safe on every `up` cycle.
+#[cfg(target_os = "linux")]
+pub async fn ensure_ipv6_addr(tun_name: &str, v6: Ipv6Addr) -> Result<()> {
+    with_tun_link(tun_name, async |handle, index| {
         handle
             .address()
             .add(index, IpAddr::V6(v6), 128)
             .replace()
             .execute()
             .await
-            .context("add TUN IPv6 address via netlink")?;
-
-        Ok(())
-    }
-    .await;
-
-    conn.abort();
-    result
+            .context("add TUN IPv6 address via netlink")
+    })
+    .await
 }
 
 /// Routes the peer ranges into the TUN. Must be called *after* the interface is
@@ -230,25 +248,9 @@ pub async fn ensure_ipv6_addr(tun_name: &str, v6: Ipv6Addr) -> Result<()> {
 /// explicitly. Idempotent, safe to call on every `up` cycle.
 #[cfg(target_os = "linux")]
 pub async fn route_peer_range(tun_name: &str) -> Result<()> {
-    use futures::TryStreamExt;
     use rtnetlink::RouteMessageBuilder;
 
-    let (connection, handle, _) = rtnetlink::new_connection().context("open netlink socket")?;
-    let conn = tokio::spawn(connection);
-
-    let result = async {
-        let index = handle
-            .link()
-            .get()
-            .match_name(tun_name.to_owned())
-            .execute()
-            .try_next()
-            .await
-            .context("query TUN link")?
-            .with_context(|| format!("TUN link {tun_name} not found"))?
-            .header
-            .index;
-
+    with_tun_link(tun_name, async |handle, index| {
         let route = RouteMessageBuilder::<Ipv6Addr>::new()
             .destination_prefix(Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 0), 7)
             .output_interface(index)
@@ -259,14 +261,9 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
             .replace()
             .execute()
             .await
-            .context("add 200::/7 route via netlink")?;
-
-        Ok(())
-    }
-    .await;
-
-    conn.abort();
-    result
+            .context("add 200::/7 route via netlink")
+    })
+    .await
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -301,25 +298,9 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
 /// interface address, it is a route-only entry. Idempotent across `up`/`down`.
 #[cfg(target_os = "linux")]
 pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
-    use futures::TryStreamExt;
     use rtnetlink::RouteMessageBuilder;
 
-    let (connection, handle, _) = rtnetlink::new_connection().context("open netlink socket")?;
-    let conn = tokio::spawn(connection);
-
-    let result = async {
-        let index = handle
-            .link()
-            .get()
-            .match_name(tun_name.to_owned())
-            .execute()
-            .try_next()
-            .await
-            .context("query TUN link")?
-            .with_context(|| format!("TUN link {tun_name} not found"))?
-            .header
-            .index;
-
+    with_tun_link(tun_name, async |handle, index| {
         let route = RouteMessageBuilder::<Ipv4Addr>::new()
             .destination_prefix(crate::dns::MAGIC_DNS_V4, 32)
             .output_interface(index)
@@ -330,14 +311,9 @@ pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
             .replace()
             .execute()
             .await
-            .context("add magic-DNS /32 route via netlink")?;
-
-        Ok(())
-    }
-    .await;
-
-    conn.abort();
-    result
+            .context("add magic-DNS /32 route via netlink")
+    })
+    .await
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]

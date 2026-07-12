@@ -15,7 +15,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ray exit-node disallow` revokes. On a client: `ray exit-node use <net> <peer>`
   routes all internet-bound traffic out through that peer, `ray exit-node none`
   restores direct egress. Availability is advertised in the signed roster, so
-  `ray status` flags exit-capable peers and `ray exit-node status` lists them.
+  `ray status` flags exit-capable peers, marks the one actually carrying your
+  traffic, shows when this node is itself offering an exit, and
+  `ray exit-node status` lists the lot.
   Full-stack IPv4 + IPv6. Connections that reach the client from outside the
   tunnel keep answering out the interface they arrived on, so turning on a full
   tunnel does not cut an existing SSH session to the host's public IP. The gateway
