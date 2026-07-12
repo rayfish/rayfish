@@ -326,7 +326,15 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
         ])?;
         remove_client_rules(family);
         run_ip(&[
-            family, "rule", "add", "fwmark", &mark, "table", "main", "pref", PREF_BYPASS,
+            family,
+            "rule",
+            "add",
+            "fwmark",
+            &mark,
+            "table",
+            "main",
+            "pref",
+            PREF_BYPASS,
         ])?;
         run_ip(&[
             family,
@@ -340,7 +348,13 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
             PREF_MAIN,
         ])?;
         run_ip(&[
-            family, "rule", "add", "table", EXIT_TABLE, "pref", PREF_TUNNEL,
+            family,
+            "rule",
+            "add",
+            "table",
+            EXIT_TABLE,
+            "pref",
+            PREF_TUNNEL,
         ])?;
     }
     // Connections opened from outside the tunnel keep answering out the interface
@@ -367,7 +381,10 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
         t = CLIENT_TABLE,
         tun = tun_name,
     ))?;
-    tracing::info!(tun = tun_name, "exit-node client full-tunnel routing installed");
+    tracing::info!(
+        tun = tun_name,
+        "exit-node client full-tunnel routing installed"
+    );
     Ok(())
 }
 

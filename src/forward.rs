@@ -718,13 +718,7 @@ pub fn spawn_peer_reader(
 
             let peer_user = device_user_map.resolve(&peer_id);
             match evaluate_inbound(
-                &datagram,
-                &firewall,
-                &exit,
-                &peer_user,
-                peer_ip,
-                peer_ipv6,
-                &network,
+                &datagram, &firewall, &exit, &peer_user, peer_ip, peer_ipv6, &network,
             ) {
                 InboundDecision::Accept => {
                     stats.record_rx(datagram.len());
@@ -990,11 +984,27 @@ mod tests {
         let blocked = make_tcp_packet(22);
         let allowed = make_tcp_packet(80);
         assert!(matches!(
-            evaluate_inbound(&blocked, &fw, &no_exit(), &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(
+                &blocked,
+                &fw,
+                &no_exit(),
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
             InboundDecision::DropFirewall(_)
         ));
         assert!(matches!(
-            evaluate_inbound(&allowed, &fw, &no_exit(), &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(
+                &allowed,
+                &fw,
+                &no_exit(),
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
             InboundDecision::Accept
         ));
     }

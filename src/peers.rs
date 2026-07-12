@@ -23,7 +23,6 @@ fn now_ms() -> u64 {
     ACTIVITY_EPOCH.elapsed().as_millis() as u64
 }
 
-
 /// A `DashMap` using ahash instead of the default SipHash. Used for the
 /// per-packet hot maps (routing table, conntrack, device→user resolution):
 /// ahash is markedly faster for small keys while keeping a randomized seed, so
@@ -330,7 +329,11 @@ impl PeerTable {
         self.by_id
             .get(peer_id)
             .map(|e| *e.value())
-            .and_then(|ip| self.v4.get(&ip).map(|e| e.supports_idle_close.load(Ordering::Relaxed)))
+            .and_then(|ip| {
+                self.v4
+                    .get(&ip)
+                    .map(|e| e.supports_idle_close.load(Ordering::Relaxed))
+            })
             .unwrap_or(false)
     }
 
@@ -1098,7 +1101,10 @@ mod tests {
         let t = map.resolve_v4(&a.ipv4).expect("known member resolves");
         // First packet claims the in-flight slot; a duplicate is rejected.
         assert!(in_flight.insert(t.endpoint_id));
-        assert!(!in_flight.insert(t.endpoint_id), "duplicate dial is deduped");
+        assert!(
+            !in_flight.insert(t.endpoint_id),
+            "duplicate dial is deduped"
+        );
 
         // Unknown destination doesn't resolve, so nothing is dialed.
         assert!(map.resolve_v4(&Ipv4Addr::new(100, 64, 9, 9)).is_none());
@@ -1238,10 +1244,16 @@ mod tests {
 
         // A zero-length window means the connection is idle immediately (the same
         // arithmetic the timer uses to decide it's time to close).
-        assert_eq!(table.idle_remaining(&peer, Duration::ZERO), Some(Duration::ZERO));
+        assert_eq!(
+            table.idle_remaining(&peer, Duration::ZERO),
+            Some(Duration::ZERO)
+        );
 
         // A fresh activity bump keeps the full window (the timer would re-arm).
-        table.last_active_of(&peer).unwrap().store(now_ms(), Ordering::Relaxed);
+        table
+            .last_active_of(&peer)
+            .unwrap()
+            .store(now_ms(), Ordering::Relaxed);
         assert!(table.idle_remaining(&peer, window).unwrap() > Duration::from_secs(115));
     }
 

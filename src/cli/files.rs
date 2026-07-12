@@ -56,7 +56,8 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 let uid = crate::uid_for_user(u).ok_or_else(|| {
                     anyhow::anyhow!("unknown user '{u}' (pass a valid username or uid)")
                 })?;
-                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadUser { uid: Some(uid) }).await;
+                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadUser { uid: Some(uid) })
+                    .await;
             }
             let mut stream = ipc::connect().await?;
             ipc::send(&mut stream, ipc::IpcMessage::GetDownloadSettings).await?;

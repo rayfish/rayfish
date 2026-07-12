@@ -187,7 +187,6 @@ impl NetworkRegistry {
         ok
     }
 
-
     /// Seed the route map from a restored roster so the on-demand data path can
     /// lazily dial members before the first reconverge (self excluded by the
     /// caller-provided list, which should already omit us).

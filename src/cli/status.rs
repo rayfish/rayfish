@@ -453,14 +453,8 @@ fn user_parent_row(
     devices: &[&ipc::PeerStatus],
     alias_by_identity: &HashMap<&str, &str>,
 ) -> Vec<layout::Cell> {
-    let active = devices
-        .iter()
-        .filter(|d| d.state.is_active())
-        .count();
-    let reachable = devices
-        .iter()
-        .filter(|d| !d.state.is_offline())
-        .count();
+    let active = devices.iter().filter(|d| d.state.is_active()).count();
+    let reachable = devices.iter().filter(|d| !d.state.is_offline()).count();
     let name = user_display_name(net, uid, devices, alias_by_identity);
     // Glyph rolls up the group: any active device is online, else any idle device
     // is idle (presumed reachable), else offline.
@@ -477,9 +471,15 @@ fn user_parent_row(
     // Show connected devices when any, else the reachable (idle) count so an
     // all-idle group doesn't read as "0 online".
     let rollup = if active > 0 || reachable == 0 {
-        format!("{n} device{}, {active} online", if n == 1 { "" } else { "s" })
+        format!(
+            "{n} device{}, {active} online",
+            if n == 1 { "" } else { "s" }
+        )
     } else {
-        format!("{n} device{}, {reachable} idle", if n == 1 { "" } else { "s" })
+        format!(
+            "{n} device{}, {reachable} idle",
+            if n == 1 { "" } else { "s" }
+        )
     };
     vec![
         layout::Cell::new(name_plain, name_styled),

@@ -752,7 +752,9 @@ pub struct PeerStatus {
 }
 
 /// Three-state peer liveness for `ray status`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, derive_more::IsVariant)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, derive_more::IsVariant,
+)]
 pub enum PeerState {
     /// A live mesh connection to the peer exists right now.
     Active,

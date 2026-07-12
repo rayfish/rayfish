@@ -206,7 +206,9 @@ impl NetworkRegistry {
             ephemeral_ttl_secs: None,
             // Local exit-node policy survives restarts (server allow-list and the
             // client's selected exit peer); neither rides the signed blob.
-            exit_allow: net_config.map(|nc| nc.exit_allow.clone()).unwrap_or_default(),
+            exit_allow: net_config
+                .map(|nc| nc.exit_allow.clone())
+                .unwrap_or_default(),
             exit_node_use: net_config.and_then(|nc| nc.exit_node_use.clone()),
         })?;
 

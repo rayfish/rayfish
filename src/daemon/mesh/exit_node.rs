@@ -110,9 +110,9 @@ impl NetworkRegistry {
             return ipc_err(format!("failed to persist network config: {e}"));
         }
         let message = match &peer {
-            Some(name) => format!(
-                "routing all traffic through {name} on {network} (activate with `ray up`)"
-            ),
+            Some(name) => {
+                format!("routing all traffic through {name} on {network} (activate with `ray up`)")
+            }
             None => format!("direct egress restored on {network} (activate with `ray up`)"),
         };
         IpcMessage::Ok { message }
@@ -221,12 +221,7 @@ impl NetworkRegistry {
     /// entry and republish. `sender` is the offering peer's transport id; it is
     /// normalized to the roster identity (device or paired user) before matching.
     /// No-op if we do not hold the network key or the sender is not a member.
-    pub(crate) async fn record_exit_offer(
-        &self,
-        network: &str,
-        sender: EndpointId,
-        enabled: bool,
-    ) {
+    pub(crate) async fn record_exit_offer(&self, network: &str, sender: EndpointId, enabled: bool) {
         let user_id = self.device_user_map.resolve(&sender);
         let changed = match self.networks.get(network) {
             Some(h) => {
