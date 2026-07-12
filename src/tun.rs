@@ -176,6 +176,50 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
     ))
 }
 
+/// Re-assigns our own IPv6 `/128` to the TUN. The address is set once at device
+/// creation, but Linux flushes an interface's global IPv6 addresses when the link
+/// goes down (`keep_addr_on_down` defaults to 0) and never restores them, while
+/// IPv4 addresses survive. Without this, a `down`/`up` cycle leaves the node with
+/// a working IPv4 overlay and a silently dead IPv6 one: it still routes `200::/7`
+/// into the TUN, but owns no address in it, so peers get no answer. Must run after
+/// [`set_link_up`]; idempotent (netlink `replace`), safe on every `up` cycle.
+#[cfg(target_os = "linux")]
+pub async fn ensure_ipv6_addr(tun_name: &str, v6: Ipv6Addr) -> Result<()> {
+    use futures::TryStreamExt;
+    use std::net::IpAddr;
+
+    let (connection, handle, _) = rtnetlink::new_connection().context("open netlink socket")?;
+    let conn = tokio::spawn(connection);
+
+    let result = async {
+        let index = handle
+            .link()
+            .get()
+            .match_name(tun_name.to_owned())
+            .execute()
+            .try_next()
+            .await
+            .context("query TUN link")?
+            .with_context(|| format!("TUN link {tun_name} not found"))?
+            .header
+            .index;
+
+        handle
+            .address()
+            .add(index, IpAddr::V6(v6), 128)
+            .replace()
+            .execute()
+            .await
+            .context("add TUN IPv6 address via netlink")?;
+
+        Ok(())
+    }
+    .await;
+
+    conn.abort();
+    result
+}
+
 /// Routes the peer ranges into the TUN. Must be called *after* the interface is
 /// up (see [`set_link_up`]). On Linux only the IPv6 `200::/7` route needs adding:
 /// the kernel does not reliably install an IPv6 connected route while the link is

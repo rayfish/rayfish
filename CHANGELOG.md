@@ -25,6 +25,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **IPv6 no longer dies after `ray down` + `ray up` (Linux).** Linux flushes an
+  interface's global IPv6 addresses when its link goes down, and the overlay `/128`
+  was only assigned when the TUN was created, so a standby cycle left the node
+  reachable over IPv4 while every IPv6 peer silently got no answer (until the
+  daemon was restarted). The address is now re-assigned on every activate.
+
 - **`ray mdns off` (and the other config-writing commands) now take effect on
   non-Linux hosts.** `ray mdns`, `ray auto-update`, `ray config set|unset`, and
   `ray files download-dir|download-user` wrote `settings.toml` from the CLI
