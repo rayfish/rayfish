@@ -51,7 +51,7 @@ Each of these has a fuller treatment further down; this is the one-line tour.
 - 🌐 **Magic DNS.** Reach peers at `name.network.ray`, updated live as they join, leave, or rename.
 - 🧱 **Per-device firewall.** A userspace firewall for mesh traffic, secure by default, layered on top of your host firewall. See [Firewall](#firewall).
 - 🔑 **Mesh SSH, no keys.** Log in over the mesh with a stock `ssh` client; peers authenticate by identity. See [SSH, no keys](#ssh-no-keys).
-- 🌍 **Exit nodes.** Route all your internet traffic through a peer that offers itself as a gateway: `ray exit-node allow` on the gateway, `ray exit-node use` on the client (Linux).
+- 🌍 **Exit nodes.** Route all your internet traffic through a peer that offers itself as a gateway: `ray exit-node allow` on the gateway, `ray exit-node use` on the client. Offering a gateway works on Linux, macOS and FreeBSD; using one is Linux-only for now.
 - 📜 **Declarative provisioning.** `ray apply deploy.yaml` stands up networks and firewall rules from a YAML spec, with reusable `aliases:` and `groups:` instead of repeated hostnames.
 - 👥 **Multi-device identity.** Pair your laptop and phone under one identity, with encrypted key backup (optionally to 1Password). See [Pairing your own devices](#pairing-your-own-devices).
 - 📁 **File sharing.** `ray send file.zip bob`, with optional auto-accept for transfers from your own paired devices.
