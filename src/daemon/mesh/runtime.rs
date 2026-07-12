@@ -767,9 +767,20 @@ impl Daemon {
         #[cfg(not(target_os = "android"))]
         {
             let tun_name = self.tun_name.load().as_str().to_owned();
+            let my_v4 = self.transport.identity.local_ip();
+            let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
             if let Err(e) = tun::set_link_up(&tun_name) {
                 tracing::warn!(error = %e, "failed to bring TUN interface up");
                 warnings.push(format!("failed to bring TUN interface up: {e}"));
+            }
+
+            // Linux drops the TUN's global IPv6 address whenever the link goes
+            // down (`ray down`) and never restores it, so re-assign it here or
+            // this node answers on IPv4 only for the rest of the daemon's life.
+            #[cfg(target_os = "linux")]
+            if let Err(e) = tun::ensure_ipv6_addr(&tun_name, my_v6).await {
+                tracing::warn!(error = %e, "failed to assign TUN IPv6 address");
+                warnings.push(format!("failed to assign TUN IPv6 address: {e}"));
             }
 
             // Route the 200::/7 peer range into the TUN. Must happen after
@@ -790,8 +801,6 @@ impl Daemon {
             // the TUN, where the forwarding loop would drop it as "no peer for
             // dst". No-op on Linux (kernel installs the `local` route
             // automatically).
-            let my_v4 = self.transport.identity.local_ip();
-            let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
             if let Err(e) = tun::route_self_loopback(my_v4, my_v6).await {
                 tracing::warn!(error = %e, "failed to install loopback self-route");
                 warnings.push(format!("failed to install loopback self-route: {e}"));
