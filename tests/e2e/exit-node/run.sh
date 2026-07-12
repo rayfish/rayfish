@@ -164,8 +164,11 @@ for pair in "b:$B" "c:$C"; do
     fail "srv-$n never saw srv-a's exit-node offer in the roster"
   fi
 done
-on "$B" "ray status" | strip | grep -q 'srv-a.*(exit)' \
-  && pass "ray status flags srv-a with the (exit) badge on srv-b" \
+# `ray status` carries an exit column: `offers` for a peer advertising an exit
+# node, `in use` for the one actually carrying our traffic. srv-b has not selected
+# srv-a yet, so it reads `offers` here (and `in use` after step 4).
+on "$B" "ray status" | strip | grep -q 'srv-a.*offers' \
+  && pass "ray status shows srv-a in the exit column as 'offers' on srv-b" \
   || fail "ray status did not flag srv-a as an exit node on srv-b"
 
 # ---------------------------------------------------------------------------
@@ -213,6 +216,11 @@ on "$B" "ip -4 route show table $TABLE" 2>/dev/null | grep -q default \
 on "$B" 'nft list table inet rayfish_exit_client 2>/dev/null | grep -q "ct mark"' \
   && pass "srv-b installed the conntrack-mark table (inbound connections bypass the tunnel)" \
   || fail "srv-b has no conntrack-mark table — inbound connections would be swallowed"
+# The exit column now names srv-a as the peer carrying our traffic, not just one
+# offering to (it read `offers` in step 3, before we selected it).
+on "$B" "ray status" | strip | grep -q 'srv-a.*in use' \
+  && pass "ray status marks srv-a 'in use' in the exit column" \
+  || fail "ray status does not mark srv-a as the exit node in use"
 
 # IPv6 is best-effort: not every instance/zone has working v6 egress.
 B_V6="$(on "$B" 'curl -6 -s --max-time 15 https://api6.ipify.org' 2>/dev/null | tr -d '[:space:]')"
