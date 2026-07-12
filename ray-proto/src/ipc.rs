@@ -702,6 +702,11 @@ pub struct NetworkStatus {
     /// (`ray exit-node use`), as a display string, or `None` for direct egress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub my_exit_node: Option<String>,
+    /// True when this node offers itself as an exit node on this network (its
+    /// `exit_allow` list is non-empty). Without it, `ray status` would show every
+    /// peer's exit offer but never your own.
+    #[serde(default)]
+    pub exit_offering: bool,
 }
 
 #[derive(
@@ -749,6 +754,11 @@ pub struct PeerStatus {
     /// (`Member.exit_node` in the signed roster). Shown as a badge in status.
     #[serde(default)]
     pub exit_node: bool,
+    /// True when this is the peer we currently route our internet traffic through
+    /// (`ray exit-node use`). Distinguishes the one exit node actually carrying our
+    /// traffic from the others that merely offer.
+    #[serde(default)]
+    pub exit_in_use: bool,
 }
 
 /// Three-state peer liveness for `ray status`.
@@ -1228,6 +1238,7 @@ mod tests {
                     connection: None,
                     state: PeerState::Idle,
                     exit_node: false,
+                    exit_in_use: false,
                 }],
                 pending_suggestions: 0,
                 pending_requests: 0,
