@@ -974,7 +974,7 @@ fn install_panic_hook() {
 
         // Remove the exit-node kernel forwarding/NAT and restore the forwarding
         // sysctls, so a crash can't leave the host acting as an open router/NAT.
-        rayfish::exit_node::emergency_teardown();
+        rayfish::exit_node::disable();
 
         // Print the standard panic message to stderr (journal), then fail fast so
         // the service manager restarts the daemon cleanly.

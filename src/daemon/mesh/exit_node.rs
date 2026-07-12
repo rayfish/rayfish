@@ -246,16 +246,16 @@ impl NetworkRegistry {
                 if s.network_secret_key.is_none() {
                     return;
                 }
-                let Some(m) = s
-                    .members
-                    .all()
-                    .iter()
-                    .find(|m| m.identity == sender || m.identity == user_id)
-                    .map(|m| m.identity)
+                // The roster keys a member by its own identity, which for a paired
+                // multi-device peer is the user identity rather than the device id
+                // the datagram arrived under. Try both.
+                let Some(id) = [sender, user_id]
+                    .into_iter()
+                    .find(|id| s.members.get(id).is_some())
                 else {
                     return;
                 };
-                match s.members.get_mut(&m) {
+                match s.members.get_mut(&id) {
                     Some(member) if member.exit_node != enabled => {
                         member.exit_node = enabled;
                         s.refresh_snapshot();

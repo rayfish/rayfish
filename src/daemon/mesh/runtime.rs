@@ -811,24 +811,7 @@ impl Daemon {
             self.start_ssh();
         }
 
-        // Exit-node server: load the runtime allow policy so the inbound data path
-        // gates transit, then install kernel forwarding/NAT if we offer an exit on
-        // any network (Linux only; a no-op elsewhere).
-        self.registry.reload_exit_policy();
-        let exit_tun_name = self.tun_name.load().as_str().to_owned();
-        self.registry.exit_server.apply_os(&exit_tun_name);
-
-        // Exit-node client: if we route through an exit peer, install the
-        // full-tunnel default route + loop-prevention policy routing (Linux only;
-        // client full-tunnel is unsupported elsewhere).
-        self.registry.reload_exit_client();
-        #[cfg(target_os = "linux")]
-        if self.registry.exit_client.is_active() {
-            if let Err(e) = crate::exit_node::install_client_routing(&exit_tun_name) {
-                tracing::warn!(error = %e, "failed to install exit-node client routing");
-                warnings.push(format!("failed to route traffic through exit node: {e}"));
-            }
-        }
+        warnings.extend(self.apply_exit_node());
 
         tracing::info!("data plane activated");
         if warnings.is_empty() {
@@ -843,6 +826,34 @@ impl Daemon {
             }
             IpcMessage::Ok { message }
         }
+    }
+
+    /// Reconcile every piece of exit-node state with the on-disk config: the
+    /// gateway allow policy and its kernel forwarding/NAT, and the client selection
+    /// and its full-tunnel policy routing. Both halves are idempotent and both
+    /// directions (install / remove) are handled, so this is the single entry point
+    /// used by `activate` and by any `ray exit-node` change made while up. Returns a
+    /// user-facing warning if the client routing could not be installed.
+    ///
+    /// Client full-tunnel is Linux only; elsewhere the selection is still tracked
+    /// (the forwarding loop honours it) but no kernel routing is installed.
+    pub(crate) fn apply_exit_node(&self) -> Option<String> {
+        let tun_name = self.tun_name.load().as_str().to_owned();
+        self.registry.reload_exit_policy();
+        self.registry.exit_server.apply_os(&tun_name);
+        self.registry.reload_exit_client();
+        #[cfg(target_os = "linux")]
+        {
+            if self.registry.exit_client.is_active() {
+                if let Err(e) = crate::exit_node::install_client_routing(&tun_name) {
+                    tracing::warn!(error = %e, "failed to install exit-node client routing");
+                    return Some(format!("failed to route traffic through exit node: {e}"));
+                }
+            } else {
+                crate::exit_node::teardown_client_routing();
+            }
+        }
+        None
     }
 
     /// Put the daemon on standby: take the data plane offline (revert system
@@ -871,10 +882,10 @@ impl Daemon {
             tracing::warn!(error = %e, "failed to bring TUN interface down");
         }
 
-        // Exit-node server: remove kernel forwarding/NAT and drop the allow policy
-        // so no transit happens while on standby.
-        self.registry.exit_server.teardown_os();
+        // Exit-node server: drop the allow policy so no transit happens while on
+        // standby, then reconcile (which removes the kernel forwarding/NAT).
         self.registry.exit_server.clear();
+        self.registry.exit_server.apply_os(&tun_name);
 
         // Exit-node client: remove the full-tunnel policy routing and clear the
         // selection. The TUN going down also drops its default route.

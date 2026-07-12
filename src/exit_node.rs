@@ -1,16 +1,20 @@
-//! Exit-node server plumbing: the runtime allow policy consulted on the inbound
-//! data path, and the Linux kernel forwarding/NAT that turns this host into an
-//! internet gateway for the mesh.
+//! Exit nodes: the runtime policy consulted on the data path, and the Linux kernel
+//! state (forwarding, NAT, policy routing) that a gateway and its clients need.
 //!
-//! Rayfish's own firewall is entirely userspace (peer -> daemon -> TUN), but
-//! forwarding a client's internet-bound packet out to the real uplink is a kernel
-//! job: once the daemon writes the packet to the TUN with a public destination,
-//! the kernel routes it, and it needs `ip_forward` plus a NAT masquerade so
-//! replies find their way back. That kernel state (Linux only) lives in [`enable`]
-//! / [`disable`]; the per-network allow decision lives in [`ExitServer`].
+//! Rayfish's own firewall is entirely userspace (peer -> daemon -> TUN), but an
+//! exit node is a kernel job on both ends. On the **gateway**, once the daemon
+//! writes a client's packet to the TUN with a public destination the kernel has to
+//! route it out the uplink, which needs `ip_forward` plus a NAT masquerade so
+//! replies come back ([`ExitServer::apply_os`] -> [`enable`] / [`disable`]). On the
+//! **client**, a full tunnel means every route decision changes, including for the
+//! node's own iroh transport ([`install_client_routing`]).
+//!
+//! The per-network allow decision ([`ExitServer`]) and the client's selection
+//! ([`ExitClient`]) are plain userspace state, live on every platform, and are
+//! bundled for the data path as [`ExitContext`].
 
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -18,60 +22,29 @@ use iroh::EndpointId;
 use smol_str::SmolStr;
 
 /// Linux fwmark set on iroh's underlay UDP sockets (via the forked
-/// `Endpoint::builder().socket_mark`). A matching `ip rule` sends marked packets
-/// to the main routing table, so the client's own transport bypasses the
-/// full-tunnel default route it installs (the standard WireGuard/Tailscale
-/// loop-prevention). Arbitrary non-zero value; must match the `ip rule` fwmark.
+/// `Endpoint::builder().socket_mark`) and on the replies of any connection that
+/// arrived from outside the tunnel. A matching `ip rule` sends marked packets to
+/// the main routing table, so both bypass the client's full-tunnel default route
+/// (the standard WireGuard/Tailscale loop prevention). Arbitrary non-zero value.
 pub const SOCKET_MARK: u32 = 0x7261; // "ra"
 
-/// Dedicated policy-routing table holding the client's full-tunnel default route
-/// (`default dev <tun>`), separate from `main` so marked iroh traffic can bypass
-/// it. Arbitrary id we fully own.
-#[cfg(target_os = "linux")]
-const EXIT_TABLE: &str = "29793"; // 0x7461
-
-/// `ip rule` preferences for the three-rule full-tunnel policy (lower = higher
-/// priority). Named so install and teardown stay in sync.
-#[cfg(target_os = "linux")]
-const PREF_BYPASS: &str = "100"; // marked (iroh) traffic -> main table (real routes)
-#[cfg(target_os = "linux")]
-const PREF_MAIN: &str = "101"; // main table except its default (LAN/overlay/connected)
-#[cfg(target_os = "linux")]
-const PREF_TUNNEL: &str = "102"; // everything else -> the exit tunnel table
-
 /// Per-network allow policy for peers using this node as an exit node, consulted
-/// on the server's inbound data path (`forward::evaluate_inbound`). Cheap to clone
+/// on the gateway's inbound data path (`forward::evaluate_inbound`). Cheap to clone
 /// (Arc-backed) and swapped wholesale whenever the allow-lists change. Empty until
 /// the data plane activates and populates it from config, so a node that offers no
 /// exit (or is on standby) transits nothing.
 #[derive(Clone, Default)]
 pub struct ExitServer {
-    inner: Arc<ArcSwap<Policy>>,
-    /// Set while the kernel forwarding/NAT is installed (Linux). Holds the prior
-    /// sysctl values so teardown can restore them. `Some` == OS state is live.
-    /// Only touched on Linux (`apply_os`/`teardown_os` are no-ops elsewhere).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    snapshot: Arc<ArcSwapOption<ForwardSnapshot>>,
+    nets: Arc<ArcSwap<HashMap<SmolStr, Allow>>>,
 }
 
-#[derive(Default)]
-struct Policy {
-    /// network name -> who may route out through us on it.
-    nets: HashMap<String, Allow>,
-}
-
+/// Who may route out through us on one network.
 #[derive(Default)]
 struct Allow {
     /// `ray exit-node allow <net> '*'`: any member of the network.
     any: bool,
     /// Specific permitted user identities.
     users: HashSet<EndpointId>,
-}
-
-impl Allow {
-    fn permits(&self, user: &EndpointId) -> bool {
-        self.any || self.users.contains(user)
-    }
 }
 
 impl ExitServer {
@@ -82,17 +55,16 @@ impl ExitServer {
     /// Whether `user` may route non-mesh traffic out through us on `network`.
     /// False unless the data plane is up and the network lists the user (or `*`).
     pub fn allows(&self, network: &str, user: &EndpointId) -> bool {
-        self.inner
+        self.nets
             .load()
-            .nets
             .get(network)
-            .is_some_and(|a| a.permits(user))
+            .is_some_and(|a| a.any || a.users.contains(user))
     }
 
     /// Whether we currently offer an exit node on any network (drives whether the
     /// kernel forwarding/NAT should be installed).
     pub fn is_active(&self) -> bool {
-        !self.inner.load().nets.is_empty()
+        !self.nets.load().is_empty()
     }
 
     /// Rebuild the policy from `(network name, allow-list)` pairs. An allow entry
@@ -100,7 +72,7 @@ impl ExitServer {
     /// skipped. Networks with an empty list are omitted, so `is_active` reflects
     /// real offers.
     pub fn reload<'a>(&self, entries: impl IntoIterator<Item = (&'a str, &'a [String])>) {
-        let mut nets = HashMap::new();
+        let mut nets: HashMap<SmolStr, Allow> = HashMap::new();
         for (name, allow_list) in entries {
             if allow_list.is_empty() {
                 continue;
@@ -113,50 +85,32 @@ impl ExitServer {
                     allow.users.insert(id);
                 }
             }
-            nets.insert(name.to_string(), allow);
+            nets.insert(SmolStr::new(name), allow);
         }
-        self.inner.store(Arc::new(Policy { nets }));
+        self.nets.store(Arc::new(nets));
     }
 
-    /// Drop all exit offers (data plane going to standby).
+    /// Drop all exit offers (data plane going to standby). Pair with
+    /// [`apply_os`](Self::apply_os) to take the kernel state down with them.
     pub fn clear(&self) {
-        self.inner.store(Arc::new(Policy::default()));
+        self.nets.store(Arc::default());
     }
 
-    /// Reconcile the kernel forwarding/NAT with the current offer state on
-    /// `tun_name`: install it when we now offer an exit and it isn't up yet, tear
-    /// it down when we no longer offer one. Idempotent and Linux only (a no-op on
-    /// other platforms, where client full-tunnel is unsupported anyway). Call
-    /// after [`reload`] whenever the data plane is active.
+    /// Reconcile the kernel forwarding/NAT with the current offer state: install it
+    /// when we offer an exit on some network, remove it when we don't. Both
+    /// directions are idempotent, so this is safe to call on every change. Linux
+    /// only (a no-op elsewhere, where client full-tunnel is unsupported anyway).
     pub fn apply_os(&self, tun_name: &str) {
         #[cfg(target_os = "linux")]
-        {
-            let want = self.is_active();
-            let live = self.snapshot.load().is_some();
-            if want && !live {
-                match enable(tun_name) {
-                    Ok(snap) => self.snapshot.store(Some(Arc::new(snap))),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to enable exit-node forwarding/NAT")
-                    }
-                }
-            } else if !want && live {
-                self.teardown_os();
+        if self.is_active() {
+            if let Err(e) = enable(tun_name) {
+                tracing::warn!(error = %e, "failed to enable exit-node forwarding/NAT");
             }
-            // want && live: the nft rules are static (user gating lives in
-            // `allows`, not the kernel), so there is nothing to reinstall.
+        } else {
+            disable();
         }
         #[cfg(not(target_os = "linux"))]
         let _ = tun_name;
-    }
-
-    /// Remove the kernel forwarding/NAT and restore the saved sysctls, if up.
-    /// Idempotent; called on `deactivate()` and when the last offer is withdrawn.
-    pub fn teardown_os(&self) {
-        #[cfg(target_os = "linux")]
-        if let Some(snap) = self.snapshot.swap(None) {
-            disable(&snap);
-        }
     }
 }
 
@@ -173,7 +127,7 @@ pub struct ExitClient {
 #[derive(Clone)]
 pub struct ExitSelection {
     /// The exit peer's user identity, matched against a datagram sender to accept
-    /// its return traffic. (Folds multi-device peers via the device→user map.)
+    /// its return traffic. (Folds multi-device peers via the device/user map.)
     pub peer_user: EndpointId,
     /// The exit peer's mesh IPv4, used to look up its live route and to dial it.
     pub ipv4: Ipv4Addr,
@@ -212,148 +166,165 @@ impl ExitClient {
     }
 }
 
-/// The two overlay source ranges masqueraded when forwarding out an uplink.
-#[cfg(target_os = "linux")]
-const V4_OVERLAY: &str = "100.64.0.0/10";
-#[cfg(target_os = "linux")]
-const V6_OVERLAY: &str = "200::/7";
-#[cfg(target_os = "linux")]
-const NFT_TABLE: &str = "rayfish_exit";
-
-/// Prior `ip_forward` / `forwarding` sysctl values captured at [`enable`] so
-/// [`disable`] can restore them instead of blindly zeroing (they may have been on
-/// for unrelated reasons). Cross-platform so [`ExitServer`]'s snapshot field has a
-/// concrete type everywhere; only populated on Linux.
-#[derive(Clone, Default)]
-pub struct ForwardSnapshot {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    v4: Option<String>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    v6: Option<String>,
+/// This node's exit-node state as the inbound data path needs it: the gateway allow
+/// policy, our own client selection, and our mesh addresses (to confirm that return
+/// traffic from the exit peer is really addressed to us). Cheap to clone; built per
+/// peer reader from the daemon's registry.
+#[derive(Clone)]
+pub struct ExitContext {
+    pub server: ExitServer,
+    pub client: ExitClient,
+    pub my_v4: Ipv4Addr,
+    pub my_v6: Ipv6Addr,
 }
+
+impl Default for ExitContext {
+    fn default() -> Self {
+        Self {
+            server: ExitServer::new(),
+            client: ExitClient::new(),
+            my_v4: Ipv4Addr::UNSPECIFIED,
+            my_v6: Ipv6Addr::UNSPECIFIED,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linux kernel state
+// ---------------------------------------------------------------------------
+
+/// The overlay source ranges we masquerade when forwarding out an uplink, and the
+/// nftables tables we own (one per role, so gateway and client are independent).
+#[cfg(target_os = "linux")]
+mod names {
+    pub(super) const V4_OVERLAY: &str = "100.64.0.0/10";
+    pub(super) const V6_OVERLAY: &str = "200::/7";
+    pub(super) const SERVER_TABLE: &str = "rayfish_exit";
+    pub(super) const CLIENT_TABLE: &str = "rayfish_exit_client";
+    pub(super) const V4_FORWARD: &str = "net/ipv4/ip_forward";
+    pub(super) const V6_FORWARD: &str = "net/ipv6/conf/all/forwarding";
+    /// Policy-routing table holding the client's full-tunnel default route
+    /// (`default dev <tun>`), separate from `main` so marked traffic can bypass it.
+    pub(super) const EXIT_TABLE: &str = "29793";
+    /// `ip rule` preferences (lower = higher priority). Named so install and
+    /// teardown stay in sync.
+    pub(super) const PREF_BYPASS: &str = "100"; // marked traffic -> main table
+    pub(super) const PREF_MAIN: &str = "101"; // main table minus its default route
+    pub(super) const PREF_TUNNEL: &str = "102"; // everything else -> the tunnel
+}
+#[cfg(target_os = "linux")]
+use names::*;
 
 /// Turn this host into an exit node: enable IPv4/IPv6 forwarding and install an
 /// nftables table that masquerades overlay-sourced traffic leaving any non-TUN
-/// interface (plus a permissive forward chain for the common case of no
-/// restrictive host firewall). Idempotent: the nft script deletes and recreates
-/// our own table, and forwarding is snapshotted then set. The snapshot is also
-/// persisted to disk so a crash (the panic hook `abort()`s) can restore the
-/// sysctls via [`emergency_teardown`]. Linux only.
+/// interface (plus a permissive forward chain, for the common case of no
+/// restrictive host firewall).
+///
+/// Idempotent, and safe to re-run while already enabled: the prior sysctl values
+/// are snapshotted to disk exactly once (a re-apply must not capture the values we
+/// set ourselves), and the nft ruleset is replaced wholesale. That same file is
+/// what [`disable`] restores from, including when it runs from the panic hook, so a
+/// crash can never leave the host acting as an open router. Linux only.
 #[cfg(target_os = "linux")]
-pub fn enable(tun_name: &str) -> anyhow::Result<ForwardSnapshot> {
-    let snapshot = ForwardSnapshot {
-        v4: read_sysctl("net/ipv4/ip_forward"),
-        v6: read_sysctl("net/ipv6/conf/all/forwarding"),
-    };
-    write_sysctl("net/ipv4/ip_forward", "1")?;
-    write_sysctl("net/ipv6/conf/all/forwarding", "1")?;
-    install_nft(tun_name)?;
-    persist_snapshot(&snapshot);
-    tracing::info!(tun = tun_name, "exit node forwarding + NAT enabled");
-    Ok(snapshot)
-}
-
-/// Tear down the exit-node kernel state: remove our nftables table and restore the
-/// forwarding sysctls to their pre-`enable` values. Best-effort (logs on failure)
-/// so a partial teardown never blocks going to standby. Linux only.
-#[cfg(target_os = "linux")]
-pub fn disable(snapshot: &ForwardSnapshot) {
-    delete_nft_table();
-    if let Some(v) = &snapshot.v4 {
-        let _ = write_sysctl("net/ipv4/ip_forward", v);
-    }
-    if let Some(v) = &snapshot.v6 {
-        let _ = write_sysctl("net/ipv6/conf/all/forwarding", v);
-    }
+fn enable(tun_name: &str) -> anyhow::Result<()> {
     if let Some(path) = snapshot_path() {
-        let _ = std::fs::remove_file(path);
+        if !path.exists() {
+            let body = format!(
+                "v4={}\nv6={}\n",
+                read_sysctl(V4_FORWARD),
+                read_sysctl(V6_FORWARD)
+            );
+            crate::config::write_file(&path, body.as_bytes(), false)?;
+        }
     }
-    tracing::info!("exit node forwarding + NAT disabled");
+    write_sysctl(V4_FORWARD, "1")?;
+    write_sysctl(V6_FORWARD, "1")?;
+    nft_load(&format!(
+        "{reset}\
+         table inet {t} {{\n\
+         \tchain forward {{\n\
+         \t\ttype filter hook forward priority filter; policy accept;\n\
+         \t\tip saddr {v4} accept\n\
+         \t\tip daddr {v4} accept\n\
+         \t\tip6 saddr {v6} accept\n\
+         \t\tip6 daddr {v6} accept\n\
+         \t}}\n\
+         \tchain postrouting {{\n\
+         \t\ttype nat hook postrouting priority srcnat; policy accept;\n\
+         \t\tip saddr {v4} oifname != \"{tun}\" masquerade\n\
+         \t\tip6 saddr {v6} oifname != \"{tun}\" masquerade\n\
+         \t}}\n\
+         }}\n",
+        reset = drop_table(SERVER_TABLE),
+        t = SERVER_TABLE,
+        v4 = V4_OVERLAY,
+        v6 = V6_OVERLAY,
+        tun = tun_name,
+    ))?;
+    tracing::info!(tun = tun_name, "exit node forwarding + NAT enabled");
+    Ok(())
 }
 
-/// Synchronous emergency teardown, safe to call from the panic hook before
-/// `abort()`. Removes our nftables table and, if a snapshot from a prior [`enable`]
-/// is on disk, restores the forwarding sysctls to their captured values so a crash
-/// can't leave the host acting as an open router/NAT. No-op when no snapshot exists
-/// (never enabled, or cleanly disabled). Linux only.
+/// Remove the exit-node gateway state: drop our nftables table and restore the
+/// forwarding sysctls to the values captured by [`enable`]. Reads the on-disk
+/// snapshot rather than in-memory state, so the same call works from the panic hook
+/// (which `abort()`s, and must not leave the host an open router/NAT). Best-effort
+/// and idempotent: a no-op when no snapshot exists (never enabled, or already torn
+/// down). Linux only.
 #[cfg(target_os = "linux")]
-pub fn emergency_teardown() {
+pub fn disable() {
     let Some(path) = snapshot_path() else { return };
     if !path.exists() {
         return;
     }
-    delete_nft_table();
-    if let Ok(contents) = std::fs::read_to_string(&path) {
-        for line in contents.lines() {
+    let _ = nft_load(&drop_table(SERVER_TABLE));
+    if let Ok(body) = std::fs::read_to_string(&path) {
+        for line in body.lines() {
             match line.split_once('=') {
-                Some(("v4", v)) => {
-                    let _ = write_sysctl("net/ipv4/ip_forward", v);
-                }
-                Some(("v6", v)) => {
-                    let _ = write_sysctl("net/ipv6/conf/all/forwarding", v);
-                }
+                Some(("v4", v)) if !v.is_empty() => drop(write_sysctl(V4_FORWARD, v)),
+                Some(("v6", v)) if !v.is_empty() => drop(write_sysctl(V6_FORWARD, v)),
                 _ => {}
             }
         }
     }
     let _ = std::fs::remove_file(&path);
+    tracing::info!("exit node forwarding + NAT disabled");
 }
 
-/// No-op on non-Linux: exit-node kernel state only exists on Linux.
+/// No-op off Linux: exit-node kernel state only exists there.
 #[cfg(not(target_os = "linux"))]
-pub fn emergency_teardown() {}
+pub fn disable() {}
 
-#[cfg(target_os = "linux")]
-fn snapshot_path() -> Option<std::path::PathBuf> {
-    crate::config::config_dir()
-        .ok()
-        .map(|d| d.join("exit-forward.snapshot"))
-}
-
-/// Persist the pre-enable sysctl values so a crash can restore them. Best-effort:
-/// a missing snapshot just means the emergency path skips the sysctl restore.
-#[cfg(target_os = "linux")]
-fn persist_snapshot(snapshot: &ForwardSnapshot) {
-    let Some(path) = snapshot_path() else { return };
-    let body = format!(
-        "v4={}\nv6={}\n",
-        snapshot.v4.as_deref().unwrap_or(""),
-        snapshot.v6.as_deref().unwrap_or(""),
-    );
-    if let Err(e) = crate::config::write_file(&path, body.as_bytes(), false) {
-        tracing::warn!(error = %e, "failed to persist exit-node forwarding snapshot");
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn delete_nft_table() {
-    if let Err(e) = run_nft(&format!("delete table inet {NFT_TABLE}")) {
-        // A missing table is fine (never enabled, or already removed).
-        tracing::debug!(error = %e, "exit-node nft table already absent");
-    }
-}
-
-/// Install the client full-tunnel: route all non-mesh traffic through the TUN and
-/// policy-route the node's own iroh transport around it (the loop prevention).
+/// Install the client full-tunnel: route all non-mesh traffic through the TUN, and
+/// keep two classes of traffic out of it.
 ///
 /// A `default` route into `<tun>` lives in a dedicated table [`EXIT_TABLE`]; three
-/// `ip rule`s then select it: marked packets (iroh's own underlay, tagged with
-/// [`SOCKET_MARK`]) go to `main` and egress normally; `main`'s specific routes
-/// (LAN, connected, the overlay ranges) still win via `suppress_prefixlength 0`;
-/// everything else falls to the tunnel table. Applied for IPv4 and IPv6.
-/// Idempotent (routes use `replace`, rules are deleted before being re-added).
-/// Linux only.
+/// `ip rule`s then select it: packets marked with [`SOCKET_MARK`] go to `main` and
+/// egress normally; `main`'s specific routes (LAN, connected, the overlay ranges)
+/// still win via `suppress_prefixlength 0`; everything else falls to the tunnel
+/// table.
+///
+/// Two things carry the mark. **iroh's own underlay sockets** set it directly
+/// (`SO_MARK`), without which the node's transport would be routed into the tunnel
+/// it is itself carrying and the link would deadlock. And an nftables `conntrack`
+/// pair marks **connections that arrived from outside the tunnel**, restoring the
+/// mark on their replies: without it, the replies of an inbound connection (an SSH
+/// session to this host's public IP, say) would egress via the exit node and get
+/// masqueraded to *its* address, so the peer would see answers from a stranger and
+/// the connection would die the moment the tunnel came up.
+///
+/// Idempotent (routes use `replace`, rules are deleted before re-adding, the nft
+/// table is replaced wholesale). Linux only.
 #[cfg(target_os = "linux")]
 pub fn install_client_routing(tun_name: &str) -> anyhow::Result<()> {
+    let mark = format!("{SOCKET_MARK:#x}");
     for family in ["-4", "-6"] {
-        // Default route into the TUN, in our own table.
         run_ip(&[
             family, "route", "replace", "default", "dev", tun_name, "table", EXIT_TABLE,
         ])?;
-        // Rebuild the three rules idempotently (delete any stale copy first).
         remove_client_rules(family);
         run_ip(&[
-            family, "rule", "add", "fwmark", SOCKET_MARK_HEX, "table", "main", "pref", PREF_BYPASS,
+            family, "rule", "add", "fwmark", &mark, "table", "main", "pref", PREF_BYPASS,
         ])?;
         run_ip(&[
             family,
@@ -370,25 +341,47 @@ pub fn install_client_routing(tun_name: &str) -> anyhow::Result<()> {
             family, "rule", "add", "table", EXIT_TABLE, "pref", PREF_TUNNEL,
         ])?;
     }
+    // Connections opened from outside the tunnel keep answering out the interface
+    // they arrived on. `prerouting` tags the conntrack entry (and marks the packet
+    // itself, so the reverse-path check resolves against `main`); `output` restores
+    // that mark on the locally-generated replies. It matches only on our own ctmark,
+    // so traffic this node originates (including iroh's already-marked sockets) is
+    // untouched. `type route` forces a re-route once the mark is set.
+    nft_load(&format!(
+        "{reset}\
+         table inet {t} {{\n\
+         \tchain prerouting {{\n\
+         \t\ttype filter hook prerouting priority mangle; policy accept;\n\
+         \t\tiifname \"{tun}\" return\n\
+         \t\tct state new ct mark set {mark}\n\
+         \t\tct mark {mark} meta mark set {mark}\n\
+         \t}}\n\
+         \tchain output {{\n\
+         \t\ttype route hook output priority mangle; policy accept;\n\
+         \t\tct mark {mark} meta mark set {mark}\n\
+         \t}}\n\
+         }}\n",
+        reset = drop_table(CLIENT_TABLE),
+        t = CLIENT_TABLE,
+        tun = tun_name,
+    ))?;
     tracing::info!(tun = tun_name, "exit-node client full-tunnel routing installed");
     Ok(())
 }
 
 /// Remove the client full-tunnel policy routing installed by
-/// [`install_client_routing`]: drop the three rules and flush the tunnel table for
-/// both families. Best-effort (the TUN going down also drops its routes). Linux only.
+/// [`install_client_routing`]: drop the rules, flush the tunnel table, remove the
+/// conntrack-mark table. Best-effort and idempotent (the TUN going down also drops
+/// its routes). Linux only.
 #[cfg(target_os = "linux")]
 pub fn teardown_client_routing() {
     for family in ["-4", "-6"] {
         remove_client_rules(family);
         let _ = run_ip(&[family, "route", "flush", "table", EXIT_TABLE]);
     }
+    let _ = nft_load(&drop_table(CLIENT_TABLE));
     tracing::info!("exit-node client full-tunnel routing removed");
 }
-
-/// Hex form of [`SOCKET_MARK`] as `ip rule` expects it.
-#[cfg(target_os = "linux")]
-const SOCKET_MARK_HEX: &str = "0x7261";
 
 /// Delete our three policy rules for one address family, ignoring "not found".
 #[cfg(target_os = "linux")]
@@ -398,70 +391,16 @@ fn remove_client_rules(family: &str) {
     }
 }
 
+/// nft script fragment that removes `table`, whether or not it exists: `delete
+/// table` alone fails when absent, so create it first. Prefixed to an install to
+/// make it a wholesale replace.
 #[cfg(target_os = "linux")]
-fn run_ip(args: &[&str]) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    let out = std::process::Command::new("ip")
-        .args(args)
-        .output()
-        .with_context(|| format!("running `ip {}`", args.join(" ")))?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "`ip {}` failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
+fn drop_table(table: &str) -> String {
+    format!("table inet {table}\ndelete table inet {table}\n")
 }
 
 #[cfg(target_os = "linux")]
-fn install_nft(tun_name: &str) -> anyhow::Result<()> {
-    // The leading create+delete makes the recreate idempotent: `delete table`
-    // fails if absent, so we create-then-delete first to guarantee a clean slate.
-    let script = format!(
-        "table inet {t}\n\
-         delete table inet {t}\n\
-         table inet {t} {{\n\
-         \tchain forward {{\n\
-         \t\ttype filter hook forward priority filter; policy accept;\n\
-         \t\tip saddr {v4} accept\n\
-         \t\tip daddr {v4} accept\n\
-         \t\tip6 saddr {v6} accept\n\
-         \t\tip6 daddr {v6} accept\n\
-         \t}}\n\
-         \tchain postrouting {{\n\
-         \t\ttype nat hook postrouting priority srcnat; policy accept;\n\
-         \t\tip saddr {v4} oifname != \"{tun}\" masquerade\n\
-         \t\tip6 saddr {v6} oifname != \"{tun}\" masquerade\n\
-         \t}}\n\
-         }}\n",
-        t = NFT_TABLE,
-        v4 = V4_OVERLAY,
-        v6 = V6_OVERLAY,
-        tun = tun_name,
-    );
-    run_nft_stdin(&script)
-}
-
-#[cfg(target_os = "linux")]
-fn run_nft(args: &str) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    let out = std::process::Command::new("nft")
-        .args(args.split_whitespace())
-        .output()
-        .with_context(|| format!("running `nft {args}`"))?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "`nft {args}` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn run_nft_stdin(script: &str) -> anyhow::Result<()> {
+fn nft_load(script: &str) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use std::io::Write as _;
     use std::process::{Command, Stdio};
@@ -489,10 +428,38 @@ fn run_nft_stdin(script: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_sysctl(path: &str) -> Option<String> {
-    std::fs::read_to_string(format!("/proc/sys/{path}"))
+fn run_ip(args: &[&str]) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let out = std::process::Command::new("ip")
+        .args(args)
+        .output()
+        .with_context(|| format!("running `ip {}`", args.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`ip {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Where the pre-`enable` forwarding sysctls are stashed so [`disable`] (and the
+/// panic hook) can put them back.
+#[cfg(target_os = "linux")]
+fn snapshot_path() -> Option<std::path::PathBuf> {
+    crate::config::config_dir()
         .ok()
+        .map(|d| d.join("exit-forward.snapshot"))
+}
+
+/// The sysctl's current value, or `""` if it can't be read (then it is not
+/// restored on teardown).
+#[cfg(target_os = "linux")]
+fn read_sysctl(path: &str) -> String {
+    std::fs::read_to_string(format!("/proc/sys/{path}"))
         .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 #[cfg(target_os = "linux")]
@@ -513,10 +480,8 @@ mod tests {
     #[test]
     fn wildcard_allows_any_user() {
         let s = ExitServer::new();
-        let allow = strs(&["*"]);
-        s.reload([("n", allow.as_slice())]);
-        let user = iroh::SecretKey::generate().public();
-        assert!(s.allows("n", &user));
+        s.reload([("n", strs(&["*"]).as_slice())]);
+        assert!(s.allows("n", &iroh::SecretKey::generate().public()));
         assert!(s.is_active());
     }
 
@@ -525,8 +490,7 @@ mod tests {
         let allowed = iroh::SecretKey::generate().public();
         let other = iroh::SecretKey::generate().public();
         let s = ExitServer::new();
-        let allow = strs(&[&allowed.to_string()]);
-        s.reload([("n", allow.as_slice())]);
+        s.reload([("n", strs(&[&allowed.to_string()]).as_slice())]);
         assert!(s.allows("n", &allowed));
         assert!(!s.allows("n", &other));
         // Unknown network is never an exit.
@@ -536,18 +500,15 @@ mod tests {
     #[test]
     fn empty_allow_is_not_active() {
         let s = ExitServer::new();
-        let allow: Vec<String> = vec![];
-        s.reload([("n", allow.as_slice())]);
+        s.reload([("n", [].as_slice())]);
         assert!(!s.is_active());
-        let user = iroh::SecretKey::generate().public();
-        assert!(!s.allows("n", &user));
+        assert!(!s.allows("n", &iroh::SecretKey::generate().public()));
     }
 
     #[test]
     fn clear_drops_all_offers() {
         let s = ExitServer::new();
-        let allow = strs(&["*"]);
-        s.reload([("n", allow.as_slice())]);
+        s.reload([("n", strs(&["*"]).as_slice())]);
         s.clear();
         assert!(!s.is_active());
     }

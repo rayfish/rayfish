@@ -196,14 +196,10 @@ pub(crate) enum InboundDecision {
 ///
 /// Non-IP / truncated / oversized packets are rejected (`DropMalformed`) rather
 /// than passed through: previously such packets bypassed the firewall entirely.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_inbound(
     packet: &[u8],
     firewall: &SharedFirewall,
-    exit: &crate::exit_node::ExitServer,
-    exit_client: &crate::exit_node::ExitClient,
-    my_v4: Ipv4Addr,
-    my_v6: Ipv6Addr,
+    exit: &crate::exit_node::ExitContext,
     peer_id: &EndpointId,
     peer_ip: Ipv4Addr,
     peer_ipv6: Ipv6Addr,
@@ -222,10 +218,10 @@ pub(crate) fn evaluate_inbound(
     // on this network and the packet is addressed to us. This is our own return
     // traffic, so it also bypasses the inbound firewall. `peer_id` is the sender's
     // user identity, matching the stored selection.
-    if exit_client.is_return_traffic(network, peer_id) {
+    if exit.client.is_return_traffic(network, peer_id) {
         let to_me = match info.dst_ip {
-            IpAddr::V4(v4) => v4 == my_v4,
-            IpAddr::V6(v6) => v6 == my_v6,
+            IpAddr::V4(v4) => v4 == exit.my_v4,
+            IpAddr::V6(v6) => v6 == exit.my_v6,
         };
         if to_me {
             return InboundDecision::Accept;
@@ -249,7 +245,7 @@ pub(crate) fn evaluate_inbound(
     // the sender's user identity, matching the allow-list. The normal inbound
     // firewall is bypassed: this is transit, not traffic addressed to us.
     if !crate::membership::is_overlay_ip(info.dst_ip) {
-        return if exit.allows(network, peer_id) {
+        return if exit.server.allows(network, peer_id) {
             InboundDecision::Accept
         } else {
             InboundDecision::DropExit
@@ -373,17 +369,11 @@ pub struct ForwardCtx {
     pub token: CancellationToken,
     pub stats: Arc<ForwardMetrics>,
     pub device_user_map: DeviceUserMap,
-    /// Per-network exit-node allow policy. Consulted for any inbound datagram
-    /// bound for a non-overlay destination (internet transit); empty unless this
-    /// node offers an exit node on the arrival network.
-    pub exit_server: crate::exit_node::ExitServer,
-    /// Client-side exit selection, consulted to accept return traffic from our own
-    /// chosen exit peer (which otherwise fails the ingress anti-spoof check).
-    pub exit_client: crate::exit_node::ExitClient,
-    /// This node's mesh IPv4/IPv6, used to confirm exit return traffic is actually
-    /// addressed to us before accepting it past the anti-spoof check.
-    pub my_v4: Ipv4Addr,
-    pub my_v6: Ipv6Addr,
+    /// Exit-node state for the inbound path: the gateway allow policy (consulted
+    /// for any datagram bound for a non-overlay destination), our own exit
+    /// selection (whose return traffic bypasses the anti-spoof check), and our mesh
+    /// addresses.
+    pub exit: crate::exit_node::ExitContext,
 }
 
 /// True when a parsed packet is a DNS query addressed to the magic resolver IP.
@@ -683,10 +673,7 @@ pub fn spawn_peer_reader(
         token,
         stats,
         device_user_map,
-        exit_server,
-        exit_client,
-        my_v4,
-        my_v6,
+        exit,
     } = ctx;
     // A peer's v6 mesh address is the 120-bit blake3 of its identity and never
     // collides, so it is fixed per-identity and derived once here. The v4 address
@@ -743,10 +730,7 @@ pub fn spawn_peer_reader(
             match evaluate_inbound(
                 &datagram,
                 &firewall,
-                &exit_server,
-                &exit_client,
-                my_v4,
-                my_v6,
+                &exit,
                 &peer_user,
                 peer_ip,
                 peer_ipv6,
@@ -945,22 +929,20 @@ mod tests {
         p
     }
 
-    /// An exit-node policy that offers no exits, for the firewall/anti-spoof
-    /// tests (their destinations are overlay IPs, so the exit path is never taken).
-    fn no_exit() -> crate::exit_node::ExitServer {
-        crate::exit_node::ExitServer::new()
-    }
-
-    /// A client with no exit selection, so the return-traffic relaxation never
-    /// fires in the firewall/anti-spoof tests.
-    fn no_client() -> crate::exit_node::ExitClient {
-        crate::exit_node::ExitClient::new()
-    }
-
-    /// This node's mesh addresses in the evaluate_inbound tests. Distinct from the
+    /// This node's mesh addresses in the `evaluate_inbound` tests. Distinct from the
     /// peer/packet addresses; only consulted by the exit return-traffic path.
     const MY_V4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
     const MY_V6: Ipv6Addr = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 1);
+
+    /// Exit state for the firewall/anti-spoof tests: no exit offered and none
+    /// selected, so neither exit path fires (their destinations are overlay IPs).
+    fn no_exit() -> crate::exit_node::ExitContext {
+        crate::exit_node::ExitContext {
+            my_v4: MY_V4,
+            my_v6: MY_V6,
+            ..Default::default()
+        }
+    }
 
     fn inbound_fw(default: Action, rules: Vec<firewall::FirewallRule>) -> SharedFirewall {
         SharedFirewall::new(firewall::FirewallConfig {
@@ -978,7 +960,7 @@ mod tests {
         let peer = iroh::SecretKey::generate().public();
         let huge = vec![0u8; MAX_PEER_DATAGRAM + 1];
         assert!(matches!(
-            evaluate_inbound(&huge, &fw, &no_exit(), &no_client(), MY_V4, MY_V6, &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(&huge, &fw, &no_exit(), &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropMalformed
         ));
     }
@@ -994,7 +976,7 @@ mod tests {
         // non-overlay dst would instead be evaluated as exit-node transit).
         pkt[24] = 0x02;
         assert!(matches!(
-            evaluate_inbound(&pkt, &fw, &no_exit(), &no_client(), MY_V4, MY_V6, &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(&pkt, &fw, &no_exit(), &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropFirewall(_)
         ));
     }
@@ -1017,11 +999,11 @@ mod tests {
         let blocked = make_tcp_packet(22);
         let allowed = make_tcp_packet(80);
         assert!(matches!(
-            evaluate_inbound(&blocked, &fw, &no_exit(), &no_client(), MY_V4, MY_V6, &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(&blocked, &fw, &no_exit(), &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropFirewall(_)
         ));
         assert!(matches!(
-            evaluate_inbound(&allowed, &fw, &no_exit(), &no_client(), MY_V4, MY_V6, &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(&allowed, &fw, &no_exit(), &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::Accept
         ));
     }
@@ -1034,7 +1016,7 @@ mod tests {
         let fw = SharedFirewall::new(firewall::FirewallConfig::default());
         let pkt = make_tcp_packet(443);
         assert!(matches!(
-            evaluate_inbound(&pkt, &fw, &no_exit(), &no_client(), MY_V4, MY_V6, &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(&pkt, &fw, &no_exit(), &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropFirewall(_)
         ));
     }
@@ -1051,7 +1033,7 @@ mod tests {
         pkt[12..16].copy_from_slice(&[100, 64, 0, 5]); // src ip (TEST_V4)
         pkt[16..20].copy_from_slice(&[100, 64, 0, 3]); // dst ip
         assert!(matches!(
-            evaluate_inbound(&pkt, &fw, &no_exit(), &no_client(), MY_V4, MY_V6, &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(&pkt, &fw, &no_exit(), &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::Accept
         ));
     }
@@ -1148,9 +1130,6 @@ mod tests {
                 &pkt,
                 &fw,
                 &no_exit(),
-                &no_client(),
-                MY_V4,
-                MY_V6,
                 &peer,
                 Ipv4Addr::new(100, 64, 0, 9),
                 TEST_V6,
@@ -1160,7 +1139,7 @@ mod tests {
         ));
         // With the matching peer IP it passes.
         assert!(matches!(
-            evaluate_inbound(&pkt, &fw, &no_exit(), &no_client(), MY_V4, MY_V6, &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(&pkt, &fw, &no_exit(), &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::Accept
         ));
     }
@@ -1188,9 +1167,6 @@ mod tests {
                 &make_public_packet(),
                 &fw,
                 &no_exit(),
-                &no_client(),
-                MY_V4,
-                MY_V6,
                 &peer,
                 TEST_V4,
                 TEST_V6,
@@ -1206,17 +1182,14 @@ mod tests {
         // accepted for forwarding, bypassing the (deny-all) inbound firewall.
         let peer = iroh::SecretKey::generate().public();
         let fw = SharedFirewall::new(firewall::FirewallConfig::default()); // deny inbound
-        let exit = crate::exit_node::ExitServer::new();
-        let allow = vec![peer.to_string()];
-        exit.reload([("test-net", allow.as_slice())]);
+        let exit = no_exit();
+        exit.server
+            .reload([("test-net", vec![peer.to_string()].as_slice())]);
         assert!(matches!(
             evaluate_inbound(
                 &make_public_packet(),
                 &fw,
                 &exit,
-                &no_client(),
-                MY_V4,
-                MY_V6,
                 &peer,
                 TEST_V4,
                 TEST_V6,
@@ -1231,9 +1204,6 @@ mod tests {
                 &make_public_packet(),
                 &fw,
                 &exit,
-                &no_client(),
-                MY_V4,
-                MY_V6,
                 &other,
                 TEST_V4,
                 TEST_V6,
@@ -1256,14 +1226,15 @@ mod tests {
         p
     }
 
-    fn exit_client_for(peer: EndpointId) -> crate::exit_node::ExitClient {
-        let c = crate::exit_node::ExitClient::new();
-        c.set(Some(crate::exit_node::ExitSelection {
+    /// Exit state where `peer` is our selected exit node on `test-net`.
+    fn exit_via(peer: EndpointId) -> crate::exit_node::ExitContext {
+        let exit = no_exit();
+        exit.client.set(Some(crate::exit_node::ExitSelection {
             peer_user: peer,
             ipv4: TEST_V4,
             network: smol_str::SmolStr::new("test-net"),
         }));
-        c
+        exit
     }
 
     #[test]
@@ -1273,15 +1244,12 @@ mod tests {
         // deny-inbound default.
         let peer = iroh::SecretKey::generate().public();
         let fw = SharedFirewall::new(firewall::FirewallConfig::default());
-        let client = exit_client_for(peer);
+        let exit = exit_via(peer);
         assert!(matches!(
             evaluate_inbound(
                 &make_return_packet(MY_V4),
                 &fw,
-                &no_exit(),
-                &client,
-                MY_V4,
-                MY_V6,
+                &exit,
                 &peer,
                 TEST_V4,
                 TEST_V6,
@@ -1297,15 +1265,12 @@ mod tests {
         // public-sourced packet to some other overlay IP still fails anti-spoof.
         let peer = iroh::SecretKey::generate().public();
         let fw = SharedFirewall::new(firewall::FirewallConfig::default());
-        let client = exit_client_for(peer);
+        let exit = exit_via(peer);
         assert!(matches!(
             evaluate_inbound(
                 &make_return_packet(Ipv4Addr::new(100, 64, 0, 42)),
                 &fw,
-                &no_exit(),
-                &client,
-                MY_V4,
-                MY_V6,
+                &exit,
                 &peer,
                 TEST_V4,
                 TEST_V6,
@@ -1322,15 +1287,12 @@ mod tests {
         let exit_peer = iroh::SecretKey::generate().public();
         let other = iroh::SecretKey::generate().public();
         let fw = SharedFirewall::new(firewall::FirewallConfig::default());
-        let client = exit_client_for(exit_peer);
+        let exit = exit_via(exit_peer);
         assert!(matches!(
             evaluate_inbound(
                 &make_return_packet(MY_V4),
                 &fw,
-                &no_exit(),
-                &client,
-                MY_V4,
-                MY_V6,
+                &exit,
                 &other,
                 TEST_V4,
                 TEST_V6,
@@ -1381,9 +1343,6 @@ mod tests {
                 &make_tcp_packet(8080),
                 &fw,
                 &no_exit(),
-                &no_client(),
-                MY_V4,
-                MY_V6,
                 &peer,
                 TEST_V4,
                 TEST_V6,
@@ -1397,9 +1356,6 @@ mod tests {
                 &make_tcp_packet(9090),
                 &fw,
                 &no_exit(),
-                &no_client(),
-                MY_V4,
-                MY_V6,
                 &peer,
                 TEST_V4,
                 TEST_V6,

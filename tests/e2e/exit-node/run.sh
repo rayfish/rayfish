@@ -19,17 +19,20 @@
 #     connection survives. Without it the tunnel deadlocks and everything dies —
 #     this is the single assertion the whole SO_MARK fork chain exists for;
 #   - mesh traffic still flows under the full tunnel (peers stay pingable);
+#   - INBOUND CONNECTIONS SURVIVE: our own SSH session to the client's public IP
+#     keeps working under the full tunnel. Naively it would not — sshd's replies
+#     would follow the default route into the tunnel and come out NATed as the exit
+#     node's address, so a headless box would lock itself out the instant you ran
+#     `exit-node use`. The conntrack-mark rules keep connections that arrived from
+#     outside the tunnel answering out the interface they came in on;
 #   - a NON-allowed peer (srv-c) selecting the same exit gets dropped: no egress
 #     via the gateway AND no leak out its own uplink;
 #   - teardown restores everything: `exit-node none` reverts egress and removes the
 #     ip rules; `ray down` on the gateway removes the nft table and the sysctls.
 #
-# NOTE ON SSH: a full tunnel routes the client's replies to *our* public IP through
-# the exit node, so our SSH session to srv-b/srv-c dies the moment `exit-node use`
-# lands (standard full-tunnel behavior — mesh-IP SSH keeps working). So the client
-# phase runs as a DETACHED, SELF-REVERTING script on the host: it does its probes,
-# writes results to /tmp, then reverts, which brings SSH back. A hard failsafe
-# (`ray down`/`up`) also fires, so a crashed probe can never strand an instance.
+# Every step that turns a full tunnel on arms a self-revert failsafe on the host
+# first: one bad rule is the difference between a working tunnel and an instance
+# that has cut off its own SSH, and a test must never be able to strand a machine.
 #
 # Reads tests/e2e/exit-node/.servers (written by provision.sh). Does NOT modify
 # infra. Re-runnable (resets rayfish state each run unless KEEP_STATE=1).
@@ -59,9 +62,14 @@ pub4(){ on "$1" "curl -4 -s --max-time 20 https://api.ipify.org || curl -4 -s --
 # exit_json <host> : `ray exit-node status --json` from a host.
 exit_json(){ on "$1" "ray exit-node status --json" 2>/dev/null; }
 
-# push <host> <remote-path> : stream stdin into a file on the host. `on` uses
-# `ssh -n` (stdin from /dev/null), so it can't carry a heredoc — this can.
-push(){ ssh "${SSH_OPTS[@]}" -i "$KEY" "root@$1" "cat > $2"; }
+# arm_failsafe <host> <seconds> : detached self-revert, armed BEFORE any full
+# tunnel goes up. If we lose the host (a routing bug cutting our own SSH), it drops
+# the tunnel on its own after <seconds> and the instance comes back. Cancelled by
+# disarm_failsafe once egress is restored, so a passing run costs nothing.
+arm_failsafe(){
+  on "$1" "rm -f /tmp/exit-disarm; setsid nohup bash -c 'sleep $2; [ -f /tmp/exit-disarm ] || { ray exit-node none $NET; ray down; ray up; }' >/dev/null 2>&1 < /dev/null &" >/dev/null 2>&1
+}
+disarm_failsafe(){ on "$1" 'touch /tmp/exit-disarm' >/dev/null 2>&1; }
 
 # clean_kernel <host...> : drop any exit-node kernel state a crashed earlier run
 # may have left behind. `reset_state` wipes /etc/rayfish (including the forwarding
@@ -71,13 +79,13 @@ clean_kernel(){
   step "reset leftover exit-node kernel state (nft table, ip rules, tunnel table)"
   local h f p
   for h in "$@"; do
-    on "$h" "nft delete table inet rayfish_exit" >/dev/null 2>&1
+    on "$h" "nft delete table inet rayfish_exit; nft delete table inet rayfish_exit_client" >/dev/null 2>&1
     for f in -4 -6; do
       for p in 100 101 102; do on "$h" "ip $f rule del pref $p" >/dev/null 2>&1; done
       on "$h" "ip $f route flush table $TABLE" >/dev/null 2>&1
     done
     on "$h" "sysctl -qw net.ipv4.ip_forward=0 net.ipv6.conf.all.forwarding=0" >/dev/null 2>&1
-    on "$h" "rm -f /tmp/exit-*.out /tmp/exit-probe.done" >/dev/null 2>&1
+    on "$h" "rm -f /tmp/exit-disarm" >/dev/null 2>&1
     echo "   cleaned $h"
   done
 }
@@ -162,43 +170,24 @@ on "$B" "ray status" | strip | grep -q 'srv-a.*(exit)' \
 
 # ---------------------------------------------------------------------------
 step "4. srv-b routes all its traffic through srv-a (the full tunnel)"
-# Detached + self-reverting: `exit-node use` kills our SSH (the reply path to our
-# public IP now goes through the exit node), so we cannot hold the session. The
-# script probes, writes to /tmp, reverts, and a failsafe guarantees recovery.
-push "$B" /tmp/exit-probe.sh <<PROBE
-#!/usr/bin/env bash
-# Failsafe: whatever happens, this box comes back in 180s.
-( sleep 180; ray exit-node none $NET; ray down; ray up ) >/dev/null 2>&1 &
-FAILSAFE=\$!
-rm -f /tmp/exit-*.out
-ray exit-node use $NET srv-a > /tmp/exit-use.out 2>&1
+arm_failsafe "$B" 240
+on "$B" "ray exit-node use $NET srv-a" 2>&1 | strip | sed 's/^/   b| /'
 sleep 8
-# The headline: which uplink did our traffic actually leave by?
-curl -4 -s --max-time 25 https://api.ipify.org > /tmp/exit-pub4.out 2>/dev/null \
-  || curl -4 -s --max-time 25 https://ifconfig.me/ip > /tmp/exit-pub4.out 2>/dev/null
-curl -6 -s --max-time 15 https://api6.ipify.org > /tmp/exit-pub6.out 2>/dev/null
-# Loop prevention: is the mesh connection to srv-a still alive under the tunnel?
-ray status --json > /tmp/exit-status.out 2>/dev/null
-ping -c 3 -W 2 $A_VPN > /tmp/exit-meshping.out 2>&1
-# The kernel state we installed.
-ip -4 rule show > /tmp/exit-rules.out 2>&1
-ip -4 route show table $TABLE > /tmp/exit-table.out 2>&1
-ray exit-node none $NET > /tmp/exit-none.out 2>&1
-kill \$FAILSAFE 2>/dev/null
-echo done > /tmp/exit-probe.done
-PROBE
-on "$B" 'chmod +x /tmp/exit-probe.sh; setsid nohup /tmp/exit-probe.sh >/dev/null 2>&1 < /dev/null &' || true
-echo "   probe launched on srv-b (SSH will drop while the tunnel is up; waiting for it to revert)"
 
-# Wait for the probe to finish and SSH to come back.
-if retry_until 150 "on '$B' 'test -f /tmp/exit-probe.done' 2>/dev/null"; then
-  pass "srv-b completed the full-tunnel probe and reverted (SSH recovered)"
+# The assertion this whole feature lives or dies on for a headless host: we are
+# still talking to srv-b over its PUBLIC IP while its default route points into the
+# tunnel. Without the conntrack-mark rules, sshd's replies egress via srv-a, come
+# out NATed as srv-a's address, and every command below hangs instead of answering.
+if on "$B" 'true' 2>/dev/null; then
+  pass "SSH to srv-b's public IP survived the full tunnel (inbound conns bypass it)"
 else
-  fail "srv-b never came back from the full-tunnel probe (check the instance)"
+  fail "srv-b cut off its own SSH under the full tunnel — inbound-connection bypass is broken"
+  echo "   (the failsafe will revert srv-b within 240s)"
   summary
 fi
 
-B_VIA_EXIT="$(on "$B" 'cat /tmp/exit-pub4.out 2>/dev/null' | tr -d '[:space:]')"
+# The headline: which uplink did srv-b's traffic actually leave by?
+B_VIA_EXIT="$(pub4 "$B")"
 echo "   srv-b public IP while tunneled: '$B_VIA_EXIT'  (srv-a=$A_PUB, srv-b own=$B_PUB)"
 if [[ "$B_VIA_EXIT" == "$A_PUB" ]]; then
   pass "srv-b's internet traffic egressed via srv-a — the exit node works (IPv4)"
@@ -210,24 +199,23 @@ fi
 
 # The loop-prevention assertion. If SO_MARK / the fwmark rule were missing, iroh's
 # own UDP would have looped into the tunnel and the mesh would be dead here.
-if on "$B" 'grep -q "0% packet loss" /tmp/exit-meshping.out'; then
+if on "$B" "ping -c 3 -W 2 $A_VPN" 2>/dev/null | grep -q "0% packet loss"; then
   pass "mesh still works under the full tunnel (srv-b pinged srv-a's mesh IP)"
 else
   fail "mesh broke under the full tunnel — loop prevention failed (SO_MARK/ip rule)"
 fi
-if on "$B" "grep -q '$MARK' /tmp/exit-rules.out"; then
-  pass "srv-b installed the fwmark bypass rule ($MARK -> main)"
-else
-  fail "srv-b has no fwmark bypass rule — iroh's transport would loop"
-fi
-if on "$B" "grep -q default /tmp/exit-table.out"; then
-  pass "srv-b installed the tunnel default route (table $TABLE)"
-else
-  fail "srv-b has no default route in the tunnel table"
-fi
+on "$B" "ip -4 rule show" 2>/dev/null | grep -q "$MARK" \
+  && pass "srv-b installed the fwmark bypass rule ($MARK -> main)" \
+  || fail "srv-b has no fwmark bypass rule — iroh's transport would loop"
+on "$B" "ip -4 route show table $TABLE" 2>/dev/null | grep -q default \
+  && pass "srv-b installed the tunnel default route (table $TABLE)" \
+  || fail "srv-b has no default route in the tunnel table"
+on "$B" 'nft list table inet rayfish_exit_client 2>/dev/null | grep -q "ct mark"' \
+  && pass "srv-b installed the conntrack-mark table (inbound connections bypass the tunnel)" \
+  || fail "srv-b has no conntrack-mark table — inbound connections would be swallowed"
 
 # IPv6 is best-effort: not every instance/zone has working v6 egress.
-B_V6="$(on "$B" 'cat /tmp/exit-pub6.out 2>/dev/null' | tr -d '[:space:]')"
+B_V6="$(on "$B" 'curl -6 -s --max-time 15 https://api6.ipify.org' 2>/dev/null | tr -d '[:space:]')"
 if [[ -n "$B_V6" ]]; then
   A_V6="$(on "$A" 'curl -6 -s --max-time 15 https://api6.ipify.org' 2>/dev/null | tr -d '[:space:]')"
   [[ "$B_V6" == "$A_V6" ]] \
@@ -239,6 +227,8 @@ fi
 
 # ---------------------------------------------------------------------------
 step "5. egress reverts after 'ray exit-node none'"
+on "$B" "ray exit-node none $NET" 2>&1 | strip | sed 's/^/   b| /'
+disarm_failsafe "$B"
 if retry_until 60 "[[ \"\$(pub4 '$B')\" == '$B_PUB' ]]"; then
   pass "srv-b egresses via its own uplink again ($B_PUB)"
 else
@@ -247,33 +237,22 @@ fi
 on "$B" "ip -4 rule show" | grep -q "$MARK" \
   && fail "srv-b's fwmark rule survived 'exit-node none' (policy routing not torn down)" \
   || pass "srv-b's full-tunnel ip rules were removed"
+on "$B" 'nft list table inet rayfish_exit_client' >/dev/null 2>&1 \
+  && fail "srv-b's conntrack-mark table survived 'exit-node none'" \
+  || pass "srv-b's conntrack-mark table was removed"
 
 # ---------------------------------------------------------------------------
 step "6. deny path: srv-c is NOT allowed — its traffic is dropped, not leaked"
 # srv-c can still *select* srv-a (the blob advertises the offer), but srv-a's
 # allow-list has only srv-b, so the gateway drops srv-c's packets. The critical
-# property: srv-c must not reach the internet via srv-a AND must not silently
-# fall back to its own uplink (that would be a leak the user never asked for).
-push "$C" /tmp/exit-probe.sh <<PROBE
-#!/usr/bin/env bash
-( sleep 120; ray exit-node none $NET; ray down; ray up ) >/dev/null 2>&1 &
-FAILSAFE=\$!
-rm -f /tmp/exit-*.out
-ray exit-node use $NET srv-a > /tmp/exit-use.out 2>&1
+# property: srv-c must not reach the internet via srv-a AND must not silently fall
+# back to its own uplink (that would be a leak the user never asked for).
+arm_failsafe "$C" 180
+on "$C" "ray exit-node use $NET srv-a" 2>&1 | strip | sed 's/^/   c| /'
 sleep 5
-curl -4 -s --max-time 15 https://api.ipify.org > /tmp/exit-pub4.out 2>/dev/null
-ray exit-node none $NET > /tmp/exit-none.out 2>&1
-kill \$FAILSAFE 2>/dev/null
-echo done > /tmp/exit-probe.done
-PROBE
-on "$C" 'chmod +x /tmp/exit-probe.sh; setsid nohup /tmp/exit-probe.sh >/dev/null 2>&1 < /dev/null &' || true
-if retry_until 120 "on '$C' 'test -f /tmp/exit-probe.done' 2>/dev/null"; then
-  pass "srv-c completed the deny-path probe and reverted"
-else
-  fail "srv-c never came back from the deny-path probe"
-  summary
-fi
-C_VIA_EXIT="$(on "$C" 'cat /tmp/exit-pub4.out 2>/dev/null' | tr -d '[:space:]')"
+C_VIA_EXIT="$(pub4 "$C")"
+on "$C" "ray exit-node none $NET" >/dev/null 2>&1
+disarm_failsafe "$C"
 if [[ -z "$C_VIA_EXIT" ]]; then
   pass "srv-c got no internet through srv-a (dropped by the allow-list, no leak)"
 elif [[ "$C_VIA_EXIT" == "$A_PUB" ]]; then
