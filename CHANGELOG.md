@@ -19,9 +19,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   traffic, shows when this node is itself offering an exit, and
   `ray exit-node status` lists the lot.
   Full-stack IPv4 + IPv6. Connections that reach the client from outside the
-  tunnel keep answering out the interface they arrived on, so a headless host
-  stays reachable on its public IP with a full tunnel up (note: a session opened
-  *before* the tunnel comes up is still cut; reconnect and it holds). The gateway
+  tunnel keep answering out the interface they arrived on, including ones already
+  open when the tunnel comes up, so a headless host stays reachable on its public
+  IP and the SSH session you turn the tunnel on from survives it. The gateway
   (NAT/forwarding) and the client (full-tunnel routing with fwmark loop-prevention)
   are Linux-only in this release; the `allow` / advertise / `status` surface is
   cross-platform. An exit node is strictly an *internet* gateway: it forwards to

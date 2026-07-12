@@ -25,6 +25,8 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use iroh::EndpointId;
 use smol_str::SmolStr;
 
+use crate::membership::is_overlay_ip;
+
 /// Linux fwmark set on iroh's underlay UDP sockets (via the forked
 /// `Endpoint::builder().socket_mark`) and on the replies of any connection that
 /// arrived from outside the tunnel. A matching `ip rule` sends marked packets to
@@ -102,19 +104,29 @@ impl ExitServer {
 
     /// Reconcile the kernel forwarding/NAT with the current offer state: install it
     /// when we offer an exit on some network, remove it when we don't. Both
-    /// directions are idempotent, so this is safe to call on every change. Linux
-    /// only (a no-op elsewhere, where client full-tunnel is unsupported anyway).
-    pub fn apply_os(&self, tun_name: &str) {
+    /// directions are idempotent, so this is safe to call on every change.
+    ///
+    /// [`enable`] is not atomic (forwarding is on before the NAT rules load), so a
+    /// failure rolls the whole thing back *and* drops the offers: a gateway that
+    /// forwards but cannot masquerade would push overlay-sourced packets out its
+    /// uplink un-NAT'd, which never gets a reply and looks like source spoofing to
+    /// everyone upstream. Returns a user-facing message when that happens.
+    #[must_use]
+    pub fn apply_os(&self, tun_name: &str) -> Option<String> {
         #[cfg(target_os = "linux")]
         if self.is_active() {
             if let Err(e) = enable(tun_name) {
+                disable();
+                self.clear();
                 tracing::warn!(error = %e, "failed to enable exit-node forwarding/NAT");
+                return Some(format!("failed to enable exit node: {e}"));
             }
         } else {
             disable();
         }
         #[cfg(not(target_os = "linux"))]
         let _ = tun_name;
+        None
     }
 }
 
@@ -129,7 +141,15 @@ impl ExitServer {
 /// inside of our network and our cloud identity. Reaching a gateway's LAN is a
 /// separate capability (a subnet router), not something an exit-node offer should
 /// imply.
+///
+/// The overlay's own ranges are refused too. The data path never asks about them
+/// (it routes an overlay destination to its peer long before considering transit),
+/// but this is the whole answer to "may we forward this?", so it should not depend
+/// on its caller having already checked.
 pub fn is_transitable(dst: IpAddr) -> bool {
+    if is_overlay_ip(dst) {
+        return false;
+    }
     match dst {
         IpAddr::V4(ip) => {
             !(ip.is_private()
@@ -139,8 +159,7 @@ pub fn is_transitable(dst: IpAddr) -> bool {
                 || ip.is_broadcast()
                 || ip.is_unspecified()
                 || ip.is_documentation()
-                // 100.64.0.0/10 (shared address space) is the overlay's own range,
-                // and 0.0.0.0/8 / 240.0.0.0/4 are not routable either.
+                // 0.0.0.0/8 and 240.0.0.0/4 are not routable either.
                 || ip.octets()[0] == 0
                 || ip.octets()[0] >= 240)
         }
@@ -270,12 +289,13 @@ use names::*;
 /// are snapshotted to disk exactly once (a re-apply must not capture the values we
 /// set ourselves), and the nft ruleset is replaced wholesale. That same file is
 /// what [`disable`] restores from, including when it runs from the panic hook, so a
-/// crash can never leave the host acting as an open router. Linux only.
+/// crash can never leave the host acting as an open router. Writing it is therefore
+/// a precondition, not a nicety: without it we could turn forwarding on and never
+/// be able to put it back, so we refuse instead. Linux only.
 #[cfg(target_os = "linux")]
 fn enable(tun_name: &str) -> Result<()> {
-    if let Some(path) = snapshot_path()
-        && !path.exists()
-    {
+    let path = snapshot_path().context("no config dir to snapshot the forwarding sysctls into")?;
+    if !path.exists() {
         let body = format!(
             "v4={}\nv6={}\n",
             read_sysctl(V4_FORWARD),
@@ -399,19 +419,25 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
         ])?;
     }
     // Connections opened from outside the tunnel keep answering out the interface
-    // they arrived on. `prerouting` tags the conntrack entry (and marks the packet
-    // itself, so the reverse-path check resolves against `main`); `output` restores
-    // that mark on the locally-generated replies. It matches only on our own ctmark,
-    // so traffic this node originates (including iroh's already-marked sockets) is
-    // untouched. `type route` forces a re-route once the mark is set.
+    // they arrived on. `prerouting` tags the conntrack entry of anything arriving on
+    // a non-TUN interface (and marks the packet itself, so the reverse-path check
+    // resolves against `main`); `output` restores that mark on the locally-generated
+    // replies, and `type route` forces a re-route once it is set.
+    //
+    // The tag is deliberately unconditional rather than `ct state new`: a connection
+    // that was already established when the tunnel came up would otherwise keep a
+    // ctmark of 0, its replies would go out the tunnel, and it would be cut. Marking
+    // every inbound packet picks those up on their next packet instead. Re-marking a
+    // connection is idempotent, and traffic this node originates never reaches this
+    // chain (iroh's underlay sockets already carry the same mark via `SO_MARK`).
     nft_load(&format!(
         "{reset}\
          table inet {t} {{\n\
          \tchain prerouting {{\n\
          \t\ttype filter hook prerouting priority mangle; policy accept;\n\
          \t\tiifname \"{tun}\" return\n\
-         \t\tct state new ct mark set {mark}\n\
-         \t\tct mark {mark} meta mark set {mark}\n\
+         \t\tct mark set {mark}\n\
+         \t\tmeta mark set {mark}\n\
          \t}}\n\
          \tchain output {{\n\
          \t\ttype route hook output priority mangle; policy accept;\n\
@@ -588,6 +614,8 @@ mod tests {
             "fe80::1",         // v6 link-local
             "fd00::1",         // v6 unique-local
             "ff02::1",         // v6 multicast
+            "100.64.0.1",      // the overlay itself: routed to its peer, never transited
+            "200::1",
         ] {
             assert!(
                 !is_transitable(ip.parse().unwrap()),

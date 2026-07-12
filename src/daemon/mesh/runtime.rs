@@ -841,29 +841,46 @@ impl Daemon {
 
     /// Reconcile every piece of exit-node state with the on-disk config: the
     /// gateway allow policy and its kernel forwarding/NAT, and the client selection
-    /// and its full-tunnel policy routing. Both halves are idempotent and both
-    /// directions (install / remove) are handled, so this is the single entry point
-    /// used by `activate` and by any `ray exit-node` change made while up. Returns a
-    /// user-facing warning if the client routing could not be installed.
-    ///
-    /// Client full-tunnel is Linux only; elsewhere the selection is still tracked
-    /// (the forwarding loop honours it) but no kernel routing is installed.
+    /// and its full-tunnel routing. Both halves are idempotent and both directions
+    /// (install / remove) are handled, so this is the single entry point used by
+    /// `activate` and by any `ray exit-node` change made while up. Returns a
+    /// user-facing warning if either half could not be put in place.
     pub(crate) fn apply_exit_node(&self) -> Option<String> {
         let tun_name = self.tun_name.load().as_str().to_owned();
         self.registry.reload_exit_state();
-        self.registry.exit_server.apply_os(&tun_name);
-        #[cfg(target_os = "linux")]
-        {
-            if self.registry.exit_client.is_active() {
-                if let Err(e) = crate::exit_node::install_client_routing(&tun_name) {
-                    tracing::warn!(error = %e, "failed to install exit-node client routing");
-                    return Some(format!("failed to route traffic through exit node: {e}"));
-                }
-            } else {
-                crate::exit_node::teardown_client_routing();
+        let server = self.registry.exit_server.apply_os(&tun_name);
+        // Both halves run even if the first one failed: they are independent roles,
+        // and each one's teardown path has to happen regardless.
+        server.or_else(|| self.apply_exit_client(&tun_name))
+    }
+
+    /// Install or remove the client full-tunnel routing to match the selection.
+    #[cfg(target_os = "linux")]
+    fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
+        if !self.registry.exit_client.is_active() {
+            crate::exit_node::teardown_client_routing();
+            return None;
+        }
+        match crate::exit_node::install_client_routing(tun_name) {
+            Ok(()) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install exit-node client routing");
+                Some(format!("failed to route traffic through exit node: {e}"))
             }
         }
-        None
+    }
+
+    /// Using an exit node needs full-tunnel routing, which only Linux has (the
+    /// loop prevention it rests on is `SO_MARK` plus policy routing). Say so, rather
+    /// than reporting success while every packet keeps leaving the local uplink.
+    /// Offering an exit node works on every platform.
+    #[cfg(not(target_os = "linux"))]
+    fn apply_exit_client(&self, _tun_name: &str) -> Option<String> {
+        self.registry.exit_client.is_active().then(|| {
+            "using an exit node is not supported on this platform yet; traffic still \
+             leaves this host directly. Clear it with `ray exit-node none`."
+                .to_string()
+        })
     }
 
     /// Put the daemon on standby: take the data plane offline (revert system
@@ -893,9 +910,10 @@ impl Daemon {
         }
 
         // Exit-node server: drop the allow policy so no transit happens while on
-        // standby, then reconcile (which removes the kernel forwarding/NAT).
+        // standby, then reconcile (which removes the kernel forwarding/NAT). With no
+        // offers left this is the teardown path, which never reports a problem.
         self.registry.exit_server.clear();
-        self.registry.exit_server.apply_os(&tun_name);
+        let _ = self.registry.exit_server.apply_os(&tun_name);
 
         // Exit-node client: remove the full-tunnel policy routing and clear the
         // selection. The TUN going down also drops its default route.
