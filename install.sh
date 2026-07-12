@@ -33,7 +33,7 @@ need curl
 # ubuntu-22.04 = glibc 2.35). A host below this can't run the gnu build.
 GLIBC_MIN="2.35"
 
-# Sets the global OS and echoes the base asset name (no libc suffix).
+# Sets the globals OS and ASSET (base asset name, no libc suffix); call directly.
 detect_asset() {
   local arch
   OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -48,7 +48,7 @@ detect_asset() {
     aarch64|arm64) arch="aarch64" ;;
     *) die "unsupported architecture: $arch" ;;
   esac
-  echo "${BIN}-${OS}-${arch}"
+  ASSET="${BIN}-${OS}-${arch}"
 }
 
 # Whether this Linux host needs the static musl binary instead of the glibc
@@ -95,7 +95,8 @@ verify_sha256() {
 
 main() {
   local asset base url
-  asset="$(detect_asset)"
+  detect_asset
+  asset="$ASSET"
   base="$(release_base)"
 
   # On Linux, switch to the static musl asset when the glibc binary won't run
