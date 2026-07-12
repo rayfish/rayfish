@@ -41,6 +41,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still installed by our own netlink/`ifconfig` helpers. This is the groundwork for
   a later Linux GRO/GSO offload path that batches TUN writes.
 
+- **FreeBSD improvements.** The logs will be stored in /var/log and the configs
+  will be stored at /usr/local/etc.
+
 ### Added
 
 - **On-demand mesh connections (near-zero idle battery).** A node connects to its
