@@ -213,22 +213,25 @@ pub(crate) fn evaluate_inbound(
     let Some(info) = firewall::parse_packet_info(packet) else {
         return InboundDecision::DropMalformed;
     };
-    // Exit-node client return traffic: replies to our internet-bound flows come
-    // back from our chosen exit peer with a public source IP (the host we reached)
-    // and our own mesh IP as destination. They fail the normal anti-spoof (src is
-    // not the peer's mesh IP), so accept them here when the sender is our exit peer
-    // on this network and the packet is addressed to us. This is our own return
-    // traffic, so it also bypasses the inbound firewall. `peer_id` is the sender's
-    // user identity, matching the stored selection.
-    if exit.client.is_return_traffic(network, peer_id) {
-        let to_me = match info.dst_ip {
+    // Exit-node client return traffic: replies to our internet-bound flows come back
+    // from our chosen exit peer sourced from the *host we reached*, not from the
+    // peer's mesh IP, so they can never satisfy the anti-spoof check below. Exempt
+    // them from it (only when the sender really is our exit peer on this network,
+    // the source is a public address, and the packet is addressed to us) and let
+    // them face the firewall like any other inbound packet.
+    //
+    // They are not waved through: the conntrack entry our own outbound packet
+    // created is what admits the reply. So the exit peer can deliver traffic for
+    // flows we opened, but cannot inject unsolicited packets at our local ports.
+    // (It is on-path for our real flows and can forge within them, as any gateway
+    // or ISP can; that is what TLS is for. Reaching a service we never dialed is a
+    // different matter, and it can't.)
+    let exit_return = exit.client.is_return_traffic(network, peer_id)
+        && !is_overlay_ip(info.src_ip)
+        && match info.dst_ip {
             IpAddr::V4(v4) => v4 == exit.my_v4,
             IpAddr::V6(v6) => v6 == exit.my_v6,
         };
-        if to_me {
-            return InboundDecision::Accept;
-        }
-    }
     // Ingress anti-spoofing: a peer may only inject packets sourced from its own
     // assigned mesh address. Anything else (e.g. one peer forging another's mesh
     // IP) is dropped before the firewall or any in-daemon listener sees it, so
@@ -237,7 +240,7 @@ pub(crate) fn evaluate_inbound(
         IpAddr::V4(v4) => v4 == peer_ip,
         IpAddr::V6(v6) => v6 == peer_ipv6,
     };
-    if !src_ok {
+    if !src_ok && !exit_return {
         return InboundDecision::DropSpoof;
     }
     // Exit-node transit: a datagram bound for a non-overlay (internet) destination
@@ -1296,14 +1299,34 @@ mod tests {
         exit
     }
 
+    /// The outbound half of the flow `make_return_packet` answers: our mesh IP to
+    /// 8.8.8.8:443. Sending it through the firewall records the conntrack entry.
+    fn open_flow_to_internet(fw: &SharedFirewall, peer: &EndpointId) {
+        let mut p = vec![0u8; 24];
+        p[0] = 0x45; // IPv4, IHL=5
+        p[9] = 6; // TCP
+        p[12..16].copy_from_slice(&MY_V4.octets()); // src = us
+        p[16..20].copy_from_slice(&[8, 8, 8, 8]); // dst 8.8.8.8
+        p[22] = 1;
+        p[23] = 0xbb; // dst port 443
+        let info = firewall::parse_packet_info(&p).unwrap();
+        assert!(
+            fw.evaluate_packet(Direction::Out, &info, peer, Some("test-net"))
+                .is_allow()
+        );
+    }
+
     #[test]
     fn exit_return_traffic_accepted_past_antispoof() {
         // A reply from our exit peer (public src, our mesh IP as dst) is accepted
-        // even though its source is not the peer's mesh IP, and even under the
-        // deny-inbound default.
+        // even though its source is not the peer's mesh IP: the anti-spoof check it
+        // could never satisfy is skipped. It still goes through the firewall, and
+        // what lets it past the deny-inbound default is the conntrack entry our own
+        // outbound packet created.
         let peer = iroh::SecretKey::generate().public();
         let fw = SharedFirewall::new(firewall::FirewallConfig::default());
         let exit = exit_via(peer);
+        open_flow_to_internet(&fw, &peer);
         assert!(matches!(
             evaluate_inbound(
                 &make_return_packet(MY_V4),
@@ -1315,6 +1338,30 @@ mod tests {
                 "test-net"
             ),
             InboundDecision::Accept
+        ));
+    }
+
+    #[test]
+    fn exit_peer_cannot_inject_unsolicited_traffic() {
+        // The exit peer carries our internet traffic, which does NOT make it trusted
+        // to reach our local ports. With no flow of ours to answer, the same packet
+        // is dropped by the firewall like any other unsolicited inbound traffic.
+        // Otherwise `exit-node use` would silently hand that peer the ability to
+        // dial every service on this host, bypassing the firewall entirely.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = SharedFirewall::new(firewall::FirewallConfig::default()); // deny inbound
+        let exit = exit_via(peer);
+        assert!(matches!(
+            evaluate_inbound(
+                &make_return_packet(MY_V4),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::DropFirewall(_)
         ));
     }
 
