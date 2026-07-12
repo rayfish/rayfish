@@ -19,14 +19,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   traffic, shows when this node is itself offering an exit, and
   `ray exit-node status` lists the lot.
   Full-stack IPv4 + IPv6. Connections that reach the client from outside the
-  tunnel keep answering out the interface they arrived on, so turning on a full
-  tunnel does not cut an existing SSH session to the host's public IP. The gateway
+  tunnel keep answering out the interface they arrived on, so a headless host
+  stays reachable on its public IP with a full tunnel up (note: a session opened
+  *before* the tunnel comes up is still cut; reconnect and it holds). The gateway
   (NAT/forwarding) and the client (full-tunnel routing with fwmark loop-prevention)
   are Linux-only in this release; the `allow` / advertise / `status` surface is
   cross-platform. An exit node is strictly an *internet* gateway: it forwards to
   globally-routable addresses only, so permitting a peer to route out through you
   never also hands it your private LAN, your loopback, or your cloud instance
   metadata service.
+
+- **The install script now lives in the repo** as `install.sh`, so the one command
+  users are asked to pipe into a root shell can be read, reviewed, and tested like
+  the rest of the code. CI lints it and installs the latest release with it on
+  Linux (glibc and musl) and macOS on every change. rayfish.xyz serves a copy of
+  this file, and its CI fails if the two drift apart.
 
 ### Fixed
 
@@ -35,6 +42,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   was only assigned when the TUN was created, so a standby cycle left the node
   reachable over IPv4 while every IPv6 peer silently got no answer (until the
   daemon was restarted). The address is now re-assigned on every activate.
+
+- **`curl -fsSL https://rayfish.xyz/install.sh | sh` works again.** The installer
+  detected the host OS inside a command substitution, which runs in a subshell, so
+  the value was lost in the caller and the script aborted with `OS: parameter not
+  set` on every Linux and macOS host. Reported in #95, fixed by @nemanjaglumac in
+  #97.
+
+- **The installer no longer asks for `sudo` when it doesn't need it.** Pointing
+  `INSTALL_DIR` at a path that didn't exist yet (`~/.local/bin`, typically) was
+  treated as "not writable", so the install escalated and left a root-owned
+  directory in the user's home. It now tests the nearest existing parent.
+
+- **The installer refuses to install a binary it can't verify.** A missing `.sha256`
+  sidecar silently skipped checksum verification. Every release publishes one, so a
+  missing sidecar now aborts the install (`RAY_SKIP_VERIFY=1` overrides).
 
 - **`ray mdns off` (and the other config-writing commands) now take effect on
   non-Linux hosts.** `ray mdns`, `ray auto-update`, `ray config set|unset`, and
@@ -68,6 +90,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `VpnService` fd). Behavior is unchanged: same 1280 MTU, addresses and routes are
   still installed by our own netlink/`ifconfig` helpers. This is the groundwork for
   a later Linux GRO/GSO offload path that batches TUN writes.
+
+- **FreeBSD improvements.** The logs will be stored in /var/log and the configs
+  will be stored at /usr/local/etc.
 
 ### Added
 

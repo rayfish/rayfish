@@ -70,12 +70,17 @@ current without rebuilding.
 
 ### 1. Install & start
 
-Build the binary, then bring the VPN up:
+Install the latest release, then bring the VPN up:
 
 ```bash
-cargo build
+curl -fsSL https://rayfish.xyz/install.sh | sh
 sudo ray up    # installs the system service if needed, then activates the VPN
 ```
+
+The installer drops the `ray` binary in `/usr/local/bin` (override with
+`INSTALL_DIR`) and verifies its checksum. It's [`install.sh`](install.sh) in
+this repo, so you can read it before you run it. To build from source instead,
+`cargo build` and see [Building](#building).
 
 Only this first `ray up` needs root. It installs a small background service (the
 daemon) that owns the network device and does the actual tunneling. From then on
