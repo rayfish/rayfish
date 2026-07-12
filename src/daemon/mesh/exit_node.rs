@@ -84,12 +84,17 @@ impl NetworkRegistry {
                 let Some(id) = self.resolve_peer_flexible(name).await else {
                     return ipc_err(format!("could not resolve peer: {name}"));
                 };
+                // Match the roster the same way `reload_exit_state` does: a paired
+                // multi-device peer is keyed by its user identity, not by the
+                // device id `resolve_peer_flexible` may hand back. Matching on
+                // `identity` alone would reject a selection the data path would
+                // then happily honour.
                 let advertises = self.networks.get(network).is_some_and(|h| {
                     let s = h.state.read().unwrap();
                     s.members
                         .all()
                         .iter()
-                        .any(|m| m.identity == id && m.exit_node)
+                        .any(|m| (m.identity == id || m.user_identity == Some(id)) && m.exit_node)
                 });
                 if !advertises {
                     return ipc_err(format!(
@@ -124,8 +129,10 @@ impl NetworkRegistry {
     ///
     /// The selection is the first network with `exit_node_use` set whose peer is a
     /// resolvable roster member, resolved to its mesh IPv4 (to route to) and user
-    /// identity (to match its return traffic); it clears when none applies. Cheap;
-    /// called on `activate()` and after any `ray exit-node` change while up.
+    /// identity (to match its return traffic); it clears when none applies. There is
+    /// one default route, so only one selection can win: a second one is reported
+    /// rather than silently ignored. Cheap; called on `activate()` and after any
+    /// `ray exit-node` change while up.
     pub(crate) fn reload_exit_state(&self) {
         let networks = config::load().map(|c| c.networks).unwrap_or_default();
         self.exit_server.reload(
@@ -133,7 +140,21 @@ impl NetworkRegistry {
                 .iter()
                 .map(|n| (n.name.as_str(), n.exit_allow.as_slice())),
         );
-        let selection = networks.iter().find_map(|nc| {
+        let selected: Vec<_> = networks
+            .iter()
+            .filter(|nc| nc.exit_node_use.is_some())
+            .collect();
+        if selected.len() > 1 {
+            let names: Vec<&str> = selected.iter().map(|nc| nc.name.as_str()).collect();
+            tracing::warn!(
+                networks = ?names,
+                "an exit node is selected on more than one network; only '{}' is used \
+                 (all traffic leaves through one default route). Clear the others with \
+                 `ray exit-node none`.",
+                names[0],
+            );
+        }
+        let selection = selected.into_iter().find_map(|nc| {
             let id = nc.exit_node_use.as_ref()?.parse::<EndpointId>().ok()?;
             let handle = self.networks.get(&nc.name)?;
             let s = handle.state.read().unwrap();

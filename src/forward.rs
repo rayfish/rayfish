@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::daemon::NetworkRegistry;
 use crate::dns;
-use crate::exit_node::{ExitClient, ExitContext};
+use crate::exit_node::{ExitClient, ExitContext, is_transitable};
 use crate::firewall::{self, Direction, SharedFirewall};
 use crate::membership::is_overlay_ip;
 use crate::peers::{DeviceUserMap, PeerRoute, PeerTable};
@@ -242,12 +242,16 @@ pub(crate) fn evaluate_inbound(
     }
     // Exit-node transit: a datagram bound for a non-overlay (internet) destination
     // is not for a mesh host at all. Forward it to the TUN (where the kernel NATs
-    // it out) only if we offer this sender an exit node on this network; otherwise
-    // drop it so a non-exit node never leaks a peer's traffic. `peer_id` is already
-    // the sender's user identity, matching the allow-list. The normal inbound
-    // firewall is bypassed: this is transit, not traffic addressed to us.
+    // it out) only if we offer this sender an exit node on this network *and* the
+    // destination is one the internet could reach anyway ([`is_transitable`]: not
+    // our LAN, loopback, or link-local/metadata). Otherwise drop it, so a non-exit
+    // node never leaks a peer's traffic and an exit offer never doubles as a way
+    // into the gateway's own network. `peer_id` is already the sender's user
+    // identity, matching the allow-list. The normal inbound firewall is bypassed:
+    // this is transit, not traffic addressed to us.
     if !is_overlay_ip(info.dst_ip) {
-        return if exit.server.allows(network, peer_id) {
+        let permitted = exit.server.allows(network, peer_id) && is_transitable(info.dst_ip);
+        return if permitted {
             InboundDecision::Accept
         } else {
             InboundDecision::DropExit
@@ -1145,16 +1149,21 @@ mod tests {
         ));
     }
 
-    /// A TCP packet from TEST_V4 to a public (non-overlay) destination.
-    fn make_public_packet() -> Vec<u8> {
+    /// A TCP packet from TEST_V4 to `dst`, a non-overlay destination.
+    fn make_packet_to(dst: [u8; 4]) -> Vec<u8> {
         let mut p = vec![0u8; 24];
         p[0] = 0x45; // IPv4, IHL=5
         p[9] = 6; // TCP
         p[12..16].copy_from_slice(&[100, 64, 0, 5]); // src (TEST_V4)
-        p[16..20].copy_from_slice(&[8, 8, 8, 8]); // dst 8.8.8.8 (internet)
+        p[16..20].copy_from_slice(&dst);
         p[22] = 1;
         p[23] = 0xbb; // dst port 443
         p
+    }
+
+    /// A TCP packet from TEST_V4 to a public (non-overlay) destination.
+    fn make_public_packet() -> Vec<u8> {
+        make_packet_to([8, 8, 8, 8]) // 8.8.8.8 (internet)
     }
 
     #[test]
@@ -1211,6 +1220,55 @@ mod tests {
                 "test-net"
             ),
             InboundDecision::DropExit
+        ));
+    }
+
+    #[test]
+    fn exit_transit_refuses_the_gateways_own_network() {
+        // An allowed exit client gets the internet, not the inside of the gateway:
+        // its LAN, its loopback, and above all the cloud metadata service (which
+        // hands out the gateway's instance credentials) are all refused.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = inbound_fw(Action::Allow, vec![]);
+        let exit = no_exit();
+        exit.server
+            .reload([("test-net", vec![peer.to_string()].as_slice())]);
+        for dst in [
+            [169, 254, 169, 254], // cloud instance metadata
+            [192, 168, 1, 1],     // the gateway's LAN router
+            [10, 0, 0, 5],        // RFC 1918
+            [172, 16, 0, 5],      // RFC 1918
+            [127, 0, 0, 1],       // the gateway's loopback
+            [224, 0, 0, 1],       // multicast
+        ] {
+            assert!(
+                matches!(
+                    evaluate_inbound(
+                        &make_packet_to(dst),
+                        &fw,
+                        &exit,
+                        &peer,
+                        TEST_V4,
+                        TEST_V6,
+                        "test-net"
+                    ),
+                    InboundDecision::DropExit
+                ),
+                "exit node transited a packet to {dst:?}, which is not on the internet"
+            );
+        }
+        // A genuinely public destination still goes through.
+        assert!(matches!(
+            evaluate_inbound(
+                &make_public_packet(),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::Accept
         ));
     }
 

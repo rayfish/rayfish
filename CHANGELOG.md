@@ -21,7 +21,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tunnel does not cut an existing SSH session to the host's public IP. The gateway
   (NAT/forwarding) and the client (full-tunnel routing with fwmark loop-prevention)
   are Linux-only in this release; the `allow` / advertise / `status` surface is
-  cross-platform.
+  cross-platform. An exit node is strictly an *internet* gateway: it forwards to
+  globally-routable addresses only, so permitting a peer to route out through you
+  never also hands it your private LAN, your loopback, or your cloud instance
+  metadata service.
 
 ### Fixed
 

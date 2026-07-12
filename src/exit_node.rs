@@ -14,7 +14,7 @@
 //! bundled for the data path as [`ExitContext`].
 
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::{fs, path::PathBuf, process::Command};
@@ -115,6 +115,43 @@ impl ExitServer {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = tun_name;
+    }
+}
+
+/// Whether an exit node will transit a packet to `dst`. An exit node is an
+/// *internet* gateway, so it forwards to globally-routable addresses only.
+///
+/// Everything the gateway can reach but the internet cannot is refused: its own
+/// loopback, its private LAN (RFC 1918 / unique-local), link-local (which on a
+/// cloud host includes `169.254.169.254`, the instance metadata service handing
+/// out credentials), multicast, and the unspecified/broadcast addresses. Without
+/// this, permitting a peer to route out through us would silently also hand it the
+/// inside of our network and our cloud identity. Reaching a gateway's LAN is a
+/// separate capability (a subnet router), not something an exit-node offer should
+/// imply.
+pub fn is_transitable(dst: IpAddr) -> bool {
+    match dst {
+        IpAddr::V4(ip) => {
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || ip.is_unspecified()
+                || ip.is_documentation()
+                // 100.64.0.0/10 (shared address space) is the overlay's own range,
+                // and 0.0.0.0/8 / 240.0.0.0/4 are not routable either.
+                || ip.octets()[0] == 0
+                || ip.octets()[0] >= 240)
+        }
+        IpAddr::V6(ip) => {
+            !(ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+                // fe80::/10 link-local and fc00::/7 unique-local.
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+                || (ip.segments()[0] & 0xfe00) == 0xfc00)
+        }
     }
 }
 
@@ -296,6 +333,10 @@ pub fn disable() {
 /// No-op off Linux: exit-node kernel state only exists there.
 #[cfg(not(target_os = "linux"))]
 pub fn disable() {}
+
+/// No-op off Linux: client full-tunnel routing only exists there.
+#[cfg(not(target_os = "linux"))]
+pub fn teardown_client_routing() {}
 
 /// Install the client full-tunnel: route all non-mesh traffic through the TUN, and
 /// keep two classes of traffic out of it.
@@ -519,6 +560,40 @@ mod tests {
         s.reload([("n", [].as_slice())]);
         assert!(!s.is_active());
         assert!(!s.allows("n", &iroh::SecretKey::generate().public()));
+    }
+
+    #[test]
+    fn only_globally_routable_destinations_transit() {
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+        ] {
+            assert!(
+                is_transitable(ip.parse().unwrap()),
+                "{ip} is on the internet and should transit"
+            );
+        }
+        for ip in [
+            "169.254.169.254", // cloud instance metadata
+            "192.168.1.1",     // LAN
+            "10.0.0.1",        // LAN
+            "172.16.0.1",      // LAN
+            "127.0.0.1",       // loopback
+            "0.0.0.0",         // unspecified
+            "255.255.255.255", // broadcast
+            "224.0.0.1",       // multicast
+            "::1",             // v6 loopback
+            "fe80::1",         // v6 link-local
+            "fd00::1",         // v6 unique-local
+            "ff02::1",         // v6 multicast
+        ] {
+            assert!(
+                !is_transitable(ip.parse().unwrap()),
+                "{ip} is reachable only from inside the gateway and must not transit"
+            );
+        }
     }
 
     #[test]
