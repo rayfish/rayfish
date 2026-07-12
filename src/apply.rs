@@ -117,7 +117,7 @@ fn normalize_nil(v: &mut config::Value) {
             v.kind = ValueKind::Table(config::Map::new());
         }
         ValueKind::Table(t) => {
-            for (_k, child) in t.iter_mut() {
+            for child in t.values_mut() {
                 normalize_nil(child);
             }
         }

@@ -108,7 +108,7 @@ pub async fn sync_network_hostnames(
     let mut t = table.write().await;
     // Drop reverse entries for the network's previous set before rebuilding.
     if let Some(old) = t.get(network) {
-        for (_, (v4, v6)) in old.iter() {
+        for (v4, v6) in old.values() {
             reverse.remove(&IpAddr::V4(*v4));
             reverse.remove(&IpAddr::V6(*v6));
         }
