@@ -6,7 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **The install script now lives in the repo** as `install.sh`, so the one command
+  users are asked to pipe into a root shell can be read, reviewed, and tested like
+  the rest of the code. CI lints it and installs the latest release with it on
+  Linux (glibc and musl) and macOS on every change. rayfish.xyz serves a copy of
+  this file, and its CI fails if the two drift apart.
+
 ### Fixed
+
+- **`curl -fsSL https://rayfish.xyz/install.sh | sh` works again.** The installer
+  detected the host OS inside a command substitution, which runs in a subshell, so
+  the value was lost in the caller and the script aborted with `OS: parameter not
+  set` on every Linux and macOS host. Reported in #95, fixed by @nemanjaglumac in
+  #97.
+
+- **The installer no longer asks for `sudo` when it doesn't need it.** Pointing
+  `INSTALL_DIR` at a path that didn't exist yet (`~/.local/bin`, typically) was
+  treated as "not writable", so the install escalated and left a root-owned
+  directory in the user's home. It now tests the nearest existing parent.
+
+- **The installer refuses to install a binary it can't verify.** A missing `.sha256`
+  sidecar silently skipped checksum verification. Every release publishes one, so a
+  missing sidecar now aborts the install (`RAY_SKIP_VERIFY=1` overrides).
 
 - **`ray mdns off` (and the other config-writing commands) now take effect on
   non-Linux hosts.** `ray mdns`, `ray auto-update`, `ray config set|unset`, and

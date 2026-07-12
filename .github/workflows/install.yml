@@ -1,0 +1,86 @@
+name: Install script
+
+# The install one-liner is piped straight into a root shell, so it gets the same
+# gate as the rest of the code: a linter and a real end-to-end run. The bug in
+# #95 (a global set inside a command substitution, lost in the caller) broke
+# every platform and shipped because nothing here ran it.
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - install.sh
+      - .github/workflows/install.yml
+  pull_request:
+    paths:
+      - install.sh
+      - .github/workflows/install.yml
+
+jobs:
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      # `local` is not POSIX but every shell that can be /bin/sh here implements
+      # it, so lint against dash rather than the stricter `sh` dialect.
+      - name: Shellcheck
+        run: shellcheck -s dash install.sh
+
+  # Actually install the latest release. This is the check that matters: the
+  # script's whole job is to put a working `ray` on the host.
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install into an unprivileged dir
+        run: |
+          set -eu
+          dir="$(mktemp -d)/bin"   # does not exist yet: must not demand sudo
+          INSTALL_DIR="$dir" sh ./install.sh
+          test -x "$dir/ray"
+          "$dir/ray" --version
+
+      - name: Install into the default dir (sudo path)
+        run: |
+          set -eu
+          sh ./install.sh
+          command -v ray
+          ray --version
+
+      - name: Fail loudly on a release that does not exist
+        run: |
+          set -eu
+          out="$(INSTALL_DIR="$(mktemp -d)" RAY_VERSION=v0.0.0-nope sh ./install.sh 2>&1 || true)"
+          case "$out" in
+            *"download failed"*) echo "ok: missing release rejected" ;;
+            *) echo "expected a download failure, got: $out"; exit 1 ;;
+          esac
+
+  # Non-glibc and old-glibc hosts take the musl detection path, which the
+  # runners themselves never exercise.
+  smoke-libc:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: alpine:3.20            # musl
+            deps: apk add --no-cache curl
+          - image: debian:11              # glibc 2.31, below the 2.35 build floor
+            deps: apt-get update -qq && apt-get install -y -qq curl ca-certificates
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install on ${{ matrix.image }}
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w ${{ matrix.image }} sh -c '
+            set -eu
+            ${{ matrix.deps }} >/dev/null
+            dir="$(mktemp -d)/bin"
+            INSTALL_DIR="$dir" sh ./install.sh
+            test -x "$dir/ray"'
