@@ -220,8 +220,7 @@ impl MeshCtx {
         // Keep the roster route map current with every peer we connect to, so a
         // later idle teardown can re-dial it on demand (reconverge covers the
         // roster-wide sync + removals; this is the incremental add).
-        self.route_map
-            .sync_add(network, ip, ipv6, peer_id);
+        self.route_map.sync_add(network, ip, ipv6, peer_id);
         self.peers.add(ip, ipv6, conn.clone(), peer_id, network)
     }
 }
@@ -1848,10 +1847,11 @@ mod headless_tests {
         // on panic, so this can't poison later tests.
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon = tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
-            .await
-            .expect("build_headless should not hang")
-            .expect("build_headless should succeed");
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
 
         // It returns a shared `Arc<DaemonState>`.
         assert!(Arc::strong_count(&daemon) >= 1);
@@ -1918,10 +1918,11 @@ mod headless_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon = tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
-            .await
-            .expect("build_headless should not hang")
-            .expect("build_headless should succeed");
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
 
         use std::sync::atomic::Ordering;
 

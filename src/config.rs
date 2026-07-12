@@ -301,8 +301,7 @@ fn parse_entries(value: &str) -> Vec<String> {
 /// The recognized `ray config` keys, for error messages. The list values
 /// (relay/discovery-dns/dns-upstreams) are set via `config set`; the on/off
 /// toggles (auto-update/on-demand) via their own `config` subcommands.
-const CONFIG_KEYS: &str =
-    "expected relay, discovery-dns, dns-upstreams, auto-update, or on-demand";
+const CONFIG_KEYS: &str = "expected relay, discovery-dns, dns-upstreams, auto-update, or on-demand";
 
 pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) -> Result<()> {
     let entries = parse_entries(value);
