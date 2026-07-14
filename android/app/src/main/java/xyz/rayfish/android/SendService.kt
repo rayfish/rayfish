@@ -1,7 +1,6 @@
 package xyz.rayfish.android
 
 import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
@@ -56,6 +55,17 @@ class SendService : Service() {
         // synchronous FFI call. One thread per start command; stop this startId
         // when its batch finishes so concurrent shares each clean up independently.
         thread(name = "rayfish-send-$startId") {
+            // sendFile does not return a transfer id, so we cannot name this batch's
+            // transfers directly. Instead snapshot every id already in the registry
+            // before offering anything: an OFFERED entry whose peer never accepts
+            // lives for the whole process, so counting "all outgoing pending"
+            // below would let one stale offer from an earlier batch pin every
+            // later send to the full wait timeout. Anything not in this snapshot
+            // was created by this batch.
+            val idsBeforeBatch = runCatching {
+                NodeHolder.get(applicationContext).listTransfers().mapTo(HashSet()) { it.id }
+            }.getOrDefault(emptySet())
+
             var offered = 0
             var failed = 0
             for (uri in uris) {
@@ -94,7 +104,10 @@ class SendService : Service() {
                     TransferNotifier.poll(applicationContext)
                     val pending = runCatching {
                         NodeHolder.get(applicationContext).listTransfers()
-                            .count { it.outgoing && (it.state == TransferState.OFFERED || it.state == TransferState.TRANSFERRING) }
+                            .count {
+                                it.outgoing && it.id !in idsBeforeBatch &&
+                                    (it.state == TransferState.OFFERED || it.state == TransferState.TRANSFERRING)
+                            }
                     }.getOrDefault(0)
                     if (pending == 0) break
                     Thread.sleep(POLL_INTERVAL_MS)
@@ -127,9 +140,9 @@ class SendService : Service() {
     }
 
     private fun startForegroundNotification(count: Int, peerName: String) {
-        ensureChannel()
+        TransferNotifier.ensureChannel(this)
         val label = if (count == 1) "1 item" else "$count items"
-        val notification: Notification = Notification.Builder(this, CHANNEL_ID)
+        val notification: Notification = Notification.Builder(this, TransferNotifier.CHANNEL_ID)
             .setContentTitle("Sending to $peerName")
             .setContentText("$label over Rayfish")
             .setSmallIcon(android.R.drawable.stat_sys_upload)
@@ -145,29 +158,23 @@ class SendService : Service() {
     /** Staging or offer failures only. Successful sends are reported per transfer by
      * [TransferNotifier] once the peer has actually pulled the bytes. */
     private fun notifyFailure(peerName: String, failed: Int) {
-        ensureChannel()
+        TransferNotifier.ensureChannel(this)
         val text = if (failed == 1) "Could not send 1 item to $peerName"
         else "Could not send $failed items to $peerName"
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )
-        val notification = Notification.Builder(this, CHANNEL_ID)
+        val notification = Notification.Builder(this, TransferNotifier.CHANNEL_ID)
             .setContentTitle("Rayfish")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_notify_error)
             .setAutoCancel(true)
             .setContentIntent(open)
             .build()
+        // A distinct id per call: two batches with the same failure count (e.g. one
+        // item each, to different peers) must not overwrite each other's notification.
         getSystemService(NotificationManager::class.java)
-            .notify(NOTIF_RESULT_BASE + failed, notification)
-    }
-
-    private fun ensureChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val channel = NotificationChannel(
-            CHANNEL_ID, "Rayfish file transfers", NotificationManager.IMPORTANCE_LOW,
-        ).apply { description = "Progress of files you share over Rayfish" }
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+            .notify(NOTIF_RESULT_BASE + failureNotifSeq.incrementAndGet(), notification)
     }
 
     private fun stopForegroundCompat() {
@@ -181,7 +188,6 @@ class SendService : Service() {
 
     companion object {
         private const val TAG = "RayfishSend"
-        private const val CHANNEL_ID = "rayfish_transfers"
         private const val NOTIF_ONGOING = 2
         private const val NOTIF_RESULT_BASE = 100
         // How long the foreground service waits for recipients to pull the bytes
@@ -189,6 +195,9 @@ class SendService : Service() {
         // longer than this; the transfer survives, only the foreground service ends.
         private const val WAIT_TIMEOUT_MS = 3 * 60 * 1000L
         private const val POLL_INTERVAL_MS = 1000L
+        // Distinguishes failure notifications from concurrent batches that would
+        // otherwise share the same NOTIF_RESULT_BASE + failed-count id.
+        private val failureNotifSeq = java.util.concurrent.atomic.AtomicInteger(0)
         const val EXTRA_PEER_ID = "xyz.rayfish.android.PEER_ID"
         const val EXTRA_PEER_NAME = "xyz.rayfish.android.PEER_NAME"
         const val EXTRA_URIS = "xyz.rayfish.android.URIS"

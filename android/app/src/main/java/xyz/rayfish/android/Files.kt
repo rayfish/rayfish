@@ -93,9 +93,18 @@ internal fun stageUriForSend(context: Context, uri: Uri): File? {
  * Gated by the user's opt-out toggle (default on). Idempotent: a process-lived set
  * of accepted ids prevents re-accepting the same offer across the many pollers that
  * call this (the foreground HomeScreen poll and the VpnService background poll).
+ *
+ * Accepts run on a small bounded pool rather than one raw thread per offer: with two
+ * pollers (HomeScreen every 2s, the VPN service every 4s) and no cap, a persistently
+ * failing offer would otherwise respawn an unbounded number of concurrent blocking
+ * downloads. Retries are also capped per offer id; past [MAX_ATTEMPTS] the id is left
+ * in [handled] for good so it stops being retried.
  */
 object FileAutoAccept {
     private val handled = java.util.Collections.synchronizedSet(HashSet<ULong>())
+    private val attempts = java.util.concurrent.ConcurrentHashMap<ULong, Int>()
+    private val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
+    private const val MAX_ATTEMPTS = 3
 
     /** Runs on the caller's coroutine context; callers dispatch it on IO. */
     fun run(context: Context) {
@@ -107,18 +116,25 @@ object FileAutoAccept {
         for (f in offers) {
             if (!f.ownDevice) continue
             if (!handled.add(f.id)) continue
-            // Accept on its own thread: acceptFileOffer blocks for the whole download,
-            // and the caller here is the same 4s poller that reports progress. The
-            // core registers the transfer, so TransferNotifier picks it up.
-            kotlin.concurrent.thread(name = "rayfish-accept-${f.id}") {
+            // acceptFileOffer blocks for the whole download; the bounded pool caps
+            // how many can run at once regardless of how many offers are pending.
+            // The core registers the transfer, so TransferNotifier picks it up.
+            executor.execute {
                 try {
                     node.acceptFileOffer(f.id, saveDir)
                     moveToDownloads(context, File(saveDir, f.filename), f.filename, f.mimeType)
+                    attempts.remove(f.id)
                     Log.i("RayfishFiles", "auto-accepted own-device file ${f.filename}")
                 } catch (t: Throwable) {
-                    // Let a later poll retry this id.
-                    handled.remove(f.id)
-                    Log.w("RayfishFiles", "auto-accept failed for ${f.filename}", t)
+                    val tries = attempts.merge(f.id, 1) { old, inc -> old + inc } ?: 1
+                    if (tries < MAX_ATTEMPTS) {
+                        // Let a later poll retry this id.
+                        handled.remove(f.id)
+                        Log.w("RayfishFiles", "auto-accept failed for ${f.filename}, will retry ($tries/$MAX_ATTEMPTS)", t)
+                    } else {
+                        // Give up: id stays in `handled` so no poller respawns it again.
+                        Log.w("RayfishFiles", "auto-accept giving up on ${f.filename} after $tries attempts", t)
+                    }
                 }
             }
         }
