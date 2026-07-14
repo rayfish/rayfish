@@ -163,10 +163,12 @@ object NodeHolder {
             runCatching { node?.stop() }
             started = false
         }
-        // The core's transfer ids restart at 1 on the next start(); reset the
-        // notifier's process-wide bookkeeping so a later transfer landing on a
-        // reused id is never muted by a stale terminal/postedProgress entry.
+        // The core's transfer and file-offer ids both restart at 1 on the next
+        // start(); reset the process-wide bookkeeping for each so a later
+        // transfer or offer landing on a reused id is never muted (or, for a
+        // given-up offer, wrongly left un-hidden) by a stale entry.
         TransferNotifier.reset(context)
+        FileAutoAccept.reset()
     }
 
     /**
