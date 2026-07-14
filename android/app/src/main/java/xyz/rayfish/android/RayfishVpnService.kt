@@ -108,6 +108,17 @@ class RayfishVpnService : VpnService() {
                 }
                 return if (standby) START_STICKY else START_NOT_STICKY
             }
+            ACTION_STANDBY -> {
+                // "Keep files working when the VPN is off", started explicitly
+                // from YouScreen while the tunnel is off. Must bring up the
+                // control plane only: never touch the Builder/establish() path,
+                // so it never contends for the single VpnService slot and never
+                // triggers the VPN consent dialog. enterStandby() is idempotent,
+                // so a repeat call (fast toggle off-then-on) is harmless.
+                Log.i(TAG, "ACTION_STANDBY received")
+                enterStandby()
+                return START_STICKY
+            }
             // An action-less start intent is the normal "turn the VPN on" path
             // (see HomeScreen / RayfishApp, which both start the service with a
             // plain Intent). It must reach startTunnel(), not be mistaken for
@@ -572,6 +583,7 @@ class RayfishVpnService : VpnService() {
         private const val CHANNEL_ID = "rayfish_vpn"
         private const val NOTIF_ID = 1
         const val ACTION_STOP = "xyz.rayfish.android.STOP"
+        const val ACTION_STANDBY = "xyz.rayfish.android.STANDBY"
 
         // Apps that misbehave behind a VPN (casting, RCS, local-device discovery).
         // Mirrors Tailscale's default Android exclusions. Excluded so they never
