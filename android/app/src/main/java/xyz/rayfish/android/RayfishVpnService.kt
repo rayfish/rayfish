@@ -187,6 +187,7 @@ class RayfishVpnService : VpnService() {
         // path below: previously a Builder throw escaped that path entirely and
         // was swallowed by the outer executor catch, leaving dnsProxy set with no
         // tunnel to serve and no standby fallback.
+        var builderThrew = false
         val pfd = try {
             val builder = Builder()
                 .setSession("Rayfish")
@@ -228,42 +229,22 @@ class RayfishVpnService : VpnService() {
             builder.establish()
         } catch (t: Throwable) {
             Log.e(TAG, "VpnService.Builder chain or establish() threw", t)
+            builderThrew = true
             null
         }
         if (pfd == null) {
             // establish() returns null precisely when we do not hold the single
             // VpnService slot (another VPN app, e.g. Tailscale, took it, or the
-            // user has none configured). With stay-online on, that is exactly
-            // the case standby exists for: the control plane (already brought up
-            // above) must keep running so files and mesh visibility survive,
-            // instead of tearing the whole service down under it.
-            val standby = NodeHolder.isStayOnline(applicationContext)
-            if (standby) {
-                Log.w(TAG, "establish() returned null (VPN slot likely unavailable); staying in standby, control plane stays up")
-                startForegroundNotification(standby = true)
-                // No tunnel exists for dnsProxy to serve (it was started above for
-                // a tunnel that never got built), so it would otherwise leak a
-                // bound socket and a thread on every retry of this path (the user
-                // re-tapping VPN on re-enters startTunnelBlocking and overwrites
-                // dnsProxy without stopping the old one). Stop and clear it here
-                // instead of restructuring the DNS setup to run after establish():
-                // that setup needs to happen before the tunnel is built so the
-                // resolver is pointed at the proxy from the first packet.
-                try {
-                    dnsProxy?.stop()
-                } catch (t: Throwable) {
-                    Log.w(TAG, "dnsProxy.stop() failed in standby fallback", t)
-                }
-                dnsProxy = null
-                // Standby's whole point is that files keep landing with the UI
-                // closed; without this the poller never starts on this path and
-                // that promise is broken. Idempotent, so a later real tunnel
-                // bring-up just no-ops here.
-                startAutoAcceptPoller()
+            // user has none configured); a Builder throw (malformed address) is
+            // the other way this branch is reached. Either way there is no
+            // tunnel, so this goes through the same recovery as a failed
+            // Node.up() below: see handleBringUpFailure.
+            val reason = if (builderThrew) {
+                "VpnService.Builder chain threw"
             } else {
-                Log.e(TAG, "VpnService.Builder.establish() returned null; tunnel not up, stopping service")
-                stopSelf()
+                "VpnService.Builder.establish() returned null (VPN slot likely unavailable)"
             }
+            handleBringUpFailure(reason)
             return
         }
         tunnel = pfd
@@ -287,18 +268,54 @@ class RayfishVpnService : VpnService() {
         try {
             NodeHolder.get(applicationContext).up(pfd.detachFd())
             Log.i(TAG, "Node.up succeeded")
+            startAutoAcceptPoller()
         } catch (t: Throwable) {
             Log.e(TAG, "Node bring-up failed", t)
             // up() threw after detachFd() handed the fd to Rust, so this
             // ParcelFileDescriptor no longer owns anything worth keeping around.
-            // Leaving tunnel non-null would make the next startTunnelBlocking's
-            // `if (tunnel != null) return` guard believe the tunnel is already
-            // up and skip rebuilding it; null it so a retry can rebuild from
-            // scratch instead of needing a full stop first.
-            tunnel = null
+            // This is the third way tunnel bring-up can fail (the other two are
+            // establish() returning null and the Builder chain throwing, above):
+            // it needs exactly the same recovery, so it goes through the same
+            // helper instead of a divergent one that leaves dnsProxy orphaned and
+            // the notification claiming a tunnel that isn't there.
+            handleBringUpFailure("Node.up() threw")
         }
+    }
 
-        startAutoAcceptPoller()
+    /**
+     * Common recovery for every way tunnel bring-up can fail: establish()
+     * returning null, the Builder chain throwing, or Node.up() throwing. Stops
+     * and clears dnsProxy (nothing left to serve; leaving it running leaks a
+     * bound socket and a thread on every retry of startTunnelBlocking, since
+     * DnsProxy.start() overwrites the field without stopping the old one).
+     * tunnel is left null so a retry can rebuild the tunnel from scratch
+     * instead of needing a full stop first.
+     *
+     * Then: with stay-online on, this is exactly the case standby exists for,
+     * so the control plane (already brought up earlier in
+     * startTunnelBlocking) keeps running, the standby notification replaces
+     * whatever startForegroundNotification() posted at the top of
+     * startTunnel(), and the poller starts so files keep landing. With
+     * stay-online off there is nothing left to keep the service alive for.
+     */
+    private fun handleBringUpFailure(reason: String) {
+        tunnel = null
+        try {
+            dnsProxy?.stop()
+        } catch (t: Throwable) {
+            Log.w(TAG, "dnsProxy.stop() failed during bring-up failure recovery", t)
+        }
+        dnsProxy = null
+
+        val standby = NodeHolder.isStayOnline(applicationContext)
+        if (standby) {
+            Log.w(TAG, "$reason; staying in standby, control plane stays up")
+            startForegroundNotification(standby = true)
+            startAutoAcceptPoller()
+        } else {
+            Log.e(TAG, "$reason; tunnel not up, stopping service")
+            stopSelf()
+        }
     }
 
     /**
@@ -413,6 +430,21 @@ class RayfishVpnService : VpnService() {
     private fun stopTunnel(standby: Boolean) {
         try {
             if (standby) {
+                // NodeHolder.started is a process-level flag and RayfishApp
+                // deliberately never calls ensureStarted (it only observes), so
+                // ACTION_STOP/onRevoke can reach this branch on a fresh service
+                // instance where the node was never started (e.g. the VPN slot
+                // was already taken when the app launched, so the service never
+                // ran startTunnelBlocking). Without this, downNode() below is a
+                // no-op, the poller starts polling a node that was never up, and
+                // the notification we already posted ("Online, VPN off · files
+                // still work") is a lie. Idempotent, so this is a no-op if the
+                // node is already started.
+                try {
+                    runBlocking { NodeHolder.ensureStarted(applicationContext) }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "stopTunnel: standby ensureStarted failed; mesh visibility and file transfer will not work until this recovers", t)
+                }
                 Log.i(TAG, "stopTunnel: Node.down (standby, control plane stays up)")
                 NodeHolder.downNode(applicationContext)
                 // Every standby path must start the poller by construction, not
