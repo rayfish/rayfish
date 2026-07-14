@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iroh_blobs::Hash;
@@ -167,6 +167,44 @@ impl TransferRegistry {
         let mut out: Vec<TransferInfo> = entries.values().map(|e| e.info.clone()).collect();
         out.sort_by_key(|t| t.id);
         out
+    }
+}
+
+/// Guards a registered transfer against a cancelled future leaving it stuck in
+/// `Transferring` forever. Held across every fallible step of a receive; its
+/// `Drop` marks the transfer failed unless [`FinishGuard::success`] disarmed
+/// it first. Cheap and unconditionally correct: the only way to reach `Done`
+/// is through `success`, so a dropped future (or an early `return`) can never
+/// leave a completion notification pointing at a file that was never written.
+pub struct FinishGuard {
+    registry: Arc<TransferRegistry>,
+    id: u64,
+    armed: bool,
+}
+
+impl FinishGuard {
+    pub fn new(registry: Arc<TransferRegistry>, id: u64) -> Self {
+        Self {
+            registry,
+            id,
+            armed: true,
+        }
+    }
+
+    /// Mark the transfer done and disarm the guard. Call this only once the
+    /// work the transfer represents (fetch + write to disk) has fully
+    /// succeeded.
+    pub fn success(mut self) {
+        self.armed = false;
+        self.registry.finish(self.id, true);
+    }
+}
+
+impl Drop for FinishGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.finish(self.id, false);
+        }
     }
 }
 

@@ -221,22 +221,24 @@ impl FileService {
             }
         };
 
-        let peer_label = pending_file
-            .from
-            .to_string()
-            .chars()
-            .take(8)
-            .collect::<String>();
+        let peer_label = pending_file.from.fmt_short().to_string();
         let transfer_id = self.transfers.register_receive(
             peer_label,
             pending_file.filename.clone(),
             pending_file.size,
         );
+        // Guards against a cancelled fetch (or an early return below) leaving
+        // the entry stuck in `Transferring`: its `Drop` marks the transfer
+        // failed unless `success()` disarms it first, which only happens once
+        // the file is actually on disk.
+        let finish_guard = transfers::FinishGuard::new(self.transfers.clone(), transfer_id);
 
         // `fetch` returns a `GetProgress`: awaiting it directly discards the
         // progress, so take the stream instead and report bytes as they land. It
         // yields `Progress(n)` items (n = payload bytes read so far) and exactly
-        // one terminal `Done`/`Error` item.
+        // one terminal `Done`/`Error` item. Note: reaching `Done` here means only
+        // the fetch succeeded, not the transfer; the registry is not finished
+        // until the file is written to disk below.
         let mut stream = Box::pin(
             self.transport
                 .blob_store
@@ -247,16 +249,11 @@ impl FileService {
         loop {
             match stream.next().await {
                 Some(GetProgressItem::Progress(n)) => self.transfers.note_progress(transfer_id, n),
-                Some(GetProgressItem::Done(_)) => {
-                    self.transfers.finish(transfer_id, true);
-                    break;
-                }
+                Some(GetProgressItem::Done(_)) => break,
                 Some(GetProgressItem::Error(e)) => {
-                    self.transfers.finish(transfer_id, false);
                     return ipc_err(format!("blob fetch failed: {e}"));
                 }
                 None => {
-                    self.transfers.finish(transfer_id, false);
                     return ipc_err("blob fetch ended without a result".to_string());
                 }
             }
@@ -296,6 +293,10 @@ impl FileService {
                 unsafe { libc::chown(c.as_ptr(), uid, gid) };
             }
         }
+
+        // The file is fully on disk (chown failures are ignored, by design,
+        // and never fail the transfer): only now is the transfer really done.
+        finish_guard.success();
 
         IpcMessage::Ok {
             message: format!("saved to {}", dest.display()),
