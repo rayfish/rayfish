@@ -56,15 +56,21 @@ class SendService : Service() {
         // when its batch finishes so concurrent shares each clean up independently.
         thread(name = "rayfish-send-$startId") {
             // sendFile does not return a transfer id, so we cannot name this batch's
-            // transfers directly. Instead snapshot every id already in the registry
-            // before offering anything: an OFFERED entry whose peer never accepts
-            // lives for the whole process, so counting "all outgoing pending"
-            // below would let one stale offer from an earlier batch pin every
-            // later send to the full wait timeout. Anything not in this snapshot
-            // was created by this batch.
-            val idsBeforeBatch = runCatching {
-                NodeHolder.get(applicationContext).listTransfers().mapTo(HashSet()) { it.id }
-            }.getOrDefault(emptySet())
+            // transfers directly. Instead bound them from both sides: take the max
+            // id already in the registry before offering anything, then again right
+            // after the offer loop finishes. This batch's transfers are exactly the
+            // ones present in the "after" snapshot with an id greater than the "before"
+            // max: newly created since we started, and already known to the registry
+            // by the time we start waiting.
+            //
+            // A single before-only snapshot is not enough with two concurrent shares:
+            // if batch B starts offering while batch A is still in its wait loop, B's
+            // ids are not in A's before-snapshot either, so A's "not in snapshot" count
+            // would include every one of B's transfers too. If B's peer never accepts,
+            // A would burn the full wait timeout for a file it delivered in seconds.
+            val maxIdBeforeBatch = runCatching {
+                NodeHolder.get(applicationContext).listTransfers().maxOfOrNull { it.id.toLong() } ?: -1L
+            }.getOrNull()
 
             var offered = 0
             var failed = 0
@@ -87,6 +93,15 @@ class SendService : Service() {
                 }
             }
 
+            val batchIds = if (maxIdBeforeBatch == null) {
+                null
+            } else {
+                runCatching {
+                    NodeHolder.get(applicationContext).listTransfers()
+                        .mapNotNullTo(HashSet()) { it.id.takeIf { id -> id.toLong() > maxIdBeforeBatch } }
+                }.getOrNull()
+            }
+
             // The offers are delivered, but the bytes have not moved: the peer pulls
             // them when it accepts. Stay foreground and let TransferNotifier report
             // real progress until every transfer reaches a terminal state, so the
@@ -98,20 +113,26 @@ class SendService : Service() {
             // it keeps running in the core, and the background poller in
             // RayfishVpnService posts the result whenever it lands, provided the node
             // is still alive (VPN on, or the stay-online pref).
-            if (offered > 0) {
+            //
+            // If either snapshot failed, we cannot bound this batch at all: waiting
+            // on an unscoped count would silently reinstate the same bug the scoping
+            // was meant to kill, so don't wait rather than wait on everything.
+            if (offered > 0 && batchIds != null) {
                 val deadline = System.currentTimeMillis() + WAIT_TIMEOUT_MS
                 while (System.currentTimeMillis() < deadline) {
                     TransferNotifier.poll(applicationContext)
                     val pending = runCatching {
                         NodeHolder.get(applicationContext).listTransfers()
                             .count {
-                                it.outgoing && it.id !in idsBeforeBatch &&
+                                it.outgoing && it.id in batchIds &&
                                     (it.state == TransferState.OFFERED || it.state == TransferState.TRANSFERRING)
                             }
                     }.getOrDefault(0)
                     if (pending == 0) break
                     Thread.sleep(POLL_INTERVAL_MS)
                 }
+                TransferNotifier.poll(applicationContext)
+            } else if (offered > 0) {
                 TransferNotifier.poll(applicationContext)
             }
 

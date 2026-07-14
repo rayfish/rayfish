@@ -33,7 +33,7 @@ object TransferNotifier {
     // registry (Critical 1a) without ever having reached a terminal state we
     // observed ourselves.
     private val postedProgress = java.util.Collections.synchronizedSet(HashSet<ULong>())
-    private var channelEnsured = false
+    @Volatile private var channelEnsured = false
     private var cancelledStaleOnStart = false
 
     /**
@@ -73,14 +73,25 @@ object TransferNotifier {
         }
     }
 
-    /** Cancel every ongoing notification on our channel, regardless of what it is
-     * for. Only called once, before this process has posted anything of its own. */
+    /** Cancel any ongoing notification left over from a previous process, on our
+     * channel and in our own id range. Only called once, before this process has
+     * posted anything of its own.
+     *
+     * This must never be able to touch SendService's live foreground notification:
+     * on a cold share the foreground notification is posted (id 2, same channel,
+     * ongoing) before the send thread's first poll, so a sweep that only checked
+     * channel + FLAG_ONGOING_EVENT would match it too. Two guards keep it out:
+     * FLAG_FOREGROUND_SERVICE (a foreground notification always carries it) and
+     * the id range (our own notifications are all >= NOTIF_BASE; SendService's
+     * ids are below it). */
     private fun cancelStaleOngoingNotifications(context: Context) {
         if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O) return
         val nm = context.getSystemService(NotificationManager::class.java)
         runCatching {
             for (sbn in nm.activeNotifications) {
                 val n = sbn.notification
+                if (sbn.id < NOTIF_BASE) continue
+                if ((n.flags and Notification.FLAG_FOREGROUND_SERVICE) != 0) continue
                 if (n.channelId == CHANNEL_ID && (n.flags and Notification.FLAG_ONGOING_EVENT) != 0) {
                     nm.cancel(sbn.id)
                 }
@@ -89,10 +100,16 @@ object TransferNotifier {
     }
 
     /** Anything we posted a progress bar for that has since left the registry
-     * (transfer completed and its 60s window elapsed, or it was never observed
-     * reaching a terminal state) is stale: cancel it so it cannot outlive the
-     * transfer it describes. Also prunes [terminal] so it does not grow forever
-     * (minor 6). */
+     * without ever reaching a terminal state we observed (the process died and
+     * restarted mid-transfer, or the entry simply vanished) is stale: cancel it
+     * so it cannot outlive the transfer it describes.
+     *
+     * A result notification's id is removed from [postedProgress] by [postResult]
+     * itself, precisely so this loop can never reach it: once a result is posted,
+     * that notification is done and permanent (until the user dismisses it or
+     * taps it), it must not be cancelled just because the terminal entry aged out
+     * of the registry 60s later. Also prunes [terminal] so it does not grow
+     * forever (minor 6). */
     private fun pruneVanished(context: Context, liveIds: Set<ULong>) {
         val nm = context.getSystemService(NotificationManager::class.java)
         val vanished = postedProgress.filter { it !in liveIds }
@@ -141,6 +158,12 @@ object TransferNotifier {
     }
 
     private fun postResult(context: Context, t: uniffi.ray_mobile.Transfer) {
+        // This id no longer names an ongoing notification: it is about to become a
+        // result notification instead. Drop it from postedProgress so pruneVanished
+        // can never mistake the result for a vanished progress bar and cancel it out
+        // from under the user 60s later when the terminal entry ages out of the
+        // registry (Critical 1).
+        postedProgress.remove(t.id)
         ensureChannel(context)
         val ok = t.state == TransferState.DONE
         val title = when {
@@ -185,13 +208,20 @@ object TransferNotifier {
      * reuses it instead of declaring its own. */
     internal fun ensureChannel(context: Context) {
         if (channelEnsured) return
-        channelEnsured = true
-        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O) return
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O) {
+            channelEnsured = true
+            return
+        }
         val channel = NotificationChannel(
             CHANNEL_ID,
             "File transfers",
             NotificationManager.IMPORTANCE_LOW,
         ).apply { description = "Progress and results for files sent and received over the mesh" }
         context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        // Set only after the channel actually exists: another thread reading
+        // channelEnsured == true before createNotificationChannel returns could
+        // notify() on a channel the platform doesn't know about yet and have the
+        // notification silently dropped.
+        channelEnsured = true
     }
 }
