@@ -87,8 +87,14 @@ class RayfishVpnService : VpnService() {
                 nodeExecutor.execute {
                     stopTunnel(standby)
                     if (!standby) {
-                        Log.i(TAG, "stopTunnel returned; calling stopSelf()")
-                        stopSelf()
+                        // stopSelf(startId), not the bare stopSelf(): fast off-then-on
+                        // toggling queues this stop behind a start that already
+                        // landed. stopSelf(startId) is a no-op once a newer start
+                        // command has been delivered, so it only kills the service
+                        // if no start arrived after this one; the bare form would
+                        // kill it either way and undo the newer start's tunnel.
+                        Log.i(TAG, "stopTunnel returned; calling stopSelf(startId=$startId)")
+                        stopSelf(startId)
                     }
                 }
                 return if (standby) START_STICKY else START_NOT_STICKY
@@ -191,10 +197,27 @@ class RayfishVpnService : VpnService() {
             }
         }
 
-        val pfd = builder.establish()
+        val pfd = try {
+            builder.establish()
+        } catch (t: Throwable) {
+            Log.e(TAG, "VpnService.Builder.establish() threw", t)
+            null
+        }
         if (pfd == null) {
-            Log.e(TAG, "VpnService.Builder.establish() returned null; tunnel not up")
-            stopSelf()
+            // establish() returns null precisely when we do not hold the single
+            // VpnService slot (another VPN app, e.g. Tailscale, took it, or the
+            // user has none configured). With stay-online on, that is exactly
+            // the case standby exists for: the control plane (already brought up
+            // above) must keep running so files and mesh visibility survive,
+            // instead of tearing the whole service down under it.
+            val standby = NodeHolder.isStayOnline(applicationContext)
+            if (standby) {
+                Log.w(TAG, "establish() returned null (VPN slot likely unavailable); staying in standby, control plane stays up")
+                startForegroundNotification(standby = true)
+            } else {
+                Log.e(TAG, "VpnService.Builder.establish() returned null; tunnel not up, stopping service")
+                stopSelf()
+            }
             return
         }
         tunnel = pfd
@@ -239,8 +262,12 @@ class RayfishVpnService : VpnService() {
             } catch (t: Throwable) {
                 Log.e(TAG, "standby bring-up failed", t)
             }
+            // Moved inside the executor task: autoAcceptPoller (like dnsProxy) is
+            // only read and written from nodeExecutor's thread (startTunnelBlocking,
+            // stopTunnel). Calling this from the main thread, as before, made it the
+            // one field touched from two threads with no lock between them.
+            startAutoAcceptPoller()
         }
-        startAutoAcceptPoller()
     }
 
     /**
@@ -341,8 +368,15 @@ class RayfishVpnService : VpnService() {
         tunnel = null
 
         // The DNS proxy exists to serve the tunnel's resolver; with no tunnel there
-        // is nothing pointed at it. Torn down in both cases.
-        dnsProxy?.stop()
+        // is nothing pointed at it. Torn down in both cases. Wrapped: this runs on
+        // nodeExecutor via execute(), so an uncaught throwable here would reach the
+        // default uncaught-exception handler and kill the process, skipping the
+        // dnsProxy = null reset and the poller shutdown below.
+        try {
+            dnsProxy?.stop()
+        } catch (t: Throwable) {
+            Log.w(TAG, "dnsProxy.stop() failed", t)
+        }
         dnsProxy = null
 
         // Keep the poller running in standby (files still work); shut it down on a
