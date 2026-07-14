@@ -179,8 +179,8 @@ async fn build_daemon(
     .await?;
 
     // Built before the blob store below, because the provider event pump that
-    // feeds it (an upcoming send-side wiring) attaches to `BlobsProtocol` at
-    // construction and needs the same registry.
+    // feeds it (a bit further down, once `blobs_proto` exists) needs the
+    // registry to already be there to hand transfer updates to.
     let transfers = Arc::new(transfers::TransferRegistry::new());
 
     // --- Content-addressed blob store (membership/file transfer) ---
