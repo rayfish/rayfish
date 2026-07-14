@@ -133,8 +133,9 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                     // single VpnService slot (and pop the consent dialog),
                     // which is exactly what this toggle exists to avoid when
                     // another VPN (Tailscale) is meant to hold that slot.
-                    // ACTION_STANDBY routes straight to enterStandby(), and is
-                    // already a no-op there when a tunnel is up.
+                    // ACTION_STANDBY routes to enterStandbyBlocking() on nodeExecutor.
+                    // If a tunnel is up, it re-posts the notification to correct text
+                    // instead of entering standby.
                     ContextCompat.startForegroundService(
                         context,
                         Intent(context, RayfishVpnService::class.java).apply {
