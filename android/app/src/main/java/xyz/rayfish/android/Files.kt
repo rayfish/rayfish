@@ -107,14 +107,19 @@ object FileAutoAccept {
         for (f in offers) {
             if (!f.ownDevice) continue
             if (!handled.add(f.id)) continue
-            try {
-                node.acceptFileOffer(f.id, saveDir)
-                moveToDownloads(context, File(saveDir, f.filename), f.filename, f.mimeType)
-                Log.i("RayfishFiles", "auto-accepted own-device file ${f.filename}")
-            } catch (t: Throwable) {
-                // Let a later poll retry this id.
-                handled.remove(f.id)
-                Log.w("RayfishFiles", "auto-accept failed for ${f.filename}", t)
+            // Accept on its own thread: acceptFileOffer blocks for the whole download,
+            // and the caller here is the same 4s poller that reports progress. The
+            // core registers the transfer, so TransferNotifier picks it up.
+            kotlin.concurrent.thread(name = "rayfish-accept-${f.id}") {
+                try {
+                    node.acceptFileOffer(f.id, saveDir)
+                    moveToDownloads(context, File(saveDir, f.filename), f.filename, f.mimeType)
+                    Log.i("RayfishFiles", "auto-accepted own-device file ${f.filename}")
+                } catch (t: Throwable) {
+                    // Let a later poll retry this id.
+                    handled.remove(f.id)
+                    Log.w("RayfishFiles", "auto-accept failed for ${f.filename}", t)
+                }
             }
         }
     }
