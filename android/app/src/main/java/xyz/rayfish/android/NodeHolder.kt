@@ -48,6 +48,14 @@ object NodeHolder {
     // surfaced as FileOffer.own_device; this toggle is only the opt-out.
     private const val KEY_AUTO_ACCEPT_OWN = "auto_accept_own_devices"
 
+    // Keep the control plane connected when the VPN tunnel is off, so file send
+    // and receive keep working and the device stays visible in the mesh. Default
+    // off: it holds a network connection open in the background. The motivating
+    // case is running another VPN (Android allows only one VpnService at a time,
+    // and our tunnel claims the same 100.64.0.0/10 range Tailscale uses), so the
+    // tunnel goes away and only the data plane goes with it.
+    private const val KEY_STAY_ONLINE = "stay_online"
+
     fun isEnabled(context: Context): Boolean =
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -68,6 +76,17 @@ object NodeHolder {
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_AUTO_ACCEPT_OWN, value).apply()
+    }
+
+    fun isStayOnline(context: Context): Boolean =
+        context.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_STAY_ONLINE, false)
+
+    fun setStayOnline(context: Context, value: Boolean) {
+        context.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_STAY_ONLINE, value).apply()
     }
 
     fun isCrashReportingEnabled(context: Context): Boolean =
@@ -143,6 +162,22 @@ object NodeHolder {
         synchronized(this) {
             runCatching { node?.stop() }
             started = false
+        }
+    }
+
+    /**
+     * Standby: tear the data plane down (TUN detached) but keep the control plane
+     * connected, so files still flow and the device stays online in the mesh. This
+     * is the mobile equivalent of desktop `ray down`.
+     *
+     * Deliberately does NOT clear [started]: the daemon stays built, so a later
+     * enable is a plain Node.up(fd) with no rebuild (near-instant, like `ray up`).
+     * No-op if the node was never started.
+     */
+    fun downNode(context: Context) {
+        synchronized(this) {
+            if (!started) return
+            runCatching { node?.down() }
         }
     }
 }
