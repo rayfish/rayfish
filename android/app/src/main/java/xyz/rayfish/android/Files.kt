@@ -16,6 +16,30 @@ import java.util.UUID
  */
 
 /**
+ * Whether the most recent [moveToDownloads] call for a given filename actually
+ * landed the file in the public Downloads collection, so [TransferNotifier] can
+ * report the truth instead of assuming Downloads whenever a receive completes.
+ *
+ * Keyed by filename rather than transfer id: the accept call site (FileAutoAccept,
+ * or HomeScreen's manual Save) and the later TransferNotifier poll that reports
+ * the terminal result are on different call chains with no transfer id in common
+ * at accept time. A same-name collision between two receives in flight at once is
+ * an accepted rough edge, not a correctness requirement here.
+ */
+internal object DownloadsOutcome {
+    private val outcomes = java.util.Collections.synchronizedMap(HashMap<String, Boolean>())
+
+    fun record(filename: String, reachedDownloads: Boolean) {
+        outcomes[filename] = reachedDownloads
+    }
+
+    /** Consumes (removes) the recorded outcome so a later receive reusing the same
+     * filename does not read a stale value. Defaults to false (the neutral "Saved"
+     * copy, no Downloads tap target) when nothing was recorded. */
+    fun consume(filename: String): Boolean = outcomes.remove(filename) ?: false
+}
+
+/**
  * Copy [src] into the device's public Downloads collection via MediaStore and
  * delete the app-private staging copy. Returns true on success. On API < 29
  * (no scoped MediaStore Downloads) it leaves the file in place and returns
@@ -142,7 +166,8 @@ object FileAutoAccept {
             executor.execute {
                 try {
                     node.acceptFileOffer(f.id, saveDir)
-                    moveToDownloads(context, File(saveDir, f.filename), f.filename, f.mimeType)
+                    val reached = moveToDownloads(context, File(saveDir, f.filename), f.filename, f.mimeType)
+                    DownloadsOutcome.record(f.filename, reached)
                     attempts.remove(f.id)
                     Log.i("RayfishFiles", "auto-accepted own-device file ${f.filename}")
                 } catch (t: Throwable) {

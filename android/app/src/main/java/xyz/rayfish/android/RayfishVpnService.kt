@@ -41,15 +41,6 @@ class RayfishVpnService : VpnService() {
     // shared to this device land in Downloads even with the app UI closed.
     private var autoAcceptPoller: ScheduledExecutorService? = null
 
-    // Serializes bring-up (startTunnel/enterStandby) and teardown (stopTunnel) so
-    // they can never interleave. Both read and write the tunnel/dnsProxy fields;
-    // running them on the same single-threaded executor means a queued task only
-    // starts once the previous one has fully finished, so an off-then-on always
-    // ends with the tunnel up and an on-then-off always ends in standby/offline,
-    // regardless of how quickly the two requests arrive. Neither task may run on
-    // the main thread: both block on FFI calls into the Rust core.
-    private val nodeExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null) {
             // A genuinely null intent means the system restarted us after killing
@@ -410,7 +401,15 @@ class RayfishVpnService : VpnService() {
             startForegroundNotification(standby = true)
             startAutoAcceptPoller()
         } else {
-            Log.e(TAG, "$reason; tunnel not up, stopping service (startId=$startId)")
+            // With stay-online off, "VPN off" must mean fully offline. Without
+            // this, startTunnelBlocking's ensureStarted call above already
+            // brought the control plane up before the tunnel build failed, and
+            // nothing else would ever stop it: the daemon would keep its mesh
+            // connection open and the device would stay visible to peers with
+            // both the VPN toggle and stay-online off, contradicting what the
+            // user asked for.
+            Log.e(TAG, "$reason; tunnel not up and stay-online off, stopping node and service (startId=$startId)")
+            NodeHolder.stopNode(applicationContext)
             stopSelf(startId)
         }
     }
@@ -634,7 +633,14 @@ class RayfishVpnService : VpnService() {
                 Log.e(TAG, "onDestroy teardown task crashed", t)
             }
         }
-        nodeExecutor.shutdown()
+        // nodeExecutor is process-wide (see the companion object), not shut down
+        // here: a fast off-then-on can create a brand new service instance while
+        // this queued teardown is still running or waiting its turn, and that new
+        // instance's bring-up must serialize behind this task on the very same
+        // executor. Shutting it down would either reject the new instance's work
+        // or, if it raced ahead, run the two instances' bring-up/teardown on two
+        // different executors with no ordering between them at all, which is the
+        // bug this design exists to prevent.
         super.onDestroy()
     }
 
@@ -675,6 +681,22 @@ class RayfishVpnService : VpnService() {
         private const val TAG = "RayfishVpn"
         private const val CHANNEL_ID = "rayfish_vpn"
         private const val NOTIF_ID = 1
+
+        // Serializes bring-up (startTunnel/enterStandby) and teardown (stopTunnel)
+        // so they can never interleave. Process-wide, not per-instance: Android can
+        // destroy this service and create a fresh instance (a new nodeExecutor,
+        // were it an instance field) while the old instance's queued teardown is
+        // still running, e.g. a fast VPN off-then-on. A per-instance executor would
+        // let the two instances' bring-up and teardown run unserialized against
+        // each other, which is exactly the interleaving this executor exists to
+        // rule out. One executor for the whole process closes that gap: every
+        // instance's work queues on the same thread, so a queued task only starts
+        // once the previous one (from any instance) has fully finished. Never shut
+        // down (see onDestroy): it outlives any single service instance by design.
+        // Neither task may run on the main thread: both block on FFI calls into the
+        // Rust core.
+        private val nodeExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
         const val ACTION_STOP = "xyz.rayfish.android.STOP"
         const val ACTION_STANDBY = "xyz.rayfish.android.STANDBY"
         const val ACTION_EXIT_STANDBY = "xyz.rayfish.android.EXIT_STANDBY"

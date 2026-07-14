@@ -24,10 +24,16 @@ import uniffi.ray_mobile.TransferState
  * otherwise a manual Save) and pulls the bytes from our blob store when it
  * accepts, which can be minutes later or never. This service stays foreground
  * and reports real per-transfer progress via [TransferNotifier] until every
- * offer reaches a terminal state or [WAIT_TIMEOUT_MS] passes; after that the
- * background poller in [RayfishVpnService] finishes the job, provided the node
- * stays online (the VPN service, or the control plane brought up by
- * ensureStarted).
+ * offer reaches a terminal state or [WAIT_TIMEOUT_MS] passes; after that, the
+ * only thing left that can report a result is [RayfishVpnService]'s background
+ * poller, and that only runs while some instance of that service is actually
+ * alive (the VPN on, or stay-online keeping it in standby). A plain
+ * `NodeHolder.ensureStarted` with no `RayfishVpnService` running (e.g.
+ * `ShareActivity` sharing with the VPN off and stay-online off) starts no
+ * poller at all: the transfer still completes in the core, but nobody is
+ * listening, so the result notification never arrives. [TransferNotifier]'s
+ * "waiting" notification says this plainly rather than implying a result
+ * notification is always coming.
  *
  * Each shared URI is staged to the app cache (the grant rides in on the start
  * intent's ClipData + FLAG_GRANT_READ_URI_PERMISSION), sent, then deleted.

@@ -23,6 +23,7 @@ import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.FileOffer
 import uniffi.ray_mobile.PendingRequest
 import uniffi.ray_mobile.Status
+import xyz.rayfish.android.DownloadsOutcome
 import xyz.rayfish.android.FileAutoAccept
 import xyz.rayfish.android.NodeHolder
 import xyz.rayfish.android.RayfishVpnService
@@ -149,7 +150,8 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
             try {
                 withContext(Dispatchers.IO) {
                     NodeHolder.get(context).acceptFileOffer(f.id, saveDir)
-                    moveToDownloads(context, File(saveDir, f.filename), f.filename, f.mimeType)
+                    val reached = moveToDownloads(context, File(saveDir, f.filename), f.filename, f.mimeType)
+                    DownloadsOutcome.record(f.filename, reached)
                 }
                 accepting.remove(f.id)
                 doneFiles[f.id] = f
