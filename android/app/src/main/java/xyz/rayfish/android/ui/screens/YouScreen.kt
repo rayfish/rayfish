@@ -119,13 +119,14 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             onCheckedChange = { on ->
                 stayOnline = on
                 NodeHolder.setStayOnline(context, on)
-                // If the VPN tunnel is up (NodeHolder.isEnabled), leave it alone in
-                // either direction: this only changes what happens at the next
-                // teardown. Otherwise drive the service now, since with the VPN off
-                // nothing else reacts to this pref: RayfishApp only starts the
-                // service when isEnabled is true, and never calls ensureStarted
-                // itself.
-                if (!NodeHolder.isEnabled(context)) {
+                // If the VPN is actually running (status.running, the real data-plane
+                // state, not the persisted isEnabled intent), leave it alone in either
+                // direction: this only changes what happens at the next teardown.
+                // Otherwise drive the service now, since with the VPN off nothing else
+                // reacts to this pref: RayfishApp's launch restore is the only other
+                // place that starts the service from these prefs, and that only runs
+                // once at launch.
+                if (status?.running != true) {
                     if (on) {
                         // Bring the control plane up only, never a tunnel: a plain
                         // intent would land in startTunnel() and try to grab the

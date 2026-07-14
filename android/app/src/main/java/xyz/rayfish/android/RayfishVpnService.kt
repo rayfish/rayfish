@@ -116,6 +116,14 @@ class RayfishVpnService : VpnService() {
                 // triggers the VPN consent dialog. enterStandby() is idempotent,
                 // so a repeat call (fast toggle off-then-on) is harmless.
                 Log.i(TAG, "ACTION_STANDBY received")
+                if (tunnel != null) {
+                    // The tunnel is already up: this is a pref-flip racing with a live
+                    // tunnel, not the "VPN is off, bring up the control plane only"
+                    // case this action exists for. Never tear a live tunnel down
+                    // because of it.
+                    Log.i(TAG, "ACTION_STANDBY ignored: tunnel already up")
+                    return START_STICKY
+                }
                 enterStandby()
                 return START_STICKY
             }
