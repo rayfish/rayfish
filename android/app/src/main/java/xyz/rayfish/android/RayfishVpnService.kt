@@ -23,7 +23,6 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
-import kotlin.concurrent.thread
 import kotlinx.coroutines.runBlocking
 
 /**
@@ -201,23 +200,26 @@ class RayfishVpnService : VpnService() {
         tunnel = pfd
 
         // Node.up drives the blocking-ish bring-up (endpoint bind, forward loop
-        // spawn) so keep it off the main thread. detachFd() transfers ownership
-        // of the tunnel fd to the Rust side, which closes it on Node.down; our
-        // ParcelFileDescriptor no longer owns an fd, so tunnel?.close() on stop
-        // is a harmless no-op kept only to clear the reference.
+        // spawn); called inline here, on nodeExecutor's own thread, so it is
+        // fully done (tunnel attached or not) before the next queued task (a
+        // stop, say) can run. A detached thread would return before Node.up
+        // ran, letting a later stopTunnel's down() race ahead of it: a stale
+        // up() would then re-attach the TUN after the user asked for it off.
+        // detachFd() transfers ownership of the tunnel fd to the Rust side,
+        // which closes it on Node.down; our ParcelFileDescriptor no longer
+        // owns an fd, so tunnel?.close() on stop is a harmless no-op kept only
+        // to clear the reference.
         //
         // ensureStarted() MUST run before up(): the node needs start() (which
         // builds the headless daemon and reconnects saved networks) or up()
         // returns NotStarted. The service is START_STICKY, so the system can
         // restart it with no Activity ever created and the UI's ensureStarted
         // never running; starting it here makes the service self-sufficient.
-        thread(name = "rayfish-node-up") {
-            try {
-                NodeHolder.get(applicationContext).up(pfd.detachFd())
-                Log.i(TAG, "Node.up succeeded")
-            } catch (t: Throwable) {
-                Log.e(TAG, "Node bring-up failed", t)
-            }
+        try {
+            NodeHolder.get(applicationContext).up(pfd.detachFd())
+            Log.i(TAG, "Node.up succeeded")
+        } catch (t: Throwable) {
+            Log.e(TAG, "Node bring-up failed", t)
         }
 
         startAutoAcceptPoller()
@@ -354,16 +356,21 @@ class RayfishVpnService : VpnService() {
     override fun onDestroy() {
         // The service is going away for good, so there is no standby to hold: a
         // standby with no foreground service is exactly the process the OS kills.
-        // Tear the node down fully. Routed through nodeExecutor (and waited on)
-        // rather than called inline, so it cannot interleave with a bring-up task
-        // still running or queued there; onDestroy blocks until it is done, since
-        // the executor is shut down right after.
+        // Tear the node down fully. Routed through nodeExecutor (not called
+        // inline) so it cannot interleave with a bring-up task still running or
+        // queued there; it queues behind whatever is already there instead.
+        //
+        // Not waited on: onDestroy runs on the main thread under a 20s
+        // foreground-service ANR deadline, and the queue ahead of this task can
+        // include a full startTunnelBlocking (RustlsInit, Node.start binding the
+        // iroh endpoint and reconnecting saved networks: seconds, network-
+        // dependent) followed by this teardown, which can itself block on a
+        // graceful endpoint close. Blocking here bought nothing anyway: the
+        // process outlives onDestroy and nodeExecutor.shutdown() below already
+        // lets every queued task, including this one, run to completion in the
+        // background.
         Log.i(TAG, "onDestroy: service being destroyed (tunnel fd present=${tunnel != null})")
-        try {
-            nodeExecutor.submit { stopTunnel(standby = false) }.get()
-        } catch (t: Throwable) {
-            Log.w(TAG, "onDestroy: teardown task failed", t)
-        }
+        nodeExecutor.execute { stopTunnel(standby = false) }
         nodeExecutor.shutdown()
         super.onDestroy()
     }
