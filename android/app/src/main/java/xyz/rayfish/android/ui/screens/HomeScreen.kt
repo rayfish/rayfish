@@ -27,6 +27,7 @@ import xyz.rayfish.android.DownloadsOutcome
 import xyz.rayfish.android.FileAutoAccept
 import xyz.rayfish.android.NodeHolder
 import xyz.rayfish.android.RayfishVpnService
+import xyz.rayfish.android.TransferKey
 import xyz.rayfish.android.TransferNotifier
 import xyz.rayfish.android.moveToDownloads
 import xyz.rayfish.android.ui.components.*
@@ -146,12 +147,18 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     val doneFiles = remember { mutableStateMapOf<ULong, FileOffer>() }
     fun acceptFile(f: FileOffer) {
         accepting[f.id] = f
+        val key = TransferKey(f.from, f.filename, f.size)
+        // Mark pending before the blocking accept starts: the core reports the
+        // transfer DONE from inside acceptFileOffer, before moveToDownloads below
+        // has copied anything, so TransferNotifier's poller must see "pending"
+        // from the first moment DONE can appear.
+        DownloadsOutcome.markPending(key)
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
                     NodeHolder.get(context).acceptFileOffer(f.id, saveDir)
                     val reached = moveToDownloads(context, File(saveDir, f.filename), f.filename, f.mimeType)
-                    DownloadsOutcome.record(f.filename, reached)
+                    DownloadsOutcome.record(key, reached)
                 }
                 accepting.remove(f.id)
                 doneFiles[f.id] = f
@@ -159,6 +166,11 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                 kotlinx.coroutines.delay(2000)
                 doneFiles.remove(f.id)
             } catch (t: Throwable) {
+                // The accept itself failed: no Downloads outcome is ever coming for
+                // this key, so stop treating it as pending rather than making the
+                // result notification wait out the timeout for a failure that has
+                // already happened.
+                DownloadsOutcome.clearPending(key)
                 accepting.remove(f.id)
                 onToast("Failed: ${t.message}")
             }

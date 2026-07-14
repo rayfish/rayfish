@@ -77,9 +77,21 @@ object TransferNotifier {
                         postProgress(context, t)
                     }
                     TransferState.DONE, TransferState.FAILED -> {
+                        // The core reports a receive as DONE from inside the
+                        // blocking acceptFileOffer call, before moveToDownloads (the
+                        // MediaStore byte copy) even runs, so this poll can land
+                        // mid-copy. Defer entirely while that save is still in
+                        // flight: do not post a result (it would be a guess that
+                        // can end up permanently wrong) and do not mark the
+                        // transfer terminal, so a later poll retries once the
+                        // outcome is actually known. DownloadsOutcome bounds how
+                        // long a save can stay "pending" so a copy that never
+                        // finishes cannot wedge this transfer's result forever.
+                        val awaitingSave = !t.outgoing &&
+                            DownloadsOutcome.isPending(TransferKey(t.peer, t.filename, t.size))
                         // Terminal entries stay listable for 60s, so guard against
                         // re-posting the same result on every poll.
-                        if (terminal.add(t.id)) postResult(context, t)
+                        if (!awaitingSave && terminal.add(t.id)) postResult(context, t)
                     }
                 }
             }
@@ -183,22 +195,29 @@ object TransferNotifier {
         // notification every time, which on modern Android silently undoes a
         // swipe-to-dismiss a few seconds after the user does it.
         if (postedProgress[t.id] == newState) return
-        postedProgress[t.id] = newState
 
         ensureChannel(context)
         val title = if (t.outgoing) "Sending ${t.filename}" else "Receiving ${t.filename}"
         val text = when {
             // Waiting on a human on the other end can take arbitrarily long, or
             // never resolve at all, and we have no way to tell the user which.
-            // Say so plainly rather than let the notification imply a result is
-            // always coming.
-            waiting -> "Waiting for ${t.peer} to accept · only notified if Rayfish stays running"
+            // Say so plainly, but only when it is actually true: with a poller
+            // alive in the background (RayfishVpnService, VPN on or standby), the
+            // completion will be observed and notified regardless of whether
+            // Rayfish's UI is open, so the caveat would be simply wrong there.
+            waiting && !RayfishVpnService.isRunning ->
+                "Waiting for ${t.peer} to accept · only notified if Rayfish stays running"
+            waiting -> "Waiting for ${t.peer} to accept"
             t.outgoing -> "To ${t.peer}"
             else -> "From ${t.peer}"
         }
         val builder = Notification.Builder(context, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(text)
+            // BigTextStyle so the shade's collapsed view does not truncate the
+            // caveat: a single-line setContentText was getting cut right around
+            // the middle dot, and the caveat is exactly the half that disappeared.
+            .setStyle(Notification.BigTextStyle().bigText(text))
             .setSmallIcon(
                 if (t.outgoing) android.R.drawable.stat_sys_upload
                 else android.R.drawable.stat_sys_download,
@@ -217,6 +236,11 @@ object TransferNotifier {
         }
         context.getSystemService(NotificationManager::class.java)
             .notify(notifId(t.id), builder.build())
+        // Written only after notify() has actually run: if notify() throws, this
+        // id must not be marked posted, or a poll a few seconds later would see an
+        // unchanged key and skip it forever, silently muting the transfer for a
+        // notification that was never shown.
+        postedProgress[t.id] = newState
     }
 
     private fun postResult(context: Context, t: uniffi.ray_mobile.Transfer) {
@@ -234,7 +258,8 @@ object TransferNotifier {
         // recorded rather than assume Downloads: claiming a file landed there
         // when it is actually sitting in app-private storage sends the user to
         // an empty Downloads view with no way to find their file.
-        val savedToDownloads = ok && !t.outgoing && DownloadsOutcome.consume(t.filename)
+        val savedToDownloads = ok && !t.outgoing &&
+            DownloadsOutcome.consume(TransferKey(t.peer, t.filename, t.size))
         val title = when {
             ok && t.outgoing -> "Sent ${t.filename}"
             ok -> "Saved ${t.filename}"
