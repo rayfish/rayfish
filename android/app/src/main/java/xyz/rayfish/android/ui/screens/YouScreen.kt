@@ -1,5 +1,6 @@
 package xyz.rayfish.android.ui.screens
 
+import android.content.Intent
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -11,11 +12,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.Status
 import xyz.rayfish.android.NodeHolder
+import xyz.rayfish.android.RayfishVpnService
 import xyz.rayfish.android.Telemetry
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.qr.rememberQrScanner
@@ -104,6 +107,49 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 }
             }
         }
+        var stayOnline by remember { mutableStateOf(NodeHolder.isStayOnline(context)) }
+        ToggleCard(
+            title = "Keep files working when the VPN is off",
+            subtitle = if (stayOnline) {
+                "on · stays online in the background, so you can run another VPN and still send and receive"
+            } else {
+                "off · turning the VPN off takes this device offline"
+            },
+            checked = stayOnline,
+            onCheckedChange = { on ->
+                stayOnline = on
+                NodeHolder.setStayOnline(context, on)
+                // If the VPN tunnel is up (NodeHolder.isEnabled), leave it alone in
+                // either direction: this only changes what happens at the next
+                // teardown. Otherwise drive the service now, since with the VPN off
+                // nothing else reacts to this pref: RayfishApp only starts the
+                // service when isEnabled is true, and never calls ensureStarted
+                // itself.
+                if (!NodeHolder.isEnabled(context)) {
+                    if (on) {
+                        // Bring the control plane up so the phone stays visible in
+                        // the mesh and keeps sending/receiving files. Same call
+                        // HomeScreen uses to start the service; with no VPN
+                        // requested, onStartCommand's plain-intent path settles
+                        // into standby (see enterStandby / handleBringUpFailure).
+                        ContextCompat.startForegroundService(
+                            context, Intent(context, RayfishVpnService::class.java),
+                        )
+                    } else {
+                        // Already in standby (service running, control plane up,
+                        // VPN off) and the user just asked to stop keeping it
+                        // online: take the node fully offline. The service reads
+                        // the now-false pref and does the full offline teardown,
+                        // including stopSelf.
+                        context.startService(
+                            Intent(context, RayfishVpnService::class.java).apply {
+                                action = RayfishVpnService.ACTION_STOP
+                            },
+                        )
+                    }
+                }
+            },
+        )
         var autoAcceptOwn by remember { mutableStateOf(NodeHolder.isAutoAcceptOwnDevices(context)) }
         ToggleCard(
             title = "Auto-accept from my devices",

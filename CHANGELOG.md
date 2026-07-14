@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Android: keep sending and receiving files with the VPN off.** A new "Keep files
+  working when the VPN is off" toggle in You (default off) keeps Rayfish's control
+  plane connected when the tunnel comes down, so files still arrive and still send,
+  and the phone stays visible in the mesh. Android only allows one VPN at a time, so
+  this is what lets you run another VPN (Tailscale, say) and keep using Rayfish for
+  files. It applies whether you turn the VPN off in the app or another VPN app takes
+  the slot.
 - **The install script now lives in the repo** as `install.sh`, so the one command
   users are asked to pipe into a root shell can be read, reviewed, and tested like
   the rest of the code. CI lints it and installs the latest release with it on
