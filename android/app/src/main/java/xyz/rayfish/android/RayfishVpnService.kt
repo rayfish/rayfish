@@ -179,45 +179,55 @@ class RayfishVpnService : VpnService() {
             Log.e(TAG, "could not set DNS upstreams; only .ray will resolve", t)
         }
 
-        val builder = Builder()
-            .setSession("Rayfish")
-            .addAddress(tunnelAddr, 32)
-            .addRoute("100.64.0.0", 10)
-            .addDnsServer("100.100.100.53")
-            .addSearchDomain("ray")
-            .setMtu(1280)
-
-        // Route the mesh IPv6 range through the tunnel (mirrors the desktop
-        // 200::/7 route). Skipped if we have no v6 address to bind.
-        if (meshV6.isNotBlank()) {
-            builder.addAddress(meshV6, 128)
-            builder.addRoute("200::", 7)
-        }
-        // Exclude Rayfish itself from its own tunnel. Its sockets (the iroh mesh
-        // underlay, the DnsResolver.rawQuery proxy) then use the real underlying
-        // network directly, so DNS forwarding can't loop back through the TUN and
-        // Private DNS keeps working. Split routing already keeps mesh traffic on
-        // the tunnel via the Rust core's fd, not the app's normal sockets.
-        try {
-            builder.addDisallowedApplication(packageName)
-        } catch (_: PackageManager.NameNotFoundException) {
-            Log.w(TAG, "could not exclude self from VPN: $packageName")
-        }
-
-        // Keep VPN-hostile apps (Android Auto, casting, RCS, Sonos) off the
-        // tunnel. Each add is guarded: an uninstalled package must not abort setup.
-        for (pkg in DISALLOWED_APPS) {
-            try {
-                builder.addDisallowedApplication(pkg)
-            } catch (_: PackageManager.NameNotFoundException) {
-                Log.i(TAG, "disallowed app not installed, skipping: $pkg")
-            }
-        }
-
+        // The whole Builder chain and establish() are one try block so a single
+        // failure handler covers both. addAddress()/addRoute() throw
+        // IllegalArgumentException on a malformed address (tunnelAddr/meshV6 come
+        // from status() and are only blank-checked, not validated), and
+        // establish() can return null. Both must land in the same pfd == null
+        // path below: previously a Builder throw escaped that path entirely and
+        // was swallowed by the outer executor catch, leaving dnsProxy set with no
+        // tunnel to serve and no standby fallback.
         val pfd = try {
+            val builder = Builder()
+                .setSession("Rayfish")
+                .addAddress(tunnelAddr, 32)
+                .addRoute("100.64.0.0", 10)
+                .addDnsServer("100.100.100.53")
+                .addSearchDomain("ray")
+                .setMtu(1280)
+
+            // Route the mesh IPv6 range through the tunnel (mirrors the desktop
+            // 200::/7 route). Skipped if we have no v6 address to bind.
+            if (meshV6.isNotBlank()) {
+                builder.addAddress(meshV6, 128)
+                builder.addRoute("200::", 7)
+            }
+            // Exclude Rayfish itself from its own tunnel. Its sockets (the iroh
+            // mesh underlay, the DnsResolver.rawQuery proxy) then use the real
+            // underlying network directly, so DNS forwarding can't loop back
+            // through the TUN and Private DNS keeps working. Split routing
+            // already keeps mesh traffic on the tunnel via the Rust core's fd,
+            // not the app's normal sockets.
+            try {
+                builder.addDisallowedApplication(packageName)
+            } catch (_: PackageManager.NameNotFoundException) {
+                Log.w(TAG, "could not exclude self from VPN: $packageName")
+            }
+
+            // Keep VPN-hostile apps (Android Auto, casting, RCS, Sonos) off the
+            // tunnel. Each add is guarded: an uninstalled package must not abort
+            // setup.
+            for (pkg in DISALLOWED_APPS) {
+                try {
+                    builder.addDisallowedApplication(pkg)
+                } catch (_: PackageManager.NameNotFoundException) {
+                    Log.i(TAG, "disallowed app not installed, skipping: $pkg")
+                }
+            }
+
             builder.establish()
         } catch (t: Throwable) {
-            Log.e(TAG, "VpnService.Builder.establish() threw", t)
+            Log.e(TAG, "VpnService.Builder chain or establish() threw", t)
             null
         }
         if (pfd == null) {
@@ -279,6 +289,13 @@ class RayfishVpnService : VpnService() {
             Log.i(TAG, "Node.up succeeded")
         } catch (t: Throwable) {
             Log.e(TAG, "Node bring-up failed", t)
+            // up() threw after detachFd() handed the fd to Rust, so this
+            // ParcelFileDescriptor no longer owns anything worth keeping around.
+            // Leaving tunnel non-null would make the next startTunnelBlocking's
+            // `if (tunnel != null) return` guard believe the tunnel is already
+            // up and skip rebuilding it; null it so a retry can rebuild from
+            // scratch instead of needing a full stop first.
+            tunnel = null
         }
 
         startAutoAcceptPoller()
@@ -398,6 +415,15 @@ class RayfishVpnService : VpnService() {
             if (standby) {
                 Log.i(TAG, "stopTunnel: Node.down (standby, control plane stays up)")
                 NodeHolder.downNode(applicationContext)
+                // Every standby path must start the poller by construction, not
+                // rely on some earlier path in the same process having already
+                // started it. ACTION_STOP and onRevoke can both reach standby on
+                // a service instance where the node was never started (a fresh
+                // instance from HomeScreen's context.startService, say), in which
+                // case downNode() above is a no-op and nothing else here would
+                // start it. Idempotent, so this is a no-op when it is already
+                // running.
+                startAutoAcceptPoller()
             } else {
                 Log.i(TAG, "stopTunnel: NodeHolder.stopNode (offline)")
                 NodeHolder.stopNode(applicationContext)
