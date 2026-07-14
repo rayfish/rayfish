@@ -118,7 +118,7 @@ impl TransferRegistry {
 
     pub fn note_progress(&self, id: u64, transferred: u64) {
         if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
-            e.info.transferred = transferred;
+            e.info.transferred = transferred.min(e.info.size);
             e.info.state = TransferState::Transferring;
         }
     }
@@ -279,6 +279,27 @@ mod tests {
         let t = &reg.list()[0];
         assert_eq!(t.state, TransferState::Done);
         assert_eq!(t.transferred, 100);
+    }
+
+    #[test]
+    fn sending_the_same_file_again_after_it_finished_does_not_reopen_it() {
+        let reg = TransferRegistry::new();
+        let first = reg.register_send("laptop".into(), "photo.jpg".into(), 100, hash(1));
+        reg.provider_started(hash(1));
+        reg.provider_finished(hash(1), true);
+        assert_eq!(reg.list()[0].state, TransferState::Done);
+
+        // The user sends the same file again: a new entry for the same hash.
+        let second = reg.register_send("laptop".into(), "photo.jpg".into(), 100, hash(1));
+        reg.provider_started(hash(1));
+        reg.provider_finished(hash(1), true);
+
+        let list = reg.list();
+        assert_eq!(list.len(), 2, "the finished first send is still listed alongside the new one");
+        let a = list.iter().find(|t| t.id == first).unwrap();
+        let b = list.iter().find(|t| t.id == second).unwrap();
+        assert_eq!(a.state, TransferState::Done, "the first send must not be reopened");
+        assert_eq!(b.state, TransferState::Done);
     }
 
     #[test]
