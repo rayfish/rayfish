@@ -21,6 +21,9 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "macos")]
+use std::num::NonZeroU32;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::{fs, path::PathBuf, process::Command};
 
@@ -28,16 +31,95 @@ use std::{fs, path::PathBuf, process::Command};
 use anyhow::{Context as _, Result};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use iroh::EndpointId;
+use iroh::endpoint::ConfigureSocket;
+#[cfg(target_os = "macos")]
+use socket2::{Domain, SockRef};
 use smol_str::SmolStr;
 
 use crate::membership::is_overlay_ip;
 
-/// Linux fwmark set on iroh's underlay UDP sockets (via the forked
-/// `Endpoint::builder().socket_mark`) and on the replies of any connection that
+/// Linux fwmark set on iroh's own sockets (via the forked
+/// `Endpoint::builder().configure_socket`) and on the replies of any connection that
 /// arrived from outside the tunnel. A matching `ip rule` sends marked packets to
 /// the main routing table, so both bypass the client's full-tunnel default route
 /// (the standard WireGuard/Tailscale loop prevention). Arbitrary non-zero value.
 pub const SOCKET_MARK: u32 = 0x7261; // "ra"
+
+/// Whether this host's default route currently points into the TUN, i.e. we are
+/// using an exit node.
+///
+/// Read by the socket hook below on every (re)bind of an iroh socket. Linux does not
+/// need it (the fwmark is set unconditionally and simply has no matching `ip rule`
+/// when no exit is in use), but macOS does: there the hook pins the socket to the
+/// default-route interface, which would otherwise make peers reachable only over a
+/// *non-default* interface (a second NIC) unreachable. So we pin only while a full
+/// tunnel is actually up, and force a rebind when this flips.
+static FULL_TUNNEL: AtomicBool = AtomicBool::new(false);
+
+/// Records whether a full tunnel is up. The caller must trigger an endpoint rebind
+/// (`Endpoint::network_change`) afterwards, so already-bound sockets pick this up.
+pub fn set_full_tunnel(on: bool) {
+    FULL_TUNNEL.store(on, Ordering::Release);
+}
+
+/// The hook iroh runs on every socket it opens (both underlay UDP sockets and the
+/// relay's TCP connection), before bind/connect and again on every rebind.
+///
+/// It keeps iroh's own traffic off the full-tunnel default route. Without it the
+/// transport is routed into the tunnel it is carrying, and the mesh connection that
+/// the exit node is reached over dies the moment the exit node is selected.
+///
+/// The two platforms get there differently. Linux marks the socket and policy-routes
+/// the mark around the tunnel. macOS has no fwmark, so we pin the socket to the
+/// default-route interface instead (`IP_BOUND_IF`), which makes it ignore the routing
+/// table altogether. That is what Tailscale does on darwin, and it is also why the
+/// hook must re-run on rebind: the right interface changes when the default route does
+/// (wifi to ethernet), and a stale pin would strand the transport on a dead interface.
+pub fn configure_socket() -> ConfigureSocket {
+    Arc::new(|sock, domain| {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = domain;
+            sock.set_mark(SOCKET_MARK)?;
+        }
+        #[cfg(target_os = "macos")]
+        bind_outside_tunnel(&sock, domain)?;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = (&sock, domain);
+        Ok(())
+    })
+}
+
+/// Pins a socket to the current default-route interface, so its egress ignores the
+/// routing table (and therefore the tunnel's default route).
+///
+/// Only while a full tunnel is up: see [`FULL_TUNNEL`]. A family with no default route
+/// is left unpinned, since there is no tunnel default for it to escape either.
+#[cfg(target_os = "macos")]
+fn bind_outside_tunnel(sock: &SockRef<'_>, domain: Domain) -> std::io::Result<()> {
+    if !FULL_TUNNEL.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let v6 = domain == Domain::IPV6;
+    let Some(index) = default_interface(if v6 { "-inet6" } else { "-inet" })
+        .and_then(|name| if_index(&name))
+    else {
+        return Ok(());
+    };
+    if v6 {
+        sock.bind_device_by_index_v6(Some(index))
+    } else {
+        sock.bind_device_by_index_v4(Some(index))
+    }
+}
+
+/// Resolves an interface name to its kernel index.
+#[cfg(target_os = "macos")]
+fn if_index(name: &str) -> Option<NonZeroU32> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `cname` is a valid NUL-terminated C string for the duration of the call.
+    NonZeroU32::new(unsafe { libc::if_nametoindex(cname.as_ptr()) })
+}
 
 /// Per-network allow policy for peers using this node as an exit node, consulted
 /// on the gateway's inbound data path (`forward::evaluate_inbound`). Cheap to clone

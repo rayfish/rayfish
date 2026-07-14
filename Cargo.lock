@@ -2499,7 +2499,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2",
  "tokio",
  "tower-service",
  "tracing",
@@ -2757,7 +2757,7 @@ version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d40460c0ce33d6ce4b0630ad68ff63d6661961c48b6dba35e5a4d81cfb48222"
 dependencies = [
- "socket2 0.6.4",
+ "socket2",
  "widestring",
  "windows-registry",
  "windows-result 0.4.1",
@@ -2776,7 +2776,6 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.0.2"
-source = "git+https://github.com/rayfish/iroh?branch=rayfish-integration#3ea6882c827d04836841ca358c67ae5497be7044"
 dependencies = [
  "backon",
  "blake3",
@@ -2813,6 +2812,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "smallvec",
+ "socket2",
  "strum",
  "time",
  "tokio",
@@ -2826,7 +2826,6 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.0.2"
-source = "git+https://github.com/rayfish/iroh?branch=rayfish-integration#3ea6882c827d04836841ca358c67ae5497be7044"
 dependencies = [
  "curve25519-dalek 5.0.0-rc.0",
  "data-encoding",
@@ -2884,7 +2883,6 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.0.2"
-source = "git+https://github.com/rayfish/iroh?branch=rayfish-integration#3ea6882c827d04836841ca358c67ae5497be7044"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -2975,7 +2973,6 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.0.2"
-source = "git+https://github.com/rayfish/iroh?branch=rayfish-integration#3ea6882c827d04836841ca358c67ae5497be7044"
 dependencies = [
  "blake3",
  "bytes",
@@ -3005,6 +3002,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_bytes",
+ "socket2",
  "strum",
  "tokio",
  "tokio-rustls",
@@ -3684,7 +3682,6 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.19.1"
-source = "git+https://github.com/rayfish/net-tools?branch=feat%2Fsocket-mark#465dd7895af67b638d10a90a6b031d46dc3de863"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3706,7 +3703,7 @@ dependencies = [
  "objc2-system-configuration",
  "pin-project-lite",
  "serde",
- "socket2 0.6.4",
+ "socket2",
  "time",
  "tokio",
  "tokio-util",
@@ -3767,7 +3764,7 @@ dependencies = [
  "pin-project-lite",
  "rustc-hash",
  "rustls",
- "socket2 0.6.4",
+ "socket2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3810,7 +3807,7 @@ checksum = "3137a52df66c20090a889828d1c655f21f52294cba64e5c4fbb04fc83eee7c8e"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.4",
+ "socket2",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -4478,7 +4475,7 @@ dependencies = [
  "rand 0.10.2",
  "serde",
  "smallvec",
- "socket2 0.6.4",
+ "socket2",
  "time",
  "tokio",
  "tokio-util",
@@ -4932,7 +4929,7 @@ dependencies = [
  "sha2 0.10.9",
  "simple-dns",
  "smol_str 0.3.6",
- "socket2 0.5.10",
+ "socket2",
  "system-configuration",
  "tar",
  "tempfile",
@@ -5880,16 +5877,6 @@ dependencies = [
 
 [[package]]
 name = "socket2"
-version = "0.5.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
-dependencies = [
- "libc",
- "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "socket2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
@@ -6053,7 +6040,7 @@ dependencies = [
  "acto",
  "hickory-proto",
  "rand 0.10.2",
- "socket2 0.6.4",
+ "socket2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6307,7 +6294,7 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2 0.6.4",
+ "socket2",
  "tokio-macros",
  "tracing",
  "windows-sys 0.61.2",

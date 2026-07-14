@@ -150,7 +150,7 @@ pty-process = { version = "0.5", features = ["async"], optional = true }
 uzers = { version = "0.12", optional = true }
 # Build the mesh SSH listener socket with SO_REUSEADDR/SO_REUSEPORT so binding
 # a specific mesh IP's port 22 coexists with a host sshd on 0.0.0.0:22.
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -192,10 +192,10 @@ enable-ansi-support = "0.3"
 #   - `Builder::direct_addr_filter` (upstream PR n0-computer/iroh#4397)
 #   - `Builder::socket_mark` for SO_MARK on the underlay sockets (draft PR #4406)
 # iroh-base/-dns/-relay are patched too so the fork and registry copies don't clash.
-iroh = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
-iroh-base = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
-iroh-dns = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
-iroh-relay = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
+iroh = { path = "../iroh/iroh" }
+iroh-base = { path = "../iroh/iroh-base" }
+iroh-dns = { path = "../iroh/iroh-dns" }
+iroh-relay = { path = "../iroh/iroh-relay" }
 # netwatch fork exposing `UdpSocket::bind_full_with_mark`, which the socket_mark
 # plumbing above calls (upstream PR n0-computer/net-tools#179).
-netwatch = { git = "https://github.com/rayfish/net-tools", branch = "feat/socket-mark" }
+netwatch = { path = "../net-tools/netwatch" }
