@@ -41,17 +41,35 @@ class RayfishVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                // stopTunnel now blocks on a graceful endpoint close (so peers
-                // see us drop cleanly and re-enable rebuilds without a stale
-                // session). Run it off the main thread to avoid an ANR, then
-                // stop the service.
-                Log.i(TAG, "ACTION_STOP received; tearing tunnel down (tunnel fd present=${tunnel != null})")
+                // Tearing down blocks (a graceful endpoint close on the offline
+                // path, so peers see us drop cleanly and a re-enable rebuilds
+                // without a stale session). Run it off the main thread to avoid an
+                // ANR. In standby we keep the service alive; only the fully-offline
+                // path calls stopSelf.
+                val standby = NodeHolder.isStayOnline(applicationContext)
+                Log.i(TAG, "ACTION_STOP received; standby=$standby (tunnel fd present=${tunnel != null})")
                 thread(name = "rayfish-node-stop") {
-                    stopTunnel()
-                    Log.i(TAG, "stopTunnel returned; calling stopSelf()")
-                    stopSelf()
+                    stopTunnel(standby)
+                    if (!standby) {
+                        Log.i(TAG, "stopTunnel returned; calling stopSelf()")
+                        stopSelf()
+                    }
                 }
-                return START_NOT_STICKY
+                return if (standby) START_STICKY else START_NOT_STICKY
+            }
+            // A null intent means the system restarted us after killing the process
+            // (START_STICKY). No Activity ran, so nothing else brought the node up:
+            // decide from the persisted prefs what state to restore.
+            null -> {
+                if (NodeHolder.isEnabled(applicationContext)) {
+                    startTunnel()
+                } else if (NodeHolder.isStayOnline(applicationContext)) {
+                    enterStandby()
+                } else {
+                    // Neither the VPN nor stay-online is wanted: nothing to run.
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
             }
             else -> startTunnel()
         }
@@ -169,10 +187,55 @@ class RayfishVpnService : VpnService() {
             }
         }
 
-        // Auto-accept own-device file offers while the tunnel is up, so a file
-        // shared to this device from one of the user's own devices lands in
-        // Downloads without the app being open. Gated by the user's opt-out toggle
-        // inside FileAutoAccept.run.
+        startAutoAcceptPoller()
+    }
+
+    /**
+     * Control plane up, no tunnel. The service stays foreground (Android kills the
+     * process, and the tokio runtime with it, once no foreground service is left),
+     * so the node keeps serving files and stays visible in the mesh.
+     */
+    private fun enterStandby() {
+        startForegroundNotification(standby = true)
+        thread(name = "rayfish-node-standby") {
+            try {
+                runBlocking { NodeHolder.ensureStarted(applicationContext) }
+                Log.i(TAG, "standby: control plane up, no tunnel")
+            } catch (t: Throwable) {
+                Log.e(TAG, "standby bring-up failed", t)
+            }
+        }
+        startAutoAcceptPoller()
+    }
+
+    /**
+     * Android revoked our VPN, which happens when another VPN app (Tailscale, say)
+     * takes the single VpnService slot, or the user disconnects us from system
+     * Settings. The default implementation calls stopSelf(), which would take the
+     * whole node offline and defeat the stay-online pref, since this path never
+     * touches our own toggle. Route it to the same place the toggle goes.
+     */
+    override fun onRevoke() {
+        val standby = NodeHolder.isStayOnline(applicationContext)
+        Log.i(TAG, "onRevoke: VPN revoked by the system; standby=$standby")
+        // The user did not ask for the tunnel any more, so clear the enable intent.
+        // Otherwise a later app launch would re-establish it and yank the VPN slot
+        // back from whatever took it.
+        NodeHolder.setEnabled(applicationContext, false)
+        thread(name = "rayfish-node-revoke") {
+            stopTunnel(standby)
+            if (!standby) stopSelf()
+        }
+    }
+
+    /**
+     * Auto-accept own-device file offers, so a file shared to this device from one
+     * of the user's own devices lands in Downloads without the app being open. Runs
+     * in standby too: that is what makes files keep working with the VPN off. Gated
+     * by the user's opt-out toggle inside FileAutoAccept.run. Idempotent.
+     */
+    private fun startAutoAcceptPoller() {
+        if (autoAcceptPoller != null) return
         autoAcceptPoller = java.util.concurrent.Executors.newSingleThreadScheduledExecutor().also { exec ->
             exec.scheduleWithFixedDelay(
                 { runCatching { FileAutoAccept.run(applicationContext) } },
@@ -202,44 +265,61 @@ class RayfishVpnService : VpnService() {
         return servers
     }
 
-    private fun stopTunnel() {
-        // Disable on mobile means go offline, not standby: tear the whole control
-        // plane down (cancels the daemon shutdown token, closes the endpoint) so
-        // the device drops out of the mesh immediately. stopNode also clears the
-        // started flag so a later enable rebuilds the daemon.
+    /**
+     * Bring the tunnel down. In standby the control plane survives (Node.down):
+     * files keep flowing and the device stays online in the mesh. Otherwise this is
+     * a full offline teardown (Node.stop), which also clears NodeHolder.started so
+     * a later enable rebuilds the daemon.
+     */
+    private fun stopTunnel(standby: Boolean) {
         try {
-            Log.i(TAG, "stopTunnel: calling NodeHolder.stopNode (offline)")
-            NodeHolder.stopNode(applicationContext)
-            Log.i(TAG, "stopTunnel: stopNode returned")
+            if (standby) {
+                Log.i(TAG, "stopTunnel: Node.down (standby, control plane stays up)")
+                NodeHolder.downNode(applicationContext)
+            } else {
+                Log.i(TAG, "stopTunnel: NodeHolder.stopNode (offline)")
+                NodeHolder.stopNode(applicationContext)
+            }
+            Log.i(TAG, "stopTunnel: teardown returned")
         } catch (t: Throwable) {
-            Log.w(TAG, "Node stop failed (may not have been up)", t)
+            Log.w(TAG, "Node teardown failed (may not have been up)", t)
         }
         try {
             // Detached to Rust via detachFd(), so this is a no-op; the fd is only
             // closed when the Rust side aborts the TUN tasks. Logged to make that
-            // explicit while debugging the lingering interface.
+            // explicit while debugging a lingering interface.
             Log.i(TAG, "stopTunnel: tunnel?.close() (no-op; fd owned by Rust after detachFd)")
             tunnel?.close()
         } catch (t: Throwable) {
             Log.w(TAG, "closing tunnel fd failed", t)
         }
+        tunnel = null
 
-        autoAcceptPoller?.shutdownNow()
-        autoAcceptPoller = null
-
+        // The DNS proxy exists to serve the tunnel's resolver; with no tunnel there
+        // is nothing pointed at it. Torn down in both cases.
         dnsProxy?.stop()
         dnsProxy = null
 
-        tunnel = null
+        if (standby) {
+            // Keep the poller running (files still work) and tell the user plainly
+            // what state we are in, so the persistent notification is not confusing.
+            startForegroundNotification(standby = true)
+        } else {
+            autoAcceptPoller?.shutdownNow()
+            autoAcceptPoller = null
+        }
     }
 
     override fun onDestroy() {
+        // The service is going away for good, so there is no standby to hold: a
+        // standby with no foreground service is exactly the process the OS kills.
+        // Tear the node down fully.
         Log.i(TAG, "onDestroy: service being destroyed (tunnel fd present=${tunnel != null})")
-        stopTunnel()
+        stopTunnel(standby = false)
         super.onDestroy()
     }
 
-    private fun startForegroundNotification() {
+    private fun startForegroundNotification(standby: Boolean = false) {
         val nm = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
@@ -259,7 +339,7 @@ class RayfishVpnService : VpnService() {
 
         val notification: Notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Rayfish")
-            .setContentText("Mesh tunnel active")
+            .setContentText(if (standby) "Online, VPN off · files still work" else "Mesh tunnel active")
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setOngoing(true)
             .setContentIntent(openIntent)
