@@ -121,13 +121,13 @@ class RayfishVpnService : VpnService() {
                 // teardown (seconds). A stale null here would run enterStandby
                 // while a bring-up is still landing; a stale non-null would skip
                 // standby entirely while a teardown is still clearing the field.
-                // So post the notification this call is obligated to post right
-                // away (this is a startForegroundService start), then decide for
-                // real on nodeExecutor, where the check is serialized against
-                // startTunnelBlocking and stopTunnel and therefore sees the
-                // settled value.
+                // Post a best guess to meet the foreground-service deadline right
+                // now; the executor task below decides for real on nodeExecutor,
+                // where the check is serialized against startTunnelBlocking and
+                // stopTunnel and therefore sees the settled value, and corrects
+                // the notification if needed.
                 Log.i(TAG, "ACTION_STANDBY received")
-                startForegroundNotification(standby = true)
+                startForegroundNotification(standby = tunnel == null)
                 nodeExecutor.execute {
                     // See the ACTION_STOP execute() block for why this must never
                     // let a throwable escape.
