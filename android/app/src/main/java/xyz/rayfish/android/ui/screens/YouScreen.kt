@@ -119,39 +119,39 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             onCheckedChange = { on ->
                 stayOnline = on
                 NodeHolder.setStayOnline(context, on)
-                // If the VPN is actually running (status.running, the real data-plane
-                // state, not the persisted isEnabled intent), leave it alone in either
-                // direction: this only changes what happens at the next teardown.
-                // Otherwise drive the service now, since with the VPN off nothing else
-                // reacts to this pref: RayfishApp's launch restore is the only other
-                // place that starts the service from these prefs, and that only runs
-                // once at launch.
-                if (status?.running != true) {
-                    if (on) {
-                        // Bring the control plane up only, never a tunnel: a plain
-                        // intent would land in startTunnel() and try to grab the
-                        // single VpnService slot (and pop the consent dialog),
-                        // which is exactly what this toggle exists to avoid when
-                        // another VPN (Tailscale) is meant to hold that slot.
-                        // ACTION_STANDBY routes straight to enterStandby().
-                        ContextCompat.startForegroundService(
-                            context,
-                            Intent(context, RayfishVpnService::class.java).apply {
-                                action = RayfishVpnService.ACTION_STANDBY
-                            },
-                        )
-                    } else {
-                        // Already in standby (service running, control plane up,
-                        // VPN off) and the user just asked to stop keeping it
-                        // online: take the node fully offline. The service reads
-                        // the now-false pref and does the full offline teardown,
-                        // including stopSelf.
-                        context.startService(
-                            Intent(context, RayfishVpnService::class.java).apply {
-                                action = RayfishVpnService.ACTION_STOP
-                            },
-                        )
-                    }
+                // status is a poll cache (RayfishApp refreshes it every 2s), and is
+                // null right after an Activity recreation: it can read stale-false
+                // while the VPN just came up in Home, or stale-true right after Home
+                // just took it down. Deciding from it here can silently kill a live
+                // VPN or silently no-op a real request. The service's tunnel field
+                // is the only state that never lags, so send unconditionally and let
+                // the service decide from that.
+                if (on) {
+                    // Bring the control plane up only, never a tunnel: a plain
+                    // intent would land in startTunnel() and try to grab the
+                    // single VpnService slot (and pop the consent dialog),
+                    // which is exactly what this toggle exists to avoid when
+                    // another VPN (Tailscale) is meant to hold that slot.
+                    // ACTION_STANDBY routes straight to enterStandby(), and is
+                    // already a no-op there when a tunnel is up.
+                    ContextCompat.startForegroundService(
+                        context,
+                        Intent(context, RayfishVpnService::class.java).apply {
+                            action = RayfishVpnService.ACTION_STANDBY
+                        },
+                    )
+                } else {
+                    // Do not send bare ACTION_STOP: that unconditionally tears down
+                    // whatever is running, which is correct for Home's VPN toggle but
+                    // not here, since a live VPN must not be touched by this pref.
+                    // ACTION_EXIT_STANDBY means "if there is no tunnel, take the node
+                    // fully offline and stop the service; if there is a tunnel, leave
+                    // it alone, since the pref only governs the next teardown."
+                    context.startService(
+                        Intent(context, RayfishVpnService::class.java).apply {
+                            action = RayfishVpnService.ACTION_EXIT_STANDBY
+                        },
+                    )
                 }
             },
         )

@@ -127,6 +127,41 @@ class RayfishVpnService : VpnService() {
                 enterStandby()
                 return START_STICKY
             }
+            ACTION_EXIT_STANDBY -> {
+                // Sent unconditionally from YouScreen's toggle OFF branch, which
+                // cannot tell from the stale status cache whether a tunnel is up.
+                // Meaning: "the user no longer wants standby; if nothing else needs
+                // the control plane up (no tunnel), take the node fully offline and
+                // stop the service." If a tunnel is up, the VPN is on and this pref
+                // only governs what happens at the next teardown, so do nothing:
+                // the same guard ACTION_STANDBY applies in the other direction.
+                Log.i(TAG, "ACTION_EXIT_STANDBY received (tunnel fd present=${tunnel != null})")
+                if (tunnel != null) {
+                    Log.i(TAG, "ACTION_EXIT_STANDBY ignored: tunnel is up")
+                    return START_STICKY
+                }
+                // No tunnel: either genuine standby the user no longer wants, or a
+                // fresh service instance (process was dead) with nothing started at
+                // all. Either way the same offline teardown ACTION_STOP performs
+                // with stay-online off, idempotent if there was nothing to tear
+                // down. No standby notification is posted here (unlike ACTION_STOP's
+                // standby branch): this path never leaves the service in standby, so
+                // there is nothing true to say about it, and the intent that reaches
+                // here is a plain startService, not a foreground one, so there is no
+                // foreground-notification deadline to meet.
+                nodeExecutor.execute {
+                    // See the ACTION_STOP execute() block for why this must never
+                    // let a throwable escape.
+                    try {
+                        stopTunnel(standby = false)
+                        Log.i(TAG, "ACTION_EXIT_STANDBY: stopTunnel returned; calling stopSelf(startId=$startId)")
+                        stopSelf(startId)
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "ACTION_EXIT_STANDBY task crashed", t)
+                    }
+                }
+                return START_NOT_STICKY
+            }
             // An action-less start intent is the normal "turn the VPN on" path
             // (see HomeScreen / RayfishApp, which both start the service with a
             // plain Intent). It must reach startTunnel(), not be mistaken for
@@ -592,6 +627,7 @@ class RayfishVpnService : VpnService() {
         private const val NOTIF_ID = 1
         const val ACTION_STOP = "xyz.rayfish.android.STOP"
         const val ACTION_STANDBY = "xyz.rayfish.android.STANDBY"
+        const val ACTION_EXIT_STANDBY = "xyz.rayfish.android.EXIT_STANDBY"
 
         // Apps that misbehave behind a VPN (casting, RCS, local-device discovery).
         // Mirrors Tailscale's default Android exclusions. Excluded so they never
