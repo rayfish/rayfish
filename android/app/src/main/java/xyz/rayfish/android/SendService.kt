@@ -66,19 +66,31 @@ class SendService : Service() {
             // That two-sided bound is not sufficient by itself with two concurrent
             // shares: it only excludes a batch that starts after this one's "after"
             // snapshot. It does nothing about a batch whose offers land while this
-            // one is still in the middle of its own offer loop (staging a large file
-            // can take seconds to tens of seconds, so that window is real): those
-            // ids are newly created and > maxIdBeforeBatch, so the after-snapshot
-            // would wrongly claim them as this batch's own. If that other batch's
-            // peer never accepts, this one would burn the full wait timeout for a
-            // file it delivered in seconds. So the region from taking the "before"
-            // max through the "after" snapshot is serialized behind batchLock: two
-            // batches' offers can never interleave, only one runs that region at a
-            // time. The lock is released before the wait loop below, so concurrent
-            // batches still wait for their own peers in parallel; only the offering
-            // is serialized, not the (much longer) waiting.
+            // one is still in the middle of its own offer loop: each sendFile reads
+            // the whole file, hashes it, adds it to the blob store, and then dials
+            // the peer over QUIC with no client-side timeout, so that window can be
+            // long, not just seconds. Those ids are newly created and greater than
+            // maxIdBeforeBatch, so the after-snapshot would wrongly claim them as
+            // this batch's own. If that other batch's peer never accepts, this one
+            // would burn the full wait timeout for a file it delivered in seconds.
+            // So the region from taking the "before" max through the "after"
+            // snapshot is serialized behind batchLock: two batches' offers can never
+            // interleave, only one runs that region at a time.
+            //
+            // Staging (a full byte copy through ContentResolver) allocates no
+            // transfer ids, so it happens before the lock is taken: only the id
+            // snapshots and the sendFile loop itself, which must stay atomic with
+            // respect to id allocation, run inside it. The lock is released before
+            // the wait loop below, so concurrent batches still wait for their own
+            // peers in parallel; only the offering is serialized, not the (much
+            // longer) waiting. A batch can still be blocked by another batch's
+            // sendFile dialing an offline peer, but that is bounded by the QUIC
+            // dial itself rather than by staging plus dial.
             var offered = 0
             var failed = 0
+            val staged = uris.mapNotNull { uri -> stageUriForSend(applicationContext, uri) }
+            failed += uris.size - staged.size
+
             val maxIdBeforeBatch: Long?
             val batchIds: Set<ULong>?
             synchronized(batchLock) {
@@ -86,22 +98,17 @@ class SendService : Service() {
                     NodeHolder.get(applicationContext).listTransfers().maxOfOrNull { it.id.toLong() } ?: -1L
                 }.getOrNull()
 
-                for (uri in uris) {
-                    val staged = stageUriForSend(applicationContext, uri)
-                    if (staged == null) {
-                        failed++
-                        continue
-                    }
+                for (file in staged) {
                     try {
-                        NodeHolder.get(applicationContext).sendFile(staged.absolutePath, peerId)
+                        NodeHolder.get(applicationContext).sendFile(file.absolutePath, peerId)
                         offered++
                     } catch (t: Throwable) {
                         failed++
-                        Log.w(TAG, "send failed for ${staged.name}", t)
+                        Log.w(TAG, "send failed for ${file.name}", t)
                     } finally {
                         // Bytes are in the blob store now; the staging copy is no
                         // longer needed. Remove the file and its per-item dir.
-                        runCatching { staged.parentFile?.deleteRecursively() ?: staged.delete() }
+                        runCatching { file.parentFile?.deleteRecursively() ?: file.delete() }
                     }
                 }
 

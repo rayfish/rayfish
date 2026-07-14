@@ -114,6 +114,18 @@ object FileAutoAccept {
      * MAX_ATTEMPTS). Lets the caller fall back to a manual Save row. */
     fun hasGivenUp(id: ULong): Boolean = id in gaveUp
 
+    /**
+     * Clear all process-wide offer-id bookkeeping. The core's file offer ids
+     * restart at 1 on the next Node.start(), so a stale entry here would
+     * otherwise mute (or, having given up, wrongly un-hide) an offer that
+     * happens to reuse an old id. Safe to call when nothing is running.
+     */
+    fun reset() {
+        handled.clear()
+        attempts.clear()
+        gaveUp.clear()
+    }
+
     /** Runs on the caller's coroutine context; callers dispatch it on IO. */
     fun run(context: Context) {
         if (!NodeHolder.isAutoAcceptOwnDevices(context)) return
