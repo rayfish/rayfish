@@ -69,7 +69,7 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
                     // screen's stay-online guard sees the real state instead of this
                     // leftover intent.
                     NodeHolder.setEnabled(context, false)
-                    if (NodeHolder.isStayOnline(context)) {
+                    if (!NodeHolder.isGoOfflineWhenDisabled(context)) {
                         ContextCompat.startForegroundService(
                             context,
                             Intent(context, RayfishVpnService::class.java).apply {
@@ -78,10 +78,11 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
                         )
                     }
                 }
-            } else if (NodeHolder.isStayOnline(context)) {
-                // The VPN is not being restored, but the user wants files to keep
-                // working in the background. Nothing else brings the control plane up
-                // after a process death: bring it up now via standby.
+            } else if (!NodeHolder.isGoOfflineWhenDisabled(context)) {
+                // The VPN is not being restored, and the user has not asked to go
+                // fully offline when disabled, so standby is the default: files
+                // should keep working. Nothing else brings the control plane up
+                // after a process death; bring it up now via standby.
                 ContextCompat.startForegroundService(
                     context,
                     Intent(context, RayfishVpnService::class.java).apply {

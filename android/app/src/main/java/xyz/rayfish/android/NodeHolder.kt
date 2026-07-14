@@ -41,13 +41,22 @@ object NodeHolder {
     // surfaced as FileOffer.own_device; this toggle is only the opt-out.
     private const val KEY_AUTO_ACCEPT_OWN = "auto_accept_own_devices"
 
-    // Keep the control plane connected when the VPN tunnel is off, so file send
-    // and receive keep working and the device stays visible in the mesh. Default
-    // off: it holds a network connection open in the background. The motivating
-    // case is running another VPN (Android allows only one VpnService at a time,
-    // and our tunnel claims the same 100.64.0.0/10 range Tailscale uses), so the
+    // Standby is now the default: disabling Rayfish drops the data plane (TUN,
+    // VPN slot) but keeps the control plane connected, so file send and receive
+    // keep working and the device stays visible in the mesh. The motivating case
+    // is running another VPN (Android allows only one VpnService at a time, and
+    // our tunnel claims the same 100.64.0.0/10 range Tailscale uses), so the
     // tunnel goes away and only the data plane goes with it.
-    private const val KEY_STAY_ONLINE = "stay_online"
+    //
+    // This key is an escape hatch for a user who wants disabling Rayfish to take
+    // the device fully offline instead. Default false (standby). This is a NEW
+    // key, not a flip of the old "stay_online" pref (default false, opt-in
+    // standby): a user who had already turned that on has a stored
+    // stay_online = true, and flipping its default in place would silently hand
+    // them the opposite of what they asked for. The old key is left unread and
+    // unmigrated; any leftover stay_online value in an existing install's
+    // SharedPreferences is inert.
+    private const val KEY_GO_OFFLINE_WHEN_DISABLED = "go_offline_when_disabled"
 
     fun isEnabled(context: Context): Boolean =
         context.applicationContext
@@ -71,15 +80,15 @@ object NodeHolder {
             .edit().putBoolean(KEY_AUTO_ACCEPT_OWN, value).apply()
     }
 
-    fun isStayOnline(context: Context): Boolean =
+    fun isGoOfflineWhenDisabled(context: Context): Boolean =
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_STAY_ONLINE, false)
+            .getBoolean(KEY_GO_OFFLINE_WHEN_DISABLED, false)
 
-    fun setStayOnline(context: Context, value: Boolean) {
+    fun setGoOfflineWhenDisabled(context: Context, value: Boolean) {
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit().putBoolean(KEY_STAY_ONLINE, value).apply()
+            .edit().putBoolean(KEY_GO_OFFLINE_WHEN_DISABLED, value).apply()
     }
 
     fun isCrashReportingEnabled(context: Context): Boolean =
