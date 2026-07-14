@@ -105,10 +105,12 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
             // gone, or the user sees a manual "Save" row for a file that is already
             // downloading and can fire a second, concurrent accept for the same id.
             runCatching { FileAutoAccept.run(context) }
-            // With the VPN off and stay-online off, RayfishVpnService is not running,
-            // so this 2s loop is the only poller while the app is open: without this,
-            // an own-device auto-accept (and any other in-flight transfer) would show
-            // no progress and no result notification at all.
+            // With the VPN off and go-fully-offline enabled, RayfishVpnService is not
+            // running, so this 2s loop becomes the only poller while the app is open:
+            // without this, an own-device auto-accept (and any other in-flight
+            // transfer) would show no progress and no result notification at all.
+            // This is uncommon (standby is the default); the common case keeps the
+            // control plane running in the background.
             runCatching { TransferNotifier.poll(context) }
             val autoAccepting = NodeHolder.isAutoAcceptOwnDevices(context)
             files = runCatching { node.listFileOffers() }.getOrDefault(emptyList())

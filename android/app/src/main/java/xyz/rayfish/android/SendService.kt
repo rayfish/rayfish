@@ -27,9 +27,9 @@ import uniffi.ray_mobile.TransferState
  * offer reaches a terminal state or [WAIT_TIMEOUT_MS] passes; after that, the
  * only thing left that can report a result is [RayfishVpnService]'s background
  * poller, and that only runs while some instance of that service is actually
- * alive (the VPN on, or stay-online keeping it in standby). A plain
+ * alive (the VPN on, or standby keeping the control plane running). A plain
  * `NodeHolder.ensureStarted` with no `RayfishVpnService` running (e.g.
- * `ShareActivity` sharing with the VPN off and stay-online off) starts no
+ * `ShareActivity` sharing with the VPN off and go-fully-offline enabled) starts no
  * poller at all: the transfer still completes in the core, but nobody is
  * listening, so the result notification never arrives. [TransferNotifier]'s
  * "waiting" notification says this plainly rather than implying a result
@@ -138,7 +138,7 @@ class SendService : Service() {
             // service after WAIT_TIMEOUT_MS. The transfer is not cancelled by that:
             // it keeps running in the core, and the background poller in
             // RayfishVpnService posts the result whenever it lands, provided the node
-            // is still alive (VPN on, or the stay-online pref).
+            // is still alive (VPN on, or in standby).
             //
             // If either snapshot failed, we cannot bound this batch at all: waiting
             // on an unscoped count would silently reinstate the same bug the scoping

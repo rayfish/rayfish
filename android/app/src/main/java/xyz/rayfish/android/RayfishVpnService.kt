@@ -110,10 +110,9 @@ class RayfishVpnService : VpnService() {
             ACTION_STANDBY -> {
                 // Enter standby explicitly, sent from YouScreen's toggle OFF
                 // branch (the user no longer wants "go fully offline") while the
-                // tunnel is off. Must bring up the
-                // control plane only: never touch the Builder/establish() path,
-                // so it never contends for the single VpnService slot and never
-                // triggers the VPN consent dialog.
+                // tunnel is off. Must bring up the control plane only: never touch
+                // the Builder/establish() path, so it never contends for the single
+                // VpnService slot and never triggers the VPN consent dialog.
                 //
                 // The tunnel != null decision cannot be made here, on the main
                 // thread: tunnel is only written on nodeExecutor, so a main-thread
@@ -180,7 +179,7 @@ class RayfishVpnService : VpnService() {
                         // No tunnel: either genuine standby the user no longer
                         // wants, or a fresh service instance (process was dead)
                         // with nothing started at all. Either way the same offline
-                        // teardown ACTION_STOP performs with stay-online off,
+                        // teardown ACTION_STOP performs when go-fully-offline is enabled,
                         // idempotent if there was nothing to tear down.
                         stopTunnel(standby = false)
                         Log.i(TAG, "ACTION_EXIT_STANDBY: stopTunnel returned; calling stopSelf(startId=$startId)")
