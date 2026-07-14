@@ -123,9 +123,10 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 // null right after an Activity recreation: it can read stale-false
                 // while the VPN just came up in Home, or stale-true right after Home
                 // just took it down. Deciding from it here can silently kill a live
-                // VPN or silently no-op a real request. The service's tunnel field
-                // is the only state that never lags, so send unconditionally and let
-                // the service decide from that.
+                // VPN or silently no-op a real request. The service's tunnel field is
+                // authoritative only once the service re-checks it on nodeExecutor
+                // (the thread that writes it), so send unconditionally and let the
+                // service decide there instead of guessing from this stale cache.
                 if (on) {
                     // Bring the control plane up only, never a tunnel: a plain
                     // intent would land in startTunnel() and try to grab the

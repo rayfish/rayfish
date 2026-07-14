@@ -113,18 +113,39 @@ class RayfishVpnService : VpnService() {
                 // from YouScreen while the tunnel is off. Must bring up the
                 // control plane only: never touch the Builder/establish() path,
                 // so it never contends for the single VpnService slot and never
-                // triggers the VPN consent dialog. enterStandby() is idempotent,
-                // so a repeat call (fast toggle off-then-on) is harmless.
+                // triggers the VPN consent dialog.
+                //
+                // The tunnel != null decision cannot be made here, on the main
+                // thread: tunnel is only written on nodeExecutor, so a main-thread
+                // read is stale for the whole duration of an in-flight bring-up or
+                // teardown (seconds). A stale null here would run enterStandby
+                // while a bring-up is still landing; a stale non-null would skip
+                // standby entirely while a teardown is still clearing the field.
+                // So post the notification this call is obligated to post right
+                // away (this is a startForegroundService start), then decide for
+                // real on nodeExecutor, where the check is serialized against
+                // startTunnelBlocking and stopTunnel and therefore sees the
+                // settled value.
                 Log.i(TAG, "ACTION_STANDBY received")
-                if (tunnel != null) {
-                    // The tunnel is already up: this is a pref-flip racing with a live
-                    // tunnel, not the "VPN is off, bring up the control plane only"
-                    // case this action exists for. Never tear a live tunnel down
-                    // because of it.
-                    Log.i(TAG, "ACTION_STANDBY ignored: tunnel already up")
-                    return START_STICKY
+                startForegroundNotification(standby = true)
+                nodeExecutor.execute {
+                    // See the ACTION_STOP execute() block for why this must never
+                    // let a throwable escape.
+                    try {
+                        if (tunnel != null) {
+                            // A tunnel is genuinely up (or came up while this call
+                            // queued behind a bring-up): never tear it down for
+                            // this. Correct the notification posted above, which
+                            // assumed standby.
+                            Log.i(TAG, "ACTION_STANDBY: tunnel is up, correcting notification instead of entering standby")
+                            startForegroundNotification(standby = false)
+                            return@execute
+                        }
+                        enterStandbyBlocking()
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "ACTION_STANDBY task crashed", t)
+                    }
                 }
-                enterStandby()
                 return START_STICKY
             }
             ACTION_EXIT_STANDBY -> {
@@ -133,26 +154,33 @@ class RayfishVpnService : VpnService() {
                 // Meaning: "the user no longer wants standby; if nothing else needs
                 // the control plane up (no tunnel), take the node fully offline and
                 // stop the service." If a tunnel is up, the VPN is on and this pref
-                // only governs what happens at the next teardown, so do nothing:
-                // the same guard ACTION_STANDBY applies in the other direction.
-                Log.i(TAG, "ACTION_EXIT_STANDBY received (tunnel fd present=${tunnel != null})")
-                if (tunnel != null) {
-                    Log.i(TAG, "ACTION_EXIT_STANDBY ignored: tunnel is up")
-                    return START_STICKY
-                }
-                // No tunnel: either genuine standby the user no longer wants, or a
-                // fresh service instance (process was dead) with nothing started at
-                // all. Either way the same offline teardown ACTION_STOP performs
-                // with stay-online off, idempotent if there was nothing to tear
-                // down. No standby notification is posted here (unlike ACTION_STOP's
-                // standby branch): this path never leaves the service in standby, so
-                // there is nothing true to say about it, and the intent that reaches
-                // here is a plain startService, not a foreground one, so there is no
-                // foreground-notification deadline to meet.
+                // only governs what happens at the next teardown, so do nothing.
+                //
+                // As with ACTION_STANDBY above, the tunnel != null decision must be
+                // made on nodeExecutor, not here: a main-thread read stays stale for
+                // as long as a bring-up or teardown is in flight, so this call could
+                // otherwise queue a full offline teardown behind a bring-up that
+                // hasn't reached its tunnel assignment yet, and then kill a tunnel
+                // the user just turned on. No notification obligation here (unlike
+                // ACTION_STANDBY): this intent is a plain startService from a
+                // visible Activity, not a foreground one, so there is no
+                // foreground-notification deadline to meet, and this path never
+                // leaves the service in standby so there is nothing true to say on
+                // a freshly created instance.
+                Log.i(TAG, "ACTION_EXIT_STANDBY received")
                 nodeExecutor.execute {
                     // See the ACTION_STOP execute() block for why this must never
                     // let a throwable escape.
                     try {
+                        if (tunnel != null) {
+                            Log.i(TAG, "ACTION_EXIT_STANDBY: a tunnel came up, nothing to exit")
+                            return@execute
+                        }
+                        // No tunnel: either genuine standby the user no longer
+                        // wants, or a fresh service instance (process was dead)
+                        // with nothing started at all. Either way the same offline
+                        // teardown ACTION_STOP performs with stay-online off,
+                        // idempotent if there was nothing to tear down.
                         stopTunnel(standby = false)
                         Log.i(TAG, "ACTION_EXIT_STANDBY: stopTunnel returned; calling stopSelf(startId=$startId)")
                         stopSelf(startId)
@@ -160,7 +188,13 @@ class RayfishVpnService : VpnService() {
                         Log.e(TAG, "ACTION_EXIT_STANDBY task crashed", t)
                     }
                 }
-                return START_NOT_STICKY
+                // START_STICKY, not START_NOT_STICKY: stopSelf(startId) above still
+                // cancels the sticky restart on the path that actually stops.
+                // Returning START_NOT_STICKY here would make it the last command's
+                // return value while a live tunnel is running (the tunnel != null
+                // path above returns without calling stopSelf), so a process kill
+                // would not restart the service to serve that tunnel.
+                return START_STICKY
             }
             // An action-less start intent is the normal "turn the VPN on" path
             // (see HomeScreen / RayfishApp, which both start the service with a
@@ -389,26 +423,37 @@ class RayfishVpnService : VpnService() {
     private fun enterStandby() {
         startForegroundNotification(standby = true)
         nodeExecutor.execute {
-            // Outer catch: see the ACTION_STOP execute() block. The inner catch
-            // below is deliberately narrower: a control-plane bring-up failure
-            // still needs the poller started, so it's caught and logged there
-            // rather than aborting this whole task.
+            // See the ACTION_STOP execute() block for why this must never let a
+            // throwable escape.
             try {
-                try {
-                    runBlocking { NodeHolder.ensureStarted(applicationContext) }
-                    Log.i(TAG, "standby: control plane up, no tunnel")
-                } catch (t: Throwable) {
-                    Log.e(TAG, "standby bring-up failed", t)
-                }
-                // Moved inside the executor task: autoAcceptPoller (like dnsProxy) is
-                // only read and written from nodeExecutor's thread (startTunnelBlocking,
-                // stopTunnel). Calling this from the main thread, as before, made it the
-                // one field touched from two threads with no lock between them.
-                startAutoAcceptPoller()
+                enterStandbyBlocking()
             } catch (t: Throwable) {
                 Log.e(TAG, "enterStandby task crashed", t)
             }
         }
+    }
+
+    /**
+     * The blocking half of standby bring-up: ensureStarted plus starting the
+     * poller. Runs on nodeExecutor, called both from enterStandby() above (the
+     * null-intent restart path and ACTION_STANDBY's own helper) and directly
+     * from ACTION_STANDBY's executor task once that task has confirmed, on
+     * nodeExecutor itself, that no tunnel is up.
+     */
+    private fun enterStandbyBlocking() {
+        // The control-plane bring-up failure below still needs the poller
+        // started, so it's caught and logged here rather than aborting the
+        // rest of this function.
+        try {
+            runBlocking { NodeHolder.ensureStarted(applicationContext) }
+            Log.i(TAG, "standby: control plane up, no tunnel")
+        } catch (t: Throwable) {
+            Log.e(TAG, "standby bring-up failed", t)
+        }
+        // autoAcceptPoller (like dnsProxy) is only read and written from
+        // nodeExecutor's thread (startTunnelBlocking, stopTunnel), so this must
+        // run here and not on the main thread.
+        startAutoAcceptPoller()
     }
 
     /**
