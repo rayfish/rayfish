@@ -130,6 +130,9 @@ pub(crate) use dns_service::DnsService;
 mod file_service;
 pub(crate) use file_service::FileService;
 
+/// In-flight transfer state, for progress reporting on both sides of a send.
+pub mod transfers;
+
 mod connect_service;
 pub(crate) use connect_service::ConnectService;
 
