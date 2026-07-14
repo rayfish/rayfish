@@ -24,29 +24,93 @@ import uniffi.ray_mobile.TransferState
  * duplicates, and a terminal state is posted exactly once.
  */
 object TransferNotifier {
-    private const val CHANNEL_ID = "rayfish_transfers"
+    internal const val CHANNEL_ID = "rayfish_transfers"
     // Offset well clear of the VPN (1) and SendService notification ids.
     private const val NOTIF_BASE = 5000
     private val terminal = java.util.Collections.synchronizedSet(HashSet<ULong>())
+    // Transfer ids we have posted an ongoing progress notification for in this
+    // process. Used to cancel the notification once the transfer leaves the
+    // registry (Critical 1a) without ever having reached a terminal state we
+    // observed ourselves.
+    private val postedProgress = java.util.Collections.synchronizedSet(HashSet<ULong>())
+    private var channelEnsured = false
+    private var cancelledStaleOnStart = false
 
-    /** Read the registry and reconcile notifications. Safe on any thread. */
+    /**
+     * Read the registry and reconcile notifications. Safe on any thread.
+     *
+     * The whole body runs under a single lock: [SendService] and the VPN
+     * poller both call this concurrently, and without serializing the read
+     * (listTransfers) plus the write (notify) as one step, one driver can
+     * post a "Sent" result and the other, working off a snapshot taken a
+     * moment earlier, can then post a progress bar over it that nothing
+     * ever clears (Critical 2).
+     */
     fun poll(context: Context) {
-        val transfers = runCatching { NodeHolder.get(context).listTransfers() }.getOrNull() ?: return
-        for (t in transfers) {
-            when (t.state) {
-                TransferState.OFFERED, TransferState.TRANSFERRING -> postProgress(context, t)
-                TransferState.DONE, TransferState.FAILED -> {
-                    // Terminal entries stay listable for 60s, so guard against
-                    // re-posting the same result on every poll.
-                    if (terminal.add(t.id)) postResult(context, t)
+        synchronized(this) {
+            // The core's transfer registry starts empty on every process start, so
+            // any ongoing notification still showing at this point is necessarily
+            // left over from a previous process and can never be resolved by this
+            // one (Critical 1b). Clear it once, before posting anything ourselves.
+            if (!cancelledStaleOnStart) {
+                cancelledStaleOnStart = true
+                cancelStaleOngoingNotifications(context)
+            }
+
+            val transfers = runCatching { NodeHolder.get(context).listTransfers() }.getOrNull() ?: return
+            val liveIds = transfers.mapTo(HashSet()) { it.id }
+            for (t in transfers) {
+                when (t.state) {
+                    TransferState.OFFERED, TransferState.TRANSFERRING -> postProgress(context, t)
+                    TransferState.DONE, TransferState.FAILED -> {
+                        // Terminal entries stay listable for 60s, so guard against
+                        // re-posting the same result on every poll.
+                        if (terminal.add(t.id)) postResult(context, t)
+                    }
+                }
+            }
+            pruneVanished(context, liveIds)
+        }
+    }
+
+    /** Cancel every ongoing notification on our channel, regardless of what it is
+     * for. Only called once, before this process has posted anything of its own. */
+    private fun cancelStaleOngoingNotifications(context: Context) {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O) return
+        val nm = context.getSystemService(NotificationManager::class.java)
+        runCatching {
+            for (sbn in nm.activeNotifications) {
+                val n = sbn.notification
+                if (n.channelId == CHANNEL_ID && (n.flags and Notification.FLAG_ONGOING_EVENT) != 0) {
+                    nm.cancel(sbn.id)
                 }
             }
         }
     }
 
-    private fun notifId(id: ULong): Int = NOTIF_BASE + (id.toInt() and 0xffff)
+    /** Anything we posted a progress bar for that has since left the registry
+     * (transfer completed and its 60s window elapsed, or it was never observed
+     * reaching a terminal state) is stale: cancel it so it cannot outlive the
+     * transfer it describes. Also prunes [terminal] so it does not grow forever
+     * (minor 6). */
+    private fun pruneVanished(context: Context, liveIds: Set<ULong>) {
+        val nm = context.getSystemService(NotificationManager::class.java)
+        val vanished = postedProgress.filter { it !in liveIds }
+        for (id in vanished) {
+            nm.cancel(notifId(id))
+            postedProgress.remove(id)
+        }
+        terminal.removeAll { it !in liveIds }
+    }
+
+    private fun notifId(id: ULong): Int = NOTIF_BASE + (id.toInt() and 0x7fffffff)
 
     private fun postProgress(context: Context, t: uniffi.ray_mobile.Transfer) {
+        // A terminal result for this id has already been posted (or is about to
+        // be, by whichever driver won the race): never draw a progress bar back
+        // over it (Critical 2).
+        if (t.id in terminal) return
+        postedProgress.add(t.id)
         ensureChannel(context)
         val waiting = t.state == TransferState.OFFERED
         val title = if (t.outgoing) "Sending ${t.filename}" else "Receiving ${t.filename}"
@@ -114,7 +178,14 @@ object TransferNotifier {
         Log.i("RayfishTransfers", "transfer ${t.id} ${t.state} (${t.filename})")
     }
 
-    private fun ensureChannel(context: Context) {
+    /** Called on every post, but only does binder work once per process: creating an
+     * already-existing channel also silently overwrites its name/description, so a
+     * second definition anywhere would make the label in system Settings flip-flop
+     * depending on which ran last (minor 7). This is the one definition; [SendService]
+     * reuses it instead of declaring its own. */
+    internal fun ensureChannel(context: Context) {
+        if (channelEnsured) return
+        channelEnsured = true
         if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O) return
         val channel = NotificationChannel(
             CHANNEL_ID,

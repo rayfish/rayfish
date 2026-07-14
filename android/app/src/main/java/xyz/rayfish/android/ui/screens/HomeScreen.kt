@@ -26,6 +26,7 @@ import uniffi.ray_mobile.Status
 import xyz.rayfish.android.FileAutoAccept
 import xyz.rayfish.android.NodeHolder
 import xyz.rayfish.android.RayfishVpnService
+import xyz.rayfish.android.TransferNotifier
 import xyz.rayfish.android.moveToDownloads
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
@@ -98,6 +99,11 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
             // Auto-accept own-device offers first so they don't linger as manual
             // "Save" prompts; the list below then shows only offers from others.
             runCatching { FileAutoAccept.run(context) }
+            // With the VPN off and stay-online off, RayfishVpnService is not running,
+            // so this 2s loop is the only poller while the app is open: without this,
+            // an own-device auto-accept (and any other in-flight transfer) would show
+            // no progress and no result notification at all.
+            runCatching { TransferNotifier.poll(context) }
             files = runCatching { node.listFileOffers() }.getOrDefault(emptyList())
             connects = runCatching { node.listConnectRequests() }.getOrDefault(emptyList())
             joins = currentNets.filter { it.isCoordinator }.flatMap { n ->
