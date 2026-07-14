@@ -174,6 +174,11 @@ async fn build_daemon(
     )
     .await?;
 
+    // Built before the blob store below, because the provider event pump that
+    // feeds it (an upcoming send-side wiring) attaches to `BlobsProtocol` at
+    // construction and needs the same registry.
+    let transfers = Arc::new(transfers::TransferRegistry::new());
+
     // --- Content-addressed blob store (membership/file transfer) ---
     let blobs_dir = config::config_dir()?.join("blobs");
     std::fs::create_dir_all(&blobs_dir)?;
@@ -289,6 +294,7 @@ async fn build_daemon(
         registry.clone(),
         device_cert.clone(),
         device_user_map.clone(),
+        transfers.clone(),
     ));
     let connect = Arc::new(ConnectService::new(
         transport.clone(),
@@ -367,6 +373,7 @@ async fn build_daemon(
         _metrics_server: metrics_server,
         router,
         files,
+        transfers,
         connect,
         device_cert,
         contact_public,

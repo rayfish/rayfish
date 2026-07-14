@@ -488,6 +488,9 @@ pub struct Daemon {
     /// File-transfer + pairing state and ALPN accept arms (see [`FileService`]).
     /// Shared with [`ProtocolRouter`], which runs the accept arms.
     files: Arc<FileService>,
+    /// In-flight file transfers, both directions, for progress reporting. Shared
+    /// with [`FileService`] (receive side) and the send-side provider event pump.
+    transfers: Arc<transfers::TransferRegistry>,
     /// `ray connect` state + ALPN accept arm (see [`ConnectService`]). Shared with
     /// [`ProtocolRouter`], which runs the accept arm.
     connect: Arc<ConnectService>,
@@ -562,6 +565,12 @@ impl Daemon {
             Ok(cert) => cert,
             Err(_) => self.device_cert.clone(),
         }
+    }
+
+    /// In-flight file transfers, both directions, for progress reporting. Cheap:
+    /// clones a small vec. Safe to poll.
+    pub fn list_transfers(&self) -> Vec<transfers::TransferInfo> {
+        self.transfers.list()
     }
 
     /// Gracefully take the whole node offline: cancel the daemon-wide shutdown
