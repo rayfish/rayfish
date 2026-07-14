@@ -16,27 +16,75 @@ import java.util.UUID
  */
 
 /**
- * Whether the most recent [moveToDownloads] call for a given filename actually
+ * Identifies one accept call's worth of work for [DownloadsOutcome], on both sides
+ * of the accept (FileAutoAccept / HomeScreen's Save) and the later TransferNotifier
+ * poll that reports the terminal result. There is no id shared across the FFI
+ * boundary here: the offer id (FileOffer.id) and the transfer id the core assigns
+ * once accept_file starts (Transfer.id) are two independent counters, and
+ * Node.acceptFileOffer returns nothing that would let Kotlin learn the resulting
+ * transfer id. (peer, filename, size) is the closest thing to unique available on
+ * both sides; it only collides if the same peer sends two files with the same name
+ * and size at the same time, an accepted rough edge, not a correctness requirement
+ * here.
+ */
+internal data class TransferKey(val peer: String, val filename: String, val size: ULong)
+
+/**
+ * Whether the most recent [moveToDownloads] call for a given transfer actually
  * landed the file in the public Downloads collection, so [TransferNotifier] can
  * report the truth instead of assuming Downloads whenever a receive completes.
  *
- * Keyed by filename rather than transfer id: the accept call site (FileAutoAccept,
- * or HomeScreen's manual Save) and the later TransferNotifier poll that reports
- * the terminal result are on different call chains with no transfer id in common
- * at accept time. A same-name collision between two receives in flight at once is
- * an accepted rough edge, not a correctness requirement here.
+ * The core reports a receive as DONE inside the blocking acceptFileOffer call,
+ * before moveToDownloads (the MediaStore byte copy) even starts, so a poller can
+ * observe DONE while the copy is still running. [markPending] records that a save
+ * is in flight for a key *before* acceptFileOffer is called; TransferNotifier
+ * checks [isPending] and, while true, defers posting the result entirely (and
+ * does not mark the transfer terminal) rather than posting a guess that can be
+ * permanently wrong. [record] (success) and [clearPending] (the accept itself
+ * failed, so no Downloads outcome will ever be recorded) both clear it.
  */
 internal object DownloadsOutcome {
-    private val outcomes = java.util.Collections.synchronizedMap(HashMap<String, Boolean>())
+    private val outcomes = java.util.Collections.synchronizedMap(HashMap<TransferKey, Boolean>())
+    private val pending = java.util.Collections.synchronizedMap(HashMap<TransferKey, Long>())
 
-    fun record(filename: String, reachedDownloads: Boolean) {
-        outcomes[filename] = reachedDownloads
+    // A save that never completes (process death mid-copy, a wedged MediaStore
+    // call) must not mute the result notification forever: past this much time
+    // since markPending, isPending gives up waiting and lets the poller post
+    // whatever it can determine (no Downloads claim, since none was ever
+    // recorded). Comfortably under the core's 60s terminal-listability window, so
+    // a poll still has time left to observe and post the terminal state once this
+    // expires instead of the entry aging out of the registry unreported.
+    private const val PENDING_TIMEOUT_MS = 45_000L
+
+    fun markPending(key: TransferKey) {
+        pending[key] = android.os.SystemClock.elapsedRealtime()
+    }
+
+    /** The accept itself failed before a Downloads outcome could ever be recorded
+     * for this key: stop treating it as pending so the failure result can post on
+     * the very next poll instead of waiting out [PENDING_TIMEOUT_MS]. */
+    fun clearPending(key: TransferKey) {
+        pending.remove(key)
+    }
+
+    fun isPending(key: TransferKey): Boolean {
+        val since = pending[key] ?: return false
+        if (android.os.SystemClock.elapsedRealtime() - since > PENDING_TIMEOUT_MS) {
+            pending.remove(key)
+            return false
+        }
+        return true
+    }
+
+    fun record(key: TransferKey, reachedDownloads: Boolean) {
+        pending.remove(key)
+        outcomes[key] = reachedDownloads
     }
 
     /** Consumes (removes) the recorded outcome so a later receive reusing the same
-     * filename does not read a stale value. Defaults to false (the neutral "Saved"
+     * key does not read a stale value. Defaults to false (the neutral "Saved"
      * copy, no Downloads tap target) when nothing was recorded. */
-    fun consume(filename: String): Boolean = outcomes.remove(filename) ?: false
+    fun consume(key: TransferKey): Boolean = outcomes.remove(key) ?: false
 }
 
 /**
@@ -127,8 +175,14 @@ internal fun stageUriForSend(context: Context, uri: Uri): File? {
 object FileAutoAccept {
     private val handled = java.util.Collections.synchronizedSet(HashSet<ULong>())
     private val attempts = java.util.concurrent.ConcurrentHashMap<ULong, Int>()
-    private val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
+    private val executor = java.util.concurrent.Executors.newFixedThreadPool(2) as java.util.concurrent.ThreadPoolExecutor
     private const val MAX_ATTEMPTS = 3
+
+    /** Best-effort: whether an accept is currently running on [executor]. Used only
+     * to log plainly when a forced offline teardown (see RayfishVpnService's
+     * handleBringUpFailure) is about to drop an in-flight receive; not a signal
+     * anything waits on or retries against. */
+    fun hasInFlightAccepts(): Boolean = executor.activeCount > 0
     // Ids we have permanently given up retrying. Exposed so HomeScreen can exempt
     // them from the "hide own-device offers while auto-accept is on" filter: once
     // we give up, the offer would otherwise be invisible with no way to save it.
@@ -160,6 +214,13 @@ object FileAutoAccept {
         for (f in offers) {
             if (!f.ownDevice) continue
             if (!handled.add(f.id)) continue
+            val key = TransferKey(f.from, f.filename, f.size)
+            // Mark the save pending before the blocking accept even starts: the
+            // core reports the transfer DONE from inside acceptFileOffer, well
+            // before moveToDownloads below has copied a single byte, so a poller
+            // racing this thread must see "pending" from the first moment DONE
+            // can appear.
+            DownloadsOutcome.markPending(key)
             // acceptFileOffer blocks for the whole download; the bounded pool caps
             // how many can run at once regardless of how many offers are pending.
             // The core registers the transfer, so TransferNotifier picks it up.
@@ -167,10 +228,15 @@ object FileAutoAccept {
                 try {
                     node.acceptFileOffer(f.id, saveDir)
                     val reached = moveToDownloads(context, File(saveDir, f.filename), f.filename, f.mimeType)
-                    DownloadsOutcome.record(f.filename, reached)
+                    DownloadsOutcome.record(key, reached)
                     attempts.remove(f.id)
                     Log.i("RayfishFiles", "auto-accepted own-device file ${f.filename}")
                 } catch (t: Throwable) {
+                    // The accept itself failed: no Downloads outcome is ever coming
+                    // for this key, so stop treating it as pending immediately
+                    // rather than making the result notification wait out the
+                    // timeout for a failure that has already happened.
+                    DownloadsOutcome.clearPending(key)
                     val tries = attempts.merge(f.id, 1) { old, inc -> old + inc } ?: 1
                     if (tries < MAX_ATTEMPTS) {
                         // Let a later poll retry this id.

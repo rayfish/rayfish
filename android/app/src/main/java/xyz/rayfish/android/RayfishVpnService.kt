@@ -41,6 +41,11 @@ class RayfishVpnService : VpnService() {
     // shared to this device land in Downloads even with the app UI closed.
     private var autoAcceptPoller: ScheduledExecutorService? = null
 
+    override fun onCreate() {
+        super.onCreate()
+        isRunning = true
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null) {
             // A genuinely null intent means the system restarted us after killing
@@ -380,6 +385,17 @@ class RayfishVpnService : VpnService() {
      * replaces whatever startForegroundNotification() posted at the top of
      * startTunnel(), and the poller starts so files keep landing. With
      * stay-online off there is nothing left to keep the service alive for.
+     *
+     * Honesty check on the stay-online-off branch: with the VPN off and
+     * stay-online off, a node started earlier by ShareActivity (own-device
+     * auto-accept, or a manual Save, driven by HomeScreen's poller) can be
+     * mid-receive when the user then asks for the VPN to come on and it fails
+     * here (another VPN app holds the slot). NodeHolder.stopNode below then
+     * kills that in-flight receive and drops the partial file, even though the
+     * user asked to go online, not offline. The "no VPN + stay-online off means
+     * offline" invariant has to win regardless: this is a real, if narrow, cost
+     * of it, not a bug to route around, and no retry/queueing is built for it
+     * here. hasInFlightAccepts() below only makes the cost visible in the log.
      */
     private fun handleBringUpFailure(reason: String, startId: Int) {
         tunnel = null
@@ -408,8 +424,17 @@ class RayfishVpnService : VpnService() {
             // connection open and the device would stay visible to peers with
             // both the VPN toggle and stay-online off, contradicting what the
             // user asked for.
+            if (FileAutoAccept.hasInFlightAccepts()) {
+                Log.w(TAG, "$reason; an own-device file accept looks in flight, stopping the node anyway (stay-online off) will drop it")
+            }
             Log.e(TAG, "$reason; tunnel not up and stay-online off, stopping node and service (startId=$startId)")
             NodeHolder.stopNode(applicationContext)
+            // Nothing is left to poll for: stay-online off means no control plane
+            // is meant to be up, so a poller left running here would just be dead
+            // work spinning every 4s against a stopped node until onDestroy's
+            // teardown eventually lands.
+            autoAcceptPoller?.shutdownNow()
+            autoAcceptPoller = null
             stopSelf(startId)
         }
     }
@@ -624,6 +649,11 @@ class RayfishVpnService : VpnService() {
         // lets every queued task, including this one, run to completion in the
         // background.
         Log.i(TAG, "onDestroy: service being destroyed (tunnel fd present=${tunnel != null})")
+        // Set now, not after the queued teardown below: TransferNotifier's "only
+        // notified if Rayfish stays running" caveat reads this to decide whether a
+        // poller is still alive, and once onDestroy has been called nothing here
+        // is going to observe a transfer completing any more.
+        isRunning = false
         nodeExecutor.execute {
             // See the ACTION_STOP execute() block for why this must never let a
             // throwable escape.
@@ -696,6 +726,17 @@ class RayfishVpnService : VpnService() {
         // Neither task may run on the main thread: both block on FFI calls into the
         // Rust core.
         private val nodeExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
+        // Whether an instance of this service is currently alive: set in onCreate,
+        // cleared in onDestroy. Read by TransferNotifier to decide whether its
+        // "only notified if Rayfish stays running" caveat is actually true (a
+        // poller alive in the background, VPN on or standby, will observe and
+        // notify a transfer's completion regardless of whether the app UI is
+        // open). Not a substitute for tunnel/standby state: it says only that a
+        // poller is running, not what it is doing.
+        @Volatile
+        var isRunning: Boolean = false
+            private set
 
         const val ACTION_STOP = "xyz.rayfish.android.STOP"
         const val ACTION_STANDBY = "xyz.rayfish.android.STANDBY"
