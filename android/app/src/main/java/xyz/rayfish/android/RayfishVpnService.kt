@@ -57,7 +57,7 @@ class RayfishVpnService : VpnService() {
             // else brought the node up: decide from the persisted prefs what
             // state to restore.
             if (NodeHolder.isEnabled(applicationContext)) {
-                startTunnel()
+                startTunnel(startId)
             } else if (NodeHolder.isStayOnline(applicationContext)) {
                 enterStandby()
             } else {
@@ -112,12 +112,12 @@ class RayfishVpnService : VpnService() {
             // (see HomeScreen / RayfishApp, which both start the service with a
             // plain Intent). It must reach startTunnel(), not be mistaken for
             // the null-intent restart-recovery branch above.
-            else -> startTunnel()
+            else -> startTunnel(startId)
         }
         return START_STICKY
     }
 
-    private fun startTunnel() {
+    private fun startTunnel(startId: Int) {
         // startForeground must be called promptly so the foreground-service
         // deadline is met; only the blocking node work goes to the executor.
         startForegroundNotification()
@@ -125,14 +125,14 @@ class RayfishVpnService : VpnService() {
             // See the ACTION_STOP execute() block for why this must never let a
             // throwable escape: an uncaught one here kills the process outright.
             try {
-                startTunnelBlocking()
+                startTunnelBlocking(startId)
             } catch (t: Throwable) {
                 Log.e(TAG, "startTunnelBlocking task crashed", t)
             }
         }
     }
 
-    private fun startTunnelBlocking() {
+    private fun startTunnelBlocking(startId: Int) {
         if (tunnel != null) return
 
         // Bring the control plane up before building the tunnel so status() can
@@ -244,7 +244,7 @@ class RayfishVpnService : VpnService() {
             } else {
                 "VpnService.Builder.establish() returned null (VPN slot likely unavailable)"
             }
-            handleBringUpFailure(reason)
+            handleBringUpFailure(reason, startId)
             return
         }
         tunnel = pfd
@@ -278,7 +278,7 @@ class RayfishVpnService : VpnService() {
             // it needs exactly the same recovery, so it goes through the same
             // helper instead of a divergent one that leaves dnsProxy orphaned and
             // the notification claiming a tunnel that isn't there.
-            handleBringUpFailure("Node.up() threw")
+            handleBringUpFailure("Node.up() threw", startId)
         }
     }
 
@@ -292,13 +292,17 @@ class RayfishVpnService : VpnService() {
      * instead of needing a full stop first.
      *
      * Then: with stay-online on, this is exactly the case standby exists for,
-     * so the control plane (already brought up earlier in
-     * startTunnelBlocking) keeps running, the standby notification replaces
-     * whatever startForegroundNotification() posted at the top of
+     * so the control plane must actually be (re)brought up here: the caller may
+     * have reached this point via a failed ensureStarted followed by a
+     * establish()/Node.up() that never needed the node running (see
+     * startTunnelBlocking's fallback tunnel address), so it cannot be assumed
+     * already up. ensureStarted is idempotent, so this is a no-op in the
+     * common case where it is. Once that is done, the standby notification
+     * replaces whatever startForegroundNotification() posted at the top of
      * startTunnel(), and the poller starts so files keep landing. With
      * stay-online off there is nothing left to keep the service alive for.
      */
-    private fun handleBringUpFailure(reason: String) {
+    private fun handleBringUpFailure(reason: String, startId: Int) {
         tunnel = null
         try {
             dnsProxy?.stop()
@@ -309,12 +313,17 @@ class RayfishVpnService : VpnService() {
 
         val standby = NodeHolder.isStayOnline(applicationContext)
         if (standby) {
-            Log.w(TAG, "$reason; staying in standby, control plane stays up")
+            Log.w(TAG, "$reason; staying in standby, ensuring control plane is up")
+            try {
+                runBlocking { NodeHolder.ensureStarted(applicationContext) }
+            } catch (t: Throwable) {
+                Log.e(TAG, "handleBringUpFailure: ensureStarted failed; mesh visibility and file transfer will not work until this recovers", t)
+            }
             startForegroundNotification(standby = true)
             startAutoAcceptPoller()
         } else {
-            Log.e(TAG, "$reason; tunnel not up, stopping service")
-            stopSelf()
+            Log.e(TAG, "$reason; tunnel not up, stopping service (startId=$startId)")
+            stopSelf(startId)
         }
     }
 
