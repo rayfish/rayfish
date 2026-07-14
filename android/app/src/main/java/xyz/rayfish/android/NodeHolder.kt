@@ -2,8 +2,6 @@ package xyz.rayfish.android
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.Node
 
@@ -24,13 +22,8 @@ object NodeHolder {
         }
     }
 
-    private val startMutex = Mutex()
-
     @Volatile
     private var started = false
-
-    /** True once the daemon is built and not yet stopped. */
-    val isStarted: Boolean get() = started
 
     // The user's persisted enable/disable intent. This is the authority for
     // whether the device should be online: the status poll must never start the
@@ -136,20 +129,32 @@ object NodeHolder {
     /**
      * Starts the node exactly once for the process, however many callers race to
      * invoke this concurrently (e.g. the initial UI launch and a cold-start deep
-     * link firing at the same time). Later callers just await the first start.
+     * link firing at the same time). Later callers just wait for the first start.
+     *
+     * This function, [stopNode] and [downNode] all guard their work with the same
+     * `synchronized(this)` monitor on this singleton, so a start can never
+     * interleave with a stop or a down: one always finishes before the other
+     * begins, whichever thread it runs on. That serialization is worth a blocked
+     * thread rather than a suspended coroutine, so this switches to
+     * [Dispatchers.IO] first and only then takes the monitor: the blocking
+     * `node.start()` FFI call and the `synchronized` block it runs in both then
+     * execute on a plain IO-pool thread, never on whatever dispatcher the caller
+     * happened to be on (composables here call this from the main-thread
+     * coroutine scope; suspending into IO before blocking keeps that safe).
      */
     suspend fun ensureStarted(context: Context) {
         if (started) return
-        startMutex.withLock {
-            if (started) return@withLock
-            withContext(Dispatchers.IO) {
-                // Register Android's trust store before start(): building the
-                // iroh endpoint sets up TLS, which fails without it.
-                RustlsInit.ensureInitialized(context)
-                get(context).start()
-                seedDeviceName(context)
+        withContext(Dispatchers.IO) {
+            synchronized(this@NodeHolder) {
+                if (!started) {
+                    // Register Android's trust store before start(): building the
+                    // iroh endpoint sets up TLS, which fails without it.
+                    RustlsInit.ensureInitialized(context)
+                    get(context).start()
+                    seedDeviceName(context)
+                    started = true
+                }
             }
-            started = true
         }
     }
 
@@ -157,6 +162,11 @@ object NodeHolder {
      * Fully stop the node so the device goes offline (control plane torn down,
      * not just the data plane). Clears the started flag so the next
      * [ensureStarted] rebuilds a fresh daemon. Safe to call when never started.
+     *
+     * The reset calls below deliberately run after the monitor is released:
+     * [TransferNotifier.reset] and [FileAutoAccept.reset] take their own locks,
+     * and neither is ever called from inside this object's monitor, so there is
+     * no path back into this monitor from theirs to deadlock against.
      */
     fun stopNode(context: Context) {
         synchronized(this) {

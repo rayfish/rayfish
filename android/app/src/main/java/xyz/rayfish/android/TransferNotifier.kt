@@ -28,11 +28,16 @@ object TransferNotifier {
     // Offset well clear of the VPN (1) and SendService notification ids.
     private const val NOTIF_BASE = 5000
     private val terminal = java.util.Collections.synchronizedSet(HashSet<ULong>())
-    // Transfer ids we have posted an ongoing progress notification for in this
-    // process. Used to cancel the notification once the transfer leaves the
-    // registry (Critical 1a) without ever having reached a terminal state we
-    // observed ourselves.
-    private val postedProgress = java.util.Collections.synchronizedSet(HashSet<ULong>())
+
+    // What we last posted for a given transfer id, keyed so a poll that finds
+    // nothing new can skip notify() entirely instead of reposting an unchanged
+    // notification: a dismissed notification must stay dismissed until the
+    // transfer's state actually changes, not get resurrected by the next poll
+    // a few seconds later. Also doubles as "we have a live progress notification
+    // out for this id" for pruneVanished below.
+    private data class Posted(val transferring: Boolean, val pct: Int)
+    private val postedProgress = java.util.Collections.synchronizedMap(HashMap<ULong, Posted>())
+
     @Volatile private var channelEnsured = false
     private var cancelledStaleOnStart = false
 
@@ -44,14 +49,14 @@ object TransferNotifier {
      * (listTransfers) plus the write (notify) as one step, one driver can
      * post a "Sent" result and the other, working off a snapshot taken a
      * moment earlier, can then post a progress bar over it that nothing
-     * ever clears (Critical 2).
+     * ever clears.
      */
     fun poll(context: Context) {
         synchronized(this) {
             // The core's transfer registry starts empty on every process start, so
             // any ongoing notification still showing at this point is necessarily
             // left over from a previous process and can never be resolved by this
-            // one (Critical 1b). Clear it once, before posting anything ourselves.
+            // one. Clear it once, before posting anything ourselves.
             if (!cancelledStaleOnStart) {
                 cancelledStaleOnStart = true
                 cancelStaleOngoingNotifications(context)
@@ -67,7 +72,7 @@ object TransferNotifier {
                         // terminal marker so postProgress does not keep suppressing
                         // it and a fresh result can post once it finishes again,
                         // instead of leaving a stale "Could not send" in the shade
-                        // for a file that actually arrived (minor 4).
+                        // for a file that actually arrived.
                         terminal.remove(t.id)
                         postProgress(context, t)
                     }
@@ -108,20 +113,20 @@ object TransferNotifier {
         }
     }
 
-    /** Anything we posted a progress bar for that has since left the registry
-     * without ever reaching a terminal state we observed (the process died and
-     * restarted mid-transfer, or the entry simply vanished) is stale: cancel it
-     * so it cannot outlive the transfer it describes.
+    /** Anything we posted a progress notification for that has since left the
+     * registry without ever reaching a terminal state we observed (the process
+     * died and restarted mid-transfer, or the entry simply vanished) is stale:
+     * cancel it so it cannot outlive the transfer it describes.
      *
      * A result notification's id is removed from [postedProgress] by [postResult]
      * itself, precisely so this loop can never reach it: once a result is posted,
      * that notification is done and permanent (until the user dismisses it or
      * taps it), it must not be cancelled just because the terminal entry aged out
      * of the registry 60s later. Also prunes [terminal] so it does not grow
-     * forever (minor 6). */
+     * forever. */
     private fun pruneVanished(context: Context, liveIds: Set<ULong>) {
         val nm = context.getSystemService(NotificationManager::class.java)
-        val vanished = postedProgress.filter { it !in liveIds }
+        val vanished = postedProgress.keys.filter { it !in liveIds }
         for (id in vanished) {
             nm.cancel(notifId(id))
             postedProgress.remove(id)
@@ -139,9 +144,9 @@ object TransferNotifier {
      * terminal.add returns false), while a stale result notification from the
      * previous run keeps sitting in the shade looking like the answer.
      *
-     * Only cancels notifications we posted a live progress bar for: a result
-     * notification's id is already out of [postedProgress] by the time it is
-     * posted (postResult removes it), so this can never cancel a result the
+     * Only cancels notifications we posted a live progress notification for: a
+     * result notification's id is already out of [postedProgress] by the time it
+     * is posted (postResult removes it), so this can never cancel a result the
      * user has not yet seen or acted on. Re-arms the one-shot stale sweep so a
      * leftover ongoing notification from before the stop still gets cleaned up
      * on the next poll. Safe to call when nothing is running.
@@ -149,7 +154,7 @@ object TransferNotifier {
     fun reset(context: Context) {
         synchronized(this) {
             val nm = context.getSystemService(NotificationManager::class.java)
-            for (id in postedProgress) {
+            for (id in postedProgress.keys) {
                 runCatching { nm.cancel(notifId(id)) }
             }
             postedProgress.clear()
@@ -161,14 +166,33 @@ object TransferNotifier {
     private fun postProgress(context: Context, t: uniffi.ray_mobile.Transfer) {
         // A terminal result for this id has already been posted (or is about to
         // be, by whichever driver won the race): never draw a progress bar back
-        // over it (Critical 2).
+        // over it.
         if (t.id in terminal) return
-        postedProgress.add(t.id)
-        ensureChannel(context)
+
         val waiting = t.state == TransferState.OFFERED
+        // size can be 0 for an empty file; treat that like "waiting" (indeterminate)
+        // rather than dividing by zero.
+        val pct = if (waiting || t.size == 0uL) {
+            -1
+        } else {
+            ((t.transferred.toDouble() / t.size.toDouble()) * 100).toInt().coerceIn(0, 100)
+        }
+        val newState = Posted(transferring = !waiting, pct = pct)
+        // Nothing changed since the last notify() for this id: skip it. Without
+        // this, a poller running every few seconds would repost the same
+        // notification every time, which on modern Android silently undoes a
+        // swipe-to-dismiss a few seconds after the user does it.
+        if (postedProgress[t.id] == newState) return
+        postedProgress[t.id] = newState
+
+        ensureChannel(context)
         val title = if (t.outgoing) "Sending ${t.filename}" else "Receiving ${t.filename}"
         val text = when {
-            waiting -> "Waiting for ${t.peer} to accept"
+            // Waiting on a human on the other end can take arbitrarily long, or
+            // never resolve at all, and we have no way to tell the user which.
+            // Say so plainly rather than let the notification imply a result is
+            // always coming.
+            waiting -> "Waiting for ${t.peer} to accept · only notified if Rayfish stays running"
             t.outgoing -> "To ${t.peer}"
             else -> "From ${t.peer}"
         }
@@ -179,14 +203,16 @@ object TransferNotifier {
                 if (t.outgoing) android.R.drawable.stat_sys_upload
                 else android.R.drawable.stat_sys_download,
             )
-            .setOngoing(true)
+            // Only a transfer that is actually moving bytes locks the notification
+            // in place. An OFFERED transfer is waiting on a human on the other end
+            // who may never act, so it must stay swipe-dismissible: an ongoing
+            // notification here would otherwise sit forever (older Android cannot
+            // swipe it away at all) for every send nobody ever accepts.
+            .setOngoing(newState.transferring)
             .setOnlyAlertOnce(true)
-        // Indeterminate while we are only waiting on the peer; a real bar once bytes
-        // move. size can be 0 for an empty file, so guard the division.
         if (waiting || t.size == 0uL) {
             builder.setProgress(0, 0, true)
         } else {
-            val pct = ((t.transferred.toDouble() / t.size.toDouble()) * 100).toInt().coerceIn(0, 100)
             builder.setProgress(100, pct, false)
         }
         context.getSystemService(NotificationManager::class.java)
@@ -196,12 +222,19 @@ object TransferNotifier {
     private fun postResult(context: Context, t: uniffi.ray_mobile.Transfer) {
         // This id no longer names an ongoing notification: it is about to become a
         // result notification instead. Drop it from postedProgress so pruneVanished
-        // can never mistake the result for a vanished progress bar and cancel it out
-        // from under the user 60s later when the terminal entry ages out of the
-        // registry (Critical 1).
+        // can never mistake the result for a vanished progress notification and
+        // cancel it out from under the user 60s later when the terminal entry ages
+        // out of the registry.
         postedProgress.remove(t.id)
         ensureChannel(context)
         val ok = t.state == TransferState.DONE
+        // moveToDownloads is best-effort (unavailable below API 29, or the
+        // MediaStore insert can fail), and its result is only known at accept
+        // time in FileAutoAccept / HomeScreen, not here. Consume what they
+        // recorded rather than assume Downloads: claiming a file landed there
+        // when it is actually sitting in app-private storage sends the user to
+        // an empty Downloads view with no way to find their file.
+        val savedToDownloads = ok && !t.outgoing && DownloadsOutcome.consume(t.filename)
         val title = when {
             ok && t.outgoing -> "Sent ${t.filename}"
             ok -> "Saved ${t.filename}"
@@ -210,11 +243,14 @@ object TransferNotifier {
         }
         val text = when {
             ok && t.outgoing -> "${t.peer} has it"
-            ok -> "Saved to Downloads"
+            savedToDownloads -> "Saved to Downloads"
+            ok -> "Saved"
             else -> "Transfer with ${t.peer} failed"
         }
-        // Tapping a received file opens Downloads; a sent one opens the app.
-        val intent = if (ok && !t.outgoing) {
+        // Tapping a file actually saved to Downloads opens Downloads; anything
+        // else (a send, or a receive that landed in app storage instead) opens
+        // the app, since Downloads has nothing relevant to show.
+        val intent = if (savedToDownloads) {
             Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS)
         } else {
             Intent(context, MainActivity::class.java)
@@ -240,7 +276,7 @@ object TransferNotifier {
     /** Called on every post, but only does binder work once per process: creating an
      * already-existing channel also silently overwrites its name/description, so a
      * second definition anywhere would make the label in system Settings flip-flop
-     * depending on which ran last (minor 7). This is the one definition; [SendService]
+     * depending on which ran last. This is the one definition; [SendService]
      * reuses it instead of declaring its own. */
     internal fun ensureChannel(context: Context) {
         if (channelEnsured) return
