@@ -66,8 +66,8 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
                     // had the tunnel, but we can no longer get it back. Clear it now,
                     // the same reasoning onRevoke already uses, so the toggle stops
                     // reading "on" for a tunnel that will never come up, and the You
-                    // screen's stay-online guard sees the real state instead of this
-                    // leftover intent.
+                    // screen's go-fully-offline control sees the real state instead of
+                    // this leftover intent.
                     NodeHolder.setEnabled(context, false)
                     if (!NodeHolder.isGoOfflineWhenDisabled(context)) {
                         ContextCompat.startForegroundService(
