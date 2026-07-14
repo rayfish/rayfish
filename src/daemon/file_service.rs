@@ -430,6 +430,17 @@ impl FileService {
             }
         }
 
+        // The bytes have not moved yet: `send_file` returns once the *offer* is
+        // delivered. The peer pulls the blob out of our store when it accepts, and
+        // that is what the provider events (wired up in bootstrap) report against
+        // this hash. So the transfer starts life as Offered.
+        self.transfers.register_send(
+            peer.to_string(),
+            filename.clone(),
+            size,
+            iroh_blobs::Hash::from_bytes(*hash.as_bytes()),
+        );
+
         IpcMessage::Ok {
             message: format!("offered {} ({}) to {}", filename, format_size(size), peer),
         }
