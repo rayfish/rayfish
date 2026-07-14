@@ -85,16 +85,25 @@ class RayfishVpnService : VpnService() {
                     startForegroundNotification(standby = true)
                 }
                 nodeExecutor.execute {
-                    stopTunnel(standby)
-                    if (!standby) {
-                        // stopSelf(startId), not the bare stopSelf(): fast off-then-on
-                        // toggling queues this stop behind a start that already
-                        // landed. stopSelf(startId) is a no-op once a newer start
-                        // command has been delivered, so it only kills the service
-                        // if no start arrived after this one; the bare form would
-                        // kill it either way and undo the newer start's tunnel.
-                        Log.i(TAG, "stopTunnel returned; calling stopSelf(startId=$startId)")
-                        stopSelf(startId)
+                    // A Runnable submitted with execute() has no Future to surface a
+                    // throw through; an uncaught one reaches the default
+                    // uncaught-exception handler and kills the process, which is
+                    // worse than whatever this task was trying to clean up. Catch
+                    // and log instead of letting that happen.
+                    try {
+                        stopTunnel(standby)
+                        if (!standby) {
+                            // stopSelf(startId), not the bare stopSelf(): fast off-then-on
+                            // toggling queues this stop behind a start that already
+                            // landed. stopSelf(startId) is a no-op once a newer start
+                            // command has been delivered, so it only kills the service
+                            // if no start arrived after this one; the bare form would
+                            // kill it either way and undo the newer start's tunnel.
+                            Log.i(TAG, "stopTunnel returned; calling stopSelf(startId=$startId)")
+                            stopSelf(startId)
+                        }
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "ACTION_STOP task crashed", t)
                     }
                 }
                 return if (standby) START_STICKY else START_NOT_STICKY
@@ -112,7 +121,15 @@ class RayfishVpnService : VpnService() {
         // startForeground must be called promptly so the foreground-service
         // deadline is met; only the blocking node work goes to the executor.
         startForegroundNotification()
-        nodeExecutor.execute { startTunnelBlocking() }
+        nodeExecutor.execute {
+            // See the ACTION_STOP execute() block for why this must never let a
+            // throwable escape: an uncaught one here kills the process outright.
+            try {
+                startTunnelBlocking()
+            } catch (t: Throwable) {
+                Log.e(TAG, "startTunnelBlocking task crashed", t)
+            }
+        }
     }
 
     private fun startTunnelBlocking() {
@@ -214,6 +231,25 @@ class RayfishVpnService : VpnService() {
             if (standby) {
                 Log.w(TAG, "establish() returned null (VPN slot likely unavailable); staying in standby, control plane stays up")
                 startForegroundNotification(standby = true)
+                // No tunnel exists for dnsProxy to serve (it was started above for
+                // a tunnel that never got built), so it would otherwise leak a
+                // bound socket and a thread on every retry of this path (the user
+                // re-tapping VPN on re-enters startTunnelBlocking and overwrites
+                // dnsProxy without stopping the old one). Stop and clear it here
+                // instead of restructuring the DNS setup to run after establish():
+                // that setup needs to happen before the tunnel is built so the
+                // resolver is pointed at the proxy from the first packet.
+                try {
+                    dnsProxy?.stop()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "dnsProxy.stop() failed in standby fallback", t)
+                }
+                dnsProxy = null
+                // Standby's whole point is that files keep landing with the UI
+                // closed; without this the poller never starts on this path and
+                // that promise is broken. Idempotent, so a later real tunnel
+                // bring-up just no-ops here.
+                startAutoAcceptPoller()
             } else {
                 Log.e(TAG, "VpnService.Builder.establish() returned null; tunnel not up, stopping service")
                 stopSelf()
@@ -256,17 +292,25 @@ class RayfishVpnService : VpnService() {
     private fun enterStandby() {
         startForegroundNotification(standby = true)
         nodeExecutor.execute {
+            // Outer catch: see the ACTION_STOP execute() block. The inner catch
+            // below is deliberately narrower: a control-plane bring-up failure
+            // still needs the poller started, so it's caught and logged there
+            // rather than aborting this whole task.
             try {
-                runBlocking { NodeHolder.ensureStarted(applicationContext) }
-                Log.i(TAG, "standby: control plane up, no tunnel")
+                try {
+                    runBlocking { NodeHolder.ensureStarted(applicationContext) }
+                    Log.i(TAG, "standby: control plane up, no tunnel")
+                } catch (t: Throwable) {
+                    Log.e(TAG, "standby bring-up failed", t)
+                }
+                // Moved inside the executor task: autoAcceptPoller (like dnsProxy) is
+                // only read and written from nodeExecutor's thread (startTunnelBlocking,
+                // stopTunnel). Calling this from the main thread, as before, made it the
+                // one field touched from two threads with no lock between them.
+                startAutoAcceptPoller()
             } catch (t: Throwable) {
-                Log.e(TAG, "standby bring-up failed", t)
+                Log.e(TAG, "enterStandby task crashed", t)
             }
-            // Moved inside the executor task: autoAcceptPoller (like dnsProxy) is
-            // only read and written from nodeExecutor's thread (startTunnelBlocking,
-            // stopTunnel). Calling this from the main thread, as before, made it the
-            // one field touched from two threads with no lock between them.
-            startAutoAcceptPoller()
         }
     }
 
@@ -290,8 +334,14 @@ class RayfishVpnService : VpnService() {
             startForegroundNotification(standby = true)
         }
         nodeExecutor.execute {
-            stopTunnel(standby)
-            if (!standby) stopSelf()
+            // See the ACTION_STOP execute() block for why this must never let a
+            // throwable escape.
+            try {
+                stopTunnel(standby)
+                if (!standby) stopSelf()
+            } catch (t: Throwable) {
+                Log.e(TAG, "onRevoke task crashed", t)
+            }
         }
     }
 
@@ -404,7 +454,15 @@ class RayfishVpnService : VpnService() {
         // lets every queued task, including this one, run to completion in the
         // background.
         Log.i(TAG, "onDestroy: service being destroyed (tunnel fd present=${tunnel != null})")
-        nodeExecutor.execute { stopTunnel(standby = false) }
+        nodeExecutor.execute {
+            // See the ACTION_STOP execute() block for why this must never let a
+            // throwable escape.
+            try {
+                stopTunnel(standby = false)
+            } catch (t: Throwable) {
+                Log.e(TAG, "onDestroy teardown task crashed", t)
+            }
+        }
         nodeExecutor.shutdown()
         super.onDestroy()
     }
