@@ -10,16 +10,20 @@
 //!   iroh-blobs *provider* events, which fire when a peer actually reads the blob
 //!   out of our store. `TransferCompleted` is the authoritative "they got it".
 //!
-//! Provider events are keyed by blob hash, not by transfer, and the roster
-//! (group blob) fetches ride the same blobs ALPN. So hashes we never registered as
-//! an outgoing file send are ignored, and a hash registered more than once (the
-//! same file sent to two peers) resolves oldest-offer-first.
+//! Provider events are keyed by blob hash *and* the resolved peer endpoint id, not
+//! by transfer. The roster (group blob) fetches ride the same blobs ALPN, so a
+//! hash we never registered as an outgoing file send is ignored, and requiring the
+//! peer to match too means the same file offered to two different peers can only
+//! ever be completed by the peer it was actually sent to: a pull by one can never
+//! complete the other's entry, and a pull by an unrelated third party (anyone who
+//! learned the hash) can't complete anyone's entry at all.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use iroh::EndpointId;
 use iroh_blobs::Hash;
 
 /// How long a finished transfer stays listable, so a poller can observe the
@@ -53,6 +57,11 @@ struct Entry {
     info: TransferInfo,
     /// Outgoing only: the blob the peer will pull, used to match provider events.
     hash: Option<Hash>,
+    /// Outgoing only: the peer this offer was sent to. A provider event must match
+    /// both this and `hash` to complete the entry, so a pull by a different peer
+    /// (another recipient of the same file, or anyone else who learned the hash)
+    /// can never complete it.
+    peer_id: Option<EndpointId>,
     /// When the transfer reached a terminal state, for TTL expiry.
     finished_at: Option<Instant>,
 }
@@ -71,9 +80,16 @@ impl TransferRegistry {
         }
     }
 
-    /// An outgoing offer has been delivered. The bytes move later, when the peer
-    /// accepts and pulls them, which arrives as provider events keyed by `hash`.
-    pub fn register_send(&self, peer: String, filename: String, size: u64, hash: Hash) -> u64 {
+    /// An outgoing offer is about to be sent to `peer`. The bytes move later, when
+    /// the peer accepts and pulls them, which arrives as provider events keyed by
+    /// `hash` *and* `peer`. Must be called before the offer can possibly reach the
+    /// peer (i.e. before dialing), so that a peer who pulls immediately can never
+    /// race ahead of its own registration; the caller finishes the entry with
+    /// `finish(id, false)` if the send fails after this point.
+    ///
+    /// The display label is always the resolved peer id's short form, matching
+    /// `register_receive`, not whatever string the caller typed at the CLI.
+    pub fn register_send(&self, peer: EndpointId, filename: String, size: u64, hash: Hash) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.entries.lock().unwrap().insert(
             id,
@@ -81,13 +97,14 @@ impl TransferRegistry {
                 info: TransferInfo {
                     id,
                     outgoing: true,
-                    peer,
+                    peer: peer.fmt_short().to_string(),
                     filename,
                     size,
                     transferred: 0,
                     state: TransferState::Offered,
                 },
                 hash: Some(hash),
+                peer_id: Some(peer),
                 finished_at: None,
             },
         );
@@ -110,6 +127,7 @@ impl TransferRegistry {
                     state: TransferState::Transferring,
                 },
                 hash: None,
+                peer_id: None,
                 finished_at: None,
             },
         );
@@ -129,26 +147,36 @@ impl TransferRegistry {
         }
     }
 
-    pub fn provider_started(&self, hash: Hash) {
+    /// A peer started pulling a blob. If the only entry for this `(hash, peer)`
+    /// pair already finished as `Failed` (an earlier pull was aborted), a fresh
+    /// `Started` revives it rather than leaving the sender stuck showing a failure
+    /// for a file that is now actually arriving: a retried pull after an aborted
+    /// one still deserves to end up `Done`.
+    pub fn provider_started(&self, hash: Hash, peer: EndpointId) {
         let mut entries = self.entries.lock().unwrap();
-        if let Some(id) = oldest_live_outgoing(&entries, hash) {
+        if let Some(id) = oldest_live_outgoing(&entries, hash, peer) {
             let e = entries.get_mut(&id).expect("id came from this map");
+            e.info.state = TransferState::Transferring;
+        } else if let Some(id) = oldest_failed_outgoing(&entries, hash, peer) {
+            let e = entries.get_mut(&id).expect("id came from this map");
+            e.finished_at = None;
+            e.info.transferred = 0;
             e.info.state = TransferState::Transferring;
         }
     }
 
-    pub fn provider_progress(&self, hash: Hash, end_offset: u64) {
+    pub fn provider_progress(&self, hash: Hash, peer: EndpointId, end_offset: u64) {
         let mut entries = self.entries.lock().unwrap();
-        if let Some(id) = oldest_live_outgoing(&entries, hash) {
+        if let Some(id) = oldest_live_outgoing(&entries, hash, peer) {
             let e = entries.get_mut(&id).expect("id came from this map");
             e.info.transferred = end_offset.min(e.info.size);
             e.info.state = TransferState::Transferring;
         }
     }
 
-    pub fn provider_finished(&self, hash: Hash, ok: bool) {
+    pub fn provider_finished(&self, hash: Hash, peer: EndpointId, ok: bool) {
         let mut entries = self.entries.lock().unwrap();
-        if let Some(id) = oldest_live_outgoing(&entries, hash) {
+        if let Some(id) = oldest_live_outgoing(&entries, hash, peer) {
             let e = entries.get_mut(&id).expect("id came from this map");
             finish_entry(e, ok);
         }
@@ -220,13 +248,28 @@ fn finish_entry(e: &mut Entry, ok: bool) {
     e.finished_at = Some(Instant::now());
 }
 
-/// The transfer a provider event belongs to: the oldest outgoing entry for this
-/// hash that has not finished. Returns `None` for a hash we never registered as an
-/// outgoing file send (a roster blob fetch, say), which is how those get ignored.
-fn oldest_live_outgoing(entries: &HashMap<u64, Entry>, hash: Hash) -> Option<u64> {
+/// The transfer a provider event belongs to: the oldest outgoing, not-yet-finished
+/// entry for this `(hash, peer)` pair. Returns `None` for a hash we never
+/// registered as an outgoing file send (a roster blob fetch, say) or for a peer
+/// that never received this exact offer, which is how both get ignored: a hash
+/// alone is not enough to identify who a send actually went to.
+fn oldest_live_outgoing(entries: &HashMap<u64, Entry>, hash: Hash, peer: EndpointId) -> Option<u64> {
     entries
         .values()
-        .filter(|e| e.hash == Some(hash) && e.finished_at.is_none())
+        .filter(|e| e.hash == Some(hash) && e.peer_id == Some(peer) && e.finished_at.is_none())
+        .map(|e| e.info.id)
+        .min()
+}
+
+/// Like [`oldest_live_outgoing`] but for an entry that already finished as
+/// `Failed`, used only to revive a stuck `Failed` on a fresh `Started` event (see
+/// `provider_started`).
+fn oldest_failed_outgoing(entries: &HashMap<u64, Entry>, hash: Hash, peer: EndpointId) -> Option<u64> {
+    entries
+        .values()
+        .filter(|e| {
+            e.hash == Some(hash) && e.peer_id == Some(peer) && e.info.state == TransferState::Failed
+        })
         .map(|e| e.info.id)
         .min()
 }
@@ -234,30 +277,41 @@ fn oldest_live_outgoing(entries: &HashMap<u64, Entry>, hash: Hash) -> Option<u64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::SecretKey;
 
     fn hash(byte: u8) -> Hash {
         Hash::from_bytes([byte; 32])
     }
 
+    fn peer(seed: u8) -> EndpointId {
+        let mut key_bytes = [0u8; 32];
+        key_bytes[0] = seed;
+        SecretKey::from(key_bytes).public()
+    }
+
     #[test]
     fn send_starts_offered_then_tracks_the_peer_pulling_it() {
         let reg = TransferRegistry::new();
-        let id = reg.register_send("laptop".into(), "photo.jpg".into(), 100, hash(1));
+        let a = peer(1);
+        let id = reg.register_send(a, "photo.jpg".into(), 100, hash(1));
 
         let t = &reg.list()[0];
         assert_eq!(t.id, id);
         assert!(t.outgoing);
         assert_eq!(t.state, TransferState::Offered);
         assert_eq!(t.transferred, 0);
+        // The display label is the resolved peer's short id, same format as a
+        // receive's, not whatever string the CLI caller typed.
+        assert_eq!(t.peer, a.fmt_short().to_string());
 
         // The peer accepts and starts reading the blob out of our store.
-        reg.provider_started(hash(1));
+        reg.provider_started(hash(1), a);
         assert_eq!(reg.list()[0].state, TransferState::Transferring);
 
-        reg.provider_progress(hash(1), 60);
+        reg.provider_progress(hash(1), a, 60);
         assert_eq!(reg.list()[0].transferred, 60);
 
-        reg.provider_finished(hash(1), true);
+        reg.provider_finished(hash(1), a, true);
         let t = &reg.list()[0];
         assert_eq!(t.state, TransferState::Done);
         // A completed transfer reads as 100%, whatever the last progress event said.
@@ -267,9 +321,10 @@ mod tests {
     #[test]
     fn an_aborted_send_fails() {
         let reg = TransferRegistry::new();
-        reg.register_send("laptop".into(), "photo.jpg".into(), 100, hash(1));
-        reg.provider_started(hash(1));
-        reg.provider_finished(hash(1), false);
+        let a = peer(1);
+        reg.register_send(a, "photo.jpg".into(), 100, hash(1));
+        reg.provider_started(hash(1), a);
+        reg.provider_finished(hash(1), a, false);
         assert_eq!(reg.list()[0].state, TransferState::Failed);
     }
 
@@ -278,26 +333,88 @@ mod tests {
         // The roster/group-blob fetches ride the same blobs ALPN. They must not
         // show up as file transfers.
         let reg = TransferRegistry::new();
-        reg.provider_started(hash(9));
-        reg.provider_progress(hash(9), 10);
-        reg.provider_finished(hash(9), true);
+        let a = peer(1);
+        reg.provider_started(hash(9), a);
+        reg.provider_progress(hash(9), a, 10);
+        reg.provider_finished(hash(9), a, true);
         assert!(reg.list().is_empty());
+    }
+
+    #[test]
+    fn a_pull_by_one_peer_cannot_complete_another_peers_entry() {
+        // The same file offered to two different peers: only the peer it was
+        // actually sent to can drive its own entry to Done. Matching on hash
+        // alone (the old behavior) would let B's pull complete A's entry and lie
+        // to the user about who actually received the file.
+        let reg = TransferRegistry::new();
+        let a = peer(1);
+        let b = peer(2);
+        let to_a = reg.register_send(a, "photo.jpg".into(), 100, hash(1));
+        let to_b = reg.register_send(b, "photo.jpg".into(), 100, hash(1));
+
+        // B accepts and pulls; A never does.
+        reg.provider_started(hash(1), b);
+        reg.provider_progress(hash(1), b, 100);
+        reg.provider_finished(hash(1), b, true);
+
+        let list = reg.list();
+        let entry_a = list.iter().find(|t| t.id == to_a).unwrap();
+        let entry_b = list.iter().find(|t| t.id == to_b).unwrap();
+        assert_eq!(entry_a.state, TransferState::Offered, "A's entry must be untouched by B's pull");
+        assert_eq!(entry_b.state, TransferState::Done);
+    }
+
+    #[test]
+    fn a_pull_from_an_unresolved_peer_completes_nothing() {
+        // A pull attributed to a peer id we never registered this hash for (a
+        // stranger who somehow learned the hash, or a connection whose
+        // ClientConnected event we missed) must not complete a registered send:
+        // falling back to hash-only matching here would reopen the false-Sent bug.
+        let reg = TransferRegistry::new();
+        let a = peer(1);
+        let stranger = peer(99);
+        let id = reg.register_send(a, "photo.jpg".into(), 100, hash(1));
+
+        reg.provider_started(hash(1), stranger);
+        reg.provider_finished(hash(1), stranger, true);
+
+        assert_eq!(reg.list()[0].state, TransferState::Offered, "id {id} must be unaffected");
+    }
+
+    #[test]
+    fn a_started_event_revives_a_failed_send_on_retry() {
+        // An aborted pull marks the send Failed; if the same peer later retries
+        // and actually completes the pull, the sender should end up Done, not
+        // stuck showing a failure for a file that did arrive.
+        let reg = TransferRegistry::new();
+        let a = peer(1);
+        reg.register_send(a, "photo.jpg".into(), 100, hash(1));
+        reg.provider_started(hash(1), a);
+        reg.provider_finished(hash(1), a, false);
+        assert_eq!(reg.list()[0].state, TransferState::Failed);
+
+        // The retry.
+        reg.provider_started(hash(1), a);
+        assert_eq!(reg.list()[0].state, TransferState::Transferring);
+        reg.provider_finished(hash(1), a, true);
+        assert_eq!(reg.list()[0].state, TransferState::Done);
     }
 
     #[test]
     fn the_same_blob_sent_twice_resolves_oldest_offer_first() {
         let reg = TransferRegistry::new();
-        let first = reg.register_send("laptop".into(), "photo.jpg".into(), 100, hash(1));
-        let second = reg.register_send("phone".into(), "photo.jpg".into(), 100, hash(1));
+        let a = peer(1);
+        let first = reg.register_send(a, "photo.jpg".into(), 100, hash(1));
+        let second = reg.register_send(a, "photo.jpg".into(), 100, hash(1));
 
-        reg.provider_started(hash(1));
-        reg.provider_finished(hash(1), true);
+        reg.provider_started(hash(1), a);
+        reg.provider_finished(hash(1), a, true);
 
         let list = reg.list();
-        let a = list.iter().find(|t| t.id == first).unwrap();
-        let b = list.iter().find(|t| t.id == second).unwrap();
-        assert_eq!(a.state, TransferState::Done);
-        assert_eq!(b.state, TransferState::Offered, "the second offer is untouched");
+        let a_entry = list.iter().find(|t| t.id == first).unwrap();
+        let b_entry = list.iter().find(|t| t.id == second).unwrap();
+        assert_eq!(a_entry.state, TransferState::Done);
+        assert_eq!(b_entry.state, TransferState::Offered, "the second offer is untouched");
     }
 
     #[test]
@@ -322,15 +439,16 @@ mod tests {
     #[test]
     fn sending_the_same_file_again_after_it_finished_does_not_reopen_it() {
         let reg = TransferRegistry::new();
-        let first = reg.register_send("laptop".into(), "photo.jpg".into(), 100, hash(1));
-        reg.provider_started(hash(1));
-        reg.provider_finished(hash(1), true);
+        let a = peer(1);
+        let first = reg.register_send(a, "photo.jpg".into(), 100, hash(1));
+        reg.provider_started(hash(1), a);
+        reg.provider_finished(hash(1), a, true);
         assert_eq!(reg.list()[0].state, TransferState::Done);
 
         // The user sends the same file again: a new entry for the same hash.
-        let second = reg.register_send("laptop".into(), "photo.jpg".into(), 100, hash(1));
-        reg.provider_started(hash(1));
-        reg.provider_finished(hash(1), true);
+        let second = reg.register_send(a, "photo.jpg".into(), 100, hash(1));
+        reg.provider_started(hash(1), a);
+        reg.provider_finished(hash(1), a, true);
 
         let list = reg.list();
         assert_eq!(list.len(), 2, "the finished first send is still listed alongside the new one");

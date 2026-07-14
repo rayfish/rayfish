@@ -11,7 +11,7 @@
 use std::sync::Mutex;
 
 use iroh_blobs::provider::events::{
-    EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
+    ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
 };
 
 use super::super::*;
@@ -193,10 +193,14 @@ async fn build_daemon(
     // which is the only signal a sender gets that its file arrived: `send_file`
     // returns when the *offer* lands, not when the bytes move. `NotifyLog` gives us
     // per-request transfer events with no interception, so a slow pump can never
-    // stall the provider.
+    // stall the provider. `connected: Notify` (also non-intercepting) is the only
+    // way to learn *who* is pulling: a `GetRequestReceivedNotify` carries a
+    // connection id, not a peer id, so without this we could only match on hash,
+    // which can't tell two recipients of the same file apart.
     let (blob_events, mut blob_event_rx) = EventSender::channel(
         64,
         EventMask {
+            connected: ConnectMode::Notify,
             get: RequestMode::NotifyLog,
             ..EventMask::DEFAULT
         },
@@ -205,11 +209,15 @@ async fn build_daemon(
 
     // Pump provider events into the transfer registry. Roster (group blob) fetches
     // ride the same blobs ALPN, so events for hashes we never registered as an
-    // outgoing file send are dropped by the registry.
+    // outgoing file send are dropped by the registry regardless of who pulled them.
     {
         let transfers = transfers.clone();
         let token = token.clone();
         tokio::spawn(async move {
+            // Connection id -> resolved peer, built from `ClientConnected` and
+            // pruned on `ConnectionClosed`. Only ever touched from this single
+            // task, so a plain map needs no lock.
+            let mut connections: HashMap<u64, EndpointId> = HashMap::new();
             loop {
                 let msg = tokio::select! {
                     _ = token.cancelled() => break,
@@ -218,28 +226,60 @@ async fn build_daemon(
                         None => break,
                     },
                 };
-                // Only the notify variant arrives under `NotifyLog`, and only for get
-                // requests: everything else in the mask is off.
-                if let ProviderMessage::GetRequestReceivedNotify(msg) = msg {
-                    let hash = msg.inner.request.hash;
-                    let transfers = transfers.clone();
-                    let mut updates = msg.rx;
-                    tokio::spawn(async move {
-                        while let Ok(Some(update)) = updates.recv().await {
-                            match update {
-                                RequestUpdate::Started(_) => transfers.provider_started(hash),
-                                RequestUpdate::Progress(p) => {
-                                    transfers.provider_progress(hash, p.end_offset)
-                                }
-                                RequestUpdate::Completed(_) => {
-                                    transfers.provider_finished(hash, true)
-                                }
-                                RequestUpdate::Aborted(_) => {
-                                    transfers.provider_finished(hash, false)
+                match msg {
+                    ProviderMessage::ClientConnectedNotify(msg) => {
+                        if let Some(endpoint_id) = msg.inner.endpoint_id {
+                            connections.insert(msg.inner.connection_id, endpoint_id);
+                        }
+                    }
+                    ProviderMessage::ConnectionClosed(msg) => {
+                        connections.remove(&msg.inner.connection_id);
+                    }
+                    // Only the notify variant arrives under `NotifyLog`, and only for
+                    // get requests: everything else in the mask is off.
+                    ProviderMessage::GetRequestReceivedNotify(msg) => {
+                        let hash = msg.inner.request.hash;
+                        let connection_id = msg.inner.connection_id;
+                        // Resolved now, synchronously, while still on the single task
+                        // that owns `connections`; the request-tracking task below
+                        // only needs the already-resolved value.
+                        let peer = connections.get(&connection_id).copied();
+                        let transfers = transfers.clone();
+                        let mut updates = msg.rx;
+                        tokio::spawn(async move {
+                            let Some(peer) = peer else {
+                                // No resolved peer for this connection (a roster
+                                // fetch, or a connection whose `ClientConnected` we
+                                // missed): drain without matching, so we never fall
+                                // back to hash-only matching and never stall the
+                                // provider by leaving its update channel unread.
+                                tracing::debug!(
+                                    connection_id,
+                                    %hash,
+                                    "provider event with no resolved peer; dropping"
+                                );
+                                while let Ok(Some(_)) = updates.recv().await {}
+                                return;
+                            };
+                            while let Ok(Some(update)) = updates.recv().await {
+                                match update {
+                                    RequestUpdate::Started(_) => {
+                                        transfers.provider_started(hash, peer)
+                                    }
+                                    RequestUpdate::Progress(p) => {
+                                        transfers.provider_progress(hash, peer, p.end_offset)
+                                    }
+                                    RequestUpdate::Completed(_) => {
+                                        transfers.provider_finished(hash, peer, true)
+                                    }
+                                    RequestUpdate::Aborted(_) => {
+                                        transfers.provider_finished(hash, peer, false)
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
+                    }
+                    _ => {}
                 }
             }
         });

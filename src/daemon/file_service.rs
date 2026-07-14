@@ -395,6 +395,19 @@ impl FileService {
             return ipc_err(format!("blob store error: {e}"));
         }
 
+        // Register the transfer now, before the peer can possibly learn the hash:
+        // it is only after `add_slice` above that the blob exists to be pulled, and
+        // the offer that tells the peer about it hasn't even been dialed yet. On
+        // auto-accept, the receiver can fetch the entire blob and close its
+        // connection before this function's own `conn.closed()` await below
+        // returns, so every provider event (Started/Progress/Completed) can arrive
+        // before an entry registered "at the end" would have existed; registering
+        // here instead means the entry always exists first.
+        let blob_hash = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
+        let transfer_id = self
+            .transfers
+            .register_send(peer_id, filename.clone(), size, blob_hash);
+
         let msg = control::ControlMsg::FileOffer {
             from: self.transport.endpoint.id(),
             filename: filename.clone(),
@@ -415,6 +428,7 @@ impl FileService {
                     // File offers ride the separate FILES_ALPN, not the mesh demux,
                     // so they carry no network scope.
                     if let Err(e) = control::send_msg(&mut send, None, &msg).await {
+                        self.transfers.finish(transfer_id, false);
                         return ipc_err(format!("failed to send offer: {e}"));
                     }
                     // send_msg already finished the stream; wait for the peer to
@@ -422,25 +436,20 @@ impl FileService {
                     let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
                 }
                 Err(e) => {
+                    self.transfers.finish(transfer_id, false);
                     return ipc_err(format!("failed to open stream: {e}"));
                 }
             },
             Err(e) => {
+                self.transfers.finish(transfer_id, false);
                 return ipc_err(format!("cannot reach peer '{peer}': {e}"));
             }
         }
 
-        // The bytes have not moved yet: `send_file` returns once the *offer* is
-        // delivered. The peer pulls the blob out of our store when it accepts, and
-        // that is what the provider events (wired up in bootstrap) report against
-        // this hash. So the transfer starts life as Offered.
-        self.transfers.register_send(
-            peer.to_string(),
-            filename.clone(),
-            size,
-            iroh_blobs::Hash::from_bytes(*hash.as_bytes()),
-        );
-
+        // The bytes have not moved yet: the offer has only just been delivered.
+        // The peer pulls the blob out of our store when it accepts, and that is
+        // what the provider events (wired up in bootstrap) report against this
+        // hash and peer. The entry stays Offered until then.
         IpcMessage::Ok {
             message: format!("offered {} ({}) to {}", filename, format_size(size), peer),
         }
