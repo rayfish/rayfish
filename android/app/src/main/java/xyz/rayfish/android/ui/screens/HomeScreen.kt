@@ -157,6 +157,13 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
             try {
                 withContext(Dispatchers.IO) {
                     NodeHolder.get(context).acceptFileOffer(f.id, saveDir)
+                    // Re-stamp pending now that the download is done and the copy
+                    // is about to start: the first markPending call above only
+                    // needed to cover the wait for DONE to appear, and acceptFileOffer
+                    // can block far longer than PENDING_TIMEOUT_MS on a large file,
+                    // which would otherwise expire the entry before the copy even
+                    // begins.
+                    DownloadsOutcome.markPending(key)
                     val reached = moveToDownloads(context, File(saveDir, f.filename), f.filename, f.mimeType)
                     DownloadsOutcome.record(key, reached)
                 }

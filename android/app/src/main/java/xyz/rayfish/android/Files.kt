@@ -51,9 +51,14 @@ internal object DownloadsOutcome {
     // call) must not mute the result notification forever: past this much time
     // since markPending, isPending gives up waiting and lets the poller post
     // whatever it can determine (no Downloads claim, since none was ever
-    // recorded). Comfortably under the core's 60s terminal-listability window, so
-    // a poll still has time left to observe and post the terminal state once this
-    // expires instead of the entry aging out of the registry unreported.
+    // recorded). This window is meant to bound moveToDownloads alone, not the
+    // download that precedes it: acceptFileOffer blocks for the whole fetch, so
+    // callers re-stamp markPending right after acceptFileOffer returns and
+    // before moveToDownloads starts, restarting this clock at the point it is
+    // actually meant to cover. Comfortably under the core's 60s
+    // terminal-listability window, so a poll still has time left to observe and
+    // post the terminal state once this expires instead of the entry aging out
+    // of the registry unreported.
     private const val PENDING_TIMEOUT_MS = 45_000L
 
     fun markPending(key: TransferKey) {
@@ -77,8 +82,11 @@ internal object DownloadsOutcome {
     }
 
     fun record(key: TransferKey, reachedDownloads: Boolean) {
-        pending.remove(key)
+        // Write the outcome before clearing pending: otherwise a poll landing
+        // between the two writes would see neither pending nor recorded, and
+        // fall back to the neutral "Saved" guess.
         outcomes[key] = reachedDownloads
+        pending.remove(key)
     }
 
     /** Consumes (removes) the recorded outcome so a later receive reusing the same
@@ -227,6 +235,13 @@ object FileAutoAccept {
             executor.execute {
                 try {
                     node.acceptFileOffer(f.id, saveDir)
+                    // Re-stamp pending now that the download is done and the copy
+                    // is about to start: the first markPending call above only
+                    // needed to cover the wait for DONE to appear, and acceptFileOffer
+                    // can block far longer than PENDING_TIMEOUT_MS on a large file,
+                    // which would otherwise expire the entry before the copy even
+                    // begins.
+                    DownloadsOutcome.markPending(key)
                     val reached = moveToDownloads(context, File(saveDir, f.filename), f.filename, f.mimeType)
                     DownloadsOutcome.record(key, reached)
                     attempts.remove(f.id)
