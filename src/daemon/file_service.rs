@@ -428,7 +428,7 @@ impl FileService {
                     // File offers ride the separate FILES_ALPN, not the mesh demux,
                     // so they carry no network scope.
                     if let Err(e) = control::send_msg(&mut send, None, &msg).await {
-                        self.transfers.finish(transfer_id, false);
+                        self.transfers.fail_offer(transfer_id);
                         return ipc_err(format!("failed to send offer: {e}"));
                     }
                     // send_msg already finished the stream; wait for the peer to
@@ -436,12 +436,12 @@ impl FileService {
                     let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
                 }
                 Err(e) => {
-                    self.transfers.finish(transfer_id, false);
+                    self.transfers.fail_offer(transfer_id);
                     return ipc_err(format!("failed to open stream: {e}"));
                 }
             },
             Err(e) => {
-                self.transfers.finish(transfer_id, false);
+                self.transfers.fail_offer(transfer_id);
                 return ipc_err(format!("cannot reach peer '{peer}': {e}"));
             }
         }

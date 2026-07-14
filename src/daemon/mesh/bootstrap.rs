@@ -191,12 +191,21 @@ async fn build_daemon(
         .context("failed to open blob store")?;
     // Provider events tell us when a peer actually reads a blob out of our store,
     // which is the only signal a sender gets that its file arrived: `send_file`
-    // returns when the *offer* lands, not when the bytes move. `NotifyLog` gives us
-    // per-request transfer events with no interception, so a slow pump can never
-    // stall the provider. `connected: Notify` (also non-intercepting) is the only
-    // way to learn *who* is pulling: a `GetRequestReceivedNotify` carries a
-    // connection id, not a peer id, so without this we could only match on hash,
-    // which can't tell two recipients of the same file apart.
+    // returns when the *offer* lands, not when the bytes move. `NotifyLog` gives
+    // us per-request transfer events with no interception; `get` is the only
+    // request-mode field this crate version actually reads, so it gates
+    // notifications for all four request kinds (get, get_many, push, observe),
+    // not just get. What this actually guarantees: our pump body below never
+    // awaits anything except `recv` (each request's update stream is drained by
+    // a task spawned immediately), and transfer progress is sent with `try_send`
+    // and dropped rather than blocking, so a slow pump cannot itself stall the
+    // provider. It does not mean the provider can never block on us:
+    // `client_connected` and `notify_streaming` do await on this channel (64
+    // slots), so a wedged pump would still backpressure connection setup.
+    // `connected: Notify` (also non-intercepting) is the only way to learn *who*
+    // is pulling: a `GetRequestReceivedNotify` carries a connection id, not a
+    // peer id, so without this we could only match on hash, which can't tell two
+    // recipients of the same file apart.
     let (blob_events, mut blob_event_rx) = EventSender::channel(
         64,
         EventMask {
@@ -278,6 +287,28 @@ async fn build_daemon(
                                 }
                             }
                         });
+                    }
+                    // Not something we track (Rayfish only issues single-blob
+                    // Gets today), but `get: RequestMode::NotifyLog` above gates
+                    // all four request kinds in this crate version, not just
+                    // Get, so these three CAN arrive (e.g. from a future
+                    // get_many/HashSeq fetch). Each carries an `rx` update
+                    // channel the provider writes progress into; if we drop it
+                    // unread, the provider's `transfer_progress` gets
+                    // `SendError::ReceiverClosed` and aborts the request. Drain
+                    // it to completion and discard, same as the Get arm, but
+                    // without touching the registry.
+                    ProviderMessage::GetManyRequestReceivedNotify(msg) => {
+                        let mut updates = msg.rx;
+                        tokio::spawn(async move { while let Ok(Some(_)) = updates.recv().await {} });
+                    }
+                    ProviderMessage::PushRequestReceivedNotify(msg) => {
+                        let mut updates = msg.rx;
+                        tokio::spawn(async move { while let Ok(Some(_)) = updates.recv().await {} });
+                    }
+                    ProviderMessage::ObserveRequestReceivedNotify(msg) => {
+                        let mut updates = msg.rx;
+                        tokio::spawn(async move { while let Ok(Some(_)) = updates.recv().await {} });
                     }
                     _ => {}
                 }

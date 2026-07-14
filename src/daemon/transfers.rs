@@ -64,6 +64,26 @@ struct Entry {
     peer_id: Option<EndpointId>,
     /// When the transfer reached a terminal state, for TTL expiry.
     finished_at: Option<Instant>,
+    /// Outgoing only: how a `Failed` entry got there. Only a pull that was
+    /// aborted partway through is worth reviving on a retried `Started`; an
+    /// offer that never reached the peer (the dial, `open_bi`, or the offer
+    /// message itself failed) has nothing to retry, because the peer never
+    /// even knew about it.
+    failure: Option<FailureKind>,
+}
+
+/// How an outgoing entry reached `Failed`. Only set on the send side: a
+/// receive's `finish(id, false)` never needs to distinguish these, since
+/// nothing ever revives a receive entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    /// The offer itself never reached the peer (dial, `open_bi`, or the offer
+    /// message failed). Not revivable: there is no pull to retry.
+    Offer,
+    /// The peer received the offer and started pulling, but the pull was
+    /// aborted. Revivable: a later `Started` for the same `(hash, peer)` is a
+    /// genuine retry.
+    Abort,
 }
 
 #[derive(Default)]
@@ -106,6 +126,7 @@ impl TransferRegistry {
                 hash: Some(hash),
                 peer_id: Some(peer),
                 finished_at: None,
+                failure: None,
             },
         );
         id
@@ -129,6 +150,7 @@ impl TransferRegistry {
                 hash: None,
                 peer_id: None,
                 finished_at: None,
+                failure: None,
             },
         );
         id
@@ -143,23 +165,42 @@ impl TransferRegistry {
 
     pub fn finish(&self, id: u64, ok: bool) {
         if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
-            finish_entry(e, ok);
+            finish_entry(e, ok, None);
+        }
+    }
+
+    /// An outgoing offer failed before the peer could ever pull it: the dial,
+    /// `open_bi`, or the offer message itself failed. Distinct from `finish`
+    /// so this can be tagged not-revivable (see [`FailureKind::Offer`]):
+    /// nothing the peer does can retry a pull of an offer it never received.
+    pub fn fail_offer(&self, id: u64) {
+        if let Some(e) = self.entries.lock().unwrap().get_mut(&id) {
+            finish_entry(e, false, Some(FailureKind::Offer));
         }
     }
 
     /// A peer started pulling a blob. If the only entry for this `(hash, peer)`
-    /// pair already finished as `Failed` (an earlier pull was aborted), a fresh
-    /// `Started` revives it rather than leaving the sender stuck showing a failure
-    /// for a file that is now actually arriving: a retried pull after an aborted
-    /// one still deserves to end up `Done`.
+    /// pair already finished as `Failed` from an aborted pull (not an offer that
+    /// never reached the peer, see [`FailureKind`]), and it failed recently
+    /// enough to still be live (within `TERMINAL_TTL`; terminal entries are only
+    /// evicted lazily in `list_at`, so an older one could otherwise sit around
+    /// forever waiting to be revived), a fresh `Started` revives it rather than
+    /// leaving the sender stuck showing a failure for a file that is now
+    /// actually arriving: a retried pull after an aborted one still deserves to
+    /// end up `Done`.
     pub fn provider_started(&self, hash: Hash, peer: EndpointId) {
+        self.provider_started_at(hash, peer, Instant::now());
+    }
+
+    fn provider_started_at(&self, hash: Hash, peer: EndpointId, now: Instant) {
         let mut entries = self.entries.lock().unwrap();
         if let Some(id) = oldest_live_outgoing(&entries, hash, peer) {
             let e = entries.get_mut(&id).expect("id came from this map");
             e.info.state = TransferState::Transferring;
-        } else if let Some(id) = oldest_failed_outgoing(&entries, hash, peer) {
+        } else if let Some(id) = oldest_revivable_outgoing(&entries, hash, peer, now) {
             let e = entries.get_mut(&id).expect("id came from this map");
             e.finished_at = None;
+            e.failure = None;
             e.info.transferred = 0;
             e.info.state = TransferState::Transferring;
         }
@@ -178,7 +219,7 @@ impl TransferRegistry {
         let mut entries = self.entries.lock().unwrap();
         if let Some(id) = oldest_live_outgoing(&entries, hash, peer) {
             let e = entries.get_mut(&id).expect("id came from this map");
-            finish_entry(e, ok);
+            finish_entry(e, ok, Some(FailureKind::Abort));
         }
     }
 
@@ -238,7 +279,10 @@ impl Drop for FinishGuard {
 
 /// A finished transfer reads as complete: a Done that showed 60/100 because the
 /// last progress event was coarse would be a worse lie than rounding up.
-fn finish_entry(e: &mut Entry, ok: bool) {
+///
+/// `failure` records why an outgoing entry failed (ignored when `ok` is true,
+/// and for receive entries, which never get revived): see [`FailureKind`].
+fn finish_entry(e: &mut Entry, ok: bool, failure: Option<FailureKind>) {
     e.info.state = if ok {
         e.info.transferred = e.info.size;
         TransferState::Done
@@ -246,6 +290,7 @@ fn finish_entry(e: &mut Entry, ok: bool) {
         TransferState::Failed
     };
     e.finished_at = Some(Instant::now());
+    e.failure = if ok { None } else { failure };
 }
 
 /// The transfer a provider event belongs to: the oldest outgoing, not-yet-finished
@@ -261,14 +306,27 @@ fn oldest_live_outgoing(entries: &HashMap<u64, Entry>, hash: Hash, peer: Endpoin
         .min()
 }
 
-/// Like [`oldest_live_outgoing`] but for an entry that already finished as
-/// `Failed`, used only to revive a stuck `Failed` on a fresh `Started` event (see
-/// `provider_started`).
-fn oldest_failed_outgoing(entries: &HashMap<u64, Entry>, hash: Hash, peer: EndpointId) -> Option<u64> {
+/// Like [`oldest_live_outgoing`] but for an entry worth reviving on a fresh
+/// `Started` event (see `provider_started`): it must have failed on the pull
+/// path (not the offer path, which the peer never even received), and recently
+/// enough that it has not already aged past `TERMINAL_TTL`. Terminal entries
+/// are only evicted lazily inside `list_at`, so without the TTL check an entry
+/// that is logically dead but hasn't been swept yet could be revived and then
+/// never expire at all.
+fn oldest_revivable_outgoing(
+    entries: &HashMap<u64, Entry>,
+    hash: Hash,
+    peer: EndpointId,
+    now: Instant,
+) -> Option<u64> {
     entries
         .values()
         .filter(|e| {
-            e.hash == Some(hash) && e.peer_id == Some(peer) && e.info.state == TransferState::Failed
+            e.hash == Some(hash)
+                && e.peer_id == Some(peer)
+                && e.info.state == TransferState::Failed
+                && e.failure == Some(FailureKind::Abort)
+                && e.finished_at.is_some_and(|at| now.duration_since(at) < TERMINAL_TTL)
         })
         .map(|e| e.info.id)
         .min()
@@ -398,6 +456,51 @@ mod tests {
         assert_eq!(reg.list()[0].state, TransferState::Transferring);
         reg.provider_finished(hash(1), a, true);
         assert_eq!(reg.list()[0].state, TransferState::Done);
+    }
+
+    #[test]
+    fn a_started_event_does_not_revive_a_failed_send_past_its_ttl() {
+        // An entry that failed long enough ago to be past TERMINAL_TTL is dead:
+        // it is only evicted lazily inside `list_at`, so one that hasn't been
+        // swept yet must still not be revived, or it would become permanently
+        // live again with no terminal event ever following.
+        let reg = TransferRegistry::new();
+        let a = peer(1);
+        reg.register_send(a, "photo.jpg".into(), 100, hash(1));
+        reg.provider_started(hash(1), a);
+        reg.provider_finished(hash(1), a, false);
+        assert_eq!(reg.list()[0].state, TransferState::Failed);
+
+        let later = Instant::now() + TERMINAL_TTL + Duration::from_secs(1);
+        reg.provider_started_at(hash(1), a, later);
+        assert!(
+            reg.list_at(later).is_empty(),
+            "a Started arriving after the entry aged out must not revive it: it is dead, \
+             so it is just evicted like any other expired terminal entry"
+        );
+    }
+
+    #[test]
+    fn a_started_event_does_not_revive_an_offer_path_failure() {
+        // `send_file` calls `fail_offer` (not `finish`) when the dial, `open_bi`,
+        // or the offer message itself fails: the peer never received the offer,
+        // so there is no pull to retry. A later Started for the same (hash, peer)
+        // must not revive it, or the sender would show a false Done for a send
+        // whose offer never got out.
+        let reg = TransferRegistry::new();
+        let a = peer(1);
+        let id = reg.register_send(a, "photo.jpg".into(), 100, hash(1));
+        reg.fail_offer(id);
+        assert_eq!(reg.list()[0].state, TransferState::Failed);
+
+        // Somehow (a coincidental resend under the same hash, say) a Started
+        // shows up for this (hash, peer) pair anyway.
+        reg.provider_started(hash(1), a);
+        assert_eq!(
+            reg.list()[0].state,
+            TransferState::Failed,
+            "an offer-path failure is not revivable"
+        );
     }
 
     #[test]
