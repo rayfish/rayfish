@@ -54,10 +54,13 @@ class RayfishVpnService : VpnService() {
             // state to restore.
             if (NodeHolder.isEnabled(applicationContext)) {
                 startTunnel(startId)
-            } else if (NodeHolder.isStayOnline(applicationContext)) {
+            } else if (!NodeHolder.isGoOfflineWhenDisabled(applicationContext)) {
+                // Standby is the default: the VPN is off, but the user has not
+                // asked to go fully offline, so keep the control plane up.
                 enterStandby()
             } else {
-                // Neither the VPN nor stay-online is wanted: nothing to run.
+                // The VPN is off and the user asked to go fully offline when
+                // disabled: nothing to run.
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -72,7 +75,7 @@ class RayfishVpnService : VpnService() {
                 // an ANR and to serialize with any concurrent bring-up. In
                 // standby we keep the service alive; only the fully-offline path
                 // calls stopSelf.
-                val standby = NodeHolder.isStayOnline(applicationContext)
+                val standby = !NodeHolder.isGoOfflineWhenDisabled(applicationContext)
                 Log.i(TAG, "ACTION_STOP received; standby=$standby (tunnel fd present=${tunnel != null})")
                 if (standby) {
                     // Post the standby text now, not after the blocking teardown
@@ -105,8 +108,9 @@ class RayfishVpnService : VpnService() {
                 return if (standby) START_STICKY else START_NOT_STICKY
             }
             ACTION_STANDBY -> {
-                // "Keep files working when the VPN is off", started explicitly
-                // from YouScreen while the tunnel is off. Must bring up the
+                // Enter standby explicitly, sent from YouScreen's toggle OFF
+                // branch (the user no longer wants "go fully offline") while the
+                // tunnel is off. Must bring up the
                 // control plane only: never touch the Builder/establish() path,
                 // so it never contends for the single VpnService slot and never
                 // triggers the VPN consent dialog.
@@ -145,8 +149,9 @@ class RayfishVpnService : VpnService() {
                 return START_STICKY
             }
             ACTION_EXIT_STANDBY -> {
-                // Sent unconditionally from YouScreen's toggle OFF branch, which
-                // cannot tell from the stale status cache whether a tunnel is up.
+                // Sent unconditionally from YouScreen's toggle ON branch (the user
+                // asked to go fully offline when disabled), which cannot tell from
+                // the stale status cache whether a tunnel is up.
                 // Meaning: "the user no longer wants standby; if nothing else needs
                 // the control plane up (no tunnel), take the node fully offline and
                 // stop the service." If a tunnel is up, the VPN is on and this pref
@@ -375,27 +380,28 @@ class RayfishVpnService : VpnService() {
      * tunnel is left null so a retry can rebuild the tunnel from scratch
      * instead of needing a full stop first.
      *
-     * Then: with stay-online on, this is exactly the case standby exists for,
-     * so the control plane must actually be (re)brought up here: the caller may
-     * have reached this point via a failed ensureStarted followed by a
-     * establish()/Node.up() that never needed the node running (see
-     * startTunnelBlocking's fallback tunnel address), so it cannot be assumed
-     * already up. ensureStarted is idempotent, so this is a no-op in the
-     * common case where it is. Once that is done, the standby notification
-     * replaces whatever startForegroundNotification() posted at the top of
-     * startTunnel(), and the poller starts so files keep landing. With
-     * stay-online off there is nothing left to keep the service alive for.
+     * Then: unless the user asked to go fully offline when disabled, this is
+     * exactly the case standby exists for, so the control plane must actually be
+     * (re)brought up here: the caller may have reached this point via a failed
+     * ensureStarted followed by a establish()/Node.up() that never needed the
+     * node running (see startTunnelBlocking's fallback tunnel address), so it
+     * cannot be assumed already up. ensureStarted is idempotent, so this is a
+     * no-op in the common case where it is. Once that is done, the standby
+     * notification replaces whatever startForegroundNotification() posted at the
+     * top of startTunnel(), and the poller starts so files keep landing. With
+     * "go fully offline" set there is nothing left to keep the service alive for.
      *
-     * Honesty check on the stay-online-off branch: with the VPN off and
-     * stay-online off, a node started earlier by ShareActivity (own-device
-     * auto-accept, or a manual Save, driven by HomeScreen's poller) can be
-     * mid-receive when the user then asks for the VPN to come on and it fails
-     * here (another VPN app holds the slot). NodeHolder.stopNode below then
-     * kills that in-flight receive and drops the partial file, even though the
-     * user asked to go online, not offline. The "no VPN + stay-online off means
-     * offline" invariant has to win regardless: this is a real, if narrow, cost
-     * of it, not a bug to route around, and no retry/queueing is built for it
-     * here. hasInFlightAccepts() below only makes the cost visible in the log.
+     * Honesty check on the go-fully-offline branch: with the VPN off and "go
+     * fully offline when disabled" set, a node started earlier by ShareActivity
+     * (own-device auto-accept, or a manual Save, driven by HomeScreen's poller)
+     * can be mid-receive when the user then asks for the VPN to come on and it
+     * fails here (another VPN app holds the slot). NodeHolder.stopNode below
+     * then kills that in-flight receive and drops the partial file, even though
+     * the user asked to go online, not offline. The "no VPN + go fully offline
+     * set means offline" invariant has to win regardless: this is a real, if
+     * narrow, cost of it, not a bug to route around, and no retry/queueing is
+     * built for it here. hasInFlightAccepts() below only makes the cost visible
+     * in the log.
      */
     private fun handleBringUpFailure(reason: String, startId: Int) {
         tunnel = null
@@ -406,7 +412,7 @@ class RayfishVpnService : VpnService() {
         }
         dnsProxy = null
 
-        val standby = NodeHolder.isStayOnline(applicationContext)
+        val standby = !NodeHolder.isGoOfflineWhenDisabled(applicationContext)
         if (standby) {
             Log.w(TAG, "$reason; staying in standby, ensuring control plane is up")
             try {
@@ -417,22 +423,22 @@ class RayfishVpnService : VpnService() {
             startForegroundNotification(standby = true)
             startAutoAcceptPoller()
         } else {
-            // With stay-online off, "VPN off" must mean fully offline. Without
-            // this, startTunnelBlocking's ensureStarted call above already
-            // brought the control plane up before the tunnel build failed, and
-            // nothing else would ever stop it: the daemon would keep its mesh
-            // connection open and the device would stay visible to peers with
-            // both the VPN toggle and stay-online off, contradicting what the
-            // user asked for.
+            // With "go fully offline when disabled" set, "VPN off" must mean
+            // fully offline. Without this, startTunnelBlocking's ensureStarted
+            // call above already brought the control plane up before the tunnel
+            // build failed, and nothing else would ever stop it: the daemon
+            // would keep its mesh connection open and the device would stay
+            // visible to peers with both the VPN toggle off and this pref set,
+            // contradicting what the user asked for.
             if (FileAutoAccept.hasInFlightAccepts()) {
-                Log.w(TAG, "$reason; an own-device file accept looks in flight, stopping the node anyway (stay-online off) will drop it")
+                Log.w(TAG, "$reason; an own-device file accept looks in flight, stopping the node anyway (go fully offline set) will drop it")
             }
-            Log.e(TAG, "$reason; tunnel not up and stay-online off, stopping node and service (startId=$startId)")
+            Log.e(TAG, "$reason; tunnel not up and go fully offline set, stopping node and service (startId=$startId)")
             NodeHolder.stopNode(applicationContext)
-            // Nothing is left to poll for: stay-online off means no control plane
-            // is meant to be up, so a poller left running here would just be dead
-            // work spinning every 4s against a stopped node until onDestroy's
-            // teardown eventually lands.
+            // Nothing is left to poll for: "go fully offline" means no control
+            // plane is meant to be up, so a poller left running here would just
+            // be dead work spinning every 4s against a stopped node until
+            // onDestroy's teardown eventually lands.
             autoAcceptPoller?.shutdownNow()
             autoAcceptPoller = null
             stopSelf(startId)
@@ -484,11 +490,13 @@ class RayfishVpnService : VpnService() {
      * Android revoked our VPN, which happens when another VPN app (Tailscale, say)
      * takes the single VpnService slot, or the user disconnects us from system
      * Settings. The default implementation calls stopSelf(), which would take the
-     * whole node offline and defeat the stay-online pref, since this path never
-     * touches our own toggle. Route it to the same place the toggle goes.
+     * whole node offline and defeat standby, since this path never touches our own
+     * toggle. Route it to the same place the toggle goes: standby unless the user
+     * asked to go fully offline when disabled. This is the entire point of the
+     * feature, so this branch must land in standby by default.
      */
     override fun onRevoke() {
-        val standby = NodeHolder.isStayOnline(applicationContext)
+        val standby = !NodeHolder.isGoOfflineWhenDisabled(applicationContext)
         Log.i(TAG, "onRevoke: VPN revoked by the system; standby=$standby")
         // The user did not ask for the tunnel any more, so clear the enable intent.
         // Otherwise a later app launch would re-establish it and yank the VPN slot

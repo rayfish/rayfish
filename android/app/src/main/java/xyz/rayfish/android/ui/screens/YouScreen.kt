@@ -107,18 +107,23 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 }
             }
         }
-        var stayOnline by remember { mutableStateOf(NodeHolder.isStayOnline(context)) }
+        // Default off: standby is the normal behavior now, so disabling Rayfish
+        // keeps files working with the VPN off (that is what lets you run another
+        // VPN, Tailscale say, at the same time). This toggle is the escape hatch
+        // for a user who wants disabling Rayfish to take the device fully offline
+        // instead.
+        var goOfflineWhenDisabled by remember { mutableStateOf(NodeHolder.isGoOfflineWhenDisabled(context)) }
         ToggleCard(
-            title = "Keep files working when the VPN is off",
-            subtitle = if (stayOnline) {
-                "on · stays online in the background, so you can run another VPN and still send and receive"
+            title = "Go fully offline when disabled",
+            subtitle = if (goOfflineWhenDisabled) {
+                "on · turning the VPN off takes this device offline"
             } else {
-                "off · turning the VPN off takes this device offline"
+                "off · Rayfish keeps working for files with the VPN off, so you can run another VPN"
             },
-            checked = stayOnline,
+            checked = goOfflineWhenDisabled,
             onCheckedChange = { on ->
-                stayOnline = on
-                NodeHolder.setStayOnline(context, on)
+                goOfflineWhenDisabled = on
+                NodeHolder.setGoOfflineWhenDisabled(context, on)
                 // status is a poll cache (RayfishApp refreshes it every 2s), and is
                 // null right after an Activity recreation: it can read stale-false
                 // while the VPN just came up in Home, or stale-true right after Home
@@ -128,10 +133,24 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 // (the thread that writes it), so send unconditionally and let the
                 // service decide there instead of guessing from this stale cache.
                 if (on) {
-                    // Bring the control plane up only, never a tunnel: a plain
-                    // intent would land in startTunnel() and try to grab the
-                    // single VpnService slot (and pop the consent dialog),
-                    // which is exactly what this toggle exists to avoid when
+                    // The user asked to go fully offline when disabled. Do not send
+                    // bare ACTION_STOP: that unconditionally tears down whatever is
+                    // running, which is correct for Home's VPN toggle but not here,
+                    // since a live VPN must not be touched by this pref.
+                    // ACTION_EXIT_STANDBY means "if there is no tunnel, take the node
+                    // fully offline and stop the service; if there is a tunnel, leave
+                    // it alone, since the pref only governs the next teardown."
+                    context.startService(
+                        Intent(context, RayfishVpnService::class.java).apply {
+                            action = RayfishVpnService.ACTION_EXIT_STANDBY
+                        },
+                    )
+                } else {
+                    // Back to the default: bring the control plane up in standby if
+                    // the VPN is currently off. Bring the control plane up only,
+                    // never a tunnel: a plain intent would land in startTunnel() and
+                    // try to grab the single VpnService slot (and pop the consent
+                    // dialog), which is exactly what standby exists to avoid when
                     // another VPN (Tailscale) is meant to hold that slot.
                     // ACTION_STANDBY routes to enterStandbyBlocking() on nodeExecutor.
                     // If a tunnel is up, it re-posts the notification to correct text
@@ -140,18 +159,6 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                         context,
                         Intent(context, RayfishVpnService::class.java).apply {
                             action = RayfishVpnService.ACTION_STANDBY
-                        },
-                    )
-                } else {
-                    // Do not send bare ACTION_STOP: that unconditionally tears down
-                    // whatever is running, which is correct for Home's VPN toggle but
-                    // not here, since a live VPN must not be touched by this pref.
-                    // ACTION_EXIT_STANDBY means "if there is no tunnel, take the node
-                    // fully offline and stop the service; if there is a tunnel, leave
-                    // it alone, since the pref only governs the next teardown."
-                    context.startService(
-                        Intent(context, RayfishVpnService::class.java).apply {
-                            action = RayfishVpnService.ACTION_EXIT_STANDBY
                         },
                     )
                 }
