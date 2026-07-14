@@ -8,9 +8,13 @@
 //! /…) stay on `Daemon` since they orchestrate over core handles (endpoint,
 //! peers, the shared blob store) and read this service's state.
 
+use super::transfers;
 use super::*;
 use std::ffi::CString;
 use std::path::PathBuf;
+
+use futures::StreamExt;
+use iroh_blobs::api::remote::GetProgressItem;
 
 /// A received file offer awaiting `ray files accept`.
 pub(crate) struct PendingFile {
@@ -39,6 +43,8 @@ pub(crate) struct FileService {
     device_cert: Option<control::DeviceCert>,
     /// Transport-key → user-identity map, to resolve a file sender's owner.
     device_user_map: peers::DeviceUserMap,
+    /// In-flight transfers, for progress reporting.
+    pub(crate) transfers: Arc<transfers::TransferRegistry>,
 }
 
 impl FileService {
@@ -48,6 +54,7 @@ impl FileService {
         registry: Arc<NetworkRegistry>,
         device_cert: Option<control::DeviceCert>,
         device_user_map: peers::DeviceUserMap,
+        transfers: Arc<transfers::TransferRegistry>,
     ) -> Self {
         Self {
             pending_files: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -58,6 +65,7 @@ impl FileService {
             registry,
             device_cert,
             device_user_map,
+            transfers,
         }
     }
 
@@ -213,14 +221,45 @@ impl FileService {
             }
         };
 
-        if let Err(e) = self
-            .transport
-            .blob_store
-            .remote()
-            .fetch(conn, iroh_blobs::HashAndFormat::raw(blob_hash))
-            .await
-        {
-            return ipc_err(format!("blob fetch failed: {e}"));
+        let peer_label = pending_file
+            .from
+            .to_string()
+            .chars()
+            .take(8)
+            .collect::<String>();
+        let transfer_id = self.transfers.register_receive(
+            peer_label,
+            pending_file.filename.clone(),
+            pending_file.size,
+        );
+
+        // `fetch` returns a `GetProgress`: awaiting it directly discards the
+        // progress, so take the stream instead and report bytes as they land. It
+        // yields `Progress(n)` items (n = payload bytes read so far) and exactly
+        // one terminal `Done`/`Error` item.
+        let mut stream = Box::pin(
+            self.transport
+                .blob_store
+                .remote()
+                .fetch(conn, iroh_blobs::HashAndFormat::raw(blob_hash))
+                .stream(),
+        );
+        loop {
+            match stream.next().await {
+                Some(GetProgressItem::Progress(n)) => self.transfers.note_progress(transfer_id, n),
+                Some(GetProgressItem::Done(_)) => {
+                    self.transfers.finish(transfer_id, true);
+                    break;
+                }
+                Some(GetProgressItem::Error(e)) => {
+                    self.transfers.finish(transfer_id, false);
+                    return ipc_err(format!("blob fetch failed: {e}"));
+                }
+                None => {
+                    self.transfers.finish(transfer_id, false);
+                    return ipc_err("blob fetch ended without a result".to_string());
+                }
+            }
         }
 
         let bytes = match self.transport.blob_store.blobs().get_bytes(blob_hash).await {
