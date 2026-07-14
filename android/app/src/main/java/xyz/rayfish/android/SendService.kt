@@ -63,43 +63,56 @@ class SendService : Service() {
             // max: newly created since we started, and already known to the registry
             // by the time we start waiting.
             //
-            // A single before-only snapshot is not enough with two concurrent shares:
-            // if batch B starts offering while batch A is still in its wait loop, B's
-            // ids are not in A's before-snapshot either, so A's "not in snapshot" count
-            // would include every one of B's transfers too. If B's peer never accepts,
-            // A would burn the full wait timeout for a file it delivered in seconds.
-            val maxIdBeforeBatch = runCatching {
-                NodeHolder.get(applicationContext).listTransfers().maxOfOrNull { it.id.toLong() } ?: -1L
-            }.getOrNull()
-
+            // That two-sided bound is not sufficient by itself with two concurrent
+            // shares: it only excludes a batch that starts after this one's "after"
+            // snapshot. It does nothing about a batch whose offers land while this
+            // one is still in the middle of its own offer loop (staging a large file
+            // can take seconds to tens of seconds, so that window is real): those
+            // ids are newly created and > maxIdBeforeBatch, so the after-snapshot
+            // would wrongly claim them as this batch's own. If that other batch's
+            // peer never accepts, this one would burn the full wait timeout for a
+            // file it delivered in seconds. So the region from taking the "before"
+            // max through the "after" snapshot is serialized behind batchLock: two
+            // batches' offers can never interleave, only one runs that region at a
+            // time. The lock is released before the wait loop below, so concurrent
+            // batches still wait for their own peers in parallel; only the offering
+            // is serialized, not the (much longer) waiting.
             var offered = 0
             var failed = 0
-            for (uri in uris) {
-                val staged = stageUriForSend(applicationContext, uri)
-                if (staged == null) {
-                    failed++
-                    continue
-                }
-                try {
-                    NodeHolder.get(applicationContext).sendFile(staged.absolutePath, peerId)
-                    offered++
-                } catch (t: Throwable) {
-                    failed++
-                    Log.w(TAG, "send failed for ${staged.name}", t)
-                } finally {
-                    // Bytes are in the blob store now; the staging copy is no longer
-                    // needed. Remove the file and its per-item dir.
-                    runCatching { staged.parentFile?.deleteRecursively() ?: staged.delete() }
-                }
-            }
-
-            val batchIds = if (maxIdBeforeBatch == null) {
-                null
-            } else {
-                runCatching {
-                    NodeHolder.get(applicationContext).listTransfers()
-                        .mapNotNullTo(HashSet()) { it.id.takeIf { id -> id.toLong() > maxIdBeforeBatch } }
+            val maxIdBeforeBatch: Long?
+            val batchIds: Set<ULong>?
+            synchronized(batchLock) {
+                maxIdBeforeBatch = runCatching {
+                    NodeHolder.get(applicationContext).listTransfers().maxOfOrNull { it.id.toLong() } ?: -1L
                 }.getOrNull()
+
+                for (uri in uris) {
+                    val staged = stageUriForSend(applicationContext, uri)
+                    if (staged == null) {
+                        failed++
+                        continue
+                    }
+                    try {
+                        NodeHolder.get(applicationContext).sendFile(staged.absolutePath, peerId)
+                        offered++
+                    } catch (t: Throwable) {
+                        failed++
+                        Log.w(TAG, "send failed for ${staged.name}", t)
+                    } finally {
+                        // Bytes are in the blob store now; the staging copy is no
+                        // longer needed. Remove the file and its per-item dir.
+                        runCatching { staged.parentFile?.deleteRecursively() ?: staged.delete() }
+                    }
+                }
+
+                batchIds = if (maxIdBeforeBatch == null) {
+                    null
+                } else {
+                    runCatching {
+                        NodeHolder.get(applicationContext).listTransfers()
+                            .mapNotNullTo(HashSet()) { it.id.takeIf { id -> id.toLong() > maxIdBeforeBatch } }
+                    }.getOrNull()
+                }
             }
 
             // The offers are delivered, but the bytes have not moved: the peer pulls
@@ -219,6 +232,11 @@ class SendService : Service() {
         // Distinguishes failure notifications from concurrent batches that would
         // otherwise share the same NOTIF_RESULT_BASE + failed-count id.
         private val failureNotifSeq = java.util.concurrent.atomic.AtomicInteger(0)
+        // Serializes the before-snapshot/offer-loop/after-snapshot region of
+        // concurrent send batches so their offers can never interleave. Not held
+        // across the wait loop: concurrent batches still wait on their own peers
+        // in parallel, only the offering is serialized.
+        private val batchLock = Any()
         const val EXTRA_PEER_ID = "xyz.rayfish.android.PEER_ID"
         const val EXTRA_PEER_NAME = "xyz.rayfish.android.PEER_NAME"
         const val EXTRA_URIS = "xyz.rayfish.android.URIS"

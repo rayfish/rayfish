@@ -61,7 +61,16 @@ object TransferNotifier {
             val liveIds = transfers.mapTo(HashSet()) { it.id }
             for (t in transfers) {
                 when (t.state) {
-                    TransferState.OFFERED, TransferState.TRANSFERRING -> postProgress(context, t)
+                    TransferState.OFFERED, TransferState.TRANSFERRING -> {
+                        // The core can revive a Failed outgoing transfer back to
+                        // Transferring if the peer retries the pull. Drop the stale
+                        // terminal marker so postProgress does not keep suppressing
+                        // it and a fresh result can post once it finishes again,
+                        // instead of leaving a stale "Could not send" in the shade
+                        // for a file that actually arrived (minor 4).
+                        terminal.remove(t.id)
+                        postProgress(context, t)
+                    }
                     TransferState.DONE, TransferState.FAILED -> {
                         // Terminal entries stay listable for 60s, so guard against
                         // re-posting the same result on every poll.
@@ -121,6 +130,33 @@ object TransferNotifier {
     }
 
     private fun notifId(id: ULong): Int = NOTIF_BASE + (id.toInt() and 0x7fffffff)
+
+    /**
+     * Reset all bookkeeping to a fresh-boot state. Node.stop() drops the core's
+     * TransferRegistry, so the next start's ids restart at 1: without this, a
+     * later transfer that happens to land on an id still sitting in [terminal]
+     * from before the stop would be silently muted (postProgress suppresses it,
+     * terminal.add returns false), while a stale result notification from the
+     * previous run keeps sitting in the shade looking like the answer.
+     *
+     * Only cancels notifications we posted a live progress bar for: a result
+     * notification's id is already out of [postedProgress] by the time it is
+     * posted (postResult removes it), so this can never cancel a result the
+     * user has not yet seen or acted on. Re-arms the one-shot stale sweep so a
+     * leftover ongoing notification from before the stop still gets cleaned up
+     * on the next poll. Safe to call when nothing is running.
+     */
+    fun reset(context: Context) {
+        synchronized(this) {
+            val nm = context.getSystemService(NotificationManager::class.java)
+            for (id in postedProgress) {
+                runCatching { nm.cancel(notifId(id)) }
+            }
+            postedProgress.clear()
+            terminal.clear()
+            cancelledStaleOnStart = false
+        }
+    }
 
     private fun postProgress(context: Context, t: uniffi.ray_mobile.Transfer) {
         // A terminal result for this id has already been posted (or is about to
