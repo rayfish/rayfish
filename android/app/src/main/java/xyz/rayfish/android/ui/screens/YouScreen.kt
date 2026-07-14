@@ -127,13 +127,17 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 // itself.
                 if (!NodeHolder.isEnabled(context)) {
                     if (on) {
-                        // Bring the control plane up so the phone stays visible in
-                        // the mesh and keeps sending/receiving files. Same call
-                        // HomeScreen uses to start the service; with no VPN
-                        // requested, onStartCommand's plain-intent path settles
-                        // into standby (see enterStandby / handleBringUpFailure).
+                        // Bring the control plane up only, never a tunnel: a plain
+                        // intent would land in startTunnel() and try to grab the
+                        // single VpnService slot (and pop the consent dialog),
+                        // which is exactly what this toggle exists to avoid when
+                        // another VPN (Tailscale) is meant to hold that slot.
+                        // ACTION_STANDBY routes straight to enterStandby().
                         ContextCompat.startForegroundService(
-                            context, Intent(context, RayfishVpnService::class.java),
+                            context,
+                            Intent(context, RayfishVpnService::class.java).apply {
+                                action = RayfishVpnService.ACTION_STANDBY
+                            },
                         )
                     } else {
                         // Already in standby (service running, control plane up,
