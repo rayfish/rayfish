@@ -105,6 +105,14 @@ object FileAutoAccept {
     private val attempts = java.util.concurrent.ConcurrentHashMap<ULong, Int>()
     private val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
     private const val MAX_ATTEMPTS = 3
+    // Ids we have permanently given up retrying. Exposed so HomeScreen can exempt
+    // them from the "hide own-device offers while auto-accept is on" filter: once
+    // we give up, the offer would otherwise be invisible with no way to save it.
+    private val gaveUp = java.util.Collections.synchronizedSet(HashSet<ULong>())
+
+    /** True once auto-accept has permanently given up on this offer id (past
+     * MAX_ATTEMPTS). Lets the caller fall back to a manual Save row. */
+    fun hasGivenUp(id: ULong): Boolean = id in gaveUp
 
     /** Runs on the caller's coroutine context; callers dispatch it on IO. */
     fun run(context: Context) {
@@ -132,7 +140,10 @@ object FileAutoAccept {
                         handled.remove(f.id)
                         Log.w("RayfishFiles", "auto-accept failed for ${f.filename}, will retry ($tries/$MAX_ATTEMPTS)", t)
                     } else {
-                        // Give up: id stays in `handled` so no poller respawns it again.
+                        // Give up: id stays in `handled` so no poller respawns it
+                        // again, and is recorded in `gaveUp` so the offer can still
+                        // be saved manually instead of vanishing for good.
+                        gaveUp.add(f.id)
                         Log.w("RayfishFiles", "auto-accept giving up on ${f.filename} after $tries attempts", t)
                     }
                 }

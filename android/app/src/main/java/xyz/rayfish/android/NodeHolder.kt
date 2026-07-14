@@ -163,6 +163,10 @@ object NodeHolder {
             runCatching { node?.stop() }
             started = false
         }
+        // The core's transfer ids restart at 1 on the next start(); reset the
+        // notifier's process-wide bookkeeping so a later transfer landing on a
+        // reused id is never muted by a stale terminal/postedProgress entry.
+        TransferNotifier.reset(context)
     }
 
     /**

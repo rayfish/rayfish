@@ -110,7 +110,10 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
             runCatching { TransferNotifier.poll(context) }
             val autoAccepting = NodeHolder.isAutoAcceptOwnDevices(context)
             files = runCatching { node.listFileOffers() }.getOrDefault(emptyList())
-                .filter { !(autoAccepting && it.ownDevice) }
+                // Hide own-device offers while auto-accept is downloading or still
+                // retrying them, but not ones it has permanently given up on: those
+                // would otherwise be invisible with no way to save them at all.
+                .filter { !(autoAccepting && it.ownDevice) || FileAutoAccept.hasGivenUp(it.id) }
             connects = runCatching { node.listConnectRequests() }.getOrDefault(emptyList())
             joins = currentNets.filter { it.isCoordinator }.flatMap { n ->
                 runCatching { node.listJoinRequests(n.name) }.getOrDefault(emptyList()).map { n.name to it }
