@@ -1,0 +1,13 @@
+<!-- Monochrome status-bar icon for the foreground VPN/standby notification.
+     Status-bar icons use only the alpha channel, so this is a solid white
+     silhouette; the system applies its own tint. A shield reads as "protected
+     connection" and is not the download glyph it replaced. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,1L3,5v6c0,5.55 3.84,10.74 9,12 5.16,-1.26 9,-6.45 9,-12V5L12,1z" />
+</vector>

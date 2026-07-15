@@ -10,6 +10,10 @@
 
 use std::sync::Mutex;
 
+use iroh_blobs::provider::events::{
+    ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
+};
+
 use super::super::*;
 
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
@@ -174,13 +178,143 @@ async fn build_daemon(
     )
     .await?;
 
+    // Built before the blob store below, because the provider event pump that
+    // feeds it (a bit further down, once `blobs_proto` exists) needs the
+    // registry to already be there to hand transfer updates to.
+    let transfers = Arc::new(transfers::TransferRegistry::new());
+
     // --- Content-addressed blob store (membership/file transfer) ---
     let blobs_dir = config::config_dir()?.join("blobs");
     std::fs::create_dir_all(&blobs_dir)?;
     let blob_store = FsStore::load(&blobs_dir)
         .await
         .context("failed to open blob store")?;
-    let blobs_proto = BlobsProtocol::new(&blob_store, None);
+    // Provider events tell us when a peer actually reads a blob out of our store,
+    // which is the only signal a sender gets that its file arrived: `send_file`
+    // returns when the *offer* lands, not when the bytes move. `NotifyLog` gives
+    // us per-request transfer events with no interception; `get` is the only
+    // request-mode field this crate version actually reads, so it gates
+    // notifications for all four request kinds (get, get_many, push, observe),
+    // not just get. What this actually guarantees: our pump body below never
+    // awaits anything except `recv` (each request's update stream is drained by
+    // a task spawned immediately), and transfer progress is sent with `try_send`
+    // and dropped rather than blocking, so a slow pump cannot itself stall the
+    // provider. It does not mean the provider can never block on us:
+    // `client_connected` and `notify_streaming` do await on this channel (64
+    // slots), so a wedged pump would still backpressure connection setup.
+    // `connected: Notify` (also non-intercepting) is the only way to learn *who*
+    // is pulling: a `GetRequestReceivedNotify` carries a connection id, not a
+    // peer id, so without this we could only match on hash, which can't tell two
+    // recipients of the same file apart.
+    let (blob_events, mut blob_event_rx) = EventSender::channel(
+        64,
+        EventMask {
+            connected: ConnectMode::Notify,
+            get: RequestMode::NotifyLog,
+            ..EventMask::DEFAULT
+        },
+    );
+    let blobs_proto = BlobsProtocol::new(&blob_store, Some(blob_events));
+
+    // Pump provider events into the transfer registry. Roster (group blob) fetches
+    // ride the same blobs ALPN, so events for hashes we never registered as an
+    // outgoing file send are dropped by the registry regardless of who pulled them.
+    {
+        let transfers = transfers.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            // Connection id -> resolved peer, built from `ClientConnected` and
+            // pruned on `ConnectionClosed`. Only ever touched from this single
+            // task, so a plain map needs no lock.
+            let mut connections: HashMap<u64, EndpointId> = HashMap::new();
+            loop {
+                let msg = tokio::select! {
+                    _ = token.cancelled() => break,
+                    msg = blob_event_rx.recv() => match msg {
+                        Some(msg) => msg,
+                        None => break,
+                    },
+                };
+                match msg {
+                    ProviderMessage::ClientConnectedNotify(msg) => {
+                        if let Some(endpoint_id) = msg.inner.endpoint_id {
+                            connections.insert(msg.inner.connection_id, endpoint_id);
+                        }
+                    }
+                    ProviderMessage::ConnectionClosed(msg) => {
+                        connections.remove(&msg.inner.connection_id);
+                    }
+                    // Only the notify variant arrives under `NotifyLog`, and only for
+                    // get requests: everything else in the mask is off.
+                    ProviderMessage::GetRequestReceivedNotify(msg) => {
+                        let hash = msg.inner.request.hash;
+                        let connection_id = msg.inner.connection_id;
+                        // Resolved now, synchronously, while still on the single task
+                        // that owns `connections`; the request-tracking task below
+                        // only needs the already-resolved value.
+                        let peer = connections.get(&connection_id).copied();
+                        let transfers = transfers.clone();
+                        let mut updates = msg.rx;
+                        tokio::spawn(async move {
+                            let Some(peer) = peer else {
+                                // No resolved peer for this connection (a roster
+                                // fetch, or a connection whose `ClientConnected` we
+                                // missed): drain without matching, so we never fall
+                                // back to hash-only matching and never stall the
+                                // provider by leaving its update channel unread.
+                                tracing::debug!(
+                                    connection_id,
+                                    %hash,
+                                    "provider event with no resolved peer; dropping"
+                                );
+                                while let Ok(Some(_)) = updates.recv().await {}
+                                return;
+                            };
+                            while let Ok(Some(update)) = updates.recv().await {
+                                match update {
+                                    RequestUpdate::Started(_) => {
+                                        transfers.provider_started(hash, peer)
+                                    }
+                                    RequestUpdate::Progress(p) => {
+                                        transfers.provider_progress(hash, peer, p.end_offset)
+                                    }
+                                    RequestUpdate::Completed(_) => {
+                                        transfers.provider_finished(hash, peer, true)
+                                    }
+                                    RequestUpdate::Aborted(_) => {
+                                        transfers.provider_finished(hash, peer, false)
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    // Not something we track (Rayfish only issues single-blob
+                    // Gets today), but `get: RequestMode::NotifyLog` above gates
+                    // all four request kinds in this crate version, not just
+                    // Get, so these three CAN arrive (e.g. from a future
+                    // get_many/HashSeq fetch). Each carries an `rx` update
+                    // channel the provider writes progress into; if we drop it
+                    // unread, the provider's `transfer_progress` gets
+                    // `SendError::ReceiverClosed` and aborts the request. Drain
+                    // it to completion and discard, same as the Get arm, but
+                    // without touching the registry.
+                    ProviderMessage::GetManyRequestReceivedNotify(msg) => {
+                        let mut updates = msg.rx;
+                        tokio::spawn(async move { while let Ok(Some(_)) = updates.recv().await {} });
+                    }
+                    ProviderMessage::PushRequestReceivedNotify(msg) => {
+                        let mut updates = msg.rx;
+                        tokio::spawn(async move { while let Ok(Some(_)) = updates.recv().await {} });
+                    }
+                    ProviderMessage::ObserveRequestReceivedNotify(msg) => {
+                        let mut updates = msg.rx;
+                        tokio::spawn(async move { while let Ok(Some(_)) = updates.recv().await {} });
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
 
     // --- Packet interface: deferred to `attach_tun` ---
     // No OS TUN device or forwarding loop is created here. On desktop `run_daemon`
@@ -289,6 +423,7 @@ async fn build_daemon(
         registry.clone(),
         device_cert.clone(),
         device_user_map.clone(),
+        transfers.clone(),
     ));
     let connect = Arc::new(ConnectService::new(
         transport.clone(),
@@ -367,6 +502,7 @@ async fn build_daemon(
         _metrics_server: metrics_server,
         router,
         files,
+        transfers,
         connect,
         device_cert,
         contact_public,

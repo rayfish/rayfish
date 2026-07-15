@@ -23,9 +23,12 @@ import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.FileOffer
 import uniffi.ray_mobile.PendingRequest
 import uniffi.ray_mobile.Status
+import xyz.rayfish.android.DownloadsOutcome
 import xyz.rayfish.android.FileAutoAccept
 import xyz.rayfish.android.NodeHolder
 import xyz.rayfish.android.RayfishVpnService
+import xyz.rayfish.android.TransferKey
+import xyz.rayfish.android.TransferNotifier
 import xyz.rayfish.android.moveToDownloads
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
@@ -95,10 +98,26 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     suspend fun reloadNotifs() {
         withContext(Dispatchers.IO) {
             val node = NodeHolder.get(context)
-            // Auto-accept own-device offers first so they don't linger as manual
-            // "Save" prompts; the list below then shows only offers from others.
+            // FileAutoAccept.run only starts own-device downloads on its bounded
+            // executor and returns immediately; it does not wait for them to finish.
+            // So an own-device offer is still present in listFileOffers() for the
+            // whole download, and must be filtered out below rather than assumed
+            // gone, or the user sees a manual "Save" row for a file that is already
+            // downloading and can fire a second, concurrent accept for the same id.
             runCatching { FileAutoAccept.run(context) }
+            // With the VPN off and go-fully-offline enabled, RayfishVpnService is not
+            // running, so this 2s loop becomes the only poller while the app is open:
+            // without this, an own-device auto-accept (and any other in-flight
+            // transfer) would show no progress and no result notification at all.
+            // This is uncommon (standby is the default); the common case keeps the
+            // control plane running in the background.
+            runCatching { TransferNotifier.poll(context) }
+            val autoAccepting = NodeHolder.isAutoAcceptOwnDevices(context)
             files = runCatching { node.listFileOffers() }.getOrDefault(emptyList())
+                // Hide own-device offers while auto-accept is downloading or still
+                // retrying them, but not ones it has permanently given up on: those
+                // would otherwise be invisible with no way to save them at all.
+                .filter { !(autoAccepting && it.ownDevice) || FileAutoAccept.hasGivenUp(it.id) }
             connects = runCatching { node.listConnectRequests() }.getOrDefault(emptyList())
             joins = currentNets.filter { it.isCoordinator }.flatMap { n ->
                 runCatching { node.listJoinRequests(n.name) }.getOrDefault(emptyList()).map { n.name to it }
@@ -130,11 +149,25 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     val doneFiles = remember { mutableStateMapOf<ULong, FileOffer>() }
     fun acceptFile(f: FileOffer) {
         accepting[f.id] = f
+        val key = TransferKey(f.from, f.filename, f.size)
+        // Mark pending before the blocking accept starts: the core reports the
+        // transfer DONE from inside acceptFileOffer, before moveToDownloads below
+        // has copied anything, so TransferNotifier's poller must see "pending"
+        // from the first moment DONE can appear.
+        DownloadsOutcome.markPending(key)
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
                     NodeHolder.get(context).acceptFileOffer(f.id, saveDir)
-                    moveToDownloads(context, File(saveDir, f.filename), f.filename, f.mimeType)
+                    // Re-stamp pending now that the download is done and the copy
+                    // is about to start: the first markPending call above only
+                    // needed to cover the wait for DONE to appear, and acceptFileOffer
+                    // can block far longer than PENDING_TIMEOUT_MS on a large file,
+                    // which would otherwise expire the entry before the copy even
+                    // begins.
+                    DownloadsOutcome.markPending(key)
+                    val reached = moveToDownloads(context, File(saveDir, f.filename), f.filename, f.mimeType)
+                    DownloadsOutcome.record(key, reached)
                 }
                 accepting.remove(f.id)
                 doneFiles[f.id] = f
@@ -142,6 +175,11 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                 kotlinx.coroutines.delay(2000)
                 doneFiles.remove(f.id)
             } catch (t: Throwable) {
+                // The accept itself failed: no Downloads outcome is ever coming for
+                // this key, so stop treating it as pending rather than making the
+                // result notification wait out the timeout for a failure that has
+                // already happened.
+                DownloadsOutcome.clearPending(key)
                 accepting.remove(f.id)
                 onToast("Failed: ${t.message}")
             }
