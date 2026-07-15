@@ -1255,7 +1255,10 @@ mod tests {
             pending_connects: 0,
             pending_networks: vec![],
         };
-        let bytes = rmp_serde::to_vec(&resp).unwrap();
+        // The IPC codec uses `to_vec_named`; positional encoding can't survive
+        // NetworkStatus's `skip_serializing_if` fields (ephemeral_ttl_secs,
+        // my_exit_node) sitting ahead of exit_offering.
+        let bytes = rmp_serde::to_vec_named(&resp).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
             IpcMessage::StatusResponse {
