@@ -1026,14 +1026,14 @@ impl Daemon {
                 // If the data plane is up, reconcile the runtime state and kernel
                 // plumbing now; otherwise `activate()` picks it up on `ray up`.
                 if self.active.load(Ordering::SeqCst) {
-                    self.apply_exit_node();
+                    self.apply_exit_node().await;
                 }
                 resp
             }
             IpcMessage::ExitNodeUse { network, peer } => {
                 let resp = self.registry.exit_node_use(&network, peer).await;
                 if self.active.load(Ordering::SeqCst) {
-                    self.apply_exit_node();
+                    self.apply_exit_node().await;
                 }
                 resp
             }

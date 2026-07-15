@@ -10,9 +10,11 @@
 //! node's own iroh transport ([`install_client_routing`]).
 //!
 //! **Offering** an exit node works on Linux (nftables), macOS and FreeBSD (pf).
-//! **Using** one is Linux-only: it rests on marking iroh's underlay sockets so they
-//! can be policy-routed around the tunnel they are carrying, and neither BSD has an
-//! equivalent we can reach through iroh yet.
+//! **Using** one works on Linux and macOS. Both rest on keeping iroh's own sockets
+//! out of the tunnel they are carrying ([`configure_socket`]): Linux marks them
+//! (`SO_MARK`) and policy-routes the mark around the tunnel; macOS pins them to the
+//! physical default-route interface (`IP_BOUND_IF`), which bypasses the routing
+//! table altogether. FreeBSD has no equivalent we can reach through iroh yet.
 //!
 //! The per-network allow decision ([`ExitServer`]) and the client's selection
 //! ([`ExitClient`]) are plain userspace state, live on every platform, and are
@@ -56,10 +58,12 @@ pub const SOCKET_MARK: u32 = 0x7261; // "ra"
 /// tunnel is actually up, and force a rebind when this flips.
 static FULL_TUNNEL: AtomicBool = AtomicBool::new(false);
 
-/// Records whether a full tunnel is up. The caller must trigger an endpoint rebind
-/// (`Endpoint::network_change`) afterwards, so already-bound sockets pick this up.
-pub fn set_full_tunnel(on: bool) {
-    FULL_TUNNEL.store(on, Ordering::Release);
+/// Records whether a full tunnel is up, returning the previous value. Whenever this
+/// flips, the caller must trigger an endpoint rebind (`Endpoint::network_change`)
+/// so already-bound sockets pick it up; when it did not flip, the rebind can be
+/// skipped.
+pub fn set_full_tunnel(on: bool) -> bool {
+    FULL_TUNNEL.swap(on, Ordering::AcqRel)
 }
 
 /// The hook iroh runs on every socket it opens (both underlay UDP sockets and the
@@ -511,7 +515,12 @@ pub fn disable() {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 pub fn disable() {}
 
-/// No-op off Linux: client full-tunnel routing only exists there.
+/// No-op off Linux. Only there does the client full tunnel leave state that can
+/// outlive the process (policy rules and an nft table). The macOS client's state
+/// dies with the daemon on its own: the split-default routes sit on the utun, which
+/// the kernel destroys (routes included) when the owning fd closes, and the socket
+/// pinning lives inside the process. So the panic hook, which calls this on every
+/// platform, has nothing to do here.
 #[cfg(not(target_os = "linux"))]
 pub fn teardown_client_routing() {}
 
