@@ -66,6 +66,7 @@ use std::sync::{Arc, Mutex};
 use android_tun::{AndroidTunReader, AndroidTunWriter};
 use rayfish::config;
 use rayfish::control;
+use rayfish::daemon::transfers;
 use rayfish::daemon::{DaemonState, build_headless};
 use rayfish::deeplink::{self, RayfishLink};
 use rayfish::firewall::{Action, Direction, Protocol};
@@ -202,6 +203,29 @@ pub struct FileOffer {
     /// True when the sender is one of this user's own paired devices. The UI
     /// auto-accepts these (own-device shares) without a manual tap.
     pub own_device: bool,
+}
+
+/// Where a transfer is. A send is `Offered` until the peer accepts and starts
+/// pulling the bytes: `send_file` returns once the offer lands, not once the file
+/// has arrived, so `Done` on an outgoing transfer is the real "they have it".
+#[derive(uniffi::Enum)]
+pub enum TransferState {
+    Offered,
+    Transferring,
+    Done,
+    Failed,
+}
+
+/// One in-flight (or recently finished) file transfer, either direction.
+#[derive(uniffi::Record)]
+pub struct Transfer {
+    pub id: u64,
+    pub outgoing: bool,
+    pub peer: String,
+    pub filename: String,
+    pub size: u64,
+    pub transferred: u64,
+    pub state: TransferState,
 }
 
 /// A pending request awaiting the user's decision: an incoming `ray connect`
@@ -658,6 +682,31 @@ impl Node {
                 "unexpected files response: {other:?}"
             ))),
         }
+    }
+
+    /// In-flight and recently finished transfers, both directions. Terminal entries
+    /// linger for 60s so a poller can see them before they expire. Cheap: safe to
+    /// poll on a timer while a notification is on screen.
+    pub fn list_transfers(&self) -> Result<Vec<Transfer>, RayError> {
+        let state = self.state()?;
+        Ok(state
+            .list_transfers()
+            .into_iter()
+            .map(|t| Transfer {
+                id: t.id,
+                outgoing: t.outgoing,
+                peer: t.peer,
+                filename: t.filename,
+                size: t.size,
+                transferred: t.transferred,
+                state: match t.state {
+                    transfers::TransferState::Offered => TransferState::Offered,
+                    transfers::TransferState::Transferring => TransferState::Transferring,
+                    transfers::TransferState::Done => TransferState::Done,
+                    transfers::TransferState::Failed => TransferState::Failed,
+                },
+            })
+            .collect())
     }
 
     /// Accept a file offer, saving it under `output_dir` (an app-writable path).

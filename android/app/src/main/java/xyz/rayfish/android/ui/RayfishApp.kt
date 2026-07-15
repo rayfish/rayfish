@@ -55,9 +55,39 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
     // stay offline. Then poll every 2s while foregrounded; suspend in background.
     LaunchedEffect(Unit) {
         try {
-            if (NodeHolder.isEnabled(context) && VpnService.prepare(context) == null) {
+            if (NodeHolder.isEnabled(context)) {
+                if (VpnService.prepare(context) == null) {
+                    ContextCompat.startForegroundService(
+                        context, Intent(context, RayfishVpnService::class.java),
+                    )
+                } else {
+                    // Another app (Tailscale, say) holds the single VpnService slot, so
+                    // our saved enable intent is stale: it was set true when we still
+                    // had the tunnel, but we can no longer get it back. Clear it now,
+                    // the same reasoning onRevoke already uses, so the toggle stops
+                    // reading "on" for a tunnel that will never come up, and the You
+                    // screen's go-fully-offline control sees the real state instead of
+                    // this leftover intent.
+                    NodeHolder.setEnabled(context, false)
+                    if (!NodeHolder.isGoOfflineWhenDisabled(context)) {
+                        ContextCompat.startForegroundService(
+                            context,
+                            Intent(context, RayfishVpnService::class.java).apply {
+                                action = RayfishVpnService.ACTION_STANDBY
+                            },
+                        )
+                    }
+                }
+            } else if (!NodeHolder.isGoOfflineWhenDisabled(context)) {
+                // The VPN is not being restored, and the user has not asked to go
+                // fully offline when disabled, so standby is the default: files
+                // should keep working. Nothing else brings the control plane up
+                // after a process death; bring it up now via standby.
                 ContextCompat.startForegroundService(
-                    context, Intent(context, RayfishVpnService::class.java),
+                    context,
+                    Intent(context, RayfishVpnService::class.java).apply {
+                        action = RayfishVpnService.ACTION_STANDBY
+                    },
                 )
             }
             readStatus()

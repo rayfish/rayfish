@@ -1,5 +1,6 @@
 package xyz.rayfish.android.ui.screens
 
+import android.content.Intent
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -11,11 +12,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.Status
 import xyz.rayfish.android.NodeHolder
+import xyz.rayfish.android.RayfishVpnService
 import xyz.rayfish.android.Telemetry
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.qr.rememberQrScanner
@@ -104,6 +107,63 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 }
             }
         }
+        // Default off: standby is the normal behavior now, so disabling Rayfish
+        // keeps files working with the VPN off (that is what lets you run another
+        // VPN, Tailscale say, at the same time). This toggle is the escape hatch
+        // for a user who wants disabling Rayfish to take the device fully offline
+        // instead.
+        var goOfflineWhenDisabled by remember { mutableStateOf(NodeHolder.isGoOfflineWhenDisabled(context)) }
+        ToggleCard(
+            title = "Go fully offline when disabled",
+            subtitle = if (goOfflineWhenDisabled) {
+                "on · turning the VPN off takes this device offline"
+            } else {
+                "off · Rayfish keeps working for files with the VPN off, so you can run another VPN"
+            },
+            checked = goOfflineWhenDisabled,
+            onCheckedChange = { on ->
+                goOfflineWhenDisabled = on
+                NodeHolder.setGoOfflineWhenDisabled(context, on)
+                // status is a poll cache (RayfishApp refreshes it every 2s), and is
+                // null right after an Activity recreation: it can read stale-false
+                // while the VPN just came up in Home, or stale-true right after Home
+                // just took it down. Deciding from it here can silently kill a live
+                // VPN or silently no-op a real request. The service's tunnel field is
+                // authoritative only once the service re-checks it on nodeExecutor
+                // (the thread that writes it), so send unconditionally and let the
+                // service decide there instead of guessing from this stale cache.
+                if (on) {
+                    // The user asked to go fully offline when disabled. Do not send
+                    // bare ACTION_STOP: that unconditionally tears down whatever is
+                    // running, which is correct for Home's VPN toggle but not here,
+                    // since a live VPN must not be touched by this pref.
+                    // ACTION_EXIT_STANDBY means "if there is no tunnel, take the node
+                    // fully offline and stop the service; if there is a tunnel, leave
+                    // it alone, since the pref only governs the next teardown."
+                    context.startService(
+                        Intent(context, RayfishVpnService::class.java).apply {
+                            action = RayfishVpnService.ACTION_EXIT_STANDBY
+                        },
+                    )
+                } else {
+                    // Back to the default: bring the control plane up in standby if
+                    // the VPN is currently off. Bring the control plane up only,
+                    // never a tunnel: a plain intent would land in startTunnel() and
+                    // try to grab the single VpnService slot (and pop the consent
+                    // dialog), which is exactly what standby exists to avoid when
+                    // another VPN (Tailscale) is meant to hold that slot.
+                    // ACTION_STANDBY routes to enterStandbyBlocking() on nodeExecutor.
+                    // If a tunnel is up, it re-posts the notification to correct text
+                    // instead of entering standby.
+                    ContextCompat.startForegroundService(
+                        context,
+                        Intent(context, RayfishVpnService::class.java).apply {
+                            action = RayfishVpnService.ACTION_STANDBY
+                        },
+                    )
+                }
+            },
+        )
         var autoAcceptOwn by remember { mutableStateOf(NodeHolder.isAutoAcceptOwnDevices(context)) }
         ToggleCard(
             title = "Auto-accept from my devices",
