@@ -8,9 +8,13 @@
 //! /…) stay on `Daemon` since they orchestrate over core handles (endpoint,
 //! peers, the shared blob store) and read this service's state.
 
+use super::transfers;
 use super::*;
 use std::ffi::CString;
 use std::path::PathBuf;
+
+use futures::StreamExt;
+use iroh_blobs::api::remote::GetProgressItem;
 
 /// A received file offer awaiting `ray files accept`.
 pub(crate) struct PendingFile {
@@ -39,6 +43,8 @@ pub(crate) struct FileService {
     device_cert: Option<control::DeviceCert>,
     /// Transport-key → user-identity map, to resolve a file sender's owner.
     device_user_map: peers::DeviceUserMap,
+    /// In-flight transfers, for progress reporting.
+    pub(crate) transfers: Arc<transfers::TransferRegistry>,
 }
 
 impl FileService {
@@ -48,6 +54,7 @@ impl FileService {
         registry: Arc<NetworkRegistry>,
         device_cert: Option<control::DeviceCert>,
         device_user_map: peers::DeviceUserMap,
+        transfers: Arc<transfers::TransferRegistry>,
     ) -> Self {
         Self {
             pending_files: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -58,6 +65,7 @@ impl FileService {
             registry,
             device_cert,
             device_user_map,
+            transfers,
         }
     }
 
@@ -213,14 +221,42 @@ impl FileService {
             }
         };
 
-        if let Err(e) = self
-            .transport
-            .blob_store
-            .remote()
-            .fetch(conn, iroh_blobs::HashAndFormat::raw(blob_hash))
-            .await
-        {
-            return ipc_err(format!("blob fetch failed: {e}"));
+        let peer_label = pending_file.from.fmt_short().to_string();
+        let transfer_id = self.transfers.register_receive(
+            peer_label,
+            pending_file.filename.clone(),
+            pending_file.size,
+        );
+        // Guards against a cancelled fetch (or an early return below) leaving
+        // the entry stuck in `Transferring`: its `Drop` marks the transfer
+        // failed unless `success()` disarms it first, which only happens once
+        // the file is actually on disk.
+        let finish_guard = transfers::FinishGuard::new(self.transfers.clone(), transfer_id);
+
+        // `fetch` returns a `GetProgress`: awaiting it directly discards the
+        // progress, so take the stream instead and report bytes as they land. It
+        // yields `Progress(n)` items (n = payload bytes read so far) and exactly
+        // one terminal `Done`/`Error` item. Note: reaching `Done` here means only
+        // the fetch succeeded, not the transfer; the registry is not finished
+        // until the file is written to disk below.
+        let mut stream = Box::pin(
+            self.transport
+                .blob_store
+                .remote()
+                .fetch(conn, iroh_blobs::HashAndFormat::raw(blob_hash))
+                .stream(),
+        );
+        loop {
+            match stream.next().await {
+                Some(GetProgressItem::Progress(n)) => self.transfers.note_progress(transfer_id, n),
+                Some(GetProgressItem::Done(_)) => break,
+                Some(GetProgressItem::Error(e)) => {
+                    return ipc_err(format!("blob fetch failed: {e}"));
+                }
+                None => {
+                    return ipc_err("blob fetch ended without a result".to_string());
+                }
+            }
         }
 
         let bytes = match self.transport.blob_store.blobs().get_bytes(blob_hash).await {
@@ -257,6 +293,10 @@ impl FileService {
                 unsafe { libc::chown(c.as_ptr(), uid, gid) };
             }
         }
+
+        // The file is fully on disk (chown failures are ignored, by design,
+        // and never fail the transfer): only now is the transfer really done.
+        finish_guard.success();
 
         IpcMessage::Ok {
             message: format!("saved to {}", dest.display()),
@@ -355,6 +395,19 @@ impl FileService {
             return ipc_err(format!("blob store error: {e}"));
         }
 
+        // Register the transfer now, before the peer can possibly learn the hash:
+        // it is only after `add_slice` above that the blob exists to be pulled, and
+        // the offer that tells the peer about it hasn't even been dialed yet. On
+        // auto-accept, the receiver can fetch the entire blob and close its
+        // connection before this function's own `conn.closed()` await below
+        // returns, so every provider event (Started/Progress/Completed) can arrive
+        // before an entry registered "at the end" would have existed; registering
+        // here instead means the entry always exists first.
+        let blob_hash = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
+        let transfer_id = self
+            .transfers
+            .register_send(peer_id, filename.clone(), size, blob_hash);
+
         let msg = control::ControlMsg::FileOffer {
             from: self.transport.endpoint.id(),
             filename: filename.clone(),
@@ -375,6 +428,7 @@ impl FileService {
                     // File offers ride the separate FILES_ALPN, not the mesh demux,
                     // so they carry no network scope.
                     if let Err(e) = control::send_msg(&mut send, None, &msg).await {
+                        self.transfers.fail_offer(transfer_id);
                         return ipc_err(format!("failed to send offer: {e}"));
                     }
                     // send_msg already finished the stream; wait for the peer to
@@ -382,14 +436,20 @@ impl FileService {
                     let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
                 }
                 Err(e) => {
+                    self.transfers.fail_offer(transfer_id);
                     return ipc_err(format!("failed to open stream: {e}"));
                 }
             },
             Err(e) => {
+                self.transfers.fail_offer(transfer_id);
                 return ipc_err(format!("cannot reach peer '{peer}': {e}"));
             }
         }
 
+        // The bytes have not moved yet: the offer has only just been delivered.
+        // The peer pulls the blob out of our store when it accepts, and that is
+        // what the provider events (wired up in bootstrap) report against this
+        // hash and peer. The entry stays Offered until then.
         IpcMessage::Ok {
             message: format!("offered {} ({}) to {}", filename, format_size(size), peer),
         }
