@@ -710,7 +710,7 @@ class RayfishVpnService : VpnService() {
         val builder = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Rayfish")
             .setContentText(if (standby) "Online, VPN off · files still work" else "Mesh tunnel active")
-            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setSmallIcon(R.drawable.ic_stat_vpn)
             .setOngoing(true)
             .setContentIntent(openIntent)
 
