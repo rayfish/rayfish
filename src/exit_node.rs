@@ -84,7 +84,15 @@ pub fn configure_socket() -> ConfigureSocket {
         #[cfg(target_os = "linux")]
         {
             let _ = domain;
-            sock.set_mark(SOCKET_MARK)?;
+            // SO_MARK needs CAP_NET_ADMIN, which an unprivileged process (tests,
+            // embedders) does not have. That is fine to skip rather than fail the
+            // bind: such a process cannot install the policy routing that consumes
+            // the mark either, so there is no tunnel its transport could leak into.
+            if let Err(e) = sock.set_mark(SOCKET_MARK)
+                && e.raw_os_error() != Some(libc::EPERM)
+            {
+                return Err(e);
+            }
         }
         #[cfg(target_os = "macos")]
         bind_outside_tunnel(&sock, domain)?;
