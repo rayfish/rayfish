@@ -190,12 +190,16 @@ enable-ansi-support = "0.3"
 [patch.crates-io]
 # iroh fork carrying two rayfish features on the `rayfish-integration` branch:
 #   - `Builder::direct_addr_filter` (upstream PR n0-computer/iroh#4397)
-#   - `Builder::socket_mark` for SO_MARK on the underlay sockets (draft PR #4406)
+#   - `Builder::configure_socket`, a hook run on every socket iroh opens (UDP and
+#     the relay's TCP), used for the exit-node loop prevention: SO_MARK on Linux,
+#     IP_BOUND_IF interface pinning on macOS. Supersedes the socket_mark draft
+#     (PR #4406); not proposed upstream yet.
 # iroh-base/-dns/-relay are patched too so the fork and registry copies don't clash.
-iroh = { path = "../iroh/iroh" }
-iroh-base = { path = "../iroh/iroh-base" }
-iroh-dns = { path = "../iroh/iroh-dns" }
-iroh-relay = { path = "../iroh/iroh-relay" }
-# netwatch fork exposing `UdpSocket::bind_full_with_mark`, which the socket_mark
-# plumbing above calls (upstream PR n0-computer/net-tools#179).
-netwatch = { path = "../net-tools/netwatch" }
+iroh = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
+iroh-base = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
+iroh-dns = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
+iroh-relay = { git = "https://github.com/rayfish/iroh", branch = "rayfish-integration" }
+# netwatch fork exposing the `ConfigureSocket` hook that the iroh branch above
+# threads through (upstream has only the SO_MARK-only BindOptions from
+# n0-computer/net-tools#179, unreleased).
+netwatch = { git = "https://github.com/rayfish/net-tools", branch = "feat/configure-socket" }
