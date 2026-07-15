@@ -786,6 +786,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -840,6 +842,8 @@ fun uniffi_ray_mobile_checksum_method_node_list_connect_requests(
 fun uniffi_ray_mobile_checksum_method_node_list_file_offers(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_list_join_requests(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_list_transfers(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_log_snapshot(
 ): Short
@@ -967,6 +971,8 @@ fun uniffi_ray_mobile_fn_method_node_list_connect_requests(`ptr`: Pointer,uniffi
 fun uniffi_ray_mobile_fn_method_node_list_file_offers(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_list_join_requests(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_list_transfers(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_log_snapshot(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1182,6 +1188,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_list_join_requests() != 56409.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_list_transfers() != 2731.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_log_snapshot() != 20955.toShort()) {
@@ -1741,6 +1750,13 @@ public interface NodeInterface {
     fun `listJoinRequests`(`network`: kotlin.String): List<PendingRequest>
     
     /**
+     * In-flight and recently finished transfers, both directions. Terminal entries
+     * linger for 60s so a poller can see them before they expire. Cheap: safe to
+     * poll on a timer while a notification is on screen.
+     */
+    fun `listTransfers`(): List<Transfer>
+    
+    /**
      * The full buffered core log, for the "Send diagnostics" button.
      */
     fun `logSnapshot`(): kotlin.String
@@ -2270,6 +2286,24 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     uniffiRustCallWithError(RayException) { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_join_requests(
         it, FfiConverterString.lower(`network`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * In-flight and recently finished transfers, both directions. Terminal entries
+     * linger for 60s so a poller can see them before they expire. Cheap: safe to
+     * poll on a timer while a notification is on screen.
+     */
+    @Throws(RayException::class)override fun `listTransfers`(): List<Transfer> {
+            return FfiConverterSequenceTypeTransfer.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_transfers(
+        it, _status)
 }
     }
     )
@@ -3073,6 +3107,61 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
 
 
 /**
+ * One in-flight (or recently finished) file transfer, either direction.
+ */
+data class Transfer (
+    var `id`: kotlin.ULong, 
+    var `outgoing`: kotlin.Boolean, 
+    var `peer`: kotlin.String, 
+    var `filename`: kotlin.String, 
+    var `size`: kotlin.ULong, 
+    var `transferred`: kotlin.ULong, 
+    var `state`: TransferState
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTransfer: FfiConverterRustBuffer<Transfer> {
+    override fun read(buf: ByteBuffer): Transfer {
+        return Transfer(
+            FfiConverterULong.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterTypeTransferState.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: Transfer) = (
+            FfiConverterULong.allocationSize(value.`id`) +
+            FfiConverterBoolean.allocationSize(value.`outgoing`) +
+            FfiConverterString.allocationSize(value.`peer`) +
+            FfiConverterString.allocationSize(value.`filename`) +
+            FfiConverterULong.allocationSize(value.`size`) +
+            FfiConverterULong.allocationSize(value.`transferred`) +
+            FfiConverterTypeTransferState.allocationSize(value.`state`)
+    )
+
+    override fun write(value: Transfer, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterBoolean.write(value.`outgoing`, buf)
+            FfiConverterString.write(value.`peer`, buf)
+            FfiConverterString.write(value.`filename`, buf)
+            FfiConverterULong.write(value.`size`, buf)
+            FfiConverterULong.write(value.`transferred`, buf)
+            FfiConverterTypeTransferState.write(value.`state`, buf)
+    }
+}
+
+
+
+/**
  * The outcome of following a `rayfish://` deep link, reflected in the UI.
  */
 sealed class LinkAction {
@@ -3292,6 +3381,43 @@ public object FfiConverterTypeRayError : FfiConverterRustBuffer<RayException> {
     }
 
 }
+
+
+
+/**
+ * Where a transfer is. A send is `Offered` until the peer accepts and starts
+ * pulling the bytes: `send_file` returns once the offer lands, not once the file
+ * has arrived, so `Done` on an outgoing transfer is the real "they have it".
+ */
+
+enum class TransferState {
+    
+    OFFERED,
+    TRANSFERRING,
+    DONE,
+    FAILED;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTransferState: FfiConverterRustBuffer<TransferState> {
+    override fun read(buf: ByteBuffer) = try {
+        TransferState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: TransferState) = 4UL
+
+    override fun write(value: TransferState, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
 
 
 
@@ -3517,6 +3643,34 @@ public object FfiConverterSequenceTypePendingRequest: FfiConverterRustBuffer<Lis
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypePendingRequest.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeTransfer: FfiConverterRustBuffer<List<Transfer>> {
+    override fun read(buf: ByteBuffer): List<Transfer> {
+        val len = buf.getInt()
+        return List<Transfer>(len) {
+            FfiConverterTypeTransfer.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<Transfer>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeTransfer.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<Transfer>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeTransfer.write(it, buf)
         }
     }
 }

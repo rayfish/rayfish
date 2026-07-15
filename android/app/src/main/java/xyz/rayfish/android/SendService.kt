@@ -1,7 +1,6 @@
 package xyz.rayfish.android
 
 import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
@@ -12,19 +11,29 @@ import android.os.Build
 import android.os.IBinder
 import io.sentry.android.core.SentryLogcatAdapter as Log
 import kotlin.concurrent.thread
+import uniffi.ray_mobile.TransferState
 
 /**
  * Foreground service that delivers shared files over the mesh in the background, so
  * the user is never blocked waiting on a send. Started by [ShareActivity] once a
  * recipient is picked; the activity finishes immediately.
  *
- * Sending is fire-and-forget by design: [uniffi.ray_mobile.Node.sendFile] offers the
- * file (metadata + blob hash) to the peer and returns once the offer is delivered —
- * it does not wait for the peer to download. The recipient decides asynchronously
- * (auto-accept for its own paired devices, otherwise a manual Save) and pulls the
- * bytes from our blob store when it accepts. So "Sent" here means "offered"; the
- * node stays online (via the VPN service, or the control plane brought up by
- * ensureStarted) to serve the bytes on demand.
+ * [uniffi.ray_mobile.Node.sendFile] offers the file (metadata + blob hash) to the
+ * peer and returns once the offer is delivered, not once the peer has it: the
+ * recipient decides asynchronously (auto-accept for its own paired devices,
+ * otherwise a manual Save) and pulls the bytes from our blob store when it
+ * accepts, which can be minutes later or never. This service stays foreground
+ * and reports real per-transfer progress via [TransferNotifier] until every
+ * offer reaches a terminal state or [WAIT_TIMEOUT_MS] passes; after that, the
+ * only thing left that can report a result is [RayfishVpnService]'s background
+ * poller, and that only runs while some instance of that service is actually
+ * alive (the VPN on, or standby keeping the control plane running). A plain
+ * `NodeHolder.ensureStarted` with no `RayfishVpnService` running (e.g.
+ * `ShareActivity` sharing with the VPN off and go-fully-offline enabled) starts no
+ * poller at all: the transfer still completes in the core, but nobody is
+ * listening, so the result notification never arrives. [TransferNotifier]'s
+ * "waiting" notification says this plainly rather than implying a result
+ * notification is always coming.
  *
  * Each shared URI is staged to the app cache (the grant rides in on the start
  * intent's ClipData + FLAG_GRANT_READ_URI_PERMISSION), sent, then deleted.
@@ -52,27 +61,108 @@ class SendService : Service() {
         // synchronous FFI call. One thread per start command; stop this startId
         // when its batch finishes so concurrent shares each clean up independently.
         thread(name = "rayfish-send-$startId") {
-            var sent = 0
+            // sendFile does not return a transfer id, so we cannot name this batch's
+            // transfers directly. Instead bound them from both sides: take the max
+            // id already in the registry before offering anything, then again right
+            // after the offer loop finishes. This batch's transfers are exactly the
+            // ones present in the "after" snapshot with an id greater than the "before"
+            // max: newly created since we started, and already known to the registry
+            // by the time we start waiting.
+            //
+            // That two-sided bound is not sufficient by itself with two concurrent
+            // shares: it only excludes a batch that starts after this one's "after"
+            // snapshot. It does nothing about a batch whose offers land while this
+            // one is still in the middle of its own offer loop: each sendFile reads
+            // the whole file, hashes it, adds it to the blob store, and then dials
+            // the peer over QUIC with no client-side timeout, so that window can be
+            // long, not just seconds. Those ids are newly created and greater than
+            // maxIdBeforeBatch, so the after-snapshot would wrongly claim them as
+            // this batch's own. If that other batch's peer never accepts, this one
+            // would burn the full wait timeout for a file it delivered in seconds.
+            // So the region from taking the "before" max through the "after"
+            // snapshot is serialized behind batchLock: two batches' offers can never
+            // interleave, only one runs that region at a time.
+            //
+            // Staging (a full byte copy through ContentResolver) allocates no
+            // transfer ids, so it happens before the lock is taken: only the id
+            // snapshots and the sendFile loop itself, which must stay atomic with
+            // respect to id allocation, run inside it. The lock is released before
+            // the wait loop below, so concurrent batches still wait for their own
+            // peers in parallel; only the offering is serialized, not the (much
+            // longer) waiting. A batch can still be blocked by another batch's
+            // sendFile dialing an offline peer, but that is bounded by the QUIC
+            // dial itself rather than by staging plus dial.
+            var offered = 0
             var failed = 0
-            for (uri in uris) {
-                val staged = stageUriForSend(applicationContext, uri)
-                if (staged == null) {
-                    failed++
-                    continue
+            val staged = uris.mapNotNull { uri -> stageUriForSend(applicationContext, uri) }
+            failed += uris.size - staged.size
+
+            val maxIdBeforeBatch: Long?
+            val batchIds: Set<ULong>?
+            synchronized(batchLock) {
+                maxIdBeforeBatch = runCatching {
+                    NodeHolder.get(applicationContext).listTransfers().maxOfOrNull { it.id.toLong() } ?: -1L
+                }.getOrNull()
+
+                for (file in staged) {
+                    try {
+                        NodeHolder.get(applicationContext).sendFile(file.absolutePath, peerId)
+                        offered++
+                    } catch (t: Throwable) {
+                        failed++
+                        Log.w(TAG, "send failed for ${file.name}", t)
+                    } finally {
+                        // Bytes are in the blob store now; the staging copy is no
+                        // longer needed. Remove the file and its per-item dir.
+                        runCatching { file.parentFile?.deleteRecursively() ?: file.delete() }
+                    }
                 }
-                try {
-                    NodeHolder.get(applicationContext).sendFile(staged.absolutePath, peerId)
-                    sent++
-                } catch (t: Throwable) {
-                    failed++
-                    Log.w(TAG, "send failed for ${staged.name}", t)
-                } finally {
-                    // Bytes are in the blob store now; the staging copy is no longer
-                    // needed. Remove the file and its per-item dir.
-                    runCatching { staged.parentFile?.deleteRecursively() ?: staged.delete() }
+
+                batchIds = if (maxIdBeforeBatch == null) {
+                    null
+                } else {
+                    runCatching {
+                        NodeHolder.get(applicationContext).listTransfers()
+                            .mapNotNullTo(HashSet()) { it.id.takeIf { id -> id.toLong() > maxIdBeforeBatch } }
+                    }.getOrNull()
                 }
             }
-            notifyResult(peerName, sent, failed)
+
+            // The offers are delivered, but the bytes have not moved: the peer pulls
+            // them when it accepts. Stay foreground and let TransferNotifier report
+            // real progress until every transfer reaches a terminal state, so the
+            // user sees a progress bar and then a genuine "sent".
+            //
+            // A manual accept on the other end can take arbitrarily long, and an
+            // indefinite foreground service is not acceptable, so give up the
+            // service after WAIT_TIMEOUT_MS. The transfer is not cancelled by that:
+            // it keeps running in the core, and the background poller in
+            // RayfishVpnService posts the result whenever it lands, provided the node
+            // is still alive (VPN on, or in standby).
+            //
+            // If either snapshot failed, we cannot bound this batch at all: waiting
+            // on an unscoped count would silently reinstate the same bug the scoping
+            // was meant to kill, so don't wait rather than wait on everything.
+            if (offered > 0 && batchIds != null) {
+                val deadline = System.currentTimeMillis() + WAIT_TIMEOUT_MS
+                while (System.currentTimeMillis() < deadline) {
+                    TransferNotifier.poll(applicationContext)
+                    val pending = runCatching {
+                        NodeHolder.get(applicationContext).listTransfers()
+                            .count {
+                                it.outgoing && it.id in batchIds &&
+                                    (it.state == TransferState.OFFERED || it.state == TransferState.TRANSFERRING)
+                            }
+                    }.getOrDefault(0)
+                    if (pending == 0) break
+                    Thread.sleep(POLL_INTERVAL_MS)
+                }
+                TransferNotifier.poll(applicationContext)
+            } else if (offered > 0) {
+                TransferNotifier.poll(applicationContext)
+            }
+
+            if (failed > 0) notifyFailure(peerName, failed)
             stopForegroundCompat()
             stopSelf(startId)
         }
@@ -97,9 +187,9 @@ class SendService : Service() {
     }
 
     private fun startForegroundNotification(count: Int, peerName: String) {
-        ensureChannel()
+        TransferNotifier.ensureChannel(this)
         val label = if (count == 1) "1 item" else "$count items"
-        val notification: Notification = Notification.Builder(this, CHANNEL_ID)
+        val notification: Notification = Notification.Builder(this, TransferNotifier.CHANNEL_ID)
             .setContentTitle("Sending to $peerName")
             .setContentText("$label over Rayfish")
             .setSmallIcon(android.R.drawable.stat_sys_upload)
@@ -112,35 +202,26 @@ class SendService : Service() {
         }
     }
 
-    private fun notifyResult(peerName: String, sent: Int, failed: Int) {
-        ensureChannel()
-        val text = when {
-            failed == 0 && sent == 1 -> "Sent 1 item to $peerName"
-            failed == 0 -> "Sent $sent items to $peerName"
-            sent == 0 -> "Failed to send to $peerName"
-            else -> "Sent $sent to $peerName, $failed failed"
-        }
+    /** Staging or offer failures only. Successful sends are reported per transfer by
+     * [TransferNotifier] once the peer has actually pulled the bytes. */
+    private fun notifyFailure(peerName: String, failed: Int) {
+        TransferNotifier.ensureChannel(this)
+        val text = if (failed == 1) "Could not send 1 item to $peerName"
+        else "Could not send $failed items to $peerName"
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )
-        val notification = Notification.Builder(this, CHANNEL_ID)
+        val notification = Notification.Builder(this, TransferNotifier.CHANNEL_ID)
             .setContentTitle("Rayfish")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_sys_upload_done)
+            .setSmallIcon(android.R.drawable.stat_notify_error)
             .setAutoCancel(true)
             .setContentIntent(open)
             .build()
-        // A fresh id per result so a completion isn't overwritten by the next send.
+        // A distinct id per call: two batches with the same failure count (e.g. one
+        // item each, to different peers) must not overwrite each other's notification.
         getSystemService(NotificationManager::class.java)
-            .notify(NOTIF_RESULT_BASE + (sent + failed), notification)
-    }
-
-    private fun ensureChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val channel = NotificationChannel(
-            CHANNEL_ID, "Rayfish file transfers", NotificationManager.IMPORTANCE_LOW,
-        ).apply { description = "Progress of files you share over Rayfish" }
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+            .notify(NOTIF_RESULT_BASE + failureNotifSeq.incrementAndGet(), notification)
     }
 
     private fun stopForegroundCompat() {
@@ -154,9 +235,21 @@ class SendService : Service() {
 
     companion object {
         private const val TAG = "RayfishSend"
-        private const val CHANNEL_ID = "rayfish_transfers"
         private const val NOTIF_ONGOING = 2
         private const val NOTIF_RESULT_BASE = 100
+        // How long the foreground service waits for recipients to pull the bytes
+        // before handing off to the background poller. A manual accept can take far
+        // longer than this; the transfer survives, only the foreground service ends.
+        private const val WAIT_TIMEOUT_MS = 3 * 60 * 1000L
+        private const val POLL_INTERVAL_MS = 1000L
+        // Distinguishes failure notifications from concurrent batches that would
+        // otherwise share the same NOTIF_RESULT_BASE + failed-count id.
+        private val failureNotifSeq = java.util.concurrent.atomic.AtomicInteger(0)
+        // Serializes the before-snapshot/offer-loop/after-snapshot region of
+        // concurrent send batches so their offers can never interleave. Not held
+        // across the wait loop: concurrent batches still wait on their own peers
+        // in parallel, only the offering is serialized.
+        private val batchLock = Any()
         const val EXTRA_PEER_ID = "xyz.rayfish.android.PEER_ID"
         const val EXTRA_PEER_NAME = "xyz.rayfish.android.PEER_NAME"
         const val EXTRA_URIS = "xyz.rayfish.android.URIS"

@@ -8,6 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Android: disabling Rayfish no longer takes the phone offline.** Turning the VPN
+  off (in the app, or because another VPN app took the slot) now drops the tunnel
+  and releases the VPN slot but keeps Rayfish's control plane connected, so files
+  still arrive and still send and the phone stays visible in the mesh. Android only
+  allows one VPN at a time, so this is what lets you run another VPN (Tailscale,
+  say) alongside Rayfish. A new "Go fully offline when disabled" toggle in You
+  (default off) is there for anyone who wants the old behavior back.
+- **Android: accurate notifications for sent and received files.** Sending a file
+  now shows a progress bar and only reports "Sent" once the recipient has actually
+  pulled the bytes, not just once the offer went out (a manual accept on the other
+  end can take a while, or never happen). Receiving a file, including an
+  auto-accepted one from your own paired device, now posts its own progress and
+  "Saved" notification instead of landing in Downloads silently. Both keep working
+  in the background, including with the VPN off.
+- **Android: a one-tap "Disable" on the VPN notification.** While the VPN is on, its
+  persistent notification now carries a Disable action, so you can drop the tunnel
+  and free the VPN slot from the notification shade (as Tailscale does) without
+  opening the app. Under the default above, the control plane stays up, so files
+  keep working after you disable.
 - **The install script now lives in the repo** as `install.sh`, so the one command
   users are asked to pipe into a root shell can be read, reviewed, and tested like
   the rest of the code. CI lints it and installs the latest release with it on
