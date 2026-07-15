@@ -163,8 +163,8 @@ async fn bind_endpoint(
     // Loop prevention for the exit-node client full-tunnel: keep iroh's own sockets
     // (the underlay UDP sockets and the relay connection) off the default route that
     // `ray up` points into the TUN, instead of looping the transport back through the
-    // tunnel it is carrying. See `exit_node::configure_socket`.
-    builder = builder.configure_socket(crate::exit_node::configure_socket());
+    // tunnel it is carrying. See `exit_node::LoopPrevention`.
+    builder = builder.configure_socket(crate::exit_node::LoopPrevention);
 
     // Override the N0 preset's relay / discovery defaults when configured.
     if let Some(mode) = build_relay_mode(relay)? {

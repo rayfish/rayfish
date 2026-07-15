@@ -1245,6 +1245,7 @@ mod tests {
                 aliases: BTreeMap::new(),
                 ephemeral_ttl_secs: None,
                 my_exit_node: None,
+                exit_offering: false,
             }],
             packets_rx: 0,
             packets_tx: 0,

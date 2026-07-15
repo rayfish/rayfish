@@ -56,6 +56,16 @@ pub struct Member {
     pub exit_node: bool,
 }
 
+impl Member {
+    /// Whether `id` names this member, matched the way the roster keys members:
+    /// by device identity, or by the user identity a paired multi-device peer is
+    /// stored under. The one matching rule for every "which member is this id"
+    /// lookup, so a change to how paired devices fold stays in one place.
+    pub fn matches_identity(&self, id: EndpointId) -> bool {
+        self.identity == id || self.user_identity == Some(id)
+    }
+}
+
 /// Controls who can approve new members joining the network.
 ///
 /// Defined in `ray-proto` (shared with GUI frontends); re-exported here so
@@ -156,10 +166,7 @@ impl MemberList {
             return Some(m.identity);
         }
         if let Ok(id) = name.parse::<EndpointId>()
-            && let Some(m) = self
-                .members
-                .values()
-                .find(|m| m.identity == id || m.user_identity == Some(id))
+            && let Some(m) = self.members.values().find(|m| m.matches_identity(id))
         {
             return Some(m.identity);
         }
