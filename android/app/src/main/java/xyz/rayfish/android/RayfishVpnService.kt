@@ -69,6 +69,14 @@ class RayfishVpnService : VpnService() {
 
         when (intent.action) {
             ACTION_STOP -> {
+                // Persist the disable intent here, not only in the caller. The UI
+                // toggle already sets this false before sending ACTION_STOP, but
+                // the notification "Disable" action (below) delivers ACTION_STOP
+                // straight to the service with no Activity in the loop. Without
+                // this write the launch-time restore would read enabled=true and
+                // bring the tunnel back up. Idempotent with the UI path; mirrors
+                // what onRevoke already does.
+                NodeHolder.setEnabled(applicationContext, false)
                 // Tearing down blocks (a graceful endpoint close on the offline
                 // path, so peers see us drop cleanly and a re-enable rebuilds
                 // without a stale session). Run it on the node executor to avoid
@@ -699,13 +707,37 @@ class RayfishVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE,
         )
 
-        val notification: Notification = Notification.Builder(this, CHANNEL_ID)
+        val builder = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Rayfish")
             .setContentText(if (standby) "Online, VPN off · files still work" else "Mesh tunnel active")
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setOngoing(true)
             .setContentIntent(openIntent)
-            .build()
+
+        // With the VPN up, offer a one-tap "Disable" straight from the shade
+        // (like Tailscale), so the user can drop the tunnel and free the single
+        // VpnService slot without opening the app. The action delivers ACTION_STOP
+        // to this service, which persists the disable intent and, under the
+        // standby default, keeps the control plane up so files still work. No
+        // action in standby: turning the VPN back on needs the system consent
+        // dialog, which only an Activity can raise.
+        if (!standby) {
+            val disableIntent = PendingIntent.getService(
+                this,
+                1,
+                Intent(this, RayfishVpnService::class.java).apply { action = ACTION_STOP },
+                PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.addAction(
+                Notification.Action.Builder(
+                    null as android.graphics.drawable.Icon?,
+                    "Disable",
+                    disableIntent,
+                ).build(),
+            )
+        }
+
+        val notification: Notification = builder.build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)

@@ -22,6 +22,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   auto-accepted one from your own paired device, now posts its own progress and
   "Saved" notification instead of landing in Downloads silently. Both keep working
   in the background, including with the VPN off.
+- **Android: a one-tap "Disable" on the VPN notification.** While the VPN is on, its
+  persistent notification now carries a Disable action, so you can drop the tunnel
+  and free the VPN slot from the notification shade (as Tailscale does) without
+  opening the app. Under the default above, the control plane stays up, so files
+  keep working after you disable.
 - **The install script now lives in the repo** as `install.sh`, so the one command
   users are asked to pipe into a root shell can be read, reviewed, and tested like
   the rest of the code. CI lints it and installs the latest release with it on
