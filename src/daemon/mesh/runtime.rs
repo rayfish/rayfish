@@ -822,7 +822,7 @@ impl Daemon {
             self.start_ssh();
         }
 
-        warnings.extend(self.apply_exit_node());
+        warnings.extend(self.apply_exit_node().await);
 
         tracing::info!("data plane activated");
         if warnings.is_empty() {
@@ -845,18 +845,19 @@ impl Daemon {
     /// (install / remove) are handled, so this is the single entry point used by
     /// `activate` and by any `ray exit-node` change made while up. Returns a
     /// user-facing warning if either half could not be put in place.
-    pub(crate) fn apply_exit_node(&self) -> Option<String> {
+    pub(crate) async fn apply_exit_node(&self) -> Option<String> {
         let tun_name = self.tun_name.load().as_str().to_owned();
         self.registry.reload_exit_state();
-        let server = self.registry.exit_server.apply_os(&tun_name);
         // Both halves run even if the first one failed: they are independent roles,
         // and each one's teardown path has to happen regardless.
-        server.or_else(|| self.apply_exit_client(&tun_name))
+        let server = self.registry.exit_server.apply_os(&tun_name);
+        let client = self.apply_exit_client(&tun_name).await;
+        server.or(client)
     }
 
     /// Install or remove the client full-tunnel routing to match the selection.
     #[cfg(target_os = "linux")]
-    fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
+    async fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
         if !self.registry.exit_client.is_active() {
             crate::exit_node::teardown_client_routing();
             return None;
@@ -870,12 +871,50 @@ impl Daemon {
         }
     }
 
-    /// Using an exit node needs full-tunnel routing, which only Linux has (the
-    /// loop prevention it rests on is `SO_MARK` plus policy routing). Say so, rather
-    /// than reporting success while every packet keeps leaving the local uplink.
-    /// Offering an exit node works on every platform.
-    #[cfg(not(target_os = "linux"))]
-    fn apply_exit_client(&self, _tun_name: &str) -> Option<String> {
+    /// Install or remove the client full tunnel to match the selection.
+    ///
+    /// macOS has no fwmark: loop prevention instead pins iroh's sockets to the
+    /// physical default-route interface (`exit_node::configure_socket`), and the
+    /// pin only lands on a (re)bind, which `Endpoint::network_change` forces. So
+    /// ordering matters both ways: pin and rebind *before* the default routes go
+    /// in, and take the routes out *before* releasing the pin, so there is never
+    /// a moment where iroh's own traffic can be routed into the tunnel it is
+    /// carrying. The rebind is skipped when the pin state did not flip (re-apply
+    /// while up, or teardown when no tunnel was installed).
+    #[cfg(target_os = "macos")]
+    async fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
+        if !self.registry.exit_client.is_active() {
+            tun::unroute_default_via_tun(tun_name).await;
+            if crate::exit_node::set_full_tunnel(false) {
+                self.transport.endpoint.network_change().await;
+            }
+            return None;
+        }
+        if !crate::exit_node::set_full_tunnel(true) {
+            self.transport.endpoint.network_change().await;
+        }
+        match tun::route_default_via_tun(tun_name).await {
+            Ok(()) => None,
+            Err(e) => {
+                // A partial install (one family in, the other not) would blackhole
+                // traffic: roll the routes and the pin all the way back.
+                tun::unroute_default_via_tun(tun_name).await;
+                if crate::exit_node::set_full_tunnel(false) {
+                    self.transport.endpoint.network_change().await;
+                }
+                tracing::warn!(error = %e, "failed to install exit-node client routing");
+                Some(format!("failed to route traffic through exit node: {e}"))
+            }
+        }
+    }
+
+    /// Using an exit node needs full-tunnel routing plus loop prevention for the
+    /// node's own transport, which only Linux (`SO_MARK` + policy routing) and
+    /// macOS (`IP_BOUND_IF` socket pinning) have. Say so, rather than reporting
+    /// success while every packet keeps leaving the local uplink. Offering an
+    /// exit node works on every platform.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    async fn apply_exit_client(&self, _tun_name: &str) -> Option<String> {
         self.registry.exit_client.is_active().then(|| {
             "using an exit node is not supported on this platform yet; traffic still \
              leaves this host directly. Clear it with `ray exit-node none`."
@@ -915,11 +954,11 @@ impl Daemon {
         self.registry.exit_server.clear();
         let _ = self.registry.exit_server.apply_os(&tun_name);
 
-        // Exit-node client: remove the full-tunnel policy routing and clear the
-        // selection. The TUN going down also drops its default route.
-        #[cfg(target_os = "linux")]
-        crate::exit_node::teardown_client_routing();
+        // Exit-node client: clear the selection, then reconcile, which removes the
+        // full tunnel (Linux policy routing; macOS split-default routes + socket
+        // pinning). Teardown never reports a problem.
         self.registry.exit_client.set(None);
+        let _ = self.apply_exit_client(&tun_name).await;
 
         tracing::info!("VPN on standby");
         IpcMessage::Ok {

@@ -291,6 +291,54 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The full-tunnel default as two half-space routes per family: `0.0.0.0/1` +
+/// `128.0.0.0/1` and `::/1` + `8000::/1`. Each is more specific than a real
+/// default route, so together they capture everything by longest-prefix match
+/// without touching (or having to restore) the system default. The wg-quick
+/// approach; Linux does not use it (its full tunnel is a policy-routing table,
+/// see `exit_node::install_client_routing`).
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const SPLIT_DEFAULT: [(&str, &str); 4] = [
+    ("-inet", "0.0.0.0/1"),
+    ("-inet", "128.0.0.0/1"),
+    ("-inet6", "::/1"),
+    ("-inet6", "8000::/1"),
+];
+
+/// Routes all traffic into the TUN via the [`SPLIT_DEFAULT`] half-space routes
+/// (the exit-node client full tunnel). Delete-then-add, so it is idempotent
+/// across re-applies. The caller is responsible for loop prevention *before*
+/// this goes in: from here on, everything the routing table decides, including
+/// the daemon's own transport unless it is pinned elsewhere, goes to the TUN.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub async fn route_default_via_tun(tun_name: &str) -> Result<()> {
+    for (family, net) in SPLIT_DEFAULT {
+        let _ = Command::new("route")
+            .args(["-n", "delete", family, "-net", net, "-interface", tun_name])
+            .status();
+        let status = Command::new("route")
+            .args(["-n", "add", family, "-net", net, "-interface", tun_name])
+            .status()
+            .with_context(|| format!("run route add {family} {net}"))?;
+        anyhow::ensure!(
+            status.success(),
+            "route add {family} {net} failed with {status}"
+        );
+    }
+    Ok(())
+}
+
+/// Removes the full-tunnel half-space routes. Best-effort and idempotent: routes
+/// that are already gone (never installed, or dropped with the utun) are fine.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub async fn unroute_default_via_tun(tun_name: &str) {
+    for (family, net) in SPLIT_DEFAULT {
+        let _ = Command::new("route")
+            .args(["-n", "delete", family, "-net", net, "-interface", tun_name])
+            .status();
+    }
+}
+
 /// Routes the magic-DNS virtual IP (`dns::MAGIC_DNS_V4`) into the TUN as a `/32`
 /// host route so that packets from the kernel addressed to that IP are delivered
 /// to the TUN device (and thus intercepted by our DNS server) rather than going

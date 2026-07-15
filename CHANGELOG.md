@@ -21,10 +21,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Full-stack IPv4 + IPv6. Connections that reach the client from outside the
   tunnel keep answering out the interface they arrived on, including ones already
   open when the tunnel comes up, so a headless host stays reachable on its public
-  IP and the SSH session you turn the tunnel on from survives it. The gateway
-  (NAT/forwarding) and the client (full-tunnel routing with fwmark loop-prevention)
-  are Linux-only in this release; the `allow` / advertise / `status` surface is
-  cross-platform. An exit node is strictly an *internet* gateway: it forwards to
+  IP and the SSH session you turn the tunnel on from survives it. Offering an
+  exit node works on Linux (nftables), macOS and FreeBSD (pf); using one works on
+  Linux (fwmark loop-prevention) and macOS (sockets pinned to the physical
+  interface); the `allow` / advertise / `status` surface is cross-platform. An
+  exit node is strictly an *internet* gateway: it forwards to
   globally-routable addresses only, so permitting a peer to route out through you
   never also hands it your private LAN, your loopback, or your cloud instance
   metadata service.
