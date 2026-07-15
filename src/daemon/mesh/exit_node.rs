@@ -26,31 +26,21 @@ fn display_name(m: &Member) -> String {
 
 impl NetworkRegistry {
     /// A network's roster, or empty if we don't have that network. Keeps the
-    /// lookup-then-lock-then-walk dance (and the lock guard) out of the callers.
+    /// lookup-then-lock-then-clone dance (and the lock guard) out of the callers.
     fn roster(&self, network: &str) -> Vec<Member> {
         match self.networks.get(network) {
-            // Cloned out: `all()` borrows from the state lock, and callers must be
-            // free to work (and to await) without holding it.
-            Some(handle) => handle
-                .state
-                .read()
-                .unwrap()
-                .members
-                .all()
-                .into_iter()
-                .cloned()
-                .collect(),
+            // Cloned out (`NetworkState::roster`): callers must be free to work
+            // (and to await) without holding the state lock.
+            Some(handle) => handle.state.read().unwrap().roster(),
             None => Vec::new(),
         }
     }
 
-    /// The roster member `id` names, matched the way the roster keys members: by
-    /// device identity, or by the user identity a paired multi-device peer is
-    /// stored under.
+    /// The roster member `id` names (see [`Member::matches_identity`]).
     fn roster_member(&self, network: &str, id: EndpointId) -> Option<Member> {
         self.roster(network)
             .into_iter()
-            .find(|m| m.identity == id || m.user_identity == Some(id))
+            .find(|m| m.matches_identity(id))
     }
 
     /// Add or remove a peer from a network's exit-node allow list, then advertise
@@ -92,7 +82,11 @@ impl NetworkRegistry {
         if let Err(e) = config::save_network(&net) {
             return ipc_err(format!("failed to persist network config: {e}"));
         }
-        self.publish_exit_offer(network, offering).await;
+        // Not advertised from here: the roster flag must reflect a gateway that
+        // actually forwards, so [`Self::sync_exit_offers`] publishes it only once
+        // the reconcile has the kernel state in place (now if the daemon is up,
+        // else on `ray up`). Advertising on config alone would let peers select a
+        // gateway that blackholes them.
         let detail = if allow {
             format!(
                 "exit-node allow {peer} on {network} (this node now offers exit; \
@@ -155,12 +149,22 @@ impl NetworkRegistry {
     ///
     /// The selection is the first network with `exit_node_use` set whose peer is a
     /// resolvable roster member, resolved to its mesh IPv4 (to route to) and user
-    /// identity (to match its return traffic); it clears when none applies. There is
-    /// one default route, so only one selection can win: a second one is reported
-    /// rather than silently ignored. Cheap; called on `activate()` and after any
-    /// `ray exit-node` change while up.
-    pub(crate) fn reload_exit_state(&self) {
-        let networks = config::load().map(|c| c.networks).unwrap_or_default();
+    /// identity (to match its return traffic); it clears when the config selects
+    /// nothing. There is one default route, so only one selection can win: a
+    /// second one is reported rather than silently ignored. Cheap; called on
+    /// `activate()` and after any `ray exit-node` change while up. Returns a
+    /// user-facing warning when the state could not (yet) be made to match.
+    pub(crate) fn reload_exit_state(&self) -> Option<String> {
+        let networks = match config::load() {
+            Ok(c) => c.networks,
+            Err(e) => {
+                // A transient read failure must not be taken for an empty config:
+                // that would clear a live gateway's allow policy and tear down a
+                // live full tunnel, leaking the traffic the user chose to route.
+                tracing::warn!(error = %e, "config unreadable; exit-node state left as it was");
+                return Some(format!("config unreadable, exit-node state left as it was: {e}"));
+            }
+        };
         self.exit_server.reload(
             networks
                 .iter()
@@ -174,15 +178,15 @@ impl NetworkRegistry {
             let names: Vec<&str> = selected.iter().map(|nc| nc.name.as_str()).collect();
             tracing::warn!(
                 networks = ?names,
-                "an exit node is selected on more than one network; only '{}' is used \
+                "an exit node is selected on more than one network; only one is used \
                  (all traffic leaves through one default route). Clear the others with \
                  `ray exit-node none`.",
-                names[0],
             );
         }
         // Note this does not require the peer to still advertise `exit_node`: a
         // roster that briefly loses the flag must not silently drop us back to
         // direct egress, leaking out our own uplink the traffic we chose to tunnel.
+        let wanted = !selected.is_empty();
         let selection = selected.into_iter().find_map(|nc| {
             let id = nc.exit_node_use.as_ref()?.parse::<EndpointId>().ok()?;
             let member = self.roster_member(&nc.name, id)?;
@@ -192,7 +196,55 @@ impl NetworkRegistry {
                 network: SmolStr::new(&nc.name),
             })
         });
+        // The same no-silent-fallback rule when the roster cannot resolve the
+        // selected peer at all (boot before the first reconverge, or the peer
+        // temporarily absent): keep whatever tunnel is in place rather than
+        // dropping to direct egress, mark the selection pending, and let the
+        // reconverge that lands the roster nudge a re-apply.
+        if wanted && selection.is_none() {
+            self.exit_selection_pending.store(true, Ordering::Relaxed);
+            return Some(if self.exit_client.is_active() {
+                "the selected exit peer is missing from the roster; keeping the \
+                 existing tunnel until it reappears"
+                    .to_string()
+            } else {
+                "the selected exit peer is not in the roster yet; the full tunnel \
+                 will be installed when it appears"
+                    .to_string()
+            });
+        }
+        self.exit_selection_pending.store(false, Ordering::Relaxed);
         self.exit_client.set(selection);
+        None
+    }
+
+    /// Reconcile the advertised `Member.exit_node` flag with what this node
+    /// actually offers right now ([`ExitServer::is_offering`]: non-empty only
+    /// while the data plane is up and the kernel state went in). Runs after every
+    /// exit reconcile and after every reconverge, so each way the two can drift
+    /// heals on the next pass: a coordinator rebuild that wiped the flag, an
+    /// offer made while every coordinator was offline, a standby or failed
+    /// gateway still advertising. Publishing only on mismatch keeps the steady
+    /// state quiet. Gated on `exit_sync_enabled` so a reconverge that fires while
+    /// the data plane is down does not withdraw an offer `activate()` is about to
+    /// re-advertise.
+    pub(crate) async fn sync_exit_offers(&self) {
+        if !self.exit_sync_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let self_id = self.transport.endpoint.id();
+        let user_id = self.device_user_map.resolve(&self_id);
+        let names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
+        for name in names {
+            let advertised = [self_id, user_id]
+                .into_iter()
+                .find_map(|id| self.roster_member(&name, id))
+                .is_some_and(|m| m.exit_node);
+            let offering = self.exit_server.is_offering(&name);
+            if advertised != offering {
+                self.publish_exit_offer(&name, offering).await;
+            }
+        }
     }
 
     /// Report exit-node state per network: this node's own allow list + selection,

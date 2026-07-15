@@ -606,6 +606,20 @@ pub(crate) async fn fetch_and_apply_blob(
         s.refresh_snapshot();
     }
     apply_suggested_firewall(fw, endpoint.id(), network_name, state);
+
+    // Exit-node reconciliation. The fresh roster may have wiped our advertised
+    // offer (a coordinator rebuild) or missed one made while every coordinator was
+    // offline: re-sync the flag with what we actually offer. And it may contain
+    // the exit peer a pending client selection has been waiting on since boot:
+    // nudge the daemon to re-run the exit reconcile rather than leaking traffic
+    // until the next `ray up`. Both are cheap no-ops otherwise.
+    registry.sync_exit_offers().await;
+    if registry
+        .exit_selection_pending
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        registry.exit_reapply.notify_one();
+    }
     ReconvergeOutcome::Applied
 }
 

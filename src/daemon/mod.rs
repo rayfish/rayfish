@@ -352,7 +352,7 @@ pub(crate) struct PendingJoin {
 impl NetworkState {
     /// Snapshot the current member roster as an owned `Vec` (the members map is
     /// the single source of truth; callers take a copy to release the lock).
-    fn roster(&self) -> Vec<Member> {
+    pub(crate) fn roster(&self) -> Vec<Member> {
         self.members.all().into_iter().cloned().collect()
     }
 
@@ -1037,17 +1037,11 @@ impl Daemon {
                 let resp = self.registry.exit_node_allow(&network, &peer, allow).await;
                 // If the data plane is up, reconcile the runtime state and kernel
                 // plumbing now; otherwise `activate()` picks it up on `ray up`.
-                if self.active.load(Ordering::SeqCst) {
-                    self.apply_exit_node().await;
-                }
-                resp
+                self.reconcile_exit_node(resp).await
             }
             IpcMessage::ExitNodeUse { network, peer } => {
                 let resp = self.registry.exit_node_use(&network, peer).await;
-                if self.active.load(Ordering::SeqCst) {
-                    self.apply_exit_node().await;
-                }
-                resp
+                self.reconcile_exit_node(resp).await
             }
             IpcMessage::ExitNodeStatus { network } => self.registry.exit_node_status(network),
             IpcMessage::SetHostname { network, hostname } => {

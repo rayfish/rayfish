@@ -151,9 +151,7 @@ impl Daemon {
             .as_ref()
             .and_then(|n| n.exit_node_use.as_ref())
             .and_then(|stored| stored.parse::<EndpointId>().ok());
-        let is_my_exit = |m: &Member| {
-            exit_id.is_some_and(|id| m.identity == id || m.user_identity == Some(id))
-        };
+        let is_my_exit = |m: &Member| exit_id.is_some_and(|id| m.matches_identity(id));
         let peers = members
             .iter()
             .filter(|m| m.identity != my_id)

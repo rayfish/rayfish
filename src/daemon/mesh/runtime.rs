@@ -822,6 +822,11 @@ impl Daemon {
             self.start_ssh();
         }
 
+        // From here until `deactivate()`, the roster's exit-offer flag is kept in
+        // sync with the loaded gateway policy (see `sync_exit_offers`).
+        self.registry
+            .exit_sync_enabled
+            .store(true, Ordering::SeqCst);
         warnings.extend(self.apply_exit_node().await);
 
         tracing::info!("data plane activated");
@@ -847,27 +852,81 @@ impl Daemon {
     /// user-facing warning if either half could not be put in place.
     pub(crate) async fn apply_exit_node(&self) -> Option<String> {
         let tun_name = self.tun_name.load().as_str().to_owned();
-        self.registry.reload_exit_state();
+        let reload = self.registry.reload_exit_state();
         // Both halves run even if the first one failed: they are independent roles,
         // and each one's teardown path has to happen regardless.
-        let server = self.registry.exit_server.apply_os(&tun_name);
+        let server = apply_exit_server_os(&self.registry.exit_server, &tun_name).await;
         let client = self.apply_exit_client(&tun_name).await;
-        server.or(client)
+        // Advertise what actually survived the reconcile: a failed enable cleared
+        // the offers, so this also withdraws a stale advertisement rather than
+        // keeping clients routed into a gateway that forwards nothing.
+        self.registry.sync_exit_offers().await;
+        reload.or(server).or(client)
+    }
+
+    /// Spawn the daemon-lifetime listener that re-runs the exit reconcile when a
+    /// reconverge nudges [`NetworkRegistry::exit_reapply`]: the roster just gained
+    /// the exit peer a pending selection has been waiting for (boot before the
+    /// first reconverge), so the full tunnel can finally go in without waiting for
+    /// the next `ray up`. A channel rather than a direct call because the kernel
+    /// plumbing lives here on `Daemon`, above the registry in the service graph.
+    pub(crate) fn spawn_exit_reapply_listener(self: &Arc<Self>) {
+        let daemon = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = daemon.shutdown_token.cancelled() => break,
+                    _ = daemon.registry.exit_reapply.notified() => {}
+                }
+                if !daemon.active.load(Ordering::SeqCst) {
+                    continue;
+                }
+                if let Some(warning) = daemon.apply_exit_node().await {
+                    tracing::warn!(warning, "exit-node re-apply after roster update");
+                }
+            }
+        });
+    }
+
+    /// After a `ray exit-node` mutation: if the data plane is up, reconcile the
+    /// runtime state and kernel plumbing now (otherwise `activate()` picks it up
+    /// on `ray up`), folding any reconcile warning into the reply so a failed
+    /// install is never reported as plain success.
+    pub(crate) async fn reconcile_exit_node(&self, resp: IpcMessage) -> IpcMessage {
+        if !self.active.load(Ordering::SeqCst) {
+            return resp;
+        }
+        match (self.apply_exit_node().await, resp) {
+            (Some(warning), IpcMessage::Ok { message }) => IpcMessage::Ok {
+                message: format!("{message}\nwarning: {warning}"),
+            },
+            (_, resp) => resp,
+        }
     }
 
     /// Install or remove the client full-tunnel routing to match the selection.
+    /// The kernel plumbing spawns a series of `ip`/`nft` children and waits on
+    /// them, so it runs on the blocking pool rather than stalling a runtime
+    /// worker (this is called from the IPC dispatcher and `activate()`).
     #[cfg(target_os = "linux")]
     async fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
-        if !self.registry.exit_client.is_active() {
-            crate::exit_node::teardown_client_routing();
-            return None;
-        }
-        match crate::exit_node::install_client_routing(tun_name) {
-            Ok(()) => None,
-            Err(e) => {
+        let install = self.registry.exit_client.is_active();
+        let tun_name = tun_name.to_owned();
+        let result = tokio::task::spawn_blocking(move || {
+            if !install {
+                crate::exit_node::teardown_client_routing();
+                return Ok(());
+            }
+            crate::exit_node::install_client_routing(&tun_name)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, "failed to install exit-node client routing");
                 Some(format!("failed to route traffic through exit node: {e}"))
             }
+            Err(e) => Some(format!("exit-node routing task failed: {e}")),
         }
     }
 
@@ -952,7 +1011,17 @@ impl Daemon {
         // standby, then reconcile (which removes the kernel forwarding/NAT). With no
         // offers left this is the teardown path, which never reports a problem.
         self.registry.exit_server.clear();
-        let _ = self.registry.exit_server.apply_os(&tun_name);
+        let _ = apply_exit_server_os(&self.registry.exit_server, &tun_name).await;
+
+        // Withdraw the roster advertisement while the offers are still cleared and
+        // syncing is still enabled: connections stay up on standby, so a peer that
+        // kept routing through us would blackhole against the empty allow list
+        // otherwise. `activate()` re-advertises. Then disable syncing, so a
+        // reconverge during standby leaves the (withdrawn) flag alone.
+        self.registry.sync_exit_offers().await;
+        self.registry
+            .exit_sync_enabled
+            .store(false, Ordering::SeqCst);
 
         // Exit-node client: clear the selection, then reconcile, which removes the
         // full tunnel (Linux policy routing; macOS split-default routes + socket
@@ -971,5 +1040,22 @@ impl Daemon {
     #[tracing::instrument(skip(self), fields(net = name))]
     pub async fn leave_network(&self, name: &str) -> IpcMessage {
         self.registry.leave_network(name).await
+    }
+}
+
+/// Run [`ExitServer::apply_os`](crate::exit_node::ExitServer::apply_os) on the
+/// blocking pool: enabling or disabling the gateway spawns a series of
+/// `nft`/`pfctl`/`sysctl` children and waits on them, which must not stall a
+/// runtime worker (this is reached from the IPC dispatcher, `activate()`, and
+/// `deactivate()`).
+async fn apply_exit_server_os(
+    server: &crate::exit_node::ExitServer,
+    tun_name: &str,
+) -> Option<String> {
+    let server = server.clone();
+    let tun_name = tun_name.to_owned();
+    match tokio::task::spawn_blocking(move || server.apply_os(&tun_name)).await {
+        Ok(warning) => warning,
+        Err(e) => Some(format!("exit-node reconcile task failed: {e}")),
     }
 }

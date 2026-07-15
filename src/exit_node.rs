@@ -27,14 +27,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "macos")]
 use std::num::NonZeroU32;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use anyhow::{Context as _, Result};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use iroh::EndpointId;
-use iroh::endpoint::ConfigureSocket;
-#[cfg(target_os = "macos")]
+use iroh::endpoint::SocketConfigurator;
 use socket2::{Domain, SockRef};
 use smol_str::SmolStr;
 
@@ -66,8 +69,8 @@ pub fn set_full_tunnel(on: bool) -> bool {
     FULL_TUNNEL.swap(on, Ordering::AcqRel)
 }
 
-/// The hook iroh runs on every socket it opens (both underlay UDP sockets and the
-/// relay's TCP connection), before bind/connect and again on every rebind.
+/// The configurator iroh runs on every socket it opens (both underlay UDP sockets
+/// and the relay's TCP connection), before bind/connect and again on every rebind.
 ///
 /// It keeps iroh's own traffic off the full-tunnel default route. Without it the
 /// transport is routed into the tunnel it is carrying, and the mesh connection that
@@ -77,10 +80,13 @@ pub fn set_full_tunnel(on: bool) -> bool {
 /// the mark around the tunnel. macOS has no fwmark, so we pin the socket to the
 /// default-route interface instead (`IP_BOUND_IF`), which makes it ignore the routing
 /// table altogether. That is what Tailscale does on darwin, and it is also why the
-/// hook must re-run on rebind: the right interface changes when the default route does
-/// (wifi to ethernet), and a stale pin would strand the transport on a dead interface.
-pub fn configure_socket() -> ConfigureSocket {
-    Arc::new(|sock, domain| {
+/// configurator must re-run on rebind: the right interface changes when the default
+/// route does (wifi to ethernet), and a stale pin would strand the transport on a
+/// dead interface.
+pub struct LoopPrevention;
+
+impl SocketConfigurator for LoopPrevention {
+    fn configure(&self, sock: SockRef<'_>, domain: Domain) -> std::io::Result<()> {
         #[cfg(target_os = "linux")]
         {
             let _ = domain;
@@ -99,7 +105,7 @@ pub fn configure_socket() -> ConfigureSocket {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = (&sock, domain);
         Ok(())
-    })
+    }
 }
 
 /// Pins a socket to the current default-route interface, so its egress ignores the
@@ -170,6 +176,13 @@ impl ExitServer {
     /// kernel forwarding/NAT should be installed).
     pub fn is_active(&self) -> bool {
         !self.nets.load().is_empty()
+    }
+
+    /// Whether we currently offer an exit node on `network`. This is the loaded
+    /// runtime policy, not the config: false on standby or after a failed enable,
+    /// which is exactly what the roster advertisement has to reflect.
+    pub fn is_offering(&self, network: &str) -> bool {
+        self.nets.load().contains_key(network)
     }
 
     /// Rebuild the policy from `(network name, allow-list)` pairs. An allow entry
@@ -310,13 +323,16 @@ impl ExitClient {
         self.inner.load().is_some()
     }
 
-    /// Whether a datagram arriving on `network` from sender `peer_user` is our own
-    /// exit-node return traffic (the sender is our chosen exit peer for it).
-    pub fn is_return_traffic(&self, network: &str, peer_user: &EndpointId) -> bool {
+    /// Whether a datagram from sender `peer_user` is our own exit-node return
+    /// traffic (the sender is our chosen exit peer). Deliberately not scoped to
+    /// the arrival network: the gateway tags replies with whatever shared network
+    /// its generic route picks, which need not be the network we selected the
+    /// exit on. The sender identity is what the exemption trusts.
+    pub fn is_return_traffic(&self, peer_user: &EndpointId) -> bool {
         self.inner
             .load()
             .as_ref()
-            .is_some_and(|s| s.network == network && &s.peer_user == peer_user)
+            .is_some_and(|s| &s.peer_user == peer_user)
     }
 
     /// Set (or with `None`, clear) the exit selection.
@@ -387,7 +403,7 @@ struct Snapshot {
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 impl Snapshot {
     /// Read the snapshot, or a default one if it does not exist / cannot be parsed.
-    fn load(path: &std::path::Path) -> Self {
+    fn load(path: &Path) -> Self {
         let mut snap = Self::default();
         let Ok(body) = fs::read_to_string(path) else {
             return snap;
@@ -403,7 +419,7 @@ impl Snapshot {
         snap
     }
 
-    fn save(&self, path: &std::path::Path) -> Result<()> {
+    fn save(&self, path: &Path) -> Result<()> {
         let mut body = format!("v4={}\nv6={}\n", self.v4, self.v6);
         if let Some(token) = &self.pf_token {
             body.push_str(&format!("pf_token={token}\n"));
@@ -644,11 +660,37 @@ pub fn teardown_client_routing() {
 }
 
 /// Delete our three policy rules for one address family, ignoring "not found".
+/// Each del names the full rule spec, mirroring the adds in
+/// [`install_client_routing`], never the pref alone: `ip rule del` removes the
+/// first rule matching only the keys given, so a bare `del pref 100` would
+/// destroy a foreign rule (another VPN's, systemd-networkd's) that happens to
+/// sit at one of our preference numbers.
 #[cfg(target_os = "linux")]
 fn remove_client_rules(family: &str) {
-    for pref in [PREF_BYPASS, PREF_MAIN, PREF_TUNNEL] {
-        let _ = run_ip(&[family, "rule", "del", "pref", pref]);
-    }
+    let mark = format!("{SOCKET_MARK:#x}");
+    let _ = run_ip(&[
+        family,
+        "rule",
+        "del",
+        "fwmark",
+        &mark,
+        "table",
+        "main",
+        "pref",
+        PREF_BYPASS,
+    ]);
+    let _ = run_ip(&[
+        family,
+        "rule",
+        "del",
+        "table",
+        "main",
+        "suppress_prefixlength",
+        "0",
+        "pref",
+        PREF_MAIN,
+    ]);
+    let _ = run_ip(&[family, "rule", "del", "table", EXIT_TABLE, "pref", PREF_TUNNEL]);
 }
 
 /// nft script fragment that removes `table`, whether or not it exists: `delete
@@ -787,8 +829,10 @@ fn enable(_tun_name: &str) -> Result<()> {
     // reference), and record the token first: if anything below fails, `disable`
     // reads this file to give pf back, and a token we never wrote is a reference
     // count we could never release.
-    if snap.pf_token.is_none() {
-        snap.pf_token = Some(pf_enable()?);
+    if snap.pf_token.is_none()
+        && let Some(token) = pf_enable()?
+    {
+        snap.pf_token = Some(token);
         snap.save(&path)?;
     }
     ensure_anchor_referenced()?;
@@ -840,25 +884,68 @@ pub fn disable() {
     }
     let snap = Snapshot::load(&path);
     let _ = pfctl(&["-a", ANCHOR, "-F", "all"]);
-    // `-X` drops our reference; pf itself only goes down if nobody else holds one.
     if let Some(token) = &snap.pf_token {
-        let _ = pfctl(&["-X", token]);
+        pf_release(token);
     }
     snap.restore_sysctls();
     let _ = fs::remove_file(&path);
     tracing::info!("exit node forwarding + NAT disabled");
 }
 
-/// Enable pf and return our reference token. `pfctl -E` is reference-counted, so
-/// this neither disturbs a pf that is already up nor lets our [`disable`] take one
-/// down that somebody else still wants.
+/// Take our reference on pf, returning the handle [`disable`] later gives back
+/// via [`pf_release`], or `None` when pf was already up and we hold nothing.
+///
+/// macOS's pfctl has the reference-counted `-E`/`-X <token>` (an Apple
+/// extension), so enabling never disturbs a pf that is already up and releasing
+/// never takes one down that somebody else still wants. FreeBSD's pfctl has only
+/// plain `-e`/`-d`, so the same guarantee is made by hand: enable pf only when
+/// it is not already running, record that we did (a fixed marker in the token
+/// slot), and let [`pf_release`] turn pf off only in that case, so an operator's
+/// own running pf is never touched.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-fn pf_enable() -> Result<String> {
-    let out = pfctl(&["-E"])?;
-    out.lines()
-        .find_map(|l| l.split_once("Token :"))
-        .map(|(_, t)| t.trim().to_string())
-        .context("`pfctl -E` did not report a token")
+fn pf_enable() -> Result<Option<String>> {
+    if cfg!(target_os = "macos") {
+        let out = pfctl(&["-E"])?;
+        return out
+            .lines()
+            .find_map(|l| l.split_once("Token :"))
+            .map(|(_, t)| Some(t.trim().to_string()))
+            .context("`pfctl -E` did not report a token");
+    }
+    if pf_running() {
+        return Ok(None);
+    }
+    pfctl(&["-e"])?;
+    Ok(Some(PF_ENABLED_BY_US.to_string()))
+}
+
+/// Give back the reference [`pf_enable`] took: on macOS release the token, on
+/// FreeBSD disable pf (only ever reached when we were the one to enable it).
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn pf_release(token: &str) {
+    if cfg!(target_os = "macos") {
+        let _ = pfctl(&["-X", token]);
+    } else {
+        let _ = pfctl(&["-d"]);
+    }
+}
+
+/// The marker stored in the snapshot's token slot on FreeBSD when [`pf_enable`]
+/// was the one to turn pf on.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const PF_ENABLED_BY_US: &str = "pf-enabled-by-rayfish";
+
+/// Whether pf is currently enabled (`pfctl -s info` reports `Status: Enabled`).
+/// Errs on the side of "running": claiming a running pf is down would make
+/// [`pf_enable`] flip it on and hand [`pf_release`] the right to turn it off.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn pf_running() -> bool {
+    pfctl(&["-s", "info"])
+        .map(|out| {
+            out.lines()
+                .any(|l| l.trim_start().strip_prefix("Status:").is_some_and(|s| s.trim_start().starts_with("Enabled")))
+        })
+        .unwrap_or(true)
 }
 
 /// Replace our anchor's ruleset with `rules`.
@@ -903,7 +990,7 @@ fn ensure_anchor_referenced() -> Result<()> {
     }
     let empty = pfctl(&["-sn"]).is_ok_and(|r| r.trim().is_empty())
         && pfctl(&["-sr"]).is_ok_and(|r| r.trim().is_empty());
-    if empty && std::path::Path::new(PF_CONF).exists() {
+    if empty && Path::new(PF_CONF).exists() {
         let _ = pfctl(&["-f", PF_CONF]);
     }
     if pfctl(&["-sn"]).is_ok_and(|r| r.contains(ANCHOR_REF)) {

@@ -6,7 +6,7 @@
 #   srv-b  member ALLOWED to route its internet traffic through srv-a
 #   srv-c  member NOT allowed (the deny path: its traffic must be dropped, not leaked)
 #
-# Proves the parts of the exit-node feature no unit test can reach — the kernel
+# Proves the parts of the exit-node feature no unit test can reach: the kernel
 # forwarding/NAT and the client's full-tunnel policy routing, on real Linux hosts:
 #   - `ray exit-node allow` turns srv-a into a gateway: forwarding sysctls go on
 #     and the nftables masquerade table appears;
@@ -16,11 +16,11 @@
 #     an external echo service becomes srv-a's (IPv4, and IPv6 where available);
 #   - THE LOOP PREVENTION HOLDS: with 0.0.0.0/0 pointed into the TUN, iroh's own
 #     underlay UDP still egresses (SO_MARK + the fwmark ip rule), so the mesh
-#     connection survives. Without it the tunnel deadlocks and everything dies —
+#     connection survives. Without it the tunnel deadlocks and everything dies;
 #     this is the single assertion the whole SO_MARK fork chain exists for;
 #   - mesh traffic still flows under the full tunnel (peers stay pingable);
 #   - INBOUND CONNECTIONS SURVIVE: our own SSH session to the client's public IP
-#     keeps working under the full tunnel. Naively it would not — sshd's replies
+#     keeps working under the full tunnel. Naively it would not: sshd's replies
 #     would follow the default route into the tunnel and come out NATed as the exit
 #     node's address, so a headless box would lock itself out the instant you ran
 #     `exit-node use`. The conntrack-mark rules keep connections that arrived from
@@ -44,7 +44,7 @@ SERVERS="$DIR/.servers"
 # shellcheck source=../../lib/common.sh
 source "$ROOT/tests/lib/common.sh"
 
-[[ -f "$SERVERS" ]] || { echo "No $SERVERS — run $DIR/provision.sh first"; exit 1; }
+[[ -f "$SERVERS" ]] || { echo "No $SERVERS: run $DIR/provision.sh first"; exit 1; }
 
 A="$(server_ip "$SERVERS" srv-a || true)"
 B="$(server_ip "$SERVERS" srv-b || true)"
@@ -103,7 +103,7 @@ for h in "$A" "$B" "$C"; do
 done
 for h in "$A" "$B" "$C"; do
   on "$h" 'command -v nft >/dev/null' && continue
-  fail "nft not available on $h — the exit node cannot install its NAT table"
+  fail "nft not available on $h: the exit node cannot install its NAT table"
 done
 
 reset_state "$A" "$B" "$C"
@@ -134,7 +134,7 @@ echo "   public IPs: a=$A_PUB  b=$B_PUB  c=$C_PUB"
 [[ -n "$A_PUB" && -n "$B_PUB" ]] || { fail "could not read baseline public IPs"; summary; }
 [[ "$A_PUB" != "$B_PUB" ]] \
   && pass "baseline: srv-b egresses via its own uplink ($B_PUB), not srv-a's ($A_PUB)" \
-  || fail "srv-a and srv-b already share a public IP — the egress assertion would be meaningless"
+  || fail "srv-a and srv-b already share a public IP: the egress assertion would be meaningless"
 
 # ---------------------------------------------------------------------------
 step "2. srv-a becomes an exit node (allow srv-b only)"
@@ -184,7 +184,7 @@ sleep 8
 if on "$B" 'true' 2>/dev/null; then
   pass "SSH to srv-b's public IP survived the full tunnel (inbound conns bypass it)"
 else
-  fail "srv-b cut off its own SSH under the full tunnel — inbound-connection bypass is broken"
+  fail "srv-b cut off its own SSH under the full tunnel: inbound-connection bypass is broken"
   echo "   (the failsafe will revert srv-b within 240s)"
   summary
 fi
@@ -193,9 +193,9 @@ fi
 B_VIA_EXIT="$(pub4 "$B")"
 echo "   srv-b public IP while tunneled: '$B_VIA_EXIT'  (srv-a=$A_PUB, srv-b own=$B_PUB)"
 if [[ "$B_VIA_EXIT" == "$A_PUB" ]]; then
-  pass "srv-b's internet traffic egressed via srv-a — the exit node works (IPv4)"
+  pass "srv-b's internet traffic egressed via srv-a: the exit node works (IPv4)"
 elif [[ "$B_VIA_EXIT" == "$B_PUB" ]]; then
-  fail "srv-b still egressed via its own uplink — the full tunnel did not take effect"
+  fail "srv-b still egressed via its own uplink: the full tunnel did not take effect"
 else
   fail "srv-b egressed via an unexpected IP '$B_VIA_EXIT' (wanted srv-a's $A_PUB)"
 fi
@@ -205,17 +205,17 @@ fi
 if on "$B" "ping -c 3 -W 2 $A_VPN" 2>/dev/null | grep -q "0% packet loss"; then
   pass "mesh still works under the full tunnel (srv-b pinged srv-a's mesh IP)"
 else
-  fail "mesh broke under the full tunnel — loop prevention failed (SO_MARK/ip rule)"
+  fail "mesh broke under the full tunnel: loop prevention failed (SO_MARK/ip rule)"
 fi
 on "$B" "ip -4 rule show" 2>/dev/null | grep -q "$MARK" \
   && pass "srv-b installed the fwmark bypass rule ($MARK -> main)" \
-  || fail "srv-b has no fwmark bypass rule — iroh's transport would loop"
+  || fail "srv-b has no fwmark bypass rule: iroh's transport would loop"
 on "$B" "ip -4 route show table $TABLE" 2>/dev/null | grep -q default \
   && pass "srv-b installed the tunnel default route (table $TABLE)" \
   || fail "srv-b has no default route in the tunnel table"
 on "$B" 'nft list table inet rayfish_exit_client 2>/dev/null | grep -q "ct mark"' \
   && pass "srv-b installed the conntrack-mark table (inbound connections bypass the tunnel)" \
-  || fail "srv-b has no conntrack-mark table — inbound connections would be swallowed"
+  || fail "srv-b has no conntrack-mark table: inbound connections would be swallowed"
 # The exit column now names srv-a as the peer carrying our traffic, not just one
 # offering to (it read `offers` in step 3, before we selected it).
 on "$B" "ray status" | strip | grep -q 'srv-a.*in use' \
@@ -230,7 +230,7 @@ if [[ -n "$B_V6" ]]; then
     && pass "srv-b's IPv6 traffic also egressed via srv-a ($B_V6)" \
     || fail "srv-b IPv6 egressed via '$B_V6', wanted srv-a's '$A_V6'"
 else
-  echo "   (no IPv6 egress on these instances — skipping the v6 assertion)"
+  echo "   (no IPv6 egress on these instances: skipping the v6 assertion)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -250,7 +250,7 @@ on "$B" 'nft list table inet rayfish_exit_client' >/dev/null 2>&1 \
   || pass "srv-b's conntrack-mark table was removed"
 
 # ---------------------------------------------------------------------------
-step "6. deny path: srv-c is NOT allowed — its traffic is dropped, not leaked"
+step "6. deny path: srv-c is NOT allowed: its traffic is dropped, not leaked"
 # srv-c can still *select* srv-a (the blob advertises the offer), but srv-a's
 # allow-list has only srv-b, so the gateway drops srv-c's packets. The critical
 # property: srv-c must not reach the internet via srv-a AND must not silently fall

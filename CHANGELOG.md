@@ -29,6 +29,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   globally-routable addresses only, so permitting a peer to route out through you
   never also hands it your private LAN, your loopback, or your cloud instance
   metadata service.
+  **This is a breaking mesh-protocol change** (the roster and control protocol
+  learned the exit-node advertisement): every peer must be on the new version to
+  connect (older peers are cleanly severed by the protocol-version gate; run
+  `ray update`).
 
 - **Android: disabling Rayfish no longer takes the phone offline.** Turning the VPN
   off (in the app, or because another VPN app took the slot) now drops the tunnel

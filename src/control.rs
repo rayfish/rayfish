@@ -190,7 +190,7 @@ pub enum ControlMsg {
     /// a *trigger only*. Receivers reconverge from the network-key-signed pkarr
     /// record, never from any peer-supplied hash.
     BlobUpdated,
-    /// Member → coordinators: announce whether this sender currently offers itself
+    /// Member -> coordinators: announce whether this sender currently offers itself
     /// as an exit node on this network (`ray exit-node allow/none`). The
     /// coordinator records the claim on the sender's roster entry
     /// (`Member.exit_node`) and republishes the signed blob so peers can discover
