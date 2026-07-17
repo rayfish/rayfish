@@ -1,7 +1,13 @@
 package xyz.rayfish.android
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.util.Log
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.Node
 
@@ -11,6 +17,8 @@ import uniffi.ray_mobile.Node
  * The node owns a tokio runtime, so we build exactly one per process.
  */
 object NodeHolder {
+    private const val TAG = "NodeHolder"
+
     @Volatile
     private var node: Node? = null
 
@@ -161,10 +169,52 @@ object NodeHolder {
                     RustlsInit.ensureInitialized(context)
                     get(context).start()
                     seedDeviceName(context)
+                    registerNetworkCallback(context)
                     started = true
                 }
             }
         }
+    }
+
+    private val netScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    @Volatile
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    /**
+     * Forward default-network changes to the core. Android blocks netlink route
+     * updates for apps, so the Rust side (netwatch) cannot see a Wi-Fi/cellular
+     * switch or roam on its own: without this the endpoint keeps using dead
+     * sockets until something rebuilds them (observed as hours of DNS resolve
+     * timeouts, no relay, no mDNS announce, device invisible to the mesh).
+     * Lives with the node's lifecycle, so it also covers standby, where the
+     * control plane is the only thing running and nothing else would notice.
+     * networkChanged() is idempotent and cheap, so the callback stays dumb.
+     */
+    private fun registerNetworkCallback(context: Context) {
+        if (networkCallback != null) return
+        val cm = context.applicationContext.getSystemService(ConnectivityManager::class.java)
+        if (cm == null) return
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = notifyCore("available", network)
+            override fun onLost(network: Network) = notifyCore("lost", network)
+            private fun notifyCore(event: String, network: Network) {
+                Log.i(TAG, "default network $event ($network); notifying core")
+                // The FFI call blocks briefly on the core runtime; keep it off
+                // Android's connectivity thread.
+                netScope.launch { runCatching { node?.networkChanged() } }
+            }
+        }
+        runCatching { cm.registerDefaultNetworkCallback(cb) }
+            .onSuccess { networkCallback = cb }
+            .onFailure { Log.w(TAG, "network callback registration failed", it) }
+    }
+
+    private fun unregisterNetworkCallback(context: Context) {
+        val cb = networkCallback ?: return
+        networkCallback = null
+        val cm = context.applicationContext.getSystemService(ConnectivityManager::class.java)
+        runCatching { cm?.unregisterNetworkCallback(cb) }
     }
 
     /**
@@ -179,6 +229,7 @@ object NodeHolder {
      */
     fun stopNode(context: Context) {
         synchronized(this) {
+            unregisterNetworkCallback(context)
             runCatching { node?.stop() }
             started = false
         }
