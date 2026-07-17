@@ -35,6 +35,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ray send` now works with relative paths.** The path was resolved by the
+  daemon, whose working directory is not the caller's, so `ray send ./file peer`
+  failed with `No such file or directory` even though the file was right there.
+  The CLI now resolves the path against your shell's working directory before
+  handing it to the daemon, and reports a missing file immediately.
+
 - **`curl -fsSL https://rayfish.xyz/install.sh | sh` works again.** The installer
   detected the host OS inside a command substitution, which runs in a subshell, so
   the value was lost in the caller and the script aborted with `OS: parameter not
