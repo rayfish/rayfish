@@ -2,7 +2,24 @@
 
 use crate::*;
 
-pub(crate) async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
+/// `ray send <peer> <files...>`: one `SendFileFd` request per file. Each file
+/// gets its own IPC connection (the protocol is one request per connection);
+/// a failure on one file still sends the rest.
+pub(crate) async fn ipc_send_files(files: &[String], peer: &str) -> Result<()> {
+    let mut failed = false;
+    for file in files {
+        if let Err(e) = ipc_send_file(file, peer).await {
+            print_error("error", &format!("{file}: {e:#}"), None);
+            failed = true;
+        }
+    }
+    if failed {
+        anyhow::bail!("some files were not sent");
+    }
+    Ok(())
+}
+
+async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     use std::fs::File;
     use std::os::fd::AsFd;
 
@@ -91,7 +108,8 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 let uid = crate::uid_for_user(u).ok_or_else(|| {
                     anyhow::anyhow!("unknown user '{u}' (pass a valid username or uid)")
                 })?;
-                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadUser { uid: Some(uid) }).await;
+                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadUser { uid: Some(uid) })
+                    .await;
             }
             let mut stream = ipc::connect().await?;
             ipc::send(&mut stream, ipc::IpcMessage::GetDownloadSettings).await?;
@@ -114,9 +132,9 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             ipc::send(&mut stream, ipc::IpcMessage::ListFiles).await?;
             let resp = ipc::recv(&mut stream).await?;
             match resp {
-                ipc::IpcMessage::FileList { files } => {
+                ipc::IpcMessage::FileList { files, outbox } => {
                     if json_enabled() {
-                        let arr: Vec<_> = files
+                        let inbound: Vec<_> = files
                             .iter()
                             .map(|f| {
                                 serde_json::json!({
@@ -125,34 +143,75 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                                 })
                             })
                             .collect();
-                        print_json(&serde_json::json!(arr));
-                    } else if files.is_empty() {
-                        println!("\n  {}\n", style::faint("no pending file transfers"));
-                    } else {
-                        let rows = files
+                        let queued: Vec<_> = outbox
                             .iter()
                             .map(|f| {
-                                let accept = format!("ray files accept {}", f.id);
-                                vec![
-                                    layout::Cell::new(
-                                        f.id.to_string(),
-                                        style::rose(&f.id.to_string()),
-                                    ),
-                                    layout::Cell::new(f.from.clone(), style::value(&f.from)),
-                                    layout::Cell::right(
-                                        format_size(f.size),
-                                        style::faint(&format_size(f.size)),
-                                    ),
-                                    layout::Cell::new(
-                                        f.filename.clone(),
-                                        style::value(&f.filename),
-                                    ),
-                                    layout::Cell::new(accept.clone(), style::faint(&accept)),
-                                ]
+                                serde_json::json!({
+                                    "id": f.id, "to": f.peer, "filename": f.filename,
+                                    "size": f.size,
+                                })
                             })
                             .collect();
-                        println!();
-                        print!("{}", table(&["id", "from", "size", "file", ""], rows, 2));
+                        print_json(&serde_json::json!({"pending": inbound, "queued": queued}));
+                    } else if files.is_empty() && outbox.is_empty() {
+                        println!("\n  {}\n", style::faint("no pending file transfers"));
+                    } else {
+                        if !files.is_empty() {
+                            let rows = files
+                                .iter()
+                                .map(|f| {
+                                    let accept = format!("ray files accept {}", f.id);
+                                    vec![
+                                        layout::Cell::new(
+                                            f.id.to_string(),
+                                            style::rose(&f.id.to_string()),
+                                        ),
+                                        layout::Cell::new(f.from.clone(), style::value(&f.from)),
+                                        layout::Cell::right(
+                                            format_size(f.size),
+                                            style::faint(&format_size(f.size)),
+                                        ),
+                                        layout::Cell::new(
+                                            f.filename.clone(),
+                                            style::value(&f.filename),
+                                        ),
+                                        layout::Cell::new(accept.clone(), style::faint(&accept)),
+                                    ]
+                                })
+                                .collect();
+                            println!();
+                            print!("{}", table(&["id", "from", "size", "file", ""], rows, 2));
+                        }
+                        if !outbox.is_empty() {
+                            let rows = outbox
+                                .iter()
+                                .map(|f| {
+                                    let cancel = format!("ray files cancel {}", f.id);
+                                    vec![
+                                        layout::Cell::new(
+                                            f.id.to_string(),
+                                            style::rose(&f.id.to_string()),
+                                        ),
+                                        layout::Cell::new(f.peer.clone(), style::value(&f.peer)),
+                                        layout::Cell::right(
+                                            format_size(f.size),
+                                            style::faint(&format_size(f.size)),
+                                        ),
+                                        layout::Cell::new(
+                                            f.filename.clone(),
+                                            style::value(&f.filename),
+                                        ),
+                                        layout::Cell::new(cancel.clone(), style::faint(&cancel)),
+                                    ]
+                                })
+                                .collect();
+                            println!();
+                            println!(
+                                "  {}",
+                                style::faint("queued sends (deliver when the peer comes online)")
+                            );
+                            print!("{}", table(&["id", "to", "size", "file", ""], rows, 2));
+                        }
                         println!();
                     }
                 }
@@ -173,6 +232,16 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             let resp = ipc::recv(&mut stream).await?;
             spinner.finish_and_clear();
             match resp {
+                ipc::IpcMessage::Ok { message } => {
+                    println!("  {} {}", style::check(), style::value(&message));
+                }
+                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+                other => eprintln!("Unexpected response: {:?}", other),
+            }
+        }
+        Some(FilesAction::Cancel { id }) => {
+            ipc::send(&mut stream, ipc::IpcMessage::CancelSend { id }).await?;
+            match ipc::recv(&mut stream).await? {
                 ipc::IpcMessage::Ok { message } => {
                     println!("  {} {}", style::check(), style::value(&message));
                 }

@@ -226,6 +226,11 @@ pub enum IpcMessage {
         peer: String,
     },
     ListFiles,
+    /// Cancel a queued outbound send (`ray files cancel <id>`). Only reaches
+    /// sends still waiting in the outbox; a delivered offer is the peer's now.
+    CancelSend {
+        id: u64,
+    },
     AcceptFile {
         id: u64,
         output: Option<String>,
@@ -500,6 +505,10 @@ pub enum IpcMessage {
     },
     FileList {
         files: Vec<PendingFileInfo>,
+        /// Outbound sends queued for delivery (peer offline). Absent on daemons
+        /// that predate queued sends.
+        #[serde(default)]
+        outbox: Vec<OutboxFileInfo>,
     },
     PairingTicket {
         ticket: String,
@@ -628,6 +637,16 @@ pub struct PendingRequestInfo {
     pub waiting_secs: u64,
 }
 
+/// An outbound send waiting in the daemon's outbox for its peer to come online.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OutboxFileInfo {
+    pub id: u64,
+    /// The peer name as given to `ray send` (hostname or short id).
+    pub peer: String,
+    pub filename: String,
+    pub size: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PendingFileInfo {
     pub id: u64,
@@ -714,7 +733,9 @@ pub struct PeerStatus {
 }
 
 /// Three-state peer liveness for `ray status`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, derive_more::IsVariant)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, derive_more::IsVariant,
+)]
 pub enum PeerState {
     /// A live mesh connection to the peer exists right now.
     Active,
