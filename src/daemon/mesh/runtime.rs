@@ -851,6 +851,9 @@ impl Daemon {
     /// `activate` and by any `ray exit-node` change made while up. Returns a
     /// user-facing warning if either half could not be put in place.
     pub(crate) async fn apply_exit_node(&self) -> Option<String> {
+        // One reconcile at a time (see `Daemon::exit_reconcile`): the kernel
+        // enable's snapshot-then-write is not safe to interleave.
+        let _guard = self.exit_reconcile.lock().await;
         let tun_name = self.tun_name.load().as_str().to_owned();
         let reload = self.registry.reload_exit_state();
         // Both halves run even if the first one failed: they are independent roles,
@@ -917,7 +920,13 @@ impl Daemon {
                 crate::exit_node::teardown_client_routing();
                 return Ok(());
             }
-            crate::exit_node::install_client_routing(&tun_name)
+            crate::exit_node::install_client_routing(&tun_name).inspect_err(|_| {
+                // A partial install must not stay live: rules that went in before
+                // the failure (say v4's, with `ipv6.disable=1` failing the v6 half)
+                // would keep routing traffic into a tunnel that was never fully set
+                // up. Mirror the macOS branch and roll all of it back.
+                crate::exit_node::teardown_client_routing();
+            })
         })
         .await;
         match result {
@@ -1010,6 +1019,11 @@ impl Daemon {
         // Exit-node server: drop the allow policy so no transit happens while on
         // standby, then reconcile (which removes the kernel forwarding/NAT). With no
         // offers left this is the teardown path, which never reports a problem.
+        // Under the reconcile lock: this must not interleave with an in-flight
+        // `apply_exit_node` (the reapply listener, a late IPC mutation), which
+        // could otherwise re-enable what this is tearing down, or worse, snapshot
+        // the half-torn-down sysctls as "original".
+        let _guard = self.exit_reconcile.lock().await;
         self.registry.exit_server.clear();
         let _ = apply_exit_server_os(&self.registry.exit_server, &tun_name).await;
 

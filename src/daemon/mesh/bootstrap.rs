@@ -501,6 +501,7 @@ async fn build_daemon(
         auto_update,
         tun_name,
         tun_tasks: Mutex::new(None),
+        exit_reconcile: tokio::sync::Mutex::new(()),
         _metrics_server: metrics_server,
         router,
         files,

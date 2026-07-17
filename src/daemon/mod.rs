@@ -482,6 +482,14 @@ pub struct Daemon {
     /// Handles for the packet-forwarding tasks spawned by
     /// [`Daemon::attach_tun`], kept so a future `down()`/detach can stop them.
     tun_tasks: Mutex<Option<TunTasks>>,
+    /// Serializes exit-node reconciles. `apply_exit_node` runs from the IPC
+    /// dispatcher, `activate()`, and the reconverge reapply listener, each on its
+    /// own task, and the kernel enable underneath is check-then-write (the sysctl
+    /// snapshot, the pf enable token): two interleaved runs can snapshot each
+    /// other's intermediate state, after which teardown "restores" forwarding to
+    /// on. One reconcile at a time. Tokio's mutex because the critical section
+    /// awaits (blocking-pool `ip`/`nft`/`pfctl` children, offer broadcasts).
+    pub(crate) exit_reconcile: tokio::sync::Mutex<()>,
     /// Prometheus metrics-server guard. Owned so it lives for the daemon's whole
     /// lifetime (dropping it stops the export); `None` if the server failed to bind.
     _metrics_server: Option<MetricsServer>,
