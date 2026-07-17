@@ -17,6 +17,8 @@ import uniffi.ray_mobile.Node
  * The node owns a tokio runtime, so we build exactly one per process.
  */
 object NodeHolder {
+    private const val TAG = "NodeHolder"
+
     @Volatile
     private var node: Node? = null
 
@@ -194,9 +196,10 @@ object NodeHolder {
         val cm = context.applicationContext.getSystemService(ConnectivityManager::class.java)
         if (cm == null) return
         val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = notifyCore()
-            override fun onLost(network: Network) = notifyCore()
-            private fun notifyCore() {
+            override fun onAvailable(network: Network) = notifyCore("available", network)
+            override fun onLost(network: Network) = notifyCore("lost", network)
+            private fun notifyCore(event: String, network: Network) {
+                Log.i(TAG, "default network $event ($network); notifying core")
                 // The FFI call blocks briefly on the core runtime; keep it off
                 // Android's connectivity thread.
                 netScope.launch { runCatching { node?.networkChanged() } }
@@ -204,7 +207,7 @@ object NodeHolder {
         }
         runCatching { cm.registerDefaultNetworkCallback(cb) }
             .onSuccess { networkCallback = cb }
-            .onFailure { Log.w("NodeHolder", "network callback registration failed", it) }
+            .onFailure { Log.w(TAG, "network callback registration failed", it) }
     }
 
     private fun unregisterNetworkCallback(context: Context) {

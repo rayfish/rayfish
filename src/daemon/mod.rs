@@ -609,6 +609,7 @@ impl Daemon {
     /// forward the endpoint sits on dead sockets until something else rebuilds
     /// them. iroh rebinds and re-probes its paths in response.
     pub async fn network_changed(&self) {
+        tracing::info!("host reported a network change; rebinding endpoint");
         self.transport.endpoint.network_change().await;
     }
 
