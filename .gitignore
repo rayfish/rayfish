@@ -30,3 +30,6 @@ secrets/
 # Android Studio / IntelliJ project settings
 android/.idea/
 *.iml
+
+# nix build output
+/result

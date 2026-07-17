@@ -1,0 +1,31 @@
+# Keeps the Nix packaging green. The most common failure mode is a stale
+# outputHashes entry in nix/package.nix after the iroh fork rev changes; the
+# error message prints the expected hash — copy it in (see CLAUDE.md, "Nix").
+name: Nix
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  flake-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+      - name: Enable KVM for the NixOS VM test
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # Builds the package and runs the NixOS VM test (flake checks).
+      - run: nix flake check -L
+
+  build-darwin:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+      - run: nix build -L

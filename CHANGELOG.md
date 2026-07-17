@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **NixOS support.** The repo is now a Nix flake: `nix run github:rayfish/rayfish`
+  builds the `ray` CLI (Linux and macOS), and a NixOS module
+  (`nixosModules.default`) runs the daemon as a system service — operator,
+  relay/DNS/on-demand settings, and a `ray apply` provisioning spec all
+  declared straight from your system configuration. Joining a network stays a
+  one-time `ray join` (invites are secrets). A CI-run VM test boots the module
+  end to end.
 - **Android: disabling Rayfish no longer takes the phone offline.** Turning the VPN
   off (in the app, or because another VPN app took the slot) now drops the tunnel
   and releases the VPN slot but keeps Rayfish's control plane connected, so files

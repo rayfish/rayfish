@@ -85,3 +85,12 @@ The rules the code upholds. Read the code for the mechanics.
 - **Git:** conventional commit subjects (`feat`/`fix`/`docs`/…) so git-cliff can generate the changelog.
 - **CHANGELOG:** add a user-facing `[Unreleased]` entry (`Added`/`Changed`/`Fixed`/`Performance`), describing behavior from the user's view, for any user-visible change; skip pure-internal churn (refactors, CI, chores).
 - **Docs:** keep this file and README current when a feature or invariant changes: at the principle level, pointing to code rather than restating it.
+
+## Nix
+
+`flake.nix` + `nix/` package the daemon (`nix/package.nix`), ship a NixOS module (`nix/module.nix`), and boot-test it (`nix/vm-test.nix`); `.github/workflows/nix.yml` keeps them green. Rules:
+
+- Routine `cargo update` needs **no** nix changes — `Cargo.lock` is imported directly.
+- When the iroh fork rev/branch in `[patch.crates-io]` changes, all four `outputHashes` in `nix/package.nix` must change (they share one value). Set them to `lib.fakeHash`, run `nix build`, copy the `got: sha256-…` hash from the error; the CI nix job fails with the same message when stale.
+- New workspace member or moved cargo source path → add it to the `fileset` in `nix/package.nix`.
+- Daemon runtime-surface changes (socket path, TUN name, config keys, unit needs) → keep `nix/module.nix` and `nix/vm-test.nix` in sync; the VM test is what catches drift. The module never manages `/etc/rayfish` files (daemon-owned mutable state) — it configures only via the CLI/IPC surface.

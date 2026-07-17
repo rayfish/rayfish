@@ -398,6 +398,40 @@ a peer's local rules. To seed a spec's `aliases:` from a machine you're on,
 `ray alias <net> set <host> <name>` saves the alias locally (it also shows inline
 in `ray status`) so you don't have to paste the identity by hand.
 
+### NixOS
+
+The repo is a Nix flake: `nix run github:rayfish/rayfish` builds and runs the
+`ray` CLI (Linux and macOS), and a NixOS module runs the daemon as a system
+service with the settings and apply spec above expressed directly in your
+system config:
+
+```nix
+{
+  inputs.rayfish.url = "github:rayfish/rayfish";
+
+  # in your NixOS configuration:
+  imports = [ rayfish.nixosModules.default ];
+
+  services.rayfish = {
+    enable = true;
+    operator = "alice";                    # ray set-operator, applied at boot
+    settings.dnsUpstreams = [ "9.9.9.9" ]; # ray config set, restarts on change
+    apply = {                              # ray apply, rerun when the spec changes
+      spec.networks.infra."*".allows.admins = "tcp:22";
+      prune = true;
+    };
+  };
+}
+```
+
+`services.resolved.enable = true` is strongly recommended so Magic DNS uses
+split-DNS via systemd-resolved instead of fighting NixOS over
+`/etc/resolv.conf`. Joining a network stays a one-time imperative step
+(`ray join <invite>`) — invites are secrets and don't belong in the
+world-readable Nix store. The daemon keeps owning `/etc/rayfish` as mutable
+state; the module configures it only through the same CLI surface documented
+above, so `nixos-rebuild switch` and hand-run `ray` commands never fight.
+
 ## Permissions
 
 Like Tailscale, the daemon authorizes each command by the **caller's UID**, not by file permissions:
