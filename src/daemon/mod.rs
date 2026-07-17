@@ -602,6 +602,16 @@ impl Daemon {
         self.transport.clone()
     }
 
+    /// Part of the embedding API (used by `ray-mobile`): the host OS observed a
+    /// network change (Wi-Fi/cellular switch, roam, airplane mode). On desktop,
+    /// netwatch sees route changes itself; on Android its route monitor is a
+    /// stub (apps cannot subscribe to netlink route updates), so without this
+    /// forward the endpoint sits on dead sockets until something else rebuilds
+    /// them. iroh rebinds and re-probes its paths in response.
+    pub async fn network_changed(&self) {
+        self.transport.endpoint.network_change().await;
+    }
+
     /// Attach a packet interface to a headless [`DaemonState`] and start the data
     /// plane's forwarding tasks: the TUN writer (`spawn_tun_writer`) and the mesh
     /// forwarding loop (`run_mesh`, reading `reader` and using the state's

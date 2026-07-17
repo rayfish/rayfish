@@ -43,6 +43,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`ray send` takes multiple files.** `ray send <peer> <file> <file> ...` sends
   each one; a failure on one file doesn't stop the rest.
 
+- **Android: the app now notices network changes.** Switching between Wi-Fi and
+  mobile data (or roaming access points) used to leave the app on dead sockets:
+  Android does not let apps observe route changes natively, so the core never
+  rebound and the device silently dropped off the mesh until the VPN was toggled
+  by hand. The app now forwards Android's connectivity callbacks to the core,
+  which rebinds and re-probes immediately.
+
 ### Changed
 
 - **`ray send` argument order flipped** to make room for multiple files: it is
