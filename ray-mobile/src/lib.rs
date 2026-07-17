@@ -666,7 +666,7 @@ impl Node {
     pub fn list_file_offers(&self) -> Result<Vec<FileOffer>, RayError> {
         let state = self.state()?;
         match state.list_files() {
-            IpcMessage::FileList { files } => Ok(files
+            IpcMessage::FileList { files, .. } => Ok(files
                 .into_iter()
                 .map(|f| FileOffer {
                     id: f.id,
