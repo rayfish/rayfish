@@ -3,11 +3,17 @@
 use crate::*;
 
 pub(crate) async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
+    // The daemon does the read and its cwd is not the caller's: resolve the
+    // path against the client's cwd before it crosses the IPC boundary.
+    let path = std::path::absolute(file).with_context(|| format!("cannot resolve '{file}'"))?;
+    if !path.is_file() {
+        anyhow::bail!("cannot read '{}': no such file", path.display());
+    }
     let mut stream = ipc::connect().await?;
     ipc::send(
         &mut stream,
         ipc::IpcMessage::SendFile {
-            path: file.to_string(),
+            path: path.to_string_lossy().to_string(),
             peer: peer.to_string(),
         },
     )
