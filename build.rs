@@ -3,20 +3,29 @@
 //! `ray update --nightly` uses the running binary's checksum (not its version)
 //! to decide whether a swap is needed — but the SHA is what a tester quotes.
 //!
-//! Falls back to `unknown` when git is unavailable (e.g. a source tarball build
-//! outside a checkout), so the build never fails for lack of a `.git` dir.
+//! Packagers building from a checkout-less source tree (Nix, tarballs) can
+//! supply the SHA via the `RAY_GIT_SHA` env var, which takes precedence.
+//! Falls back to `unknown` when neither is available, so the build never
+//! fails for lack of a `.git` dir.
 
+use std::env;
 use std::process::Command;
 
 fn main() {
-    let sha = Command::new("git")
-        .args(["rev-parse", "--short=8", "HEAD"])
-        .output()
+    println!("cargo:rerun-if-env-changed=RAY_GIT_SHA");
+    let sha = env::var("RAY_GIT_SHA")
         .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            Command::new("git")
+                .args(["rev-parse", "--short=8", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=RAY_GIT_SHA={sha}");
