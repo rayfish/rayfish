@@ -661,9 +661,11 @@ fn set_socket_permissions(path: &std::path::Path) {
 
 async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<()> {
     let peer_cred = stream.peer_cred().ok().map(|c| (c.uid(), c.gid()));
+    // The request is read fd-aware: `SendFileFd` arrives with the file as
+    // SCM_RIGHTS ancillary data, which a plain framed read would drop.
+    let (req, fds) = ipc::recv_with_fds(&stream).await?;
+    let resp = daemon.handle_request(req, peer_cred, fds).await;
     let mut framed = ipc::framed(stream);
-    let req = ipc::recv(&mut framed).await?;
-    let resp = daemon.handle_request(req, peer_cred).await;
     ipc::send(&mut framed, resp).await?;
     Ok(())
 }
