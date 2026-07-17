@@ -41,6 +41,7 @@ use iroh_metrics::service::MetricsServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -917,6 +918,7 @@ impl Daemon {
         self: &Arc<Self>,
         req: IpcMessage,
         peer_cred: Option<(u32, u32)>,
+        mut fds: Vec<OwnedFd>,
     ) -> IpcMessage {
         if let Some(denied) = Self::check_authorized(&req, peer_cred) {
             return denied;
@@ -1036,6 +1038,10 @@ impl Daemon {
             }
             IpcMessage::AliasList { network } => self.registry.list_aliases(&network),
             IpcMessage::SendFile { path, peer } => self.send_file(&path, &peer).await,
+            IpcMessage::SendFileFd { filename, peer } => match fds.pop() {
+                Some(fd) => self.files.send_file_fd(fd, &filename, &peer).await,
+                None => ipc_err("SendFileFd request carried no file descriptor"),
+            },
             IpcMessage::ListFiles => self.list_files(),
             IpcMessage::AcceptFile { id, output } => {
                 self.files.accept_file(id, output, peer_cred).await
