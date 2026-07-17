@@ -11,6 +11,7 @@
 use super::transfers;
 use super::*;
 use std::ffi::CString;
+use std::io::Read;
 use std::path::PathBuf;
 
 use futures::StreamExt;
@@ -361,14 +362,10 @@ impl FileService {
     }
 
     /// Add a file to the blob store and offer it to a peer over `FILES_ALPN`.
+    /// The read happens daemon-side, so this only works for paths the daemon
+    /// itself can see; IPC clients use `send_file_fd`. Kept for in-process
+    /// callers (ray-mobile), where daemon and app share one privilege domain.
     pub(crate) async fn send_file(&self, path: &str, peer: &str) -> IpcMessage {
-        let peer_id = match self.registry.resolve_peer_flexible(peer).await {
-            Some(id) => id,
-            None => {
-                return ipc_err(format!("unknown peer '{peer}'"));
-            }
-        };
-
         let file_path = Path::new(path);
         let file_bytes = match std::fs::read(file_path) {
             Ok(b) => b,
@@ -376,11 +373,49 @@ impl FileService {
                 return ipc_err(format!("cannot read '{}': {e}", file_path.display()));
             }
         };
-
         let filename = file_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "file".to_string());
+        self.send_bytes(file_bytes, filename, peer).await
+    }
+
+    /// `send_file` for a descriptor received over IPC (`SendFileFd`): the
+    /// client opened the file with its own privileges, the daemon never
+    /// resolves a path. This is what lets `ray send` reach TCC-protected
+    /// folders on macOS and files the daemon can't read but the caller can.
+    pub(crate) async fn send_file_fd(&self, fd: OwnedFd, filename: &str, peer: &str) -> IpcMessage {
+        let mut file = File::from(fd);
+        // fstat before reading: an fd is attacker-chosen input, and reading a
+        // FIFO or a device (/dev/zero) here would stall or balloon the daemon.
+        match file.metadata() {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => return ipc_err("not a regular file"),
+            Err(e) => return ipc_err(format!("cannot stat file: {e}")),
+        }
+        let mut file_bytes = Vec::new();
+        if let Err(e) = file.read_to_end(&mut file_bytes) {
+            return ipc_err(format!("cannot read file: {e}"));
+        }
+        // The client names the file; keep only the basename so a hostile
+        // client can't smuggle path components into the offer.
+        let filename = Path::new(filename)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+        self.send_bytes(file_bytes, filename, peer).await
+    }
+
+    /// Shared tail of the send flow: blob-store the bytes and deliver the
+    /// offer to the peer over `FILES_ALPN`.
+    async fn send_bytes(&self, file_bytes: Vec<u8>, filename: String, peer: &str) -> IpcMessage {
+        let peer_id = match self.registry.resolve_peer_flexible(peer).await {
+            Some(id) => id,
+            None => {
+                return ipc_err(format!("unknown peer '{peer}'"));
+            }
+        };
+
         let size = file_bytes.len() as u64;
         let mime_type = guess_mime_type(&filename);
         let hash = blake3::hash(&file_bytes);

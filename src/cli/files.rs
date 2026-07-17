@@ -3,22 +3,51 @@
 use crate::*;
 
 pub(crate) async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
-    // The daemon does the read and its cwd is not the caller's: resolve the
-    // path against the client's cwd before it crosses the IPC boundary.
+    use std::fs::File;
+    use std::os::fd::AsFd;
+
     let path = std::path::absolute(file).with_context(|| format!("cannot resolve '{file}'"))?;
-    if !path.is_file() {
-        anyhow::bail!("cannot read '{}': no such file", path.display());
+    // Open here, in the caller's privilege domain, and pass the descriptor:
+    // the daemon never touches the path, so files the daemon can't read (TCC
+    // folders on macOS, user-only files) work as long as *we* can open them.
+    let opened = File::open(&path).with_context(|| format!("cannot read '{}'", path.display()))?;
+    if !opened.metadata()?.is_file() {
+        anyhow::bail!("cannot send '{}': not a regular file", path.display());
     }
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+
     let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::SendFile {
-            path: path.to_string_lossy().to_string(),
+    ipc::send_with_fd(
+        stream.get_ref(),
+        &ipc::IpcMessage::SendFileFd {
+            filename,
             peer: peer.to_string(),
         },
+        opened.as_fd(),
     )
     .await?;
-    let resp = ipc::recv(&mut stream).await?;
+    let resp = match ipc::recv(&mut stream).await {
+        Ok(resp) => resp,
+        // A daemon predating `SendFileFd` fails to decode the request and
+        // drops the connection without a reply (never with an `Error`
+        // response). Retry once the old way, path over IPC, so an updated CLI
+        // keeps working until the daemon restarts onto the new binary.
+        Err(_) => {
+            let mut stream = ipc::connect().await?;
+            ipc::send(
+                &mut stream,
+                ipc::IpcMessage::SendFile {
+                    path: path.to_string_lossy().to_string(),
+                    peer: peer.to_string(),
+                },
+            )
+            .await?;
+            ipc::recv(&mut stream).await?
+        }
+    };
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => print_error("error", &message, None),

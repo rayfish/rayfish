@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
+use std::io::{IoSlice, IoSliceMut};
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::io::Interest;
 use tokio::net::UnixStream;
 use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
 
@@ -211,6 +214,15 @@ pub enum IpcMessage {
     },
     SendFile {
         path: String,
+        peer: String,
+    },
+    /// Send a file to a peer, passing the already-open file as an SCM_RIGHTS
+    /// descriptor on the same connection (see [`send_with_fd`]). The client
+    /// opens the file with its own privileges, so filesystem permissions and
+    /// macOS TCC grants apply to the caller, not to the root daemon. `SendFile`
+    /// stays for frontends that cannot pass descriptors.
+    SendFileFd {
+        filename: String,
         peer: String,
     },
     ListFiles,
@@ -834,6 +846,104 @@ pub async fn recv(framed: &mut IpcFramed) -> Result<IpcMessage> {
     framed.next().await.context("connection closed")?
 }
 
+/// Cap on SCM_RIGHTS descriptors accepted per request. One is all any message
+/// uses today; the cap keeps a hostile client from stuffing the daemon's fd
+/// table through a single connection.
+pub const MAX_IPC_FDS: usize = 4;
+
+/// Send `msg` as a normal length-prefixed frame with `fd` attached to its
+/// first byte as SCM_RIGHTS ancillary data. The receiver must read with
+/// [`recv_with_fds`]: a plain `read()` consumes the bytes but silently drops
+/// the descriptor.
+pub async fn send_with_fd(stream: &UnixStream, msg: &IpcMessage, fd: BorrowedFd<'_>) -> Result<()> {
+    use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+
+    let body = rmp_serde::to_vec_named(msg).context("serialize IPC message")?;
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&u32::try_from(body.len())?.to_be_bytes());
+    frame.extend_from_slice(&body);
+
+    let mut sent = 0;
+    let mut fd_sent = false;
+    while sent < frame.len() {
+        let n = stream
+            .async_io(Interest::WRITABLE, || {
+                let iov = [IoSlice::new(&frame[sent..])];
+                let fds = [fd.as_raw_fd()];
+                // The descriptor rides the first sendmsg that accepts bytes;
+                // continuation writes after a partial send carry no ancillary.
+                let cmsgs: &[ControlMessage] = if fd_sent {
+                    &[]
+                } else {
+                    &[ControlMessage::ScmRights(&fds)]
+                };
+                sendmsg::<()>(stream.as_raw_fd(), &iov, cmsgs, MsgFlags::empty(), None)
+                    .map_err(std::io::Error::from)
+            })
+            .await?;
+        fd_sent = true;
+        sent += n;
+    }
+    Ok(())
+}
+
+/// Read one request frame, capturing any SCM_RIGHTS descriptors delivered
+/// with it. The daemon reads every request through this (not through the
+/// framed codec) because ancillary data is only surfaced by `recvmsg` with a
+/// control buffer; any other read on the socket would drop the descriptors.
+pub async fn recv_with_fds(stream: &UnixStream) -> Result<(IpcMessage, Vec<OwnedFd>)> {
+    use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut fds: Vec<OwnedFd> = Vec::new();
+    loop {
+        if buf.len() >= 4 {
+            let len = u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
+            if len > MAX_FRAME_LEN {
+                anyhow::bail!("IPC frame too large ({len} bytes)");
+            }
+            if buf.len() >= 4 + len {
+                let msg = rmp_serde::from_slice(&buf[4..4 + len]).context("decode IPC message")?;
+                return Ok((msg, fds));
+            }
+        }
+
+        let mut chunk = [0u8; 8192];
+        let (n, mut got) = stream
+            .async_io(Interest::READABLE, || {
+                let mut iov = [IoSliceMut::new(&mut chunk)];
+                let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_IPC_FDS]);
+                // CLOEXEC on Linux/Android so a received fd never leaks into a
+                // spawned child; macOS has no MSG_CMSG_CLOEXEC.
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let flags = MsgFlags::MSG_CMSG_CLOEXEC;
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let flags = MsgFlags::empty();
+                let msg = recvmsg::<()>(stream.as_raw_fd(), &mut iov, Some(&mut cmsg_buf), flags)
+                    .map_err(std::io::Error::from)?;
+                let mut received = Vec::new();
+                for cmsg in msg.cmsgs().map_err(std::io::Error::from)? {
+                    if let ControlMessageOwned::ScmRights(raw) = cmsg {
+                        // SAFETY: the kernel just installed these descriptors in
+                        // our fd table for this process; we are their sole owner.
+                        received.extend(raw.iter().map(|&r| unsafe { OwnedFd::from_raw_fd(r) }));
+                    }
+                }
+                Ok((msg.bytes, received))
+            })
+            .await?;
+        if n == 0 {
+            anyhow::bail!("connection closed mid-frame");
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        fds.append(&mut got);
+        if fds.len() > MAX_IPC_FDS {
+            // Dropping the OwnedFds closes everything the client pushed.
+            anyhow::bail!("too many file descriptors in IPC request");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,6 +964,76 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[tokio::test]
+    async fn send_file_fd_roundtrip() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::fd::AsFd;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"payload bytes").unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+
+        let msg = IpcMessage::SendFileFd {
+            filename: "report.pdf".to_string(),
+            peer: "peer1".to_string(),
+        };
+        send_with_fd(&client, &msg, file.as_fd()).await.unwrap();
+
+        let (decoded, fds) = recv_with_fds(&server).await.unwrap();
+        match decoded {
+            IpcMessage::SendFileFd { filename, peer } => {
+                assert_eq!(filename, "report.pdf");
+                assert_eq!(peer, "peer1");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        assert_eq!(fds.len(), 1);
+
+        let mut received = std::fs::File::from(fds.into_iter().next().unwrap());
+        let mut contents = String::new();
+        received.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "payload bytes");
+    }
+
+    #[tokio::test]
+    async fn recv_with_fds_handles_plain_frames() {
+        use futures::SinkExt;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut framed = framed(client);
+        framed.send(IpcMessage::Status).await.unwrap();
+
+        let (decoded, fds) = recv_with_fds(&server).await.unwrap();
+        assert!(matches!(decoded, IpcMessage::Status));
+        assert!(fds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_file_fd_survives_multi_chunk_frames() {
+        use std::os::fd::AsFd;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let file = tempfile::tempfile().unwrap();
+
+        // A frame much larger than the 8 KiB recv chunk, so the descriptor
+        // (attached to the first bytes) must survive a multi-read assembly.
+        let msg = IpcMessage::SendFileFd {
+            filename: "x".repeat(100 * 1024),
+            peer: "peer1".to_string(),
+        };
+        let send = send_with_fd(&client, &msg, file.as_fd());
+        let recv = recv_with_fds(&server);
+        let (sent, received) = tokio::join!(send, recv);
+        sent.unwrap();
+        let (decoded, fds) = received.unwrap();
+        match decoded {
+            IpcMessage::SendFileFd { filename, .. } => assert_eq!(filename.len(), 100 * 1024),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        assert_eq!(fds.len(), 1);
     }
 
     #[test]
