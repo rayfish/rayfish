@@ -59,11 +59,18 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// (`ray connect`) network's co-coordinator key grant into the join handshake's
 /// Welcome (deterministic) instead of a separate best-effort `AdminGrant` stream.
 ///
-/// Bumped to 3 for exit nodes: `ControlMsg::ExitNodeOffer` is a new control
-/// variant a member sends to coordinators to advertise itself as an exit node.
-/// A v2 (`v0.2.0`) peer cannot decode the new variant, so the version gate keeps
-/// the two apart rather than risking a decode failure on the wire.
-pub const MESH_PROTOCOL_VERSION: u32 = 3;
+/// *Additive* wire changes do not bump this version. The frame reader skips any
+/// frame it cannot decode (so an unknown `ControlMsg` variant is dropped, not
+/// fatal) and nacks it with `ControlMsg::NotSupported` so the mismatch shows in
+/// the sender's log (builds before the nack existed skip silently), and every
+/// frame and blob is msgpack map-encoded (`to_vec_named`) with
+/// `serde(default)` on new fields, so unknown fields are ignored and missing ones
+/// defaulted in both directions. Exit nodes ride that: a v2 peer that predates
+/// `ControlMsg::ExitNodeOffer` and `Member.exit_node` stays connected and simply
+/// cannot offer or discover exit nodes until updated. Bump only for changes an
+/// old peer would *misinterpret* (removed/repurposed fields or variants, changed
+/// semantics of existing ones), not for ones it safely ignores.
+pub const MESH_PROTOCOL_VERSION: u32 = 2;
 
 /// Capability bits a peer advertises in its `MeshHello.features`. These are
 /// negotiated *inside* the single mesh ALPN, so adding one needs no version bump:

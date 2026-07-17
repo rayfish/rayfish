@@ -3,6 +3,7 @@
 //! Each message is encoded as a 4-byte big-endian length prefix followed by a msgpack body.
 //! Control messages manage membership (join, approve, sync) and mesh topology (hello, reconnect).
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result};
@@ -300,6 +301,18 @@ pub enum ControlMsg {
     /// non-member/coordinator recipient ignores it. Best-effort, sent while the link
     /// is up; a missed message falls back to the receiver's periodic reconverge.
     KickedFromNetwork,
+    /// Receiver to sender: the receiver read a control frame it could not decode,
+    /// i.e. a variant from a newer build. `msg_kind` is the unknown variant's name
+    /// as it appeared on the wire (`to_vec_named` puts the name in the msgpack
+    /// map, so it survives even when the variant itself is unknown; see
+    /// [`FrameRead`]). Advisory and connection-level (`net: None`): nothing acts
+    /// on it beyond logging, it exists so the sender can tell its user "peer X
+    /// doesn't support Y" instead of features failing silently. Never sent in
+    /// reply to a `NotSupported` and bounded per connection (see
+    /// `MeshConnection::nack_unknown`), so two mismatched builds cannot ping-pong.
+    NotSupported {
+        msg_kind: String,
+    },
 }
 
 /// One `network pubkey → u16 handle` binding in a [`ControlMsg::NetworkHandles`]
@@ -344,7 +357,61 @@ fn decode_msg(data: &[u8]) -> Result<ControlFrame> {
     anyhow::ensure!(data.len() >= 4, "message too short");
     let len = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
     anyhow::ensure!(data.len() >= 4 + len, "incomplete message");
-    rmp_serde::from_slice(&data[4..4 + len]).context("invalid control frame")
+    match decode_frame(&data[4..4 + len])? {
+        FrameRead::Frame(frame) => Ok(*frame),
+        FrameRead::Unknown { msg_kind } => anyhow::bail!("unknown control message: {msg_kind}"),
+    }
+}
+
+/// Outcome of decoding one control frame off the wire.
+#[derive(Debug)]
+pub enum FrameRead {
+    /// A frame this build understands. Boxed to keep the enum small next to
+    /// `Unknown`.
+    Frame(Box<ControlFrame>),
+    /// The bytes arrived intact but the [`ControlMsg`] did not decode: the
+    /// variant (or its payload) is from a newer build. `msg_kind` is the variant
+    /// name recovered from the msgpack body so the demux can answer with
+    /// [`ControlMsg::NotSupported`] instead of failing silently.
+    Unknown { msg_kind: String },
+}
+
+/// The shape of a frame whose [`ControlMsg`] this build cannot decode: just
+/// enough structure to recover the variant name for the `NotSupported` nack.
+#[derive(Deserialize)]
+struct FrameProbe {
+    msg: KindProbe,
+}
+
+/// `to_vec_named` encodes a unit variant as a bare string and a payload variant
+/// as a single-key map keyed by the variant name; either way the name survives
+/// even when the variant itself is unknown to this build.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KindProbe {
+    Unit(String),
+    Tagged(HashMap<String, serde::de::IgnoredAny>),
+}
+
+/// Decode a control-frame body (length prefix already stripped). A body that
+/// fails to decode as a [`ControlFrame`] is probed for its variant name and
+/// reported as [`FrameRead::Unknown`]; bytes without a recoverable name are a
+/// plain error (the demux skips them, as it always has).
+fn decode_frame(body: &[u8]) -> Result<FrameRead> {
+    let decode_err = match rmp_serde::from_slice(body) {
+        Ok(frame) => return Ok(FrameRead::Frame(Box::new(frame))),
+        Err(e) => e,
+    };
+    let probe: FrameProbe = rmp_serde::from_slice(body)
+        .with_context(|| format!("invalid control frame: {decode_err}"))?;
+    let msg_kind = match probe.msg {
+        KindProbe::Unit(name) => name,
+        KindProbe::Tagged(map) => map
+            .into_keys()
+            .next()
+            .context("control message map is empty")?,
+    };
+    Ok(FrameRead::Unknown { msg_kind })
 }
 
 pub async fn send_msg(
@@ -370,18 +437,28 @@ pub async fn send_msg(
 
 /// Read one mesh control message off a stream, discarding the frame envelope.
 /// Used by the handshake paths (join/reconnect/pair) that already know which
-/// network the stream belongs to. The per-connection demux uses [`recv_frame`]
-/// instead, since it must route by `ControlFrame.net`.
+/// network the stream belongs to and expect a specific message, so an
+/// unknown variant is an error here, not a skippable frame. The per-connection
+/// demux uses [`recv_frame`] instead, since it must route by `ControlFrame.net`
+/// and nack unknown variants.
 pub async fn recv_msg(stream: &mut RecvStream) -> Result<ControlMsg> {
-    Ok(recv_frame(stream).await?.msg)
+    match recv_frame(stream).await? {
+        FrameRead::Frame(frame) => Ok(frame.msg),
+        FrameRead::Unknown { msg_kind } => {
+            anyhow::bail!("peer sent a control message this build cannot decode: {msg_kind}")
+        }
+    }
 }
 
 /// Read one mesh control message off a stream, keeping the frame envelope (the
 /// network it pertains to, or `None` for connection-level messages). Used by the
 /// per-connection demux (`ProtocolRouter::drive_mesh_connection`) to route each
-/// frame to the right per-network handler.
-pub async fn recv_frame(stream: &mut RecvStream) -> Result<ControlFrame> {
-    recv_framed(stream).await
+/// frame to the right per-network handler. Tolerant of newer builds: a frame
+/// whose variant this build cannot decode comes back as [`FrameRead::Unknown`]
+/// rather than an error, carrying the variant name for the `NotSupported` nack.
+pub async fn recv_frame(stream: &mut RecvStream) -> Result<FrameRead> {
+    let body = recv_raw(stream).await?;
+    decode_frame(&body)
 }
 
 /// Send any serializable message as a length-prefixed msgpack frame, then finish
@@ -400,6 +477,12 @@ pub async fn send_framed<T: Serialize>(stream: &mut SendStream, msg: &T) -> Resu
 
 /// Read a length-prefixed msgpack frame into any deserializable type.
 pub async fn recv_framed<T: serde::de::DeserializeOwned>(stream: &mut RecvStream) -> Result<T> {
+    let body = recv_raw(stream).await?;
+    rmp_serde::from_slice(&body).context("decode framed message")
+}
+
+/// Read one length-prefixed frame body off a stream, undecoded.
+async fn recv_raw(stream: &mut RecvStream) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
@@ -412,7 +495,7 @@ pub async fn recv_framed<T: serde::de::DeserializeOwned>(stream: &mut RecvStream
         .read_exact(&mut body)
         .await
         .context("read message body")?;
-    rmp_serde::from_slice(&body).context("decode framed message")
+    Ok(body)
 }
 
 /// A pairing ticket is `bs58(endpoint_id[32] || secret[32])`, minted by the
@@ -514,6 +597,80 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_roundtrip_not_supported() {
+        let msg = ControlMsg::NotSupported {
+            msg_kind: "ExitNodeOffer".to_string(),
+        };
+        let bytes = encode_msg(None, &msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded.msg);
+    }
+
+    #[test]
+    fn unknown_struct_variant_probes_its_kind() {
+        // A frame from a newer build carrying a struct variant this build has
+        // never heard of. Decode must not error: it reports the variant name
+        // recovered from the msgpack map so the demux can nack it.
+        #[derive(serde::Serialize)]
+        enum FutureMsg {
+            ExitNodeTeleport { hops: u32 },
+        }
+        #[derive(serde::Serialize)]
+        struct FutureFrame {
+            msg: FutureMsg,
+        }
+        let body = rmp_serde::to_vec_named(&FutureFrame {
+            msg: FutureMsg::ExitNodeTeleport { hops: 3 },
+        })
+        .unwrap();
+        match decode_frame(&body).unwrap() {
+            FrameRead::Unknown { msg_kind } => assert_eq!(msg_kind, "ExitNodeTeleport"),
+            FrameRead::Frame(f) => panic!("decoded a future variant: {f:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_unit_variant_probes_its_kind() {
+        // Unit variants encode as a bare string under `to_vec_named`, not a map.
+        #[derive(serde::Serialize)]
+        enum FutureMsg {
+            Teleport,
+        }
+        #[derive(serde::Serialize)]
+        struct FutureFrame {
+            msg: FutureMsg,
+        }
+        let body = rmp_serde::to_vec_named(&FutureFrame {
+            msg: FutureMsg::Teleport,
+        })
+        .unwrap();
+        match decode_frame(&body).unwrap() {
+            FrameRead::Unknown { msg_kind } => assert_eq!(msg_kind, "Teleport"),
+            FrameRead::Frame(f) => panic!("decoded a future variant: {f:?}"),
+        }
+    }
+
+    #[test]
+    fn known_frame_decodes_as_frame() {
+        let body = rmp_serde::to_vec_named(&ControlFrame {
+            net: None,
+            msg: ControlMsg::Ping { nonce: 7 },
+        })
+        .unwrap();
+        match decode_frame(&body).unwrap() {
+            FrameRead::Frame(f) => assert_eq!(f.msg, ControlMsg::Ping { nonce: 7 }),
+            FrameRead::Unknown { msg_kind } => panic!("known variant probed as {msg_kind}"),
+        }
+    }
+
+    #[test]
+    fn garbage_frame_is_an_error_not_unknown() {
+        // Bytes that are not even a frame envelope: no kind to nack, plain error
+        // (the demux skips it, as it always has).
+        assert!(decode_frame(&[0xc1, 0xff, 0x00]).is_err());
     }
 
     #[test]

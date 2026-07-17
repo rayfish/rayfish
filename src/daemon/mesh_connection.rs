@@ -30,7 +30,27 @@ pub(crate) struct MeshConnection {
     ctx: MeshCtx,
     token: CancellationToken,
     gate: crate::ratelimit::ControlGate,
+    nacks: NackGate,
     pre_registered: bool,
+}
+
+/// Bounds [`ControlMsg::NotSupported`] nacks on one connection: each unknown
+/// kind is nacked once, at most [`NackGate::LIMIT`] distinct kinds, and never a
+/// `NotSupported` itself, so two mismatched builds cannot ping-pong.
+#[derive(Default)]
+struct NackGate {
+    sent: HashSet<String>,
+}
+
+impl NackGate {
+    const LIMIT: usize = 8;
+
+    fn should_send(&mut self, msg_kind: &str) -> bool {
+        if msg_kind == "NotSupported" || self.sent.len() >= Self::LIMIT {
+            return false;
+        }
+        self.sent.insert(msg_kind.to_string())
+    }
 }
 
 impl MeshConnection {
@@ -51,6 +71,7 @@ impl MeshConnection {
             ctx,
             token,
             gate: crate::ratelimit::ControlGate::new(),
+            nacks: NackGate::default(),
             pre_registered,
         }
     }
@@ -140,7 +161,13 @@ impl MeshConnection {
                 }
             };
             let frame = match control::recv_frame(&mut recv).await {
-                Ok(f) => f,
+                Ok(control::FrameRead::Frame(f)) => *f,
+                // A frame from a newer build. Tell the sender once so its
+                // feature fails loudly on its side instead of silently here.
+                Ok(control::FrameRead::Unknown { msg_kind }) => {
+                    self.nack_unknown(msg_kind).await;
+                    continue;
+                }
                 Err(_) => continue,
             };
             // Control traffic deliberately does NOT count as activity: "idle" means
@@ -228,6 +255,17 @@ impl MeshConnection {
                     }
                     continue;
                 }
+                ControlMsg::NotSupported { msg_kind } => {
+                    // Advisory: the peer could not decode a `msg_kind` we sent
+                    // (it runs an older build). Nothing to act on; the feature
+                    // simply does not reach this peer until it updates.
+                    tracing::warn!(
+                        peer = %self.peer_id.fmt_short(),
+                        kind = %msg_kind,
+                        "peer runs an older build without this control message"
+                    );
+                    continue;
+                }
                 _ => {}
             }
             let Some(net_pubkey) = frame.net else {
@@ -252,6 +290,20 @@ impl MeshConnection {
                 announce_network_handles(&self.ctx.peers, &self.conn, ip).await;
             }
         }
+    }
+
+    /// Best-effort `NotSupported` nack for a control frame this build could not
+    /// decode, bounded by [`NackGate`].
+    async fn nack_unknown(&mut self, msg_kind: String) {
+        if !self.nacks.should_send(&msg_kind) {
+            return;
+        }
+        tracing::info!(
+            peer = %self.peer_id.fmt_short(),
+            kind = %msg_kind,
+            "control message from a newer build; nacking"
+        );
+        let _ = open_and_send(&self.conn, None, &ControlMsg::NotSupported { msg_kind }).await;
     }
 
     /// Report this connection's drop to the daemon-wide supervisor. The peer's
@@ -314,6 +366,22 @@ mod tests {
             error_code: VarInt::from_u32(code),
             reason: Vec::new().into(),
         })
+    }
+
+    #[test]
+    fn nack_gate_bounds_and_dedups() {
+        let mut gate = NackGate::default();
+        // First sighting of a kind passes, repeats do not.
+        assert!(gate.should_send("ExitNodeTeleport"));
+        assert!(!gate.should_send("ExitNodeTeleport"));
+        // A NotSupported is never nacked back: two mismatched builds must not
+        // ping-pong.
+        assert!(!gate.should_send("NotSupported"));
+        // Distinct kinds pass until the per-connection cap, then nothing does.
+        for i in 1..NackGate::LIMIT {
+            assert!(gate.should_send(&format!("Future{i}")));
+        }
+        assert!(!gate.should_send("OneTooMany"));
     }
 
     #[test]
