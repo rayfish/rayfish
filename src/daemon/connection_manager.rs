@@ -24,6 +24,11 @@ use super::*;
 pub(crate) struct MeshDispatch {
     pub(crate) ctx: MeshCtx,
     pub(crate) token: CancellationToken,
+    /// Fired once per mesh connection as it starts (dialed or accepted), with
+    /// the peer's id. Wired by the composition root to the file-service send
+    /// outbox, which delivers queued offers the moment their peer reappears;
+    /// the manager stays ignorant of who listens.
+    pub(crate) on_peer_connected: Arc<dyn Fn(EndpointId) + Send + Sync>,
 }
 
 pub(crate) struct ConnectionManager {
@@ -50,6 +55,14 @@ impl ConnectionManager {
 
     /// Install the daemon-wide mesh dispatch context. Called once by
     /// `Daemon` right after it is built.
+    /// Invoke the composition-root peer-connected hook (no-op before dispatch
+    /// is installed). Called by each `MeshConnection` as its run loop starts.
+    pub(crate) fn notify_peer_connected(&self, peer: EndpointId) {
+        if let Some(mesh) = self.mesh.get() {
+            (mesh.on_peer_connected)(peer);
+        }
+    }
+
     pub(crate) fn set_mesh_dispatch(&self, dispatch: MeshDispatch) {
         let _ = self.mesh.set(dispatch);
     }

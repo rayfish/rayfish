@@ -300,15 +300,21 @@ async fn build_daemon(
                     // without touching the registry.
                     ProviderMessage::GetManyRequestReceivedNotify(msg) => {
                         let mut updates = msg.rx;
-                        tokio::spawn(async move { while let Ok(Some(_)) = updates.recv().await {} });
+                        tokio::spawn(
+                            async move { while let Ok(Some(_)) = updates.recv().await {} },
+                        );
                     }
                     ProviderMessage::PushRequestReceivedNotify(msg) => {
                         let mut updates = msg.rx;
-                        tokio::spawn(async move { while let Ok(Some(_)) = updates.recv().await {} });
+                        tokio::spawn(
+                            async move { while let Ok(Some(_)) = updates.recv().await {} },
+                        );
                     }
                     ProviderMessage::ObserveRequestReceivedNotify(msg) => {
                         let mut updates = msg.rx;
-                        tokio::spawn(async move { while let Ok(Some(_)) = updates.recv().await {} });
+                        tokio::spawn(
+                            async move { while let Ok(Some(_)) = updates.recv().await {} },
+                        );
                     }
                     _ => {}
                 }
@@ -469,6 +475,34 @@ async fn build_daemon(
     protocol_router.set_mesh_dispatch(MeshDispatch {
         ctx: registry.mesh_ctx(),
         token: token.clone(),
+        on_peer_connected: {
+            // Deliver queued `ray send` offers the moment their peer connects.
+            let files = files.clone();
+            Arc::new(move |peer| {
+                let files = files.clone();
+                tokio::spawn(async move { files.flush_outbox_for(peer).await });
+            })
+        },
+    });
+    // Slow safety net for offers whose delivery failed transiently while the
+    // peer connection stayed up (the connect hook won't refire until the peer
+    // reconnects). `outbox_peers` only yields currently connected peers, so
+    // this never dials into the void.
+    tokio::spawn({
+        let files = files.clone();
+        let token = token.clone();
+        async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => return,
+                    _ = tokio::time::sleep(file_service::OUTBOX_SWEEP_INTERVAL) => {}
+                }
+                for peer in files.outbox_peers() {
+                    let files = files.clone();
+                    tokio::spawn(async move { files.flush_outbox_for(peer).await });
+                }
+            }
+        }
     });
     // The Router owns the endpoint accept loop and dispatches by ALPN. It aborts on
     // drop, so the Daemon owns it for the process lifetime and shuts it down on exit.

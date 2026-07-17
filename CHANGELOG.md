@@ -33,6 +33,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Linux (glibc and musl) and macOS on every change. rayfish.xyz serves a copy of
   this file, and its CI fails if the two drift apart.
 
+- **`ray send` no longer blocks, and sending to an offline device just works.**
+  The command returns as soon as the daemon has the file: if the peer is
+  connected the offer goes out immediately, otherwise it is queued and delivered
+  automatically the moment the device comes back online (sends survive a daemon
+  restart). Queued sends show up in `ray files` and can be dropped with
+  `ray files cancel <id>`. Previously `ray send` sat silent for as long as the
+  dial took and failed outright if the peer was offline.
+- **`ray send` takes multiple files.** `ray send <peer> <file> <file> ...` sends
+  each one; a failure on one file doesn't stop the rest.
+
+### Changed
+
+- **`ray send` argument order flipped** to make room for multiple files: it is
+  now `ray send <peer> <files...>` (was `ray send <file> <peer>`). The `--json`
+  output of `ray files` is now an object with `pending` (inbound offers) and
+  `queued` (outbound sends) arrays instead of a bare array.
+
 ### Fixed
 
 - **`ray send` now works from Documents, Desktop, and other protected folders on

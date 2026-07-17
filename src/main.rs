@@ -317,12 +317,13 @@ pub(crate) enum Command {
         /// Username or numeric UID to grant operator access
         user: String,
     },
-    /// Send a file to a peer
+    /// Send one or more files to a peer (queued if the peer is offline)
     Send {
-        /// File path to send
-        file: String,
-        /// Peer hostname or short ID
+        /// Peer hostname, mesh IP, or short ID
         peer: String,
+        /// File paths to send
+        #[arg(required = true)]
+        files: Vec<String>,
     },
     /// Manage incoming file transfers
     Files {
@@ -690,6 +691,11 @@ pub(crate) enum FilesAction {
         /// Output directory (default: ~/Downloads)
         #[arg(long, short)]
         output: Option<String>,
+    },
+    /// Cancel a queued send that hasn't reached its peer yet
+    Cancel {
+        /// Queued-send ID (from 'ray files')
+        id: u64,
     },
     /// Toggle auto-accepting file transfers from your own paired devices on a
     /// network (`on` also drains any already-queued offers from your devices;
@@ -1060,7 +1066,7 @@ async fn main() -> Result<()> {
         Command::AutoUpdate { state } => cmd_auto_update(&state).await,
         Command::Config { action } => cmd_config(action, cli.json).await,
         Command::SetOperator { user } => cmd_set_operator(&user).await,
-        Command::Send { file, peer } => ipc_send_file(&file, &peer).await,
+        Command::Send { peer, files } => ipc_send_files(&files, &peer).await,
         Command::Files { action } => ipc_files(action).await,
         Command::Pair { action, ticket } => cmd_pair(action, ticket).await,
         Command::Unpair { device } => ipc_unpair(&device).await,

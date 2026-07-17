@@ -179,6 +179,21 @@ impl TransferRegistry {
         }
     }
 
+    /// `fail_offer` addressed by `(hash, peer)` instead of registry id, for the
+    /// send outbox: a canceled queued send registered its transfer at enqueue
+    /// (see `register_send`'s ordering contract) and only knows the blob and
+    /// peer. Touches only the still-`Offered` entry, never a moving transfer.
+    pub fn fail_offer_by(&self, hash: Hash, peer: EndpointId) {
+        if let Some(e) = self.entries.lock().unwrap().values_mut().find(|e| {
+            e.info.outgoing
+                && e.hash == Some(hash)
+                && e.peer_id == Some(peer)
+                && e.info.state == TransferState::Offered
+        }) {
+            finish_entry(e, false, Some(FailureKind::Offer));
+        }
+    }
+
     /// A peer started pulling a blob. If the only entry for this `(hash, peer)`
     /// pair already finished as `Failed` from an aborted pull (not an offer that
     /// never reached the peer, see [`FailureKind`]), and it failed recently
@@ -298,7 +313,11 @@ fn finish_entry(e: &mut Entry, ok: bool, failure: Option<FailureKind>) {
 /// registered as an outgoing file send (a roster blob fetch, say) or for a peer
 /// that never received this exact offer, which is how both get ignored: a hash
 /// alone is not enough to identify who a send actually went to.
-fn oldest_live_outgoing(entries: &HashMap<u64, Entry>, hash: Hash, peer: EndpointId) -> Option<u64> {
+fn oldest_live_outgoing(
+    entries: &HashMap<u64, Entry>,
+    hash: Hash,
+    peer: EndpointId,
+) -> Option<u64> {
     entries
         .values()
         .filter(|e| e.hash == Some(hash) && e.peer_id == Some(peer) && e.finished_at.is_none())
@@ -326,7 +345,8 @@ fn oldest_revivable_outgoing(
                 && e.peer_id == Some(peer)
                 && e.info.state == TransferState::Failed
                 && e.failure == Some(FailureKind::Abort)
-                && e.finished_at.is_some_and(|at| now.duration_since(at) < TERMINAL_TTL)
+                && e.finished_at
+                    .is_some_and(|at| now.duration_since(at) < TERMINAL_TTL)
         })
         .map(|e| e.info.id)
         .min()
@@ -418,7 +438,11 @@ mod tests {
         let list = reg.list();
         let entry_a = list.iter().find(|t| t.id == to_a).unwrap();
         let entry_b = list.iter().find(|t| t.id == to_b).unwrap();
-        assert_eq!(entry_a.state, TransferState::Offered, "A's entry must be untouched by B's pull");
+        assert_eq!(
+            entry_a.state,
+            TransferState::Offered,
+            "A's entry must be untouched by B's pull"
+        );
         assert_eq!(entry_b.state, TransferState::Done);
     }
 
@@ -436,7 +460,11 @@ mod tests {
         reg.provider_started(hash(1), stranger);
         reg.provider_finished(hash(1), stranger, true);
 
-        assert_eq!(reg.list()[0].state, TransferState::Offered, "id {id} must be unaffected");
+        assert_eq!(
+            reg.list()[0].state,
+            TransferState::Offered,
+            "id {id} must be unaffected"
+        );
     }
 
     #[test]
@@ -517,7 +545,11 @@ mod tests {
         let a_entry = list.iter().find(|t| t.id == first).unwrap();
         let b_entry = list.iter().find(|t| t.id == second).unwrap();
         assert_eq!(a_entry.state, TransferState::Done);
-        assert_eq!(b_entry.state, TransferState::Offered, "the second offer is untouched");
+        assert_eq!(
+            b_entry.state,
+            TransferState::Offered,
+            "the second offer is untouched"
+        );
     }
 
     #[test]
@@ -554,10 +586,18 @@ mod tests {
         reg.provider_finished(hash(1), a, true);
 
         let list = reg.list();
-        assert_eq!(list.len(), 2, "the finished first send is still listed alongside the new one");
+        assert_eq!(
+            list.len(),
+            2,
+            "the finished first send is still listed alongside the new one"
+        );
         let a = list.iter().find(|t| t.id == first).unwrap();
         let b = list.iter().find(|t| t.id == second).unwrap();
-        assert_eq!(a.state, TransferState::Done, "the first send must not be reopened");
+        assert_eq!(
+            a.state,
+            TransferState::Done,
+            "the first send must not be reopened"
+        );
         assert_eq!(b.state, TransferState::Done);
     }
 
