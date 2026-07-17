@@ -147,6 +147,10 @@ fn if_index(name: &str) -> Option<NonZeroU32> {
 #[derive(Clone, Default)]
 pub struct ExitServer {
     nets: Arc<ArcSwap<HashMap<SmolStr, Allow>>>,
+    /// The gateway's own addresses, refused as transit destinations: a packet to
+    /// one of them would be local-delivered by the kernel, reaching this host's
+    /// services without ever passing its rayfish inbound firewall.
+    self_addrs: Arc<ArcSwap<HashSet<IpAddr>>>,
 }
 
 /// Who may route out through us on one network.
@@ -170,6 +174,18 @@ impl ExitServer {
             .load()
             .get(network)
             .is_some_and(|a| a.any || a.users.contains(user))
+    }
+
+    /// Whether `dst` is one of the gateway's own addresses (so transit to it must
+    /// be refused; see `self_addrs`).
+    pub fn is_self_addr(&self, dst: IpAddr) -> bool {
+        self.self_addrs.load().contains(&dst)
+    }
+
+    /// Replace the set of the gateway's own addresses. Refreshed on every
+    /// reconcile ([`apply_os`](Self::apply_os)) from the host's interfaces.
+    pub fn set_self_addrs(&self, addrs: HashSet<IpAddr>) {
+        self.self_addrs.store(Arc::new(addrs));
     }
 
     /// Whether we currently offer an exit node on any network (drives whether the
@@ -227,6 +243,7 @@ impl ExitServer {
     pub fn apply_os(&self, tun_name: &str) -> Option<String> {
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         if self.is_active() {
+            self.set_self_addrs(host_addresses());
             if let Err(e) = enable(tun_name) {
                 disable();
                 self.clear();
@@ -258,6 +275,43 @@ impl ExitServer {
 /// (it routes an overlay destination to its peer long before considering transit),
 /// but this is the whole answer to "may we forward this?", so it should not depend
 /// on its caller having already checked.
+/// Every address configured on this host's interfaces, asked of the OS
+/// (`ip -o addr` on Linux, `ifconfig -a` on the BSDs). Best-effort: an empty set
+/// on failure, which only costs the self-address transit refusal its input (the
+/// LAN/loopback refusals in [`is_transitable`] do not depend on it).
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+fn host_addresses() -> HashSet<IpAddr> {
+    #[cfg(target_os = "linux")]
+    let out = Command::new("ip").args(["-o", "addr", "show"]).output();
+    #[cfg(not(target_os = "linux"))]
+    let out = Command::new("ifconfig").arg("-a").output();
+    match out {
+        Ok(out) if out.status.success() => {
+            parse_host_addresses(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => HashSet::new(),
+    }
+}
+
+/// Pull the addresses out of `ip -o addr show` or `ifconfig -a` output: any token
+/// following an `inet`/`inet6` keyword, with the Linux `/prefix` and BSD `%zone`
+/// suffixes stripped.
+fn parse_host_addresses(out: &str) -> HashSet<IpAddr> {
+    let mut addrs = HashSet::new();
+    let mut tokens = out.split_whitespace().peekable();
+    while let Some(tok) = tokens.next() {
+        if tok != "inet" && tok != "inet6" {
+            continue;
+        }
+        let Some(raw) = tokens.peek() else { break };
+        let addr = raw.split(['/', '%']).next().unwrap_or(raw);
+        if let Ok(ip) = addr.parse::<IpAddr>() {
+            addrs.insert(ip);
+        }
+    }
+    addrs
+}
+
 pub fn is_transitable(dst: IpAddr) -> bool {
     if is_overlay_ip(dst) {
         return false;
@@ -570,7 +624,44 @@ pub fn teardown_client_routing() {}
 /// table is replaced wholesale). Linux only.
 #[cfg(target_os = "linux")]
 pub fn install_client_routing(tun_name: &str) -> Result<()> {
+    // The conntrack-mark table loads first: nothing routes into the tunnel until
+    // the `ip rule`s below go in, but the moment they do, an inbound connection's
+    // replies depend on this table already restoring the mark. Loading it after
+    // the rules would open a window (or, on a mid-way failure, a permanent state)
+    // where an SSH session to this host's public IP is routed into the tunnel and
+    // cut.
+    //
+    // Connections opened from outside the tunnel keep answering out the interface
+    // they arrived on. `prerouting` tags the conntrack entry of anything arriving on
+    // a non-TUN interface (and marks the packet itself, so the reverse-path check
+    // resolves against `main`); `output` restores that mark on the locally-generated
+    // replies, and `type route` forces a re-route once it is set.
+    //
+    // The tag is deliberately unconditional rather than `ct state new`: a connection
+    // that was already established when the tunnel came up would otherwise keep a
+    // ctmark of 0, its replies would go out the tunnel, and it would be cut. Marking
+    // every inbound packet picks those up on their next packet instead. Re-marking a
+    // connection is idempotent, and traffic this node originates never reaches this
+    // chain (iroh's underlay sockets already carry the same mark via `SO_MARK`).
     let mark = format!("{SOCKET_MARK:#x}");
+    nft_load(&format!(
+        "{reset}\
+         table inet {t} {{\n\
+         \tchain prerouting {{\n\
+         \t\ttype filter hook prerouting priority mangle; policy accept;\n\
+         \t\tiifname \"{tun}\" return\n\
+         \t\tct mark set {mark}\n\
+         \t\tmeta mark set {mark}\n\
+         \t}}\n\
+         \tchain output {{\n\
+         \t\ttype route hook output priority mangle; policy accept;\n\
+         \t\tct mark {mark} meta mark set {mark}\n\
+         \t}}\n\
+         }}\n",
+        reset = drop_table(CLIENT_TABLE),
+        t = CLIENT_TABLE,
+        tun = tun_name,
+    ))?;
     for family in ["-4", "-6"] {
         run_ip(&[
             family, "route", "replace", "default", "dev", tun_name, "table", EXIT_TABLE,
@@ -608,36 +699,6 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
             PREF_TUNNEL,
         ])?;
     }
-    // Connections opened from outside the tunnel keep answering out the interface
-    // they arrived on. `prerouting` tags the conntrack entry of anything arriving on
-    // a non-TUN interface (and marks the packet itself, so the reverse-path check
-    // resolves against `main`); `output` restores that mark on the locally-generated
-    // replies, and `type route` forces a re-route once it is set.
-    //
-    // The tag is deliberately unconditional rather than `ct state new`: a connection
-    // that was already established when the tunnel came up would otherwise keep a
-    // ctmark of 0, its replies would go out the tunnel, and it would be cut. Marking
-    // every inbound packet picks those up on their next packet instead. Re-marking a
-    // connection is idempotent, and traffic this node originates never reaches this
-    // chain (iroh's underlay sockets already carry the same mark via `SO_MARK`).
-    nft_load(&format!(
-        "{reset}\
-         table inet {t} {{\n\
-         \tchain prerouting {{\n\
-         \t\ttype filter hook prerouting priority mangle; policy accept;\n\
-         \t\tiifname \"{tun}\" return\n\
-         \t\tct mark set {mark}\n\
-         \t\tmeta mark set {mark}\n\
-         \t}}\n\
-         \tchain output {{\n\
-         \t\ttype route hook output priority mangle; policy accept;\n\
-         \t\tct mark {mark} meta mark set {mark}\n\
-         \t}}\n\
-         }}\n",
-        reset = drop_table(CLIENT_TABLE),
-        t = CLIENT_TABLE,
-        tun = tun_name,
-    ))?;
     tracing::info!(
         tun = tun_name,
         "exit-node client full-tunnel routing installed"
@@ -1162,6 +1223,31 @@ mod tests {
         assert!(!v4_only.contains("inet6"));
         // With no uplink at all there is nothing to be a gateway for.
         assert!(nat_rules(None, None).is_none());
+    }
+
+    #[test]
+    fn host_address_parser_reads_ip_and_ifconfig_output() {
+        // `ip -o addr show` (Linux)
+        let linux = "\
+1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever
+2: eth0    inet 51.15.20.7/24 brd 51.15.20.255 scope global eth0\\       valid_lft forever preferred_lft forever
+2: eth0    inet6 2001:bc8:710:d1::1/64 scope global \\       valid_lft forever preferred_lft forever
+2: eth0    inet6 fe80::1c:2ff:fe33:4455/64 scope link \\       valid_lft forever preferred_lft forever";
+        let addrs = parse_host_addresses(linux);
+        assert!(addrs.contains(&"51.15.20.7".parse().unwrap()));
+        assert!(addrs.contains(&"2001:bc8:710:d1::1".parse().unwrap()));
+        assert!(addrs.contains(&"127.0.0.1".parse().unwrap()));
+
+        // `ifconfig -a` (macOS/FreeBSD), including a zone-suffixed link-local.
+        let mac = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.168.1.5 netmask 0xffffff00 broadcast 192.168.1.255
+\tinet6 fe80::8aa:bbcc:ddee:ff00%en0 prefixlen 64 secured scopeid 0xb
+\tinet6 2a01:cb00:11:2200:1:2:3:4 prefixlen 64 autoconf secured";
+        let addrs = parse_host_addresses(mac);
+        assert!(addrs.contains(&"192.168.1.5".parse().unwrap()));
+        assert!(addrs.contains(&"2a01:cb00:11:2200:1:2:3:4".parse().unwrap()));
+        assert!(addrs.contains(&"fe80::8aa:bbcc:ddee:ff00".parse().unwrap()));
     }
 
     #[test]

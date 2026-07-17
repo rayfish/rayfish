@@ -27,8 +27,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   interface); the `allow` / advertise / `status` surface is cross-platform. An
   exit node is strictly an *internet* gateway: it forwards to
   globally-routable addresses only, so permitting a peer to route out through you
-  never also hands it your private LAN, your loopback, or your cloud instance
-  metadata service.
+  never also hands it your private LAN, your loopback, your cloud instance
+  metadata service, or services on the gateway host itself.
   Backward compatible on the wire: peers on the previous release stay connected,
   they just cannot offer or discover exit nodes until they update (an old
   coordinator ignores the exit-node advertisement, so offers on its networks do

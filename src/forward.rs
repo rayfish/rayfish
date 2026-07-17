@@ -252,13 +252,17 @@ pub(crate) fn evaluate_inbound(
     // is not for a mesh host at all. Forward it to the TUN (where the kernel NATs
     // it out) only if we offer this sender an exit node on this network *and* the
     // destination is one the internet could reach anyway ([`is_transitable`]: not
-    // our LAN, loopback, or link-local/metadata). Otherwise drop it, so a non-exit
-    // node never leaks a peer's traffic and an exit offer never doubles as a way
-    // into the gateway's own network. `peer_id` is already the sender's user
+    // our LAN, loopback, or link-local/metadata) *and* not one of this host's own
+    // addresses (the kernel would local-deliver those, skipping this firewall).
+    // Otherwise drop it, so a non-exit node never leaks a peer's traffic and an
+    // exit offer never doubles as a way into the gateway's own network or the
+    // gateway host itself. `peer_id` is already the sender's user
     // identity, matching the allow-list. The normal inbound firewall is bypassed:
     // this is transit, not traffic addressed to us.
     if !is_overlay_ip(info.dst_ip) {
-        let permitted = exit.server.allows(network, peer_id) && is_transitable(info.dst_ip);
+        let permitted = exit.server.allows(network, peer_id)
+            && is_transitable(info.dst_ip)
+            && !exit.server.is_self_addr(info.dst_ip);
         return if permitted {
             InboundDecision::Accept
         } else {
@@ -1269,6 +1273,46 @@ mod tests {
         assert!(matches!(
             evaluate_inbound(
                 &make_public_packet(),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::Accept
+        ));
+    }
+
+    #[test]
+    fn exit_transit_refuses_the_gateways_own_public_ip() {
+        // The gateway's own public address is globally routable, but a packet
+        // transited to it is local-delivered by the gateway's kernel, reaching its
+        // services without ever passing its rayfish inbound firewall. Refused: an
+        // exit offer is a way to the internet, not into the gateway host.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = SharedFirewall::new(firewall::FirewallConfig::default()); // deny inbound
+        let exit = no_exit();
+        exit.server
+            .reload([("test-net", vec![peer.to_string()].as_slice())]);
+        exit.server
+            .set_self_addrs([IpAddr::from([93, 184, 216, 34])].into());
+        assert!(matches!(
+            evaluate_inbound(
+                &make_packet_to([93, 184, 216, 34]),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::DropExit
+        ));
+        // A neighboring public destination still transits.
+        assert!(matches!(
+            evaluate_inbound(
+                &make_packet_to([93, 184, 216, 35]),
                 &fw,
                 &exit,
                 &peer,
