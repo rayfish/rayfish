@@ -35,6 +35,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ray send` now works from Documents, Desktop, and other protected folders on
+  macOS, and for files only your user can read.** The CLI used to hand the daemon
+  a path and the daemon (running as root) did the read, which failed with
+  `Operation not permitted` in TCC-protected folders (the daemon has no Full Disk
+  Access, and root does not bypass TCC) and quietly meant the daemon would read
+  anything root could. `ray send` now opens the file itself, with your own
+  permissions, and passes the open file descriptor to the daemon over the IPC
+  socket (SCM_RIGHTS), so the daemon never touches a path on your behalf. An
+  updated CLI still falls back to the old path-based request when talking to a
+  daemon that predates this.
+
 - **`ray send` now works with relative paths.** The path was resolved by the
   daemon, whose working directory is not the caller's, so `ray send ./file peer`
   failed with `No such file or directory` even though the file was right there.
