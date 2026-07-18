@@ -897,7 +897,15 @@ impl Daemon {
     /// install is never reported as plain success.
     pub(crate) async fn reconcile_exit_node(&self, resp: IpcMessage) -> IpcMessage {
         if !self.active.load(Ordering::SeqCst) {
-            return resp;
+            // Data plane on standby: persisted but not in effect until `ray up`.
+            // (When the data plane is up we fall through and apply it now, so the
+            // reply must not claim `ray up` is needed.)
+            return match resp {
+                IpcMessage::Ok { message } => IpcMessage::Ok {
+                    message: format!("{message} (takes effect on `ray up`)"),
+                },
+                other => other,
+            };
         }
         match (self.apply_exit_node().await, resp) {
             (Some(warning), IpcMessage::Ok { message }) => IpcMessage::Ok {
