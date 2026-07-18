@@ -718,10 +718,12 @@ pub(crate) enum ExitNodeAction {
         /// Exit peer (hostname / mesh IP / short id)
         peer: String,
     },
-    /// Stop routing through an exit node on a network (restore direct egress).
+    /// Stop routing through an exit node (restore direct egress). With no
+    /// network, clears the exit selection on every network that has one.
+    #[command(visible_aliases = ["off", "disable"])]
     None {
-        /// Network name
-        network: String,
+        /// Network name (omit to clear every network's exit selection)
+        network: Option<String>,
     },
     /// Show exit-node state: this node's offer + selection, and available peers.
     #[command(visible_aliases = ["ls", "list", "show"])]

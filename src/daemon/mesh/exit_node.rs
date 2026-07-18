@@ -88,10 +88,7 @@ impl NetworkRegistry {
         // else on `ray up`). Advertising on config alone would let peers select a
         // gateway that blackholes them.
         let detail = if allow {
-            format!(
-                "exit-node allow {peer} on {network} (this node now offers exit; \
-                 activate with `ray up`)"
-            )
+            format!("exit-node allow {peer} on {network} (this node now offers exit)")
         } else if offering {
             format!("exit-node disallow {peer} on {network}")
         } else {
@@ -135,10 +132,8 @@ impl NetworkRegistry {
             return ipc_err(format!("failed to persist network config: {e}"));
         }
         let message = match &peer {
-            Some(name) => {
-                format!("routing all traffic through {name} on {network} (activate with `ray up`)")
-            }
-            None => format!("direct egress restored on {network} (activate with `ray up`)"),
+            Some(name) => format!("routing all traffic through {name} on {network}"),
+            None => format!("direct egress restored on {network}"),
         };
         IpcMessage::Ok { message }
     }
@@ -214,6 +209,15 @@ impl NetworkRegistry {
             });
         }
         self.exit_selection_pending.store(false, Ordering::Relaxed);
+        match &selection {
+            Some(s) => tracing::info!(
+                network = %s.network,
+                peer_user = %s.peer_user.fmt_short(),
+                ipv4 = %s.ipv4,
+                "exit selection active (return traffic from this peer will be admitted)"
+            ),
+            None => tracing::debug!("exit selection cleared (direct egress)"),
+        }
         self.exit_client.set(selection);
         None
     }

@@ -4,6 +4,11 @@
 use crate::*;
 
 pub(crate) async fn ipc_exit_node(action: ExitNodeAction) -> Result<()> {
+    // `none`/`off`/`disable` with no network clears every network that has a
+    // selection, resolved client-side so the daemon keeps its per-network API.
+    if let ExitNodeAction::None { network: None } = &action {
+        return clear_all_exit_selections().await;
+    }
     let req = match action {
         ExitNodeAction::Allow { network, peer } => ipc::IpcMessage::ExitNodeAllow {
             network,
@@ -20,7 +25,7 @@ pub(crate) async fn ipc_exit_node(action: ExitNodeAction) -> Result<()> {
             peer: Some(peer),
         },
         ExitNodeAction::None { network } => ipc::IpcMessage::ExitNodeUse {
-            network,
+            network: network.expect("bare `none` handled above"),
             peer: None,
         },
         ExitNodeAction::Status { network } => ipc::IpcMessage::ExitNodeStatus { network },
@@ -33,6 +38,50 @@ pub(crate) async fn ipc_exit_node(action: ExitNodeAction) -> Result<()> {
         ipc::IpcMessage::ExitNodeState { networks } => render_exit_node_state(networks),
         ipc::IpcMessage::Error { message } => print_error("exit-node", &message, None),
         other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+/// Clear the exit selection on every network that currently has one. Queries
+/// status first, then sends one `none` per active network. No-op with a friendly
+/// note when nothing is routed through an exit.
+async fn clear_all_exit_selections() -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(&mut stream, ipc::IpcMessage::ExitNodeStatus { network: None }).await?;
+    let active: Vec<String> = match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::ExitNodeState { networks } => networks
+            .into_iter()
+            .filter(|n| n.using.is_some())
+            .map(|n| n.network)
+            .collect(),
+        ipc::IpcMessage::Error { message } => {
+            print_error("exit-node", &message, None);
+            return Ok(());
+        }
+        other => {
+            eprintln!("Unexpected response: {:?}", other);
+            return Ok(());
+        }
+    };
+    if active.is_empty() {
+        println!("no exit node in use");
+        return Ok(());
+    }
+    for network in active {
+        let mut s = ipc::connect().await?;
+        ipc::send(
+            &mut s,
+            ipc::IpcMessage::ExitNodeUse {
+                network,
+                peer: None,
+            },
+        )
+        .await?;
+        match ipc::recv(&mut s).await? {
+            ipc::IpcMessage::Ok { message } => println!("{message}"),
+            ipc::IpcMessage::Error { message } => print_error("exit-node", &message, None),
+            other => eprintln!("Unexpected response: {:?}", other),
+        }
     }
     Ok(())
 }
