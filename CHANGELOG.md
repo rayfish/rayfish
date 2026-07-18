@@ -24,7 +24,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   IP and the SSH session you turn the tunnel on from survives it. Offering an
   exit node works on Linux (nftables), macOS and FreeBSD (pf); using one works on
   Linux (fwmark loop-prevention) and macOS (sockets pinned to the physical
-  interface); the `allow` / advertise / `status` surface is cross-platform. An
+  interface); the `allow` / advertise / `status` surface is cross-platform.
+  Traffic routed through an exit node whose packets exceed what a single QUIC
+  datagram can carry on the peer's path (common over a relayed link) now gets a
+  path-MTU signal (ICMP "fragmentation needed" / "packet too big") back to the
+  sender so it shrinks to fit, instead of being silently dropped. An
   exit node is strictly an *internet* gateway: it forwards to
   globally-routable addresses only, so permitting a peer to route out through you
   never also hands it your private LAN, your loopback, your cloud instance
