@@ -1405,8 +1405,16 @@ async fn broadcast_control_msg(
     network_name: &str,
     msg: &ControlMsg,
 ) {
-    for (_id, _ip, conn) in peers.peers_for_network_with_conn(network_name) {
-        let _ = open_and_send(&conn, Some(net_pubkey), msg).await;
+    let targets = peers.peers_for_network_with_conn(network_name);
+    tracing::debug!(
+        network = %network_name,
+        peers = targets.len(),
+        "broadcasting control message"
+    );
+    for (_id, ip, conn) in targets {
+        if let Err(e) = open_and_send(&conn, Some(net_pubkey), msg).await {
+            tracing::warn!(peer_ip = %ip, error = %e, "failed to send control message");
+        }
     }
 }
 
@@ -1605,6 +1613,449 @@ mod accept_handler_tests {
         // AcceptHandler exposes whether it is the coordinator variant.
         assert!(!sample_member_handler().await.is_coordinator());
         assert!(sample_coordinator_handler().await.is_coordinator());
+    }
+
+    #[tokio::test]
+    async fn exit_offer_is_recorded_by_every_handler_role() {
+        // `ExitNodeOffer` must be handled identically by both accept-handler
+        // roles: it once reached only the Member dispatch, so a plain
+        // coordinator (the one node that can record the offer on the signed
+        // roster) silently discarded it and no exit node was ever advertised.
+        use crate::membership::{Member, derive_ip};
+        for handler in [sample_coordinator_handler().await, sample_member_handler().await] {
+            let (registry, state) = match &handler {
+                AcceptHandler::Coordinator(s) => (s.ctx.registry.clone(), s.state.clone()),
+                AcceptHandler::Member(s) => (s.ctx.registry.clone(), s.state.clone()),
+            };
+            // Hold the network key (recording needs it) and list the sender.
+            let sender = SecretKey::from_bytes(&[9u8; 32]).public();
+            {
+                let mut s = state.write().unwrap();
+                s.network_secret_key = Some(SecretKey::from_bytes(&[1u8; 32]));
+                s.members
+                    .add(Member {
+                        identity: sender,
+                        ip: derive_ip(&sender),
+                        is_coordinator: false,
+                        hostname: None,
+                        user_identity: None,
+                        device_cert: None,
+                        collision_index: 0,
+                        last_seen: None,
+                        exit_node: false,
+                    })
+                    .unwrap();
+            }
+            let (disconnect_tx, _disconnect_rx) = mpsc::channel(1);
+            registry.networks.insert(
+                "test-net".to_string(),
+                NetworkHandle {
+                    name: "test-net".to_string(),
+                    network_key: state.read().unwrap().network_public_key,
+                    role: NetworkRole::Coordinator,
+                    my_ip: Ipv4Addr::new(100, 64, 0, 1),
+                    state: state.clone(),
+                    dht_notify: None,
+                    cancel: CancellationToken::new(),
+                    tasks: Vec::new(),
+                    invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    disconnect_tx,
+                },
+            );
+            assert!(
+                handler.handle_common(sender, &ControlMsg::ExitNodeOffer { enabled: true }),
+                "ExitNodeOffer must be consumed by the role-independent dispatch"
+            );
+            // The recording runs off the demux loop; wait for it to land.
+            let mut recorded = false;
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let done = state
+                    .read()
+                    .unwrap()
+                    .members
+                    .get(&sender)
+                    .is_some_and(|m| m.exit_node);
+                if done {
+                    recorded = true;
+                    break;
+                }
+            }
+            assert!(
+                recorded,
+                "exit offer not recorded (coordinator variant: {})",
+                handler.is_coordinator()
+            );
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exit_offer_over_the_wire_reaches_the_coordinator_roster() {
+        // End-to-end replication of the original bug: a member opens a real mesh
+        // connection to a coordinator and sends `ExitNodeOffer` over it. The frame
+        // has to travel through the connection demux into the coordinator's
+        // recording path and flip the member's roster `exit_node` flag. Before the
+        // fix the coordinator's accept handler dropped the frame on its catch-all,
+        // so nothing was recorded and no exit node was ever advertised.
+        use crate::membership::{Member, derive_ip};
+        use iroh::endpoint::presets;
+        use iroh::{Endpoint, RelayMode, SecretKey};
+
+        let alpn = transport::mesh_alpn();
+
+        // Coordinator (accepts) and member (dials), on loopback with relay
+        // disabled for a deterministic direct connection.
+        let coord_key = SecretKey::from_bytes(&[7u8; 32]);
+        let coord_id = coord_key.public();
+        let coord_ep = Endpoint::builder(presets::N0)
+            .secret_key(coord_key)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let member_ep = Endpoint::builder(presets::N0)
+            .secret_key(SecretKey::from_bytes(&[8u8; 32]))
+            .alpns(vec![alpn.clone()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let member_id = member_ep.id();
+
+        // Coordinator registry holding the network key, member already in roster.
+        let tmp = tempfile::tempdir().unwrap();
+        let blob_store = FsStore::load(tmp.path()).await.unwrap();
+        let registry = sample_registry(
+            coord_ep.clone(),
+            IrohIdentityProvider::new(coord_id, 0),
+            blob_store.clone(),
+            coord_id,
+        );
+        let state = make_network_state();
+        let net_pubkey = state.read().unwrap().network_public_key;
+        {
+            let mut s = state.write().unwrap();
+            s.network_secret_key = Some(SecretKey::from_bytes(&[1u8; 32]));
+            s.members
+                .add(Member {
+                    identity: member_id,
+                    ip: derive_ip(&member_id),
+                    is_coordinator: false,
+                    hostname: None,
+                    user_identity: None,
+                    device_cert: None,
+                    collision_index: 0,
+                    last_seen: None,
+                    exit_node: false,
+                })
+                .unwrap();
+        }
+        let (disconnect_tx, _drx) = mpsc::channel(1);
+        registry.networks.insert(
+            "test-net".to_string(),
+            NetworkHandle {
+                name: "test-net".to_string(),
+                network_key: net_pubkey,
+                role: NetworkRole::Coordinator,
+                my_ip: Ipv4Addr::new(100, 64, 0, 1),
+                state: state.clone(),
+                dht_notify: None,
+                cancel: CancellationToken::new(),
+                tasks: Vec::new(),
+                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                disconnect_tx,
+            },
+        );
+
+        // Connection manager wired with the coordinator accept handler + dispatch,
+        // both pointing at the same registry the frame must mutate.
+        let connmgr = Arc::new(ConnectionManager::new());
+        connmgr.set_mesh_dispatch(MeshDispatch {
+            ctx: sample_mesh_ctx(
+                IrohIdentityProvider::new(coord_id, 0),
+                blob_store.clone(),
+                registry.clone(),
+            ),
+            token: CancellationToken::new(),
+        });
+        connmgr.register(
+            net_pubkey,
+            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
+                ctx: sample_mesh_ctx(
+                    IrohIdentityProvider::new(coord_id, 0),
+                    blob_store.clone(),
+                    registry.clone(),
+                ),
+                network_name: "test-net".to_string(),
+                state: state.clone(),
+                dht_notify: None,
+                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+            })),
+        );
+
+        // Coordinator accepts and drives the demux; member dials.
+        let coord_addr = coord_ep.addr();
+        let accept = {
+            let coord_ep = coord_ep.clone();
+            let cm = connmgr.clone();
+            tokio::spawn(async move {
+                let conn = coord_ep
+                    .accept()
+                    .await
+                    .expect("incoming")
+                    .await
+                    .expect("accept connection");
+                cm.drive_mesh_connection(conn, false).await;
+            })
+        };
+        let conn = member_ep
+            .connect(coord_addr, &alpn)
+            .await
+            .expect("member dials coordinator");
+
+        // Member advertises its exit-node offer over the wire.
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        control::send_msg(
+            &mut send,
+            Some(net_pubkey),
+            &ControlMsg::ExitNodeOffer { enabled: true },
+        )
+        .await
+        .unwrap();
+
+        // The coordinator's roster must reflect the offer.
+        let mut recorded = false;
+        for _ in 0..300 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if state
+                .read()
+                .unwrap()
+                .members
+                .get(&member_id)
+                .is_some_and(|m| m.exit_node)
+            {
+                recorded = true;
+                break;
+            }
+        }
+        accept.abort();
+        assert!(
+            recorded,
+            "coordinator did not record the member's exit-node offer received over the wire"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sync_exit_offers_delivers_over_the_retained_connection() {
+        // Full replication of the live failure: an offering member runs the real
+        // `sync_exit_offers` and the coordinator's roster must end up flagged.
+        // The member delivers over its retained mesh connection (the one the
+        // ConnectionManager owns); the earlier bug dialed a throwaway connection
+        // and dropped it, so the frame never flushed and the coordinator's
+        // roster never changed even though the sender logged "delivered".
+        use crate::membership::{Member, derive_ip, derive_ipv6};
+        use iroh::endpoint::presets;
+        use iroh::{Endpoint, RelayMode, SecretKey};
+
+        let alpn = transport::mesh_alpn();
+        let net_secret = SecretKey::from_bytes(&[1u8; 32]);
+        let net_pubkey = net_secret.public();
+
+        let coord_key = SecretKey::from_bytes(&[7u8; 32]);
+        let coord_id = coord_key.public();
+        let coord_ip = derive_ip(&coord_id);
+        let coord_ep = Endpoint::builder(presets::N0)
+            .secret_key(coord_key)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let member_key = SecretKey::from_bytes(&[8u8; 32]);
+        let member_id = member_key.public();
+        let member_ip = derive_ip(&member_id);
+        let member_ep = Endpoint::builder(presets::N0)
+            .secret_key(member_key)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+
+        // A roster both sides share: the coordinator (key holder) and the member.
+        let roster = || {
+            vec![
+                Member {
+                    identity: coord_id,
+                    ip: coord_ip,
+                    is_coordinator: true,
+                    hostname: None,
+                    user_identity: None,
+                    device_cert: None,
+                    collision_index: 0,
+                    last_seen: None,
+                    exit_node: false,
+                },
+                Member {
+                    identity: member_id,
+                    ip: member_ip,
+                    is_coordinator: false,
+                    hostname: None,
+                    user_identity: None,
+                    device_cert: None,
+                    collision_index: 0,
+                    last_seen: None,
+                    exit_node: false,
+                },
+            ]
+        };
+
+        // --- Coordinator side: holds the key, drives the demux. ---
+        let coord_tmp = tempfile::tempdir().unwrap();
+        let coord_blobs = FsStore::load(coord_tmp.path()).await.unwrap();
+        let coord_reg = sample_registry(
+            coord_ep.clone(),
+            IrohIdentityProvider::new(coord_id, 0),
+            coord_blobs.clone(),
+            coord_id,
+        );
+        let coord_state = make_network_state();
+        {
+            let mut s = coord_state.write().unwrap();
+            s.network_secret_key = Some(net_secret.clone());
+            s.members = MemberList::from_members(roster());
+        }
+        let (ctx_tx, _ctx_rx) = mpsc::channel(1);
+        coord_reg.networks.insert(
+            "test-net".to_string(),
+            NetworkHandle {
+                name: "test-net".to_string(),
+                network_key: net_pubkey,
+                role: NetworkRole::Coordinator,
+                my_ip: coord_ip,
+                state: coord_state.clone(),
+                dht_notify: None,
+                cancel: CancellationToken::new(),
+                tasks: Vec::new(),
+                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                disconnect_tx: ctx_tx,
+            },
+        );
+        let connmgr = Arc::new(ConnectionManager::new());
+        connmgr.set_mesh_dispatch(MeshDispatch {
+            ctx: sample_mesh_ctx(
+                IrohIdentityProvider::new(coord_id, 0),
+                coord_blobs.clone(),
+                coord_reg.clone(),
+            ),
+            token: CancellationToken::new(),
+        });
+        connmgr.register(
+            net_pubkey,
+            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
+                ctx: sample_mesh_ctx(
+                    IrohIdentityProvider::new(coord_id, 0),
+                    coord_blobs.clone(),
+                    coord_reg.clone(),
+                ),
+                network_name: "test-net".to_string(),
+                state: coord_state.clone(),
+                dht_notify: None,
+                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+            })),
+        );
+        let accept = {
+            let coord_ep = coord_ep.clone();
+            let cm = connmgr.clone();
+            tokio::spawn(async move {
+                let conn = coord_ep
+                    .accept()
+                    .await
+                    .expect("incoming")
+                    .await
+                    .expect("accept connection");
+                cm.drive_mesh_connection(conn, false).await;
+            })
+        };
+
+        // --- Member side: offers an exit, holds a retained connection to coord. ---
+        let member_tmp = tempfile::tempdir().unwrap();
+        let member_blobs = FsStore::load(member_tmp.path()).await.unwrap();
+        let member_reg = sample_registry(
+            member_ep.clone(),
+            IrohIdentityProvider::new(member_id, 0),
+            member_blobs.clone(),
+            member_id,
+        );
+        let member_state = make_network_state();
+        {
+            let mut s = member_state.write().unwrap();
+            s.network_secret_key = None; // plain member
+            s.members = MemberList::from_members(roster());
+        }
+        let (mtx, _mrx) = mpsc::channel(1);
+        member_reg.networks.insert(
+            "test-net".to_string(),
+            NetworkHandle {
+                name: "test-net".to_string(),
+                network_key: net_pubkey,
+                role: NetworkRole::Member,
+                my_ip: member_ip,
+                state: member_state.clone(),
+                dht_notify: None,
+                cancel: CancellationToken::new(),
+                tasks: Vec::new(),
+                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                disconnect_tx: mtx,
+            },
+        );
+        // Offering an exit, and the data plane is up so sync is enabled.
+        member_reg
+            .exit_server
+            .reload([("test-net", ["*".to_string()].as_slice())]);
+        member_reg
+            .exit_sync_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // The member dials the coordinator and retains the connection in its
+        // PeerTable, exactly like the live daemon keeps its coordinator link.
+        let member_conn = member_ep
+            .connect(coord_ep.addr(), &alpn)
+            .await
+            .expect("member dials coordinator");
+        member_reg.peers.add(
+            coord_ip,
+            derive_ipv6(&coord_id),
+            member_conn.clone(),
+            coord_id,
+            "test-net",
+        );
+
+        // Run the real reconcile: it must deliver the offer over the retained link.
+        member_reg.sync_exit_offers().await;
+
+        let mut recorded = false;
+        for _ in 0..300 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if coord_state
+                .read()
+                .unwrap()
+                .members
+                .get(&member_id)
+                .is_some_and(|m| m.exit_node)
+            {
+                recorded = true;
+                break;
+            }
+        }
+        accept.abort();
+        assert!(
+            recorded,
+            "sync_exit_offers did not get the offer recorded on the coordinator over the retained connection"
+        );
     }
 
     #[test]
