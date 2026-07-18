@@ -389,6 +389,19 @@ impl ExitClient {
             .is_some_and(|s| &s.peer_user == peer_user)
     }
 
+    /// Whether return traffic arriving from a peer whose verified mesh IPv4 is
+    /// `peer_v4` is our own exit-node return traffic. The sender's mesh IPv4 is
+    /// resolved by the reader from our own roster (so it cannot be forged) and is
+    /// the same whatever family the reply packet is, which makes it a more robust
+    /// match than the resolved user identity (a device-vs-user-key mismatch would
+    /// wrongly reject every reply). Matches by identity *or* IPv4.
+    pub fn is_return_from(&self, peer_user: &EndpointId, peer_v4: Ipv4Addr) -> bool {
+        self.inner
+            .load()
+            .as_ref()
+            .is_some_and(|s| &s.peer_user == peer_user || s.ipv4 == peer_v4)
+    }
+
     /// Set (or with `None`, clear) the exit selection.
     pub fn set(&self, selection: Option<ExitSelection>) {
         self.inner.store(selection.map(Arc::new));

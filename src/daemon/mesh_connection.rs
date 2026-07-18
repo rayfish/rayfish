@@ -101,7 +101,24 @@ impl MeshConnection {
             // a peer on a build that predates the idle close code is held open, never
             // flapped. Recomputed each iteration because the peer registers its
             // capability just after connect and the clock advances as traffic flows.
+            // Never idle-close the selected exit peer: it carries all our
+            // internet traffic, and an internet-bound packet cannot lazily
+            // re-dial it (the destination is not a roster member), so a reaped
+            // exit link blackholes until the next reconverge. Keep it warm.
+            let is_exit_peer = self
+                .ctx
+                .registry
+                .exit_client
+                .selection()
+                .and_then(|s| {
+                    self.ctx
+                        .peers
+                        .v4_for_id(&self.peer_id)
+                        .map(|v4| v4 == s.ipv4)
+                })
+                .unwrap_or(false);
             let sleep_for = (self.ctx.registry.on_demand
+                && !is_exit_peer
                 && self.ctx.peers.supports_idle_close(&self.peer_id))
             .then(|| {
                 self.ctx
