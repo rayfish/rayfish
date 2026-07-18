@@ -611,6 +611,25 @@ pub(crate) async fn send_over_route(
         }
         return;
     }
+    // PMTUD: if the packet (plus its tag) is larger than a single datagram can
+    // carry on this peer's current path, tell the source to lower its path MTU
+    // (ICMP "packet too big") instead of dropping into a blackhole. Injecting the
+    // reply into our own TUN makes the local kernel shrink the flow and resend a
+    // packet that fits. Common under an exit-node full tunnel: bulk internet
+    // traffic over a relayed peer whose datagram budget is below the 1280 TUN MTU.
+    // Not gated on `reject_enabled`: this is required PMTU signaling, not an
+    // opt-in fail-fast reject.
+    if let Some(max) = route.conn.max_datagram_size()
+        && n + TAG_LEN > max
+    {
+        let inner_mtu = max.saturating_sub(TAG_LEN) as u16;
+        tracing::debug!(dst = %info.dst_ip, len = n, max, inner_mtu, "packet too big for datagram; signalling PMTU");
+        if let Some(reply) = crate::reject::build_packet_too_big(&pkt, info, inner_mtu) {
+            let _ = tun_tx.send(reply).await;
+        }
+        stats.record_drop(DropReason::PacketTooBig);
+        return;
+    }
     // Drop-newest at the application boundary: if the peer's QUIC datagram send
     // buffer is too full to accept this packet (plus its tag) without evicting an
     // already-queued (older) one, drop the *new* packet here instead of calling
