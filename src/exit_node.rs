@@ -69,6 +69,13 @@ pub fn set_full_tunnel(on: bool) -> bool {
     FULL_TUNNEL.swap(on, Ordering::AcqRel)
 }
 
+/// Whether a full tunnel (an exit-node selection) is currently active. Read by
+/// the macOS DNS configurator to decide whether to route *all* DNS through Magic
+/// DNS (so name resolution goes out via the exit) or only `.ray` (split DNS).
+pub fn full_tunnel_active() -> bool {
+    FULL_TUNNEL.load(Ordering::Acquire)
+}
+
 /// The configurator iroh runs on every socket it opens (both underlay UDP sockets
 /// and the relay's TCP connection), before bind/connect and again on every rebind.
 ///

@@ -62,7 +62,7 @@ pub async fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigura
     #[cfg(target_os = "macos")]
     {
         let _ = tun_name;
-        let configurator = MacosDynamicStoreDns;
+        let configurator = MacosDynamicStoreDns::new();
         configurator.apply().await?;
         return Ok(Box::new(configurator));
     }
@@ -255,6 +255,15 @@ mod macos {
         for name in network_names {
             match_domains.push(CFString::new(name));
         }
+        // Full tunnel (an exit node is selected): become the default resolver for
+        // *all* queries too. An empty match domain is macOS's catch-all: it makes
+        // our resolver handle everything not matched more specifically, so name
+        // resolution is forwarded upstream *through the tunnel* (from the daemon)
+        // instead of leaking out the physical link, where macOS scopes the query
+        // and it never traverses the exit. Split (.ray only) when no exit is up.
+        if crate::exit_node::full_tunnel_active() {
+            match_domains.push(CFString::new(""));
+        }
         let match_val = CFArray::from_CFTypes(&match_domains);
 
         let search_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSSearchDomains) };
@@ -276,7 +285,54 @@ mod macos {
         Ok(())
     }
 
-    pub struct MacosDynamicStoreDns;
+    /// Read the system's current default-resolver upstreams from `scutil --dns`,
+    /// so a full-tunnel catch-all can forward non-`.ray` queries to them. Captured
+    /// once, before we install our own config, so we never capture ourselves.
+    /// `resolver #1` is macOS's primary (default) resolver; skip our magic IP.
+    fn capture_system_upstreams() -> Vec<std::net::Ipv4Addr> {
+        let out = std::process::Command::new("scutil")
+            .arg("--dns")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let magic: std::net::Ipv4Addr = super::RESOLVER_IP.parse().unwrap();
+        let mut ups = Vec::new();
+        let mut in_first = false;
+        for line in out.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("resolver #") {
+                // Stop once we pass the first resolver block; take only #1.
+                if in_first {
+                    break;
+                }
+                in_first = rest.trim() == "1";
+                continue;
+            }
+            if in_first
+                && t.starts_with("nameserver[")
+                && let Some(ip) = t.split(':').nth(1).and_then(|s| s.trim().parse().ok())
+                && ip != magic
+                && !ups.contains(&ip)
+            {
+                ups.push(ip);
+            }
+        }
+        ups
+    }
+
+    pub struct MacosDynamicStoreDns {
+        captured: Vec<std::net::Ipv4Addr>,
+    }
+
+    impl MacosDynamicStoreDns {
+        pub fn new() -> Self {
+            Self {
+                captured: capture_system_upstreams(),
+            }
+        }
+    }
 
     #[async_trait]
     impl DnsConfigurator for MacosDynamicStoreDns {
@@ -285,9 +341,14 @@ mod macos {
             write_dns_config(&[DNS_DOMAIN.to_string()], &[])?;
             tracing::info!(
                 key = SC_DNS_KEY,
-                "configured macOS DNS via SCDynamicStore for .{DNS_DOMAIN}"
+                full_tunnel = crate::exit_node::full_tunnel_active(),
+                "configured macOS DNS via SCDynamicStore"
             );
             Ok(())
+        }
+
+        fn captured_upstreams(&self) -> Vec<std::net::Ipv4Addr> {
+            self.captured.clone()
         }
 
         async fn revert(&self) -> Result<()> {
