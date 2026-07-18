@@ -237,14 +237,29 @@ pub(crate) fn evaluate_inbound(
         // (It is on-path for our real flows and can forge within them, as any
         // gateway or ISP can; that is what TLS is for. Reaching a service we never
         // dialed is a different matter, and it can't.)
-        let exit_return = exit.client.is_return_traffic(peer_id)
+        let dst_is_me = match info.dst_ip {
+            IpAddr::V4(v4) => v4 == exit.my_v4,
+            IpAddr::V6(v6) => v6 == exit.my_v6,
+        };
+        let exit_return = exit.client.is_return_from(peer_id, peer_ip)
             && !is_overlay_ip(info.src_ip)
             && is_transitable(info.src_ip)
-            && match info.dst_ip {
-                IpAddr::V4(v4) => v4 == exit.my_v4,
-                IpAddr::V6(v6) => v6 == exit.my_v6,
-            };
+            && dst_is_me;
         if !exit_return {
+            // A non-overlay source is a would-be exit-node reply: log why the
+            // exemption did not fire so a broken return path is diagnosable.
+            if !is_overlay_ip(info.src_ip) {
+                tracing::debug!(
+                    src = %info.src_ip,
+                    dst = %info.dst_ip,
+                    is_return = exit.client.is_return_from(peer_id, peer_ip),
+                    transitable = is_transitable(info.src_ip),
+                    dst_is_me,
+                    peer_ip = %peer_ip,
+                    my_v4 = %exit.my_v4,
+                    "exit-return exemption did not fire; dropping as spoofed"
+                );
+            }
             return InboundDecision::DropSpoof;
         }
     }
@@ -1457,9 +1472,11 @@ mod tests {
     #[test]
     fn exit_return_traffic_from_wrong_peer_is_spoof() {
         // A public-sourced packet from a peer that is NOT our exit peer gets no
-        // relaxation and is dropped as spoofed.
+        // relaxation and is dropped as spoofed. The wrong peer has its own mesh IP
+        // (two peers never share one), so neither the identity nor the IP match.
         let exit_peer = iroh::SecretKey::generate().public();
         let other = iroh::SecretKey::generate().public();
+        let other_ip = Ipv4Addr::new(100, 64, 0, 9);
         let fw = SharedFirewall::new(firewall::FirewallConfig::default());
         let exit = exit_via(exit_peer);
         assert!(matches!(
@@ -1468,11 +1485,43 @@ mod tests {
                 &fw,
                 &exit,
                 &other,
-                TEST_V4,
+                other_ip,
                 TEST_V6,
                 "test-net"
             ),
             InboundDecision::DropSpoof
+        ));
+    }
+
+    #[test]
+    fn exit_return_traffic_accepted_by_ip_when_identity_differs() {
+        // Regression: the exemption must admit return traffic from our exit peer
+        // even when the sender's resolved user identity does not match the
+        // selection's (a device-vs-user-key mismatch). The verified mesh IPv4 the
+        // reader resolves for the sender is the robust match, and it is the exit
+        // peer's IP whatever family the reply is. Without the IP match every reply
+        // from the exit node was dropped as spoofed and traffic never flowed.
+        let selected_user = iroh::SecretKey::generate().public();
+        let arriving_user = iroh::SecretKey::generate().public(); // resolves differently
+        let fw = SharedFirewall::new(firewall::FirewallConfig::default());
+        let exit = no_exit();
+        exit.client.set(Some(crate::exit_node::ExitSelection {
+            peer_user: selected_user,
+            ipv4: TEST_V4, // the exit peer's mesh IPv4
+            network: SmolStr::new("test-net"),
+        }));
+        open_flow_to_internet(&fw, &arriving_user);
+        assert!(matches!(
+            evaluate_inbound(
+                &make_return_packet(MY_V4),
+                &fw,
+                &exit,
+                &arriving_user, // identity does NOT match selection.peer_user
+                TEST_V4,        // but the verified mesh IP does
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::Accept
         ));
     }
 
