@@ -24,8 +24,10 @@ pub(crate) struct DnsService {
     pub(crate) reverse_table: dns::ReverseLookupTable,
     /// In-daemon Magic DNS resolver (answers `.ray` queries intercepted via TUN).
     pub(crate) resolver: std::sync::Arc<crate::dns::resolver::Resolver>,
-    /// The system-DNS configurator owned while active, so `revert` can undo it.
-    configurator: Arc<std::sync::Mutex<Option<Box<dyn dns_config::DnsConfigurator>>>>,
+    /// The system-DNS configurator owned while active, so `revert` can undo it and
+    /// `reassert_os_config` can re-apply it. `Arc` (not `Box`) so a re-apply can
+    /// clone it out and run without holding the lock across the await.
+    configurator: Arc<std::sync::Mutex<Option<Arc<dyn dns_config::DnsConfigurator>>>>,
     /// Cancellation token for the `run_resolv_reassert` task (Linux direct mode).
     reassert_token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
 }
@@ -87,7 +89,7 @@ impl DnsService {
                 let search = c.search_domains();
                 tracing::info!(backend = c.name(), resolver_ip = %crate::dns::MAGIC_DNS_V4, upstreams = ?upstreams, "Magic DNS active");
                 self.resolver.set_upstreams(upstreams);
-                *self.configurator.lock().unwrap() = Some(c);
+                *self.configurator.lock().unwrap() = Some(Arc::from(c));
                 // In direct mode, re-assert /etc/resolv.conf the instant another
                 // program (NetworkManager, dhclient) overwrites it (inotify watch).
                 #[cfg(target_os = "linux")]
@@ -105,6 +107,21 @@ impl DnsService {
                     "failed to configure system DNS, so .ray names won't resolve: {e}"
                 ));
             }
+        }
+    }
+
+    /// Re-apply the current OS-DNS configuration in place (no re-detect, no
+    /// re-capture of upstreams). Called when the exit-node full-tunnel state flips
+    /// so the macOS configurator rewrites its match domains: catch-all (route all
+    /// DNS through Magic DNS, forwarded upstream via the tunnel) while an exit is
+    /// up, `.ray`-only split DNS otherwise. No-op if DNS was never configured.
+    pub(crate) async fn reassert_os_config(&self) {
+        // Clone the Arc out, not the guard, so the lock isn't held across await.
+        let configurator = self.configurator.lock().unwrap().clone();
+        if let Some(configurator) = configurator
+            && let Err(e) = configurator.apply().await
+        {
+            tracing::warn!(error = %e, "failed to re-apply system DNS after exit-node change");
         }
     }
 

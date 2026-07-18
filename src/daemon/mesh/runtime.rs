@@ -959,21 +959,51 @@ impl Daemon {
     /// while up, or teardown when no tunnel was installed).
     #[cfg(target_os = "macos")]
     async fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
-        if !self.registry.exit_client.is_active() {
+        let result = if !self.registry.exit_client.is_active() {
             tun::unroute_default_via_tun(tun_name).await;
             if crate::exit_node::set_full_tunnel(false) {
                 self.transport.endpoint.network_change().await;
             }
-            return None;
+            None
+        } else {
+            // Establish the connection to the exit peer *before* pinning sockets
+            // and installing the tunnel: a cold selection would otherwise dial the
+            // exit peer over the routes it is about to become, so the dial gets
+            // captured by the tunnel it is meant to carry and blackholes until a
+            // manual `ray ping`. Warming it first (over the still-unpinned socket)
+            // lets the pin keep the live connection off the tunnel.
+            self.warm_exit_peer().await;
+            if !crate::exit_node::set_full_tunnel(true) {
+                self.transport.endpoint.network_change().await;
+            }
+            self.route_default_or_rollback(tun_name).await
+        };
+        // Re-apply system DNS to match the now-settled full-tunnel state: route
+        // *all* DNS through Magic DNS while the tunnel is up (so resolution goes
+        // out via the exit), split `.ray`-only otherwise.
+        self.dns.reassert_os_config().await;
+        result
+    }
+
+    /// Dial the selected exit peer so its mesh connection is live before the full
+    /// tunnel pins sockets. Idempotent (a no-op when already connected).
+    #[cfg(target_os = "macos")]
+    async fn warm_exit_peer(&self) {
+        if let Some(sel) = self.registry.exit_client.selection()
+            && let Some(target) = self.registry.resolve_route(IpAddr::V4(sel.ipv4))
+        {
+            self.registry.dial_target(&target).await;
         }
-        if !crate::exit_node::set_full_tunnel(true) {
-            self.transport.endpoint.network_change().await;
-        }
+    }
+
+    /// Install the split default routes into the TUN, rolling the full-tunnel pin
+    /// back on failure so a partial install (one family in, the other not) does
+    /// not blackhole traffic.
+    #[cfg(target_os = "macos")]
+    async fn route_default_or_rollback(&self, tun_name: &str) -> Option<String> {
         match tun::route_default_via_tun(tun_name).await {
             Ok(()) => None,
             Err(e) => {
-                // A partial install (one family in, the other not) would blackhole
-                // traffic: roll the routes and the pin all the way back.
                 tun::unroute_default_via_tun(tun_name).await;
                 if crate::exit_node::set_full_tunnel(false) {
                     self.transport.endpoint.network_change().await;
