@@ -200,6 +200,12 @@ pub(crate) async fn reconverge_and_apply(
             device_cert,
         )
         .await;
+        // Re-sync the exit-offer flag on this path too. An offer broadcast can
+        // miss entirely (activation at boot races the first peer connections;
+        // every coordinator offline), and a missed offer never changes the blob,
+        // so the apply path below would never run and the offer would stay
+        // invisible forever. Quiet no-op when the flag already matches.
+        registry.sync_exit_offers().await;
         return;
     }
     let Some(data) =
@@ -279,6 +285,19 @@ pub(crate) async fn reconverge_and_apply(
         device_cert,
     )
     .await;
+    // Re-advertise the exit offer if the fresh roster disagrees with what we
+    // actually offer. This is the retry that makes the offer survive a missed
+    // broadcast: reconverges run exactly when a connection (re)forms (the
+    // "reconnected" trigger), so a sync here reaches a live coordinator, unlike
+    // the activation-time one, which can fire before any network is connected
+    // and go to zero peers. Quiet no-op when the flag already matches.
+    registry.sync_exit_offers().await;
+    if registry
+        .exit_selection_pending
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        registry.exit_reapply.notify_one();
+    }
     tracing::info!(network = %network_name, "reconverged from signed record");
 }
 
@@ -464,6 +483,14 @@ pub(crate) fn spawn_group_poller(
                 _ = token.cancelled() => break,
                 _ = tick.tick() => {},
             }
+
+            // Re-advertise the exit offer if the signed roster still disagrees
+            // with what this node actually offers. Delivery can miss entirely
+            // (activation at boot runs before the network is registered; every
+            // coordinator unreachable), and a missed offer never changes the
+            // blob, so no reconverge trigger would ever heal it. Quiet local
+            // no-op when the flag already matches.
+            registry.sync_exit_offers().await;
 
             let current_hash = {
                 let s = state.read().unwrap();

@@ -230,21 +230,35 @@ impl NetworkRegistry {
     /// re-advertise.
     pub(crate) async fn sync_exit_offers(&self) {
         if !self.exit_sync_enabled.load(Ordering::Relaxed) {
+            tracing::debug!("exit offer sync disabled (data plane down); skipping");
             return;
         }
-        let self_id = self.transport.endpoint.id();
-        let user_id = self.device_user_map.resolve(&self_id);
         let names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
         for name in names {
-            let advertised = [self_id, user_id]
-                .into_iter()
-                .find_map(|id| self.roster_member(&name, id))
-                .is_some_and(|m| m.exit_node);
-            let offering = self.exit_server.is_offering(&name);
-            if advertised != offering {
+            if self.exit_offer_out_of_sync(&name) {
+                let offering = self.exit_server.is_offering(&name);
+                tracing::debug!(network = %name, offering, "exit offer out of sync; publishing");
                 self.publish_exit_offer(&name, offering).await;
             }
         }
+    }
+
+    /// Whether `network`'s signed roster disagrees with what this node actually
+    /// offers right now: the condition [`Self::sync_exit_offers`] publishes on.
+    /// Cheap (two map reads), so it also gates the reconverge worker's backstop
+    /// tick, which is the retry that heals a delivery that missed every
+    /// coordinator. Always false while the data plane is down.
+    pub(crate) fn exit_offer_out_of_sync(&self, network: &str) -> bool {
+        if !self.exit_sync_enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let self_id = self.transport.endpoint.id();
+        let user_id = self.device_user_map.resolve(&self_id);
+        let advertised = [self_id, user_id]
+            .into_iter()
+            .find_map(|id| self.roster_member(network, id))
+            .is_some_and(|m| m.exit_node);
+        advertised != self.exit_server.is_offering(network)
     }
 
     /// Report exit-node state per network: this node's own allow list + selection,
@@ -277,11 +291,23 @@ impl NetworkRegistry {
 
     /// Advertise this node's exit-node offer to the network. If we hold the
     /// network key we record it on our own roster entry and republish the signed
-    /// blob directly; either way we broadcast [`ControlMsg::ExitNodeOffer`] so any
-    /// online coordinator records it. If no coordinator is reachable the offer is
-    /// simply not yet visible to peers, and re-advertises on the next change.
+    /// blob directly. Otherwise we deliver [`ControlMsg::ExitNodeOffer`] to the
+    /// coordinator set over each coordinator's **retained** mesh connection (the
+    /// daemon keeps a connection to every saved network for its lifetime).
+    ///
+    /// The connection has to be one the [`ConnectionManager`] owns, not a
+    /// locally-held dial: a control frame is written on a fresh bidirectional
+    /// stream and only flushes while its connection stays open, so sending over a
+    /// connection this function owns and then drops cuts the stream off before
+    /// the bytes reach the coordinator (the sender sees a clean `Ok` while the
+    /// coordinator never receives the frame, the bug this replaced). A coordinator
+    /// with no live connection right now (an idle-closed on-demand link) is
+    /// skipped; [`Self::sync_exit_offers`] retries on the backstop / group-poll
+    /// cadence, and the reconnect loop re-establishes the link, so a later pass
+    /// delivers.
     async fn publish_exit_offer(&self, network: &str, enabled: bool) {
         let self_id = self.transport.endpoint.id();
+        let user_id = self.device_user_map.resolve(&self_id);
         let (net_pubkey, is_coordinator) = match self.networks.get(network) {
             Some(h) => {
                 let s = h.state.read().unwrap();
@@ -289,16 +315,49 @@ impl NetworkRegistry {
             }
             None => return,
         };
+        tracing::debug!(network = %network, enabled, is_coordinator, "advertising exit offer");
         if is_coordinator {
             self.record_exit_offer(network, self_id, enabled).await;
+            return;
         }
-        broadcast_control_msg(
-            &self.peers,
-            net_pubkey,
-            network,
-            &ControlMsg::ExitNodeOffer { enabled },
-        )
-        .await;
+        let coordinators: Vec<Member> = self
+            .roster(network)
+            .into_iter()
+            .filter(|m| m.is_coordinator && m.identity != self_id && m.identity != user_id)
+            .collect();
+        if coordinators.is_empty() {
+            tracing::debug!(network = %network, "no coordinator in roster to deliver exit offer to; will retry");
+            return;
+        }
+        for m in coordinators {
+            // Reuse the live, ConnectionManager-owned link. Never a connection we
+            // dial and own here: it would be dropped before the frame flushes.
+            let Some(conn) = self.peers.conn_for_ip(&m.ip) else {
+                tracing::debug!(
+                    network = %network,
+                    coordinator = %m.identity.fmt_short(),
+                    "no live connection to coordinator to deliver exit offer; will retry"
+                );
+                continue;
+            };
+            if let Err(e) =
+                open_and_send(&conn, Some(net_pubkey), &ControlMsg::ExitNodeOffer { enabled }).await
+            {
+                tracing::warn!(
+                    network = %network,
+                    coordinator = %m.identity.fmt_short(),
+                    error = %e,
+                    "failed to deliver exit offer to coordinator; will retry"
+                );
+            } else {
+                tracing::debug!(
+                    network = %network,
+                    coordinator = %m.identity.fmt_short(),
+                    enabled,
+                    "delivered exit offer to coordinator"
+                );
+            }
+        }
     }
 
     /// Coordinator side: record a member's exit-node offer on its signed roster
@@ -311,6 +370,7 @@ impl NetworkRegistry {
             Some(h) => {
                 let mut s = h.state.write().unwrap();
                 if s.network_secret_key.is_none() {
+                    tracing::debug!(network = %network, "exit offer received but we hold no network key; ignoring");
                     return;
                 }
                 // The roster keys a member by its own identity, which for a paired
@@ -320,6 +380,11 @@ impl NetworkRegistry {
                     .into_iter()
                     .find(|id| s.members.get(id).is_some())
                 else {
+                    tracing::warn!(
+                        network = %network,
+                        sender = %sender.fmt_short(),
+                        "exit offer from a peer the roster does not list; ignoring"
+                    );
                     return;
                 };
                 match s.members.get_mut(&id) {
@@ -333,6 +398,13 @@ impl NetworkRegistry {
             }
             None => return,
         };
+        tracing::debug!(
+            network = %network,
+            sender = %sender.fmt_short(),
+            enabled,
+            changed,
+            "exit offer recorded"
+        );
         if changed {
             self.store_and_publish_group(network).await;
         }
