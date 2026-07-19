@@ -1008,20 +1008,53 @@ impl Daemon {
         let Some(conn) = self.registry.peers.conn_for_ip(&sel.ipv4) else {
             return;
         };
-        // Poll for a direct path rather than proceeding on the relay. Give up
-        // after ~6s and continue (the relay still works, just slower) so a peer
-        // that can't be reached directly doesn't hang the command forever.
-        for _ in 0..60 {
-            if conn.paths().iter().any(|p| p.is_ip()) {
-                tracing::debug!(peer = %sel.peer_user.fmt_short(), "exit peer on a direct path");
-                return;
+        // Wait (event-driven) until iroh opens a *direct* path, nudging the
+        // hole-punch with pings meanwhile: iroh only upgrades off the relay once
+        // there is traffic on the connection, which is why a manual `ray ping`
+        // was the fix. `paths_stream` wakes only on a real path change; the
+        // interval solely generates the traffic that drives the upgrade. Bounded
+        // by one timeout; on expiry we proceed on the (slower) relay.
+        use futures::StreamExt as _;
+        let mut paths = conn.paths_stream();
+        let got_direct = tokio::time::timeout(Duration::from_secs(8), async {
+            let mut nudge = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                tokio::select! {
+                    _ = nudge.tick() => self.nudge_holepunch(&conn).await,
+                    Some(list) = paths.next() => {
+                        if list.iter().any(|p| p.is_ip()) {
+                            break;
+                        }
+                    }
+                }
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        })
+        .await
+        .is_ok();
+        if got_direct {
+            tracing::debug!(peer = %sel.peer_user.fmt_short(), "exit peer on a direct path");
+        } else {
+            tracing::info!(
+                peer = %sel.peer_user.fmt_short(),
+                "exit peer still on the relay after 8s; proceeding (traffic will be slower)"
+            );
         }
-        tracing::info!(
-            peer = %sel.peer_user.fmt_short(),
-            "exit peer still on the relay after 6s; proceeding (traffic will be slower)"
-        );
+    }
+
+    /// Send one control ping purely to generate traffic on `conn`, so iroh
+    /// hole-punches a direct path instead of staying on the relay. The pong is
+    /// irrelevant here (`paths_stream` reports the upgrade), so the reply slot is
+    /// dropped after a brief wait.
+    #[cfg(target_os = "macos")]
+    async fn nudge_holepunch(&self, conn: &Connection) {
+        let nonce: u64 = rand::random();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.protocol_router.pending_pongs().insert(nonce, tx);
+        if let Ok((mut send, _)) = conn.open_bi().await {
+            let _ = control::send_msg(&mut send, None, &control::ControlMsg::Ping { nonce }).await;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(500), rx).await;
+        self.protocol_router.pending_pongs().remove(&nonce);
     }
 
     /// Resolve iroh's relay servers to their IPv4 addresses so they can be routed
