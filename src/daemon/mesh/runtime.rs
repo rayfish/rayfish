@@ -991,15 +991,37 @@ impl Daemon {
         result
     }
 
-    /// Dial the selected exit peer so its mesh connection is live before the full
-    /// tunnel pins sockets. Idempotent (a no-op when already connected).
+    /// Dial the selected exit peer and block until iroh has hole-punched a
+    /// **direct** path to it (or a few seconds pass), *before* the full tunnel
+    /// pins sockets. A fresh connection starts on the relay (100s of ms), which
+    /// stalls the first flows; waiting for the direct path here means
+    /// `ray exit-node use` only returns once traffic will actually be fast, and
+    /// the established direct path then survives the pin. Idempotent.
     #[cfg(target_os = "macos")]
     async fn warm_exit_peer(&self) {
-        if let Some(sel) = self.registry.exit_client.selection()
-            && let Some(target) = self.registry.resolve_route(IpAddr::V4(sel.ipv4))
-        {
+        let Some(sel) = self.registry.exit_client.selection() else {
+            return;
+        };
+        if let Some(target) = self.registry.resolve_route(IpAddr::V4(sel.ipv4)) {
             self.registry.dial_target(&target).await;
         }
+        let Some(conn) = self.registry.peers.conn_for_ip(&sel.ipv4) else {
+            return;
+        };
+        // Poll for a direct path rather than proceeding on the relay. Give up
+        // after ~6s and continue (the relay still works, just slower) so a peer
+        // that can't be reached directly doesn't hang the command forever.
+        for _ in 0..60 {
+            if conn.paths().iter().any(|p| p.is_ip()) {
+                tracing::debug!(peer = %sel.peer_user.fmt_short(), "exit peer on a direct path");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tracing::info!(
+            peer = %sel.peer_user.fmt_short(),
+            "exit peer still on the relay after 6s; proceeding (traffic will be slower)"
+        );
     }
 
     /// Resolve iroh's relay servers to their IPv4 addresses so they can be routed
