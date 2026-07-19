@@ -961,6 +961,7 @@ impl Daemon {
     async fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
         let result = if !self.registry.exit_client.is_active() {
             tun::unroute_default_via_tun(tun_name).await;
+            crate::exit_node::remove_relay_exclusions();
             if crate::exit_node::set_full_tunnel(false) {
                 self.transport.endpoint.network_change().await;
             }
@@ -973,6 +974,11 @@ impl Daemon {
             // manual `ray ping`. Warming it first (over the still-unpinned socket)
             // lets the pin keep the live connection off the tunnel.
             self.warm_exit_peer().await;
+            // Keep iroh's relay servers off the tunnel: the socket pin only covers
+            // direct QUIC, so a relay-routed exit link would otherwise be captured
+            // by the tunnel and die. Resolve them now, while DNS is still split.
+            let relay_ips = self.relay_underlay_ips().await;
+            crate::exit_node::exclude_relays_from_tunnel(&relay_ips);
             if !crate::exit_node::set_full_tunnel(true) {
                 self.transport.endpoint.network_change().await;
             }
@@ -994,6 +1000,36 @@ impl Daemon {
         {
             self.registry.dial_target(&target).await;
         }
+    }
+
+    /// Resolve iroh's relay servers to their IPv4 addresses so they can be routed
+    /// around the full tunnel. Resolved via the system resolver, so call this
+    /// while DNS is still split (before the tunnel's DNS catch-all goes in).
+    #[cfg(target_os = "macos")]
+    async fn relay_underlay_ips(&self) -> Vec<std::net::Ipv4Addr> {
+        // The configured relay set (custom override + n0 default fallback), the
+        // same the endpoint dials. Excluding the whole set (a handful of host
+        // routes) covers whichever relay it is actually homed on.
+        let relay_mode = config::load()
+            .ok()
+            .and_then(|c| crate::transport::build_relay_mode(&c.relay).ok().flatten())
+            .unwrap_or(iroh::RelayMode::Default);
+        let urls = relay_mode.relay_map().urls::<Vec<iroh::RelayUrl>>();
+        let mut ips = Vec::new();
+        for url in urls {
+            let Some(host) = url.host_str() else { continue };
+            let port = url.port_or_known_default().unwrap_or(443);
+            if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
+                for a in addrs {
+                    if let IpAddr::V4(v4) = a.ip()
+                        && !ips.contains(&v4)
+                    {
+                        ips.push(v4);
+                    }
+                }
+            }
+        }
+        ips
     }
 
     /// Install the split default routes into the TUN, rolling the full-tunnel pin

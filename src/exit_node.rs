@@ -146,6 +146,71 @@ fn if_index(name: &str) -> Option<NonZeroU32> {
     NonZeroU32::new(unsafe { libc::if_nametoindex(cname.as_ptr()) })
 }
 
+/// The physical default-route gateway, for host routes that must bypass the full
+/// tunnel.
+#[cfg(target_os = "macos")]
+fn default_gateway() -> Option<String> {
+    let out = Command::new("route")
+        .args(["-n", "get", "-inet", "default"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gateway:"))
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
+}
+
+/// Relay host routes installed to keep iroh's relay traffic off the full tunnel,
+/// tracked so teardown can remove exactly what it added.
+#[cfg(target_os = "macos")]
+static EXCLUDED_RELAY_IPS: std::sync::Mutex<Vec<Ipv4Addr>> = std::sync::Mutex::new(Vec::new());
+
+/// Route each relay server IP straight out the physical gateway so a
+/// relay-routed exit connection (one iroh has not yet hole-punched to a direct
+/// path, which the socket pin already protects) is not swallowed by the full
+/// tunnel it is meant to carry. A `/32` host route beats the `0/1`+`128/1` split
+/// default, so relay traffic bypasses the TUN. Idempotent; call before the tunnel
+/// routes go in, with IPs resolved while DNS is still split.
+#[cfg(target_os = "macos")]
+pub fn exclude_relays_from_tunnel(ips: &[Ipv4Addr]) {
+    let Some(gw) = default_gateway() else {
+        tracing::warn!("no default gateway; cannot keep relay traffic off the exit tunnel");
+        return;
+    };
+    let mut excluded = EXCLUDED_RELAY_IPS.lock().unwrap();
+    for ip in ips {
+        let s = ip.to_string();
+        let _ = Command::new("route")
+            .args(["-n", "delete", "-host", &s])
+            .status();
+        let ok = Command::new("route")
+            .args(["-n", "add", "-host", &s, &gw])
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false);
+        if ok && !excluded.contains(ip) {
+            excluded.push(*ip);
+        }
+    }
+    tracing::debug!(count = excluded.len(), %gw, "excluded relay IPs from the exit tunnel");
+}
+
+/// Remove the relay-exclusion host routes installed by
+/// [`exclude_relays_from_tunnel`].
+#[cfg(target_os = "macos")]
+pub fn remove_relay_exclusions() {
+    let mut excluded = EXCLUDED_RELAY_IPS.lock().unwrap();
+    for ip in excluded.drain(..) {
+        let _ = Command::new("route")
+            .args(["-n", "delete", "-host", &ip.to_string()])
+            .status();
+    }
+}
+
 /// Per-network allow policy for peers using this node as an exit node, consulted
 /// on the gateway's inbound data path (`forward::evaluate_inbound`). Cheap to clone
 /// (Arc-backed) and swapped wholesale whenever the allow-lists change. Empty until
