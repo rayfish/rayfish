@@ -215,25 +215,37 @@ fn default_gateway() -> Option<String> {
         .filter(|g| !g.is_empty())
 }
 
-/// Relay host routes installed to keep iroh's relay traffic off the full tunnel,
+/// Host routes installed to keep iroh's own underlay traffic off the full tunnel,
 /// tracked so teardown can remove exactly what it added.
 #[cfg(target_os = "macos")]
-static EXCLUDED_RELAY_IPS: std::sync::Mutex<Vec<Ipv4Addr>> = std::sync::Mutex::new(Vec::new());
+static EXCLUDED_IPS: std::sync::Mutex<Vec<Ipv4Addr>> = std::sync::Mutex::new(Vec::new());
 
-/// Route each relay server IP straight out the physical gateway so a
-/// relay-routed exit connection (one iroh has not yet hole-punched to a direct
-/// path, which the socket pin already protects) is not swallowed by the full
-/// tunnel it is meant to carry. A `/32` host route beats the `0/1`+`128/1` split
-/// default, so relay traffic bypasses the TUN. Idempotent; call before the tunnel
-/// routes go in, with IPs resolved while DNS is still split.
+/// Route each underlay IP straight out the physical gateway so iroh's own traffic
+/// is not swallowed by the full tunnel it is carrying. A `/32` host route beats the
+/// `0/1`+`128/1` split default, so it bypasses the TUN. Idempotent.
+///
+/// This, not the socket pin, is what actually keeps the transport alive. The pin
+/// only takes effect when iroh rebinds its sockets, and `Endpoint::network_change`
+/// merely asks the network monitor to re-evaluate: it rebinds only if the monitor
+/// decides the change was *major*, which a route-only change is not. So a live
+/// socket keeps using the routing table, and anything without a host route here
+/// goes into the tunnel and disappears.
+///
+/// Applies to the relay servers (resolved while DNS is still split) and to the exit
+/// peer's own direct addresses. IPv6 underlay addresses are not excluded yet, so a
+/// peer reachable only over IPv6 still falls back to the relay.
 #[cfg(target_os = "macos")]
-pub fn exclude_relays_from_tunnel(ips: &[Ipv4Addr]) {
+pub fn exclude_from_tunnel(ips: &[Ipv4Addr]) {
     let Some(gw) = default_gateway() else {
-        tracing::warn!("no default gateway; cannot keep relay traffic off the exit tunnel");
+        tracing::warn!("no default gateway; cannot keep iroh's traffic off the exit tunnel");
         return;
     };
-    let mut excluded = EXCLUDED_RELAY_IPS.lock().unwrap();
+    let mut excluded = EXCLUDED_IPS.lock().unwrap();
+    let mut added = 0;
     for ip in ips {
+        if excluded.contains(ip) {
+            continue;
+        }
         let s = ip.to_string();
         let _ = Command::new("route")
             .args(["-n", "delete", "-host", &s])
@@ -243,18 +255,20 @@ pub fn exclude_relays_from_tunnel(ips: &[Ipv4Addr]) {
             .status()
             .map(|st| st.success())
             .unwrap_or(false);
-        if ok && !excluded.contains(ip) {
+        if ok {
             excluded.push(*ip);
+            added += 1;
         }
     }
-    tracing::debug!(count = excluded.len(), %gw, "excluded relay IPs from the exit tunnel");
+    if added > 0 {
+        tracing::debug!(added, total = excluded.len(), %gw, "excluded IPs from the exit tunnel");
+    }
 }
 
-/// Remove the relay-exclusion host routes installed by
-/// [`exclude_relays_from_tunnel`].
+/// Remove the host routes installed by [`exclude_from_tunnel`].
 #[cfg(target_os = "macos")]
-pub fn remove_relay_exclusions() {
-    let mut excluded = EXCLUDED_RELAY_IPS.lock().unwrap();
+pub fn remove_tunnel_exclusions() {
+    let mut excluded = EXCLUDED_IPS.lock().unwrap();
     for ip in excluded.drain(..) {
         let _ = Command::new("route")
             .args(["-n", "delete", "-host", &ip.to_string()])
