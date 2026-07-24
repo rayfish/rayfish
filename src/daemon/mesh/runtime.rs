@@ -964,24 +964,32 @@ impl Daemon {
             crate::exit_node::remove_relay_exclusions();
             if crate::exit_node::set_full_tunnel(false) {
                 self.transport.endpoint.network_change().await;
+                // The rebind that releases the pin drops every direct path too.
+                self.nudge_all_peers();
             }
             None
         } else {
-            // Establish the connection to the exit peer *before* pinning sockets
-            // and installing the tunnel: a cold selection would otherwise dial the
-            // exit peer over the routes it is about to become, so the dial gets
-            // captured by the tunnel it is meant to carry and blackholes until a
-            // manual `ray ping`. Warming it first (over the still-unpinned socket)
-            // lets the pin keep the live connection off the tunnel.
-            self.warm_exit_peer().await;
             // Keep iroh's relay servers off the tunnel: the socket pin only covers
             // direct QUIC, so a relay-routed exit link would otherwise be captured
             // by the tunnel and die. Resolve them now, while DNS is still split.
             let relay_ips = self.relay_underlay_ips().await;
             crate::exit_node::exclude_relays_from_tunnel(&relay_ips);
+            // Pin and rebind *first*, then warm. `network_change` rebinds iroh's
+            // UDP socket to apply the pin, and a rebind is a new local socket: it
+            // kills every hole-punched path, so anything warmed beforehand is on
+            // the relay again a moment later. Warming after the rebind means the
+            // direct path is punched from the socket that will carry it.
             if !crate::exit_node::set_full_tunnel(true) {
                 self.transport.endpoint.network_change().await;
             }
+            // The rebind knocked *every* peer to the relay, not just the exit
+            // peer, and iroh only re-punches once traffic flows. Nudge them all
+            // in the background so the rest of the mesh (`ping <peer>`) is not
+            // dead for the minutes it takes an idle connection to notice.
+            self.nudge_all_peers();
+            // The exit peer itself is worth blocking on: it carries every packet
+            // from here on, and the routes go in the moment this returns.
+            self.warm_exit_peer().await;
             self.route_default_or_rollback(tun_name).await
         };
         // Re-apply system DNS to match the now-settled full-tunnel state: route
@@ -991,12 +999,29 @@ impl Daemon {
         result
     }
 
+    /// Nudge every live peer connection so it re-punches a direct path after the
+    /// full-tunnel rebind dropped it to the relay. Fire-and-forget (the mesh is
+    /// still reachable over the relay meanwhile); only the exit peer is worth
+    /// blocking on, which [`warm_exit_peer`](Self::warm_exit_peer) does.
+    #[cfg(target_os = "macos")]
+    fn nudge_all_peers(&self) {
+        let exit_ip = self.registry.exit_client.selection().map(|s| s.ipv4);
+        for (ip, conn) in self.registry.peers.all_connections() {
+            if Some(ip) == exit_ip {
+                continue; // warmed synchronously below
+            }
+            let router = self.protocol_router.clone();
+            tokio::spawn(async move { nudge_holepunch(&router, &conn).await });
+        }
+    }
+
     /// Dial the selected exit peer and block until iroh has hole-punched a
-    /// **direct** path to it (or a few seconds pass), *before* the full tunnel
-    /// pins sockets. A fresh connection starts on the relay (100s of ms), which
-    /// stalls the first flows; waiting for the direct path here means
-    /// `ray exit-node use` only returns once traffic will actually be fast, and
-    /// the established direct path then survives the pin. Idempotent.
+    /// **direct** path to it (or a few seconds pass), *after* the full tunnel has
+    /// pinned and rebound iroh's sockets (a rebind would otherwise throw the path
+    /// away) and *before* the default routes go in. A fresh connection starts on
+    /// the relay (100s of ms), which stalls the first flows; waiting for the
+    /// direct path here means `ray exit-node use` only returns once traffic will
+    /// actually be fast. Idempotent.
     #[cfg(target_os = "macos")]
     async fn warm_exit_peer(&self) {
         let Some(sel) = self.registry.exit_client.selection() else {
@@ -1020,7 +1045,7 @@ impl Daemon {
             let mut nudge = tokio::time::interval(Duration::from_millis(200));
             loop {
                 tokio::select! {
-                    _ = nudge.tick() => self.nudge_holepunch(&conn).await,
+                    _ = nudge.tick() => nudge_holepunch(&self.protocol_router, &conn).await,
                     Some(list) = paths.next() => {
                         if list.iter().any(|p| p.is_ip()) {
                             break;
@@ -1041,21 +1066,6 @@ impl Daemon {
         }
     }
 
-    /// Send one control ping purely to generate traffic on `conn`, so iroh
-    /// hole-punches a direct path instead of staying on the relay. The pong is
-    /// irrelevant here (`paths_stream` reports the upgrade), so the reply slot is
-    /// dropped after a brief wait.
-    #[cfg(target_os = "macos")]
-    async fn nudge_holepunch(&self, conn: &Connection) {
-        let nonce: u64 = rand::random();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.protocol_router.pending_pongs().insert(nonce, tx);
-        if let Ok((mut send, _)) = conn.open_bi().await {
-            let _ = control::send_msg(&mut send, None, &control::ControlMsg::Ping { nonce }).await;
-        }
-        let _ = tokio::time::timeout(Duration::from_millis(500), rx).await;
-        self.protocol_router.pending_pongs().remove(&nonce);
-    }
 
     /// Resolve iroh's relay servers to their IPv4 addresses so they can be routed
     /// around the full tunnel. Resolved via the system resolver, so call this
@@ -1201,4 +1211,20 @@ async fn apply_exit_server_os(
         Ok(warning) => warning,
         Err(e) => Some(format!("exit-node reconcile task failed: {e}")),
     }
+}
+
+/// Send one control ping purely to generate traffic on `conn`, so iroh
+/// hole-punches a direct path instead of staying on the relay. The pong is
+/// irrelevant here (the caller watches `paths_stream`, or does not care at all),
+/// so the reply slot is dropped after a brief wait.
+#[cfg(target_os = "macos")]
+async fn nudge_holepunch(router: &ProtocolRouter, conn: &Connection) {
+    let nonce: u64 = rand::random();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    router.pending_pongs().insert(nonce, tx);
+    if let Ok((mut send, _)) = conn.open_bi().await {
+        let _ = control::send_msg(&mut send, None, &control::ControlMsg::Ping { nonce }).await;
+    }
+    let _ = tokio::time::timeout(Duration::from_millis(500), rx).await;
+    router.pending_pongs().remove(&nonce);
 }
