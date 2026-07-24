@@ -972,7 +972,7 @@ impl Daemon {
     async fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
         let result = if !self.registry.exit_client.is_active() {
             tun::unroute_default_via_tun(tun_name).await;
-            crate::exit_node::remove_relay_exclusions();
+            crate::exit_node::remove_tunnel_exclusions();
             crate::exit_node::clear_physical_defaults();
             if crate::exit_node::set_full_tunnel(false) {
                 self.transport.endpoint.network_change().await;
@@ -981,11 +981,11 @@ impl Daemon {
             }
             None
         } else {
-            // Keep iroh's relay servers off the tunnel: the socket pin only covers
-            // direct QUIC, so a relay-routed exit link would otherwise be captured
-            // by the tunnel and die. Resolve them now, while DNS is still split.
+            // Keep iroh's own underlay traffic off the tunnel with host routes: the
+            // relay servers (resolved now, while DNS is still split) and, below,
+            // the exit peer's direct addresses.
             let relay_ips = self.relay_underlay_ips().await;
-            crate::exit_node::exclude_relays_from_tunnel(&relay_ips);
+            crate::exit_node::exclude_from_tunnel(&relay_ips);
             // Snapshot the physical default interfaces while the routing table is
             // still clean. Once the split defaults are in, a live lookup answers
             // "the tunnel" for any family without a default route of its own, and
@@ -998,6 +998,14 @@ impl Daemon {
                 self.transport.endpoint.network_change().await;
             }
             let conn = self.exit_peer_conn().await;
+            // The exit peer's own direct addresses need the same treatment as the
+            // relays, and are only knowable from the live connection. Without this
+            // the direct path is the one thing still routed into the tunnel: it
+            // blackholes, iroh spends ~20s failing over, and only the relay (which
+            // does have a host route) carries traffic.
+            if let Some(conn) = &conn {
+                crate::exit_node::exclude_from_tunnel(&peer_underlay_ips(conn));
+            }
             let failure = self.route_default_or_rollback(tun_name).await;
             if failure.is_none() {
                 // Only now is the routing table in its final shape. Everything
@@ -1071,7 +1079,15 @@ impl Daemon {
     async fn await_exit_ready(&self, conn: &Connection) {
         let started = tokio::time::Instant::now();
         let ready = tokio::time::timeout(EXIT_READY_TIMEOUT, async {
-            while !nudge_holepunch(&self.protocol_router, conn).await {}
+            loop {
+                // Re-check every round: hole-punching discovers new candidate
+                // addresses as it goes, and one that appears without a host route
+                // around the tunnel is a path that will blackhole.
+                crate::exit_node::exclude_from_tunnel(&peer_underlay_ips(conn));
+                if nudge_holepunch(&self.protocol_router, conn).await {
+                    break;
+                }
+            }
         })
         .await
         .is_ok();
@@ -1249,4 +1265,24 @@ async fn nudge_holepunch(router: &ProtocolRouter, conn: &Connection) -> bool {
     let answered = tokio::time::timeout(NUDGE_REPLY_WAIT, rx).await.is_ok();
     router.pending_pongs().remove(&nonce);
     answered
+}
+
+/// The exit peer's own underlay IPv4 addresses, as iroh currently knows them.
+///
+/// These are the addresses our QUIC packets to the exit peer are actually sent to,
+/// so they are exactly what must be routed around the full tunnel. Relay paths are
+/// skipped: the relay servers are excluded separately, by name, before DNS moves
+/// into the tunnel.
+#[cfg(target_os = "macos")]
+fn peer_underlay_ips(conn: &Connection) -> Vec<std::net::Ipv4Addr> {
+    let mut ips = Vec::new();
+    for path in conn.paths().iter() {
+        if let iroh::TransportAddr::Ip(addr) = path.remote_addr()
+            && let IpAddr::V4(v4) = addr.ip()
+            && !ips.contains(&v4)
+        {
+            ips.push(v4);
+        }
+    }
+    ips
 }
