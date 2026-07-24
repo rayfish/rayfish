@@ -28,6 +28,7 @@ ray create | join | leave | nuke | kick | ephemeral | hostname | status
 ray invite | requests | accept | deny | admin        # admission + coordinators
 ray connect | connections | contact | pair | unpair  # direct links + multi-device identity
 ray firewall … | apply | alias | identityof          # policy
+ray exit-node allow | disallow | use | none | status  # internet gateway (offer: Linux/macOS/BSD, use: Linux/macOS)
 ray send | files | config | gui | mdns | auto-update | update | ping | netcheck | report
 ```
 

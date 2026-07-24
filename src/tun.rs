@@ -7,6 +7,10 @@
 // These support the desktop TUN setup (address/route/link configuration via
 // `ifconfig`/`ip`/netlink) and the CGNAT preflight, none of which compile on
 // Android where the packet interface is a `VpnService` fd.
+#[cfg(target_os = "linux")]
+use std::future::Future;
+#[cfg(target_os = "linux")]
+use std::net::IpAddr;
 #[cfg(not(target_os = "android"))]
 use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(not(target_os = "android"))]
@@ -176,18 +180,19 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
     ))
 }
 
-/// Routes the peer ranges into the TUN. Must be called *after* the interface is
-/// up (see [`set_link_up`]). On Linux only the IPv6 `200::/7` route needs adding:
-/// the kernel does not reliably install an IPv6 connected route while the link is
-/// down (peer traffic would otherwise leak out the host's default IPv6 route),
-/// whereas it re-installs the IPv4 `100.64.0.0/10` connected route from the /10
-/// netmask automatically on link-up. On macOS the point-to-point utun installs
-/// neither range reliably, so *both* `100.64.0.0/10` and `200::/7` are added
-/// explicitly. Idempotent, safe to call on every `up` cycle.
+/// Run `f` with a netlink handle and the interface index of `tun_name`.
+///
+/// Every netlink call below needs the same preamble (open a socket, spawn the
+/// connection driver, resolve the link index) and must abort that driver task on
+/// every path out, success or error. Doing it here keeps each caller down to the
+/// one call it actually makes.
 #[cfg(target_os = "linux")]
-pub async fn route_peer_range(tun_name: &str) -> Result<()> {
+async fn with_tun_link<F, Fut>(tun_name: &str, f: F) -> Result<()>
+where
+    F: FnOnce(rtnetlink::Handle, u32) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
     use futures::TryStreamExt;
-    use rtnetlink::RouteMessageBuilder;
 
     let (connection, handle, _) = rtnetlink::new_connection().context("open netlink socket")?;
     let conn = tokio::spawn(connection);
@@ -204,7 +209,48 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
             .with_context(|| format!("TUN link {tun_name} not found"))?
             .header
             .index;
+        f(handle.clone(), index).await
+    }
+    .await;
 
+    conn.abort();
+    result
+}
+
+/// Re-assigns our own IPv6 `/128` to the TUN. The address is set once at device
+/// creation, but Linux flushes an interface's global IPv6 addresses when the link
+/// goes down (`keep_addr_on_down` defaults to 0) and never restores them, while
+/// IPv4 addresses survive. Without this, a `down`/`up` cycle leaves the node with
+/// a working IPv4 overlay and a silently dead IPv6 one: it still routes `200::/7`
+/// into the TUN, but owns no address in it, so peers get no answer. Must run after
+/// [`set_link_up`]; idempotent (netlink `replace`), safe on every `up` cycle.
+#[cfg(target_os = "linux")]
+pub async fn ensure_ipv6_addr(tun_name: &str, v6: Ipv6Addr) -> Result<()> {
+    with_tun_link(tun_name, async |handle, index| {
+        handle
+            .address()
+            .add(index, IpAddr::V6(v6), 128)
+            .replace()
+            .execute()
+            .await
+            .context("add TUN IPv6 address via netlink")
+    })
+    .await
+}
+
+/// Routes the peer ranges into the TUN. Must be called *after* the interface is
+/// up (see [`set_link_up`]). On Linux only the IPv6 `200::/7` route needs adding:
+/// the kernel does not reliably install an IPv6 connected route while the link is
+/// down (peer traffic would otherwise leak out the host's default IPv6 route),
+/// whereas it re-installs the IPv4 `100.64.0.0/10` connected route from the /10
+/// netmask automatically on link-up. On macOS the point-to-point utun installs
+/// neither range reliably, so *both* `100.64.0.0/10` and `200::/7` are added
+/// explicitly. Idempotent, safe to call on every `up` cycle.
+#[cfg(target_os = "linux")]
+pub async fn route_peer_range(tun_name: &str) -> Result<()> {
+    use rtnetlink::RouteMessageBuilder;
+
+    with_tun_link(tun_name, async |handle, index| {
         let route = RouteMessageBuilder::<Ipv6Addr>::new()
             .destination_prefix(Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 0), 7)
             .output_interface(index)
@@ -215,14 +261,9 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
             .replace()
             .execute()
             .await
-            .context("add 200::/7 route via netlink")?;
-
-        Ok(())
-    }
-    .await;
-
-    conn.abort();
-    result
+            .context("add 200::/7 route via netlink")
+    })
+    .await
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -250,6 +291,54 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The full-tunnel default as two half-space routes per family: `0.0.0.0/1` +
+/// `128.0.0.0/1` and `::/1` + `8000::/1`. Each is more specific than a real
+/// default route, so together they capture everything by longest-prefix match
+/// without touching (or having to restore) the system default. The wg-quick
+/// approach; Linux does not use it (its full tunnel is a policy-routing table,
+/// see `exit_node::install_client_routing`).
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const SPLIT_DEFAULT: [(&str, &str); 4] = [
+    ("-inet", "0.0.0.0/1"),
+    ("-inet", "128.0.0.0/1"),
+    ("-inet6", "::/1"),
+    ("-inet6", "8000::/1"),
+];
+
+/// Routes all traffic into the TUN via the [`SPLIT_DEFAULT`] half-space routes
+/// (the exit-node client full tunnel). Delete-then-add, so it is idempotent
+/// across re-applies. The caller is responsible for loop prevention *before*
+/// this goes in: from here on, everything the routing table decides, including
+/// the daemon's own transport unless it is pinned elsewhere, goes to the TUN.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub async fn route_default_via_tun(tun_name: &str) -> Result<()> {
+    for (family, net) in SPLIT_DEFAULT {
+        let _ = Command::new("route")
+            .args(["-n", "delete", family, "-net", net, "-interface", tun_name])
+            .status();
+        let status = Command::new("route")
+            .args(["-n", "add", family, "-net", net, "-interface", tun_name])
+            .status()
+            .with_context(|| format!("run route add {family} {net}"))?;
+        anyhow::ensure!(
+            status.success(),
+            "route add {family} {net} failed with {status}"
+        );
+    }
+    Ok(())
+}
+
+/// Removes the full-tunnel half-space routes. Best-effort and idempotent: routes
+/// that are already gone (never installed, or dropped with the utun) are fine.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub async fn unroute_default_via_tun(tun_name: &str) {
+    for (family, net) in SPLIT_DEFAULT {
+        let _ = Command::new("route")
+            .args(["-n", "delete", family, "-net", net, "-interface", tun_name])
+            .status();
+    }
+}
+
 /// Routes the magic-DNS virtual IP (`dns::MAGIC_DNS_V4`) into the TUN as a `/32`
 /// host route so that packets from the kernel addressed to that IP are delivered
 /// to the TUN device (and thus intercepted by our DNS server) rather than going
@@ -257,25 +346,9 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
 /// interface address, it is a route-only entry. Idempotent across `up`/`down`.
 #[cfg(target_os = "linux")]
 pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
-    use futures::TryStreamExt;
     use rtnetlink::RouteMessageBuilder;
 
-    let (connection, handle, _) = rtnetlink::new_connection().context("open netlink socket")?;
-    let conn = tokio::spawn(connection);
-
-    let result = async {
-        let index = handle
-            .link()
-            .get()
-            .match_name(tun_name.to_owned())
-            .execute()
-            .try_next()
-            .await
-            .context("query TUN link")?
-            .with_context(|| format!("TUN link {tun_name} not found"))?
-            .header
-            .index;
-
+    with_tun_link(tun_name, async |handle, index| {
         let route = RouteMessageBuilder::<Ipv4Addr>::new()
             .destination_prefix(crate::dns::MAGIC_DNS_V4, 32)
             .output_interface(index)
@@ -286,14 +359,9 @@ pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
             .replace()
             .execute()
             .await
-            .context("add magic-DNS /32 route via netlink")?;
-
-        Ok(())
-    }
-    .await;
-
-    conn.abort();
-    result
+            .context("add magic-DNS /32 route via netlink")
+    })
+    .await
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]

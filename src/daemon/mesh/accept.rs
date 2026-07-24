@@ -548,6 +548,7 @@ impl CoordinatorAcceptState {
                 device_cert: device_cert.clone(),
                 collision_index,
                 last_seen: Some(crate::membership::now_secs()),
+                exit_node: false,
             });
             s.refresh_snapshot();
             s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
@@ -993,6 +994,7 @@ impl MemberAcceptState {
                 device_cert: device_cert.clone(),
                 collision_index: member_idx,
                 last_seen: Some(crate::membership::now_secs()),
+                exit_node: false,
             });
             s.refresh_snapshot();
             (
@@ -1115,6 +1117,38 @@ impl AcceptHandler {
         }
     }
 
+    fn registry(&self) -> &Arc<NetworkRegistry> {
+        match self {
+            AcceptHandler::Coordinator(s) => &s.ctx.registry,
+            AcceptHandler::Member(s) => &s.ctx.registry,
+        }
+    }
+
+    /// Network-scoped messages both roles handle identically, dispatched here so
+    /// an arm cannot sit in one role's match and be silently discarded by the
+    /// other's catch-all (`ExitNodeOffer` once lived only in the Member dispatch,
+    /// so a plain coordinator, the one node that records the offer on the signed
+    /// roster, dropped it). Returns true if the message was consumed.
+    pub(crate) fn handle_common(&self, peer_id: EndpointId, msg: &ControlMsg) -> bool {
+        match *msg {
+            // A member tells us it does (or no longer does) offer itself as an
+            // exit node. Only a network-key holder records it on the sender's
+            // roster entry and republishes (`record_exit_offer` no-ops
+            // otherwise). Off the demux loop: signing + DHT publish are slow.
+            ControlMsg::ExitNodeOffer { enabled } => {
+                let registry = self.registry().clone();
+                let Some(network) = self.network_name() else {
+                    return true;
+                };
+                tokio::spawn(async move {
+                    registry.record_exit_offer(&network, peer_id, enabled).await;
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Process one network-scoped control frame, returning the peer's mesh v4 if it
     /// is now a registered member on this network (else `None`).
     pub(crate) async fn handle_frame(
@@ -1124,6 +1158,9 @@ impl AcceptHandler {
         peer_id: EndpointId,
         msg: ControlMsg,
     ) -> Option<Ipv4Addr> {
+        if self.handle_common(peer_id, &msg) {
+            return None;
+        }
         match self {
             AcceptHandler::Coordinator(s) => s.handle_frame(conn, send, peer_id, msg).await,
             AcceptHandler::Member(s) => s.handle_frame(conn, send, peer_id, msg).await,

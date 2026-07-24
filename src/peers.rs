@@ -23,7 +23,6 @@ fn now_ms() -> u64 {
     ACTIVITY_EPOCH.elapsed().as_millis() as u64
 }
 
-
 /// A `DashMap` using ahash instead of the default SipHash. Used for the
 /// per-packet hot maps (routing table, conntrack, device→user resolution):
 /// ahash is markedly faster for small keys while keeping a randomized seed, so
@@ -330,7 +329,11 @@ impl PeerTable {
         self.by_id
             .get(peer_id)
             .map(|e| *e.value())
-            .and_then(|ip| self.v4.get(&ip).map(|e| e.supports_idle_close.load(Ordering::Relaxed)))
+            .and_then(|ip| {
+                self.v4
+                    .get(&ip)
+                    .map(|e| e.supports_idle_close.load(Ordering::Relaxed))
+            })
             .unwrap_or(false)
     }
 
@@ -391,6 +394,26 @@ impl PeerTable {
     /// IPv6 counterpart of [`lookup_v4`](Self::lookup_v4).
     pub fn lookup_v6(&self, ip: &Ipv6Addr) -> Option<PeerRoute> {
         self.v6.get(ip).and_then(|e| e.route())
+    }
+
+    /// Route to the peer holding mesh IPv4 `ip`, pinned to a specific `network`
+    /// (rather than [`route`](PeerEntry::route)'s lexically-smallest shared one).
+    /// Used by exit-node client routing, which must tag the datagram with the exit
+    /// network's handle so the exit peer attributes it to the network whose
+    /// allow-list permits us. `None` if the peer isn't connected on `network`.
+    pub fn route_on_network(&self, ip: &Ipv4Addr, network: &str) -> Option<PeerRoute> {
+        let e = self.v4.get(ip)?;
+        if !e.networks.contains(network) {
+            return None;
+        }
+        let handle = e.out_handles.get(network).copied().unwrap_or(0);
+        Some(PeerRoute {
+            conn: e.conn.clone(),
+            endpoint_id: e.endpoint_id,
+            network: SmolStr::new(network),
+            handle,
+            last_active: e.last_active.clone(),
+        })
     }
 
     /// Resolve the network an inbound datagram belongs to from the peer's mesh
@@ -1078,7 +1101,10 @@ mod tests {
         let t = map.resolve_v4(&a.ipv4).expect("known member resolves");
         // First packet claims the in-flight slot; a duplicate is rejected.
         assert!(in_flight.insert(t.endpoint_id));
-        assert!(!in_flight.insert(t.endpoint_id), "duplicate dial is deduped");
+        assert!(
+            !in_flight.insert(t.endpoint_id),
+            "duplicate dial is deduped"
+        );
 
         // Unknown destination doesn't resolve, so nothing is dialed.
         assert!(map.resolve_v4(&Ipv4Addr::new(100, 64, 9, 9)).is_none());
@@ -1218,10 +1244,16 @@ mod tests {
 
         // A zero-length window means the connection is idle immediately (the same
         // arithmetic the timer uses to decide it's time to close).
-        assert_eq!(table.idle_remaining(&peer, Duration::ZERO), Some(Duration::ZERO));
+        assert_eq!(
+            table.idle_remaining(&peer, Duration::ZERO),
+            Some(Duration::ZERO)
+        );
 
         // A fresh activity bump keeps the full window (the timer would re-arm).
-        table.last_active_of(&peer).unwrap().store(now_ms(), Ordering::Relaxed);
+        table
+            .last_active_of(&peer)
+            .unwrap()
+            .store(now_ms(), Ordering::Relaxed);
         assert!(table.idle_remaining(&peer, window).unwrap() > Duration::from_secs(115));
     }
 
@@ -1275,6 +1307,7 @@ mod tests {
             token: CancellationToken::new(),
             stats: Arc::new(ForwardMetrics::default()),
             device_user_map: DeviceUserMap::new(),
+            exit: crate::exit_node::ExitContext::default(),
         };
         spawn_peer_reader(conn_r.clone(), s_id, peers.clone(), ctx);
 

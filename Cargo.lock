@@ -1340,7 +1340,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.118",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1742,7 +1742,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2499,7 +2499,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2",
  "tokio",
  "tower-service",
  "tracing",
@@ -2757,7 +2757,7 @@ version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d40460c0ce33d6ce4b0630ad68ff63d6661961c48b6dba35e5a4d81cfb48222"
 dependencies = [
- "socket2 0.6.4",
+ "socket2",
  "widestring",
  "windows-registry",
  "windows-result 0.4.1",
@@ -2776,7 +2776,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.0.2"
-source = "git+https://github.com/rayfish/iroh?branch=direct-addr-filter#7f64ac3ea5931dd4c63ec35ba9d95588e43d0239"
+source = "git+https://github.com/rayfish/iroh?branch=rayfish-integration#f4fcc29ada8a0f13d9dfd1ca0650a48362e6be4f"
 dependencies = [
  "backon",
  "blake3",
@@ -2813,6 +2813,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "smallvec",
+ "socket2",
  "strum",
  "time",
  "tokio",
@@ -2826,7 +2827,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.0.2"
-source = "git+https://github.com/rayfish/iroh?branch=direct-addr-filter#7f64ac3ea5931dd4c63ec35ba9d95588e43d0239"
+source = "git+https://github.com/rayfish/iroh?branch=rayfish-integration#f4fcc29ada8a0f13d9dfd1ca0650a48362e6be4f"
 dependencies = [
  "curve25519-dalek 5.0.0-rc.0",
  "data-encoding",
@@ -2884,7 +2885,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.0.2"
-source = "git+https://github.com/rayfish/iroh?branch=direct-addr-filter#7f64ac3ea5931dd4c63ec35ba9d95588e43d0239"
+source = "git+https://github.com/rayfish/iroh?branch=rayfish-integration#f4fcc29ada8a0f13d9dfd1ca0650a48362e6be4f"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -2975,7 +2976,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.0.2"
-source = "git+https://github.com/rayfish/iroh?branch=direct-addr-filter#7f64ac3ea5931dd4c63ec35ba9d95588e43d0239"
+source = "git+https://github.com/rayfish/iroh?branch=rayfish-integration#f4fcc29ada8a0f13d9dfd1ca0650a48362e6be4f"
 dependencies = [
  "blake3",
  "bytes",
@@ -3005,6 +3006,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_bytes",
+ "socket2",
  "strum",
  "tokio",
  "tokio-rustls",
@@ -3105,7 +3107,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3684,8 +3686,7 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d9cbe01741347ef750d743d6690603f5eed8341e679fb51c8e629337aa11976"
+source = "git+https://github.com/rayfish/net-tools?branch=feat%2Fconfigure-socket#7d77e11b36d26e5a61cefa87117fdae81912fbcb"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3707,7 +3708,7 @@ dependencies = [
  "objc2-system-configuration",
  "pin-project-lite",
  "serde",
- "socket2 0.6.4",
+ "socket2",
  "time",
  "tokio",
  "tokio-util",
@@ -3768,7 +3769,7 @@ dependencies = [
  "pin-project-lite",
  "rustc-hash",
  "rustls",
- "socket2 0.6.4",
+ "socket2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3811,7 +3812,7 @@ checksum = "3137a52df66c20090a889828d1c655f21f52294cba64e5c4fbb04fc83eee7c8e"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.4",
+ "socket2",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -4479,7 +4480,7 @@ dependencies = [
  "rand 0.10.2",
  "serde",
  "smallvec",
- "socket2 0.6.4",
+ "socket2",
  "time",
  "tokio",
  "tokio-util",
@@ -4935,7 +4936,7 @@ dependencies = [
  "sha2 0.10.9",
  "simple-dns",
  "smol_str 0.3.6",
- "socket2 0.5.10",
+ "socket2",
  "system-configuration",
  "tar",
  "tempfile",
@@ -5323,7 +5324,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5336,7 +5337,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5394,7 +5395,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5542,7 +5543,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5883,16 +5884,6 @@ dependencies = [
 
 [[package]]
 name = "socket2"
-version = "0.5.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
-dependencies = [
- "libc",
- "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "socket2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
@@ -6056,7 +6047,7 @@ dependencies = [
  "acto",
  "hickory-proto",
  "rand 0.10.2",
- "socket2 0.6.4",
+ "socket2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6169,7 +6160,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6310,7 +6301,7 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2 0.6.4",
+ "socket2",
  "tokio-macros",
  "tracing",
  "windows-sys 0.61.2",
@@ -7124,7 +7115,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

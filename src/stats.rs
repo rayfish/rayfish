@@ -30,16 +30,29 @@ pub enum DropReason {
     /// assigned mesh address (ingress anti-spoofing). A peer may only inject
     /// packets sourced from its own mesh IP.
     Spoof,
+    /// Inbound datagram bound for a non-overlay (internet) destination that this
+    /// node dropped because it does not offer an exit node to the sender (exit
+    /// mode off, or the sender is not in the network's `exit_allow` list). Keeps
+    /// a non-exit node from silently transiting a peer's internet traffic.
+    ExitDenied,
+    /// Outbound packet larger than the peer path's single-datagram budget. The
+    /// forwarder emits an ICMP "packet too big" (PMTUD) back to the source before
+    /// dropping, so the sender lowers its path MTU and resends a packet that fits
+    /// rather than blackholing. Seen mostly under an exit-node full tunnel
+    /// carrying bulk traffic over a relayed peer.
+    PacketTooBig,
 }
 
 impl DropReason {
-    const ALL: [DropReason; 6] = [
+    const ALL: [DropReason; 8] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
         DropReason::Malformed,
         DropReason::Backpressure,
         DropReason::Spoof,
+        DropReason::ExitDenied,
+        DropReason::PacketTooBig,
     ];
 }
 

@@ -26,7 +26,13 @@ summary(){
 
 # on <ip> <command-string> : run a shell command on a host as root.
 # -n: never read stdin, so calling `on` inside a `while read` loop can't eat it.
-on(){ local ip="$1"; shift; ssh -n "${SSH_OPTS[@]}" -i "$KEY" "root@$ip" "$*"; }
+on(){ local ip="$1"; shift
+  [[ -n "${E2E_TRACE:-}" ]] && echo "$(date -u +%T) -> $ip: $*" >> "$E2E_TRACE"
+  ssh -n "${SSH_OPTS[@]}" -i "$KEY" "root@$ip" "$*"
+  local rc=$?
+  [[ -n "${E2E_TRACE:-}" ]] && echo "$(date -u +%T) <- $ip rc=$rc" >> "$E2E_TRACE"
+  return $rc
+}
 
 # strip : remove ANSI colour codes from rayfish CLI output (stdin -> stdout).
 strip(){ sed -r 's/\x1B\[[0-9;]*[mGKH]//g'; }
