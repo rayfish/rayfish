@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-24
+
 ### Added
 
 - **Exit nodes.** A node can offer itself as an internet gateway for a network so
@@ -82,12 +84,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   by hand. The app now forwards Android's connectivity callbacks to the core,
   which rebinds and re-probes immediately.
 
+- **On-demand mesh connections (near-zero idle battery).** A node connects to its
+  peers at startup (so it knows immediately who is reachable), then closes any
+  connection that sees no traffic in either direction for the idle timeout (default
+  120s), returning to zero peer connections so it stops waking the radio for QUIC
+  keepalives. The link re-forms on the next packet either side sends. Idle teardown
+  coexists with older peers: a node only closes an idle link to a peer whose build
+  also understands the idle close, so a peer on an earlier release is held open
+  instead of flapped. On by default; turn it off with `ray config set on-demand off`
+  (and `idle_timeout_secs` tunes the window).
+- **`ray config` now covers the `auto-update` and `on-demand` toggles.** Both
+  on/off daemon settings are settable through the standard config surface (e.g.
+  `ray config set on-demand off`, `ray config set auto-update on`,
+  `ray config unset on-demand`), and bare `ray config` lists their current value
+  alongside relay/discovery-dns/dns-upstreams. `ray auto-update on|off` still works
+  as a shorthand.
+- **`ray status` shows peers as idle, active, or offline.** With on-demand
+  connections a reachable peer usually has no live link, so status now renders three
+  states (Tailscale-style): `active` (connected now), `idle` (a roster member with
+  no current link, presumed reachable), and `offline` (only after an actual reach
+  attempt failed). `ray ping <peer>` dials on demand and refreshes a peer's state.
+- **Static musl Linux binaries.** Every release and nightly now also ships
+  `ray-linux-{x86_64,aarch64}-musl`: fully static builds with no glibc dependency
+  that run on any Linux, including musl distros (Alpine) and hosts with a glibc
+  older than the gnu build floor. The installer picks them automatically when the
+  glibc binary won't run on the host (and a musl asset exists for that version),
+  and `ray update` on a musl-built daemon self-updates to the musl asset.
+
 ### Changed
 
 - **`ray send` argument order flipped** to make room for multiple files: it is
   now `ray send <peer> <files...>` (was `ray send <file> <peer>`). The `--json`
   output of `ray files` is now an object with `pending` (inbound offers) and
   `queued` (outbound sends) arrays instead of a bare array.
+- **Desktop TUN now runs on `tun-rs`.** Swapped the `tun` crate for `tun-rs` on
+  Linux, macOS, and the other desktop targets (Android is unaffected, it uses the
+  `VpnService` fd). Behavior is unchanged: same 1280 MTU, addresses and routes are
+  still installed by our own netlink/`ifconfig` helpers. This is the groundwork for
+  a later Linux GRO/GSO offload path that batches TUN writes.
+- **FreeBSD improvements.** The logs will be stored in /var/log and the configs
+  will be stored at /usr/local/etc.
 
 ### Fixed
 
@@ -155,47 +191,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   endpoint without releasing the tunnel fd. Disable now detaches the data plane
   first, so both the interface and the control plane go down and the device stops
   using the radio.
-
-### Changed
-
-- **Desktop TUN now runs on `tun-rs`.** Swapped the `tun` crate for `tun-rs` on
-  Linux, macOS, and the other desktop targets (Android is unaffected, it uses the
-  `VpnService` fd). Behavior is unchanged: same 1280 MTU, addresses and routes are
-  still installed by our own netlink/`ifconfig` helpers. This is the groundwork for
-  a later Linux GRO/GSO offload path that batches TUN writes.
-
-- **FreeBSD improvements.** The logs will be stored in /var/log and the configs
-  will be stored at /usr/local/etc.
-
-### Added
-
-- **On-demand mesh connections (near-zero idle battery).** A node connects to its
-  peers at startup (so it knows immediately who is reachable), then closes any
-  connection that sees no traffic in either direction for the idle timeout (default
-  120s), returning to zero peer connections so it stops waking the radio for QUIC
-  keepalives. The link re-forms on the next packet either side sends. Idle teardown
-  coexists with older peers: a node only closes an idle link to a peer whose build
-  also understands the idle close, so a peer on an earlier release is held open
-  instead of flapped. On by default; turn it off with `ray config set on-demand off`
-  (and `idle_timeout_secs` tunes the window).
-- **`ray config` now covers the `auto-update` and `on-demand` toggles.** Both
-  on/off daemon settings are settable through the standard config surface (e.g.
-  `ray config set on-demand off`, `ray config set auto-update on`,
-  `ray config unset on-demand`), and bare `ray config` lists their current value
-  alongside relay/discovery-dns/dns-upstreams. `ray auto-update on|off` still works
-  as a shorthand.
-- **`ray status` shows peers as idle, active, or offline.** With on-demand
-  connections a reachable peer usually has no live link, so status now renders three
-  states (Tailscale-style): `active` (connected now), `idle` (a roster member with
-  no current link, presumed reachable), and `offline` (only after an actual reach
-  attempt failed). `ray ping <peer>` dials on demand and refreshes a peer's state.
-
-- **Static musl Linux binaries.** Every release and nightly now also ships
-  `ray-linux-{x86_64,aarch64}-musl`: fully static builds with no glibc dependency
-  that run on any Linux, including musl distros (Alpine) and hosts with a glibc
-  older than the gnu build floor. The installer picks them automatically when the
-  glibc binary won't run on the host (and a musl asset exists for that version),
-  and `ray update` on a musl-built daemon self-updates to the musl asset.
 
 ## [0.2.0] - 2026-07-08
 
@@ -780,7 +775,8 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/rayfish/rayfish/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/rayfish/rayfish/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/rayfish/rayfish/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/rayfish/rayfish/compare/v0.1.2...v0.1.3
