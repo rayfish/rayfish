@@ -41,6 +41,7 @@ use iroh_metrics::service::MetricsServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -615,6 +616,17 @@ impl Daemon {
         self.transport.clone()
     }
 
+    /// Part of the embedding API (used by `ray-mobile`): the host OS observed a
+    /// network change (Wi-Fi/cellular switch, roam, airplane mode). On desktop,
+    /// netwatch sees route changes itself; on Android its route monitor is a
+    /// stub (apps cannot subscribe to netlink route updates), so without this
+    /// forward the endpoint sits on dead sockets until something else rebuilds
+    /// them. iroh rebinds and re-probes its paths in response.
+    pub async fn network_changed(&self) {
+        tracing::info!("host reported a network change; rebinding endpoint");
+        self.transport.endpoint.network_change().await;
+    }
+
     /// Attach a packet interface to a headless [`DaemonState`] and start the data
     /// plane's forwarding tasks: the TUN writer (`spawn_tun_writer`) and the mesh
     /// forwarding loop (`run_mesh`, reading `reader` and using the state's
@@ -931,6 +943,7 @@ impl Daemon {
         self: &Arc<Self>,
         req: IpcMessage,
         peer_cred: Option<(u32, u32)>,
+        mut fds: Vec<OwnedFd>,
     ) -> IpcMessage {
         if let Some(denied) = Self::check_authorized(&req, peer_cred) {
             return denied;
@@ -1065,6 +1078,11 @@ impl Daemon {
             }
             IpcMessage::AliasList { network } => self.registry.list_aliases(&network),
             IpcMessage::SendFile { path, peer } => self.send_file(&path, &peer).await,
+            IpcMessage::SendFileFd { filename, peer } => match fds.pop() {
+                Some(fd) => self.files.send_file_fd(fd, &filename, &peer).await,
+                None => ipc_err("SendFileFd request carried no file descriptor"),
+            },
+            IpcMessage::CancelSend { id } => self.files.cancel_send(id),
             IpcMessage::ListFiles => self.list_files(),
             IpcMessage::AcceptFile { id, output } => {
                 self.files.accept_file(id, output, peer_cred).await
@@ -1779,6 +1797,7 @@ mod accept_handler_tests {
                 registry.clone(),
             ),
             token: CancellationToken::new(),
+            on_peer_connected: Arc::new(|_| {}),
         });
         connmgr.register(
             net_pubkey,
@@ -1952,6 +1971,7 @@ mod accept_handler_tests {
                 coord_reg.clone(),
             ),
             token: CancellationToken::new(),
+            on_peer_connected: Arc::new(|_| {}),
         });
         connmgr.register(
             net_pubkey,

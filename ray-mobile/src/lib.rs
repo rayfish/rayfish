@@ -651,6 +651,19 @@ impl Node {
     /// only the control plane ([`Node::start`]), not the tunnel, but the peer must
     /// be reachable. Runs to completion synchronously; callers drive it off the UI
     /// thread (Android's share flow runs it in a foreground service).
+    /// The host OS reported a network change (Wi-Fi/cellular switch, roam,
+    /// airplane-mode flip). Android blocks netlink route updates for apps, so
+    /// the core cannot observe these itself (netwatch's Android monitor is a
+    /// stub): the app must forward `ConnectivityManager` default-network
+    /// callbacks here. The core rebinds its QUIC socket and re-probes paths.
+    /// Cheap, idempotent, safe to call on every callback; a no-op before
+    /// [`Node::start`].
+    pub fn network_changed(&self) {
+        if let Ok(state) = self.state() {
+            self.runtime.block_on(state.network_changed());
+        }
+    }
+
     pub fn send_file(&self, path: String, peer: String) -> Result<(), RayError> {
         let state = self.state()?;
         match self.runtime.block_on(state.send_file(&path, &peer)) {
@@ -666,7 +679,7 @@ impl Node {
     pub fn list_file_offers(&self) -> Result<Vec<FileOffer>, RayError> {
         let state = self.state()?;
         match state.list_files() {
-            IpcMessage::FileList { files } => Ok(files
+            IpcMessage::FileList { files, .. } => Ok(files
                 .into_iter()
                 .map(|f| FileOffer {
                     id: f.id,

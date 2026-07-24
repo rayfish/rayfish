@@ -83,6 +83,9 @@ impl MeshConnection {
     /// exit that isn't daemon shutdown, stop the reader and, if this connection was
     /// ever a registered member, report the drop to the supervisor.
     pub(crate) async fn run(mut self) {
+        // A connection to this peer now exists (either side dialed): let the
+        // composition-root hook flush anything queued for it (send outbox).
+        self.manager.notify_peer_connected(self.peer_id);
         // The connection's single data reader. One reader serves every network the
         // connection carries; `MeshConnection` owns it for the connection's
         // lifetime and aborts it when the loop below ends.

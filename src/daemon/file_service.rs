@@ -11,10 +11,53 @@
 use super::transfers;
 use super::*;
 use std::ffi::CString;
+use std::io::Read;
 use std::path::PathBuf;
 
 use futures::StreamExt;
 use iroh_blobs::api::remote::GetProgressItem;
+use serde::{Deserialize, Serialize};
+
+/// Upper bound on one background offer dial. `Endpoint::connect` retries
+/// discovery with no timeout of its own; the outbox retries on the next
+/// peer-connected event anyway, so a stuck dial must not pin the flush task.
+const OFFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How often the outbox re-attempts delivery to peers that currently hold a
+/// live mesh connection. The peer-connected hook is the primary trigger; this
+/// sweep only catches offers whose delivery failed transiently while the
+/// connection stayed up.
+pub(crate) const OUTBOX_SWEEP_INTERVAL: Duration = Duration::from_secs(120);
+
+fn outbox_path() -> Option<PathBuf> {
+    config::config_dir().ok().map(|d| d.join("outbox.json"))
+}
+
+fn load_outbox() -> Vec<OutboxEntry> {
+    let Some(path) = outbox_path() else {
+        return Vec::new();
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "unreadable send outbox; starting empty");
+            Vec::new()
+        }),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// An outbound send waiting for its peer. Persisted (JSON, in the config dir)
+/// so a queued send survives a daemon restart; the bytes themselves already
+/// live in the persistent blob store. `id` is session-local, reassigned on load.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct OutboxEntry {
+    #[serde(skip)]
+    pub(crate) id: u64,
+    pub(crate) peer: EndpointId,
+    pub(crate) filename: String,
+    pub(crate) size: u64,
+    pub(crate) blob_hash: blake3::Hash,
+}
 
 /// A received file offer awaiting `ray files accept`.
 pub(crate) struct PendingFile {
@@ -45,6 +88,13 @@ pub(crate) struct FileService {
     device_user_map: peers::DeviceUserMap,
     /// In-flight transfers, for progress reporting.
     pub(crate) transfers: Arc<transfers::TransferRegistry>,
+    /// Outbound sends awaiting delivery (peer offline, or the offer dial
+    /// failed). Flushed on every peer-connected event and by a slow sweep.
+    /// Ids come from `file_id_counter`, shared with inbound pending offers.
+    outbox: Arc<std::sync::Mutex<Vec<OutboxEntry>>>,
+    /// Peers with a flush in flight, so a burst of connect events (or the
+    /// sweep racing a connect) can't deliver the same offer twice.
+    flushing: Arc<DashSet<EndpointId>>,
 }
 
 impl FileService {
@@ -56,9 +106,23 @@ impl FileService {
         device_user_map: peers::DeviceUserMap,
         transfers: Arc<transfers::TransferRegistry>,
     ) -> Self {
+        // Reload queued sends from the previous run. Ids and transfer entries
+        // are session-local: reassign fresh ones (the transfer re-registers as
+        // Offered so provider events find it by hash+peer when the peer pulls).
+        let mut queued = load_outbox();
+        let ids = AtomicU64::new(1);
+        for entry in &mut queued {
+            entry.id = ids.fetch_add(1, Ordering::Relaxed);
+            transfers.register_send(
+                entry.peer,
+                entry.filename.clone(),
+                entry.size,
+                iroh_blobs::Hash::from_bytes(*entry.blob_hash.as_bytes()),
+            );
+        }
         Self {
             pending_files: Arc::new(std::sync::Mutex::new(Vec::new())),
-            file_id_counter: Arc::new(AtomicU64::new(1)),
+            file_id_counter: Arc::new(ids),
             pairing_secret: Arc::new(std::sync::Mutex::new(None)),
             secret_key,
             transport,
@@ -66,6 +130,8 @@ impl FileService {
             device_cert,
             device_user_map,
             transfers,
+            outbox: Arc::new(std::sync::Mutex::new(queued)),
+            flushing: Arc::new(DashSet::new()),
         }
     }
 
@@ -361,14 +427,10 @@ impl FileService {
     }
 
     /// Add a file to the blob store and offer it to a peer over `FILES_ALPN`.
-    pub(crate) async fn send_file(&self, path: &str, peer: &str) -> IpcMessage {
-        let peer_id = match self.registry.resolve_peer_flexible(peer).await {
-            Some(id) => id,
-            None => {
-                return ipc_err(format!("unknown peer '{peer}'"));
-            }
-        };
-
+    /// The read happens daemon-side, so this only works for paths the daemon
+    /// itself can see; IPC clients use `send_file_fd`. Kept for in-process
+    /// callers (ray-mobile), where daemon and app share one privilege domain.
+    pub(crate) async fn send_file(self: &Arc<Self>, path: &str, peer: &str) -> IpcMessage {
         let file_path = Path::new(path);
         let file_bytes = match std::fs::read(file_path) {
             Ok(b) => b,
@@ -376,13 +438,63 @@ impl FileService {
                 return ipc_err(format!("cannot read '{}': {e}", file_path.display()));
             }
         };
-
         let filename = file_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "file".to_string());
+        self.send_bytes(file_bytes, filename, peer).await
+    }
+
+    /// `send_file` for a descriptor received over IPC (`SendFileFd`): the
+    /// client opened the file with its own privileges, the daemon never
+    /// resolves a path. This is what lets `ray send` reach TCC-protected
+    /// folders on macOS and files the daemon can't read but the caller can.
+    pub(crate) async fn send_file_fd(
+        self: &Arc<Self>,
+        fd: OwnedFd,
+        filename: &str,
+        peer: &str,
+    ) -> IpcMessage {
+        let mut file = File::from(fd);
+        // fstat before reading: an fd is attacker-chosen input, and reading a
+        // FIFO or a device (/dev/zero) here would stall or balloon the daemon.
+        match file.metadata() {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => return ipc_err("not a regular file"),
+            Err(e) => return ipc_err(format!("cannot stat file: {e}")),
+        }
+        let mut file_bytes = Vec::new();
+        if let Err(e) = file.read_to_end(&mut file_bytes) {
+            return ipc_err(format!("cannot read file: {e}"));
+        }
+        // The client names the file; keep only the basename so a hostile
+        // client can't smuggle path components into the offer.
+        let filename = Path::new(filename)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+        self.send_bytes(file_bytes, filename, peer).await
+    }
+
+    /// Shared tail of the send flow: blob-store the bytes, queue the offer,
+    /// and reply immediately. Delivery is asynchronous: a background flush
+    /// attempts it right away, and the outbox re-flushes whenever a mesh
+    /// connection to the peer comes up, so a send to an offline peer parks
+    /// here instead of making the caller wait on an unbounded dial.
+    async fn send_bytes(
+        self: &Arc<Self>,
+        file_bytes: Vec<u8>,
+        filename: String,
+        peer: &str,
+    ) -> IpcMessage {
+        let peer_id = match self.registry.resolve_peer_flexible(peer).await {
+            Some(id) => id,
+            None => {
+                return ipc_err(format!("unknown peer '{peer}'"));
+            }
+        };
+
         let size = file_bytes.len() as u64;
-        let mime_type = guess_mime_type(&filename);
         let hash = blake3::hash(&file_bytes);
 
         if let Err(e) = self
@@ -396,62 +508,188 @@ impl FileService {
         }
 
         // Register the transfer now, before the peer can possibly learn the hash:
-        // it is only after `add_slice` above that the blob exists to be pulled, and
-        // the offer that tells the peer about it hasn't even been dialed yet. On
-        // auto-accept, the receiver can fetch the entire blob and close its
-        // connection before this function's own `conn.closed()` await below
-        // returns, so every provider event (Started/Progress/Completed) can arrive
-        // before an entry registered "at the end" would have existed; registering
-        // here instead means the entry always exists first.
-        let blob_hash = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
-        let transfer_id = self
-            .transfers
-            .register_send(peer_id, filename.clone(), size, blob_hash);
+        // it is only after `add_slice` above that the blob exists to be pulled,
+        // and on auto-accept the receiver can fetch the entire blob the moment
+        // the offer lands, so every provider event (Started/Progress/Completed)
+        // must find the entry already registered.
+        self.transfers.register_send(
+            peer_id,
+            filename.clone(),
+            size,
+            iroh_blobs::Hash::from_bytes(*hash.as_bytes()),
+        );
 
-        let msg = control::ControlMsg::FileOffer {
-            from: self.transport.endpoint.id(),
+        let entry = OutboxEntry {
+            id: self.file_id_counter.fetch_add(1, Ordering::Relaxed),
+            peer: peer_id,
             filename: filename.clone(),
             size,
-            mime_type: mime_type.clone(),
             blob_hash: hash,
         };
+        self.outbox.lock().unwrap().push(entry);
+        self.save_outbox();
 
-        match transport::connect_to_peer_with_alpn(
-            &self.transport.endpoint,
-            peer_id,
-            transport::FILES_ALPN,
-        )
-        .await
-        {
-            Ok(conn) => match conn.open_bi().await {
-                Ok((mut send, _)) => {
-                    // File offers ride the separate FILES_ALPN, not the mesh demux,
-                    // so they carry no network scope.
-                    if let Err(e) = control::send_msg(&mut send, None, &msg).await {
-                        self.transfers.fail_offer(transfer_id);
-                        return ipc_err(format!("failed to send offer: {e}"));
-                    }
-                    // send_msg already finished the stream; wait for the peer to
-                    // read the offer so it flushes before this `conn` is dropped.
-                    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+        // Kick delivery in the background either way: even a peer with no live
+        // mesh connection may be dialable (fresh mDNS discovery, say), and the
+        // attempt is bounded by OFFER_CONNECT_TIMEOUT.
+        let svc = Arc::clone(self);
+        tokio::spawn(async move { svc.flush_outbox_for(peer_id).await });
+
+        let message = if self.peer_connected(peer_id) {
+            format!("sending {} ({}) to {}", filename, format_size(size), peer)
+        } else {
+            format!(
+                "queued {} ({}) for {}; it delivers when the peer comes online (see `ray files`)",
+                filename,
+                format_size(size),
+                peer
+            )
+        };
+        IpcMessage::Ok { message }
+    }
+
+    /// Distinct peers with queued sends that hold a live mesh connection right
+    /// now: the periodic sweep's work list (it never dials offline peers).
+    pub(crate) fn outbox_peers(&self) -> Vec<EndpointId> {
+        let mut peers: Vec<EndpointId> =
+            self.outbox.lock().unwrap().iter().map(|e| e.peer).collect();
+        peers.sort();
+        peers.dedup();
+        peers.retain(|p| self.peer_connected(*p));
+        peers
+    }
+
+    /// True when any shared network holds a live mesh connection to `peer`.
+    fn peer_connected(&self, peer: EndpointId) -> bool {
+        self.registry.networks.iter().any(|entry| {
+            self.registry
+                .peers
+                .peers_for_network_with_conn(entry.key())
+                .iter()
+                .any(|(pid, _, _)| *pid == peer)
+        })
+    }
+
+    /// Deliver every queued offer for `peer`, stopping at the first failure
+    /// (the next peer-connected event or sweep retries). Called from the
+    /// mesh-connection hook, the enqueue path, and the periodic sweep; the
+    /// `flushing` guard collapses concurrent triggers so an offer can't be
+    /// delivered twice.
+    pub(crate) async fn flush_outbox_for(self: Arc<Self>, peer: EndpointId) {
+        if !self.flushing.insert(peer) {
+            return;
+        }
+        loop {
+            let Some(entry) = self
+                .outbox
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| e.peer == peer)
+                .cloned()
+            else {
+                break;
+            };
+            match self.deliver_offer(&entry).await {
+                Ok(()) => {
+                    tracing::info!(
+                        peer = %peer.fmt_short(),
+                        filename = %entry.filename,
+                        "queued file offer delivered"
+                    );
+                    self.outbox.lock().unwrap().retain(|e| e.id != entry.id);
+                    self.save_outbox();
                 }
                 Err(e) => {
-                    self.transfers.fail_offer(transfer_id);
-                    return ipc_err(format!("failed to open stream: {e}"));
+                    tracing::debug!(
+                        peer = %peer.fmt_short(),
+                        filename = %entry.filename,
+                        error = %e,
+                        "outbox delivery attempt failed; will retry"
+                    );
+                    break;
                 }
-            },
-            Err(e) => {
-                self.transfers.fail_offer(transfer_id);
-                return ipc_err(format!("cannot reach peer '{peer}': {e}"));
             }
         }
+        self.flushing.remove(&peer);
+    }
 
-        // The bytes have not moved yet: the offer has only just been delivered.
-        // The peer pulls the blob out of our store when it accepts, and that is
-        // what the provider events (wired up in bootstrap) report against this
-        // hash and peer. The entry stays Offered until then.
-        IpcMessage::Ok {
-            message: format!("offered {} ({}) to {}", filename, format_size(size), peer),
+    /// One bounded delivery attempt: dial `FILES_ALPN`, send the offer, wait
+    /// for the peer to read it. The transfer entry stays Offered afterwards;
+    /// the peer pulling the blob is what moves it (provider events).
+    async fn deliver_offer(&self, entry: &OutboxEntry) -> Result<(), String> {
+        let msg = control::ControlMsg::FileOffer {
+            from: self.transport.endpoint.id(),
+            filename: entry.filename.clone(),
+            size: entry.size,
+            mime_type: guess_mime_type(&entry.filename),
+            blob_hash: entry.blob_hash,
+        };
+        let conn = tokio::time::timeout(
+            OFFER_CONNECT_TIMEOUT,
+            transport::connect_to_peer_with_alpn(
+                &self.transport.endpoint,
+                entry.peer,
+                transport::FILES_ALPN,
+            ),
+        )
+        .await
+        .map_err(|_| "connect timed out".to_string())?
+        .map_err(|e| format!("connect failed: {e}"))?;
+        let (mut send, _recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| format!("failed to open stream: {e}"))?;
+        // File offers ride the separate FILES_ALPN, not the mesh demux, so they
+        // carry no network scope.
+        control::send_msg(&mut send, None, &msg)
+            .await
+            .map_err(|e| format!("failed to send offer: {e}"))?;
+        // send_msg already finished the stream; wait for the peer to read the
+        // offer so it flushes before this `conn` is dropped.
+        let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+        Ok(())
+    }
+
+    /// `ray files cancel <id>`: drop a queued send that hasn't been delivered.
+    pub(crate) fn cancel_send(&self, id: u64) -> IpcMessage {
+        let removed = {
+            let mut outbox = self.outbox.lock().unwrap();
+            let i = outbox.iter().position(|e| e.id == id);
+            i.map(|i| outbox.remove(i))
+        };
+        match removed {
+            Some(entry) => {
+                self.transfers.fail_offer_by(
+                    iroh_blobs::Hash::from_bytes(*entry.blob_hash.as_bytes()),
+                    entry.peer,
+                );
+                self.save_outbox();
+                IpcMessage::Ok {
+                    message: format!(
+                        "canceled queued send of {} to {}",
+                        entry.filename,
+                        entry.peer.fmt_short()
+                    ),
+                }
+            }
+            None => ipc_err(format!("no queued send with id {id}")),
+        }
+    }
+
+    /// Persist the outbox (atomic write via `config::write_file`). Filenames
+    /// and peers are not secrets in the config-dir threat model, but keep the
+    /// file root-only like the rest of the daemon state.
+    fn save_outbox(&self) {
+        let Some(path) = outbox_path() else { return };
+        let entries = self.outbox.lock().unwrap().clone();
+        match serde_json::to_vec_pretty(&entries) {
+            Ok(bytes) => {
+                if let Err(e) = config::write_file(&path, &bytes, true) {
+                    tracing::warn!(error = %e, "failed to persist send outbox");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to serialize send outbox"),
         }
     }
 
@@ -470,7 +708,19 @@ impl FileService {
                 own_device: self.is_own_device_sender(f.from),
             })
             .collect();
-        IpcMessage::FileList { files }
+        let outbox = self
+            .outbox
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| ipc::OutboxFileInfo {
+                id: e.id,
+                peer: e.peer.fmt_short().to_string(),
+                filename: e.filename.clone(),
+                size: e.size,
+            })
+            .collect();
+        IpcMessage::FileList { files, outbox }
     }
 
     /// Decline a pending file offer: drop it from the queue without fetching the
@@ -647,5 +897,34 @@ impl FileService {
                 tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to accept bi stream for pairing");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the outbox persistence format: `EndpointId` and `blake3::Hash`
+    /// must survive a JSON round trip (the file is reloaded across daemon
+    /// restarts, so a serde-shape regression would silently drop the queue).
+    #[test]
+    fn outbox_entry_roundtrips_through_json() {
+        let peer = SecretKey::from([7u8; 32]).public();
+        let entry = OutboxEntry {
+            id: 3,
+            peer,
+            filename: "report.pdf".to_string(),
+            size: 42,
+            blob_hash: blake3::hash(b"payload"),
+        };
+        let bytes = serde_json::to_vec(&vec![entry.clone()]).unwrap();
+        let loaded: Vec<OutboxEntry> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(loaded.len(), 1);
+        // `id` is #[serde(skip)]: session-local, reassigned on load.
+        assert_eq!(loaded[0].id, 0);
+        assert_eq!(loaded[0].peer, entry.peer);
+        assert_eq!(loaded[0].filename, entry.filename);
+        assert_eq!(loaded[0].size, entry.size);
+        assert_eq!(loaded[0].blob_hash, entry.blob_hash);
     }
 }

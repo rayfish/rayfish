@@ -1,6 +1,6 @@
 [package]
 name = "ray-proto"
-version = "0.1.6"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Dario <dario@rayfish.xyz>"]
@@ -19,7 +19,13 @@ bytes = "1"
 derive_more = { version = "2", features = ["is_variant", "display"] }
 futures = "0.3"
 iroh = { version = "1" }
+# SCM_RIGHTS fd passing for `SendFileFd` (sendmsg/recvmsg with ancillary data).
+nix = { version = "0.30", features = ["socket", "uio"] }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["net"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["net", "rt", "macros"] }

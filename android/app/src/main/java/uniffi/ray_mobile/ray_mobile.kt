@@ -788,6 +788,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -846,6 +848,8 @@ fun uniffi_ray_mobile_checksum_method_node_list_join_requests(
 fun uniffi_ray_mobile_checksum_method_node_list_transfers(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_log_snapshot(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_network_changed(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_pair(
 ): Short
@@ -976,6 +980,8 @@ fun uniffi_ray_mobile_fn_method_node_list_transfers(`ptr`: Pointer,uniffi_out_er
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_log_snapshot(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_network_changed(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_ray_mobile_fn_method_node_pair(`ptr`: Pointer,`ticket`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_reject_connect_request(`ptr`: Pointer,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1196,6 +1202,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_log_snapshot() != 20955.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_network_changed() != 41989.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_pair() != 22172.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1205,7 +1214,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_reject_file_offer() != 10539.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_send_file() != 31964.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_send_file() != 40644.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_set_default_hostname() != 40200.toShort()) {
@@ -1762,6 +1771,25 @@ public interface NodeInterface {
     fun `logSnapshot`(): kotlin.String
     
     /**
+     * Send a file to a peer. `path` is a readable file path (the core reads its
+     * bytes and adds them to the blob store); `peer` is any identifier the core
+     * resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+     * Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
+     * (or auto-accepts if it is one of the sender's own paired devices). Needs
+     * only the control plane ([`Node::start`]), not the tunnel, but the peer must
+     * be reachable. Runs to completion synchronously; callers drive it off the UI
+     * thread (Android's share flow runs it in a foreground service).
+     * The host OS reported a network change (Wi-Fi/cellular switch, roam,
+     * airplane-mode flip). Android blocks netlink route updates for apps, so
+     * the core cannot observe these itself (netwatch's Android monitor is a
+     * stub): the app must forward `ConnectivityManager` default-network
+     * callbacks here. The core rebinds its QUIC socket and re-probes paths.
+     * Cheap, idempotent, safe to call on every callback; a no-op before
+     * [`Node::start`].
+     */
+    fun `networkChanged`()
+    
+    /**
      * Pair this device with a primary device using a scanned/pasted pairing
      * ticket (`bs58(endpoint_id[32] || secret[32])`).
      */
@@ -1777,16 +1805,6 @@ public interface NodeInterface {
      */
     fun `rejectFileOffer`(`id`: kotlin.ULong)
     
-    /**
-     * Send a file to a peer. `path` is a readable file path (the core reads its
-     * bytes and adds them to the blob store); `peer` is any identifier the core
-     * resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
-     * Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
-     * (or auto-accepts if it is one of the sender's own paired devices). Needs
-     * only the control plane ([`Node::start`]), not the tunnel, but the peer must
-     * be reachable. Runs to completion synchronously; callers drive it off the UI
-     * thread (Android's share flow runs it in a foreground service).
-     */
     fun `sendFile`(`path`: kotlin.String, `peer`: kotlin.String)
     
     /**
@@ -2327,6 +2345,34 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
+     * Send a file to a peer. `path` is a readable file path (the core reads its
+     * bytes and adds them to the blob store); `peer` is any identifier the core
+     * resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+     * Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
+     * (or auto-accepts if it is one of the sender's own paired devices). Needs
+     * only the control plane ([`Node::start`]), not the tunnel, but the peer must
+     * be reachable. Runs to completion synchronously; callers drive it off the UI
+     * thread (Android's share flow runs it in a foreground service).
+     * The host OS reported a network change (Wi-Fi/cellular switch, roam,
+     * airplane-mode flip). Android blocks netlink route updates for apps, so
+     * the core cannot observe these itself (netwatch's Android monitor is a
+     * stub): the app must forward `ConnectivityManager` default-network
+     * callbacks here. The core rebinds its QUIC socket and re-probes paths.
+     * Cheap, idempotent, safe to call on every callback; a no-op before
+     * [`Node::start`].
+     */override fun `networkChanged`()
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_network_changed(
+        it, _status)
+}
+    }
+    
+    
+
+    
+    /**
      * Pair this device with a primary device using a scanned/pasted pairing
      * ticket (`bs58(endpoint_id[32] || secret[32])`).
      */
@@ -2372,16 +2418,6 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     
 
     
-    /**
-     * Send a file to a peer. `path` is a readable file path (the core reads its
-     * bytes and adds them to the blob store); `peer` is any identifier the core
-     * resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
-     * Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
-     * (or auto-accepts if it is one of the sender's own paired devices). Needs
-     * only the control plane ([`Node::start`]), not the tunnel, but the peer must
-     * be reachable. Runs to completion synchronously; callers drive it off the UI
-     * thread (Android's share flow runs it in a foreground service).
-     */
     @Throws(RayException::class)override fun `sendFile`(`path`: kotlin.String, `peer`: kotlin.String)
         = 
     callWithPointer {
