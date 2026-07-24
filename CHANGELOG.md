@@ -59,6 +59,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **No more ANSI color codes in syslog.** The daemon colors its console logs only
+  when stdout is actually a terminal, so logs collected by systemd/journald (and
+  any piped output) are plain text instead of escape-code soup.
 - **`ray send` now works from Documents, Desktop, and other protected folders on
   macOS, and for files only your user can read.** The CLI used to hand the daemon
   a path and the daemon (running as root) did the read, which failed with
