@@ -65,6 +65,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Linux (glibc and musl) and macOS on every change. rayfish.xyz serves a copy of
   this file, and its CI fails if the two drift apart.
 
+- **`ray send` no longer blocks, and sending to an offline device just works.**
+  The command returns as soon as the daemon has the file: if the peer is
+  connected the offer goes out immediately, otherwise it is queued and delivered
+  automatically the moment the device comes back online (sends survive a daemon
+  restart). Queued sends show up in `ray files` and can be dropped with
+  `ray files cancel <id>`. Previously `ray send` sat silent for as long as the
+  dial took and failed outright if the peer was offline.
+- **`ray send` takes multiple files.** `ray send <peer> <file> <file> ...` sends
+  each one; a failure on one file doesn't stop the rest.
+
+- **Android: the app now notices network changes.** Switching between Wi-Fi and
+  mobile data (or roaming access points) used to leave the app on dead sockets:
+  Android does not let apps observe route changes natively, so the core never
+  rebound and the device silently dropped off the mesh until the VPN was toggled
+  by hand. The app now forwards Android's connectivity callbacks to the core,
+  which rebinds and re-probes immediately.
+
+### Changed
+
+- **`ray send` argument order flipped** to make room for multiple files: it is
+  now `ray send <peer> <files...>` (was `ray send <file> <peer>`). The `--json`
+  output of `ray files` is now an object with `pending` (inbound offers) and
+  `queued` (outbound sends) arrays instead of a bare array.
+
 ### Fixed
 
 - **IPv6 no longer dies after `ray down` + `ray up` (Linux).** Linux flushes an
@@ -72,6 +96,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   was only assigned when the TUN was created, so a standby cycle left the node
   reachable over IPv4 while every IPv6 peer silently got no answer (until the
   daemon was restarted). The address is now re-assigned on every activate.
+- **No more ANSI color codes in syslog.** The daemon colors its console logs only
+  when stdout is actually a terminal, so logs collected by systemd/journald (and
+  any piped output) are plain text instead of escape-code soup.
+- **`ray send` now works from Documents, Desktop, and other protected folders on
+  macOS, and for files only your user can read.** The CLI used to hand the daemon
+  a path and the daemon (running as root) did the read, which failed with
+  `Operation not permitted` in TCC-protected folders (the daemon has no Full Disk
+  Access, and root does not bypass TCC) and quietly meant the daemon would read
+  anything root could. `ray send` now opens the file itself, with your own
+  permissions, and passes the open file descriptor to the daemon over the IPC
+  socket (SCM_RIGHTS), so the daemon never touches a path on your behalf. An
+  updated CLI still falls back to the old path-based request when talking to a
+  daemon that predates this.
+
+- **`ray send` now works with relative paths.** The path was resolved by the
+  daemon, whose working directory is not the caller's, so `ray send ./file peer`
+  failed with `No such file or directory` even though the file was right there.
+  The CLI now resolves the path against your shell's working directory before
+  handing it to the daemon, and reports a missing file immediately.
 
 - **`curl -fsSL https://rayfish.xyz/install.sh | sh` works again.** The installer
   detected the host OS inside a command substitution, which runs in a subshell, so

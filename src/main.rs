@@ -323,12 +323,13 @@ pub(crate) enum Command {
         /// Username or numeric UID to grant operator access
         user: String,
     },
-    /// Send a file to a peer
+    /// Send one or more files to a peer (queued if the peer is offline)
     Send {
-        /// File path to send
-        file: String,
-        /// Peer hostname or short ID
+        /// Peer hostname, mesh IP, or short ID
         peer: String,
+        /// File paths to send
+        #[arg(required = true)]
+        files: Vec<String>,
     },
     /// Manage incoming file transfers
     Files {
@@ -743,6 +744,11 @@ pub(crate) enum FilesAction {
         #[arg(long, short)]
         output: Option<String>,
     },
+    /// Cancel a queued send that hasn't reached its peer yet
+    Cancel {
+        /// Queued-send ID (from 'ray files')
+        id: u64,
+    },
     /// Toggle auto-accepting file transfers from your own paired devices on a
     /// network (`on` also drains any already-queued offers from your devices;
     /// `off` stops future auto-accept). Only your own devices are auto-accepted.
@@ -804,6 +810,7 @@ impl Drop for LogGuard {
 /// OTLP endpoint configured, spans are also exported to an OpenTelemetry collector.
 /// The returned [`LogGuard`] must be kept alive for the lifetime of the process.
 fn init_tracing(to_file: bool) -> LogGuard {
+    use std::io::IsTerminal;
     use tracing_subscriber::prelude::*;
 
     // The global gate must be permissive enough for the most verbose layer (the
@@ -818,7 +825,11 @@ fn init_tracing(to_file: bool) -> LogGuard {
 
     // Console layer: human text on stdout, held at `info` so CLI output and the
     // daemon console stay readable while the file keeps the `debug` detail.
-    let console_layer = tracing_subscriber::fmt::layer().with_filter(console_filter);
+    // Color only when stdout is a terminal: under systemd stdout is a pipe to
+    // journald, and ANSI escapes would end up verbatim in syslog.
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(std::io::stdout().is_terminal())
+        .with_filter(console_filter);
 
     // File layer: daemon only, human text with ANSI stripped, rotated daily.
     let (file_layer, appender_guard) = if to_file {
@@ -1119,7 +1130,7 @@ async fn main() -> Result<()> {
         Command::AutoUpdate { state } => cmd_auto_update(&state).await,
         Command::Config { action } => cmd_config(action, cli.json).await,
         Command::SetOperator { user } => cmd_set_operator(&user).await,
-        Command::Send { file, peer } => ipc_send_file(&file, &peer).await,
+        Command::Send { peer, files } => ipc_send_files(&files, &peer).await,
         Command::Files { action } => ipc_files(action).await,
         Command::Pair { action, ticket } => cmd_pair(action, ticket).await,
         Command::Unpair { device } => ipc_unpair(&device).await,
