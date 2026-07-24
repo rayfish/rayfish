@@ -7,6 +7,17 @@ use super::super::*;
 use std::net::IpAddr;
 use std::sync::RwLock;
 
+/// How long `ray exit-node use` waits for the exit peer to answer through the
+/// finished tunnel before returning anyway. Long enough to cover a re-punch after
+/// the routing change (the netwatch-driven rebind lands a few seconds in), short
+/// enough that a broken exit node does not hang the command.
+#[cfg(target_os = "macos")]
+const EXIT_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Per-attempt wait for a control pong. Also paces the readiness loop.
+#[cfg(target_os = "macos")]
+const NUDGE_REPLY_WAIT: Duration = Duration::from_millis(500);
+
 /// The membership a coordinator restores at startup, sourced from the signed
 /// `GroupBlob` (authoritative) or the stale config roster as a fallback.
 struct RestoredRoster {
@@ -73,6 +84,7 @@ impl NetworkRegistry {
                             device_cert: None,
                             collision_index: 0,
                             last_seen: None,
+                            exit_node: false,
                         });
                     }
                     for entry in &nc.approved {
@@ -100,6 +112,7 @@ impl NetworkRegistry {
                     device_cert: None,
                     collision_index: 0,
                     last_seen: None,
+                    exit_node: false,
                 })
                 .expect("self-add cannot collide");
         }
@@ -202,6 +215,12 @@ impl NetworkRegistry {
                 .unwrap_or_default(),
             aliases: net_config.map(|nc| nc.aliases.clone()).unwrap_or_default(),
             ephemeral_ttl_secs: None,
+            // Local exit-node policy survives restarts (server allow-list and the
+            // client's selected exit peer); neither rides the signed blob.
+            exit_allow: net_config
+                .map(|nc| nc.exit_allow.clone())
+                .unwrap_or_default(),
+            exit_node_use: net_config.and_then(|nc| nc.exit_node_use.clone()),
         })?;
 
         let cancel = self.shutdown_token.child_token();
@@ -761,9 +780,20 @@ impl Daemon {
         #[cfg(not(target_os = "android"))]
         {
             let tun_name = self.tun_name.load().as_str().to_owned();
+            let my_v4 = self.transport.identity.local_ip();
+            let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
             if let Err(e) = tun::set_link_up(&tun_name) {
                 tracing::warn!(error = %e, "failed to bring TUN interface up");
                 warnings.push(format!("failed to bring TUN interface up: {e}"));
+            }
+
+            // Linux drops the TUN's global IPv6 address whenever the link goes
+            // down (`ray down`) and never restores it, so re-assign it here or
+            // this node answers on IPv4 only for the rest of the daemon's life.
+            #[cfg(target_os = "linux")]
+            if let Err(e) = tun::ensure_ipv6_addr(&tun_name, my_v6).await {
+                tracing::warn!(error = %e, "failed to assign TUN IPv6 address");
+                warnings.push(format!("failed to assign TUN IPv6 address: {e}"));
             }
 
             // Route the 200::/7 peer range into the TUN. Must happen after
@@ -784,8 +814,6 @@ impl Daemon {
             // the TUN, where the forwarding loop would drop it as "no peer for
             // dst". No-op on Linux (kernel installs the `local` route
             // automatically).
-            let my_v4 = self.transport.identity.local_ip();
-            let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
             if let Err(e) = tun::route_self_loopback(my_v4, my_v6).await {
                 tracing::warn!(error = %e, "failed to install loopback self-route");
                 warnings.push(format!("failed to install loopback self-route: {e}"));
@@ -805,6 +833,13 @@ impl Daemon {
             self.start_ssh();
         }
 
+        // From here until `deactivate()`, the roster's exit-offer flag is kept in
+        // sync with the loaded gateway policy (see `sync_exit_offers`).
+        self.registry
+            .exit_sync_enabled
+            .store(true, Ordering::SeqCst);
+        warnings.extend(self.apply_exit_node().await);
+
         tracing::info!("data plane activated");
         if warnings.is_empty() {
             IpcMessage::Ok {
@@ -818,6 +853,332 @@ impl Daemon {
             }
             IpcMessage::Ok { message }
         }
+    }
+
+    /// Reconcile every piece of exit-node state with the on-disk config: the
+    /// gateway allow policy and its kernel forwarding/NAT, and the client selection
+    /// and its full-tunnel routing. Both halves are idempotent and both directions
+    /// (install / remove) are handled, so this is the single entry point used by
+    /// `activate` and by any `ray exit-node` change made while up. Returns a
+    /// user-facing warning if either half could not be put in place.
+    pub(crate) async fn apply_exit_node(&self) -> Option<String> {
+        // One reconcile at a time (see `Daemon::exit_reconcile`): the kernel
+        // enable's snapshot-then-write is not safe to interleave.
+        let started = tokio::time::Instant::now();
+        let _guard = self.exit_reconcile.lock().await;
+        let locked = started.elapsed();
+        let tun_name = self.tun_name.load().as_str().to_owned();
+        let reload = self.registry.reload_exit_state();
+        let reloaded = started.elapsed();
+        // Both halves run even if the first one failed: they are independent roles,
+        // and each one's teardown path has to happen regardless.
+        let server = apply_exit_server_os(&self.registry.exit_server, &tun_name).await;
+        let served = started.elapsed();
+        let client = self.apply_exit_client(&tun_name).await;
+        let clients = started.elapsed();
+        // Advertise what actually survived the reconcile: a failed enable cleared
+        // the offers, so this also withdraws a stale advertisement rather than
+        // keeping clients routed into a gateway that forwards nothing.
+        self.registry.sync_exit_offers().await;
+        // This runs inside the IPC request, so anything slow here is time the user
+        // spends staring at `ray exit-node use`. Timed per phase because a stall in
+        // any of them is indistinguishable from the outside.
+        tracing::debug!(
+            lock = ?locked,
+            reload = ?(reloaded - locked),
+            server = ?(served - reloaded),
+            client = ?(clients - served),
+            sync_offers = ?(started.elapsed() - clients),
+            total = ?started.elapsed(),
+            "exit reconcile timing"
+        );
+        reload.or(server).or(client)
+    }
+
+    /// Spawn the daemon-lifetime listener that re-runs the exit reconcile when a
+    /// reconverge nudges [`NetworkRegistry::exit_reapply`]: the roster just gained
+    /// the exit peer a pending selection has been waiting for (boot before the
+    /// first reconverge), so the full tunnel can finally go in without waiting for
+    /// the next `ray up`. A channel rather than a direct call because the kernel
+    /// plumbing lives here on `Daemon`, above the registry in the service graph.
+    pub(crate) fn spawn_exit_reapply_listener(self: &Arc<Self>) {
+        let daemon = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = daemon.shutdown_token.cancelled() => break,
+                    _ = daemon.registry.exit_reapply.notified() => {}
+                }
+                if !daemon.active.load(Ordering::SeqCst) {
+                    continue;
+                }
+                if let Some(warning) = daemon.apply_exit_node().await {
+                    tracing::warn!(warning, "exit-node re-apply after roster update");
+                }
+            }
+        });
+    }
+
+    /// After a `ray exit-node` mutation: if the data plane is up, reconcile the
+    /// runtime state and kernel plumbing now (otherwise `activate()` picks it up
+    /// on `ray up`), folding any reconcile warning into the reply so a failed
+    /// install is never reported as plain success.
+    pub(crate) async fn reconcile_exit_node(&self, resp: IpcMessage) -> IpcMessage {
+        if !self.active.load(Ordering::SeqCst) {
+            // Data plane on standby: persisted but not in effect until `ray up`.
+            // (When the data plane is up we fall through and apply it now, so the
+            // reply must not claim `ray up` is needed.)
+            return match resp {
+                IpcMessage::Ok { message } => IpcMessage::Ok {
+                    message: format!("{message} (takes effect on `ray up`)"),
+                },
+                other => other,
+            };
+        }
+        match (self.apply_exit_node().await, resp) {
+            (Some(warning), IpcMessage::Ok { message }) => IpcMessage::Ok {
+                message: format!("{message}\nwarning: {warning}"),
+            },
+            (_, resp) => resp,
+        }
+    }
+
+    /// Install or remove the client full-tunnel routing to match the selection.
+    /// The kernel plumbing spawns a series of `ip`/`nft` children and waits on
+    /// them, so it runs on the blocking pool rather than stalling a runtime
+    /// worker (this is called from the IPC dispatcher and `activate()`).
+    #[cfg(target_os = "linux")]
+    async fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
+        let install = self.registry.exit_client.is_active();
+        let tun_name = tun_name.to_owned();
+        let result = tokio::task::spawn_blocking(move || {
+            if !install {
+                crate::exit_node::teardown_client_routing();
+                return Ok(());
+            }
+            crate::exit_node::install_client_routing(&tun_name).inspect_err(|_| {
+                // A partial install must not stay live: rules that went in before
+                // the failure (say v4's, with `ipv6.disable=1` failing the v6 half)
+                // would keep routing traffic into a tunnel that was never fully set
+                // up. Mirror the macOS branch and roll all of it back.
+                crate::exit_node::teardown_client_routing();
+            })
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "failed to install exit-node client routing");
+                Some(format!("failed to route traffic through exit node: {e}"))
+            }
+            Err(e) => Some(format!("exit-node routing task failed: {e}")),
+        }
+    }
+
+    /// Install or remove the client full tunnel to match the selection.
+    ///
+    /// macOS has no fwmark: loop prevention instead pins iroh's sockets to the
+    /// physical default-route interface (`exit_node::configure_socket`), and the
+    /// pin only lands on a (re)bind, which `Endpoint::network_change` forces. So
+    /// ordering matters both ways: pin and rebind *before* the default routes go
+    /// in, and take the routes out *before* releasing the pin, so there is never
+    /// a moment where iroh's own traffic can be routed into the tunnel it is
+    /// carrying. The rebind is skipped when the pin state did not flip (re-apply
+    /// while up, or teardown when no tunnel was installed).
+    #[cfg(target_os = "macos")]
+    async fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
+        let result = if !self.registry.exit_client.is_active() {
+            tun::unroute_default_via_tun(tun_name).await;
+            crate::exit_node::remove_tunnel_exclusions();
+            crate::exit_node::clear_physical_defaults();
+            if crate::exit_node::set_full_tunnel(false) {
+                self.transport.endpoint.network_change().await;
+                // The rebind that releases the pin drops every direct path too.
+                self.nudge_all_peers();
+            }
+            None
+        } else {
+            // Keep iroh's own underlay traffic off the tunnel with host routes: the
+            // relay servers (resolved now, while DNS is still split) and, below,
+            // the exit peer's direct addresses.
+            let relay_ips = self.relay_underlay_ips().await;
+            crate::exit_node::exclude_from_tunnel(&relay_ips);
+            // Snapshot the physical default interfaces while the routing table is
+            // still clean. Once the split defaults are in, a live lookup answers
+            // "the tunnel" for any family without a default route of its own, and
+            // pinning iroh there routes its transport into its own tunnel.
+            crate::exit_node::capture_physical_defaults();
+            // Pin and rebind before the routes go in: `network_change` rebinds
+            // iroh's UDP socket to apply the pin, and until it has, the transport
+            // has nothing keeping it out of the tunnel.
+            if !crate::exit_node::set_full_tunnel(true) {
+                self.transport.endpoint.network_change().await;
+            }
+            let conn = self.exit_peer_conn().await;
+            // The exit peer's own direct addresses need the same treatment as the
+            // relays, and are only knowable from the live connection. Without this
+            // the direct path is the one thing still routed into the tunnel: it
+            // blackholes, iroh spends ~20s failing over, and only the relay (which
+            // does have a host route) carries traffic.
+            if let Some(conn) = &conn {
+                crate::exit_node::exclude_from_tunnel(&peer_underlay_ips(conn));
+            }
+            let failure = self.route_default_or_rollback(tun_name).await;
+            if failure.is_none() {
+                // Only now is the routing table in its final shape. Everything
+                // before this point gets invalidated by it: a rebind drops every
+                // hole-punched path, and installing the routes makes netwatch fire
+                // its own network change a few seconds later, which drops them
+                // again. So wait here, at the end, or the command returns while
+                // the tunnel is still settling and the first `curl` hangs.
+                self.nudge_all_peers();
+                if let Some(conn) = conn {
+                    self.await_exit_ready(&conn).await;
+                }
+            }
+            failure
+        };
+        // Re-apply system DNS to match the now-settled full-tunnel state: route
+        // *all* DNS through Magic DNS while the tunnel is up (so resolution goes
+        // out via the exit), split `.ray`-only otherwise.
+        self.dns.reassert_os_config().await;
+        result
+    }
+
+    /// Nudge every live peer connection so it re-punches a direct path after the
+    /// full-tunnel rebind dropped it to the relay. Fire-and-forget (the mesh is
+    /// still reachable over the relay meanwhile); only the exit peer is worth
+    /// blocking on, which [`warm_exit_peer`](Self::warm_exit_peer) does.
+    #[cfg(target_os = "macos")]
+    fn nudge_all_peers(&self) {
+        let exit_ip = self.registry.exit_client.selection().map(|s| s.ipv4);
+        for (ip, conn) in self.registry.peers.all_connections() {
+            if Some(ip) == exit_ip {
+                continue; // warmed synchronously below
+            }
+            let router = self.protocol_router.clone();
+            tokio::spawn(async move { nudge_holepunch(&router, &conn).await });
+        }
+    }
+
+    /// The live connection to the selected exit peer, dialing it if there is none.
+    #[cfg(target_os = "macos")]
+    async fn exit_peer_conn(&self) -> Option<Connection> {
+        let sel = self.registry.exit_client.selection()?;
+        // Dial only when there is no live connection. Dialing on top of one opens a
+        // *second* QUIC connection to the same peer, and with one reader per peer
+        // the two ends settle on different connections: we send every exit packet
+        // down ours while the gateway reads its own, and nothing crosses in either
+        // direction. Same gate the on-demand data path and `ray ping` use.
+        if let Some(conn) = self.registry.peers.conn_for_ip(&sel.ipv4) {
+            return Some(conn);
+        }
+        // Dial only when there is no live connection. Dialing on top of one opens a
+        // *second* QUIC connection to the same peer, and with one reader per peer
+        // the two ends settle on different connections: we send every exit packet
+        // down ours while the gateway reads its own, and nothing crosses in either
+        // direction. Same gate the on-demand data path and `ray ping` use.
+        let target = self.registry.resolve_route(IpAddr::V4(sel.ipv4))?;
+        self.registry.dial_target(&target).await;
+        self.registry.peers.conn_for_ip(&sel.ipv4)
+    }
+
+    /// Block until the exit peer answers over the finished tunnel, so
+    /// `ray exit-node use` returns only once traffic through it actually works.
+    ///
+    /// The readiness signal is a control ping that comes *back*. Path state is not
+    /// enough: every failure this feature has had (the transport pinned into its own
+    /// tunnel, the split connection, relay traffic captured by the tunnel) presented
+    /// as a healthy-looking path carrying nothing, and each one showed up here as a
+    /// ping that never returned. On expiry we proceed anyway rather than fail the
+    /// command, since the tunnel is installed and may still come good.
+    #[cfg(target_os = "macos")]
+    async fn await_exit_ready(&self, conn: &Connection) {
+        let started = tokio::time::Instant::now();
+        let ready = tokio::time::timeout(EXIT_READY_TIMEOUT, async {
+            loop {
+                // Re-check every round: hole-punching discovers new candidate
+                // addresses as it goes, and one that appears without a host route
+                // around the tunnel is a path that will blackhole.
+                crate::exit_node::exclude_from_tunnel(&peer_underlay_ips(conn));
+                if nudge_holepunch(&self.protocol_router, conn).await {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok();
+        if ready {
+            tracing::debug!(took = ?started.elapsed(), "exit peer reachable through the tunnel");
+        } else {
+            tracing::warn!(
+                timeout = ?EXIT_READY_TIMEOUT,
+                "exit peer did not answer through the tunnel; traffic may not flow yet"
+            );
+        }
+    }
+
+
+    /// Resolve iroh's relay servers to their IPv4 addresses so they can be routed
+    /// around the full tunnel. Resolved via the system resolver, so call this
+    /// while DNS is still split (before the tunnel's DNS catch-all goes in).
+    #[cfg(target_os = "macos")]
+    async fn relay_underlay_ips(&self) -> Vec<std::net::Ipv4Addr> {
+        // The configured relay set (custom override + n0 default fallback), the
+        // same the endpoint dials. Excluding the whole set (a handful of host
+        // routes) covers whichever relay it is actually homed on.
+        let relay_mode = config::load()
+            .ok()
+            .and_then(|c| crate::transport::build_relay_mode(&c.relay).ok().flatten())
+            .unwrap_or(iroh::RelayMode::Default);
+        let urls = relay_mode.relay_map().urls::<Vec<iroh::RelayUrl>>();
+        let mut ips = Vec::new();
+        for url in urls {
+            let Some(host) = url.host_str() else { continue };
+            let port = url.port_or_known_default().unwrap_or(443);
+            if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
+                for a in addrs {
+                    if let IpAddr::V4(v4) = a.ip()
+                        && !ips.contains(&v4)
+                    {
+                        ips.push(v4);
+                    }
+                }
+            }
+        }
+        ips
+    }
+
+    /// Install the split default routes into the TUN, rolling the full-tunnel pin
+    /// back on failure so a partial install (one family in, the other not) does
+    /// not blackhole traffic.
+    #[cfg(target_os = "macos")]
+    async fn route_default_or_rollback(&self, tun_name: &str) -> Option<String> {
+        match tun::route_default_via_tun(tun_name).await {
+            Ok(()) => None,
+            Err(e) => {
+                tun::unroute_default_via_tun(tun_name).await;
+                if crate::exit_node::set_full_tunnel(false) {
+                    self.transport.endpoint.network_change().await;
+                }
+                tracing::warn!(error = %e, "failed to install exit-node client routing");
+                Some(format!("failed to route traffic through exit node: {e}"))
+            }
+        }
+    }
+
+    /// Using an exit node needs full-tunnel routing plus loop prevention for the
+    /// node's own transport, which only Linux (`SO_MARK` + policy routing) and
+    /// macOS (`IP_BOUND_IF` socket pinning) have. Say so, rather than reporting
+    /// success while every packet keeps leaving the local uplink. Offering an
+    /// exit node works on every platform.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    async fn apply_exit_client(&self, _tun_name: &str) -> Option<String> {
+        self.registry.exit_client.is_active().then(|| {
+            "using an exit node is not supported on this platform yet; traffic still \
+             leaves this host directly. Clear it with `ray exit-node none`."
+                .to_string()
+        })
     }
 
     /// Put the daemon on standby: take the data plane offline (revert system
@@ -846,6 +1207,33 @@ impl Daemon {
             tracing::warn!(error = %e, "failed to bring TUN interface down");
         }
 
+        // Exit-node server: drop the allow policy so no transit happens while on
+        // standby, then reconcile (which removes the kernel forwarding/NAT). With no
+        // offers left this is the teardown path, which never reports a problem.
+        // Under the reconcile lock: this must not interleave with an in-flight
+        // `apply_exit_node` (the reapply listener, a late IPC mutation), which
+        // could otherwise re-enable what this is tearing down, or worse, snapshot
+        // the half-torn-down sysctls as "original".
+        let _guard = self.exit_reconcile.lock().await;
+        self.registry.exit_server.clear();
+        let _ = apply_exit_server_os(&self.registry.exit_server, &tun_name).await;
+
+        // Withdraw the roster advertisement while the offers are still cleared and
+        // syncing is still enabled: connections stay up on standby, so a peer that
+        // kept routing through us would blackhole against the empty allow list
+        // otherwise. `activate()` re-advertises. Then disable syncing, so a
+        // reconverge during standby leaves the (withdrawn) flag alone.
+        self.registry.sync_exit_offers().await;
+        self.registry
+            .exit_sync_enabled
+            .store(false, Ordering::SeqCst);
+
+        // Exit-node client: clear the selection, then reconcile, which removes the
+        // full tunnel (Linux policy routing; macOS split-default routes + socket
+        // pinning). Teardown never reports a problem.
+        self.registry.exit_client.set(None);
+        let _ = self.apply_exit_client(&tun_name).await;
+
         tracing::info!("VPN on standby");
         IpcMessage::Ok {
             message: "VPN on standby (still connected to peers)".into(),
@@ -858,4 +1246,60 @@ impl Daemon {
     pub async fn leave_network(&self, name: &str) -> IpcMessage {
         self.registry.leave_network(name).await
     }
+}
+
+/// Run [`ExitServer::apply_os`](crate::exit_node::ExitServer::apply_os) on the
+/// blocking pool: enabling or disabling the gateway spawns a series of
+/// `nft`/`pfctl`/`sysctl` children and waits on them, which must not stall a
+/// runtime worker (this is reached from the IPC dispatcher, `activate()`, and
+/// `deactivate()`).
+async fn apply_exit_server_os(
+    server: &crate::exit_node::ExitServer,
+    tun_name: &str,
+) -> Option<String> {
+    let server = server.clone();
+    let tun_name = tun_name.to_owned();
+    match tokio::task::spawn_blocking(move || server.apply_os(&tun_name)).await {
+        Ok(warning) => warning,
+        Err(e) => Some(format!("exit-node reconcile task failed: {e}")),
+    }
+}
+
+/// Send one control ping on `conn` and report whether the pong came back within
+/// [`NUDGE_REPLY_WAIT`].
+///
+/// Doubles as the hole-punch nudge: iroh only upgrades off the relay once there is
+/// traffic on the connection, so the ping drives the upgrade whether or not the
+/// caller cares about the answer.
+#[cfg(target_os = "macos")]
+async fn nudge_holepunch(router: &ProtocolRouter, conn: &Connection) -> bool {
+    let nonce: u64 = rand::random();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    router.pending_pongs().insert(nonce, tx);
+    if let Ok((mut send, _)) = conn.open_bi().await {
+        let _ = control::send_msg(&mut send, None, &control::ControlMsg::Ping { nonce }).await;
+    }
+    let answered = tokio::time::timeout(NUDGE_REPLY_WAIT, rx).await.is_ok();
+    router.pending_pongs().remove(&nonce);
+    answered
+}
+
+/// The exit peer's own underlay IPv4 addresses, as iroh currently knows them.
+///
+/// These are the addresses our QUIC packets to the exit peer are actually sent to,
+/// so they are exactly what must be routed around the full tunnel. Relay paths are
+/// skipped: the relay servers are excluded separately, by name, before DNS moves
+/// into the tunnel.
+#[cfg(target_os = "macos")]
+fn peer_underlay_ips(conn: &Connection) -> Vec<std::net::Ipv4Addr> {
+    let mut ips = Vec::new();
+    for path in conn.paths().iter() {
+        if let iroh::TransportAddr::Ip(addr) = path.remote_addr()
+            && let IpAddr::V4(v4) = addr.ip()
+            && !ips.contains(&v4)
+        {
+            ips.push(v4);
+        }
+    }
+    ips
 }

@@ -146,6 +146,18 @@ for i in "${!HOSTS[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
+# Open iperf3's port on every host. The mesh firewall is secure-by-default
+# (inbound TCP/UDP denied, only ICMP allowed), so the icmp/flood probes pass
+# untouched but iperf3's control (TCP 5201) + data (UDP 5201) would be dropped
+# and the UDP probe would read as a total measurement failure. This is a loss
+# test of the data path, not of the firewall, so allow the port explicitly.
+step "2b. allow iperf3 (tcp+udp 5201) inbound on all hosts"
+for i in "${!HOSTS[@]}"; do
+  on "${PUBS[$i]}" "ray firewall add in allow --proto tcp --port 5201 >/dev/null && ray firewall add in allow --proto udp --port 5201 >/dev/null" \
+    && echo "   iperf3 port open on ${HOSTS[$i]}"
+done
+
+# ---------------------------------------------------------------------------
 # Probe every unordered pair in both directions. Results also land in a report.
 RESDIR="$DIR/results"; mkdir -p "$RESDIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -159,15 +171,15 @@ probe_pair(){
 
   local r d
   r="$(ping_loss_n "$fp" "$tv" "$PING_COUNT" 0.01)"; d="$(ping_loss_n "$fp" "$tp" "$PING_COUNT" 0.01)"
-  assert_loss "$from→$to  icmp  (-c $PING_COUNT -i 0.01)" "$r" "$d"
+  assert_loss "$from -> $to  icmp  (-c $PING_COUNT -i 0.01)" "$r" "$d"
   printf '%s\t%s\ticmp\t%s\t%s\n' "$from" "$to" "${r:-?}" "${d:-?}" >> "$RAW"
 
   r="$(ping_flood "$fp" "$tv" "$FLOOD_COUNT")"; d="$(ping_flood "$fp" "$tp" "$FLOOD_COUNT")"
-  assert_loss "$from→$to  flood (-f -c $FLOOD_COUNT)" "$r" "$d"
+  assert_loss "$from -> $to  flood (-f -c $FLOOD_COUNT)" "$r" "$d"
   printf '%s\t%s\tflood\t%s\t%s\n' "$from" "$to" "${r:-?}" "${d:-?}" >> "$RAW"
 
   r="$(iperf_udp_loss "$fp" "$tv" "$tp")"; d="$(iperf_udp_loss "$fp" "$tp" "$tp")"
-  assert_loss "$from→$to  iperf-udp (-b $RATE -t ${DURATION}s)" "$r" "$d"
+  assert_loss "$from -> $to  iperf-udp (-b $RATE -t ${DURATION}s)" "$r" "$d"
   printf '%s\t%s\tudp\t%s\t%s\n' "$from" "$to" "${r:-?}" "${d:-?}" >> "$RAW"
 }
 

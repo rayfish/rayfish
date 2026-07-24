@@ -58,6 +58,18 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// plus the 60s group poll; and `Welcome.direct_key`, which folds a direct
 /// (`ray connect`) network's co-coordinator key grant into the join handshake's
 /// Welcome (deterministic) instead of a separate best-effort `AdminGrant` stream.
+///
+/// *Additive* wire changes do not bump this version. The frame reader skips any
+/// frame it cannot decode (so an unknown `ControlMsg` variant is dropped, not
+/// fatal) and nacks it with `ControlMsg::NotSupported` so the mismatch shows in
+/// the sender's log (builds before the nack existed skip silently), and every
+/// frame and blob is msgpack map-encoded (`to_vec_named`) with
+/// `serde(default)` on new fields, so unknown fields are ignored and missing ones
+/// defaulted in both directions. Exit nodes ride that: a v2 peer that predates
+/// `ControlMsg::ExitNodeOffer` and `Member.exit_node` stays connected and simply
+/// cannot offer or discover exit nodes until updated. Bump only for changes an
+/// old peer would *misinterpret* (removed/repurposed fields or variants, changed
+/// semantics of existing ones), not for ones it safely ignores.
 pub const MESH_PROTOCOL_VERSION: u32 = 2;
 
 /// Capability bits a peer advertises in its `MeshHello.features`. These are
@@ -154,6 +166,12 @@ async fn bind_endpoint(
         // would loop the underlay back through the tunnel). Stays bound to `0.0.0.0`,
         // so multi-homing / roaming is unaffected.
         .direct_addr_filter(OverlayAddrFilter);
+
+    // Loop prevention for the exit-node client full-tunnel: keep iroh's own sockets
+    // (the underlay UDP sockets and the relay connection) off the default route that
+    // `ray up` points into the TUN, instead of looping the transport back through the
+    // tunnel it is carrying. See `exit_node::LoopPrevention`.
+    builder = builder.configure_socket(crate::exit_node::LoopPrevention);
 
     // Override the N0 preset's relay / discovery defaults when configured.
     if let Some(mode) = build_relay_mode(relay)? {

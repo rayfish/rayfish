@@ -116,6 +116,8 @@ impl Daemon {
                         pending_requests: 0,
                         aliases,
                         ephemeral_ttl_secs,
+                        my_exit_node: None,
+                        exit_offering: false,
                     };
                 }
             };
@@ -142,6 +144,14 @@ impl Daemon {
             .as_ref()
             .map(|c| c.user_identity)
             .unwrap_or(my_id);
+        // The exit peer we route internet traffic through (`ray exit-node use`),
+        // matched the way the roster keys members: by device id, or by the user
+        // identity a paired multi-device peer is stored under.
+        let exit_id = net_cfg
+            .as_ref()
+            .and_then(|n| n.exit_node_use.as_ref())
+            .and_then(|stored| stored.parse::<EndpointId>().ok());
+        let is_my_exit = |m: &Member| exit_id.is_some_and(|id| m.matches_identity(id));
         let peers = members
             .iter()
             .filter(|m| m.identity != my_id)
@@ -179,9 +189,25 @@ impl Daemon {
                         PeerState::Idle
                     },
                     connection,
+                    exit_node: m.exit_node,
+                    exit_in_use: is_my_exit(m),
                 }
             })
             .collect();
+        // The same peer as a display string for the network header: its hostname if
+        // the roster knows it, else a short id, else the raw stored value (which is
+        // all we have if it names nobody in the roster).
+        let my_exit_node = net_cfg
+            .as_ref()
+            .and_then(|n| n.exit_node_use.clone())
+            .map(|stored| match members.iter().find(|m| is_my_exit(m)) {
+                Some(m) => m
+                    .hostname
+                    .clone()
+                    .or_else(|| lookup_hostname(m.ip))
+                    .unwrap_or_else(|| m.identity.fmt_short().to_string()),
+                None => stored,
+            });
         NetworkStatus {
             name: h.name.clone(),
             role,
@@ -195,6 +221,9 @@ impl Daemon {
             pending_requests,
             aliases,
             ephemeral_ttl_secs,
+            my_exit_node,
+            // A non-empty allow-list is exactly what makes this node an exit node.
+            exit_offering: net_cfg.as_ref().is_some_and(|n| !n.exit_allow.is_empty()),
         }
     }
 

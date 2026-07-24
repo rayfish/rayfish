@@ -282,19 +282,25 @@ fn persist_join_config(
         .or(my_hostname.clone());
     // Preserve across reconnects/restores state the just-fetched blob doesn't
     // carry: the direct-connection flag, a queued rename intent, the SSH allow
-    // list, and node-local aliases.
-    let (direct, pending_hostname, ssh_allow, aliases, prev_auto_accept_files) =
-        config::load_network(network_name)?
-            .map(|n| {
-                (
-                    n.direct,
-                    n.pending_hostname,
-                    n.ssh_allow,
-                    n.aliases,
-                    n.auto_accept_files,
-                )
-            })
-            .unwrap_or((false, None, vec![], BTreeMap::new(), false));
+    // list, node-local aliases, and the local exit-node policy (server
+    // allow-list + selected exit peer). Anything node-local left out of this
+    // list is silently erased on every member daemon restart.
+    let prev = config::load_network(network_name)?;
+    let (direct, pending_hostname, ssh_allow, aliases, prev_auto_accept_files) = prev
+        .as_ref()
+        .map(|n| {
+            (
+                n.direct,
+                n.pending_hostname.clone(),
+                n.ssh_allow.clone(),
+                n.aliases.clone(),
+                n.auto_accept_files,
+            )
+        })
+        .unwrap_or((false, None, vec![], BTreeMap::new(), false));
+    let (exit_allow, exit_node_use) = prev
+        .map(|n| (n.exit_allow, n.exit_node_use))
+        .unwrap_or((vec![], None));
     // The toggle command (`ray files auto-accept`) is authoritative, so preserve
     // a previously-persisted value; the join-time `--auto-accept-files` seed only
     // needs to take effect on the first join (no prior config).
@@ -317,6 +323,8 @@ fn persist_join_config(
         ssh_allow,
         aliases,
         ephemeral_ttl_secs: None,
+        exit_allow,
+        exit_node_use,
     })
 }
 
@@ -564,14 +572,18 @@ fn spawn_reconverge_worker(
                 _ = token.cancelled() => return,
                 _ = notify.notified() => {}
                 _ = tick.tick() => {
-                    // Only the pending-rename backstop wants the periodic
-                    // wake; otherwise idle until the next real trigger.
-                    if !has_pending_hostname(&network_name) {
+                    // Only outstanding deliveries want the periodic wake: a
+                    // pending rename, or an exit offer the signed roster does
+                    // not reflect yet (its delivery missed every coordinator).
+                    // Otherwise idle until the next real trigger.
+                    if !has_pending_hostname(&network_name)
+                        && !ctx_w.registry.exit_offer_out_of_sync(&network_name)
+                    {
                         continue;
                     }
                     tracing::debug!(
                         network = %network_name,
-                        "backstop tick: pending rename outstanding, reconverging to retry delivery"
+                        "backstop tick: pending rename or exit offer outstanding, reconverging to retry delivery"
                     );
                 }
             }
@@ -596,4 +608,119 @@ fn spawn_reconverge_worker(
             .await;
         }
     });
+}
+
+#[cfg(test)]
+mod persist_config_tests {
+    use super::*;
+    use crate::config::{self, CONFIG_ENV_LOCK, MemberEntry, NetworkConfig};
+    use crate::membership::Member;
+    use iroh::SecretKey;
+    use std::collections::BTreeMap;
+
+    fn id(seed: u8) -> EndpointId {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        SecretKey::from(b).public()
+    }
+
+    fn member(seed: u8, ip: Ipv4Addr, coordinator: bool) -> Member {
+        Member {
+            identity: id(seed),
+            ip,
+            is_coordinator: coordinator,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+            last_seen: None,
+            exit_node: false,
+        }
+    }
+
+    /// Regression: a member daemon reconnecting must not erase the node-local
+    /// exit-node policy. `persist_join_config` rewrites the network config from
+    /// the freshly fetched blob roster, which does not carry `exit_allow` /
+    /// `exit_node_use`; before the fix it wrote empty values, so every restart
+    /// silently withdrew the gateway's offer and dropped the client's selection.
+    #[test]
+    fn reconnect_preserves_local_exit_node_policy() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("RAYFISH_CONFIG_DIR");
+        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", tmp.path()) };
+
+        let net_pubkey = id(1);
+        let me = id(2);
+        let my_ip = Ipv4Addr::new(100, 64, 0, 2);
+
+        // Pre-existing config: this node offers an exit (`*`) and routes its own
+        // traffic through a chosen peer. This is the state a restart must keep.
+        let exit_peer = id(3).to_string();
+        config::save_network(&NetworkConfig {
+            name: "homelab".to_string(),
+            group_mode: GroupMode::Restricted,
+            my_ip: Some(my_ip),
+            my_hostname: Some("umbrel".to_string()),
+            pending_hostname: None,
+            members: vec![MemberEntry {
+                identity: me,
+                ip: my_ip,
+                is_coordinator: false,
+                hostname: Some("umbrel".to_string()),
+            }],
+            approved: vec![],
+            network_secret_key: None,
+            network_public_key: Some(net_pubkey),
+            transport: None,
+            auto_accept_firewall: false,
+            auto_accept_files: false,
+            admins: vec![],
+            direct: false,
+            ssh_allow: vec![],
+            aliases: BTreeMap::new(),
+            ephemeral_ttl_secs: None,
+            exit_allow: vec!["*".to_string()],
+            exit_node_use: Some(exit_peer.clone()),
+        })
+        .unwrap();
+
+        // Reconnect: re-persist from a blob roster that carries no exit policy.
+        let roster = vec![
+            member(2, my_ip, false),
+            member(4, Ipv4Addr::new(100, 64, 0, 4), true),
+        ];
+        persist_join_config(
+            "homelab",
+            &roster,
+            &[],
+            me,
+            my_ip,
+            net_pubkey,
+            &Some("umbrel".to_string()),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let after = config::load_network("homelab").unwrap().unwrap();
+        assert_eq!(
+            after.exit_allow,
+            vec!["*".to_string()],
+            "exit allow-list must survive a reconnect"
+        );
+        assert_eq!(
+            after.exit_node_use,
+            Some(exit_peer),
+            "selected exit peer must survive a reconnect"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RAYFISH_CONFIG_DIR", v),
+                None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+            }
+        }
+    }
 }

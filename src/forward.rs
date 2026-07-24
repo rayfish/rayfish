@@ -21,7 +21,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::daemon::NetworkRegistry;
 use crate::dns;
+use crate::exit_node::{ExitClient, ExitContext, is_transitable};
 use crate::firewall::{self, Direction, SharedFirewall};
+use crate::membership::is_overlay_ip;
 use crate::peers::{DeviceUserMap, PeerRoute, PeerTable};
 use crate::stats::{DropReason, ForwardMetrics};
 
@@ -185,6 +187,10 @@ pub(crate) enum InboundDecision {
     /// address. A peer may only source packets from its own mesh IP, so this
     /// blocks one peer from impersonating another's IP (ingress anti-spoofing).
     DropSpoof,
+    /// Dropped: the datagram is bound for a non-overlay (internet) destination but
+    /// this node does not offer the sender an exit node on this network. Prevents
+    /// a non-exit node from silently transiting a peer's internet traffic.
+    DropExit,
 }
 
 /// Pure evaluation of an inbound peer datagram against the firewall and basic
@@ -195,6 +201,7 @@ pub(crate) enum InboundDecision {
 pub(crate) fn evaluate_inbound(
     packet: &[u8],
     firewall: &SharedFirewall,
+    exit: &ExitContext,
     peer_id: &EndpointId,
     peer_ip: Ipv4Addr,
     peer_ipv6: Ipv6Addr,
@@ -215,7 +222,67 @@ pub(crate) fn evaluate_inbound(
         IpAddr::V6(v6) => v6 == peer_ipv6,
     };
     if !src_ok {
-        return InboundDecision::DropSpoof;
+        // Exit-node client return traffic: replies to our internet-bound flows come
+        // back from our chosen exit peer sourced from the *host we reached*, not
+        // from the peer's mesh IP, so they can never satisfy the anti-spoof check.
+        // Exempt them (only when the sender is our exit peer, whichever shared
+        // network's handle the reply arrives under; the source is a routable public
+        // address, symmetric to the outbound is_transitable check so the exit peer
+        // cannot forge our LAN or loopback; and the packet is addressed to us) and
+        // let them face the firewall like any other inbound packet.
+        //
+        // They are not waved through: the conntrack entry our own outbound packet
+        // created is what admits the reply. So the exit peer can deliver traffic for
+        // flows we opened, but cannot inject unsolicited packets at our local ports.
+        // (It is on-path for our real flows and can forge within them, as any
+        // gateway or ISP can; that is what TLS is for. Reaching a service we never
+        // dialed is a different matter, and it can't.)
+        let dst_is_me = match info.dst_ip {
+            IpAddr::V4(v4) => v4 == exit.my_v4,
+            IpAddr::V6(v6) => v6 == exit.my_v6,
+        };
+        let exit_return = exit.client.is_return_from(peer_id, peer_ip)
+            && !is_overlay_ip(info.src_ip)
+            && is_transitable(info.src_ip)
+            && dst_is_me;
+        if !exit_return {
+            // A non-overlay source is a would-be exit-node reply: log why the
+            // exemption did not fire so a broken return path is diagnosable.
+            if !is_overlay_ip(info.src_ip) {
+                tracing::debug!(
+                    src = %info.src_ip,
+                    dst = %info.dst_ip,
+                    is_return = exit.client.is_return_from(peer_id, peer_ip),
+                    transitable = is_transitable(info.src_ip),
+                    dst_is_me,
+                    peer_ip = %peer_ip,
+                    my_v4 = %exit.my_v4,
+                    "exit-return exemption did not fire; dropping as spoofed"
+                );
+            }
+            return InboundDecision::DropSpoof;
+        }
+    }
+    // Exit-node transit: a datagram bound for a non-overlay (internet) destination
+    // is not for a mesh host at all. Forward it to the TUN (where the kernel NATs
+    // it out) only if we offer this sender an exit node on this network *and* the
+    // destination is one the internet could reach anyway ([`is_transitable`]: not
+    // our LAN, loopback, or link-local/metadata) *and* not one of this host's own
+    // addresses (the kernel would local-deliver those, skipping this firewall).
+    // Otherwise drop it, so a non-exit node never leaks a peer's traffic and an
+    // exit offer never doubles as a way into the gateway's own network or the
+    // gateway host itself. `peer_id` is already the sender's user
+    // identity, matching the allow-list. The normal inbound firewall is bypassed:
+    // this is transit, not traffic addressed to us.
+    if !is_overlay_ip(info.dst_ip) {
+        let permitted = exit.server.allows(network, peer_id)
+            && is_transitable(info.dst_ip)
+            && !exit.server.is_self_addr(info.dst_ip);
+        return if permitted {
+            InboundDecision::Accept
+        } else {
+            InboundDecision::DropExit
+        };
     }
     if firewall
         .evaluate_packet(Direction::In, &info, peer_id, Some(network))
@@ -335,6 +402,11 @@ pub struct ForwardCtx {
     pub token: CancellationToken,
     pub stats: Arc<ForwardMetrics>,
     pub device_user_map: DeviceUserMap,
+    /// Exit-node state for the inbound path: the gateway allow policy (consulted
+    /// for any datagram bound for a non-overlay destination), our own exit
+    /// selection (whose return traffic bypasses the anti-spoof check), and our mesh
+    /// addresses.
+    pub exit: ExitContext,
 }
 
 /// True when a parsed packet is a DNS query addressed to the magic resolver IP.
@@ -370,6 +442,12 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
     let mut buffered: HashMap<EndpointId, VecDeque<Bytes>> = HashMap::new();
     let mut in_flight: HashSet<EndpointId> = HashSet::new();
     let (done_tx, mut done_rx) = mpsc::channel::<(EndpointId, bool)>(64);
+    // Client-side exit-node selection (cheap Arc-backed clone), consulted for
+    // internet-bound packets. Default (no selection) when there is no registry.
+    let exit_client = dialer
+        .as_ref()
+        .map(|r| r.exit_client.clone())
+        .unwrap_or_default();
     loop {
         // Ensure a full MTU of contiguous spare capacity before reading (a short
         // buffer would truncate the packet). `reserve` reuses the current chunk
@@ -387,7 +465,8 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
             Some((peer, connected)) = done_rx.recv() => {
                 in_flight.remove(&peer);
                 let pkts = buffered.remove(&peer).unwrap_or_default();
-                flush_or_drop(&peers, &firewall, &stats, &tun_tx, connected, pkts).await;
+                flush_or_drop(&peers, &firewall, &stats, &tun_tx, &exit_client, connected, pkts)
+                    .await;
                 continue;
             }
         };
@@ -411,20 +490,16 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
             });
             continue; // do not fall through to peer routing
         }
-        let lookup = match info.dst_ip {
-            IpAddr::V4(v4) => peers.lookup_v4(&v4),
-            IpAddr::V6(v6) => peers.lookup_v6(&v6),
-        };
-        let Some(route) = lookup else {
-            // No live connection to this destination.
-            let Some(reg) = dialer.as_ref() else {
-                tracing::debug!(dst = %info.dst_ip, "no peer for dst");
-                stats.record_drop(DropReason::NoPeer);
-                continue;
-            };
-
-            // On-demand: only known roster members are dialable.
-            let Some(target) = reg.resolve_route(info.dst_ip) else {
+        let Some(route) = resolve_send_route(&peers, &exit_client, info.dst_ip) else {
+            // No live connection to this destination (direct or via the exit peer).
+            // Dial the destination member itself for overlay traffic, or the
+            // configured exit peer for internet-bound traffic. Only known roster
+            // members are dialable.
+            let target = dialer.as_ref().and_then(|reg| {
+                let dst = dial_dst(&exit_client, info.dst_ip)?;
+                reg.resolve_route(dst)
+            });
+            let (Some(reg), Some(target)) = (dialer.as_ref(), target) else {
                 tracing::debug!(dst = %info.dst_ip, "no peer for dst");
                 stats.record_drop(DropReason::NoPeer);
                 continue;
@@ -452,6 +527,33 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
     }
 }
 
+/// The mesh peer an outbound packet is sent to: the destination itself for overlay
+/// traffic, the selected exit peer for internet-bound traffic. `None` when a packet
+/// is internet-bound and no exit node is selected (it has nowhere to go).
+fn dial_dst(exit: &ExitClient, dst: IpAddr) -> Option<IpAddr> {
+    if is_overlay_ip(dst) {
+        return Some(dst);
+    }
+    Some(IpAddr::V4(exit.selection()?.ipv4))
+}
+
+/// Resolve the live route to send an outbound packet over: the destination's own
+/// mesh route for overlay traffic, or the configured exit peer's route for
+/// internet-bound traffic. `None` when the packet can't be routed (no live
+/// connection, or nothing to route it through).
+fn resolve_send_route(peers: &PeerTable, exit: &ExitClient, dst: IpAddr) -> Option<PeerRoute> {
+    if is_overlay_ip(dst) {
+        return match dst {
+            IpAddr::V4(v4) => peers.lookup_v4(&v4),
+            IpAddr::V6(v6) => peers.lookup_v6(&v6),
+        };
+    }
+    // Internet-bound: route it through the selected exit peer, pinned to the exit
+    // network's handle (the network whose allow-list permits us).
+    let sel = exit.selection()?;
+    peers.route_on_network(&sel.ipv4, &sel.network)
+}
+
 /// Flush packets buffered while a peer's on-demand connection came up. On success
 /// each is re-routed and sent over the now-live connection (its route may differ
 /// per packet, so look it up fresh); on failure they are dropped. Called by
@@ -461,6 +563,7 @@ async fn flush_or_drop(
     firewall: &SharedFirewall,
     stats: &ForwardMetrics,
     tun_tx: &mpsc::Sender<Bytes>,
+    exit: &ExitClient,
     connected: bool,
     pkts: VecDeque<Bytes>,
 ) {
@@ -476,11 +579,7 @@ async fn flush_or_drop(
             continue;
         };
 
-        let route = match info.dst_ip {
-            IpAddr::V4(v4) => peers.lookup_v4(&v4),
-            IpAddr::V6(v6) => peers.lookup_v6(&v6),
-        };
-        let Some(route) = route else {
+        let Some(route) = resolve_send_route(peers, exit, info.dst_ip) else {
             // The connection vanished between dialing and flushing (a racing
             // teardown); the flow's retransmit will re-drive it.
             stats.record_drop(DropReason::NoPeer);
@@ -525,6 +624,25 @@ pub(crate) async fn send_over_route(
             stats.record_reject();
             let _ = tun_tx.send(reply).await;
         }
+        return;
+    }
+    // PMTUD: if the packet (plus its tag) is larger than a single datagram can
+    // carry on this peer's current path, tell the source to lower its path MTU
+    // (ICMP "packet too big") instead of dropping into a blackhole. Injecting the
+    // reply into our own TUN makes the local kernel shrink the flow and resend a
+    // packet that fits. Common under an exit-node full tunnel: bulk internet
+    // traffic over a relayed peer whose datagram budget is below the 1280 TUN MTU.
+    // Not gated on `reject_enabled`: this is required PMTU signaling, not an
+    // opt-in fail-fast reject.
+    if let Some(max) = route.conn.max_datagram_size()
+        && n + TAG_LEN > max
+    {
+        let inner_mtu = max.saturating_sub(TAG_LEN) as u16;
+        tracing::debug!(dst = %info.dst_ip, len = n, max, inner_mtu, "packet too big for datagram; signalling PMTU");
+        if let Some(reply) = crate::reject::build_packet_too_big(&pkt, info, inner_mtu) {
+            let _ = tun_tx.send(reply).await;
+        }
+        stats.record_drop(DropReason::PacketTooBig);
         return;
     }
     // Drop-newest at the application boundary: if the peer's QUIC datagram send
@@ -595,6 +713,7 @@ pub fn spawn_peer_reader(
         token,
         stats,
         device_user_map,
+        exit,
     } = ctx;
     // A peer's v6 mesh address is the 120-bit blake3 of its identity and never
     // collides, so it is fixed per-identity and derived once here. The v4 address
@@ -649,7 +768,7 @@ pub fn spawn_peer_reader(
 
             let peer_user = device_user_map.resolve(&peer_id);
             match evaluate_inbound(
-                &datagram, &firewall, &peer_user, peer_ip, peer_ipv6, &network,
+                &datagram, &firewall, &exit, &peer_user, peer_ip, peer_ipv6, &network,
             ) {
                 InboundDecision::Accept => {
                     stats.record_rx(datagram.len());
@@ -698,6 +817,13 @@ pub fn spawn_peer_reader(
                         "dropped inbound packet with spoofed source IP"
                     );
                 }
+                InboundDecision::DropExit => {
+                    stats.record_drop(DropReason::ExitDenied);
+                    tracing::debug!(
+                        peer = %peer_id.fmt_short(),
+                        "dropped internet-bound packet: not an exit node for this sender"
+                    );
+                }
             }
         }
     };
@@ -733,6 +859,7 @@ pub fn spawn_tun_writer<W: crate::tun::TunWrite>(
 mod tests {
     use super::*;
     use crate::firewall::Action;
+    use smol_str::SmolStr;
 
     #[test]
     fn only_a_deliberate_leave_prunes_the_member() {
@@ -837,6 +964,21 @@ mod tests {
         p
     }
 
+    /// This node's mesh addresses in the `evaluate_inbound` tests. Distinct from the
+    /// peer/packet addresses; only consulted by the exit return-traffic path.
+    const MY_V4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
+    const MY_V6: Ipv6Addr = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 1);
+
+    /// Exit state for the firewall/anti-spoof tests: no exit offered and none
+    /// selected, so neither exit path fires (their destinations are overlay IPs).
+    fn no_exit() -> ExitContext {
+        ExitContext {
+            my_v4: MY_V4,
+            my_v6: MY_V6,
+            ..Default::default()
+        }
+    }
+
     fn inbound_fw(default: Action, rules: Vec<firewall::FirewallRule>) -> SharedFirewall {
         SharedFirewall::new(firewall::FirewallConfig {
             default_inbound: default,
@@ -853,7 +995,7 @@ mod tests {
         let peer = iroh::SecretKey::generate().public();
         let huge = vec![0u8; MAX_PEER_DATAGRAM + 1];
         assert!(matches!(
-            evaluate_inbound(&huge, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(&huge, &fw, &no_exit(), &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropMalformed
         ));
     }
@@ -865,8 +1007,11 @@ mod tests {
         let mut pkt = vec![0u8; 40];
         pkt[0] = 0x60; // IPv6
         pkt[6] = 6; // TCP
+        // dst in the overlay 200::/7 range so it takes the firewall path (a
+        // non-overlay dst would instead be evaluated as exit-node transit).
+        pkt[24] = 0x02;
         assert!(matches!(
-            evaluate_inbound(&pkt, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(&pkt, &fw, &no_exit(), &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropFirewall(_)
         ));
     }
@@ -889,11 +1034,27 @@ mod tests {
         let blocked = make_tcp_packet(22);
         let allowed = make_tcp_packet(80);
         assert!(matches!(
-            evaluate_inbound(&blocked, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(
+                &blocked,
+                &fw,
+                &no_exit(),
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
             InboundDecision::DropFirewall(_)
         ));
         assert!(matches!(
-            evaluate_inbound(&allowed, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(
+                &allowed,
+                &fw,
+                &no_exit(),
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
             InboundDecision::Accept
         ));
     }
@@ -906,7 +1067,7 @@ mod tests {
         let fw = SharedFirewall::new(firewall::FirewallConfig::default());
         let pkt = make_tcp_packet(443);
         assert!(matches!(
-            evaluate_inbound(&pkt, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(&pkt, &fw, &no_exit(), &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropFirewall(_)
         ));
     }
@@ -923,7 +1084,7 @@ mod tests {
         pkt[12..16].copy_from_slice(&[100, 64, 0, 5]); // src ip (TEST_V4)
         pkt[16..20].copy_from_slice(&[100, 64, 0, 3]); // dst ip
         assert!(matches!(
-            evaluate_inbound(&pkt, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(&pkt, &fw, &no_exit(), &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::Accept
         ));
     }
@@ -1019,6 +1180,7 @@ mod tests {
             evaluate_inbound(
                 &pkt,
                 &fw,
+                &no_exit(),
                 &peer,
                 Ipv4Addr::new(100, 64, 0, 9),
                 TEST_V6,
@@ -1028,8 +1190,380 @@ mod tests {
         ));
         // With the matching peer IP it passes.
         assert!(matches!(
-            evaluate_inbound(&pkt, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
+            evaluate_inbound(&pkt, &fw, &no_exit(), &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::Accept
+        ));
+    }
+
+    /// A TCP packet from TEST_V4 to `dst`, a non-overlay destination.
+    fn make_packet_to(dst: [u8; 4]) -> Vec<u8> {
+        let mut p = vec![0u8; 24];
+        p[0] = 0x45; // IPv4, IHL=5
+        p[9] = 6; // TCP
+        p[12..16].copy_from_slice(&[100, 64, 0, 5]); // src (TEST_V4)
+        p[16..20].copy_from_slice(&dst);
+        p[22] = 1;
+        p[23] = 0xbb; // dst port 443
+        p
+    }
+
+    /// A TCP packet from TEST_V4 to a public (non-overlay) destination.
+    fn make_public_packet() -> Vec<u8> {
+        make_packet_to([8, 8, 8, 8]) // 8.8.8.8 (internet)
+    }
+
+    #[test]
+    fn internet_bound_dropped_when_not_an_exit() {
+        // With no exit offered, a packet to the internet is dropped (not leaked),
+        // even though the source IP is legitimate.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = inbound_fw(Action::Allow, vec![]);
+        assert!(matches!(
+            evaluate_inbound(
+                &make_public_packet(),
+                &fw,
+                &no_exit(),
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::DropExit
+        ));
+    }
+
+    #[test]
+    fn internet_bound_accepted_for_allowed_exit_user() {
+        // When we offer an exit to this sender, the internet-bound packet is
+        // accepted for forwarding, bypassing the (deny-all) inbound firewall.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = SharedFirewall::new(firewall::FirewallConfig::default()); // deny inbound
+        let exit = no_exit();
+        exit.server
+            .reload([("test-net", vec![peer.to_string()].as_slice())]);
+        assert!(matches!(
+            evaluate_inbound(
+                &make_public_packet(),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::Accept
+        ));
+        // A different sender we don't allow is still dropped.
+        let other = iroh::SecretKey::generate().public();
+        assert!(matches!(
+            evaluate_inbound(
+                &make_public_packet(),
+                &fw,
+                &exit,
+                &other,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::DropExit
+        ));
+    }
+
+    #[test]
+    fn exit_transit_refuses_the_gateways_own_network() {
+        // An allowed exit client gets the internet, not the inside of the gateway:
+        // its LAN, its loopback, and above all the cloud metadata service (which
+        // hands out the gateway's instance credentials) are all refused.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = inbound_fw(Action::Allow, vec![]);
+        let exit = no_exit();
+        exit.server
+            .reload([("test-net", vec![peer.to_string()].as_slice())]);
+        for dst in [
+            [169, 254, 169, 254], // cloud instance metadata
+            [192, 168, 1, 1],     // the gateway's LAN router
+            [10, 0, 0, 5],        // RFC 1918
+            [172, 16, 0, 5],      // RFC 1918
+            [127, 0, 0, 1],       // the gateway's loopback
+            [224, 0, 0, 1],       // multicast
+        ] {
+            assert!(
+                matches!(
+                    evaluate_inbound(
+                        &make_packet_to(dst),
+                        &fw,
+                        &exit,
+                        &peer,
+                        TEST_V4,
+                        TEST_V6,
+                        "test-net"
+                    ),
+                    InboundDecision::DropExit
+                ),
+                "exit node transited a packet to {dst:?}, which is not on the internet"
+            );
+        }
+        // A genuinely public destination still goes through.
+        assert!(matches!(
+            evaluate_inbound(
+                &make_public_packet(),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::Accept
+        ));
+    }
+
+    #[test]
+    fn exit_transit_refuses_the_gateways_own_public_ip() {
+        // The gateway's own public address is globally routable, but a packet
+        // transited to it is local-delivered by the gateway's kernel, reaching its
+        // services without ever passing its rayfish inbound firewall. Refused: an
+        // exit offer is a way to the internet, not into the gateway host.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = SharedFirewall::new(firewall::FirewallConfig::default()); // deny inbound
+        let exit = no_exit();
+        exit.server
+            .reload([("test-net", vec![peer.to_string()].as_slice())]);
+        exit.server
+            .set_self_addrs([IpAddr::from([93, 184, 216, 34])].into());
+        assert!(matches!(
+            evaluate_inbound(
+                &make_packet_to([93, 184, 216, 34]),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::DropExit
+        ));
+        // A neighboring public destination still transits.
+        assert!(matches!(
+            evaluate_inbound(
+                &make_packet_to([93, 184, 216, 35]),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::Accept
+        ));
+    }
+
+    /// A TCP packet from a public source (8.8.8.8) to `dst` (an overlay IP): the
+    /// shape of exit-node return traffic arriving from our exit peer.
+    fn make_return_packet(dst: Ipv4Addr) -> Vec<u8> {
+        let mut p = vec![0u8; 24];
+        p[0] = 0x45; // IPv4, IHL=5
+        p[9] = 6; // TCP
+        p[12..16].copy_from_slice(&[8, 8, 8, 8]); // src 8.8.8.8 (from the internet)
+        p[16..20].copy_from_slice(&dst.octets()); // dst = our mesh IP
+        p[20] = 1;
+        p[21] = 0xbb; // src port 443
+        p
+    }
+
+    /// Exit state where `peer` is our selected exit node on `test-net`.
+    fn exit_via(peer: EndpointId) -> ExitContext {
+        let exit = no_exit();
+        exit.client.set(Some(crate::exit_node::ExitSelection {
+            peer_user: peer,
+            ipv4: TEST_V4,
+            network: SmolStr::new("test-net"),
+        }));
+        exit
+    }
+
+    /// The outbound half of the flow `make_return_packet` answers: our mesh IP to
+    /// 8.8.8.8:443. Sending it through the firewall records the conntrack entry.
+    fn open_flow_to_internet(fw: &SharedFirewall, peer: &EndpointId) {
+        let mut p = vec![0u8; 24];
+        p[0] = 0x45; // IPv4, IHL=5
+        p[9] = 6; // TCP
+        p[12..16].copy_from_slice(&MY_V4.octets()); // src = us
+        p[16..20].copy_from_slice(&[8, 8, 8, 8]); // dst 8.8.8.8
+        p[22] = 1;
+        p[23] = 0xbb; // dst port 443
+        let info = firewall::parse_packet_info(&p).unwrap();
+        assert!(
+            fw.evaluate_packet(Direction::Out, &info, peer, Some("test-net"))
+                .is_allow()
+        );
+    }
+
+    #[test]
+    fn exit_return_traffic_accepted_past_antispoof() {
+        // A reply from our exit peer (public src, our mesh IP as dst) is accepted
+        // even though its source is not the peer's mesh IP: the anti-spoof check it
+        // could never satisfy is skipped. It still goes through the firewall, and
+        // what lets it past the deny-inbound default is the conntrack entry our own
+        // outbound packet created.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = SharedFirewall::new(firewall::FirewallConfig::default());
+        let exit = exit_via(peer);
+        open_flow_to_internet(&fw, &peer);
+        assert!(matches!(
+            evaluate_inbound(
+                &make_return_packet(MY_V4),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::Accept
+        ));
+    }
+
+    #[test]
+    fn exit_peer_cannot_inject_unsolicited_traffic() {
+        // The exit peer carries our internet traffic, which does NOT make it trusted
+        // to reach our local ports. With no flow of ours to answer, the same packet
+        // is dropped by the firewall like any other unsolicited inbound traffic.
+        // Otherwise `exit-node use` would silently hand that peer the ability to
+        // dial every service on this host, bypassing the firewall entirely.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = SharedFirewall::new(firewall::FirewallConfig::default()); // deny inbound
+        let exit = exit_via(peer);
+        assert!(matches!(
+            evaluate_inbound(
+                &make_return_packet(MY_V4),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::DropFirewall(_)
+        ));
+    }
+
+    #[test]
+    fn exit_return_traffic_not_addressed_to_us_is_spoof() {
+        // The relaxation only applies to packets addressed to our own mesh IP; a
+        // public-sourced packet to some other overlay IP still fails anti-spoof.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = SharedFirewall::new(firewall::FirewallConfig::default());
+        let exit = exit_via(peer);
+        assert!(matches!(
+            evaluate_inbound(
+                &make_return_packet(Ipv4Addr::new(100, 64, 0, 42)),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::DropSpoof
+        ));
+    }
+
+    #[test]
+    fn exit_return_traffic_from_wrong_peer_is_spoof() {
+        // A public-sourced packet from a peer that is NOT our exit peer gets no
+        // relaxation and is dropped as spoofed. The wrong peer has its own mesh IP
+        // (two peers never share one), so neither the identity nor the IP match.
+        let exit_peer = iroh::SecretKey::generate().public();
+        let other = iroh::SecretKey::generate().public();
+        let other_ip = Ipv4Addr::new(100, 64, 0, 9);
+        let fw = SharedFirewall::new(firewall::FirewallConfig::default());
+        let exit = exit_via(exit_peer);
+        assert!(matches!(
+            evaluate_inbound(
+                &make_return_packet(MY_V4),
+                &fw,
+                &exit,
+                &other,
+                other_ip,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::DropSpoof
+        ));
+    }
+
+    #[test]
+    fn exit_return_traffic_accepted_by_ip_when_identity_differs() {
+        // Regression: the exemption must admit return traffic from our exit peer
+        // even when the sender's resolved user identity does not match the
+        // selection's (a device-vs-user-key mismatch). The verified mesh IPv4 the
+        // reader resolves for the sender is the robust match, and it is the exit
+        // peer's IP whatever family the reply is. Without the IP match every reply
+        // from the exit node was dropped as spoofed and traffic never flowed.
+        let selected_user = iroh::SecretKey::generate().public();
+        let arriving_user = iroh::SecretKey::generate().public(); // resolves differently
+        let fw = SharedFirewall::new(firewall::FirewallConfig::default());
+        let exit = no_exit();
+        exit.client.set(Some(crate::exit_node::ExitSelection {
+            peer_user: selected_user,
+            ipv4: TEST_V4, // the exit peer's mesh IPv4
+            network: SmolStr::new("test-net"),
+        }));
+        open_flow_to_internet(&fw, &arriving_user);
+        assert!(matches!(
+            evaluate_inbound(
+                &make_return_packet(MY_V4),
+                &fw,
+                &exit,
+                &arriving_user, // identity does NOT match selection.peer_user
+                TEST_V4,        // but the verified mesh IP does
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::Accept
+        ));
+    }
+
+    #[test]
+    fn exit_return_traffic_accepted_on_any_shared_network() {
+        // The gateway tags its replies via the generic route(), which picks the
+        // lexically-smallest network it shares with us, not necessarily the one we
+        // selected the exit on. The exemption is scoped to the peer identity, not
+        // the tag: a reply from our exit peer is accepted whichever shared
+        // network's handle it arrives under.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = SharedFirewall::new(firewall::FirewallConfig::default());
+        let exit = exit_via(peer); // selected on "test-net"
+        open_flow_to_internet(&fw, &peer);
+        assert!(matches!(
+            evaluate_inbound(
+                &make_return_packet(MY_V4),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "another-net"
+            ),
+            InboundDecision::Accept
+        ));
+    }
+
+    #[test]
+    fn exit_return_traffic_with_martian_source_is_spoof() {
+        // Symmetric to the outbound is_transitable check: the exit peer cannot
+        // inject packets sourced from private/loopback/link-local space (e.g.
+        // forging our LAN gateway at 192.168.1.1), conntrack entry or not.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = SharedFirewall::new(firewall::FirewallConfig::default());
+        let exit = exit_via(peer);
+        open_flow_to_internet(&fw, &peer);
+        let mut p = make_return_packet(MY_V4);
+        p[12..16].copy_from_slice(&[192, 168, 1, 1]);
+        assert!(matches!(
+            evaluate_inbound(&p, &fw, &exit, &peer, TEST_V4, TEST_V6, "test-net"),
+            InboundDecision::DropSpoof
         ));
     }
 
@@ -1073,6 +1607,7 @@ mod tests {
             evaluate_inbound(
                 &make_tcp_packet(8080),
                 &fw,
+                &no_exit(),
                 &peer,
                 TEST_V4,
                 TEST_V6,
@@ -1085,6 +1620,7 @@ mod tests {
             evaluate_inbound(
                 &make_tcp_packet(9090),
                 &fw,
+                &no_exit(),
                 &peer,
                 TEST_V4,
                 TEST_V6,

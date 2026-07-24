@@ -16,6 +16,7 @@ use arc_swap::ArcSwap;
 use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
+use tokio::sync::Notify;
 
 /// Upper bound on a single on-demand dial. The first packets of a flow wait at
 /// most this long for the connection; past it the buffered packets are dropped and
@@ -88,6 +89,29 @@ pub(crate) struct NetworkRegistry {
     /// How long a connection may sit with no traffic (either direction) before an
     /// on-demand node idle-closes it. Read by each [`MeshConnection`]'s idle timer.
     pub(crate) idle_timeout: Duration,
+    /// Per-network exit-node allow policy, threaded into peer readers via the
+    /// [`MeshCtx`] forward context and populated on `activate()` from config.
+    pub(crate) exit_server: crate::exit_node::ExitServer,
+    /// Client-side exit-node selection: the peer this node routes its non-mesh
+    /// traffic through. Read by the forwarding loop (outbound) and peer readers
+    /// (return traffic); populated on `activate()` from config.
+    pub(crate) exit_client: crate::exit_node::ExitClient,
+    /// Set while the config selects an exit peer that the roster cannot resolve
+    /// yet (boot before reconverge, or the peer temporarily absent). A reconverge
+    /// that lands a roster then nudges [`Self::exit_reapply`] so the daemon
+    /// re-runs the exit reconcile instead of leaking traffic until the next
+    /// `ray up`.
+    pub(crate) exit_selection_pending: AtomicBool,
+    /// Nudged by reconverge when [`Self::exit_selection_pending`] is set; the
+    /// daemon listens and re-runs `apply_exit_node`. A channel rather than a
+    /// direct call because the kernel plumbing lives on `Daemon`, above the
+    /// registry in the service graph.
+    pub(crate) exit_reapply: Arc<Notify>,
+    /// Whether exit-offer advertisements may be synced to the roster right now:
+    /// true only between `activate()` and `deactivate()`. Keeps a reconverge that
+    /// fires while the data plane is down (boot, standby) from withdrawing an
+    /// offer that `activate()` is about to re-advertise.
+    pub(crate) exit_sync_enabled: AtomicBool,
 }
 
 impl NetworkRegistry {
@@ -128,6 +152,11 @@ impl NetworkRegistry {
             protocol_router: OnceLock::new(),
             on_demand,
             idle_timeout,
+            exit_server: crate::exit_node::ExitServer::new(),
+            exit_client: crate::exit_node::ExitClient::new(),
+            exit_selection_pending: AtomicBool::new(false),
+            exit_reapply: Arc::new(Notify::new()),
+            exit_sync_enabled: AtomicBool::new(false),
         }
     }
 
@@ -177,7 +206,6 @@ impl NetworkRegistry {
         self.transport.stats.record_lazy_dial(ok);
         ok
     }
-
 
     /// Seed the route map from a restored roster so the on-demand data path can
     /// lazily dial members before the first reconverge (self excluded by the
@@ -504,6 +532,8 @@ impl NetworkRegistry {
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
+            exit_allow: vec![],
+            exit_node_use: None,
         })?;
 
         let cancel = self.shutdown_token.child_token();
@@ -577,6 +607,7 @@ impl NetworkRegistry {
                 device_cert: None,
                 collision_index: 0,
                 last_seen: None,
+                exit_node: false,
             })
             .expect("self-add cannot collide");
 

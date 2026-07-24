@@ -66,6 +66,46 @@ pub fn build_reject(packet: &[u8], info: &PacketInfo) -> Option<Bytes> {
     }
 }
 
+/// Build an ICMP "packet too big" reply telling the source to lower its path MTU
+/// to `mtu` for this destination, or `None` when no reply should be sent. This is
+/// the PMTUD feedback the forwarder emits when a packet won't fit a single QUIC
+/// datagram on a peer's path (common under an exit-node full tunnel over a
+/// relayed peer): injected back into our own TUN, it makes the local kernel lower
+/// the flow's path MTU and resend a packet that fits, instead of a silent
+/// blackhole. Addressing mirrors [`build_reject`]: the reply appears to come back
+/// from the destination.
+///
+/// IPv4: ICMP Destination Unreachable, code 4 (fragmentation needed, DF set),
+/// with `mtu` in the next-hop-MTU field (RFC 1191). IPv6: ICMPv6 Packet Too Big
+/// (RFC 4443) with `mtu` in its 32-bit MTU field.
+pub fn build_packet_too_big(packet: &[u8], info: &PacketInfo, mtu: u16) -> Option<Bytes> {
+    if is_multicast_or_unspecified(info.src_ip) || is_icmp_error(info) {
+        return None;
+    }
+    match (info.dst_ip, info.src_ip) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            let quote_len = (ip_header_len(packet, info) + 8).min(packet.len());
+            let mut msg = build_icmp_message(3, 4, &packet[..quote_len]);
+            // RFC 1191: the low 16 bits of the "unused" word carry the next-hop MTU.
+            msg[6..8].copy_from_slice(&mtu.to_be_bytes());
+            let csum = icmpv4_checksum(&msg);
+            msg[2..4].copy_from_slice(&csum.to_be_bytes());
+            Some(wrap_ipv4(src, dst, PROTO_ICMPV4, &msg))
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            let budget = MTU - IPV6_HEADER_LEN - ICMP_HEADER_LEN;
+            let quote_len = packet.len().min(budget);
+            let mut msg = build_icmp_message(2, 0, &packet[..quote_len]);
+            // RFC 4443: the 32-bit field after the checksum carries the MTU.
+            msg[4..8].copy_from_slice(&(mtu as u32).to_be_bytes());
+            let csum = icmpv6_checksum(&src, &dst, &msg);
+            msg[2..4].copy_from_slice(&csum.to_be_bytes());
+            Some(wrap_ipv6(src, dst, PROTO_ICMPV6, &msg))
+        }
+        _ => None,
+    }
+}
+
 /// IPv4 link-local broadcast, any multicast, or the unspecified address: never a
 /// legitimate REJECT target.
 fn is_multicast_or_unspecified(ip: IpAddr) -> bool {
@@ -441,6 +481,79 @@ mod tests {
         p[t + 12] = ((TCP_HEADER_LEN / 4) << 4) as u8;
         p[t + 13] = flags;
         p
+    }
+
+    #[test]
+    fn packet_too_big_v4_is_frag_needed_with_mtu() {
+        // A full-size TCP/v4 packet that won't fit the tunnel: the PMTUD reply
+        // must be ICMP Destination Unreachable / code 4 (fragmentation needed),
+        // carry the next-hop MTU in the low half of the unused word (RFC 1191),
+        // swap addresses, and checksum cleanly.
+        let pkt = tcp_v4(TCP_SYN, 1000, 0);
+        let info = parse_packet_info(&pkt).unwrap();
+        let reply = build_packet_too_big(&pkt, &info, 1200).unwrap();
+        let r = parse_packet_info(&reply).unwrap();
+        assert_eq!(r.protocol, PROTO_ICMPV4);
+        assert_eq!(r.src_ip, info.dst_ip); // appears to come back from the dst
+        assert_eq!(r.dst_ip, info.src_ip);
+        assert_eq!(reply[IPV4_HEADER_LEN], 3); // type: dest unreachable
+        assert_eq!(reply[IPV4_HEADER_LEN + 1], 4); // code: fragmentation needed
+        // next-hop MTU sits in bytes 6..8 of the ICMP header.
+        let mtu = u16::from_be_bytes([reply[IPV4_HEADER_LEN + 6], reply[IPV4_HEADER_LEN + 7]]);
+        assert_eq!(mtu, 1200);
+        assert!(checksum_ok(&reply[..IPV4_HEADER_LEN]));
+        assert!(checksum_ok(&reply[IPV4_HEADER_LEN..]));
+        // quotes the original IP header + 8 bytes.
+        assert_eq!(
+            &reply[IPV4_HEADER_LEN + ICMP_HEADER_LEN..],
+            &pkt[..IPV4_HEADER_LEN + 8]
+        );
+    }
+
+    #[test]
+    fn packet_too_big_v6_is_ptb_with_mtu() {
+        let pkt = tcp_v6(TCP_SYN, 2000);
+        let info = parse_packet_info(&pkt).unwrap();
+        let reply = build_packet_too_big(&pkt, &info, 1280).unwrap();
+        let r = parse_packet_info(&reply).unwrap();
+        assert_eq!(r.protocol, PROTO_ICMPV6);
+        assert_eq!(r.src_ip, info.dst_ip);
+        assert_eq!(r.dst_ip, info.src_ip);
+        assert_eq!(reply[IPV6_HEADER_LEN], 2); // type: packet too big
+        assert_eq!(reply[IPV6_HEADER_LEN + 1], 0); // code 0
+        // RFC 4443: MTU is the 32-bit field right after the checksum.
+        let mtu = u32::from_be_bytes([
+            reply[IPV6_HEADER_LEN + 4],
+            reply[IPV6_HEADER_LEN + 5],
+            reply[IPV6_HEADER_LEN + 6],
+            reply[IPV6_HEADER_LEN + 7],
+        ]);
+        assert_eq!(mtu, 1280);
+        // ICMPv6 checksum covers the pseudo-header; recompute in place folds to 0.
+        let (IpAddr::V6(s), IpAddr::V6(d)) = (r.src_ip, r.dst_ip) else {
+            panic!("v6");
+        };
+        let msg = &reply[IPV6_HEADER_LEN..];
+        let mut sum = checksum_words(&s.octets()) + checksum_words(&d.octets());
+        sum += msg.len() as u32 + PROTO_ICMPV6 as u32 + checksum_words(msg);
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        assert_eq!(sum as u16, 0xffff);
+    }
+
+    #[test]
+    fn packet_too_big_does_not_answer_an_icmp_error() {
+        // An inbound ICMP error must never provoke a PMTUD reply (loop guard).
+        let mut p = vec![0u8; IPV4_HEADER_LEN + 8];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&((IPV4_HEADER_LEN + 8) as u16).to_be_bytes());
+        p[9] = PROTO_ICMPV4;
+        p[12..16].copy_from_slice(&Ipv4Addr::new(100, 64, 0, 5).octets());
+        p[16..20].copy_from_slice(&Ipv4Addr::new(100, 64, 0, 9).octets());
+        p[IPV4_HEADER_LEN] = 3; // dest unreachable (an error)
+        let info = parse_packet_info(&p).unwrap();
+        assert!(build_packet_too_big(&p, &info, 1200).is_none());
     }
 
     #[test]

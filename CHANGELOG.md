@@ -8,6 +8,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Exit nodes.** A node can offer itself as an internet gateway for a network so
+  other members route all their non-mesh traffic through it (like a Tailscale exit
+  node). On the gateway: `ray exit-node allow <net> <peer|*>`
+  permits peers (and turns on kernel forwarding + NAT on `ray up`);
+  `ray exit-node disallow` revokes. On a client: `ray exit-node use <net> <peer>`
+  routes all internet-bound traffic out through that peer, `ray exit-node none`
+  restores direct egress. Availability is advertised in the signed roster, so
+  `ray status` flags exit-capable peers, marks the one actually carrying your
+  traffic, shows when this node is itself offering an exit, and
+  `ray exit-node status` lists the lot.
+  Full-stack IPv4 + IPv6. Connections that reach the client from outside the
+  tunnel keep answering out the interface they arrived on, including ones already
+  open when the tunnel comes up, so a headless host stays reachable on its public
+  IP and the SSH session you turn the tunnel on from survives it. Offering an
+  exit node works on Linux (nftables), macOS and FreeBSD (pf); using one works on
+  Linux (fwmark loop-prevention) and macOS (sockets pinned to the physical
+  interface); the `allow` / advertise / `status` surface is cross-platform.
+  Traffic routed through an exit node whose packets exceed what a single QUIC
+  datagram can carry on the peer's path (common over a relayed link) now gets a
+  path-MTU signal (ICMP "fragmentation needed" / "packet too big") back to the
+  sender so it shrinks to fit, instead of being silently dropped. An
+  exit node is strictly an *internet* gateway: it forwards to
+  globally-routable addresses only, so permitting a peer to route out through you
+  never also hands it your private LAN, your loopback, your cloud instance
+  metadata service, or services on the gateway host itself.
+  Backward compatible on the wire: peers on the previous release stay connected,
+  they just cannot offer or discover exit nodes until they update (an old
+  coordinator ignores the exit-node advertisement, so offers on its networks do
+  not propagate until it runs the new version). From this release on, a peer that
+  receives a control message it cannot decode tells the sender, so a version
+  mismatch shows up in the sender's log instead of features failing silently.
+
 - **Android: disabling Rayfish no longer takes the phone offline.** Turning the VPN
   off (in the app, or because another VPN app took the slot) now drops the tunnel
   and releases the VPN slot but keeps Rayfish's control plane connected, so files
@@ -59,6 +91,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **IPv6 no longer dies after `ray down` + `ray up` (Linux).** Linux flushes an
+  interface's global IPv6 addresses when its link goes down, and the overlay `/128`
+  was only assigned when the TUN was created, so a standby cycle left the node
+  reachable over IPv4 while every IPv6 peer silently got no answer (until the
+  daemon was restarted). The address is now re-assigned on every activate.
 - **No more ANSI color codes in syslog.** The daemon colors its console logs only
   when stdout is actually a terminal, so logs collected by systemd/journald (and
   any piped output) are plain text instead of escape-code soup.
