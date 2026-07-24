@@ -962,6 +962,7 @@ impl Daemon {
         let result = if !self.registry.exit_client.is_active() {
             tun::unroute_default_via_tun(tun_name).await;
             crate::exit_node::remove_relay_exclusions();
+            crate::exit_node::clear_physical_defaults();
             if crate::exit_node::set_full_tunnel(false) {
                 self.transport.endpoint.network_change().await;
                 // The rebind that releases the pin drops every direct path too.
@@ -974,6 +975,11 @@ impl Daemon {
             // by the tunnel and die. Resolve them now, while DNS is still split.
             let relay_ips = self.relay_underlay_ips().await;
             crate::exit_node::exclude_relays_from_tunnel(&relay_ips);
+            // Snapshot the physical default interfaces while the routing table is
+            // still clean. Once the split defaults are in, a live lookup answers
+            // "the tunnel" for any family without a default route of its own, and
+            // pinning iroh there routes its transport into its own tunnel.
+            crate::exit_node::capture_physical_defaults();
             // Pin and rebind *first*, then warm. `network_change` rebinds iroh's
             // UDP socket to apply the pin, and a rebind is a new local socket: it
             // kills every hole-punched path, so anything warmed beforehand is on

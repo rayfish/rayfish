@@ -115,20 +115,71 @@ impl SocketConfigurator for LoopPrevention {
     }
 }
 
-/// Pins a socket to the current default-route interface, so its egress ignores the
+/// The physical default-route interface per family, snapshotted by
+/// [`capture_physical_defaults`] before the tunnel routes go in.
+#[cfg(target_os = "macos")]
+static PHYSICAL_DEFAULTS: std::sync::Mutex<Option<(Option<String>, Option<String>)>> =
+    std::sync::Mutex::new(None);
+
+/// Record which interface each family's default route leaves by, to pin iroh's
+/// sockets to for as long as the full tunnel is up.
+///
+/// Must run **before** the tunnel's split defaults are installed, because once they
+/// are, the answer is the tunnel: a host with no IPv6 default route (common) has
+/// `route get -inet6 default` resolve to the TUN as soon as `::/1` points there, and
+/// pinning iroh to that puts its transport inside the tunnel it is carrying. A
+/// family with no physical default of its own falls back to the other family's
+/// interface, which is the physical NIC either way; that leaves such a socket
+/// exactly as (un)usable as it was before the tunnel, instead of looping.
+#[cfg(target_os = "macos")]
+pub fn capture_physical_defaults() {
+    let v4 = default_interface("-inet").and_then(usable_pin_iface);
+    let v6 = default_interface("-inet6").and_then(usable_pin_iface);
+    let (v4, v6) = (v4.clone().or_else(|| v6.clone()), v6.or(v4));
+    tracing::debug!(?v4, ?v6, "captured physical default interfaces for the socket pin");
+    *PHYSICAL_DEFAULTS.lock().unwrap() = Some((v4, v6));
+}
+
+/// Drop the snapshot when the full tunnel comes down.
+#[cfg(target_os = "macos")]
+pub fn clear_physical_defaults() {
+    *PHYSICAL_DEFAULTS.lock().unwrap() = None;
+}
+
+/// Rejects a tunnel interface as a pin target: pinning iroh's socket to the TUN
+/// routes its transport into the tunnel it is carrying, which blackholes the very
+/// connection the exit node is reached over. Unpinned is strictly better.
+#[cfg(target_os = "macos")]
+fn usable_pin_iface(name: String) -> Option<String> {
+    (!name.starts_with("utun")).then_some(name)
+}
+
+/// Pins a socket to the physical default-route interface, so its egress ignores the
 /// routing table (and therefore the tunnel's default route).
 ///
-/// Only while a full tunnel is up: see [`FULL_TUNNEL`]. A family with no default route
-/// is left unpinned, since there is no tunnel default for it to escape either.
+/// Only while a full tunnel is up: see [`FULL_TUNNEL`]. Uses the snapshot taken
+/// before the tunnel routes went in, never a live lookup, which by then resolves to
+/// the tunnel. A family with no interface to pin to is left unpinned.
 #[cfg(target_os = "macos")]
 fn bind_outside_tunnel(sock: &SockRef<'_>, domain: Domain) -> std::io::Result<()> {
     if !FULL_TUNNEL.load(Ordering::Acquire) {
         return Ok(());
     }
     let v6 = domain == Domain::IPV6;
-    let Some(index) = default_interface(if v6 { "-inet6" } else { "-inet" })
-        .and_then(|name| if_index(&name))
-    else {
+    let snapshot = PHYSICAL_DEFAULTS.lock().unwrap().clone();
+    let name = match snapshot {
+        Some((v4_if, v6_if)) => {
+            if v6 {
+                v6_if
+            } else {
+                v4_if
+            }
+        }
+        // No snapshot (the tunnel flag flipped without one): fall back to a live
+        // lookup, still refusing to pin to a tunnel.
+        None => default_interface(if v6 { "-inet6" } else { "-inet" }).and_then(usable_pin_iface),
+    };
+    let Some(index) = name.and_then(|name| if_index(&name)) else {
         return Ok(());
     };
     if v6 {
@@ -1224,6 +1275,17 @@ mod tests {
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Pinning iroh to a tunnel interface puts its transport inside the tunnel it
+    /// is carrying, which is worse than not pinning at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_tunnel_is_never_a_pin_target() {
+        assert_eq!(usable_pin_iface("en0".into()), Some("en0".into()));
+        assert_eq!(usable_pin_iface("en12".into()), Some("en12".into()));
+        assert_eq!(usable_pin_iface("utun7".into()), None);
+        assert_eq!(usable_pin_iface("utun0".into()), None);
     }
 
     #[test]
