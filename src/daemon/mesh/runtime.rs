@@ -1027,11 +1027,23 @@ impl Daemon {
         let Some(sel) = self.registry.exit_client.selection() else {
             return;
         };
-        if let Some(target) = self.registry.resolve_route(IpAddr::V4(sel.ipv4)) {
-            self.registry.dial_target(&target).await;
-        }
-        let Some(conn) = self.registry.peers.conn_for_ip(&sel.ipv4) else {
-            return;
+        // Dial only when there is no live connection. Dialing on top of one opens a
+        // *second* QUIC connection to the same peer, and with one reader per peer
+        // the two ends settle on different connections: we send every exit packet
+        // down ours while the gateway reads its own, and nothing crosses in either
+        // direction. Same gate the on-demand data path and `ray ping` use.
+        let conn = match self.registry.peers.conn_for_ip(&sel.ipv4) {
+            Some(conn) => conn,
+            None => {
+                let Some(target) = self.registry.resolve_route(IpAddr::V4(sel.ipv4)) else {
+                    return;
+                };
+                self.registry.dial_target(&target).await;
+                let Some(conn) = self.registry.peers.conn_for_ip(&sel.ipv4) else {
+                    return;
+                };
+                conn
+            }
         };
         // Wait (event-driven) until iroh opens a *direct* path, nudging the
         // hole-punch with pings meanwhile: iroh only upgrades off the relay once
@@ -1047,7 +1059,12 @@ impl Daemon {
                 tokio::select! {
                     _ = nudge.tick() => nudge_holepunch(&self.protocol_router, &conn).await,
                     Some(list) = paths.next() => {
-                        if list.iter().any(|p| p.is_ip()) {
+                        // `is_selected` matters as much as `is_ip`: a freshly
+                        // dialed connection lists its candidate addresses before
+                        // any of them is validated, so "an IP path exists" fires
+                        // instantly and means nothing. The *selected* path is the
+                        // one traffic actually takes.
+                        if list.iter().any(|p| p.is_ip() && p.is_selected()) {
                             break;
                         }
                     }
