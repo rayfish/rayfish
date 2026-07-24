@@ -665,6 +665,7 @@ mod names {
     pub(super) const EXIT_TABLE: &str = "29793";
     /// `ip rule` preferences (lower = higher priority). Named so install and
     /// teardown stay in sync.
+    pub(super) const PREF_SRC: &str = "99"; // physical-sourced traffic -> main table
     pub(super) const PREF_BYPASS: &str = "100"; // marked traffic -> main table
     pub(super) const PREF_MAIN: &str = "101"; // main table minus its default route
     pub(super) const PREF_TUNNEL: &str = "102"; // everything else -> the tunnel
@@ -772,29 +773,67 @@ pub fn teardown_client_routing() {}
 ///
 /// Idempotent (routes use `replace`, rules are deleted before re-adding, the nft
 /// table is replaced wholesale). Linux only.
+/// Whether a local address should get a "leave via the physical uplink" rule at
+/// [`PREF_SRC`]. True for the host's own globally-routable addresses; false for the
+/// overlay (traffic entering the TUN is sourced from there, and bypassing the tunnel
+/// for it would leak exactly what the tunnel is meant to carry) and for addresses
+/// that never leave the host.
 #[cfg(target_os = "linux")]
-pub fn install_client_routing(tun_name: &str) -> Result<()> {
-    // The conntrack-mark table loads first: nothing routes into the tunnel until
-    // the `ip rule`s below go in, but the moment they do, an inbound connection's
-    // replies depend on this table already restoring the mark. Loading it after
-    // the rules would open a window (or, on a mid-way failure, a permanent state)
-    // where an SSH session to this host's public IP is routed into the tunnel and
-    // cut.
-    //
-    // Connections opened from outside the tunnel keep answering out the interface
-    // they arrived on. `prerouting` tags the conntrack entry of anything arriving on
-    // a non-TUN interface (and marks the packet itself, so the reverse-path check
-    // resolves against `main`); `output` restores that mark on the locally-generated
-    // replies, and `type route` forces a re-route once it is set.
-    //
-    // The tag is deliberately unconditional rather than `ct state new`: a connection
-    // that was already established when the tunnel came up would otherwise keep a
-    // ctmark of 0, its replies would go out the tunnel, and it would be cut. Marking
-    // every inbound packet picks those up on their next packet instead. Re-marking a
-    // connection is idempotent, and traffic this node originates never reaches this
-    // chain (iroh's underlay sockets already carry the same mark via `SO_MARK`).
+fn is_bypass_source(addr: IpAddr) -> bool {
+    if crate::membership::is_overlay_ip(addr) {
+        return false;
+    }
+    match addr {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                // Link-local fe80::/10: no `is_unicast_link_local` on stable.
+                && (v6.segments()[0] & 0xffc0 != 0xfe80)
+        }
+    }
+}
+
+/// The host's own addresses that need a source rule: everything [`is_bypass_source`]
+/// accepts, read from `ip -o addr show scope global`. Read fresh at install time,
+/// because which addresses exist is exactly what a DHCP lease or a new interface
+/// changes between one `exit-node use` and the next.
+#[cfg(target_os = "linux")]
+fn bypass_source_addrs(family: &str) -> Vec<IpAddr> {
+    let out = match Command::new("ip")
+        .args([family, "-o", "addr", "show", "scope", "global"])
+        .output()
+    {
+        Ok(out) if out.status.success() => out.stdout,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(3))
+        .filter_map(|cidr| cidr.split('/').next()?.parse::<IpAddr>().ok())
+        .filter(|addr| is_bypass_source(*addr))
+        .collect()
+}
+
+/// The client-side conntrack-mark ruleset: what keeps connections that reached this
+/// host from *outside* the tunnel answering out the interface they arrived on, so a
+/// headless box does not cut itself off the instant it starts using an exit node.
+///
+/// `prerouting` tags anything arriving on a non-TUN interface (and marks the packet
+/// itself, so the reverse-path check resolves against `main`); `output` puts that
+/// mark back on the locally-generated replies, and `type route` forces a re-route
+/// once it is set.
+///
+/// This covers connections that arrive *after* the tunnel is up. Ones that predate
+/// it cannot be handled here at all: loading this table is what loads conntrack, so
+/// at that instant they are untracked, and the first packet conntrack sees on them is
+/// our own outgoing reply, which registers the entry with its direction inverted.
+/// Neither their ctmark nor their `ct direction` says what they are. The [`PREF_SRC`]
+/// source rules in [`install_client_routing`] are what keeps those alive.
+#[cfg(target_os = "linux")]
+fn client_nft_script(tun_name: &str) -> String {
     let mark = format!("{SOCKET_MARK:#x}");
-    nft_load(&format!(
+    format!(
         "{reset}\
          table inet {t} {{\n\
          \tchain prerouting {{\n\
@@ -811,12 +850,48 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
         reset = drop_table(CLIENT_TABLE),
         t = CLIENT_TABLE,
         tun = tun_name,
-    ))?;
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub fn install_client_routing(tun_name: &str) -> Result<()> {
+    // The conntrack-mark table loads first: nothing routes into the tunnel until
+    // the `ip rule`s below go in, but the moment they do, an inbound connection's
+    // replies depend on this table already restoring the mark. Loading it after
+    // the rules would open a window (or, on a mid-way failure, a permanent state)
+    // where an SSH session to this host's public IP is routed into the tunnel and
+    // cut.
+    nft_load(&client_nft_script(tun_name))?;
+    let mark = format!("{SOCKET_MARK:#x}");
     for family in ["-4", "-6"] {
         run_ip(&[
             family, "route", "replace", "default", "dev", tun_name, "table", EXIT_TABLE,
         ])?;
         remove_client_rules(family);
+        // Ahead of everything else: traffic sourced from one of this host's own
+        // physical addresses leaves the way it always did. That is every connection
+        // that existed before the tunnel, whose socket is already bound to that
+        // address and cannot be re-bound. Without this they are routed into the
+        // tunnel mid-flight and stall on retransmits until something inbound
+        // arrives, which is minutes for an idle peer (an SSH session watching the
+        // command that turned the tunnel on, for instance). The conntrack table
+        // below cannot cover them: it is what *loads* conntrack, so those
+        // connections are untracked at that moment and get registered with their
+        // direction inverted. Traffic bound for the tunnel is sourced from the
+        // overlay address instead, so it does not match.
+        for addr in bypass_source_addrs(family) {
+            run_ip(&[
+                family,
+                "rule",
+                "add",
+                "from",
+                &addr.to_string(),
+                "table",
+                "main",
+                "pref",
+                PREF_SRC,
+            ])?;
+        }
         run_ip(&[
             family,
             "rule",
@@ -870,7 +945,39 @@ pub fn teardown_client_routing() {
     tracing::info!("exit-node client full-tunnel routing removed");
 }
 
-/// Delete our three policy rules for one address family, ignoring "not found".
+/// The source addresses of the [`PREF_SRC`] rules currently installed for one
+/// family, read back from `ip rule show`. Matches only our own shape
+/// (`<pref>: from <addr> lookup main`) so a foreign rule sharing the pref is left
+/// alone. See [`parse_source_rules`] for the parsing.
+#[cfg(target_os = "linux")]
+fn installed_source_rules(family: &str) -> Vec<String> {
+    let out = match Command::new("ip").args([family, "rule", "show"]).output() {
+        Ok(out) if out.status.success() => out.stdout,
+        _ => return Vec::new(),
+    };
+    parse_source_rules(&String::from_utf8_lossy(&out))
+}
+
+/// Pull the addresses out of `ip rule show` output for rules that are ours: at
+/// [`PREF_SRC`], `from <addr>`, looking up `main`.
+#[cfg(target_os = "linux")]
+fn parse_source_rules(show: &str) -> Vec<String> {
+    show.lines()
+        .filter_map(|line| {
+            let (pref, rest) = line.split_once(':')?;
+            if pref.trim() != PREF_SRC {
+                return None;
+            }
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            match f.as_slice() {
+                ["from", addr, "lookup", "main"] => Some((*addr).to_string()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Delete our policy rules for one address family, ignoring "not found".
 /// Each del names the full rule spec, mirroring the adds in
 /// [`install_client_routing`], never the pref alone: `ip rule del` removes the
 /// first rule matching only the keys given, so a bare `del pref 100` would
@@ -878,6 +985,23 @@ pub fn teardown_client_routing() {
 /// sit at one of our preference numbers.
 #[cfg(target_os = "linux")]
 fn remove_client_rules(family: &str) {
+    // Source rules are removed by reading back what is actually installed, not by
+    // re-deriving the address list: a lease change between install and teardown
+    // would otherwise strand a rule pointing at an address we no longer hold. Only
+    // rules matching our exact shape at our pref are touched.
+    for addr in installed_source_rules(family) {
+        let _ = run_ip(&[
+            family,
+            "rule",
+            "del",
+            "from",
+            &addr,
+            "table",
+            "main",
+            "pref",
+            PREF_SRC,
+        ]);
+    }
     let mark = format!("{SOCKET_MARK:#x}");
     let _ = run_ip(&[
         family,
@@ -1289,6 +1413,55 @@ mod tests {
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Which local addresses get a "leave via the physical uplink" source rule.
+    ///
+    /// A connection that predates the tunnel is bound to a physical address, and its
+    /// packets must keep leaving that way or it stalls (see [`super::PREF_SRC`]). The
+    /// overlay addresses are the opposite case: traffic entering the TUN is sourced
+    /// from them, and a bypass rule for those would route the tunnel's own payload
+    /// straight back out the uplink, which is the leak the whole feature exists to
+    /// prevent. Loopback and link-local never leave the host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_physical_addresses_get_a_source_bypass() {
+        let phys4: IpAddr = "212.47.229.78".parse().unwrap();
+        let phys6: IpAddr = "2001:bc8:1234::1".parse().unwrap();
+        assert!(is_bypass_source(phys4));
+        assert!(is_bypass_source(phys6));
+
+        // Overlay: routing these around the tunnel would defeat the tunnel.
+        assert!(!is_bypass_source("100.64.0.1".parse().unwrap()));
+        assert!(!is_bypass_source("100.127.255.254".parse().unwrap()));
+        assert!(!is_bypass_source("200::1".parse().unwrap()));
+
+        assert!(!is_bypass_source("127.0.0.1".parse().unwrap()));
+        assert!(!is_bypass_source("::1".parse().unwrap()));
+        assert!(!is_bypass_source("169.254.1.1".parse().unwrap()));
+        assert!(!is_bypass_source("fe80::1".parse().unwrap()));
+    }
+
+    /// Teardown reads back what it installed. It must recognise its own rules and
+    /// leave anything else at that pref alone: `ip rule del` matches on the keys
+    /// given, so deleting somebody else's rule is a real possibility.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_our_own_source_rules_are_reclaimed() {
+        let show = "\
+0:\tfrom all lookup local
+99:\tfrom 212.47.229.78 lookup main
+99:\tfrom 2001:bc8:1234::1 lookup main
+99:\tfrom 10.0.0.5 lookup 42
+100:\tfrom all fwmark 0x7261 lookup main
+102:\tfrom all lookup 29793
+32766:\tfrom all lookup main
+";
+        assert_eq!(
+            parse_source_rules(show),
+            vec!["212.47.229.78".to_string(), "2001:bc8:1234::1".to_string()],
+            "only `from <addr> lookup main` rules at pref 99 are ours"
+        );
     }
 
     /// Pinning iroh to a tunnel interface puts its transport inside the tunnel it
