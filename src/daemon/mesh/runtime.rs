@@ -864,17 +864,34 @@ impl Daemon {
     pub(crate) async fn apply_exit_node(&self) -> Option<String> {
         // One reconcile at a time (see `Daemon::exit_reconcile`): the kernel
         // enable's snapshot-then-write is not safe to interleave.
+        let started = tokio::time::Instant::now();
         let _guard = self.exit_reconcile.lock().await;
+        let locked = started.elapsed();
         let tun_name = self.tun_name.load().as_str().to_owned();
         let reload = self.registry.reload_exit_state();
+        let reloaded = started.elapsed();
         // Both halves run even if the first one failed: they are independent roles,
         // and each one's teardown path has to happen regardless.
         let server = apply_exit_server_os(&self.registry.exit_server, &tun_name).await;
+        let served = started.elapsed();
         let client = self.apply_exit_client(&tun_name).await;
+        let clients = started.elapsed();
         // Advertise what actually survived the reconcile: a failed enable cleared
         // the offers, so this also withdraws a stale advertisement rather than
         // keeping clients routed into a gateway that forwards nothing.
         self.registry.sync_exit_offers().await;
+        // This runs inside the IPC request, so anything slow here is time the user
+        // spends staring at `ray exit-node use`. Timed per phase because a stall in
+        // any of them is indistinguishable from the outside.
+        tracing::debug!(
+            lock = ?locked,
+            reload = ?(reloaded - locked),
+            server = ?(served - reloaded),
+            client = ?(clients - served),
+            sync_offers = ?(started.elapsed() - clients),
+            total = ?started.elapsed(),
+            "exit reconcile timing"
+        );
         reload.or(server).or(client)
     }
 
