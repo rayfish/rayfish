@@ -174,7 +174,17 @@ on "$B" "ray status" | strip | grep -q 'srv-a.*offers' \
 # ---------------------------------------------------------------------------
 step "4. srv-b routes all its traffic through srv-a (the full tunnel)"
 arm_failsafe "$B" 240
+use_started=$SECONDS
 on "$B" "ray exit-node use $NET srv-a" 2>&1 | strip | sed 's/^/   b| /'
+use_took=$((SECONDS - use_started))
+# The command runs over SSH, and the tunnel comes up underneath that very session.
+# If the conntrack-mark rules do not cover a connection that predates the tunnel,
+# the reply is swallowed and this returns minutes later, after the failsafe has
+# already reverted the host: every assertion below then measures a torn-down
+# tunnel and lies about which part is broken. Time it so that failure names itself.
+[[ $use_took -le 30 ]] \
+  && pass "\`exit-node use\` returned promptly (${use_took}s)" \
+  || fail "\`exit-node use\` took ${use_took}s: the SSH session running it stalled under the tunnel"
 sleep 8
 
 # The assertion this whole feature lives or dies on for a headless host: we are
