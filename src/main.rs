@@ -758,6 +758,7 @@ impl Drop for LogGuard {
 /// OTLP endpoint configured, spans are also exported to an OpenTelemetry collector.
 /// The returned [`LogGuard`] must be kept alive for the lifetime of the process.
 fn init_tracing(to_file: bool) -> LogGuard {
+    use std::io::IsTerminal;
     use tracing_subscriber::prelude::*;
 
     // The global gate must be permissive enough for the most verbose layer (the
@@ -772,7 +773,11 @@ fn init_tracing(to_file: bool) -> LogGuard {
 
     // Console layer: human text on stdout, held at `info` so CLI output and the
     // daemon console stay readable while the file keeps the `debug` detail.
-    let console_layer = tracing_subscriber::fmt::layer().with_filter(console_filter);
+    // Color only when stdout is a terminal: under systemd stdout is a pipe to
+    // journald, and ANSI escapes would end up verbatim in syslog.
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(std::io::stdout().is_terminal())
+        .with_filter(console_filter);
 
     // File layer: daemon only, human text with ANSI stripped, rotated daily.
     let (file_layer, appender_guard) = if to_file {
