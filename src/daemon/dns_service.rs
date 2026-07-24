@@ -115,6 +115,10 @@ impl DnsService {
     /// so the macOS configurator rewrites its match domains: catch-all (route all
     /// DNS through Magic DNS, forwarded upstream via the tunnel) while an exit is
     /// up, `.ray`-only split DNS otherwise. No-op if DNS was never configured.
+    ///
+    /// macOS-only: it is the only platform whose exit-node client rewrites match
+    /// domains, so elsewhere this is dead code and `-D warnings` says so.
+    #[cfg(target_os = "macos")]
     pub(crate) async fn reassert_os_config(&self) {
         // Clone the Arc out, not the guard, so the lock isn't held across await.
         let configurator = self.configurator.lock().unwrap().clone();
