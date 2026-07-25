@@ -21,6 +21,22 @@ val keystoreProperties = Properties().apply {
     }
 }
 
+// The app version is the crate version: Cargo.toml is the single source of
+// truth, so a release bump there carries into the manifest, the app UI and the
+// Sentry release tag without a second edit. versionCode is derived from the
+// same semver (major*10000 + minor*100 + patch) so it stays monotonic.
+val rayVersion: String = run {
+    val cargoToml = rootProject.file("../Cargo.toml")
+    val re = Regex("""(?m)^version\s*=\s*"([^"]+)"""")
+    re.find(cargoToml.readText())?.groupValues?.get(1)
+        ?: throw GradleException("no version found in ${cargoToml.path}")
+}
+val rayVersionCode: Int = run {
+    val parts = rayVersion.substringBefore('-').split('.')
+    if (parts.size != 3) throw GradleException("cannot derive versionCode from '$rayVersion'")
+    parts[0].toInt() * 10000 + parts[1].toInt() * 100 + parts[2].toInt()
+}
+
 android {
     namespace = "xyz.rayfish.android"
     compileSdk = 36
@@ -30,8 +46,8 @@ android {
         applicationId = "xyz.rayfish.android"
         minSdk = 24
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.1.4"
+        versionCode = rayVersionCode
+        versionName = rayVersion
 
         // App-name placeholders substituted into the manifest labels. The debug
         // build type overrides these (see below) so the dev build installs as a

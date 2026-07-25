@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Android app reports the right version.** The APK version was pinned to 0.1.4
+  and no longer tracked releases, so the manifest, the version shown in the app
+  and the crash-report release tag were all wrong. It now comes from the crate
+  version.
+
 ## [0.2.1] - 2026-07-24
 
 ### Added
