@@ -8,17 +8,23 @@
 //! only the work the data plane does, so a regression (or the gain from the
 //! zero-copy hand-off) is visible and stable run-to-run.
 //!
-//! Two groups:
+//! Three groups:
 //! - `handoff` — the packet ownership transfer that the zero-copy change
 //!   touched. `copy` reproduces the old allocate-and-copy (`Bytes::copy_from_slice`
 //!   on TX, `Vec::to_vec` on RX); `zerocopy` is the current pooled
 //!   `split_to(n).freeze()` (TX) and `Bytes` clone (RX). The delta is the saving.
+//! - `writer_resolve` — resolving the swappable TUN sender once per inbound
+//!   datagram: `load_full` (two atomic refcount ops) against the `arc_swap`
+//!   `Cache` the peer reader now uses.
 //! - `firewall` — `parse_packet_info` + `evaluate_packet`, the unavoidable
 //!   per-packet work run once per direction on every packet. A regression guard.
 
+use arc_swap::ArcSwap;
+use arc_swap::cache::Cache;
 use bytes::{Bytes, BytesMut};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
+use std::sync::Arc;
 
 use rayfish::firewall::{
     self, Action, Direction, FirewallConfig, FirewallRule, PeerFilter, PortRange, Protocol,
@@ -106,6 +112,36 @@ fn bench_handoff(c: &mut Criterion) {
     group.finish();
 }
 
+/// Resolving the live TUN writer, done once per inbound datagram in every peer
+/// reader. The sender cell is swappable (a TUN re-attach stores a new sender), so
+/// a reader has to re-resolve rather than capture. `load_full` pays two atomic
+/// refcount ops per packet; the `Cache` revalidates against the cell and reuses
+/// the `Arc` it already holds, cloning only after a real swap.
+fn bench_writer_resolve(c: &mut Criterion) {
+    let (tx, _rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let cell = Arc::new(ArcSwap::new(Arc::new(tx)));
+
+    let mut group = c.benchmark_group("writer_resolve");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("load_full", |b| {
+        b.iter(|| {
+            let sender = black_box(&cell).load_full();
+            black_box(sender.capacity())
+        });
+    });
+
+    group.bench_function("cache", |b| {
+        let mut cache = Cache::new(Arc::clone(&cell));
+        b.iter(|| {
+            let sender = black_box(&mut cache).load();
+            black_box(sender.capacity())
+        });
+    });
+
+    group.finish();
+}
+
 /// `parse_packet_info` + `evaluate_packet`: the per-packet work that runs
 /// regardless of the hand-off strategy, once per direction on every packet.
 fn bench_firewall(c: &mut Criterion) {
@@ -180,5 +216,5 @@ fn rule(
     }
 }
 
-criterion_group!(benches, bench_handoff, bench_firewall);
+criterion_group!(benches, bench_handoff, bench_writer_resolve, bench_firewall);
 criterion_main!(benches);

@@ -394,10 +394,11 @@ pub struct ForwardCtx {
     pub firewall: SharedFirewall,
     /// Swappable sender cell for the TUN writer. Peer readers outlive TUN
     /// attach/detach cycles (the control plane stays up across a VPN toggle), so
-    /// they resolve the current writer per packet via `tun_tx.load_full()` rather
-    /// than capturing one sender. After a detach + re-attach the cell points at
-    /// the new writer, so a reader spawned during the first `up()` keeps
-    /// forwarding after the next one. See [`DaemonState::attach_tun`].
+    /// they resolve the current writer per packet through an `arc_swap` `Cache`
+    /// over this cell rather than capturing one sender. After a detach +
+    /// re-attach the cell points at the new writer, so a reader spawned during
+    /// the first `up()` keeps forwarding after the next one. See
+    /// [`DaemonState::attach_tun`].
     pub tun_tx: Arc<arc_swap::ArcSwap<mpsc::Sender<Bytes>>>,
     pub token: CancellationToken,
     pub stats: Arc<ForwardMetrics>,
@@ -728,6 +729,12 @@ pub fn spawn_peer_reader(
     // all the peer's shared networks, so the reader is per-identity, not per-net.
     let span = tracing::info_span!("peer", peer = %peer_id.fmt_short());
     let reader = async move {
+        // Per-reader view of the swappable TUN sender. `Cache::load` revalidates
+        // against the cell and hands back the already-held `Arc` without touching
+        // its refcount, re-cloning only when `attach_tun` actually stored a new
+        // sender. The steady state (sender unchanged) is then refcount-free on the
+        // hottest path we have, while a re-attach still redirects this reader.
+        let mut tun_tx = arc_swap::cache::Cache::new(tun_tx);
         loop {
             // Wait for the next datagram, exiting on cancellation or connection
             // loss. Keeping the `select!` to "yield a datagram or return" leaves
@@ -793,7 +800,7 @@ pub fn spawn_peer_reader(
                     // means the writer is currently down (standby between a
                     // detach and the next attach); drop the packet and keep the
                     // reader alive so it forwards again once a new TUN attaches.
-                    let _ = tun_tx.load_full().send(datagram).await;
+                    let _ = tun_tx.load().send(datagram).await;
                 }
                 InboundDecision::DropFirewall(info) => {
                     stats.record_drop(DropReason::Firewall);
