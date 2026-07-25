@@ -246,6 +246,85 @@ mod tests {
         assert!(response_has_a(&resp, Ipv4Addr::new(100, 64, 0, 7)));
     }
 
+    /// Minimal upstream that answers every A query with `ip`. Returns its addr.
+    async fn fake_upstream(ip: Ipv4Addr) -> SocketAddr {
+        use simple_dns::{ResourceRecord, rdata::A, rdata::RData};
+
+        let sock = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                    return;
+                };
+                let query = Packet::parse(&buf[..n]).expect("parse query");
+                let mut reply = Packet::new_reply(query.id());
+                let qname = query.questions[0].qname.clone();
+                reply.questions.push(query.questions[0].clone());
+                reply.answers.push(ResourceRecord::new(
+                    qname,
+                    simple_dns::CLASS::IN,
+                    60,
+                    RData::A(A { address: ip.into() }),
+                ));
+                let bytes = reply.build_bytes_vec().expect("build reply");
+                let _ = sock.send_to(&bytes, from).await;
+            }
+        });
+        addr
+    }
+
+    /// The reporter path in #111: a non-`.ray` name must be forwarded to the
+    /// captured upstream and the answer injected back into the TUN. Without
+    /// this the host loses all DNS the moment Magic DNS takes over resolv.conf.
+    #[tokio::test]
+    async fn non_ray_name_is_forwarded_and_reply_injected() {
+        use std::net::IpAddr;
+
+        let upstream_answer = Ipv4Addr::new(93, 184, 216, 34);
+        let up = fake_upstream(upstream_answer).await;
+
+        let r = Resolver::new(
+            crate::dns::new_hostname_table(),
+            crate::dns::new_reverse_table(),
+        );
+        r.set_upstream_addrs([up]);
+
+        let dns_query = build_a_query("example.com");
+        let app = crate::firewall::PacketInfo {
+            src_ip: IpAddr::V4(Ipv4Addr::new(100, 69, 9, 225)),
+            dst_ip: IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            protocol: 17,
+            src_port: 50000,
+            dst_port: 53,
+            tcp_flags: 0,
+            icmp_type: 0,
+            icmp_id: 0,
+        };
+        let query_pkt = crate::dns::packet::build_udp_reply(
+            &crate::firewall::PacketInfo {
+                src_ip: app.dst_ip,
+                dst_ip: app.src_ip,
+                src_port: app.dst_port,
+                dst_port: app.src_port,
+                ..app
+            },
+            &dns_query,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let info = crate::firewall::parse_packet_info(&query_pkt).unwrap();
+        r.handle_tun_query(&query_pkt, &info, &tx).await;
+
+        let reply = rx.try_recv().expect("forwarded answer injected into TUN");
+        let rinfo = crate::firewall::parse_packet_info(&reply).unwrap();
+        assert_eq!(rinfo.src_ip, IpAddr::V4(crate::dns::MAGIC_DNS_V4));
+        assert_eq!(rinfo.dst_port, 50000);
+        assert!(response_has_a(&reply[28..], upstream_answer));
+    }
+
     #[tokio::test]
     async fn upstream_dropped_when_equal_to_magic_ip() {
         let r = Resolver::new(
