@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Invite codes carry a checksum.** A code that lost or gained characters on
+  its way through a chat client now fails immediately with "invalid invite
+  code" instead of decoding into a well-formed invite for a network that
+  doesn't exist, which surfaced later as a confusing join failure. Codes minted
+  by older builds still work; codes minted now are four characters longer, so a
+  peer on a build older than this one cannot redeem them.
+
 ### Fixed
 
 - **Firewall rules now match the real ports of every packet.** An IPv4 packet

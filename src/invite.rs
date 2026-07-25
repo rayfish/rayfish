@@ -7,9 +7,10 @@
 //! never published into the GroupBlob.
 //!
 //! The invite *code* handed to a joiner is `bs58(network_pubkey || coordinator ||
-//! secret)` (see [`encode_invite_code`]), mirroring the pairing-ticket format. The
-//! joiner decodes it, dials the coordinator directly, and presents the secret; the
-//! coordinator hashes the secret, looks it up in the ledger, and burns it.
+//! secret || checksum)` (see [`encode_invite_code`]). The joiner decodes it, dials
+//! the coordinator directly, and presents the secret; the coordinator hashes the
+//! secret, looks it up in the ledger, and burns it. Codes minted before the
+//! checksum existed still decode.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -104,34 +105,73 @@ pub fn invite_path(network: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("{network}.toml")))
 }
 
-/// Encode an invite code: `bs58(network_pubkey(32) || coordinator(32) || secret(16))`.
+/// Payload of an invite code, before the checksum: two keys and the secret.
+const PAYLOAD_LEN: usize = 32 + 32 + SECRET_LEN;
+/// Bytes of blake3 appended as an integrity check (see [`encode_invite_code`]).
+const CHECKSUM_LEN: usize = 4;
+
+/// The checksum appended to an invite code: the leading bytes of the payload's
+/// blake3 hash. Not a security control (the payload is public and anyone can
+/// recompute it), purely error detection so a truncated or mistyped code fails
+/// as "invalid invite code" instead of decoding into a plausible-looking
+/// invite for a network that doesn't exist.
+fn invite_checksum(payload: &[u8]) -> [u8; CHECKSUM_LEN] {
+    let hash = blake3::hash(payload);
+    let mut out = [0u8; CHECKSUM_LEN];
+    out.copy_from_slice(&hash.as_bytes()[..CHECKSUM_LEN]);
+    out
+}
+
+/// Encode an invite code:
+/// `bs58(network_pubkey(32) || coordinator(32) || secret(16) || checksum(4))`.
+///
+/// base58 carries no error detection of its own, so the trailing checksum is
+/// what makes a mangled code fail cleanly: without it, dropping a character
+/// divides the encoded number by 58 and can still land on a payload of the
+/// right length, which then decodes into a well-formed invite pointing
+/// nowhere.
 pub fn encode_invite_code(
     network_pubkey: &EndpointId,
     coordinator: &EndpointId,
     secret: &[u8],
 ) -> String {
-    let mut bytes = Vec::with_capacity(32 + 32 + SECRET_LEN);
+    let mut bytes = Vec::with_capacity(PAYLOAD_LEN + CHECKSUM_LEN);
     bytes.extend_from_slice(network_pubkey.as_bytes());
     bytes.extend_from_slice(coordinator.as_bytes());
     bytes.extend_from_slice(secret);
+    bytes.extend_from_slice(&invite_checksum(&bytes));
     bs58::encode(&bytes).into_string()
 }
 
 /// Decode an invite code into `(network_pubkey, coordinator, secret)`.
+///
+/// Accepts both the checksummed form and the older unchecksummed one, so codes
+/// minted before the checksum existed (and codes minted by a peer still on an
+/// older build) keep working. A code carrying a checksum must have a correct
+/// one.
 pub fn decode_invite_code(code: &str) -> Result<(EndpointId, EndpointId, Vec<u8>)> {
-    let bytes = bs58::decode(code)
+    let bytes = bs58::decode(code.trim())
         .into_vec()
         .map_err(|e| anyhow::anyhow!("invalid invite code: {e}"))?;
-    if bytes.len() != 32 + 32 + SECRET_LEN {
-        bail!(
-            "invalid invite code: expected {} bytes, got {}",
-            32 + 32 + SECRET_LEN,
-            bytes.len()
-        );
-    }
-    let net: [u8; 32] = bytes[0..32].try_into().unwrap();
-    let coord: [u8; 32] = bytes[32..64].try_into().unwrap();
-    let secret = bytes[64..].to_vec();
+
+    let payload = match bytes.len() {
+        PAYLOAD_LEN => &bytes[..],
+        len if len == PAYLOAD_LEN + CHECKSUM_LEN => {
+            let (payload, checksum) = bytes.split_at(PAYLOAD_LEN);
+            if checksum != invite_checksum(payload) {
+                bail!("invalid invite code: checksum mismatch (was it copied in full?)");
+            }
+            payload
+        }
+        len => bail!(
+            "invalid invite code: expected {} bytes, got {len}",
+            PAYLOAD_LEN + CHECKSUM_LEN,
+        ),
+    };
+
+    let net: [u8; 32] = payload[0..32].try_into().unwrap();
+    let coord: [u8; 32] = payload[32..64].try_into().unwrap();
+    let secret = payload[64..].to_vec();
     let network_pubkey = EndpointId::from_bytes(&net)
         .map_err(|e| anyhow::anyhow!("invalid network key in invite: {e}"))?;
     let coordinator = EndpointId::from_bytes(&coord)
@@ -373,6 +413,56 @@ mod tests {
         // A 32-byte bs58 string (a bare room id) is not a valid invite.
         let code = bs58::encode(test_id(1).as_bytes()).into_string();
         assert!(decode_invite_code(&code).is_err());
+    }
+
+    /// Codes minted before the checksum was added (and by peers still on an
+    /// older build) carry no checksum and must keep working.
+    #[test]
+    fn decode_accepts_legacy_unchecksummed_code() {
+        let (net, coord, secret) = (test_id(1), test_id(2), generate_secret());
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(net.as_bytes());
+        bytes.extend_from_slice(coord.as_bytes());
+        bytes.extend_from_slice(&secret);
+        let legacy = bs58::encode(&bytes).into_string();
+
+        let (dn, dc, ds) = decode_invite_code(&legacy).unwrap();
+        assert_eq!(dn, net);
+        assert_eq!(dc, coord);
+        assert_eq!(ds, secret.to_vec());
+    }
+
+    #[test]
+    fn decode_rejects_corrupted_checksum() {
+        let (net, coord, secret) = (test_id(1), test_id(2), generate_secret());
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(net.as_bytes());
+        bytes.extend_from_slice(coord.as_bytes());
+        bytes.extend_from_slice(&secret);
+        bytes.extend_from_slice(&[0xff; 4]); // not the real checksum
+
+        let err = decode_invite_code(&bs58::encode(&bytes).into_string()).unwrap_err();
+        assert!(err.to_string().contains("checksum"), "got: {err}");
+    }
+
+    /// The point of the checksum: a code that lost characters in a paste is
+    /// reported as invalid instead of decoding into a plausible invite.
+    ///
+    /// Bounded at four characters because base58 length is value-dependent:
+    /// four dropped characters shrink the payload by at most three bytes, so
+    /// the result can't reach the four-bytes-shorter legacy shape, which is
+    /// the one case the decoder still accepts unchecked (see
+    /// [`decode_invite_code`]).
+    #[test]
+    fn decode_rejects_truncated_code() {
+        let code = encode_invite_code(&test_id(1), &test_id(2), &generate_secret());
+        for cut in 1..=4 {
+            let truncated = &code[..code.len() - cut];
+            assert!(
+                decode_invite_code(truncated).is_err(),
+                "truncation by {cut} was accepted",
+            );
+        }
     }
 
     #[test]
