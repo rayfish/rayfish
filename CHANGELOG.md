@@ -25,6 +25,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Magic DNS no longer takes a host's DNS down with it.** When rayfish falls
+  back to managing `/etc/resolv.conf` itself, it used to forward every non-`.ray`
+  lookup to whatever nameserver the file happened to list, without checking that
+  the nameserver answers. On a machine whose `resolv.conf` is rendered by another
+  program (NetworkManager, most often) that entry can name a server that no
+  longer replies, and the result was a box with no DNS at all: ordinary names
+  stopped resolving, and `ray join` failed with `Service 'pkarr' failed` because
+  the daemon could not look up the discovery server either. Rayfish now checks
+  each nameserver before trusting it, keeps a working one listed in
+  `resolv.conf` after its own so the host still resolves names if the daemon
+  stops, and refuses to take the file over at all when nothing answers, telling
+  you to set `dns_upstreams` rather than leaving you without DNS. A lookup that
+  can't be forwarded now fails immediately instead of hanging until the client
+  gives up.
+
 - **Firewall rules now match the real ports of every packet.** An IPv4 packet
   claiming a header shorter than 20 bytes was still evaluated, with its "ports"
   and TCP flags read from bytes inside the IP header, so a peer could pick which

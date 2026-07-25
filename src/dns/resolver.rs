@@ -79,8 +79,16 @@ impl Resolver {
         let Some(dns_query) = pkt.get(payload_start..) else {
             return;
         };
-        let Some(resp) = self.resolve(dns_query).await else {
-            return;
+        let resp = match self.resolve(dns_query).await {
+            Some(resp) => resp,
+            // No upstream answered. Reply SERVFAIL instead of dropping: a dropped
+            // query looks like packet loss, so the client retries until its own
+            // timeout and the box appears to hang. SERVFAIL fails it immediately
+            // and lets a resolver with a second nameserver move on to it.
+            None => match servfail(dns_query) {
+                Some(resp) => resp,
+                None => return,
+            },
         };
         if let Some(reply) = crate::dns::packet::build_udp_reply(info, &resp) {
             let _ = tun_tx.send(reply).await;
@@ -89,25 +97,93 @@ impl Resolver {
 
     async fn forward(&self, query: &[u8]) -> Option<Vec<u8>> {
         let upstreams = self.upstreams.load();
+        if upstreams.is_empty() {
+            tracing::warn!("no DNS upstream configured; cannot forward non-.ray queries");
+            return None;
+        }
         for up in upstreams.iter() {
-            if let Ok(resp) = forward_once(query, *up).await {
-                return Some(resp);
+            match forward_once(query, *up, FORWARD_TIMEOUT).await {
+                Ok(resp) => return Some(resp),
+                Err(e) => tracing::debug!(upstream = %up, error = %e, "upstream DNS query failed"),
             }
         }
+        tracing::warn!(upstreams = ?upstreams.as_ref(), "no DNS upstream answered");
         None
     }
 }
 
-async fn forward_once(query: &[u8], up: SocketAddr) -> std::io::Result<Vec<u8>> {
+/// How long to wait for an upstream to answer a forwarded query.
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long to wait for an upstream to answer the liveness probe. Shorter than
+/// [`FORWARD_TIMEOUT`]: this runs on the `ray up` path, once per candidate.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+async fn forward_once(query: &[u8], up: SocketAddr, wait: Duration) -> std::io::Result<Vec<u8>> {
     let sock = tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await?;
     sock.connect(up).await?;
     sock.send(query).await?;
     let mut buf = vec![0u8; 4096];
-    let n = tokio::time::timeout(Duration::from_secs(3), sock.recv(&mut buf))
+    let n = tokio::time::timeout(wait, sock.recv(&mut buf))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "upstream DNS timeout"))??;
     buf.truncate(n);
     Ok(buf)
+}
+
+/// True if `up` answers a DNS query at all.
+///
+/// Captured upstreams are only ever a *claim* about where DNS lives: on a box
+/// whose resolv.conf is rendered by another manager the entry can be stale, and
+/// forwarding to it silently blackholes every non-`.ray` name (see #111). Any
+/// well-formed reply counts, including SERVFAIL: this asks "is something
+/// listening", not "is it a good resolver", and a dead upstream answers nothing.
+pub async fn probe_upstream(up: SocketAddr) -> bool {
+    // `. NS`, the cheapest question every resolver understands, and one that
+    // needs no upstream connectivity of its own to produce a reply.
+    let query = [
+        0x2b, 0x1d, // id (arbitrary, fixed: we only compare against the reply)
+        0x01, 0x00, // flags: standard query, recursion desired
+        0x00, 0x01, // qdcount 1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // an/ns/ar count 0
+        0x00, // qname: root
+        0x00, 0x02, // qtype NS
+        0x00, 0x01, // qclass IN
+    ];
+    match forward_once(&query, up, PROBE_TIMEOUT).await {
+        // Match the transaction id so a stray datagram can't pass as an answer.
+        Ok(resp) => resp.len() >= 12 && resp[..2] == query[..2],
+        Err(_) => false,
+    }
+}
+
+/// Filter `candidates` down to the ones that actually answer, probing them
+/// concurrently so a set of dead entries costs one [`PROBE_TIMEOUT`], not one
+/// per entry. Order is preserved: callers treat the first as preferred.
+pub async fn live_upstreams(candidates: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+    let probes = candidates
+        .iter()
+        .map(|ip| async move { probe_upstream(SocketAddr::from((*ip, 53u16))).await });
+    let alive = futures::future::join_all(probes).await;
+    candidates
+        .iter()
+        .zip(alive)
+        .filter_map(|(ip, ok)| ok.then_some(*ip))
+        .collect()
+}
+
+/// Turn a query into a SERVFAIL response by flipping the header in place,
+/// keeping the id, question, and any EDNS OPT so the client matches it to its
+/// outstanding query. Editing the header beats decoding and re-encoding: it
+/// can't drop a section we failed to model.
+fn servfail(query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
+    let mut resp = query.to_vec();
+    resp[2] |= 0x80; // QR: this is a response
+    resp[3] = 0x80 | 2; // RA=1, Z=0, RCODE=2 (server failure)
+    Some(resp)
 }
 
 /// A name we answer locally: `.ray`, the apex `ray`, or `<host>.<network>`
@@ -323,6 +399,94 @@ mod tests {
         assert_eq!(rinfo.src_ip, IpAddr::V4(crate::dns::MAGIC_DNS_V4));
         assert_eq!(rinfo.dst_port, 50000);
         assert!(response_has_a(&reply[28..], upstream_answer));
+    }
+
+    /// A dead address: bind a socket to claim a port, then drop it, so nothing
+    /// is listening there. Sending to it fails fast (loopback ICMP port
+    /// unreachable) instead of waiting out the probe timeout.
+    async fn dead_upstream() -> SocketAddr {
+        let sock = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        sock.local_addr().unwrap()
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_a_live_upstream_and_rejects_a_dead_one() {
+        let live = fake_upstream(Ipv4Addr::new(1, 2, 3, 4)).await;
+        assert!(probe_upstream(live).await, "a listening resolver is live");
+        assert!(
+            !probe_upstream(dead_upstream().await).await,
+            "nothing listening must not pass as a working upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_upstreams_preserves_order_of_survivors() {
+        // No listener on the loopback addresses, so both are filtered out and
+        // the caller is left with the empty set it needs to refuse on.
+        assert!(
+            live_upstreams(&[Ipv4Addr::new(127, 0, 0, 2)])
+                .await
+                .is_empty()
+        );
+        assert!(live_upstreams(&[]).await.is_empty());
+    }
+
+    /// #111: with no upstream that answers, a forwarded query must come back
+    /// SERVFAIL rather than vanish. A dropped query is indistinguishable from
+    /// packet loss, so the client retries until its own timeout and the box
+    /// looks hung; SERVFAIL fails it immediately.
+    #[tokio::test]
+    async fn servfail_returned_when_no_upstream_answers() {
+        use std::net::IpAddr;
+
+        let r = Resolver::new(
+            crate::dns::new_hostname_table(),
+            crate::dns::new_reverse_table(),
+        );
+        r.set_upstream_addrs([dead_upstream().await]);
+
+        let dns_query = build_a_query("example.com");
+        let app = crate::firewall::PacketInfo {
+            src_ip: IpAddr::V4(Ipv4Addr::new(100, 69, 9, 225)),
+            dst_ip: IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            protocol: 17,
+            src_port: 50000,
+            dst_port: 53,
+            tcp_flags: 0,
+            icmp_type: 0,
+            icmp_id: 0,
+        };
+        let query_pkt = crate::dns::packet::build_udp_reply(
+            &crate::firewall::PacketInfo {
+                src_ip: app.dst_ip,
+                dst_ip: app.src_ip,
+                src_port: app.dst_port,
+                dst_port: app.src_port,
+                ..app
+            },
+            &dns_query,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let info = crate::firewall::parse_packet_info(&query_pkt).unwrap();
+        r.handle_tun_query(&query_pkt, &info, &tx).await;
+
+        let reply = rx
+            .try_recv()
+            .expect("SERVFAIL injected, not a dropped query");
+        let pkt = Packet::parse(&reply[28..]).expect("parse SERVFAIL");
+        assert_eq!(pkt.rcode(), simple_dns::RCODE::ServerFailure);
+        // The id and question have to survive or the client can't match the
+        // response to its outstanding query and will ignore it.
+        assert_eq!(pkt.id(), Packet::parse(&dns_query).unwrap().id());
+        assert_eq!(pkt.questions.len(), 1);
+    }
+
+    #[test]
+    fn servfail_rejects_a_runt_packet() {
+        // Shorter than a DNS header: there is nothing to turn into a response.
+        assert!(servfail(&[0u8; 11]).is_none());
     }
 
     #[tokio::test]

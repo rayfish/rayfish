@@ -87,6 +87,8 @@ impl DnsService {
                 let is_direct = c.name() == "direct-resolv.conf";
                 #[cfg(target_os = "linux")]
                 let search = c.search_domains();
+                #[cfg(target_os = "linux")]
+                let fallback = c.fallback_upstream();
                 tracing::info!(backend = c.name(), resolver_ip = %crate::dns::MAGIC_DNS_V4, upstreams = ?upstreams, "Magic DNS active");
                 self.resolver.set_upstreams(upstreams);
                 *self.configurator.lock().unwrap() = Some(Arc::from(c));
@@ -96,7 +98,7 @@ impl DnsService {
                 if is_direct {
                     let rt = tokio_util::sync::CancellationToken::new();
                     *self.reassert_token.lock().unwrap() = Some(rt.clone());
-                    tokio::spawn(dns_config::run_resolv_reassert(search, rt));
+                    tokio::spawn(dns_config::run_resolv_reassert(search, fallback, rt));
                 }
                 #[cfg(not(target_os = "linux"))]
                 let _ = is_direct;

@@ -46,6 +46,13 @@ pub trait DnsConfigurator: Send + Sync {
     fn search_domains(&self) -> Vec<String> {
         Vec::new()
     }
+    /// The real resolver listed after ours in resolv.conf (direct mode only), so
+    /// the host still resolves names if our resolver stops answering. Threaded
+    /// into the re-assert loop so a trample-repair rewrites the same file we
+    /// installed. Default: none (split-DNS backends don't write the file).
+    fn fallback_upstream(&self) -> Option<Ipv4Addr> {
+        None
+    }
 }
 
 /// Revert a DNS configuration.
@@ -867,21 +874,40 @@ impl DnsConfigurator for Resolvconf {
 
 /// Extract IPv4 `nameserver` entries from resolv.conf contents, excluding our
 /// own magic IP (so we never capture ourselves as an upstream → no forward loop).
+///
+/// `resolv.conf(5)` separates the keyword from its value by any run of spaces or
+/// tabs, and plenty of generators emit a tab. Splitting on whitespace rather
+/// than matching `"nameserver "` matters more than it looks: missing an entry
+/// here doesn't degrade anything, it silently leaves the forwarder with nothing
+/// to forward to.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_resolv_nameservers(contents: &str) -> Vec<Ipv4Addr> {
     contents
         .lines()
-        .filter_map(|l| l.trim().strip_prefix("nameserver "))
-        .filter_map(|s| s.trim().parse::<Ipv4Addr>().ok())
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            (f.next()? == "nameserver").then(|| f.next())?
+        })
+        // IPv6 nameservers parse as None and are skipped: the forwarder is v4-only.
+        .filter_map(|s| s.parse::<Ipv4Addr>().ok())
         .filter(|ip| *ip != crate::dns::MAGIC_DNS_V4)
         .collect()
 }
 
-/// Render a direct-mode resolv.conf that points only at the magic resolver IP.
+/// Render a direct-mode resolv.conf pointing at the magic resolver IP, with a
+/// verified upstream listed after it as a fallback.
+///
+/// The fallback is what keeps a box that trusts us from losing DNS outright. We
+/// answer `.ray` authoritatively so it never reaches the second entry, but if
+/// our resolver is dead, wedged, or the daemon is gone, the libc resolver moves
+/// on to a real server instead of the machine having no DNS at all.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn render_direct_resolv_conf(search: &[String]) -> String {
+fn render_direct_resolv_conf(search: &[String], fallback: Option<Ipv4Addr>) -> String {
     let mut s = String::from(HEADER_COMMENT);
     s.push_str(&format!("nameserver {RESOLVER_IP}\n"));
+    if let Some(ip) = fallback {
+        s.push_str(&format!("nameserver {ip}\n"));
+    }
     if !search.is_empty() {
         s.push_str(&format!("search {}\n", search.join(" ")));
     }
@@ -900,12 +926,12 @@ fn resolv_conf_is_ours(contents: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-async fn reassert_resolv_conf(search: &[String]) -> Result<()> {
+async fn reassert_resolv_conf(search: &[String], fallback: Option<Ipv4Addr>) -> Result<()> {
     let path = Path::new("/etc/resolv.conf");
     let current = tokio::fs::read_to_string(path).await.unwrap_or_default();
     if !resolv_conf_is_ours(&current) {
         tracing::warn!("/etc/resolv.conf was overwritten; re-asserting rayfish DNS");
-        tokio::fs::write(path, render_direct_resolv_conf(search))
+        tokio::fs::write(path, render_direct_resolv_conf(search, fallback))
             .await
             .context("re-asserting /etc/resolv.conf")?;
     }
@@ -922,11 +948,15 @@ async fn reassert_resolv_conf(search: &[String]) -> Result<()> {
 /// in direct mode, so on an NM host this watch mostly fires for dhclient or
 /// other writers; it remains the catch-all repair either way.
 #[cfg(target_os = "linux")]
-pub async fn run_resolv_reassert(search: Vec<String>, token: tokio_util::sync::CancellationToken) {
+pub async fn run_resolv_reassert(
+    search: Vec<String>,
+    fallback: Option<Ipv4Addr>,
+    token: tokio_util::sync::CancellationToken,
+) {
     use futures::StreamExt;
 
     // Re-assert immediately: covers any trample between apply() and our arrival.
-    if let Err(e) = reassert_resolv_conf(&search).await {
+    if let Err(e) = reassert_resolv_conf(&search, fallback).await {
         tracing::warn!(error = %e, "initial resolv.conf re-assert failed");
     }
 
@@ -971,12 +1001,12 @@ pub async fn run_resolv_reassert(search: Vec<String>, token: tokio_util::sync::C
                     None => { stream = None; false } // stream ended; rely on the tick
                 };
                 if relevant
-                    && let Err(e) = reassert_resolv_conf(&search).await {
+                    && let Err(e) = reassert_resolv_conf(&search, fallback).await {
                     tracing::warn!(error = %e, "resolv.conf re-assert failed");
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                if let Err(e) = reassert_resolv_conf(&search).await {
+                if let Err(e) = reassert_resolv_conf(&search, fallback).await {
                     tracing::warn!(error = %e, "resolv.conf re-assert failed");
                 }
             }
@@ -1146,13 +1176,25 @@ pub fn emergency_restore_resolv_conf() {}
 struct DirectResolvConf {
     captured_upstreams: Vec<Ipv4Addr>,
     search: Vec<String>,
+    /// The operator named `dns_upstreams` in the config. Their explicit choice
+    /// overrides our refusal to take over with no verified upstream of our own:
+    /// [`DnsService::configure`] merges theirs in after detection, so the
+    /// forwarder does get somewhere to send queries.
+    operator_upstreams: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl DirectResolvConf {
     /// Read the current resolv.conf to capture upstreams + existing search
-    /// domains BEFORE we overwrite it. Call this in detect_and_configure
-    /// before apply().
+    /// domains BEFORE we overwrite it, then keep only the upstreams that answer.
+    /// Call this in detect_and_configure before apply().
+    ///
+    /// The probe is the whole point of this backend being careful. Every other
+    /// backend hands DNS to a manager that knows where the real resolvers are;
+    /// this one infers them from a file that some other program rendered, which
+    /// can name a server that no longer answers from this host. Forwarding to a
+    /// dead entry takes the machine's DNS down completely (#111), so an upstream
+    /// has to prove it is alive before we bet the box on it.
     async fn new() -> Self {
         let contents = tokio::fs::read_to_string("/etc/resolv.conf")
             .await
@@ -1166,10 +1208,29 @@ impl DirectResolvConf {
             })
             .flat_map(|s| s.split_whitespace().map(|x| x.to_string()))
             .collect();
-        Self {
-            captured_upstreams: parse_resolv_nameservers(&contents),
-            search,
+
+        let captured = parse_resolv_nameservers(&contents);
+        let live = crate::dns::resolver::live_upstreams(&captured).await;
+        if live.len() != captured.len() {
+            let dead: Vec<_> = captured.iter().filter(|ip| !live.contains(ip)).collect();
+            tracing::warn!(
+                ?dead,
+                "resolv.conf names DNS servers that do not answer; ignoring them"
+            );
         }
+        Self {
+            captured_upstreams: live,
+            search,
+            operator_upstreams: crate::config::load()
+                .map(|c| !c.dns_upstreams.servers.is_empty())
+                .unwrap_or(false),
+        }
+    }
+
+    /// The upstream written into resolv.conf as the second nameserver, so the
+    /// host keeps resolving if our resolver stops answering.
+    fn fallback(&self) -> Option<Ipv4Addr> {
+        self.captured_upstreams.first().copied()
     }
 }
 
@@ -1177,18 +1238,31 @@ impl DirectResolvConf {
 #[async_trait]
 impl DnsConfigurator for DirectResolvConf {
     async fn apply(&self) -> Result<()> {
+        // Refuse the takeover rather than install a black hole. Taking over
+        // resolv.conf routes every name on the box through us, so with no
+        // upstream that answers we would break all non-`.ray` resolution, and
+        // the re-assert watcher would undo any manual repair. A host with
+        // working DNS and no Magic DNS is the better failure. Bail before
+        // touching anything so there is nothing to undo.
+        anyhow::ensure!(
+            !self.captured_upstreams.is_empty() || self.operator_upstreams,
+            "no working DNS server found in /etc/resolv.conf, so taking it over would leave \
+             this host unable to resolve anything; set `dns_upstreams` in the config to \
+             name one explicitly"
+        );
+
         let path = Path::new("/etc/resolv.conf");
         backup_file(path).await?;
         // Quiet NM first so it doesn't regenerate the file out from under the
         // write we're about to make (the inotify re-assert covers any residual).
         nm_quiet_install().await;
-        let new_content = render_direct_resolv_conf(&self.search);
+        let new_content = render_direct_resolv_conf(&self.search, self.fallback());
         tokio::fs::write(path, new_content)
             .await
             .context("writing /etc/resolv.conf")?;
         tracing::info!(
             upstreams = ?self.captured_upstreams,
-            "configured /etc/resolv.conf directly (fallback); captured upstream resolvers"
+            "configured /etc/resolv.conf directly (fallback); verified upstream resolvers"
         );
         Ok(())
     }
@@ -1212,6 +1286,10 @@ impl DnsConfigurator for DirectResolvConf {
 
     fn search_domains(&self) -> Vec<String> {
         self.search.clone()
+    }
+
+    fn fallback_upstream(&self) -> Option<Ipv4Addr> {
+        self.fallback()
     }
 }
 
@@ -1256,7 +1334,7 @@ mod tests {
 
     #[test]
     fn render_direct_resolv_conf_points_at_magic_ip() {
-        let out = render_direct_resolv_conf(&["homelab.ray".to_string(), "ray".to_string()]);
+        let out = render_direct_resolv_conf(&["homelab.ray".to_string(), "ray".to_string()], None);
         assert!(out.starts_with("# Added by rayfish"));
         assert!(out.contains("nameserver 100.100.100.53"));
         assert!(out.contains("search homelab.ray ray"));
@@ -1264,9 +1342,45 @@ mod tests {
 
     #[test]
     fn render_direct_resolv_conf_no_search_line_when_empty() {
-        let out = render_direct_resolv_conf(&[]);
+        let out = render_direct_resolv_conf(&[], None);
         assert!(out.contains("nameserver 100.100.100.53"));
         assert!(!out.contains("search "));
+    }
+
+    #[test]
+    fn render_direct_resolv_conf_lists_fallback_after_magic_ip() {
+        let out = render_direct_resolv_conf(&[], Some("192.168.1.1".parse().unwrap()));
+        // Order is load-bearing: the resolver library tries entries top-down, so
+        // ours must come first or `.ray` names go to the upstream and NXDOMAIN.
+        let magic = out.find("nameserver 100.100.100.53").unwrap();
+        let fallback = out.find("nameserver 192.168.1.1").unwrap();
+        assert!(magic < fallback, "magic IP must be listed first:\n{out}");
+    }
+
+    #[test]
+    fn parse_resolv_nameservers_accepts_tabs_and_runs_of_spaces() {
+        // A generator that emits a tab, or aligns its columns, must not read as
+        // "this host has no DNS servers" — that silently empties the upstream
+        // set and takes the box's resolution down with it.
+        let c = "nameserver\t192.168.1.1\nnameserver   8.8.8.8\n";
+        assert_eq!(
+            parse_resolv_nameservers(c),
+            vec![
+                "192.168.1.1".parse::<Ipv4Addr>().unwrap(),
+                "8.8.8.8".parse::<Ipv4Addr>().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_resolv_nameservers_ignores_non_nameserver_lines() {
+        // `nameserver` must be the whole keyword: a prefix match would let
+        // `nameservers-are-fun 1.2.3.4` or a comment through.
+        let c = "# nameserver 9.9.9.9\noptions ndots:2\nsearch example.com\nnameserver 1.1.1.1\n";
+        assert_eq!(
+            parse_resolv_nameservers(c),
+            vec!["1.1.1.1".parse::<Ipv4Addr>().unwrap()]
+        );
     }
 
     #[test]
