@@ -40,6 +40,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   can't be forwarded now fails immediately instead of hanging until the client
   gives up.
 
+- **Failed lookups say what actually went wrong.** `ray join` reported every
+  discovery failure as `failed to resolve network record: failed to resolve
+  network record: Service 'pkarr' failed`, which repeated itself and named
+  neither the cause nor the server it tried. It now names the discovery server
+  and keeps the underlying reason, so an unreachable server, a DNS failure, and
+  a network that was never published are told apart. A lookup also gives up
+  after 15 seconds instead of potentially hanging forever.
+
 - **Firewall rules now match the real ports of every packet.** An IPv4 packet
   claiming a header shorter than 20 bytes was still evaluated, with its "ports"
   and TCP flags read from bytes inside the IP header, so a peer could pick which

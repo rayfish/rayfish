@@ -16,6 +16,12 @@ const RECORD_VERSION: &str = "v1";
 const RECORD_TTL: u32 = 300;
 const PKARR_RELAY_URL: &str = "https://dns.iroh.link/pkarr";
 
+/// Cap on a single record resolution. The relay is plain HTTPS and iroh's
+/// client sets no total timeout, so a blackholed relay (or a host whose DNS
+/// stopped resolving the relay's own name) would otherwise leave `ray join`
+/// hanging with nothing on screen.
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Process-wide pkarr relay URL, set once at daemon startup from the
 /// `discovery-dns` config. The discovery server is a set-once constant for the
 /// daemon's lifetime, so a `OnceLock` avoids threading it through every
@@ -195,7 +201,7 @@ pub async fn publish_network(
     client
         .publish(&packet)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to publish network record: {e}"))
+        .map_err(|e| anyhow::anyhow!("failed to publish network record: {e:#}"))
 }
 
 /// Resolves the raw signed network record packet. Use this when you need fields
@@ -206,10 +212,19 @@ pub async fn resolve_network_packet(
     client: &PkarrRelayClient,
     network_pubkey: EndpointId,
 ) -> Result<SignedPacket> {
-    client
-        .resolve(network_pubkey)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to resolve network record: {e}"))
+    // `{e:#}` rather than `{e}`: the top-level Display of iroh's lookup error is
+    // the bare "Service 'pkarr' failed", which says nothing. The alternate form
+    // renders the source chain, so a DNS failure resolving the relay reads as
+    // such instead of looking like the network record is missing.
+    let resolve = client.resolve(network_pubkey);
+    match tokio::time::timeout(RESOLVE_TIMEOUT, resolve).await {
+        Ok(Ok(packet)) => Ok(packet),
+        Ok(Err(e)) => Err(anyhow::anyhow!("{e:#}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "timed out after {}s",
+            RESOLVE_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 pub async fn resolve_network(
@@ -230,7 +245,7 @@ pub async fn publish_contact(
     client
         .publish(&packet)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to publish contact record: {e}"))
+        .map_err(|e| anyhow::anyhow!("failed to publish contact record: {e:#}"))
 }
 
 /// Resolve a contact id to the holder's current transport EndpointId.
@@ -241,7 +256,7 @@ pub async fn resolve_contact(
     let packet = client
         .resolve(contact_pubkey)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to resolve contact record: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to resolve contact record: {e:#}"))?;
     decode_contact_record(&packet)
 }
 

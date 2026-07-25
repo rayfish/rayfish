@@ -325,7 +325,12 @@ impl NetworkRegistry {
         let pkarr_client = dht::create_pkarr_client(&self.transport.endpoint)?;
         let record = dht::resolve_network_packet(&pkarr_client, net_pubkey)
             .await
-            .context("failed to resolve network record")?;
+            .with_context(|| {
+                format!(
+                    "could not look up this network at {}",
+                    dht::effective_pkarr_url()
+                )
+            })?;
 
         // Absent version (older record) ⇒ skip and let the ALPN gate decide.
         if let Some(net_ver) = dht::mesh_version_from_record(&record) {
