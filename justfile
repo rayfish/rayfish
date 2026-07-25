@@ -28,6 +28,23 @@ fmt:
     cargo clippy --all-targets --all-features -- -D warnings
     # cargo shear --fix # cargo install shear
 
+# Format only the .rs files you have actually touched (modified or new).
+#
+# Use this mid-change instead of `just fmt`. `cargo fmt` always formats the
+# whole crate, and `cargo fmt -- some/file.rs` does NOT narrow it: cargo passes
+# every target to rustfmt and appends your paths, so unrelated files get
+# rewritten and land in your diff. Calling rustfmt directly is the only way to
+# scope it.
+fmt-changed:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    files=$({ git diff --name-only HEAD -- '*.rs'; \
+              git ls-files --others --exclude-standard -- '*.rs'; } | sort -u)
+    if [ -z "$files" ]; then echo "no changed .rs files"; exit 0; fi
+    echo "$files"
+    # shellcheck disable=SC2086
+    rustfmt --edition 2024 $files
+
 cross:
     cross -q build --release --target {{target}}
 
