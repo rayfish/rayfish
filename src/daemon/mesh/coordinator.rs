@@ -745,3 +745,93 @@ mod prune_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod sender_authority_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn eid(seed: u8) -> EndpointId {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        SecretKey::from(b).public()
+    }
+
+    fn member(id: EndpointId, is_coordinator: bool) -> Member {
+        Member {
+            identity: id,
+            ip: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            is_coordinator,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+            last_seen: None,
+            exit_node: false,
+        }
+    }
+
+    fn state_with(members: Vec<Member>) -> SharedNetworkState {
+        let mut list = MemberList::new();
+        for (i, mut m) in members.into_iter().enumerate() {
+            // Distinct addresses so `MemberList::add` doesn't reject a collision.
+            m.ip = std::net::Ipv4Addr::new(100, 64, 0, (i + 2) as u8);
+            list.add(m).unwrap();
+        }
+        Arc::new(RwLock::new(NetworkState {
+            members: list,
+            approved: ApprovedList::new(),
+            snapshot: None,
+            network_secret_key: None,
+            network_public_key: eid(200),
+            network_name: Some("test-net".to_string()),
+            mode: GroupMode::Restricted,
+            suggested_firewall: SuggestedFirewall::default(),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+            pending_suggestions: Vec::new(),
+            pending: HashMap::new(),
+        }))
+    }
+
+    #[test]
+    fn coordinator_member_is_recognized() {
+        let coord = eid(1);
+        let state = state_with(vec![member(coord, true), member(eid(2), false)]);
+        assert!(sender_is_coordinator(&state, coord));
+    }
+
+    /// The authority gate: a plain member is not a coordinator, so its
+    /// coordinator-only control messages must not be honored.
+    #[test]
+    fn plain_member_is_not_a_coordinator() {
+        let plain = eid(2);
+        let state = state_with(vec![member(eid(1), true), member(plain, false)]);
+        assert!(!sender_is_coordinator(&state, plain));
+    }
+
+    /// A peer absent from the roster has no authority at all, even on a
+    /// network whose roster does contain coordinators.
+    #[test]
+    fn non_member_is_not_a_coordinator() {
+        let state = state_with(vec![member(eid(1), true)]);
+        assert!(!sender_is_coordinator(&state, eid(9)));
+    }
+
+    #[test]
+    fn empty_roster_grants_no_authority() {
+        let state = state_with(Vec::new());
+        assert!(!sender_is_coordinator(&state, eid(1)));
+    }
+
+    /// Several co-coordinators (`ray admin add`) each hold authority
+    /// independently.
+    #[test]
+    fn every_co_coordinator_holds_authority() {
+        let (a, b, plain) = (eid(1), eid(2), eid(3));
+        let state = state_with(vec![member(a, true), member(b, true), member(plain, false)]);
+        assert!(sender_is_coordinator(&state, a));
+        assert!(sender_is_coordinator(&state, b));
+        assert!(!sender_is_coordinator(&state, plain));
+    }
+}

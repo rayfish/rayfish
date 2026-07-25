@@ -155,6 +155,7 @@ socket2 = { version = "0.6", features = ["all"] }
 [dev-dependencies]
 tempfile = "3"
 criterion = "0.5"
+proptest = "1"
 
 # Microbenchmarks for the per-packet data path (firewall eval + the zero-copy
 # Bytes hand-off). Run with `cargo bench`. `harness = false` lets Criterion own

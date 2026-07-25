@@ -598,3 +598,46 @@ fn normalize_ssh_users(mut users: Vec<String>) -> Vec<String> {
     users.dedup();
     users
 }
+
+#[cfg(test)]
+mod ssh_user_tests {
+    use super::*;
+
+    fn v(users: &[&str]) -> Vec<String> {
+        users.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `*` means "any user, root included", so it must collapse the list
+    /// rather than sit alongside named users: leaving both would let a later
+    /// reader match on a name and miss that everything is already allowed.
+    #[test]
+    fn wildcard_collapses_the_list() {
+        assert_eq!(normalize_ssh_users(v(&["alice", "*", "bob"])), v(&["*"]));
+        assert_eq!(normalize_ssh_users(v(&["*"])), v(&["*"]));
+        assert_eq!(normalize_ssh_users(v(&["*", "*"])), v(&["*"]));
+    }
+
+    /// An empty list is the secure default (any non-root user) and must not
+    /// silently become a wildcard.
+    #[test]
+    fn empty_list_stays_empty() {
+        assert!(normalize_ssh_users(Vec::new()).is_empty());
+    }
+
+    /// Sorted and deduped, so the same allow-list written in any order
+    /// produces the same stored rule.
+    #[test]
+    fn named_users_are_sorted_and_deduped() {
+        assert_eq!(
+            normalize_ssh_users(v(&["carol", "alice", "bob", "alice"])),
+            v(&["alice", "bob", "carol"]),
+        );
+    }
+
+    /// A name that merely contains an asterisk is not the wildcard.
+    #[test]
+    fn only_a_bare_asterisk_is_the_wildcard() {
+        let got = normalize_ssh_users(v(&["ro*t", "alice"]));
+        assert_eq!(got, v(&["alice", "ro*t"]));
+    }
+}
