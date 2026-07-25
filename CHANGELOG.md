@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Firewall rules now match the real ports of every packet.** An IPv4 packet
+  claiming a header shorter than 20 bytes was still evaluated, with its "ports"
+  and TCP flags read from bytes inside the IP header, so a peer could pick which
+  rule such a packet appeared to match. These packets are now dropped as
+  malformed, which is what every OS does with them on receive anyway.
+
 - **Android app reports the right version.** The APK version was pinned to 0.1.4
   and no longer tracked releases, so the manifest, the version shown in the app
   and the crash-report release tag were all wrong. It now comes from the crate

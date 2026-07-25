@@ -614,6 +614,14 @@ fn parse_ipv4(packet: &[u8]) -> Option<PacketInfo> {
         return None;
     }
     let ihl = (packet[0] & 0x0F) as usize;
+    // A header shorter than 5 words can't hold the fields we're about to read,
+    // so the L4 offset derived from it would point back inside the IP header
+    // and the "ports" would be header bytes the sender controls. Reject rather
+    // than evaluate a packet whose ports and TCP flags are fiction. Every
+    // OS drops ihl < 5 on receive anyway, so nothing legitimate is lost.
+    if ihl < 5 {
+        return None;
+    }
     let header_len = ihl * 4;
     if packet.len() < header_len {
         return None;
