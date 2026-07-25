@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`RAYFISH_CONFIG_DIR` works on every platform.** The variable used to be read
+  only on Android, so there was no way to point a desktop daemon at a config tree
+  outside `/etc/rayfish` (Linux) or `~/.config/rayfish` (macOS). Set it and both
+  the daemon and the CLI use that directory instead, which makes side-by-side
+  test nodes and non-standard install layouts possible. The daemon and the CLI
+  have to agree, so export it in the service environment as well as your shell.
+  Leaving it unset (or empty) keeps the previous per-platform paths exactly.
+
 - **Invite codes carry a checksum.** A code that lost or gained characters on
   its way through a chat client now fails immediately with "invalid invite
   code" instead of decoding into a well-formed invite for a network that
@@ -27,6 +35,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and no longer tracked releases, so the manifest, the version shown in the app
   and the crash-report release tag were all wrong. It now comes from the crate
   version.
+
+### Performance
+
+- **Cheaper per-packet receive.** Every datagram arriving from a peer re-resolved
+  the TUN writer through two atomic reference-count operations. Readers now keep
+  a cached view that only refreshes when the writer actually changes (a VPN
+  toggle), taking that step from ~11 ns to ~1 ns per packet.
 
 ## [0.2.1] - 2026-07-24
 

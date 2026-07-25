@@ -681,19 +681,29 @@ fn ensure_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the `RAYFISH_CONFIG_DIR` override from its raw environment value. An
+/// unset *or empty* var means "no override": an exported-but-empty var is a
+/// common shell accident and must not resolve the config tree to the current
+/// directory. Split out from [`config_dir`] so it is testable without touching
+/// the real platform path.
+fn config_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    raw.filter(|d| !d.is_empty()).map(PathBuf::from)
+}
+
 /// Base directory for all rayfish config + state. Created if missing.
 ///
-/// Linux: `/etc/rayfish` (system service location, root:rayfish). macOS: the
-/// daemon's `~/.config/rayfish` (root-only under `/var/root`).
+/// `RAYFISH_CONFIG_DIR` overrides the platform default on every platform. The
+/// daemon and the CLI must agree on it, so setting it for one and not the other
+/// points them at different trees: export it in the service unit (or the daemon's
+/// environment) as well as the shell you run `ray` from.
+///
+/// Platform defaults: Linux `/etc/rayfish` (system service location,
+/// root:rayfish), FreeBSD `/usr/local/etc/rayfish`, macOS the daemon's
+/// `~/.config/rayfish` (root-only under `/var/root`), Android the app's
+/// `Context.getFilesDir()` (passed by `ray-mobile`'s `Node::new` through this
+/// same var).
 pub fn config_dir() -> Result<PathBuf> {
-    // An explicit `RAYFISH_CONFIG_DIR` override is honored only on Android
-    // (`ray-mobile`'s `Node::new` points it at the app's `Context.getFilesDir()`)
-    // and in `cfg(test)` (headless/test harnesses run against an isolated config
-    // tree). Desktop/service production builds never check this var, so their
-    // resolved path is byte-for-byte unchanged from before the override existed.
-    #[cfg(any(target_os = "android", test))]
-    if let Some(dir) = std::env::var_os("RAYFISH_CONFIG_DIR") {
-        let dir = PathBuf::from(dir);
+    if let Some(dir) = config_dir_override(std::env::var_os("RAYFISH_CONFIG_DIR")) {
         ensure_dir(&dir)?;
         return Ok(dir);
     }
@@ -782,11 +792,17 @@ pub fn restrict_perms(path: &Path, secret: bool) {
 /// everything under the daemon's `~/.config/rayfish` (i.e. `/root/.config`); this
 /// moves `secret_key`, `networks.toml`, `firewall.toml`, `invites/`, etc. over so
 /// the node keeps its identity and networks. No-op on macOS (location unchanged)
-/// and once `/etc/rayfish` is populated. Must run before any config/identity read
+/// and once `/etc/rayfish` is populated, and skipped entirely when
+/// `RAYFISH_CONFIG_DIR` is set. Must run before any config/identity read
 /// (called at the top of `build_daemon`).
 pub fn migrate_location() {
     #[cfg(target_os = "linux")]
     {
+        // An explicit `RAYFISH_CONFIG_DIR` is a deliberate location, not an
+        // upgrade in progress: never pull `/root/.config/rayfish` into it.
+        if config_dir_override(std::env::var_os("RAYFISH_CONFIG_DIR")).is_some() {
+            return;
+        }
         let Ok(new) = config_dir() else { return };
         // Already populated → nothing to relocate.
         if new.join("secret_key").exists()
@@ -1075,6 +1091,20 @@ mod tests {
         let mut key_bytes = [0u8; 32];
         key_bytes[0] = seed;
         SecretKey::from(key_bytes).public()
+    }
+
+    #[test]
+    fn config_dir_override_ignores_unset_and_empty() {
+        use std::ffi::OsString;
+
+        assert_eq!(config_dir_override(None), None);
+        // An exported-but-empty var must not resolve the tree to `""` (which
+        // `create_dir_all` would reject) or to the process's cwd.
+        assert_eq!(config_dir_override(Some(OsString::new())), None);
+        assert_eq!(
+            config_dir_override(Some(OsString::from("/srv/rayfish"))),
+            Some(PathBuf::from("/srv/rayfish"))
+        );
     }
 
     #[test]
