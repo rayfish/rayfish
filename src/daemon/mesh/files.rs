@@ -32,6 +32,13 @@ impl Daemon {
         self.files.reject_file(id)
     }
 
+    /// Drop a queued outbound send before it is delivered (delegates to
+    /// [`FileService`]). Public for the `ray-mobile` FFI, matching how the CLI
+    /// reaches it via `IpcMessage::CancelSend`.
+    pub fn cancel_send(&self, id: u64) -> IpcMessage {
+        self.files.cancel_send(id)
+    }
+
     /// Accept a queued file offer (delegates to [`FileService`]). Kept as a
     /// public Daemon method for the `ray-mobile` FFI.
     pub async fn accept_file(

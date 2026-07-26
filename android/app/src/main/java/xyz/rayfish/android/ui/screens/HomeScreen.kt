@@ -22,6 +22,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.FileOffer
 import uniffi.ray_mobile.PendingRequest
+import uniffi.ray_mobile.QueuedSend
 import uniffi.ray_mobile.Status
 import xyz.rayfish.android.DownloadsOutcome
 import xyz.rayfish.android.FileAutoAccept
@@ -48,6 +49,10 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     var files by remember { mutableStateOf<List<FileOffer>>(emptyList()) }
     var connects by remember { mutableStateOf<List<PendingRequest>>(emptyList()) }
     var joins by remember { mutableStateOf<List<Pair<String, PendingRequest>>>(emptyList()) }
+    // Outbound sends whose peer hasn't taken the offer yet. Listed so a send to
+    // the wrong person, or one aimed at a device that never comes back, can be
+    // called off. Only these can be: a delivered offer is the recipient's.
+    var queued by remember { mutableStateOf<List<QueuedSend>>(emptyList()) }
 
     // Reflect the real data-plane state when status arrives, without stomping an in-flight toggle.
     LaunchedEffect(status?.running) {
@@ -119,6 +124,7 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                 // retrying them, but not ones it has permanently given up on: those
                 // would otherwise be invisible with no way to save them at all.
                 .filter { !(autoAccepting && it.ownDevice) || FileAutoAccept.hasGivenUp(it.id) }
+            queued = runCatching { node.listQueuedSends() }.getOrDefault(emptyList())
             connects = runCatching { node.listConnectRequests() }.getOrDefault(emptyList())
             joins = currentNets.filter { it.isCoordinator }.flatMap { n ->
                 runCatching { node.listJoinRequests(n.name) }.getOrDefault(emptyList()).map { n.name to it }
@@ -188,7 +194,7 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     }
 
     val hasNotifs = files.isNotEmpty() || connects.isNotEmpty() || joins.isNotEmpty() ||
-        accepting.isNotEmpty() || doneFiles.isNotEmpty()
+        accepting.isNotEmpty() || doneFiles.isNotEmpty() || queued.isNotEmpty()
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
@@ -220,6 +226,13 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                             subtitle = "file · ${formatSize(f.size)} · from ${f.from}",
                             acceptLabel = "Save", onAccept = { acceptFile(f) },
                             onReject = { act { NodeHolder.get(context).rejectFileOffer(f.id) } },
+                        )
+                    }
+                    queued.forEach { q ->
+                        QueuedSendRow(
+                            title = q.filename,
+                            subtitle = "waiting for ${q.peer} · ${formatSize(q.size)}",
+                            onCancel = { act { NodeHolder.get(context).cancelSend(q.id) } },
                         )
                     }
                     accepting.values.forEach { f -> FileTransferRow(f.filename, done = false) }
@@ -258,6 +271,19 @@ private fun NotifRow(title: String, subtitle: String, acceptLabel: String, onAcc
             TextButton(onClick = onReject, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
                 Text("Decline", color = Rf.Rose400, fontFamily = Chakra, fontSize = 12.sp)
             }
+        }
+    }
+}
+
+/// A send still waiting on its peer. One action only: there is nothing to accept
+/// on this side, and once the peer takes the offer the row is gone anyway.
+@Composable
+private fun QueuedSendRow(title: String, subtitle: String, onCancel: () -> Unit) {
+    Column {
+        Text(title, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading, maxLines = 1)
+        Text(subtitle, fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Muted)
+        TextButton(onClick = onCancel, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
+            Text("Cancel", color = Rf.Rose400, fontFamily = Chakra, fontSize = 12.sp)
         }
     }
 }

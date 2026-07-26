@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The Android app can cancel a queued send.** A send waiting on a peer that
+  hasn't picked it up now shows under Notifications with a Cancel button, the
+  same thing `ray files cancel` does on desktop. Only works before the offer
+  reaches the peer: once it lands, the file is theirs to accept or decline.
+
 - **A "Share services" toggle on each network card in the GUI.** One click
   allows the network's peers to reach every TCP service on this machine (the
   firewall otherwise denies unsolicited inbound, so a freshly joined server is

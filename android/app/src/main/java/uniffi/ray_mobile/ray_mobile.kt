@@ -792,6 +792,10 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -812,6 +816,8 @@ internal interface IntegrityCheckingUniffiLib : Library {
 fun uniffi_ray_mobile_checksum_method_node_accept_join_request(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_approve_connect_request(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_cancel_send(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_create(
 ): Short
@@ -846,6 +852,8 @@ fun uniffi_ray_mobile_checksum_method_node_list_connect_requests(
 fun uniffi_ray_mobile_checksum_method_node_list_file_offers(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_list_join_requests(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_list_queued_sends(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_list_transfers(
 ): Short
@@ -946,6 +954,8 @@ fun uniffi_ray_mobile_fn_method_node_accept_join_request(`ptr`: Pointer,`network
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_approve_connect_request(`ptr`: Pointer,`shortId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_ray_mobile_fn_method_node_cancel_send(`ptr`: Pointer,`id`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_ray_mobile_fn_method_node_create(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_default_hostname(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -979,6 +989,8 @@ fun uniffi_ray_mobile_fn_method_node_list_connect_requests(`ptr`: Pointer,uniffi
 fun uniffi_ray_mobile_fn_method_node_list_file_offers(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_list_join_requests(`ptr`: Pointer,`network`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_ray_mobile_fn_method_node_list_queued_sends(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_ray_mobile_fn_method_node_list_transfers(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1151,6 +1163,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_approve_connect_request() != 47115.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_cancel_send() != 49789.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_create() != 50208.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1200,6 +1215,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_list_join_requests() != 56409.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_list_queued_sends() != 2207.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_list_transfers() != 2731.toShort()) {
@@ -1672,6 +1690,13 @@ public interface NodeInterface {
     fun `approveConnectRequest`(`shortId`: kotlin.String)
     
     /**
+     * Call off a queued send, by the id from [`Node::list_queued_sends`].
+     * Fails if the offer has already been delivered, since there is nothing
+     * left on this side to withdraw.
+     */
+    fun `cancelSend`(`id`: kotlin.ULong)
+    
+    /**
      * Create a new network (default CLOSED membership) and register this node as
      * its coordinator. `name` is optional; the core generates one if absent.
      */
@@ -1766,6 +1791,14 @@ public interface NodeInterface {
      * Join requests awaiting approval on a network we coordinate.
      */
     fun `listJoinRequests`(`network`: kotlin.String): List<PendingRequest>
+    
+    /**
+     * Outbound sends still sitting in the daemon's outbox, waiting for their
+     * peer. These are the only sends that can still be called off: once the
+     * offer is delivered the entry leaves the outbox and the file is the
+     * recipient's to accept or decline.
+     */
+    fun `listQueuedSends`(): List<QueuedSend>
     
     /**
      * In-flight and recently finished transfers, both directions. Terminal entries
@@ -2058,6 +2091,23 @@ open class Node: Disposable, AutoCloseable, NodeInterface
 
     
     /**
+     * Call off a queued send, by the id from [`Node::list_queued_sends`].
+     * Fails if the offer has already been delivered, since there is nothing
+     * left on this side to withdraw.
+     */
+    @Throws(RayException::class)override fun `cancelSend`(`id`: kotlin.ULong)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_cancel_send(
+        it, FfiConverterULong.lower(`id`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Create a new network (default CLOSED membership) and register this node as
      * its coordinator. `name` is optional; the core generates one if absent.
      */
@@ -2324,6 +2374,25 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     uniffiRustCallWithError(RayException) { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_join_requests(
         it, FfiConverterString.lower(`network`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Outbound sends still sitting in the daemon's outbox, waiting for their
+     * peer. These are the only sends that can still be called off: once the
+     * offer is delivered the entry leaves the outbox and the file is the
+     * recipient's to accept or decline.
+     */
+    @Throws(RayException::class)override fun `listQueuedSends`(): List<QueuedSend> {
+            return FfiConverterSequenceTypeQueuedSend.lift(
+    callWithPointer {
+    uniffiRustCallWithError(RayException) { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_list_queued_sends(
+        it, _status)
 }
     }
     )
@@ -3129,6 +3198,54 @@ public object FfiConverterTypePendingRequest: FfiConverterRustBuffer<PendingRequ
 
 
 /**
+ * An outbound send still queued for a peer that hasn't taken the offer yet.
+ * `id` is what [`Node::cancel_send`] takes; it is the outbox's own id, not a
+ * transfer-registry id.
+ */
+data class QueuedSend (
+    var `id`: kotlin.ULong, 
+    /**
+     * The recipient's short endpoint id.
+     */
+    var `peer`: kotlin.String, 
+    var `filename`: kotlin.String, 
+    var `size`: kotlin.ULong
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeQueuedSend: FfiConverterRustBuffer<QueuedSend> {
+    override fun read(buf: ByteBuffer): QueuedSend {
+        return QueuedSend(
+            FfiConverterULong.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: QueuedSend) = (
+            FfiConverterULong.allocationSize(value.`id`) +
+            FfiConverterString.allocationSize(value.`peer`) +
+            FfiConverterString.allocationSize(value.`filename`) +
+            FfiConverterULong.allocationSize(value.`size`)
+    )
+
+    override fun write(value: QueuedSend, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterString.write(value.`peer`, buf)
+            FfiConverterString.write(value.`filename`, buf)
+            FfiConverterULong.write(value.`size`, buf)
+    }
+}
+
+
+
+/**
  * Health/addresses/networks snapshot for the UI.
  */
 data class Status (
@@ -3757,6 +3874,34 @@ public object FfiConverterSequenceTypePendingRequest: FfiConverterRustBuffer<Lis
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypePendingRequest.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeQueuedSend: FfiConverterRustBuffer<List<QueuedSend>> {
+    override fun read(buf: ByteBuffer): List<QueuedSend> {
+        val len = buf.getInt()
+        return List<QueuedSend>(len) {
+            FfiConverterTypeQueuedSend.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<QueuedSend>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeQueuedSend.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<QueuedSend>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeQueuedSend.write(it, buf)
         }
     }
 }

@@ -226,6 +226,18 @@ pub struct FileOffer {
     pub own_device: bool,
 }
 
+/// An outbound send still queued for a peer that hasn't taken the offer yet.
+/// `id` is what [`Node::cancel_send`] takes; it is the outbox's own id, not a
+/// transfer-registry id.
+#[derive(uniffi::Record)]
+pub struct QueuedSend {
+    pub id: u64,
+    /// The recipient's short endpoint id.
+    pub peer: String,
+    pub filename: String,
+    pub size: u64,
+}
+
 /// Where a transfer is. A send is `Offered` until the peer accepts and starts
 /// pulling the bytes: `send_file` returns once the offer lands, not once the file
 /// has arrived, so `Done` on an outgoing transfer is the real "they have it".
@@ -728,6 +740,43 @@ impl Node {
             IpcMessage::Error { message } => Err(RayError::Network(message)),
             other => Err(RayError::Network(format!(
                 "unexpected files response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Outbound sends still sitting in the daemon's outbox, waiting for their
+    /// peer. These are the only sends that can still be called off: once the
+    /// offer is delivered the entry leaves the outbox and the file is the
+    /// recipient's to accept or decline.
+    pub fn list_queued_sends(&self) -> Result<Vec<QueuedSend>, RayError> {
+        let state = self.state()?;
+        match state.list_files() {
+            IpcMessage::FileList { outbox, .. } => Ok(outbox
+                .into_iter()
+                .map(|e| QueuedSend {
+                    id: e.id,
+                    peer: e.peer,
+                    filename: e.filename,
+                    size: e.size,
+                })
+                .collect()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!(
+                "unexpected files response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Call off a queued send, by the id from [`Node::list_queued_sends`].
+    /// Fails if the offer has already been delivered, since there is nothing
+    /// left on this side to withdraw.
+    pub fn cancel_send(&self, id: u64) -> Result<(), RayError> {
+        let state = self.state()?;
+        match state.cancel_send(id) {
+            IpcMessage::Ok { .. } => Ok(()),
+            IpcMessage::Error { message } => Err(RayError::Network(message)),
+            other => Err(RayError::Network(format!(
+                "unexpected cancel response: {other:?}"
             ))),
         }
     }
