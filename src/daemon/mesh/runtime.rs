@@ -2,8 +2,10 @@
 //! connect-all, activate/deactivate (data plane), teardown, leave. Split out of `daemon/mod.rs`.
 
 use super::super::*;
-// Only the desktop-gated `start_ssh` binds SSH listeners on concrete IPs.
-#[cfg(feature = "desktop")]
+// The desktop-gated `start_ssh` binds SSH listeners on concrete IPs, and the
+// macOS exit-node helpers below match on underlay addresses. macOS without the
+// desktop feature (the ray-mobile host build) still needs the import.
+#[cfg(any(feature = "desktop", target_os = "macos"))]
 use std::net::IpAddr;
 use std::sync::RwLock;
 
