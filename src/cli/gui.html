@@ -63,6 +63,8 @@
     button.small { min-height: 28px; padding: 0 10px; font-size: 13px; border-radius: 6px; }
     button.danger { color: var(--rose); border-color: rgba(244,63,94,.35); }
     button.danger:hover { border-color: var(--rose-strong); }
+    button.on { color: var(--green); border-color: rgba(52,211,153,.4); }
+    button.on:hover { color: var(--green); border-color: var(--green); }
     input, select {
       width: 100%;
       min-height: 38px;
@@ -478,11 +480,16 @@
     // ---- live state ----
     let statusBusy = false;
     let lastData = null;
+    let lastFw = null;
     async function refresh() {
       if (statusBusy || document.hidden) return;
       statusBusy = true;
       try {
-        const res = await call(["status"], true);
+        const [res, fw] = await Promise.all([
+          call(["status"], true),
+          call(["firewall", "show"], true),
+        ]);
+        lastFw = fw && fw.success ? JSON.parse(fw.stdout) : null;
         if (res && res.success) {
           lastData = JSON.parse(res.stdout);
           render(lastData);
@@ -508,6 +515,14 @@
       $("liveText").textContent = reachable ? (active ? "connected" : "standby") : "daemon unreachable";
     }
 
+    // Index of the "share everything" rule for a network: inbound allow, all
+    // TCP ports, any peer. This is what the Share services toggle manages.
+    function shareRuleIndex(net) {
+      if (!lastFw || !Array.isArray(lastFw.rules)) return -1;
+      return lastFw.rules.findIndex(r =>
+        r.direction === "in" && r.action === "allow" && r.protocol === "tcp" &&
+        r.port === "*" && r.peer === "any" && r.network === net);
+    }
     function peerKind(p) {
       const type = p.connection && p.connection.conn_type;
       if (type && /direct/i.test(type)) return "direct";
@@ -570,6 +585,9 @@
             <span class="role ${isCoord ? "coordinator" : ""}">${esc(role)}</span>
             <span class="self">you: ${esc(n.my_hostname || "?")} · <span class="copyable" data-copy="${esc(n.my_ip || "")}" title="Copy IP">${esc(n.my_ip || "")}</span> · ${n.member_count ?? "?"} members</span>
             <span class="net-actions">
+              ${shareRuleIndex(n.name) >= 0
+                ? `<button class="small on" data-share="${esc(n.name)}" title="Peers can reach every TCP service on this machine. Click to stop sharing.">Sharing services</button>`
+                : `<button class="small" data-share="${esc(n.name)}" title="Let ${esc(n.name)} peers reach this machine's services (all TCP ports), e.g. at ${esc(n.my_hostname || "this-host")}.ray">Share services</button>`}
               ${isCoord ? `<button class="small primary" data-invite="${esc(n.name)}">Invite</button>` : ""}
               <button class="small danger" data-leave="${esc(n.name)}">Leave</button>
             </span>
@@ -664,7 +682,7 @@
 
     // ---- wiring ----
     document.addEventListener("click", ev => {
-      const t = ev.target.closest("[data-copy],[data-ping],[data-kick],[data-leave],[data-invite],[data-act],[data-run],[data-close]");
+      const t = ev.target.closest("[data-copy],[data-ping],[data-kick],[data-leave],[data-invite],[data-share],[data-act],[data-run],[data-close]");
       if (!t) return;
       if (t.dataset.copy != null) {
         if (t.dataset.copy) copyText(t.dataset.copy).then(() => toast("copied"));
@@ -678,6 +696,15 @@
           act(["leave", t.dataset.leave], `left ${t.dataset.leave}`);
       } else if (t.dataset.invite != null) {
         mintInvite(t.dataset.invite);
+      } else if (t.dataset.share != null) {
+        const net = t.dataset.share;
+        const idx = shareRuleIndex(net);
+        if (idx >= 0) {
+          if (confirm(`Stop sharing this machine's services with ${net} peers?`))
+            act(["firewall", "remove", String(idx)], "sharing off");
+        } else if (confirm(`Let ${net} peers reach every TCP service on this machine?`)) {
+          act(["firewall", "add", "in", "allow", "-p", "tcp", "--network", net], "sharing on");
+        }
       } else if (t.dataset.act != null) {
         act(JSON.parse(t.dataset.act), t.dataset.ok);
       } else if (t.dataset.run != null) {

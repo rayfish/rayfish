@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **A "Share services" toggle on each network card in the GUI.** One click
+  allows the network's peers to reach every TCP service on this machine (the
+  firewall otherwise denies unsolicited inbound, so a freshly joined server is
+  unreachable beyond ping). The toggle shows the current state, asks before
+  opening or closing, and maps to a single inbound allow rule you can also
+  manage from `ray firewall`.
+
 ### Changed
 
 - **The `ray gui` dashboard got a redesign.** The overview now shows live data
