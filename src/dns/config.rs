@@ -1216,10 +1216,60 @@ async fn restore_file(path: &Path) -> Result<()> {
             .await
             .with_context(|| format!("restoring {}", path.display()))?;
         tokio::fs::remove_file(&backup).await?;
-    } else if path.exists() {
-        tokio::fs::remove_file(path).await?;
+        return Ok(());
     }
+    // No backup (it was lost, or apply() never made one). Deleting the file was
+    // the old behaviour and it is the worst option available: `/etc/resolv.conf`
+    // is how every non-resolved host finds a nameserver, and removing it takes
+    // that host's DNS down completely for something that was only supposed to
+    // undo our edit. Edit in place instead, dropping only the lines we wrote and
+    // keeping whatever else the file holds. A file that isn't ours is left
+    // untouched: with no backup and no marker we cannot tell our edit from the
+    // operator's own configuration, and guessing risks discarding theirs.
+    let Ok(current) = tokio::fs::read_to_string(path).await else {
+        return Ok(());
+    };
+    if !resolv_conf_is_ours(&current) {
+        tracing::warn!(
+            path = %path.display(),
+            "no DNS backup to restore and the file is not ours; leaving it untouched"
+        );
+        return Ok(());
+    }
+    tokio::fs::write(path, strip_our_resolv_entries(&current))
+        .await
+        .with_context(|| format!("restoring {}", path.display()))?;
+    tracing::warn!(
+        path = %path.display(),
+        "no DNS backup to restore; removed our entries in place instead of deleting the file"
+    );
     Ok(())
+}
+
+/// Drop the lines [`DirectResolvConf`] adds (our marker comment and the
+/// `nameserver` line pointing at our resolver) and keep everything else, so a
+/// backup-less revert leaves the host with its other nameservers and search
+/// domains rather than an empty or missing file.
+#[cfg(target_os = "linux")]
+fn strip_our_resolv_entries(contents: &str) -> String {
+    let magic = crate::dns::MAGIC_DNS_V4.to_string();
+    let kept: Vec<&str> = contents
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            if t == HEADER_COMMENT.trim() || t.starts_with("# Added by rayfish") {
+                return false;
+            }
+            // `nameserver <our ip>` in any spacing; other nameservers stay.
+            !matches!(t.split_whitespace().collect::<Vec<_>>().as_slice(),
+                ["nameserver", ip] if *ip == magic)
+        })
+        .collect();
+    let mut out = kept.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 /// Synchronous emergency restore of the direct-mode DNS artifacts, safe to call
@@ -1384,6 +1434,8 @@ mod tests {
         RESOLVER_IP, nm_dns_none_dropin, parse_resolv_nameservers, render_direct_resolv_conf,
         resolv_conf_is_ours,
     };
+    #[cfg(target_os = "linux")]
+    use super::{nsswitch_uses_resolve, resolv_conf_points_at_resolved, strip_our_resolv_entries};
 
     #[test]
     fn resolv_conf_is_ours_detects_marker() {
@@ -1421,6 +1473,36 @@ mod tests {
         assert!(out.starts_with("# Added by rayfish"));
         assert!(out.contains("nameserver 100.100.100.53"));
         assert!(out.contains("search homelab.ray ray"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn backup_less_revert_keeps_the_other_nameservers() {
+        // Verbatim from a host running direct mode. A revert with no backup used
+        // to delete this file outright, leaving the machine with no resolver at
+        // all; it must come back as the upstream it had before we prepended ours.
+        let ours = "# Added by rayfish - do not edit\nnameserver 100.100.100.53\nnameserver 108.61.10.10\n";
+        assert_eq!(strip_our_resolv_entries(ours), "nameserver 108.61.10.10\n");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn backup_less_revert_preserves_search_domains_and_options() {
+        let ours = "# Added by rayfish - do not edit\nsearch home lan\nnameserver 100.100.100.53\nnameserver 1.1.1.1\noptions ndots:2\n";
+        let out = strip_our_resolv_entries(ours);
+        assert!(out.contains("search home lan"));
+        assert!(out.contains("nameserver 1.1.1.1"));
+        assert!(out.contains("options ndots:2"));
+        assert!(!out.contains("100.100.100.53"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn backup_less_revert_can_empty_the_server_list_without_losing_the_file() {
+        // Our resolver was the only entry. The result is a file with no servers,
+        // which lets NetworkManager/resolvconf regenerate one. Still not a delete.
+        let ours = "# Added by rayfish - do not edit\nnameserver 100.100.100.53\n";
+        assert_eq!(strip_our_resolv_entries(ours), "\n");
     }
 
     #[test]
