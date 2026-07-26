@@ -472,6 +472,8 @@ impl Daemon {
         // Nudge: enabling the server does nothing until a peer is authorized. If
         // no network has any `ssh_allow` entry yet, tell the user the next step.
         let has_allow = app_config.networks.iter().any(|n| !n.ssh_allow.is_empty());
+        // Only the desktop build appends the host-firewall warning below.
+        #[cfg_attr(not(feature = "desktop"), allow(unused_mut))]
         let mut message = if enabled && !has_allow {
             "mesh SSH on. No peer is authorized yet. Grant access with \
              `ray firewall ssh allow <network> <peer>` (peer = hostname / mesh IP / \
@@ -484,12 +486,15 @@ impl Daemon {
         // actually listens on, and the resulting failure looks like a network
         // problem rather than a firewall one. Say so here, where the operator is
         // already thinking about SSH access. The check only reads the ruleset.
+        // Desktop-only: the embedded SSH server (and the port NAT it needs) is
+        // not part of the Android library, so there is nothing to warn about.
+        #[cfg(feature = "desktop")]
         if enabled
             && let Some(warning) = crate::hostfw::check_inbound_tcp(
                 self.tun_name.load().as_str(),
-                crate::ssh::SSH_LISTEN_PORT,
+                crate::forward::SSH_LISTEN_PORT,
             )
-            .warning(crate::ssh::SSH_LISTEN_PORT)
+            .warning(crate::forward::SSH_LISTEN_PORT)
         {
             tracing::warn!("{warning}");
             message.push_str("\n\n");

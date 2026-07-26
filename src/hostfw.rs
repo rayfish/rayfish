@@ -188,7 +188,7 @@ fn iptables_line_permits(line: &str, tun: &str, port: u16) -> bool {
             .any(|w| w[0] == flag && w[1].trim_end_matches('/') == want)
     };
     // `-i tun0 -j ACCEPT` with no port restriction: everything on the TUN is in.
-    if has_flag("-i", tun) && !fields.iter().any(|f| *f == "--dport") {
+    if has_flag("-i", tun) && !fields.contains(&"--dport") {
         return true;
     }
     has_flag("--dport", &port.to_string())

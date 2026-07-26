@@ -92,27 +92,27 @@ pub async fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigura
             );
         }
 
-        if resolved_in_path {
-            if let Some(c) = try_systemd_resolved_dbus(tun_name).await {
-                c.apply().await?;
-                return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
-            }
+        if resolved_in_path
+            && let Some(c) = try_systemd_resolved_dbus(tun_name).await
+        {
+            c.apply().await?;
+            return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
         }
         if let Some(c) = try_networkmanager_dbus(tun_name).await {
             c.apply().await?;
             return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
         }
-        if resolved_in_path {
-            if let Some(c) = try_systemd_resolved_cli(tun_name) {
-                c.apply().await?;
-                return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
-            }
+        if resolved_in_path
+            && let Some(c) = try_systemd_resolved_cli(tun_name)
+        {
+            c.apply().await?;
+            return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
         }
-        if resolved_in_path || !resolvconf_is_resolved_shim() {
-            if let Some(c) = try_resolvconf() {
-                c.apply().await?;
-                return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
-            }
+        if (resolved_in_path || !resolvconf_is_resolved_shim())
+            && let Some(c) = try_resolvconf()
+        {
+            c.apply().await?;
+            return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
         }
         let c = DirectResolvConf::new().await;
         c.apply().await?;
