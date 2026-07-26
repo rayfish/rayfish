@@ -472,7 +472,7 @@ impl Daemon {
         // Nudge: enabling the server does nothing until a peer is authorized. If
         // no network has any `ssh_allow` entry yet, tell the user the next step.
         let has_allow = app_config.networks.iter().any(|n| !n.ssh_allow.is_empty());
-        let message = if enabled && !has_allow {
+        let mut message = if enabled && !has_allow {
             "mesh SSH on. No peer is authorized yet. Grant access with \
              `ray firewall ssh allow <network> <peer>` (peer = hostname / mesh IP / \
              short id, or `*` for any peer on the network)."
@@ -480,6 +480,21 @@ impl Daemon {
         } else {
             format!("mesh SSH {}", if enabled { "on" } else { "off" })
         };
+        // A host firewall that allows "22/tcp" does not allow the port mesh SSH
+        // actually listens on, and the resulting failure looks like a network
+        // problem rather than a firewall one. Say so here, where the operator is
+        // already thinking about SSH access. The check only reads the ruleset.
+        if enabled
+            && let Some(warning) = crate::hostfw::check_inbound_tcp(
+                self.tun_name.load().as_str(),
+                crate::ssh::SSH_LISTEN_PORT,
+            )
+            .warning(crate::ssh::SSH_LISTEN_PORT)
+        {
+            tracing::warn!("{warning}");
+            message.push_str("\n\n");
+            message.push_str(&warning);
+        }
         IpcMessage::Ok { message }
     }
 

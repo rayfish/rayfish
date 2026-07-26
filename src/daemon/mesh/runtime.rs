@@ -833,6 +833,17 @@ impl Daemon {
         #[cfg(feature = "desktop")]
         if config::load().map(|c| c.ssh_enabled).unwrap_or(false) {
             self.start_ssh();
+            // Mesh SSH listens on a NAT'd port, so a host firewall allowing
+            // "22/tcp" still drops it and the failure looks like a dead network
+            // rather than a firewall rule. Surface it with the other `ray up`
+            // warnings; we only read the ruleset, never edit it.
+            if let Some(w) =
+                crate::hostfw::check_inbound_tcp(&dns_tun_name, crate::ssh::SSH_LISTEN_PORT)
+                    .warning(crate::ssh::SSH_LISTEN_PORT)
+            {
+                tracing::warn!("{w}");
+                warnings.push(w);
+            }
         }
 
         // From here until `deactivate()`, the roster's exit-offer flag is kept in
