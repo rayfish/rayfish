@@ -5,673 +5,408 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Rayfish</title>
   <style>
+    /* Same families as rayfish.xyz; falls back to system stacks offline. */
+    @import url("https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@300;400;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Press+Start+2P&display=swap");
     :root {
-      color-scheme: light;
-      --bg: #f6f7f2;
-      --panel: #ffffff;
-      --ink: #202124;
-      --muted: #676b72;
-      --line: #d9ddd5;
-      --teal: #0f766e;
-      --coral: #c2410c;
-      --amber: #b7791f;
-      --green: #15803d;
-      --red: #b91c1c;
-      --code: #111827;
-      --shadow: 0 12px 30px rgba(32, 33, 36, .08);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color-scheme: dark;
+      --bg: #18181b;          /* zinc-900 */
+      --panel: #1c1c20;
+      --deep: #09090b;        /* zinc-950 */
+      --line: #27272a;        /* zinc-800 */
+      --line-2: #3f3f46;      /* zinc-700 */
+      --ink: #f4f4f5;         /* zinc-100 */
+      --body: #d4d4d8;        /* zinc-300 */
+      --muted: #a1a1aa;       /* zinc-400 */
+      --faint: #71717a;       /* zinc-500 */
+      --rose: #fb7185;        /* rose-400 */
+      --rose-strong: #f43f5e; /* rose-500 */
+      --rose-deep: #e11d48;   /* rose-600 */
+      --green: #34d399;       /* emerald-400 */
+      --amber: #fbbf24;
+      --robot: "Chakra Petch", system-ui, sans-serif;
+      --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --logo: "Press Start 2P", var(--mono);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       background: var(--bg);
-      color: var(--ink);
+      color: var(--body);
+      font-family: var(--robot);
       font-size: 15px;
+      letter-spacing: .01em;
+      line-height: 1.5;
     }
-    button, input, select {
-      font: inherit;
-    }
+    ::selection { background: var(--rose-deep); color: #fff; }
+    button, input, select { font: inherit; letter-spacing: inherit; }
     button {
-      border: 1px solid var(--line);
+      border: 1px solid var(--line-2);
       border-radius: 8px;
-      background: #fff;
-      color: var(--ink);
-      min-height: 38px;
-      padding: 0 12px;
+      background: transparent;
+      color: var(--body);
+      min-height: 36px;
+      padding: 0 14px;
       cursor: pointer;
     }
-    button:hover { border-color: #aab2a7; }
+    button:hover { border-color: var(--faint); color: var(--ink); }
+    button:focus-visible, input:focus-visible, select:focus-visible {
+      outline: 2px solid var(--rose);
+      outline-offset: 1px;
+    }
     button.primary {
-      background: var(--teal);
-      border-color: var(--teal);
+      background: var(--rose-strong);
+      border-color: var(--rose-strong);
       color: #fff;
+      font-weight: 600;
     }
-    button.warn {
-      border-color: #fed7aa;
-      color: var(--coral);
-    }
+    button.primary:hover { background: var(--rose-deep); border-color: var(--rose-deep); color: #fff; }
+    button.small { min-height: 28px; padding: 0 10px; font-size: 13px; border-radius: 6px; }
+    button.danger { color: var(--rose); border-color: rgba(244,63,94,.35); }
+    button.danger:hover { border-color: var(--rose-strong); }
     input, select {
       width: 100%;
       min-height: 38px;
-      border: 1px solid var(--line);
+      border: 1px solid var(--line-2);
       border-radius: 8px;
-      background: #fff;
+      background: var(--deep);
       color: var(--ink);
-      padding: 8px 10px;
+      padding: 7px 11px;
     }
-    label {
-      display: grid;
-      gap: 5px;
-      color: var(--muted);
-      font-size: 12px;
+    input::placeholder { color: var(--faint); }
+    label { display: grid; gap: 5px; font-size: 13px; color: var(--muted); }
+    label.check { display: flex; align-items: center; gap: 8px; color: var(--body); font-size: 14px; }
+    label.check input { width: auto; min-height: auto; accent-color: var(--rose-strong); }
+
+    .wrap { max-width: 920px; margin: 0 auto; padding: 22px 18px 80px; }
+    header.top {
+      display: flex; align-items: center; gap: 14px;
+      padding: 4px 0 18px;
     }
-    label.check {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      min-height: 38px;
-      color: var(--ink);
-      font-size: 14px;
+    .logo { font-family: var(--logo); font-size: 15px; color: #e4e4e7; text-decoration: none; }
+    .logo .dot-i { color: var(--rose); }
+    .live { display: inline-flex; align-items: center; gap: 6px; color: var(--faint); font-family: var(--mono); font-size: 11px; }
+    .live i { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+    .live.on { color: var(--green); }
+    .live.on i { background: var(--green); box-shadow: 0 0 7px rgba(52,211,153,.8); }
+    .top-actions { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+
+    .statline {
+      display: flex; flex-wrap: wrap; gap: 6px 18px;
+      font-family: var(--mono); font-size: 12.5px; color: var(--muted);
+      padding: 10px 0 4px;
     }
-    label.check input { width: auto; min-height: auto; }
-    .app {
-      min-height: 100vh;
-      display: grid;
-      grid-template-columns: 250px minmax(0, 1fr);
-    }
-    aside {
-      border-right: 1px solid var(--line);
-      background: #eef3ef;
-      padding: 22px 18px;
-      position: sticky;
-      top: 0;
-      height: 100vh;
-      overflow: auto;
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-bottom: 22px;
-    }
-    .mark {
-      width: 34px;
-      height: 34px;
-      border-radius: 8px;
-      background: linear-gradient(135deg, var(--teal), #22c55e 58%, #f59e0b);
-      box-shadow: inset 0 0 0 1px rgba(255,255,255,.38);
-    }
-    .brand strong { display: block; font-size: 18px; }
-    .brand span { color: var(--muted); font-size: 12px; }
-    nav {
-      display: grid;
-      gap: 7px;
-    }
-    nav button {
-      width: 100%;
-      justify-content: flex-start;
-      text-align: left;
-      background: transparent;
-      border-color: transparent;
-    }
-    nav button.active {
-      background: #fff;
-      border-color: var(--line);
-      box-shadow: var(--shadow);
-    }
-    main {
-      padding: 22px;
-      display: grid;
-      grid-template-rows: auto minmax(0, 1fr);
-      gap: 18px;
-    }
-    .topbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-    }
-    .topbar h1 {
+    .statline .copyable { cursor: pointer; color: var(--body); }
+    .statline .copyable:hover { color: var(--rose); }
+    .statline b { color: var(--ink); font-weight: 600; }
+
+    section { margin-top: 26px; }
+    .sec-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+    .sec-head h2 {
       margin: 0;
-      font-size: 22px;
-      font-weight: 700;
+      font-size: 17px;
+      font-weight: 600;
+      color: var(--ink);
+      letter-spacing: .02em;
     }
-    .topbar-actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      justify-content: flex-end;
+    .sec-head .spacer { flex: 1; }
+
+    /* Needs attention */
+    #attention .card { border-color: rgba(251,191,36,.25); }
+    .attn-row {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      padding: 11px 14px;
+      border-top: 1px solid var(--line);
     }
-    .content {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(330px, 40%);
-      gap: 18px;
-      align-items: start;
-    }
-    section.view {
-      display: none;
-    }
-    section.view.active {
-      display: grid;
-      gap: 14px;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 14px;
-    }
-    .panel {
+    .attn-row:first-child { border-top: 0; }
+    .attn-row .what { flex: 1; min-width: 220px; }
+    .attn-row .what b { color: var(--ink); font-weight: 600; }
+    .attn-row .sub { display: block; color: var(--faint); font-family: var(--mono); font-size: 12px; }
+
+    .card {
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 8px;
-      box-shadow: var(--shadow);
-      padding: 14px;
-      display: grid;
-      align-content: start;
-      gap: 12px;
-    }
-    .panel h2 {
-      margin: 0;
-      font-size: 15px;
-      font-weight: 700;
-    }
-    .row {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-    }
-    .row.three {
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-    .actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
-    .status-card {
-      min-height: 94px;
-      display: grid;
-      gap: 9px;
-    }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      width: fit-content;
-      min-height: 26px;
-      padding: 3px 9px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      background: #fff;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .badge.good { color: var(--green); border-color: #bbf7d0; background: #f0fdf4; }
-    .badge.bad { color: var(--red); border-color: #fecaca; background: #fef2f2; }
-    .badge.warn { color: var(--amber); border-color: #fde68a; background: #fffbeb; }
-    #networks {
-      display: grid;
-      gap: 10px;
-    }
-    .network {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 10px;
-      background: #fbfcfa;
-    }
-    .network strong { display: block; margin-bottom: 5px; }
-    .meta {
-      color: var(--muted);
-      font-size: 13px;
-      word-break: break-word;
-    }
-    .output {
-      position: sticky;
-      top: 22px;
-      max-height: calc(100vh - 44px);
+      border-radius: 10px;
       overflow: hidden;
     }
-    .output-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 8px;
+    .net-card { margin-bottom: 14px; }
+    .net-head {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
     }
-    .output pre {
+    .net-head strong { color: var(--ink); font-size: 16px; font-weight: 600; }
+    .role {
+      font-family: var(--mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+      border: 1px solid var(--line-2);
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 2px 8px;
+    }
+    .role.coordinator { color: var(--rose); border-color: rgba(251,113,133,.4); }
+    .net-head .self { color: var(--faint); font-family: var(--mono); font-size: 12px; }
+    .net-head .self .copyable { cursor: pointer; color: var(--muted); }
+    .net-head .self .copyable:hover { color: var(--rose); }
+    .net-head .net-actions { margin-left: auto; display: flex; gap: 8px; }
+
+    .peer-row {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      padding: 9px 14px;
+      border-top: 1px solid var(--line);
+      font-family: var(--mono); font-size: 13px;
+    }
+    .peer-row:first-of-type { border-top: 0; }
+    .peer-row .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+    .dot.direct { background: var(--green); box-shadow: 0 0 6px rgba(52,211,153,.6); }
+    .dot.relay { background: var(--amber); }
+    .dot.idle { background: transparent; border: 1px solid var(--faint); }
+    .peer-row .host { color: var(--ink); min-width: 120px; }
+    .peer-row .tag {
+      font-size: 9px; letter-spacing: .07em; text-transform: uppercase;
+      border: 1px solid var(--line-2); border-radius: 4px; padding: 1px 5px; margin-left: 6px;
+      color: var(--faint);
+    }
+    .peer-row .ip { color: var(--muted); cursor: pointer; }
+    .peer-row .ip:hover { color: var(--rose); }
+    .peer-row .conn { color: var(--faint); }
+    .peer-row .conn.direct { color: var(--green); }
+    .peer-row .acts { margin-left: auto; display: flex; gap: 6px; }
+    .empty {
+      padding: 26px 14px; text-align: center; color: var(--faint);
+    }
+    .empty .big { color: var(--muted); margin-bottom: 14px; }
+
+    /* Advanced drawer */
+    #advanced { display: none; }
+    #advanced.open { display: block; }
+    .console pre {
       margin: 0;
-      min-height: 420px;
-      max-height: calc(100vh - 170px);
+      min-height: 200px;
+      max-height: 46vh;
       overflow: auto;
-      border-radius: 8px;
-      background: var(--code);
-      color: #e5e7eb;
-      padding: 12px;
+      background: var(--deep);
+      border-top: 1px solid var(--line);
+      color: var(--body);
+      padding: 12px 14px;
       white-space: pre-wrap;
       word-break: break-word;
-      font: 13px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font: 13px/1.55 var(--mono);
     }
-    .advanced {
-      display: grid;
-      gap: 10px;
+    .console .prompt { color: var(--rose); user-select: none; }
+    .cmdbar {
+      display: flex; gap: 8px; padding: 10px 14px; flex-wrap: wrap;
+      border-top: 1px solid var(--line);
     }
-    .templates {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 8px;
+    .cmdbar input { flex: 1; min-width: 200px; font-family: var(--mono); font-size: 13px; }
+    .cmdbar select { width: auto; max-width: 240px; font-family: var(--mono); font-size: 13px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 14px 2px; }
+    .chips button { font-family: var(--mono); font-size: 12px; }
+    .console-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px 0; }
+    .console-head h3 { margin: 0; font-size: 14px; color: var(--ink); font-weight: 600; }
+    .console-head .badge { margin-left: auto; }
+    .badge {
+      font-family: var(--mono); font-size: 11px;
+      border: 1px solid var(--line-2); border-radius: 999px;
+      color: var(--muted);
+      padding: 2px 9px;
     }
-    @media (max-width: 980px) {
-      .app { grid-template-columns: 1fr; }
-      aside {
-        position: static;
-        height: auto;
-        border-right: 0;
-        border-bottom: 1px solid var(--line);
-      }
-      nav { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-      .content { grid-template-columns: 1fr; }
-      .output { position: static; max-height: none; }
-      .output pre { max-height: 460px; }
+    .badge.good { color: var(--green); border-color: rgba(52,211,153,.35); }
+    .badge.bad { color: var(--rose); border-color: rgba(251,113,133,.4); }
+
+    dialog {
+      background: var(--panel);
+      color: var(--body);
+      border: 1px solid var(--line-2);
+      border-radius: 12px;
+      padding: 20px;
+      width: min(440px, calc(100vw - 32px));
     }
+    dialog::backdrop { background: rgba(0,0,0,.6); }
+    dialog h3 { margin: 0 0 14px; color: var(--ink); font-size: 17px; font-weight: 600; }
+    dialog form { display: grid; gap: 12px; }
+    dialog .dlg-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+    .code-block {
+      font-family: var(--mono); font-size: 13px;
+      background: var(--deep);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      word-break: break-all;
+      color: var(--ink);
+      user-select: all;
+    }
+    .dlg-note { color: var(--faint); font-size: 13px; }
+
+    #toast {
+      position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+      background: var(--deep);
+      border: 1px solid var(--line-2);
+      color: var(--ink);
+      border-radius: 8px;
+      padding: 9px 16px;
+      font-family: var(--mono); font-size: 13px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .18s ease;
+      max-width: min(560px, calc(100vw - 32px));
+    }
+    #toast.show { opacity: 1; }
+    #toast.err { border-color: var(--rose-strong); color: var(--rose); }
+
     @media (max-width: 640px) {
-      main { padding: 14px; }
-      .grid, .row, .row.three { grid-template-columns: 1fr; }
-      nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .topbar { align-items: flex-start; flex-direction: column; }
-      .topbar-actions { justify-content: flex-start; }
+      .peer-row .acts, .net-head .net-actions { margin-left: 0; width: 100%; }
+      .top-actions { width: 100%; }
+      header.top { flex-wrap: wrap; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #toast { transition: none; }
     }
   </style>
 </head>
 <body>
-  <div class="app">
-    <aside>
-      <div class="brand">
-        <div class="mark" aria-hidden="true"></div>
-        <div><strong>Rayfish</strong><span>mesh VPN control</span></div>
+  <div class="wrap">
+    <header class="top">
+      <span class="logo">rayf<span class="dot-i">i</span>sh</span>
+      <span id="liveDot" class="live"><i></i><span id="liveText">connecting</span></span>
+      <div class="top-actions">
+        <button id="powerBtn" class="small">…</button>
+        <button id="advancedBtn" class="small">Advanced</button>
       </div>
-      <nav aria-label="Sections">
-        <button class="active" data-view="overview">Overview</button>
-        <button data-view="networks">Networks</button>
-        <button data-view="security">Security</button>
-        <button data-view="files">Files</button>
-        <button data-view="devices">Devices</button>
-        <button data-view="advanced">Advanced</button>
-      </nav>
-    </aside>
-    <main>
-      <div class="topbar">
-        <h1 id="title">Overview</h1>
-        <div class="topbar-actions">
-          <button id="refresh" class="primary">Refresh</button>
-          <button data-run="up">Up</button>
-          <button data-run="down">Down</button>
-          <button data-run="netcheck" data-json="1">Netcheck</button>
+    </header>
+
+    <div id="statusLine" class="statline"></div>
+
+    <section id="attention" hidden>
+      <div class="sec-head"><h2>Needs attention</h2></div>
+      <div class="card" id="attnList"></div>
+    </section>
+
+    <section>
+      <div class="sec-head">
+        <h2>Networks</h2>
+        <div class="spacer"></div>
+        <button id="joinBtn" class="small">Join with a code</button>
+        <button id="createBtn" class="small primary">Create a network</button>
+      </div>
+      <div id="networks"></div>
+    </section>
+
+    <section id="advanced">
+      <div class="card console">
+        <div class="console-head">
+          <h3>Console</h3>
+          <button id="copyOutput" class="small">Copy</button>
+          <span id="lastStatus" class="badge">idle</span>
         </div>
-      </div>
-      <div class="content">
-        <div>
-          <section id="view-overview" class="view active">
-            <div class="grid">
-              <div class="panel status-card">
-                <h2>Daemon</h2>
-                <div id="daemonBadge" class="badge warn">unknown</div>
-                <div id="daemonMeta" class="meta">Run refresh to read status.</div>
-              </div>
-              <div class="panel status-card">
-                <h2>Identity</h2>
-                <div id="contact" class="meta">No contact id loaded.</div>
-                <div id="endpoint" class="meta"></div>
-              </div>
-            </div>
-            <div class="panel">
-              <h2>Networks</h2>
-              <div id="networks"></div>
-            </div>
-            <div class="panel">
-              <h2>Quick Actions</h2>
-              <div class="actions">
-                <button data-run="status" data-json="1">Status JSON</button>
-                <button data-run="contact id" data-json="1">Contact ID</button>
-                <button data-run="connections" data-json="1">Connection Requests</button>
-                <button data-run="files" data-json="1">File Offers</button>
-                <button data-run="firewall show" data-json="1">Firewall</button>
-                <button data-run="config" data-json="1">Config</button>
-              </div>
-            </div>
-          </section>
-
-          <section id="view-networks" class="view">
-            <div class="grid">
-              <form id="createForm" class="panel">
-                <h2>Create Network</h2>
-                <div class="row">
-                  <label>Name<input id="createName" autocomplete="off"></label>
-                  <label>Hostname<input id="createHost" autocomplete="off"></label>
-                </div>
-                <div class="actions">
-                  <label class="check"><input id="createOpen" type="checkbox"> Open</label>
-                  <label class="check"><input id="createTor" type="checkbox"> Tor</label>
-                  <button class="primary" type="submit">Create</button>
-                </div>
-              </form>
-              <form id="joinForm" class="panel">
-                <h2>Join Network</h2>
-                <label>Room ID or invite code<input id="joinKey" required autocomplete="off"></label>
-                <div class="row">
-                  <label>Alias<input id="joinName" autocomplete="off"></label>
-                  <label>Hostname<input id="joinHost" autocomplete="off"></label>
-                </div>
-                <div class="actions">
-                  <label class="check"><input id="joinFirewall" type="checkbox"> Auto firewall</label>
-                  <label class="check"><input id="joinManualFiles" type="checkbox"> Manual files</label>
-                  <label class="check"><input id="joinTor" type="checkbox"> Tor</label>
-                  <button class="primary" type="submit">Join</button>
-                </div>
-              </form>
-            </div>
-            <div class="grid">
-              <form id="inviteForm" class="panel">
-                <h2>Invites</h2>
-                <div class="row">
-                  <label>Network<input id="inviteNet" required autocomplete="off"></label>
-                  <label>Expires<input id="inviteExpires" placeholder="7d" autocomplete="off"></label>
-                </div>
-                <div class="row">
-                  <label>Bound hostname<input id="inviteHost" autocomplete="off"></label>
-                  <label>Revoke ID<input id="inviteRevoke" autocomplete="off"></label>
-                </div>
-                <div class="actions">
-                  <label class="check"><input id="inviteReusable" type="checkbox"> Reusable</label>
-                  <button class="primary" type="submit">Create</button>
-                  <button type="button" id="inviteList">List</button>
-                  <button type="button" id="inviteRevokeBtn" class="warn">Revoke</button>
-                </div>
-              </form>
-              <form id="membershipForm" class="panel">
-                <h2>Membership</h2>
-                <div class="row">
-                  <label>Network<input id="memberNet" required autocomplete="off"></label>
-                  <label>Peer or ID<input id="memberPeer" autocomplete="off"></label>
-                </div>
-                <div class="row">
-                  <label>TTL<input id="ephemeral" placeholder="show, off, 7d" autocomplete="off"></label>
-                  <label>New hostname<input id="renameHost" autocomplete="off"></label>
-                </div>
-                <div class="actions">
-                  <button type="button" id="requestsBtn">Requests</button>
-                  <button type="button" id="acceptBtn">Accept</button>
-                  <button type="button" id="denyBtn" class="warn">Deny</button>
-                  <button type="button" id="kickBtn" class="warn">Kick</button>
-                  <button type="button" id="leaveBtn" class="warn">Leave</button>
-                  <button type="button" id="ephemeralBtn">Ephemeral</button>
-                  <button type="button" id="renameBtn">Rename</button>
-                </div>
-              </form>
-            </div>
-          </section>
-
-          <section id="view-security" class="view">
-            <div class="grid">
-              <form id="firewallAddForm" class="panel">
-                <h2>Firewall Rule</h2>
-                <div class="row three">
-                  <label>Direction<select id="fwDir"><option>in</option><option>out</option></select></label>
-                  <label>Action<select id="fwAction"><option>allow</option><option>deny</option></select></label>
-                  <label>Protocol<select id="fwProto"><option>any</option><option>tcp</option><option>udp</option><option>icmp</option></select></label>
-                </div>
-                <div class="row">
-                  <label>Port<input id="fwPort" placeholder="22, 80-443, *" autocomplete="off"></label>
-                  <label>Peer<input id="fwPeer" autocomplete="off"></label>
-                </div>
-                <label>Network<input id="fwNet" autocomplete="off"></label>
-                <div class="actions">
-                  <button class="primary" type="submit">Add</button>
-                  <button type="button" data-run="firewall show" data-json="1">Show</button>
-                  <button type="button" data-run="firewall on">On</button>
-                  <button type="button" data-run="firewall off" class="warn">Off</button>
-                </div>
-              </form>
-              <form id="firewallManageForm" class="panel">
-                <h2>Firewall Manage</h2>
-                <div class="row">
-                  <label>Rule index<input id="fwRemove" type="number" min="0"></label>
-                  <label>Default<select id="fwDefault"><option>deny</option><option>allow</option></select></label>
-                </div>
-                <div class="row">
-                  <label>Network<input id="fwReviewNet" autocomplete="off"></label>
-                  <label>Reject<select id="fwReject"><option>on</option><option>off</option></select></label>
-                </div>
-                <div class="actions">
-                  <button type="button" id="fwRemoveBtn" class="warn">Remove</button>
-                  <button type="button" id="fwDefaultBtn">Set Default</button>
-                  <button type="button" id="fwRejectBtn">Reject Mode</button>
-                  <button type="button" id="fwPendingBtn">Pending</button>
-                  <button type="button" id="fwAcceptBtn">Accept Pending</button>
-                  <button type="button" id="fwDenyBtn" class="warn">Deny Pending</button>
-                </div>
-              </form>
-            </div>
-            <div class="grid">
-              <form id="sshForm" class="panel">
-                <h2>Mesh SSH</h2>
-                <div class="row">
-                  <label>Network<input id="sshNet" autocomplete="off"></label>
-                  <label>Peer<input id="sshPeer" autocomplete="off"></label>
-                </div>
-                <label>Users<input id="sshUsers" placeholder="alice,bob or *" autocomplete="off"></label>
-                <div class="actions">
-                  <button type="button" data-run="firewall ssh on">Server On</button>
-                  <button type="button" data-run="firewall ssh off" class="warn">Server Off</button>
-                  <button type="button" data-run="firewall ssh show" data-json="1">Show</button>
-                  <button type="button" id="sshAllowBtn">Allow</button>
-                  <button type="button" id="sshDenyBtn" class="warn">Deny</button>
-                </div>
-              </form>
-              <form id="suggestForm" class="panel">
-                <h2>Suggested Rules</h2>
-                <div class="row">
-                  <label>Network<input id="suggestNet" autocomplete="off"></label>
-                  <label>Subject<input id="suggestSubject" placeholder="host or *" autocomplete="off"></label>
-                </div>
-                <label>Allow<input id="suggestAllow" placeholder="tcp:22, alice:tcp:443" autocomplete="off"></label>
-                <label>Deny<input id="suggestDeny" placeholder="udp:53" autocomplete="off"></label>
-                <div class="actions">
-                  <button class="primary" type="submit">Suggest</button>
-                  <button type="button" id="fwAutoOn">Auto Accept On</button>
-                  <button type="button" id="fwAutoOff">Auto Accept Off</button>
-                </div>
-              </form>
-            </div>
-          </section>
-
-          <section id="view-files" class="view">
-            <div class="grid">
-              <form id="sendForm" class="panel">
-                <h2>Send File</h2>
-                <label>File path<input id="sendPath" required autocomplete="off"></label>
-                <label>Peer<input id="sendPeer" required autocomplete="off"></label>
-                <div class="actions">
-                  <button class="primary" type="submit">Send</button>
-                  <button type="button" data-run="files" data-json="1">Offers</button>
-                </div>
-              </form>
-              <form id="filesForm" class="panel">
-                <h2>Receive Files</h2>
-                <div class="row">
-                  <label>Offer ID<input id="fileId" type="number" min="0"></label>
-                  <label>Output dir<input id="fileOut" autocomplete="off"></label>
-                </div>
-                <div class="row">
-                  <label>Network<input id="fileNet" autocomplete="off"></label>
-                  <label>State<select id="fileAuto"><option>on</option><option>off</option></select></label>
-                </div>
-                <div class="actions">
-                  <button type="button" id="fileAcceptBtn">Accept</button>
-                  <button type="button" id="fileAutoBtn">Auto Accept</button>
-                </div>
-              </form>
-            </div>
-            <form id="downloadForm" class="panel">
-              <h2>Download Location</h2>
-              <div class="row">
-                <label>Directory<input id="downloadDir" autocomplete="off"></label>
-                <label>User<input id="downloadUser" autocomplete="off"></label>
-              </div>
-              <div class="actions">
-                <button type="button" id="downloadDirShow">Show Dir</button>
-                <button type="button" id="downloadDirSet">Set Dir</button>
-                <button type="button" id="downloadDirClear" class="warn">Clear Dir</button>
-                <button type="button" id="downloadUserShow">Show User</button>
-                <button type="button" id="downloadUserSet">Set User</button>
-                <button type="button" id="downloadUserClear" class="warn">Clear User</button>
-              </div>
-            </form>
-          </section>
-
-          <section id="view-devices" class="view">
-            <div class="grid">
-              <form id="connectForm" class="panel">
-                <h2>Direct Connections</h2>
-                <div class="row">
-                  <label>Contact ID<input id="connectId" autocomplete="off"></label>
-                  <label>Hostname<input id="connectHost" autocomplete="off"></label>
-                </div>
-                <label>Request ID<input id="connectReq" autocomplete="off"></label>
-                <div class="actions">
-                  <button class="primary" type="submit">Connect</button>
-                  <button type="button" data-run="connections" data-json="1">Requests</button>
-                  <button type="button" id="connectApprove">Approve</button>
-                  <button type="button" data-run="contact id" data-json="1">Contact ID</button>
-                  <button type="button" data-run="contact rotate" class="warn">Rotate Contact</button>
-                </div>
-              </form>
-              <form id="pairForm" class="panel">
-                <h2>Pairing</h2>
-                <label>Ticket / backup / device<input id="pairValue" autocomplete="off"></label>
-                <div class="actions">
-                  <button type="button" data-run="pair">Start Pairing</button>
-                  <button type="button" data-run="pair list" data-json="1">List Devices</button>
-                  <button type="button" id="pairAccept">Accept Ticket</button>
-                  <button type="button" data-run="pair backup">Backup</button>
-                  <button type="button" id="pairRestore">Restore</button>
-                  <button type="button" id="unpairBtn" class="warn">Unpair</button>
-                </div>
-              </form>
-            </div>
-            <div class="grid">
-              <form id="aliasForm" class="panel">
-                <h2>Aliases</h2>
-                <div class="row">
-                  <label>Network<input id="aliasNet" autocomplete="off"></label>
-                  <label>Key / host<input id="aliasKey" autocomplete="off"></label>
-                </div>
-                <label>Alias<input id="aliasName" autocomplete="off"></label>
-                <div class="actions">
-                  <button type="button" id="aliasSet">Set</button>
-                  <button type="button" id="aliasList">List</button>
-                  <button type="button" id="aliasRm" class="warn">Remove</button>
-                  <button type="button" id="identityOf">Identity Of</button>
-                </div>
-              </form>
-              <form id="probeForm" class="panel">
-                <h2>Probe Peer</h2>
-                <label>Peer<input id="probePeer" autocomplete="off"></label>
-                <div class="row">
-                  <label>Count<input id="probeCount" type="number" value="3" min="1"></label>
-                  <label>Interval ms<input id="probeInterval" type="number" value="1000" min="1"></label>
-                </div>
-                <div class="actions">
-                  <button class="primary" type="submit">Ping</button>
-                </div>
-              </form>
-            </div>
-          </section>
-
-          <section id="view-advanced" class="view">
-            <div class="panel advanced">
-              <h2>Run Any Ray Command</h2>
-              <div class="templates">
-                <select id="template"></select>
-                <button id="useTemplate" type="button">Use</button>
-              </div>
-              <label>Command<input id="commandLine" placeholder="status" autocomplete="off"></label>
-              <div class="actions">
-                <label class="check"><input id="advancedJson" type="checkbox"> JSON</label>
-                <button id="runCommand" class="primary" type="button">Run</button>
-              </div>
-            </div>
-            <div class="grid">
-              <form id="settingsForm" class="panel">
-                <h2>Settings</h2>
-                <div class="row">
-                  <label>Key<select id="configKey"><option>relay</option><option>discovery-dns</option><option>dns-upstreams</option></select></label>
-                  <label>Value<input id="configValue" autocomplete="off"></label>
-                </div>
-                <div class="actions">
-                  <label class="check"><input id="configReplace" type="checkbox"> Replace</label>
-                  <button type="button" data-run="config" data-json="1">Show</button>
-                  <button type="button" id="configSet">Set</button>
-                  <button type="button" id="configUnset" class="warn">Unset</button>
-                </div>
-              </form>
-              <div class="panel">
-                <h2>Service</h2>
-                <div class="actions">
-                  <button data-run="start">Start</button>
-                  <button data-run="stop" class="warn">Stop</button>
-                  <button data-run="restart">Restart</button>
-                  <button data-run="install">Install</button>
-                  <button data-run="uninstall" class="warn">Uninstall</button>
-                  <button data-run="report">Report</button>
-                  <button data-run="update --check">Check Update</button>
-                  <button data-run="update --list">List Releases</button>
-                  <button data-run="auto-update on">Auto Update On</button>
-                  <button data-run="auto-update off" class="warn">Auto Update Off</button>
-                  <button data-run="mdns on">mDNS On</button>
-                  <button data-run="mdns off" class="warn">mDNS Off</button>
-                </div>
-              </div>
-            </div>
-          </section>
+        <div class="chips">
+          <button data-run="status">status</button>
+          <button data-run="netcheck">netcheck</button>
+          <button data-run="firewall show">firewall</button>
+          <button data-run="files">files</button>
+          <button data-run="pair list">devices</button>
+          <button data-run="connections">connections</button>
+          <button data-run="config">config</button>
+          <button data-run="update --check">update check</button>
+          <button data-run="report">report issue</button>
         </div>
-
-        <section class="panel output">
-          <div class="output-head">
-            <h2>Output</h2>
-            <span id="lastStatus" class="badge">idle</span>
-          </div>
-          <pre id="output" aria-live="polite"></pre>
-        </section>
+        <div class="cmdbar">
+          <select id="template"><option value="">templates…</option></select>
+          <input id="commandLine" placeholder="any ray command, e.g. firewall add in allow -p tcp --port 22" autocomplete="off">
+          <button id="runCommand" class="primary">Run</button>
+        </div>
+        <pre id="output"></pre>
       </div>
-    </main>
+    </section>
   </div>
+
+  <dialog id="createDlg">
+    <h3>Create a network</h3>
+    <form id="createForm" method="dialog">
+      <label>Network name <span>(optional, generated if empty)</span><input id="createName" autocomplete="off"></label>
+      <label>This machine's name in the network <span>(optional)</span><input id="createHost" autocomplete="off"></label>
+      <label class="check"><input id="createOpen" type="checkbox"> Open network (anyone with the room id can join)</label>
+      <div class="dlg-actions">
+        <button type="button" data-close>Cancel</button>
+        <button class="primary" type="submit">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="joinDlg">
+    <h3>Join a network</h3>
+    <form id="joinForm" method="dialog">
+      <label>Invite code or room id<input id="joinKey" required autocomplete="off"></label>
+      <label>This machine's name in the network <span>(optional)</span><input id="joinHost" autocomplete="off"></label>
+      <div class="dlg-actions">
+        <button type="button" data-close>Cancel</button>
+        <button class="primary" type="submit">Join</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="inviteDlg">
+    <h3>Invite to <span id="inviteNetName"></span></h3>
+    <div class="code-block" id="inviteCode"></div>
+    <p class="dlg-note" id="inviteNote">Single use. The holder runs <b>ray join &lt;code&gt;</b> or pastes it in their dashboard.</p>
+    <div class="dlg-actions">
+      <button type="button" data-close>Close</button>
+      <button class="primary" id="inviteCopy" type="button">Copy code</button>
+    </div>
+  </dialog>
+
+  <div id="toast" role="status"></div>
 
   <script>
     const token = "__TOKEN__";
-    const out = document.getElementById("output");
-    const lastStatus = document.getElementById("lastStatus");
-    const title = document.getElementById("title");
+    const $ = id => document.getElementById(id);
+    const out = $("output");
+
     const templates = [
-      "status", "up", "down", "create --hostname alice", "join <code> --name gaming --hostname bob",
-      "invite <network>", "invite <network> list", "requests <network>", "accept <network> <id>",
-      "deny <network> <id>", "leave <network>", "kick <network> <peer>", "ephemeral <network> show",
-      "connect <contact-id>", "connections", "connections approve <id>", "contact id", "contact rotate",
-      "ping <peer> -c 3 -i 1000", "netcheck", "firewall show", "firewall add in allow -p tcp --port 22",
-      "firewall remove <index>", "firewall default deny", "firewall reject on", "firewall on", "firewall off",
-      "firewall pending <network>", "firewall accept <network>", "firewall deny <network>",
-      "firewall auto-accept <network> on", "firewall ssh show", "firewall ssh on",
-      "firewall ssh allow <network> <peer>", "apply <spec.yaml> --dry-run", "hostname <network> <name>",
-      "identityof <network> <host>", "alias <network> list", "alias <network> set <host> <alias>",
-      "send <file> <peer>", "files", "files accept <id>", "files auto-accept <network> on",
-      "files download-dir", "files download-user", "pair", "pair list", "pair backup", "pair restore <backup>",
-      "unpair <device>", "mdns on", "auto-update on", "config", "config set relay rayfish",
-      "set-operator <user>", "report", "update --check", "update --list", "version", "completions zsh"
+      "status", "netcheck", "ping <peer> -c 3", "invite <network> --reusable",
+      "invite <network> list", "invite <network> revoke <id>", "ephemeral <network> 7d",
+      "kick <network> <peer>", "hostname <network> <new-name>",
+      "firewall show", "firewall add in allow -p tcp --port 22", "firewall remove <index>",
+      "firewall reject on", "firewall off", "firewall pending <network>", "firewall accept <network>",
+      "firewall suggest <network> --subject '*' --allow tcp:22", "firewall auto-accept <network> on",
+      "firewall ssh on", "firewall ssh allow <network> <peer>",
+      "send <file> <peer>", "files accept <id>", "files auto-accept <network> on", "files download-dir <dir>",
+      "connect <contact-id>", "connections approve <id>", "contact id", "contact rotate",
+      "pair", "pair accept <ticket>", "pair list", "pair backup", "unpair <device>",
+      "alias <network> set <host> <alias>", "identityof <network> <host>",
+      "exit-node allow", "exit-node use <peer>", "exit-node none",
+      "apply <spec.yaml> --dry-run", "config set relay rayfish", "mdns off",
+      "update --check", "update --list", "auto-update on", "report", "version"
     ];
 
-    function $(id) { return document.getElementById(id); }
-    function val(id) { return ($(id).value || "").trim(); }
-    function add(args, flag, value) { if (value) args.push(flag, value); }
-    function addSwitch(args, on, flag) { if (on) args.push(flag); }
     function esc(s) {
       return String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    function copyText(text) {
+      // Clipboard API needs a secure context; this dashboard is plain http on
+      // the LAN, so fall back to a hidden textarea + execCommand.
+      if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } finally { ta.remove(); }
+      return Promise.resolve();
+    }
+    let toastTimer = null;
+    function toast(msg, isErr) {
+      const el = $("toast");
+      el.textContent = msg;
+      el.className = (isErr ? "err " : "") + "show";
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => { el.className = ""; }, isErr ? 5000 : 2200);
+    }
+    function fmtBytes(n) {
+      if (!n) return "0 B";
+      const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+      let i = 0;
+      while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+      return n.toFixed(n >= 100 || i === 0 ? 0 : 1) + " " + units[i];
     }
     function splitArgs(input) {
       const args = [];
@@ -695,149 +430,314 @@
       if (cur) args.push(cur);
       return args;
     }
+
+    async function call(args, json) {
+      const http = await fetch("/run", {
+        method: "POST",
+        headers: {"content-type": "application/json", "x-rayfish-token": token},
+        body: JSON.stringify({args, json: !!json})
+      });
+      return http.json();
+    }
+    // Quiet action: no console. Toasts the result, then refreshes state.
+    async function act(args, okMsg) {
+      try {
+        const res = await call(args, false);
+        if (res.success) toast(okMsg || "done");
+        else toast((res.stderr || res.stdout || "command failed").trim().split("\n")[0], true);
+        refresh();
+        return res;
+      } catch (err) {
+        toast(String(err), true);
+        return null;
+      }
+    }
+    // Console run: opens the Advanced drawer and prints there.
     async function run(args, opts = {}) {
-      lastStatus.className = "badge warn";
-      lastStatus.textContent = "running";
-      out.textContent = "$ ray " + args.join(" ") + "\n";
+      openAdvanced();
+      $("lastStatus").className = "badge";
+      $("lastStatus").textContent = "running";
+      out.innerHTML = `<span class="prompt">$ ray ${esc(args.join(" "))}</span>\n`;
       let res;
       try {
-        const http = await fetch("/run", {
-          method: "POST",
-          headers: {"content-type": "application/json", "x-rayfish-token": token},
-          body: JSON.stringify({args, json: !!opts.json})
-        });
-        res = await http.json();
+        res = await call(args, opts.json);
       } catch (err) {
-        lastStatus.className = "badge bad";
-        lastStatus.textContent = "failed";
+        $("lastStatus").className = "badge bad";
+        $("lastStatus").textContent = "failed";
         out.textContent += String(err);
         return null;
       }
       const text = [res.stdout, res.stderr].filter(Boolean).join(res.stdout && res.stderr ? "\n" : "");
-      out.textContent = "$ ray " + res.command.join(" ") + "\n\n" + (text || "(no output)");
-      lastStatus.className = "badge " + (res.success ? "good" : "bad");
-      lastStatus.textContent = res.timed_out ? "timeout" : "exit " + res.status;
+      out.innerHTML = `<span class="prompt">$ ray ${esc(res.command.join(" "))}</span>\n\n` + esc(text || "(no output)");
+      $("lastStatus").className = "badge " + (res.success ? "good" : "bad");
+      $("lastStatus").textContent = res.timed_out ? "timeout" : "exit " + res.status;
+      refreshSoon();
       return res;
     }
-    async function refresh() {
-      const res = await run(["status"], {json: true});
-      if (!res || !res.success) return;
-      try {
-        renderStatus(JSON.parse(res.stdout));
-      } catch (_) {}
-    }
-    function renderStatus(data) {
-      $("daemonBadge").className = "badge " + (data.active ? "good" : "warn");
-      $("daemonBadge").textContent = data.active ? "up" : "standby";
-      $("daemonMeta").textContent = [data.daemon_version && "daemon " + data.daemon_version, data.mdns ? "mDNS on" : "mDNS off", data.auto_update ? "auto-update on" : ""].filter(Boolean).join(" · ");
-      $("contact").textContent = data.contact_id ? "contact " + data.contact_id : "no contact id";
-      $("endpoint").textContent = data.endpoint ? "endpoint " + data.endpoint : "";
-      const nets = Array.isArray(data.networks) ? data.networks : [];
-      $("networks").innerHTML = nets.length ? nets.map(n => {
-        const peers = Array.isArray(n.peers) ? n.peers.length + " peers" : "";
-        const ip = n.my_ip || n.ipv4 || n.ip || "";
-        const mode = n.role || n.mode || "";
-        return `<div class="network"><strong>${esc(n.name || n.network || "network")}</strong><div class="meta">${esc([mode, ip, peers].filter(Boolean).join(" · "))}</div></div>`;
-      }).join("") : `<div class="meta">No active networks.</div>`;
-    }
-    function onForm(id, build) {
-      $(id).addEventListener("submit", ev => { ev.preventDefault(); run(build()); });
-    }
-    document.querySelectorAll("nav button").forEach(btn => {
-      btn.addEventListener("click", () => {
-        document.querySelectorAll("nav button").forEach(b => b.classList.remove("active"));
-        document.querySelectorAll("section.view").forEach(v => v.classList.remove("active"));
-        btn.classList.add("active");
-        $("view-" + btn.dataset.view).classList.add("active");
-        title.textContent = btn.textContent;
-      });
-    });
-    document.querySelectorAll("[data-run]").forEach(btn => {
-      btn.addEventListener("click", () => run(splitArgs(btn.dataset.run), {json: btn.dataset.json === "1"}));
-    });
-    $("refresh").addEventListener("click", refresh);
 
-    onForm("createForm", () => {
+    // ---- live state ----
+    let statusBusy = false;
+    let lastData = null;
+    async function refresh() {
+      if (statusBusy || document.hidden) return;
+      statusBusy = true;
+      try {
+        const res = await call(["status"], true);
+        if (res && res.success) {
+          lastData = JSON.parse(res.stdout);
+          render(lastData);
+          await renderAttention(lastData);
+          setLive(true, lastData.active);
+        } else {
+          setLive(false);
+        }
+      } catch (_) {
+        setLive(false);
+      } finally {
+        statusBusy = false;
+      }
+    }
+    let refreshTimer = null;
+    function refreshSoon() {
+      clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(refresh, 600);
+    }
+    function setLive(reachable, active) {
+      const el = $("liveDot");
+      el.className = "live" + (reachable ? " on" : "");
+      $("liveText").textContent = reachable ? (active ? "connected" : "standby") : "daemon unreachable";
+    }
+
+    function peerKind(p) {
+      const type = p.connection && p.connection.conn_type;
+      if (type && /direct/i.test(type)) return "direct";
+      if (type) return "relay";
+      return "idle";
+    }
+    function render(data) {
+      const nets = Array.isArray(data.networks) ? data.networks : [];
+
+      // power button
+      const power = $("powerBtn");
+      power.textContent = data.active ? "Turn VPN off" : "Turn VPN on";
+      power.className = "small" + (data.active ? "" : " primary");
+
+      // status line. The global traffic counter only tracks TUN-forwarded
+      // packets since the last daemon restart, so sum the live per-peer
+      // connection counters instead (one connection per peer device, so
+      // dedupe peers that appear in several networks).
+      let tx = 0, rx = 0;
+      const seen = new Set();
+      for (const n of nets) {
+        for (const p of (n.peers || [])) {
+          if (!p.connection || seen.has(p.endpoint_id)) continue;
+          seen.add(p.endpoint_id);
+          tx += p.connection.bytes_tx || 0;
+          rx += p.connection.bytes_rx || 0;
+        }
+      }
+      $("statusLine").innerHTML =
+        `<span>daemon <b>${esc(data.daemon_version || "?")}</b></span>` +
+        `<span>&#8593; ${fmtBytes(tx)} · &#8595; ${fmtBytes(rx)}</span>` +
+        (data.mdns ? `<span>mDNS on</span>` : "") +
+        `<span class="copyable" data-copy="${esc(data.contact_id || "")}" title="Copy your contact id">contact ${esc((data.contact_id || "").slice(0, 12))}… (copy)</span>`;
+
+      // networks
+      $("networks").innerHTML = nets.length ? nets.map(n => {
+        const role = String(n.role || "member");
+        const isCoord = role.toLowerCase() === "coordinator";
+        const peers = (n.peers || []).map(p => {
+          const kind = peerKind(p);
+          const conn = p.connection;
+          const connText = conn
+            ? `${kind}${conn.rtt_ms != null ? " · " + Math.round(conn.rtt_ms) + "ms" : ""}`
+            : "idle";
+          const tags = [p.is_own_device ? "yours" : "", p.exit_node ? "exit" : "", p.incompatible ? "outdated" : ""].filter(Boolean);
+          return `<div class="peer-row">
+            <span class="dot ${kind}"></span>
+            <span class="host">${esc(p.hostname || "?")}${tags.map(x => `<span class="tag">${x}</span>`).join("")}</span>
+            <span class="ip" data-copy="${esc(p.ip || "")}" title="Copy IP">${esc(p.ip || "")}</span>
+            <span class="conn ${kind}">${esc(connText)}</span>
+            <span class="acts">
+              <button class="small" data-ping="${esc(p.hostname || p.ip || "")}">ping</button>
+              ${isCoord && !p.is_own_device ? `<button class="small danger" data-kick="${esc(p.hostname || "")}" data-net="${esc(n.name)}">kick</button>` : ""}
+            </span>
+          </div>`;
+        }).join("");
+        return `<div class="card net-card">
+          <div class="net-head">
+            <strong>${esc(n.name)}</strong>
+            <span class="role ${isCoord ? "coordinator" : ""}">${esc(role)}</span>
+            <span class="self">you: ${esc(n.my_hostname || "?")} · <span class="copyable" data-copy="${esc(n.my_ip || "")}" title="Copy IP">${esc(n.my_ip || "")}</span> · ${n.member_count ?? "?"} members</span>
+            <span class="net-actions">
+              ${isCoord ? `<button class="small primary" data-invite="${esc(n.name)}">Invite</button>` : ""}
+              <button class="small danger" data-leave="${esc(n.name)}">Leave</button>
+            </span>
+          </div>
+          ${peers || `<div class="peer-row"><span class="conn">no peers online</span></div>`}
+        </div>`;
+      }).join("") : `<div class="card"><div class="empty">
+          <div class="big">Not part of any network yet.</div>
+          <div>Create one and invite your devices, or paste an invite code someone sent you.</div>
+        </div></div>`;
+    }
+
+    // Fetch details for pending items and render them as actionable rows.
+    async function renderAttention(data) {
+      const nets = Array.isArray(data.networks) ? data.networks : [];
+      const pd = data.pending || {};
+      const rows = [];
+
+      for (const n of nets) {
+        if (n.pending_requests > 0) {
+          const res = await call(["requests", n.name], true);
+          if (res && res.success) {
+            for (const r of JSON.parse(res.stdout)) {
+              rows.push(`<div class="attn-row">
+                <span class="what"><b>${esc(r.hostname || r.id)}</b> asks to join <b>${esc(n.name)}</b>
+                  <span class="sub">waiting ${esc(String(r.waiting_secs))}s · id ${esc(r.id)}</span></span>
+                <button class="small primary" data-act='${esc(JSON.stringify(["accept", n.name, r.id]))}' data-ok="let ${esc(r.hostname || r.id)} in">Let in</button>
+                <button class="small danger" data-act='${esc(JSON.stringify(["deny", n.name, r.id]))}' data-ok="denied">Deny</button>
+              </div>`);
+            }
+          }
+        }
+        if (n.pending_suggestions > 0) {
+          rows.push(`<div class="attn-row">
+            <span class="what">Firewall rules suggested for <b>${esc(n.name)}</b>
+              <span class="sub">review before accepting, they open ports to peers</span></span>
+            <button class="small" data-run="firewall pending ${esc(n.name)}">View</button>
+            <button class="small primary" data-act='${esc(JSON.stringify(["firewall", "accept", n.name]))}' data-ok="rules accepted">Accept</button>
+            <button class="small danger" data-act='${esc(JSON.stringify(["firewall", "deny", n.name]))}' data-ok="rules dismissed">Dismiss</button>
+          </div>`);
+        }
+      }
+      if (pd.connects > 0) {
+        const res = await call(["connections"], true);
+        if (res && res.success) {
+          for (const r of JSON.parse(res.stdout)) {
+            rows.push(`<div class="attn-row">
+              <span class="what"><b>${esc(r.hostname || r.id)}</b> wants a direct connection
+                <span class="sub">waiting ${esc(String(r.waiting_secs))}s · id ${esc(r.id)}</span></span>
+              <button class="small primary" data-act='${esc(JSON.stringify(["connections", "approve", r.id]))}' data-ok="connected">Approve</button>
+            </div>`);
+          }
+        }
+      }
+      if (pd.files > 0) {
+        const res = await call(["files"], true);
+        if (res && res.success) {
+          const files = JSON.parse(res.stdout);
+          for (const f of (files.pending || [])) {
+            rows.push(`<div class="attn-row">
+              <span class="what"><b>${esc(f.from)}</b> sends <b>${esc(f.filename)}</b>
+                <span class="sub">${fmtBytes(f.size)} · id ${esc(String(f.id))}</span></span>
+              <button class="small primary" data-act='${esc(JSON.stringify(["files", "accept", String(f.id)]))}' data-ok="receiving ${esc(f.filename)}">Accept</button>
+            </div>`);
+          }
+        }
+      }
+
+      $("attention").hidden = rows.length === 0;
+      $("attnList").innerHTML = rows.join("");
+    }
+
+    // ---- invites ----
+    async function mintInvite(net) {
+      toast("minting invite…");
+      const res = await call(["invite", net], false);
+      if (!res || !res.success) {
+        toast((res && (res.stderr || res.stdout) || "invite failed").trim().split("\n")[0], true);
+        return;
+      }
+      // The code is the long standalone base58 line of the output.
+      const lines = res.stdout.split("\n").map(l => l.trim()).filter(Boolean);
+      const code = lines.find(l => /^[1-9A-HJ-NP-Za-km-z]{40,}$/.test(l));
+      $("inviteNetName").textContent = net;
+      $("inviteCode").textContent = code || res.stdout.trim();
+      const expiry = lines.find(l => /expires/.test(l));
+      if (expiry) $("inviteNote").textContent = expiry + ". The holder runs `ray join <code>` or pastes it in their dashboard.";
+      $("inviteDlg").showModal();
+    }
+    $("inviteCopy").onclick = () =>
+      copyText($("inviteCode").textContent).then(() => toast("invite code copied"));
+
+    // ---- wiring ----
+    document.addEventListener("click", ev => {
+      const t = ev.target.closest("[data-copy],[data-ping],[data-kick],[data-leave],[data-invite],[data-act],[data-run],[data-close]");
+      if (!t) return;
+      if (t.dataset.copy != null) {
+        if (t.dataset.copy) copyText(t.dataset.copy).then(() => toast("copied"));
+      } else if (t.dataset.ping != null) {
+        run(["ping", t.dataset.ping, "-c", "3"]);
+      } else if (t.dataset.kick != null) {
+        if (confirm(`Remove ${t.dataset.kick} from ${t.dataset.net}? They lose access on every device.`))
+          act(["kick", t.dataset.net, t.dataset.kick], `kicked ${t.dataset.kick}`);
+      } else if (t.dataset.leave != null) {
+        if (confirm(`Leave ${t.dataset.leave} on this machine?`))
+          act(["leave", t.dataset.leave], `left ${t.dataset.leave}`);
+      } else if (t.dataset.invite != null) {
+        mintInvite(t.dataset.invite);
+      } else if (t.dataset.act != null) {
+        act(JSON.parse(t.dataset.act), t.dataset.ok);
+      } else if (t.dataset.run != null) {
+        run(splitArgs(t.dataset.run));
+      } else if (t.dataset.close != null) {
+        t.closest("dialog").close();
+      }
+    });
+
+    $("powerBtn").onclick = () => {
+      if (!lastData) return;
+      act([lastData.active ? "down" : "up"], lastData.active ? "VPN off (standby)" : "VPN on");
+    };
+    $("advancedBtn").onclick = () => {
+      const adv = $("advanced");
+      adv.classList.toggle("open");
+      if (adv.classList.contains("open")) adv.scrollIntoView({behavior: "smooth", block: "nearest"});
+    };
+    function openAdvanced() {
+      $("advanced").classList.add("open");
+    }
+    $("copyOutput").onclick = () => copyText(out.textContent).then(() => toast("output copied"));
+
+    $("createBtn").onclick = () => $("createDlg").showModal();
+    $("joinBtn").onclick = () => $("joinDlg").showModal();
+    $("createForm").addEventListener("submit", () => {
       const args = ["create"];
-      add(args, "--name", val("createName")); add(args, "--hostname", val("createHost"));
-      addSwitch(args, $("createOpen").checked, "--open"); addSwitch(args, $("createTor").checked, "--tor");
-      return args;
+      if ($("createName").value.trim()) args.push("--name", $("createName").value.trim());
+      if ($("createHost").value.trim()) args.push("--hostname", $("createHost").value.trim());
+      if ($("createOpen").checked) args.push("--open");
+      run(args);
     });
-    onForm("joinForm", () => {
-      const args = ["join", val("joinKey")];
-      add(args, "--name", val("joinName")); add(args, "--hostname", val("joinHost"));
-      addSwitch(args, $("joinFirewall").checked, "--auto-accept-firewall");
-      addSwitch(args, $("joinManualFiles").checked, "--no-auto-accept-files");
-      addSwitch(args, $("joinTor").checked, "--tor");
-      return args;
+    $("joinForm").addEventListener("submit", () => {
+      const args = ["join", $("joinKey").value.trim()];
+      if ($("joinHost").value.trim()) args.push("--hostname", $("joinHost").value.trim());
+      run(args);
     });
-    onForm("inviteForm", () => {
-      const args = ["invite", val("inviteNet")];
-      add(args, "--expires", val("inviteExpires")); add(args, "--hostname", val("inviteHost"));
-      addSwitch(args, $("inviteReusable").checked, "--reusable");
-      return args;
-    });
-    $("inviteList").onclick = () => run(["invite", val("inviteNet"), "list"], {json: true});
-    $("inviteRevokeBtn").onclick = () => run(["invite", val("inviteNet"), "revoke", val("inviteRevoke")]);
-    $("requestsBtn").onclick = () => run(["requests", val("memberNet")], {json: true});
-    $("acceptBtn").onclick = () => run(["accept", val("memberNet"), val("memberPeer")]);
-    $("denyBtn").onclick = () => run(["deny", val("memberNet"), val("memberPeer")]);
-    $("kickBtn").onclick = () => run(["kick", val("memberNet"), val("memberPeer")]);
-    $("leaveBtn").onclick = () => run(["leave", val("memberNet")]);
-    $("ephemeralBtn").onclick = () => run(["ephemeral", val("memberNet"), val("ephemeral") || "show"]);
-    $("renameBtn").onclick = () => run(["hostname", val("memberNet"), val("renameHost")]);
-    onForm("firewallAddForm", () => {
-      const args = ["firewall", "add", val("fwDir"), val("fwAction"), "-p", val("fwProto")];
-      add(args, "--port", val("fwPort")); add(args, "--peer", val("fwPeer")); add(args, "--network", val("fwNet"));
-      return args;
-    });
-    $("fwRemoveBtn").onclick = () => run(["firewall", "remove", val("fwRemove")]);
-    $("fwDefaultBtn").onclick = () => run(["firewall", "default", val("fwDefault")]);
-    $("fwRejectBtn").onclick = () => run(["firewall", "reject", val("fwReject")]);
-    $("fwPendingBtn").onclick = () => run(["firewall", "pending", val("fwReviewNet")], {json: true});
-    $("fwAcceptBtn").onclick = () => run(["firewall", "accept", val("fwReviewNet")]);
-    $("fwDenyBtn").onclick = () => run(["firewall", "deny", val("fwReviewNet")]);
-    $("sshAllowBtn").onclick = () => { const args = ["firewall", "ssh", "allow", val("sshNet"), val("sshPeer")]; add(args, "--user", val("sshUsers")); run(args); };
-    $("sshDenyBtn").onclick = () => run(["firewall", "ssh", "deny", val("sshNet"), val("sshPeer")]);
-    onForm("suggestForm", () => {
-      const args = ["firewall", "suggest", val("suggestNet"), "--subject", val("suggestSubject")];
-      val("suggestAllow").split(",").map(s => s.trim()).filter(Boolean).forEach(s => add(args, "--allow", s));
-      val("suggestDeny").split(",").map(s => s.trim()).filter(Boolean).forEach(s => add(args, "--deny", s));
-      return args;
-    });
-    $("fwAutoOn").onclick = () => run(["firewall", "auto-accept", val("suggestNet"), "on"]);
-    $("fwAutoOff").onclick = () => run(["firewall", "auto-accept", val("suggestNet"), "off"]);
-    onForm("sendForm", () => run(["send", val("sendPath"), val("sendPeer")]));
-    $("fileAcceptBtn").onclick = () => { const args = ["files", "accept", val("fileId")]; add(args, "--output", val("fileOut")); run(args); };
-    $("fileAutoBtn").onclick = () => run(["files", "auto-accept", val("fileNet"), val("fileAuto")]);
-    $("downloadDirShow").onclick = () => run(["files", "download-dir"]);
-    $("downloadDirSet").onclick = () => run(["files", "download-dir", val("downloadDir")]);
-    $("downloadDirClear").onclick = () => run(["files", "download-dir", "--clear"]);
-    $("downloadUserShow").onclick = () => run(["files", "download-user"]);
-    $("downloadUserSet").onclick = () => run(["files", "download-user", val("downloadUser")]);
-    $("downloadUserClear").onclick = () => run(["files", "download-user", "--clear"]);
-    onForm("connectForm", () => { const args = ["connect", val("connectId")]; add(args, "--hostname", val("connectHost")); return args; });
-    $("connectApprove").onclick = () => run(["connections", "approve", val("connectReq")]);
-    $("pairAccept").onclick = () => run(["pair", "accept", val("pairValue")]);
-    $("pairRestore").onclick = () => run(["pair", "restore", val("pairValue")]);
-    $("unpairBtn").onclick = () => run(["unpair", val("pairValue")]);
-    $("aliasSet").onclick = () => run(["alias", val("aliasNet"), "set", val("aliasKey"), val("aliasName")]);
-    $("aliasList").onclick = () => run(["alias", val("aliasNet"), "list"], {json: true});
-    $("aliasRm").onclick = () => run(["alias", val("aliasNet"), "rm", val("aliasName")]);
-    $("identityOf").onclick = () => run(["identityof", val("aliasNet"), val("aliasKey")], {json: true});
-    onForm("probeForm", () => ["ping", val("probePeer"), "-c", val("probeCount"), "-i", val("probeInterval")]);
-    $("configSet").onclick = () => { const args = ["config", "set", val("configKey"), val("configValue")]; addSwitch(args, $("configReplace").checked, "--replace"); run(args); };
-    $("configUnset").onclick = () => run(["config", "unset", val("configKey")]);
-    $("template").innerHTML = templates.map(t => `<option>${esc(t)}</option>`).join("");
-    $("useTemplate").onclick = () => { $("commandLine").value = $("template").value; $("commandLine").focus(); };
+
+    $("template").innerHTML = `<option value="">templates…</option>` +
+      templates.map(t => `<option>${esc(t)}</option>`).join("");
+    $("template").onchange = () => {
+      if ($("template").value) {
+        $("commandLine").value = $("template").value;
+        $("commandLine").focus();
+        $("template").value = "";
+      }
+    };
     $("runCommand").onclick = () => {
-      try { run(splitArgs(val("commandLine")), {json: $("advancedJson").checked}); }
-      catch (err) { out.textContent = String(err); }
+      const line = $("commandLine").value.trim();
+      if (!line) return;
+      try { run(splitArgs(line)); }
+      catch (err) { toast(String(err), true); }
     };
     $("commandLine").addEventListener("keydown", ev => {
       if (ev.key === "Enter") { ev.preventDefault(); $("runCommand").click(); }
     });
+
     refresh();
+    setInterval(refresh, 5000);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
   </script>
 </body>
 </html>

@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The `ray gui` dashboard got a redesign.** The overview now shows live data
+  instead of raw command output: a mesh map of your peers, per-network peer
+  tables with connection type and latency, and pending items (join requests,
+  firewall suggestions, file offers) as one-click chips. Status refreshes
+  quietly every few seconds, network name fields auto-complete, IPs and the
+  contact id copy on click, and the join form now labels `--name` as
+  "local name" so it is no longer mistaken for the device hostname.
+
 - **`RAYFISH_CONFIG_DIR` works on every platform.** The variable used to be read
   only on Android, so there was no way to point a desktop daemon at a config tree
   outside `/etc/rayfish` (Linux) or `~/.config/rayfish` (macOS). Set it and both
