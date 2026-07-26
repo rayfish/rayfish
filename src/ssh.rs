@@ -103,6 +103,57 @@ impl UserPolicy {
     fn permits(&self, name: &str, uid: u32) -> bool {
         self.any || self.users.contains(name) || (self.nonroot && uid != 0)
     }
+
+    /// Which logins this policy grants, phrased for the SSH banner. `None` when
+    /// the policy allows every user, since there is nothing the client needs
+    /// warning about.
+    fn restriction(&self) -> Option<String> {
+        if self.any {
+            return None;
+        }
+        let mut named: Vec<&str> = self.users.iter().map(String::as_str).collect();
+        named.sort_unstable();
+        Some(match (self.nonroot, named.is_empty()) {
+            (true, true) => "any user except root".to_string(),
+            (true, false) => format!("any user except root, plus {}", named.join(", ")),
+            (false, false) => named.join(", "),
+            (false, true) => "no users".to_string(),
+        })
+    }
+}
+
+/// The banner shown before authentication, or `None` when this peer can log in
+/// unrestricted and there is nothing to explain.
+///
+/// Without it a rejection is invisible: mesh SSH offers only the `none` method,
+/// so a client that is refused silently falls through to whatever the *system*
+/// sshd offers and prompts for a password. Every mesh SSH authorization problem
+/// then presents as "why is it asking for a password", or worse as a network
+/// fault, with the real reason only in this node's log where the person
+/// connecting cannot see it. Say it on the wire instead.
+fn auth_banner(policy: &UserPolicy, peer: &EndpointId, networks: &[SmolStr]) -> Option<String> {
+    let net = networks
+        .iter()
+        .min()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "<network>".to_string());
+    if !policy.authorized() {
+        return Some(format!(
+            "rayfish mesh SSH: peer {} is not authorized on this node.\r\n\
+             Authorize it here with: ray firewall ssh allow {net} {} [-u <users>]\r\n\
+             A password prompt after this line comes from the system sshd, not rayfish.\r\n",
+            peer.fmt_short(),
+            peer.fmt_short(),
+        ));
+    }
+    policy.restriction().map(|allowed| {
+        format!(
+            "rayfish mesh SSH: peer {} may log in as {allowed}.\r\n\
+             Widen it with: ray firewall ssh allow {net} {} -u '*'\r\n",
+            peer.fmt_short(),
+            peer.fmt_short(),
+        )
+    })
 }
 
 /// Accumulate the login policy for `user` (a peer's user identity) across the
@@ -242,7 +293,8 @@ async fn handle_conn(
     let user_identity = device_user_map.resolve(&peer_id);
     let policy = resolve_user_policy(&authz, &user_identity, &networks);
     debug!(%src, peer = %user_identity.fmt_short(), authorized = policy.authorized(), "mesh SSH connection");
-    let handler = SshHandler::new(policy, user_identity);
+    let banner = auth_banner(&policy, &user_identity, &networks);
+    let handler = SshHandler::new(policy, user_identity, banner);
     match russh::server::run_stream(config, stream, handler).await {
         Ok(session) => {
             let _ = session.await;
@@ -266,6 +318,9 @@ struct SshHandler {
     policy: UserPolicy,
     /// The connecting peer's user identity (for logging).
     user: EndpointId,
+    /// Shown before auth when the peer is unauthorized or restricted, so a
+    /// refusal reaches the person connecting instead of only this node's log.
+    banner: Option<String>,
     /// The unix user the client asked to log in as (the `user` in `user@host`).
     login_user: String,
     /// The resolved login account, set in `auth_none` once the requested user
@@ -279,10 +334,11 @@ struct SshHandler {
 }
 
 impl SshHandler {
-    fn new(policy: UserPolicy, user: EndpointId) -> Self {
+    fn new(policy: UserPolicy, user: EndpointId, banner: Option<String>) -> Self {
         Self {
             policy,
             user,
+            banner,
             login_user: String::new(),
             login: None,
             pty: None,
@@ -335,6 +391,10 @@ impl SshHandler {
 
 impl Handler for SshHandler {
     type Error = russh::Error;
+
+    async fn authentication_banner(&mut self) -> Result<Option<String>, Self::Error> {
+        Ok(self.banner.clone())
+    }
 
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
         self.login_user = user.to_string();
@@ -678,7 +738,18 @@ fn load_host_key() -> Result<PrivateKey> {
         return Ok(key);
     }
     let key = load_or_generate_host_key()?;
-    info!("mesh SSH: using generated host key");
+    // Loud, because the consequence lands on whoever connects, not here. With no
+    // system sshd key to reuse (a container with no `/etc/ssh`, a host with no
+    // sshd, an encrypted key) we present a key of our own, so a client that has
+    // this host in `known_hosts` from a LAN or public-IP session sees a different
+    // key for the same name and OpenSSH reports it as a possible MITM. Print the
+    // fingerprint so the operator can compare and confirm the swap themselves.
+    warn!(
+        fingerprint = %key.public_key().fingerprint(Default::default()),
+        "mesh SSH: no reusable system sshd host key found; serving a generated one. \
+         Clients that already know this host by another address will see a host-key \
+         change for the mesh name"
+    );
     Ok(key)
 }
 
@@ -762,6 +833,43 @@ mod tests {
         let mut b = [0u8; 32];
         b[0] = seed;
         iroh::SecretKey::from(b).public()
+    }
+
+    #[test]
+    fn banner_tells_an_unauthorized_peer_why_and_how_to_fix_it() {
+        // The whole point: without this the client only sees a password prompt
+        // from the system sshd and reads the refusal as a network problem.
+        let peer = id(7);
+        let nets = [SmolStr::new("trade"), SmolStr::new("homelab")];
+        let banner = auth_banner(&UserPolicy::default(), &peer, &nets)
+            .expect("an unauthorized peer must be told");
+        assert!(banner.contains("not authorized"));
+        assert!(banner.contains(&peer.fmt_short().to_string()));
+        assert!(banner.contains("ray firewall ssh allow homelab"));
+        assert!(banner.contains("system sshd"));
+    }
+
+    #[test]
+    fn banner_names_the_permitted_users_when_restricted() {
+        let peer = id(8);
+        let mut policy = UserPolicy::default();
+        policy.add(&[]); // the default grant: any non-root user
+        let banner = auth_banner(&policy, &peer, &[SmolStr::new("trade")])
+            .expect("a restricted peer must be told what it may use");
+        assert!(banner.contains("any user except root"));
+
+        let mut named = UserPolicy::default();
+        named.add(&["deploy".to_string(), "ci".to_string()]);
+        let banner = auth_banner(&named, &peer, &[SmolStr::new("trade")]).expect("restricted");
+        assert!(banner.contains("ci, deploy"), "users listed sorted: {banner}");
+    }
+
+    #[test]
+    fn no_banner_when_the_peer_may_log_in_as_anyone() {
+        // Nothing to warn about, so don't nag on every successful connection.
+        let mut policy = UserPolicy::default();
+        policy.add(&["*".to_string()]);
+        assert_eq!(auth_banner(&policy, &id(9), &[SmolStr::new("trade")]), None);
     }
 
     fn rule(peer: &str, users: &[&str]) -> crate::config::SshRule {
