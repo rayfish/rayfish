@@ -292,7 +292,13 @@ async fn build_daemon(
                                 // missed): drain without matching, so we never fall
                                 // back to hash-only matching and never stall the
                                 // provider by leaving its update channel unread.
-                                tracing::debug!(
+                                // Warn, not debug: every drop here is a pull whose
+                                // transfer can never be marked finished and whose
+                                // blob is never reclaimed, so the sender is left
+                                // showing "waiting to accept" forever. If this is
+                                // firing for real file transfers it is a bug, not
+                                // noise.
+                                tracing::warn!(
                                     connection_id,
                                     %hash,
                                     "provider event with no resolved peer; dropping"
@@ -309,6 +315,14 @@ async fn build_daemon(
                                         transfers.provider_progress(hash, peer, p.end_offset)
                                     }
                                     RequestUpdate::Completed(_) => {
+                                        // Once per transfer, and the only signal a
+                                        // sender gets that its file actually landed:
+                                        // worth an info line on both ends.
+                                        tracing::info!(
+                                            peer = %peer.fmt_short(),
+                                            %hash,
+                                            "peer finished pulling a blob from us"
+                                        );
                                         transfers.provider_finished(hash, peer, true);
                                         // Full pull: the receiver has the bytes, so
                                         // our copy can go. Dropped rather than

@@ -60,131 +60,149 @@ class SendService : Service() {
         // Blocking work (stage + FFI send) off the main thread. sendFile is a
         // synchronous FFI call. One thread per start command; stop this startId
         // when its batch finishes so concurrent shares each clean up independently.
+        //
+        // The whole body is guarded: anything thrown in here used to kill the thread
+        // before it could leave the foreground, stranding an ONGOING|NO_CLEAR
+        // notification with no service behind it to ever clear or update it. The
+        // batch is best-effort, the cleanup is not.
         thread(name = "rayfish-send-$startId") {
-            // sendFile does not return a transfer id, so we cannot name this batch's
-            // transfers directly. Instead bound them from both sides: take the max
-            // id already in the registry before offering anything, then again right
-            // after the offer loop finishes. This batch's transfers are exactly the
-            // ones present in the "after" snapshot with an id greater than the "before"
-            // max: newly created since we started, and already known to the registry
-            // by the time we start waiting.
-            //
-            // That two-sided bound is not sufficient by itself with two concurrent
-            // shares: it only excludes a batch that starts after this one's "after"
-            // snapshot. It does nothing about a batch whose offers land while this
-            // one is still in the middle of its own offer loop: each sendFile reads
-            // the whole file, hashes it, adds it to the blob store, and then dials
-            // the peer over QUIC with no client-side timeout, so that window can be
-            // long, not just seconds. Those ids are newly created and greater than
-            // maxIdBeforeBatch, so the after-snapshot would wrongly claim them as
-            // this batch's own. If that other batch's peer never accepts, this one
-            // would burn the full wait timeout for a file it delivered in seconds.
-            // So the region from taking the "before" max through the "after"
-            // snapshot is serialized behind batchLock: two batches' offers can never
-            // interleave, only one runs that region at a time.
-            //
-            // Staging (a full byte copy through ContentResolver) allocates no
-            // transfer ids, so it happens before the lock is taken: only the id
-            // snapshots and the sendFile loop itself, which must stay atomic with
-            // respect to id allocation, run inside it. The lock is released before
-            // the wait loop below, so concurrent batches still wait for their own
-            // peers in parallel; only the offering is serialized, not the (much
-            // longer) waiting. A batch can still be blocked by another batch's
-            // sendFile dialing an offline peer, but that is bounded by the QUIC
-            // dial itself rather than by staging plus dial.
-            var offered = 0
-            var failed = 0
-            val staged = uris.mapNotNull { uri -> stageUriForSend(applicationContext, uri) }
-            failed += uris.size - staged.size
-
-            // Wake the recipient before offering. The picker lists idle peers (on an
-            // on-demand node most reachable peers are idle), so "picked" says nothing
-            // about reachability. This dials once, outside the offer loop and outside
-            // batchLock, so a slow dial doesn't stall another batch's offers. Returns
-            // immediately when a link is already up.
-            //
-            // A failed wake is not a send failure: the offer still goes out and parks
-            // in the core's outbox until the peer reappears. Say that in the
-            // notification instead of implying the transfer is on its way.
-            updateOngoingNotification(uris.size, peerName, "Waking $peerName…")
-            val awake = runCatching {
-                NodeHolder.get(applicationContext).wakePeer(peerId)
-            }.getOrDefault(false)
-            updateOngoingNotification(
-                uris.size, peerName,
-                if (awake) null else "$peerName is not answering, queued until it's back",
-            )
-
-            val maxIdBeforeBatch: Long?
-            val batchIds: Set<ULong>?
-            synchronized(batchLock) {
-                maxIdBeforeBatch = runCatching {
-                    NodeHolder.get(applicationContext).listTransfers().maxOfOrNull { it.id.toLong() } ?: -1L
-                }.getOrNull()
-
-                for (file in staged) {
-                    try {
-                        NodeHolder.get(applicationContext).sendFile(file.absolutePath, peerId)
-                        offered++
-                    } catch (t: Throwable) {
-                        failed++
-                        Log.w(TAG, "send failed for ${file.name}", t)
-                    } finally {
-                        // Bytes are in the blob store now; the staging copy is no
-                        // longer needed. Remove the file and its per-item dir.
-                        runCatching { file.parentFile?.deleteRecursively() ?: file.delete() }
-                    }
-                }
-
-                batchIds = if (maxIdBeforeBatch == null) {
-                    null
-                } else {
-                    runCatching {
-                        NodeHolder.get(applicationContext).listTransfers()
-                            .mapNotNullTo(HashSet()) { it.id.takeIf { id -> id.toLong() > maxIdBeforeBatch } }
-                    }.getOrNull()
-                }
+            try {
+                runBatch(peerId, peerName, uris)
+            } catch (t: Throwable) {
+                Log.e(TAG, "send batch to $peerName failed", t)
+                runCatching { notifyFailure(peerName, uris.size) }
+            } finally {
+                stopForegroundCompat()
+                stopSelf(startId)
             }
-
-            // The offers are delivered, but the bytes have not moved: the peer pulls
-            // them when it accepts. Stay foreground and let TransferNotifier report
-            // real progress until every transfer reaches a terminal state, so the
-            // user sees a progress bar and then a genuine "sent".
-            //
-            // A manual accept on the other end can take arbitrarily long, and an
-            // indefinite foreground service is not acceptable, so give up the
-            // service after WAIT_TIMEOUT_MS. The transfer is not cancelled by that:
-            // it keeps running in the core, and the background poller in
-            // RayfishVpnService posts the result whenever it lands, provided the node
-            // is still alive (VPN on, or in standby).
-            //
-            // If either snapshot failed, we cannot bound this batch at all: waiting
-            // on an unscoped count would silently reinstate the same bug the scoping
-            // was meant to kill, so don't wait rather than wait on everything.
-            if (offered > 0 && batchIds != null) {
-                val deadline = System.currentTimeMillis() + WAIT_TIMEOUT_MS
-                while (System.currentTimeMillis() < deadline) {
-                    TransferNotifier.poll(applicationContext)
-                    val pending = runCatching {
-                        NodeHolder.get(applicationContext).listTransfers()
-                            .count {
-                                it.outgoing && it.id in batchIds &&
-                                    (it.state == TransferState.OFFERED || it.state == TransferState.TRANSFERRING)
-                            }
-                    }.getOrDefault(0)
-                    if (pending == 0) break
-                    Thread.sleep(POLL_INTERVAL_MS)
-                }
-                TransferNotifier.poll(applicationContext)
-            } else if (offered > 0) {
-                TransferNotifier.poll(applicationContext)
-            }
-
-            if (failed > 0) notifyFailure(peerName, failed)
-            stopForegroundCompat()
-            stopSelf(startId)
         }
         return START_NOT_STICKY
+    }
+
+    /** One share batch: stage the URIs, wake the peer, offer each file, then stay
+     * foreground reporting progress until the batch settles or [WAIT_TIMEOUT_MS]
+     * passes. Throwing is survivable; the caller always leaves the foreground. */
+    private fun runBatch(peerId: String, peerName: String, uris: List<Uri>) {
+        // sendFile does not return a transfer id, so we cannot name this batch's
+        // transfers directly. Instead bound them from both sides: take the max
+        // id already in the registry before offering anything, then again right
+        // after the offer loop finishes. This batch's transfers are exactly the
+        // ones present in the "after" snapshot with an id greater than the "before"
+        // max: newly created since we started, and already known to the registry
+        // by the time we start waiting.
+        //
+        // That two-sided bound is not sufficient by itself with two concurrent
+        // shares: it only excludes a batch that starts after this one's "after"
+        // snapshot. It does nothing about a batch whose offers land while this
+        // one is still in the middle of its own offer loop: each sendFile reads
+        // the whole file, hashes it, adds it to the blob store, and then dials
+        // the peer over QUIC with no client-side timeout, so that window can be
+        // long, not just seconds. Those ids are newly created and greater than
+        // maxIdBeforeBatch, so the after-snapshot would wrongly claim them as
+        // this batch's own. If that other batch's peer never accepts, this one
+        // would burn the full wait timeout for a file it delivered in seconds.
+        // So the region from taking the "before" max through the "after"
+        // snapshot is serialized behind batchLock: two batches' offers can never
+        // interleave, only one runs that region at a time.
+        //
+        // Staging (a full byte copy through ContentResolver) allocates no
+        // transfer ids, so it happens before the lock is taken: only the id
+        // snapshots and the sendFile loop itself, which must stay atomic with
+        // respect to id allocation, run inside it. The lock is released before
+        // the wait loop below, so concurrent batches still wait for their own
+        // peers in parallel; only the offering is serialized, not the (much
+        // longer) waiting. A batch can still be blocked by another batch's
+        // sendFile dialing an offline peer, but that is bounded by the QUIC
+        // dial itself rather than by staging plus dial.
+        var offered = 0
+        var failed = 0
+        val staged = uris.mapNotNull { uri -> stageUriForSend(applicationContext, uri) }
+        failed += uris.size - staged.size
+
+        // Wake the recipient before offering. The picker lists idle peers (on an
+        // on-demand node most reachable peers are idle), so "picked" says nothing
+        // about reachability. This dials once, outside the offer loop and outside
+        // batchLock, so a slow dial doesn't stall another batch's offers. Returns
+        // immediately when a link is already up.
+        //
+        // A failed wake is not a send failure: the offer still goes out and parks
+        // in the core's outbox until the peer reappears. Say that in the
+        // notification instead of implying the transfer is on its way.
+        updateOngoingNotification(uris.size, peerName, "Waking $peerName…")
+        val awake = runCatching {
+            NodeHolder.get(applicationContext).wakePeer(peerId)
+        }.getOrDefault(false)
+        updateOngoingNotification(
+            uris.size, peerName,
+            if (awake) null else "$peerName is not answering, queued until it's back",
+        )
+
+        val maxIdBeforeBatch: Long?
+        val batchIds: Set<ULong>?
+        synchronized(batchLock) {
+            maxIdBeforeBatch = runCatching {
+                NodeHolder.get(applicationContext).listTransfers().maxOfOrNull { it.id.toLong() } ?: -1L
+            }.getOrNull()
+
+            for (file in staged) {
+                try {
+                    NodeHolder.get(applicationContext).sendFile(file.absolutePath, peerId)
+                    offered++
+                } catch (t: Throwable) {
+                    failed++
+                    Log.w(TAG, "send failed for ${file.name}", t)
+                } finally {
+                    // Bytes are in the blob store now; the staging copy is no
+                    // longer needed. Remove the file and its per-item dir.
+                    runCatching { file.parentFile?.deleteRecursively() ?: file.delete() }
+                }
+            }
+
+            batchIds = if (maxIdBeforeBatch == null) {
+                null
+            } else {
+                runCatching {
+                    NodeHolder.get(applicationContext).listTransfers()
+                        .mapNotNullTo(HashSet()) { it.id.takeIf { id -> id.toLong() > maxIdBeforeBatch } }
+                }.getOrNull()
+            }
+        }
+
+        // The offers are delivered, but the bytes have not moved: the peer pulls
+        // them when it accepts. Stay foreground and let TransferNotifier report
+        // real progress until every transfer reaches a terminal state, so the
+        // user sees a progress bar and then a genuine "sent".
+        //
+        // A manual accept on the other end can take arbitrarily long, and an
+        // indefinite foreground service is not acceptable, so give up the
+        // service after WAIT_TIMEOUT_MS. The transfer is not cancelled by that:
+        // it keeps running in the core, and the background poller in
+        // RayfishVpnService posts the result whenever it lands, provided the node
+        // is still alive (VPN on, or in standby).
+        //
+        // If either snapshot failed, we cannot bound this batch at all: waiting
+        // on an unscoped count would silently reinstate the same bug the scoping
+        // was meant to kill, so don't wait rather than wait on everything.
+        if (offered > 0 && batchIds != null) {
+            val deadline = System.currentTimeMillis() + WAIT_TIMEOUT_MS
+            while (System.currentTimeMillis() < deadline) {
+                runCatching { TransferNotifier.poll(applicationContext) }
+                val pending = runCatching {
+                    NodeHolder.get(applicationContext).listTransfers()
+                        .count {
+                            it.outgoing && it.id in batchIds &&
+                                (it.state == TransferState.OFFERED || it.state == TransferState.TRANSFERRING)
+                        }
+                }.getOrDefault(0)
+                if (pending == 0) break
+                Thread.sleep(POLL_INTERVAL_MS)
+            }
+            runCatching { TransferNotifier.poll(applicationContext) }
+        } else if (offered > 0) {
+            runCatching { TransferNotifier.poll(applicationContext) }
+        }
+
+        if (failed > 0) notifyFailure(peerName, failed)
     }
 
     /** Prefer the ClipData URIs (the set the read grant was issued for); fall back
@@ -205,21 +223,29 @@ class SendService : Service() {
     }
 
     private fun startForegroundNotification(count: Int, peerName: String) {
+        postOngoing(count, peerName, null)
+    }
+
+    /** Update the ongoing notification's status line.
+     *
+     * Goes through `startForeground` again rather than `NotificationManager.notify`,
+     * even though both target NOTIF_ONGOING. A plain `notify` to a foreground
+     * service's own id posts a notification the service does not own: the two
+     * writers then disagree about the FOREGROUND_SERVICE/NO_CLEAR flags, and
+     * `stopForeground(STOP_FOREGROUND_REMOVE)` can leave the last one stranded on
+     * screen with no service behind it to ever clear it. Re-calling
+     * `startForeground` keeps a single owner for the id. */
+    private fun updateOngoingNotification(count: Int, peerName: String, status: String?) {
+        runCatching { postOngoing(count, peerName, status) }
+    }
+
+    private fun postOngoing(count: Int, peerName: String, status: String?) {
         TransferNotifier.ensureChannel(this)
-        val notification = buildOngoing(count, peerName, null)
+        val notification = buildOngoing(count, peerName, status)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(NOTIF_ONGOING, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
             startForeground(NOTIF_ONGOING, notification)
-        }
-    }
-
-    /** Re-post the ongoing notification with a new status line. Same id, so it
-     * replaces in place rather than stacking; the service stays foreground. */
-    private fun updateOngoingNotification(count: Int, peerName: String, status: String?) {
-        runCatching {
-            getSystemService(NotificationManager::class.java)
-                .notify(NOTIF_ONGOING, buildOngoing(count, peerName, status))
         }
     }
 
