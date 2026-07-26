@@ -790,6 +790,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -878,6 +880,8 @@ fun uniffi_ray_mobile_checksum_method_node_submit_code(
 fun uniffi_ray_mobile_checksum_method_node_unpair(
 ): Short
 fun uniffi_ray_mobile_checksum_method_node_up(
+): Short
+fun uniffi_ray_mobile_checksum_method_node_wake_peer(
 ): Short
 fun uniffi_ray_mobile_checksum_constructor_node_new(
 ): Short
@@ -1010,6 +1014,8 @@ fun uniffi_ray_mobile_fn_method_node_unpair(`ptr`: Pointer,uniffi_out_err: Uniff
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_up(`ptr`: Pointer,`tunFd`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_ray_mobile_fn_method_node_wake_peer(`ptr`: Pointer,`peer`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
 fun ffi_ray_mobile_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun ffi_ray_mobile_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1245,6 +1251,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_up() != 62370.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_wake_peer() != 45813.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_constructor_node_new() != 39092.toShort()) {
@@ -1889,6 +1898,17 @@ public interface NodeInterface {
      * Requires [`Node::start`] first.
      */
     fun `up`(`tunFd`: kotlin.Int)
+    
+    /**
+     * Dial an idle peer to check it is really reachable before sending to it,
+     * and leave the link up so the file offer lands on an awake device. Returns
+     * false when the peer did not answer; the caller can still send, the offer
+     * just parks in the outbox until the peer comes back.
+     *
+     * Blocks for up to the core's lazy-dial timeout. Cheap and immediate when a
+     * live connection already exists. A stopped node returns false.
+     */
+    fun `wakePeer`(`peer`: kotlin.String): kotlin.Boolean
     
     companion object
 }
@@ -2614,6 +2634,27 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     
 
     
+    /**
+     * Dial an idle peer to check it is really reachable before sending to it,
+     * and leave the link up so the file offer lands on an awake device. Returns
+     * false when the peer did not answer; the caller can still send, the offer
+     * just parks in the outbox until the peer comes back.
+     *
+     * Blocks for up to the core's lazy-dial timeout. Cheap and immediate when a
+     * live connection already exists. A stopped node returns false.
+     */override fun `wakePeer`(`peer`: kotlin.String): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_wake_peer(
+        it, FfiConverterString.lower(`peer`),_status)
+}
+    }
+    )
+    }
+    
+
+    
 
     
     
@@ -3005,13 +3046,13 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
 
 
 /**
- * One peer in a network snapshot. `online` reflects a live connection.
+ * One peer in a network snapshot.
  */
 data class PeerInfo (
     var `ipv4`: kotlin.String, 
     var `nodeId`: kotlin.String, 
     var `hostname`: kotlin.String, 
-    var `online`: kotlin.Boolean
+    var `state`: PeerConnState
 ) {
     
     companion object
@@ -3026,7 +3067,7 @@ public object FfiConverterTypePeerInfo: FfiConverterRustBuffer<PeerInfo> {
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
-            FfiConverterBoolean.read(buf),
+            FfiConverterTypePeerConnState.read(buf),
         )
     }
 
@@ -3034,14 +3075,14 @@ public object FfiConverterTypePeerInfo: FfiConverterRustBuffer<PeerInfo> {
             FfiConverterString.allocationSize(value.`ipv4`) +
             FfiConverterString.allocationSize(value.`nodeId`) +
             FfiConverterString.allocationSize(value.`hostname`) +
-            FfiConverterBoolean.allocationSize(value.`online`)
+            FfiConverterTypePeerConnState.allocationSize(value.`state`)
     )
 
     override fun write(value: PeerInfo, buf: ByteBuffer) {
             FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`nodeId`, buf)
             FfiConverterString.write(value.`hostname`, buf)
-            FfiConverterBoolean.write(value.`online`, buf)
+            FfiConverterTypePeerConnState.write(value.`state`, buf)
     }
 }
 
@@ -3257,6 +3298,43 @@ public object FfiConverterTypeLinkAction : FfiConverterRustBuffer<LinkAction>{
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+/**
+ * Three-state peer liveness, mirroring [`ipc::PeerState`]. `Idle` is not
+ * "unreachable": on an on-demand node (which mobile always is) every link
+ * self-closes after the idle timeout, so a reachable peer sits in `Idle` until
+ * something dials it. Only `Offline` means a reach attempt recently failed.
+ */
+
+enum class PeerConnState {
+    
+    ACTIVE,
+    IDLE,
+    OFFLINE;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePeerConnState: FfiConverterRustBuffer<PeerConnState> {
+    override fun read(buf: ByteBuffer) = try {
+        PeerConnState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: PeerConnState) = 4UL
+
+    override fun write(value: PeerConnState, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
     }
 }
 

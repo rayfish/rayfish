@@ -73,7 +73,7 @@ use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::hostname;
 use rayfish::identity;
 use rayfish::invite;
-use rayfish::ipc::IpcMessage;
+use rayfish::ipc::{self, IpcMessage};
 use rayfish::membership::{self, GroupMode};
 use tokio::runtime::Runtime;
 
@@ -117,13 +117,34 @@ pub struct NetworkInfo {
     pub pending: bool,
 }
 
-/// One peer in a network snapshot. `online` reflects a live connection.
+/// Three-state peer liveness, mirroring [`ipc::PeerState`]. `Idle` is not
+/// "unreachable": on an on-demand node (which mobile always is) every link
+/// self-closes after the idle timeout, so a reachable peer sits in `Idle` until
+/// something dials it. Only `Offline` means a reach attempt recently failed.
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
+pub enum PeerConnState {
+    Active,
+    Idle,
+    Offline,
+}
+
+impl From<ipc::PeerState> for PeerConnState {
+    fn from(s: ipc::PeerState) -> Self {
+        match s {
+            ipc::PeerState::Active => Self::Active,
+            ipc::PeerState::Idle => Self::Idle,
+            ipc::PeerState::Offline => Self::Offline,
+        }
+    }
+}
+
+/// One peer in a network snapshot.
 #[derive(uniffi::Record)]
 pub struct PeerInfo {
     pub ipv4: String,
     pub node_id: String,
     pub hostname: String,
-    pub online: bool,
+    pub state: PeerConnState,
 }
 
 /// One network this node belongs to, with its peers.
@@ -277,7 +298,7 @@ impl Node {
 
 /// Build an offline status snapshot from the on-disk config, used when the node
 /// is stopped so the UI can still show the user's saved networks. Everything is
-/// reported offline: `running` is false and every peer's `online` is false. The
+/// reported offline: `running` is false and every peer's state is `Offline`. The
 /// per-network address/hostname come straight from the saved membership.
 ///
 /// The device's own node id and mesh addresses are derived from the persisted
@@ -334,7 +355,7 @@ fn saved_networks_status() -> Status {
                     ipv4: m.ip.to_string(),
                     node_id: m.identity.to_string(),
                     hostname: m.hostname.clone().unwrap_or_default(),
-                    online: false,
+                    state: PeerConnState::Offline,
                 })
                 .collect();
             NetworkDetail {
@@ -662,6 +683,20 @@ impl Node {
         if let Ok(state) = self.state() {
             self.runtime.block_on(state.network_changed());
         }
+    }
+
+    /// Dial an idle peer to check it is really reachable before sending to it,
+    /// and leave the link up so the file offer lands on an awake device. Returns
+    /// false when the peer did not answer; the caller can still send, the offer
+    /// just parks in the outbox until the peer comes back.
+    ///
+    /// Blocks for up to the core's lazy-dial timeout. Cheap and immediate when a
+    /// live connection already exists. A stopped node returns false.
+    pub fn wake_peer(&self, peer: String) -> bool {
+        let Ok(state) = self.state() else {
+            return false;
+        };
+        self.runtime.block_on(state.wake_peer(&peer))
     }
 
     pub fn send_file(&self, path: String, peer: String) -> Result<(), RayError> {
@@ -1034,14 +1069,14 @@ impl Node {
                     ipv4: p.ip.to_string(),
                     node_id: p.endpoint_id.to_string(),
                     hostname: p.hostname.clone().unwrap_or_default(),
-                    online: p.connection.is_some(),
+                    state: p.state.into(),
                 })
                 .collect();
             flat_peers.extend(peers.iter().map(|p| PeerInfo {
                 ipv4: p.ipv4.clone(),
                 node_id: p.node_id.clone(),
                 hostname: p.hostname.clone(),
-                online: p.online,
+                state: p.state,
             }));
             detail.push(NetworkDetail {
                 name: n.name.clone(),
@@ -1096,10 +1131,14 @@ impl Node {
             .iter()
             .map(|n| NetworkHealth {
                 name: n.name.clone(),
-                connected: n.peers.iter().any(|p| p.online),
+                connected: n.peers.iter().any(|p| p.state == PeerConnState::Active),
             })
             .collect();
-        let peers_online = s.peers.iter().filter(|p| p.online).count() as u32;
+        let peers_online = s
+            .peers
+            .iter()
+            .filter(|p| p.state == PeerConnState::Active)
+            .count() as u32;
         HealthSnapshot {
             running: s.running,
             network_count: s.networks.len() as u32,

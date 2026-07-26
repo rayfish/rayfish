@@ -22,6 +22,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.NetworkDetail
 import xyz.rayfish.android.NodeHolder
+import xyz.rayfish.android.isActive
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
 
@@ -75,13 +76,13 @@ fun NetworkDetailScreen(
             KeyValueRow("Role", if (detail.isCoordinator) "coordinator" else "member")
         }
         SectionCard {
-            SectionLabel("Peers · ${detail.peers.count { it.online }} online")
+            SectionLabel("Peers · ${detail.peers.count { it.isActive }} online")
             if (detail.peers.isEmpty()) Text("No peers yet", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Faint)
             detail.peers.forEach { p ->
                 Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp))
                     .clickable { copyToClipboard(context, p.hostname.ifEmpty { "peer" }, p.ipv4); onToast("Copied ${p.ipv4}") }
                     .padding(top = 9.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.size(6.dp).clip(RoundedCornerShape(3.dp)).background(if (p.online) Rf.Emerald else Rf.Faint))
+                    Box(Modifier.size(6.dp).clip(RoundedCornerShape(3.dp)).background(if (p.isActive) Rf.Emerald else Rf.Faint))
                     Spacer(Modifier.width(8.dp))
                     Text(p.ipv4, fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Body)
                     Spacer(Modifier.weight(1f))

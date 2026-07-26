@@ -17,6 +17,7 @@ object Rf {
     val Rose500 = Color(0xFFF43F5E)
     val Rose600 = Color(0xFFE11D48)
     val Emerald = Color(0xFF34D399)     // emerald-400
+    val Amber = Color(0xFFFBBF24)       // amber-400: idle, reachable but not connected
     val OnPrimary = Color(0xFF18181B)   // text on white pills
     val Primary = Color(0xFFF4F4F5)     // white pill fill
 }

@@ -21,6 +21,7 @@ import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.NetworkDetail
 import uniffi.ray_mobile.Status
 import xyz.rayfish.android.NodeHolder
+import xyz.rayfish.android.isActive
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.qr.QrImage
 import xyz.rayfish.android.ui.qr.rememberQrScanner
@@ -62,14 +63,14 @@ fun NetworksScreen(
                     // peer is reachable, grey when online but nobody's connected.
                     val dot = when {
                         !running -> Rf.Rose500
-                        net.peers.any { it.online } -> Rf.Emerald
+                        net.peers.any { it.isActive } -> Rf.Emerald
                         else -> Rf.Faint
                     }
                     Box(Modifier.size(8.dp).clip(RoundedCornerShape(4.dp)).background(dot))
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
                         Text(net.name, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-                        Text("${net.hostname.ifEmpty { net.ipv4 }} · ${if (running) "${net.peers.count { it.online }} online" else "offline"}",
+                        Text("${net.hostname.ifEmpty { net.ipv4 }} · ${if (running) "${net.peers.count { it.isActive }} online" else "offline"}",
                             fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Muted)
                     }
                     // The device's stable .ray DNS name in this network. Prefer

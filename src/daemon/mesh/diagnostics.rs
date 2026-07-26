@@ -415,6 +415,46 @@ impl Daemon {
         None
     }
 
+    /// Wake an idle peer so a caller can tell, before committing to a transfer,
+    /// whether it is actually reachable. Returns true when a live mesh link
+    /// exists once this returns.
+    ///
+    /// On an on-demand node every link self-closes after the idle timeout, so a
+    /// perfectly reachable peer holds no connection and reports `Idle`. This
+    /// dials it (which also stamps reachability, flipping the peer to `Offline`
+    /// in `status` when the dial fails) and leaves the link up, so the file
+    /// offer's own `FILES_ALPN` dial lands on an already-awake device.
+    ///
+    /// Part of the embedding API (used by `ray-mobile`'s share picker).
+    pub async fn wake_peer(&self, peer: &str) -> bool {
+        let Some(id) = self.resolve_peer_flexible(peer).await else {
+            return false;
+        };
+        // A live link already exists (the peer table only holds connected peers).
+        if self.registry.peers.v4_for_id(&id).is_some() {
+            return true;
+        }
+        let Some(ip) = self.member_ipv4(&id) else {
+            return false;
+        };
+        match self.registry.resolve_route(IpAddr::V4(ip)) {
+            Some(target) => self.registry.dial_target(&target).await,
+            None => false,
+        }
+    }
+
+    /// The peer's mesh IPv4 as recorded in the roster, for peers with no live
+    /// connection (where `PeerTable::v4_for_id` has nothing).
+    fn member_ipv4(&self, id: &EndpointId) -> Option<Ipv4Addr> {
+        for entry in self.registry.networks.iter() {
+            let state = entry.value().state.read().unwrap();
+            if let Some(m) = state.members.all().iter().find(|m| &m.identity == id) {
+                return Some(m.ip);
+            }
+        }
+        None
+    }
+
     /// Active liveness probe: send `count` `Ping` control messages over the
     /// peer's live mesh connection and time each `Pong` reply.
     pub(crate) async fn ping(&self, peer: &str, count: u32, interval_ms: u64) -> IpcMessage {

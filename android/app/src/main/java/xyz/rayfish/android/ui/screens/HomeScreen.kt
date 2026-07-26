@@ -29,6 +29,7 @@ import xyz.rayfish.android.NodeHolder
 import xyz.rayfish.android.RayfishVpnService
 import xyz.rayfish.android.TransferKey
 import xyz.rayfish.android.TransferNotifier
+import xyz.rayfish.android.isActive
 import xyz.rayfish.android.moveToDownloads
 import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
@@ -84,7 +85,7 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     }
 
     val nets = status?.networks ?: emptyList()
-    val online = nets.sumOf { n -> n.peers.count { it.online } }
+    val online = nets.sumOf { n -> n.peers.count { it.isActive } }
     val banner = when {
         starting -> "Starting"
         vpnOn -> "Connected · ${nets.size} network${if (nets.size == 1) "" else "s"}"

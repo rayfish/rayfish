@@ -97,6 +97,24 @@ class SendService : Service() {
             val staged = uris.mapNotNull { uri -> stageUriForSend(applicationContext, uri) }
             failed += uris.size - staged.size
 
+            // Wake the recipient before offering. The picker lists idle peers (on an
+            // on-demand node most reachable peers are idle), so "picked" says nothing
+            // about reachability. This dials once, outside the offer loop and outside
+            // batchLock, so a slow dial doesn't stall another batch's offers. Returns
+            // immediately when a link is already up.
+            //
+            // A failed wake is not a send failure: the offer still goes out and parks
+            // in the core's outbox until the peer reappears. Say that in the
+            // notification instead of implying the transfer is on its way.
+            updateOngoingNotification(uris.size, peerName, "Waking $peerName…")
+            val awake = runCatching {
+                NodeHolder.get(applicationContext).wakePeer(peerId)
+            }.getOrDefault(false)
+            updateOngoingNotification(
+                uris.size, peerName,
+                if (awake) null else "$peerName is not answering, queued until it's back",
+            )
+
             val maxIdBeforeBatch: Long?
             val batchIds: Set<ULong>?
             synchronized(batchLock) {
@@ -188,18 +206,32 @@ class SendService : Service() {
 
     private fun startForegroundNotification(count: Int, peerName: String) {
         TransferNotifier.ensureChannel(this)
-        val label = if (count == 1) "1 item" else "$count items"
-        val notification: Notification = Notification.Builder(this, TransferNotifier.CHANNEL_ID)
-            .setContentTitle("Sending to $peerName")
-            .setContentText("$label over Rayfish")
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setOngoing(true)
-            .build()
+        val notification = buildOngoing(count, peerName, null)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(NOTIF_ONGOING, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
             startForeground(NOTIF_ONGOING, notification)
         }
+    }
+
+    /** Re-post the ongoing notification with a new status line. Same id, so it
+     * replaces in place rather than stacking; the service stays foreground. */
+    private fun updateOngoingNotification(count: Int, peerName: String, status: String?) {
+        runCatching {
+            getSystemService(NotificationManager::class.java)
+                .notify(NOTIF_ONGOING, buildOngoing(count, peerName, status))
+        }
+    }
+
+    /** `status` overrides the default item-count line (used for the wake step). */
+    private fun buildOngoing(count: Int, peerName: String, status: String?): Notification {
+        val label = if (count == 1) "1 item" else "$count items"
+        return Notification.Builder(this, TransferNotifier.CHANNEL_ID)
+            .setContentTitle("Sending to $peerName")
+            .setContentText(status ?: "$label over Rayfish")
+            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setOngoing(true)
+            .build()
     }
 
     /** Staging or offer failures only. Successful sends are reported per transfer by
