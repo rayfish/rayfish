@@ -272,6 +272,9 @@ pub(crate) async fn reconverge_and_apply(
         network_name,
         my_identity,
     );
+    // The mirror of the prune: a peer we are already connected to that this roster
+    // now lists, but whose connection never got registered for this network.
+    attach_rejoined_peers(peers, device_user_map, &roster, network_name, my_identity).await;
     apply_suggested_firewall(firewall, my_identity, network_name, state);
     // If a local rename is still unconfirmed by this just-applied blob, keep
     // delivering it to the coordinator set until it lands.
@@ -363,6 +366,52 @@ pub(crate) fn prune_departed_peers(
                 b"removed from network",
             );
         }
+    }
+}
+
+/// Register the connections we already hold for peers this roster lists but whose
+/// link was never registered for `network`.
+///
+/// One connection carries every network two peers share, and it is registered per
+/// network as each side's `MeshHello` for that network is processed. A hello is
+/// only registered if the network's roster already names the sender, so one that
+/// arrives while the roster is still converging (a restart, a fresh join, a blob
+/// that lands after the link) is dropped and never retried: the connection then
+/// carries a network the peer table does not list. That is not cosmetic, the set
+/// is the in-band reachability wall, so `resolve_inbound_by_id` drops the
+/// network's inbound datagrams and `ray status` shows the peer `Idle` on it while
+/// it is plainly `Active` on another. Reconverge is the right place to repair it:
+/// it runs exactly when a verified roster arrives, which is the information that
+/// was missing when the hello landed.
+pub(crate) async fn attach_rejoined_peers(
+    peers: &PeerTable,
+    device_user_map: &peers::DeviceUserMap,
+    members: &[Member],
+    network_name: &str,
+    my_identity: EndpointId,
+) {
+    for m in members {
+        if m.identity == my_identity {
+            continue;
+        }
+        // The roster keys a paired peer by its user identity, while the peer table
+        // is keyed on the transport (device) id, so resolve through the same map
+        // the prune pass uses before looking the connection up.
+        let Some((ip, ipv6, conn)) = peers.connected_device_for(&m.identity, device_user_map)
+        else {
+            continue;
+        };
+        if peers.attach_network(&ip, &ipv6, network_name).is_none() {
+            continue;
+        }
+        tracing::info!(
+            peer = %m.identity.fmt_short(),
+            network = %network_name,
+            "attached an existing connection to a network its handshake missed"
+        );
+        // The peer cannot decode datagrams tagged with a handle it has never been
+        // told about, so the repair is only half done until we re-announce.
+        crate::daemon::announce_network_handles(peers, &conn, ip).await;
     }
 }
 

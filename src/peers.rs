@@ -464,6 +464,64 @@ impl PeerTable {
             .and_then(|e| e.out_handles.get(network).copied())
     }
 
+    /// Resolve a roster identity to the live connection we hold for that device.
+    /// The roster names a paired peer by its *user* identity while this table is
+    /// keyed on the transport (device) id, so try the identity directly and then
+    /// every device mapped to it. Returns the peer's addresses with its connection.
+    pub fn connected_device_for(
+        &self,
+        identity: &EndpointId,
+        device_user_map: &DeviceUserMap,
+    ) -> Option<(Ipv4Addr, Ipv6Addr, Connection)> {
+        let by_id = |id: &EndpointId| {
+            let ip = *self.by_id.get(id)?.value();
+            let e = self.v4.get(&ip)?;
+            Some((ip, membership::derive_ipv6(id), e.conn.clone()))
+        };
+        by_id(identity).or_else(|| {
+            device_user_map
+                .devices_for(identity)
+                .into_iter()
+                .find_map(|dev| by_id(&dev))
+        })
+    }
+
+    /// Add `network` to the shared set of a peer we already hold a live connection
+    /// to, assigning it an outbound handle. Returns the handle if this call added
+    /// the network (so the caller announces it), `None` if the peer has no entry
+    /// or already shared the network.
+    ///
+    /// Repairs the ordering hole between the handshake and the roster: a peer's
+    /// `MeshHello` for a network is only registered if that network's roster
+    /// already lists the sender ([`handle_member_hello`]), so a hello that lands
+    /// while the roster is still converging (a restart, a fresh join) leaves the
+    /// connection carrying a network the peer table doesn't know about. Nothing
+    /// else repairs that: the entry is only rebuilt by a fresh dial, and until
+    /// then `resolve_inbound_by_id` drops the network's datagrams and `ray status`
+    /// reports the peer `Idle` on it while it is plainly connected on another.
+    ///
+    /// [`handle_member_hello`]: crate::daemon::mesh
+    pub fn attach_network(&self, ip: &Ipv4Addr, ipv6: &Ipv6Addr, network: &str) -> Option<u16> {
+        let net = SmolStr::new(network);
+        // The v4 entry owns handle allocation; v6 mirrors whatever it decides, so
+        // both halves stamp the same handle for the network.
+        let handle = {
+            let mut e = self.v4.get_mut(ip)?;
+            if e.networks.contains(&net) {
+                return None;
+            }
+            let h = next_free_handle(&e.out_handles);
+            e.networks.insert(net.clone());
+            e.out_handles.insert(net.clone(), h);
+            h
+        };
+        if let Some(mut e) = self.v6.get_mut(ipv6) {
+            e.networks.insert(net.clone());
+            e.out_handles.insert(net, handle);
+        }
+        Some(handle)
+    }
+
     /// Merge one `(handle → network)` mapping into a peer's inbound decode table,
     /// keyed by the peer's endpoint id. Upsert (not replace), so announcing one
     /// network's handle doesn't clobber the decode entries for the peer's other
@@ -977,6 +1035,18 @@ impl DeviceUserMap {
             .unwrap_or(*transport_key)
     }
 
+    /// Every device key currently mapped to `user_identity`. The inverse of
+    /// [`resolve`](Self::resolve), for callers holding a roster identity (which is
+    /// the user identity for a paired peer) that need the device the peer table is
+    /// keyed on.
+    pub fn devices_for(&self, user_identity: &EndpointId) -> Vec<EndpointId> {
+        self.inner
+            .iter()
+            .filter(|e| e.value() == user_identity)
+            .map(|e| *e.key())
+            .collect()
+    }
+
     /// Drop a device's mapping so it stops resolving to a user identity. Used by
     /// `ray unpair` to demote a revoked device to a plain peer immediately (its
     /// user's firewall rules and own-device file auto-accept no longer apply).
@@ -1193,6 +1263,71 @@ mod tests {
         // Both networks route over the one connection.
         let route = table.lookup_v4(&ip).expect("peer routable");
         assert_eq!(route.conn.stable_id(), conn.stable_id());
+    }
+
+    #[tokio::test]
+    async fn attach_network_admits_a_network_the_handshake_missed() {
+        // A peer's `MeshHello` for "n2" is only registered if n2's roster already
+        // lists the sender, so a hello that arrives mid-reconverge leaves the
+        // connection carrying a network the table doesn't know. Reconverge repairs
+        // it with `attach_network` once the roster names the peer.
+        let (_srv, _cli, conn, _client_side) = connected_pair().await;
+        let peer = conn.remote_id();
+        let ip = crate::membership::derive_ip(&peer);
+        let ipv6 = crate::membership::derive_ipv6(&peer);
+        let table = PeerTable::new();
+        table.add(ip, ipv6, conn.clone(), peer, "n1");
+
+        // Before the repair the peer is invisible on n2 (this is what shows as
+        // `Idle` in `ray status` while it is Active on n1).
+        assert!(table.peers_for_network_with_conn("n2").is_empty());
+
+        let handle = table
+            .attach_network(&ip, &ipv6, "n2")
+            .expect("attaching an unshared network assigns a handle");
+        assert_eq!(table.peers_for_network_with_conn("n2").len(), 1);
+        assert_eq!(table.out_handle(&ip, "n2"), Some(handle));
+        // n1 keeps its own distinct handle: the repair must not collide with or
+        // clobber the networks already negotiated on this connection.
+        assert_ne!(table.out_handle(&ip, "n1"), Some(handle));
+        assert_eq!(table.peers_for_network_with_conn("n1").len(), 1);
+
+        // Idempotent: a later reconverge re-running the repair changes nothing.
+        assert_eq!(table.attach_network(&ip, &ipv6, "n2"), None);
+        assert_eq!(table.out_handle(&ip, "n2"), Some(handle));
+        // A peer we hold no connection to cannot be attached.
+        let absent = "100.99.99.99".parse().unwrap();
+        let absent6 = crate::membership::derive_ipv6(&conn.remote_id());
+        assert_eq!(table.attach_network(&absent, &absent6, "n2"), None);
+    }
+
+    #[tokio::test]
+    async fn attach_network_reopens_the_reachability_wall_for_that_network() {
+        // The missing network is not cosmetic: `resolve_inbound_by_id` drops every
+        // datagram tagged with a network the peer entry does not list, so an
+        // unrepaired entry silently blackholes that network's traffic.
+        let (_srv, _cli, conn, _client_side) = connected_pair().await;
+        let peer = conn.remote_id();
+        let ip = crate::membership::derive_ip(&peer);
+        let ipv6 = crate::membership::derive_ipv6(&peer);
+        let table = PeerTable::new();
+        table.add(ip, ipv6, conn.clone(), peer, "n1");
+        // The peer announced its handle for n2; we just never joined it to the
+        // entry's shared set.
+        table.add_inbound_handle_by_id(&peer, 7, SmolStr::new("n2"));
+
+        assert_eq!(
+            table.resolve_inbound_by_id(&peer, 7),
+            None,
+            "n2 datagrams must be dropped while the entry does not share n2"
+        );
+
+        table.attach_network(&ip, &ipv6, "n2");
+        assert_eq!(
+            table.resolve_inbound_by_id(&peer, 7),
+            Some((ip, SmolStr::new("n2"))),
+            "after the repair the same datagram must be accepted on n2"
+        );
     }
 
     #[tokio::test]
