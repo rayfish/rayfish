@@ -163,6 +163,34 @@ object TransferNotifier {
      * leftover ongoing notification from before the stop still gets cleaned up
      * on the next poll. Safe to call when nothing is running.
      */
+    /**
+     * Stop reporting on [ids] and clear whatever is on screen for them.
+     *
+     * For an outgoing offer the sender only learns the transfer finished from the
+     * receiver pulling the bytes. A receiver that already holds the blob (the same
+     * file sent twice: blobs are content-addressed) pulls nothing, so no such
+     * signal ever arrives and the entry sits at OFFERED for the life of the
+     * process. Left alone, "Waiting for X to accept" stays on screen forever for a
+     * file that was delivered fine.
+     *
+     * So when the driver that was watching a batch gives up, it retires those
+     * notifications rather than abandoning them. Marking them terminal is the
+     * important half: [pruneVanished] only clears ids that leave the registry, and
+     * a stuck OFFERED entry never does, so without this the next poll would just
+     * post it again.
+     */
+    fun retire(context: Context, ids: Set<ULong>) {
+        if (ids.isEmpty()) return
+        synchronized(this) {
+            val nm = context.getSystemService(NotificationManager::class.java)
+            for (id in ids) {
+                runCatching { nm.cancel(notifId(id)) }
+                postedProgress.remove(id)
+                terminal.add(id)
+            }
+        }
+    }
+
     fun reset(context: Context) {
         synchronized(this) {
             val nm = context.getSystemService(NotificationManager::class.java)

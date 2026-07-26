@@ -76,21 +76,43 @@ pub async fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigura
 
     #[cfg(target_os = "linux")]
     {
-        if let Some(c) = try_systemd_resolved_dbus(tun_name).await {
-            c.apply().await?;
-            return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
+        // Every backend below hands `.ray` to a DNS manager, which only helps if
+        // the C library actually asks that manager. When resolved is running but
+        // out of the resolution path, all three resolved-backed paths (D-Bus,
+        // resolvectl, and the resolvconf shim that redirects into resolved) apply
+        // cleanly and resolve nothing: `resolvectl query x.ray` answers while
+        // `getent hosts x.ray` fails. Skip them so we fall through to writing
+        // resolv.conf ourselves, which is what the host is really reading.
+        let resolved_in_path = resolved_is_in_resolution_path().await;
+        if !resolved_in_path {
+            tracing::info!(
+                "systemd-resolved is not in this host's resolution path \
+                 (/etc/resolv.conf does not point at the stub and nsswitch.conf has no \
+                 `resolve`); configuring /etc/resolv.conf directly instead"
+            );
+        }
+
+        if resolved_in_path {
+            if let Some(c) = try_systemd_resolved_dbus(tun_name).await {
+                c.apply().await?;
+                return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
+            }
         }
         if let Some(c) = try_networkmanager_dbus(tun_name).await {
             c.apply().await?;
             return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
         }
-        if let Some(c) = try_systemd_resolved_cli(tun_name) {
-            c.apply().await?;
-            return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
+        if resolved_in_path {
+            if let Some(c) = try_systemd_resolved_cli(tun_name) {
+                c.apply().await?;
+                return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
+            }
         }
-        if let Some(c) = try_resolvconf() {
-            c.apply().await?;
-            return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
+        if resolved_in_path || !resolvconf_is_resolved_shim() {
+            if let Some(c) = try_resolvconf() {
+                c.apply().await?;
+                return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
+            }
         }
         let c = DirectResolvConf::new().await;
         c.apply().await?;
@@ -458,6 +480,67 @@ mod linux {
 // ---------------------------------------------------------------------------
 // Linux: systemd-resolved via D-Bus
 // ---------------------------------------------------------------------------
+
+/// The stub listeners systemd-resolved binds. A `nameserver` line naming either
+/// one means glibc queries reach resolved.
+#[cfg(target_os = "linux")]
+const RESOLVED_STUB_IPS: [Ipv4Addr; 2] = [
+    Ipv4Addr::new(127, 0, 0, 53),
+    Ipv4Addr::new(127, 0, 0, 54),
+];
+
+/// Whether name lookups on this host actually reach systemd-resolved.
+///
+/// Resolved running is not the same as resolved being consulted: cloud images
+/// ship it enabled while leaving a static `/etc/resolv.conf` full of upstream
+/// servers (`resolvectl status` calls this `resolv.conf mode: foreign`). There
+/// glibc talks to the upstreams directly and every split-DNS domain we register
+/// is dead on arrival. Two ways in, either is enough:
+///   - `/etc/resolv.conf` names a stub listener, so the normal DNS path lands on
+///     resolved;
+///   - `/etc/nsswitch.conf` lists the `resolve` module, so glibc calls resolved
+///     over D-Bus before it ever reads resolv.conf.
+#[cfg(target_os = "linux")]
+async fn resolved_is_in_resolution_path() -> bool {
+    let resolv = tokio::fs::read_to_string("/etc/resolv.conf")
+        .await
+        .unwrap_or_default();
+    if resolv_conf_points_at_resolved(&resolv) {
+        return true;
+    }
+
+    let nsswitch = tokio::fs::read_to_string("/etc/nsswitch.conf")
+        .await
+        .unwrap_or_default();
+    nsswitch_uses_resolve(&nsswitch)
+}
+
+#[cfg(target_os = "linux")]
+fn resolv_conf_points_at_resolved(contents: &str) -> bool {
+    parse_resolv_nameservers(contents)
+        .iter()
+        .any(|ip| RESOLVED_STUB_IPS.contains(ip))
+}
+
+#[cfg(target_os = "linux")]
+fn nsswitch_uses_resolve(contents: &str) -> bool {
+    contents
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter_map(|l| l.strip_prefix("hosts:"))
+        .any(|l| l.split_whitespace().any(|m| m == "resolve"))
+}
+
+/// Whether the `resolvconf` binary is systemd's compatibility symlink to
+/// `resolvectl`. If it is, the resolvconf backend is just another door into
+/// resolved and inherits its "not in the resolution path" problem.
+#[cfg(target_os = "linux")]
+fn resolvconf_is_resolved_shim() -> bool {
+    ["/sbin/resolvconf", "/usr/sbin/resolvconf"]
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .any(|p| p.file_name().is_some_and(|n| n == "resolvectl"))
+}
 
 #[cfg(target_os = "linux")]
 struct SystemdResolvedDBus {
@@ -1338,6 +1421,36 @@ mod tests {
         assert!(out.starts_with("# Added by rayfish"));
         assert!(out.contains("nameserver 100.100.100.53"));
         assert!(out.contains("search homelab.ray ray"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn foreign_resolv_conf_does_not_count_as_reaching_resolved() {
+        // Verbatim from a Vultr Ubuntu image where resolved runs but nothing
+        // asks it: registering `.ray` on the tun link there resolves nothing.
+        let c = "nameserver 108.61.10.10\nnameserver 9.9.9.9\nnameserver 2001:19f0:300:1704::6\n";
+        assert!(!resolv_conf_points_at_resolved(c));
+        assert!(!nsswitch_uses_resolve("hosts:          files dns\n"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stub_resolv_conf_counts_as_reaching_resolved() {
+        assert!(resolv_conf_points_at_resolved("nameserver 127.0.0.53\noptions edns0\n"));
+        assert!(resolv_conf_points_at_resolved("nameserver 127.0.0.54\n"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn nsswitch_resolve_module_counts_as_reaching_resolved() {
+        // glibc calls resolved over D-Bus here, so resolv.conf never matters.
+        assert!(nsswitch_uses_resolve(
+            "passwd: files\nhosts: mymachines resolve [!UNAVAIL=return] files dns\n"
+        ));
+        // A commented-out line is not configuration, and `resolve` has to be a
+        // whole module name rather than a substring of another one.
+        assert!(!nsswitch_uses_resolve("# hosts: resolve files\n"));
+        assert!(!nsswitch_uses_resolve("hosts: files resolvectl dns\n"));
     }
 
     #[test]

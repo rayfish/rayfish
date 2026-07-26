@@ -198,6 +198,19 @@ class SendService : Service() {
                 Thread.sleep(POLL_INTERVAL_MS)
             }
             runCatching { TransferNotifier.poll(applicationContext) }
+            // Anything still merely OFFERED once we stop watching is never going
+            // to resolve on its own. The sender only learns a transfer finished by
+            // the receiver pulling the bytes, and a receiver that already holds
+            // this blob pulls nothing at all, so the entry stays OFFERED for the
+            // life of the process and "Waiting for X to accept" would sit on
+            // screen forever for a file that arrived fine. Retire those instead of
+            // abandoning them; the offer itself is delivered and still stands.
+            val abandoned = runCatching {
+                NodeHolder.get(applicationContext).listTransfers()
+                    .filter { it.outgoing && it.id in batchIds && it.state == TransferState.OFFERED }
+                    .mapTo(HashSet()) { it.id }
+            }.getOrDefault(emptySet())
+            runCatching { TransferNotifier.retire(applicationContext, abandoned) }
         } else if (offered > 0) {
             runCatching { TransferNotifier.poll(applicationContext) }
         }
