@@ -208,7 +208,14 @@ object TransferNotifier {
             waiting && !RayfishVpnService.isRunning ->
                 "Waiting for ${t.peer} to accept · only notified if Rayfish stays running"
             waiting -> "Waiting for ${t.peer} to accept"
+            // Spell the percentage out next to the bar. The bar alone reads as
+            // "something is happening" but not how far along it is, and a large
+            // file's bar can look frozen for a while. `pct` is -1 only when the
+            // bar is indeterminate anyway (waiting, or an empty file), so those
+            // cases fall through to the plain text.
+            t.outgoing && pct >= 0 -> "To ${t.peer} ($pct%)"
             t.outgoing -> "To ${t.peer}"
+            pct >= 0 -> "From ${t.peer} ($pct%)"
             else -> "From ${t.peer}"
         }
         val builder = Notification.Builder(context, CHANNEL_ID)

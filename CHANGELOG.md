@@ -17,6 +17,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Android transfer notifications show the percentage next to the progress
+  bar.** A bar on its own says something is moving but not how far along it is,
+  and on a large file it can look stuck.
+
 - **The `ray gui` dashboard got a redesign.** The overview now shows live data
   instead of raw command output: a mesh map of your peers, per-network peer
   tables with connection type and latency, and pending items (join requests,
@@ -41,6 +45,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   peer on a build older than this one cannot redeem them.
 
 ### Fixed
+
+- **Sharing from the Android app no longer says "No peers online" when peers are
+  right there.** The app runs the mesh on demand, so a link closes after a couple
+  of idle minutes and the share picker, which only listed peers holding a live
+  connection, went empty. It now lists every peer in your networks and marks each
+  one connected, idle, or offline. Picking an idle peer wakes it first and the
+  notification says so; if it does not answer, the files queue and deliver when it
+  comes back, same as before.
 
 - **Android: turning the VPN off no longer crashes the app.** If a DNS lookup was
   still in flight the moment the tunnel came down, the system resolver delivered
