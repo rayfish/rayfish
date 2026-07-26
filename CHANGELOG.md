@@ -51,6 +51,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Magic DNS works on hosts where systemd-resolved runs but nothing asks it.**
+  Many cloud images (Vultr, some Hetzner and DigitalOcean builds) leave
+  `systemd-resolved` enabled while `/etc/resolv.conf` still points straight at
+  the provider's nameservers. rayfish handed `.ray` to resolved anyway, so
+  `resolvectl query host.ray` answered while `ping host.ray` said "Name or
+  service not known", and every name-based command silently failed. rayfish now
+  checks that resolved is actually in the host's resolution path before using
+  it, and takes over `/etc/resolv.conf` when it isn't.
+
+- **`ray up` warns when the host firewall will swallow mesh SSH.** The embedded
+  SSH server cannot bind port 22 next to a system sshd, so it listens on 30022
+  and rewrites the port internally. A ufw or firewalld rule allowing "22/tcp"
+  therefore does not cover it, and the connection hangs with no clue anywhere:
+  ping works, the mesh is up, SSH just stops. rayfish now detects that case and
+  prints the exact command to open it. It only ever reads your firewall.
+
+- **Peers no longer show as `Idle` on one shared network while connected on
+  another.** One connection carries every network two peers share, but it was
+  only registered for the networks whose roster already listed the peer when its
+  handshake arrived. A hello that landed mid-reconverge (after a restart, or a
+  fresh join) left the link carrying a network the peer table didn't know about,
+  which showed as `Idle` in `ray status` **and** silently dropped that network's
+  inbound traffic until something re-dialed. Reconverge now repairs it.
+
+- **A failed mesh SSH login says why.** Mesh SSH offers only identity-based
+  auth, so a peer that wasn't authorized was refused with no explanation and the
+  client fell through to a password prompt from the system sshd. Every
+  authorization problem looked like a password or network problem. The server
+  now sends the reason and the `ray firewall ssh allow` command that fixes it.
+
+- **Reverting DNS no longer deletes `/etc/resolv.conf`.** If the backup was
+  missing, the revert removed the file outright, taking the host's entire DNS
+  with it over what should have been an undo of one line. It now edits our own
+  entries out in place and leaves anything it didn't write alone.
+
 - **File transfers no longer leave a copy of every file behind.** The blob store
   each transfer runs through was never cleaned up, so `blobs/` kept a copy of
   everything you had ever sent, and everything you had ever received sat there a
