@@ -311,10 +311,10 @@
           <button data-run="report">report issue</button>
         </div>
         <div class="cmdbar">
-          <select id="template"><option value="">templates…</option></select>
-          <input id="commandLine" placeholder="any ray command, e.g. firewall add in allow -p tcp --port 22" autocomplete="off">
+          <input id="commandLine" list="cmdlist" placeholder="type a ray command, suggestions appear as you type" autocomplete="off">
           <button id="runCommand" class="primary">Run</button>
         </div>
+        <datalist id="cmdlist"></datalist>
         <pre id="output"></pre>
       </div>
     </section>
@@ -743,15 +743,7 @@
       run(args);
     });
 
-    $("template").innerHTML = `<option value="">templates…</option>` +
-      templates.map(t => `<option>${esc(t)}</option>`).join("");
-    $("template").onchange = () => {
-      if ($("template").value) {
-        $("commandLine").value = $("template").value;
-        $("commandLine").focus();
-        $("template").value = "";
-      }
-    };
+    $("cmdlist").innerHTML = templates.map(t => `<option>${esc(t)}</option>`).join("");
     $("runCommand").onclick = () => {
       const line = $("commandLine").value.trim();
       if (!line) return;
