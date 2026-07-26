@@ -11,12 +11,12 @@
 use super::transfers;
 use super::*;
 use std::ffi::CString;
-use std::io::Read;
 use std::path::PathBuf;
 
 use futures::StreamExt;
 use iroh_blobs::api::remote::GetProgressItem;
 use serde::{Deserialize, Serialize};
+use tokio_util::io::ReaderStream;
 
 /// Upper bound on one background offer dial. `Endpoint::connect` retries
 /// discovery with no timeout of its own; the outbox retries on the next
@@ -28,6 +28,66 @@ const OFFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// sweep only catches offers whose delivery failed transiently while the
 /// connection stayed up.
 pub(crate) const OUTBOX_SWEEP_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Tag naming for transfer blobs, and the reclaim that follows a tag going away.
+///
+/// A blob in the store is kept alive by a tag; GC sweeps whatever no tag points
+/// at. Nothing here used to delete tags, so `config_dir()/blobs` grew forever:
+/// every file ever sent stayed next to the original, and every file ever
+/// received stayed next to the copy in Downloads. Both ends now tag for exactly
+/// as long as they need the bytes and reclaim afterwards.
+///
+/// Names are derived, not stored: the sender's tag is keyed by `(hash, peer)`,
+/// so the right tag can be found again after a restart without persisting
+/// anything alongside the outbox.
+///
+/// Both names are per-transfer rather than per-blob, and that is what makes the
+/// refcount work. The same file can go to several people, so two outstanding
+/// sends of one file are two tags over one blob and the bytes survive until the
+/// last of them is picked up; likewise two offers of the same file from
+/// different senders are two receive tags, so accepting one cannot sweep the
+/// blob the other is still fetching.
+mod blob_tags {
+    use super::*;
+
+    pub(super) fn send(hash: &blake3::Hash, peer: &EndpointId) -> String {
+        format!("send/{}/{}", hash.to_hex(), peer.fmt_short())
+    }
+
+    /// Keyed by the pending offer's id, which is unique per received offer.
+    pub(super) fn recv(hash: &iroh_blobs::Hash, offer_id: u64) -> String {
+        format!("recv/{hash}/{offer_id}")
+    }
+}
+
+impl FileService {
+    /// Drop `tag`, making its blob collectable if nothing else points at it. The
+    /// store's periodic GC (see `BLOB_GC_INTERVAL`) does the actual reclaim;
+    /// `Blobs::delete` is private precisely so callers go through GC.
+    ///
+    /// Best-effort and detached: a failed reclaim wastes disk, it never fails
+    /// the transfer that triggered it, so the error is logged and swallowed.
+    fn reclaim_blob(self: &Arc<Self>, tag: String) {
+        let svc = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(e) = svc.transport.blob_store.tags().delete(&tag).await {
+                tracing::warn!(%tag, error = %e, "could not drop blob tag");
+            }
+        });
+    }
+
+    /// Point a persistent tag at a freshly imported blob so GC leaves it alone,
+    /// and release the import's temp tag now that something durable holds it.
+    async fn tag_blob(&self, tag: String, temp: iroh_blobs::api::TempTag) -> Result<(), String> {
+        let haf = temp.hash_and_format();
+        self.transport
+            .blob_store
+            .tags()
+            .set(tag, haf)
+            .await
+            .map_err(|e| format!("blob store error: {e}"))
+    }
+}
 
 fn outbox_path() -> Option<PathBuf> {
     config::config_dir().ok().map(|d| d.join("outbox.json"))
@@ -137,7 +197,7 @@ impl FileService {
 
     /// `FILES_ALPN`: read a single `FileOffer` and queue it for `ray files`.
     /// Rejects offers whose claimed sender doesn't match the dialing identity.
-    pub(crate) async fn accept_file_offer(&self, conn: Connection) {
+    pub(crate) async fn accept_file_offer(self: &Arc<Self>, conn: Connection) {
         let pending = self.pending_files.clone();
         let counter = self.file_id_counter.clone();
         let remote_id = conn.remote_id();
@@ -206,7 +266,7 @@ impl FileService {
     /// *our own* user identity (a paired device) **and** it is a member of at
     /// least one network with `auto_accept_files` enabled. Never removes the
     /// pending entry unless it actually accepts (via `accept_file`).
-    pub(crate) async fn try_auto_accept_file(&self, id: u64) {
+    pub(crate) async fn try_auto_accept_file(self: &Arc<Self>, id: u64) {
         // Peek the offer's sender without consuming the queue entry.
         let from = {
             let pending = self.pending_files.lock().unwrap();
@@ -256,7 +316,7 @@ impl FileService {
     /// Fetch a pending file's blob from its sender, write it to disk, and (when a
     /// `peer_cred` is given) chown it to that user. Removes the pending entry.
     pub(crate) async fn accept_file(
-        &self,
+        self: &Arc<Self>,
         id: u64,
         output: Option<String>,
         peer_cred: Option<(u32, u32)>,
@@ -299,6 +359,21 @@ impl FileService {
         // the file is actually on disk.
         let finish_guard = transfers::FinishGuard::new(self.transfers.clone(), transfer_id);
 
+        // Claim the blob before fetching it. `fetch` leaves what it downloads
+        // untagged, so a GC triggered by some other transfer finishing mid-fetch
+        // would sweep the bytes out from under us. The tag is dropped again as
+        // soon as the file reaches its destination, on every exit path below.
+        let recv_tag = blob_tags::recv(&blob_hash, pending_file.id);
+        if let Err(e) = self
+            .transport
+            .blob_store
+            .tags()
+            .set(&recv_tag, iroh_blobs::HashAndFormat::raw(blob_hash))
+            .await
+        {
+            return ipc_err(format!("blob store error: {e}"));
+        }
+
         // `fetch` returns a `GetProgress`: awaiting it directly discards the
         // progress, so take the stream instead and report bytes as they land. It
         // yields `Progress(n)` items (n = payload bytes read so far) and exactly
@@ -317,20 +392,15 @@ impl FileService {
                 Some(GetProgressItem::Progress(n)) => self.transfers.note_progress(transfer_id, n),
                 Some(GetProgressItem::Done(_)) => break,
                 Some(GetProgressItem::Error(e)) => {
+                    self.reclaim_blob(recv_tag);
                     return ipc_err(format!("blob fetch failed: {e}"));
                 }
                 None => {
+                    self.reclaim_blob(recv_tag);
                     return ipc_err("blob fetch ended without a result".to_string());
                 }
             }
         }
-
-        let bytes = match self.transport.blob_store.blobs().get_bytes(blob_hash).await {
-            Ok(b) => b,
-            Err(e) => {
-                return ipc_err(format!("blob read failed: {e}"));
-            }
-        };
 
         let dir = match output {
             Some(ref p) => PathBuf::from(p),
@@ -342,13 +412,30 @@ impl FileService {
         };
 
         if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.reclaim_blob(recv_tag);
             return ipc_err(format!("cannot create directory '{}': {e}", dir.display()));
         }
 
+        // Export straight from the blob store to the destination. The obvious
+        // alternative, `get_bytes` + `fs::write`, materializes the whole file in
+        // memory first (iroh-blobs documents it as "will run out of memory when
+        // called for very large blobs"), which on a phone sharing a video is a
+        // kill, not a slowdown. The fetch above already streamed the bytes to
+        // disk, so there is no reason to route them through RAM again.
         let dest = dir.join(&pending_file.filename);
-        if let Err(e) = std::fs::write(&dest, &bytes) {
+        if let Err(e) = self
+            .transport
+            .blob_store
+            .blobs()
+            .export(blob_hash, &dest)
+            .await
+        {
+            self.reclaim_blob(recv_tag);
             return ipc_err(format!("write failed: {e}"));
         }
+        // The file is where the user wanted it, so the store's copy is now pure
+        // duplication: every accepted file used to be kept twice, forever.
+        self.reclaim_blob(recv_tag);
 
         if let Some((uid, gid)) = peer_cred {
             use std::os::unix::ffi::OsStrExt;
@@ -432,17 +519,39 @@ impl FileService {
     /// callers (ray-mobile), where daemon and app share one privilege domain.
     pub(crate) async fn send_file(self: &Arc<Self>, path: &str, peer: &str) -> IpcMessage {
         let file_path = Path::new(path);
-        let file_bytes = match std::fs::read(file_path) {
-            Ok(b) => b,
-            Err(e) => {
-                return ipc_err(format!("cannot read '{}': {e}", file_path.display()));
-            }
+        // Same guard the fd path applies: a FIFO or a character device would
+        // stall or balloon the import.
+        let size = match std::fs::metadata(file_path) {
+            Ok(m) if m.is_file() => m.len(),
+            Ok(_) => return ipc_err(format!("not a regular file: '{}'", file_path.display())),
+            Err(e) => return ipc_err(format!("cannot read '{}': {e}", file_path.display())),
         };
         let filename = file_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "file".to_string());
-        self.send_bytes(file_bytes, filename, peer).await
+
+        let peer_id = match self.registry.resolve_peer_flexible(peer).await {
+            Some(id) => id,
+            None => return ipc_err(format!("unknown peer '{peer}'")),
+        };
+        // `add_path` streams the file into the blob store a chunk at a time (and
+        // reflinks instead of copying where the filesystem supports it). Reading
+        // the whole file into a `Vec` first, as this used to, meant peak memory of
+        // one full file per concurrent send, which is what killed the Android app
+        // on large videos.
+        let temp = match self
+            .transport
+            .blob_store
+            .blobs()
+            .add_path(file_path)
+            .temp_tag()
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => return ipc_err(format!("blob store error: {e}")),
+        };
+        self.queue_offer(peer_id, peer, filename, size, temp).await
     }
 
     /// `send_file` for a descriptor received over IPC (`SendFileFd`): the
@@ -455,60 +564,71 @@ impl FileService {
         filename: &str,
         peer: &str,
     ) -> IpcMessage {
-        let mut file = File::from(fd);
+        let file = File::from(fd);
         // fstat before reading: an fd is attacker-chosen input, and reading a
         // FIFO or a device (/dev/zero) here would stall or balloon the daemon.
-        match file.metadata() {
-            Ok(m) if m.is_file() => {}
+        let size = match file.metadata() {
+            Ok(m) if m.is_file() => m.len(),
             Ok(_) => return ipc_err("not a regular file"),
             Err(e) => return ipc_err(format!("cannot stat file: {e}")),
-        }
-        let mut file_bytes = Vec::new();
-        if let Err(e) = file.read_to_end(&mut file_bytes) {
-            return ipc_err(format!("cannot read file: {e}"));
-        }
+        };
         // The client names the file; keep only the basename so a hostile
         // client can't smuggle path components into the offer.
         let filename = Path::new(filename)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "file".to_string());
-        self.send_bytes(file_bytes, filename, peer).await
-    }
 
-    /// Shared tail of the send flow: blob-store the bytes, queue the offer,
-    /// and reply immediately. Delivery is asynchronous: a background flush
-    /// attempts it right away, and the outbox re-flushes whenever a mesh
-    /// connection to the peer comes up, so a send to an offline peer parks
-    /// here instead of making the caller wait on an unbounded dial.
-    async fn send_bytes(
-        self: &Arc<Self>,
-        file_bytes: Vec<u8>,
-        filename: String,
-        peer: &str,
-    ) -> IpcMessage {
         let peer_id = match self.registry.resolve_peer_flexible(peer).await {
             Some(id) => id,
-            None => {
-                return ipc_err(format!("unknown peer '{peer}'"));
-            }
+            None => return ipc_err(format!("unknown peer '{peer}'")),
         };
-
-        let size = file_bytes.len() as u64;
-        let hash = blake3::hash(&file_bytes);
-
-        if let Err(e) = self
+        // There is no path to hand `add_path` here, only the caller's fd, so feed
+        // the store a chunk stream off the descriptor. Same reason as the path
+        // case: `read_to_end` into a `Vec` put the whole file in RAM.
+        let chunks = ReaderStream::new(tokio::fs::File::from_std(file));
+        let temp = match self
             .transport
             .blob_store
             .blobs()
-            .add_slice(&file_bytes)
+            .add_stream(chunks)
+            .await
+            .temp_tag()
             .await
         {
-            return ipc_err(format!("blob store error: {e}"));
+            Ok(t) => t,
+            Err(e) => return ipc_err(format!("blob store error: {e}")),
+        };
+        self.queue_offer(peer_id, peer, filename, size, temp).await
+    }
+
+    /// Shared tail of the send flow: pin the imported blob with a durable tag,
+    /// queue the offer, and reply immediately. Delivery is asynchronous: a
+    /// background flush attempts it right away, and the outbox re-flushes
+    /// whenever a mesh connection to the peer comes up, so a send to an offline
+    /// peer parks here instead of making the caller wait on an unbounded dial.
+    ///
+    /// `temp` is the import's temp tag. It keeps the blob alive only as long as
+    /// it is held, so the durable `send/<hash>/<peer>` tag has to be in place
+    /// before it drops at the end of this function. The sender's copy is
+    /// reclaimed when the peer finishes pulling it (see `note_send_completed`),
+    /// not here: the offer can sit undelivered for days, and the bytes have to
+    /// outlive that wait.
+    async fn queue_offer(
+        self: &Arc<Self>,
+        peer_id: EndpointId,
+        peer: &str,
+        filename: String,
+        size: u64,
+        temp: iroh_blobs::api::TempTag,
+    ) -> IpcMessage {
+        let hash = blake3::Hash::from_bytes(*temp.hash().as_bytes());
+        if let Err(e) = self.tag_blob(blob_tags::send(&hash, &peer_id), temp).await {
+            return ipc_err(e);
         }
 
         // Register the transfer now, before the peer can possibly learn the hash:
-        // it is only after `add_slice` above that the blob exists to be pulled,
+        // it is only after the import above that the blob exists to be pulled,
         // and on auto-accept the receiver can fetch the entire blob the moment
         // the offer lands, so every provider event (Started/Progress/Completed)
         // must find the entry already registered.
@@ -546,6 +666,18 @@ impl FileService {
             )
         };
         IpcMessage::Ok { message }
+    }
+
+    /// The peer finished pulling a blob we offered it: our copy has done its job,
+    /// so drop this send's tag and let GC reclaim the bytes if nothing else
+    /// points at them. Driven by the provider's `Completed` event, which is the
+    /// only authoritative "they got it" a sender ever gets.
+    ///
+    /// Not called on an aborted pull: a peer that gave up halfway will retry, and
+    /// the outbox offer is still live.
+    pub(crate) fn note_send_completed(self: &Arc<Self>, hash: iroh_blobs::Hash, peer: EndpointId) {
+        let hash = blake3::Hash::from_bytes(*hash.as_bytes());
+        self.reclaim_blob(blob_tags::send(&hash, &peer));
     }
 
     /// Distinct peers with queued sends that hold a live mesh connection right
@@ -741,7 +873,11 @@ impl FileService {
     /// Toggle this node's per-network auto-accept of file offers from our own
     /// paired devices (persisted in config). Turning it on also drains any
     /// already-queued offers that now qualify.
-    pub(crate) async fn files_auto_accept(&self, network: &str, enabled: bool) -> IpcMessage {
+    pub(crate) async fn files_auto_accept(
+        self: &Arc<Self>,
+        network: &str,
+        enabled: bool,
+    ) -> IpcMessage {
         if !self.registry.contains(network) {
             return ipc_err(format!("network '{network}' not found"));
         }
@@ -926,5 +1062,133 @@ mod tests {
         assert_eq!(loaded[0].filename, entry.filename);
         assert_eq!(loaded[0].size, entry.size);
         assert_eq!(loaded[0].blob_hash, entry.blob_hash);
+    }
+
+    /// Two outstanding sends of one file must be two tags over one blob, so the
+    /// first pickup cannot sweep the bytes the second recipient still needs.
+    #[test]
+    fn send_tags_are_per_recipient() {
+        let hash = blake3::hash(b"same file");
+        let a = SecretKey::from([1u8; 32]).public();
+        let b = SecretKey::from([2u8; 32]).public();
+        assert_ne!(blob_tags::send(&hash, &a), blob_tags::send(&hash, &b));
+        // ...and stable, since the name is re-derived rather than stored: the
+        // reclaim after a daemon restart has to find the same tag.
+        assert_eq!(blob_tags::send(&hash, &a), blob_tags::send(&hash, &a));
+    }
+
+    /// Same, for two senders offering identical content: accepting one offer
+    /// must not collect the blob the other is still fetching.
+    #[test]
+    fn recv_tags_are_per_offer() {
+        let hash = iroh_blobs::Hash::from_bytes(*blake3::hash(b"same file").as_bytes());
+        assert_ne!(blob_tags::recv(&hash, 1), blob_tags::recv(&hash, 2));
+    }
+
+    /// A short-interval store, so a test can watch a sweep happen instead of
+    /// waiting out `BLOB_GC_INTERVAL`.
+    async fn gc_store(dir: &std::path::Path) -> FsStore {
+        let mut opts = iroh_blobs::store::fs::options::Options::new(dir);
+        opts.gc = Some(iroh_blobs::store::GcConfig {
+            interval: Duration::from_millis(100),
+            add_protected: None,
+        });
+        FsStore::load_with_opts(dir.join("blobs.db"), opts)
+            .await
+            .unwrap()
+    }
+
+    /// Long enough for several sweeps at the interval above.
+    async fn let_gc_run() {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+
+    /// The invariant the whole reclaim design rests on: a tagged blob survives
+    /// garbage collection, and dropping its tag is what frees the bytes. If GC
+    /// ever stopped honoring tags this would delete files mid-transfer; if it
+    /// stopped collecting untagged blobs the store would grow forever, which is
+    /// the bug this replaced.
+    #[tokio::test]
+    async fn dropping_a_tag_is_what_frees_the_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = gc_store(tmp.path()).await;
+
+        // Import past the 16 KiB inline threshold, so this exercises a real
+        // on-disk blob rather than one stored inside the metadata db.
+        let src = tmp.path().join("payload.bin");
+        std::fs::write(&src, vec![7u8; 64 * 1024]).unwrap();
+        let temp = store.blobs().add_path(&src).temp_tag().await.unwrap();
+        let hash = temp.hash();
+        let tag = "send/test".to_string();
+        store
+            .tags()
+            .set(&tag, iroh_blobs::HashAndFormat::raw(hash))
+            .await
+            .unwrap();
+        drop(temp);
+
+        let_gc_run().await;
+        assert!(
+            store.blobs().has(hash).await.unwrap(),
+            "a tagged blob must survive gc"
+        );
+
+        store.tags().delete(&tag).await.unwrap();
+        let_gc_run().await;
+        assert!(
+            !store.blobs().has(hash).await.unwrap(),
+            "an untagged blob must be collected"
+        );
+    }
+
+    /// `accept_file` tags the blob *before* fetching it, so for a moment the tag
+    /// names a hash the store does not have yet. That must neither error nor
+    /// abort the sweep, or a GC firing mid-fetch would take out unrelated
+    /// in-flight transfers.
+    #[tokio::test]
+    async fn a_tag_for_an_absent_blob_does_not_break_gc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = gc_store(tmp.path()).await;
+
+        let absent = iroh_blobs::Hash::from_bytes(*blake3::hash(b"never fetched").as_bytes());
+        store
+            .tags()
+            .set("recv/pending", iroh_blobs::HashAndFormat::raw(absent))
+            .await
+            .unwrap();
+
+        // A real, tagged blob alongside it: if the dangling tag aborted the mark
+        // phase, the sweep would either skip everything or collect this.
+        let src = tmp.path().join("payload.bin");
+        std::fs::write(&src, vec![9u8; 64 * 1024]).unwrap();
+        let temp = store.blobs().add_path(&src).temp_tag().await.unwrap();
+        let present = temp.hash();
+        store
+            .tags()
+            .set("send/live", iroh_blobs::HashAndFormat::raw(present))
+            .await
+            .unwrap();
+        drop(temp);
+
+        // An untagged blob, purely so the assertions below can tell "gc ran and
+        // behaved" apart from "gc never ran". Without it every assertion here
+        // would also hold if the sweep had silently aborted.
+        let junk = tmp.path().join("junk.bin");
+        std::fs::write(&junk, vec![3u8; 64 * 1024]).unwrap();
+        let junk_hash = {
+            let t = store.blobs().add_path(&junk).temp_tag().await.unwrap();
+            t.hash()
+        };
+
+        let_gc_run().await;
+        assert!(
+            !store.blobs().has(junk_hash).await.unwrap(),
+            "gc did not run, so this test proves nothing"
+        );
+        assert!(
+            store.blobs().has(present).await.unwrap(),
+            "gc must still protect tagged blobs despite a dangling tag"
+        );
+        assert!(!store.blobs().has(absent).await.unwrap());
     }
 }

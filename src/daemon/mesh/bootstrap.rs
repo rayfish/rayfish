@@ -16,6 +16,12 @@ use iroh_blobs::provider::events::{
 
 use super::super::*;
 
+/// How often the blob store sweeps untagged blobs. This is reclaim latency, not
+/// correctness: a finished transfer's bytes linger at most this long after its
+/// tag goes away. Kept coarse because a sweep walks the whole store, and on a
+/// phone that is a wakeup nobody asked for.
+const BLOB_GC_INTERVAL: Duration = Duration::from_secs(600);
+
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
     // Bail early on a CGNAT clash (e.g. Tailscale) before touching anything.
     #[cfg(not(target_os = "android"))]
@@ -188,7 +194,20 @@ async fn build_daemon(
     // --- Content-addressed blob store (membership/file transfer) ---
     let blobs_dir = config::config_dir()?.join("blobs");
     std::fs::create_dir_all(&blobs_dir)?;
-    let blob_store = FsStore::load(&blobs_dir)
+    // GC is what actually frees a transfer's bytes: `Blobs::delete` is private
+    // ("users should rely only on garbage collection"), so dropping a tag only
+    // marks the blob collectable and this periodic sweep is what reclaims it.
+    // Without it the store grew forever, keeping every file ever sent next to the
+    // original and every file ever received next to the copy in Downloads.
+    //
+    // Membership snapshots share this store but are added with a permanent tag,
+    // so a sweep never touches them; only untagged transfer blobs are collected.
+    let mut blob_opts = iroh_blobs::store::fs::options::Options::new(&blobs_dir);
+    blob_opts.gc = Some(iroh_blobs::store::GcConfig {
+        interval: BLOB_GC_INTERVAL,
+        add_protected: None,
+    });
+    let blob_store = FsStore::load_with_opts(blobs_dir.join("blobs.db"), blob_opts)
         .await
         .context("failed to open blob store")?;
     // Provider events tell us when a peer actually reads a blob out of our store,
@@ -218,12 +237,20 @@ async fn build_daemon(
     );
     let blobs_proto = BlobsProtocol::new(&blob_store, Some(blob_events));
 
+    // A completed pull is also the sender's cue to release its copy of the blob,
+    // but `FileService` does not exist yet at this point in the wiring and the
+    // service graph stays acyclic, so the pump reports completions over a channel
+    // that a drain task hands to `FileService` once it has been built.
+    let (send_done_tx, mut send_done_rx) =
+        tokio::sync::mpsc::channel::<(iroh_blobs::Hash, EndpointId)>(64);
+
     // Pump provider events into the transfer registry. Roster (group blob) fetches
     // ride the same blobs ALPN, so events for hashes we never registered as an
     // outgoing file send are dropped by the registry regardless of who pulled them.
     {
         let transfers = transfers.clone();
         let token = token.clone();
+        let send_done_tx = send_done_tx.clone();
         tokio::spawn(async move {
             // Connection id -> resolved peer, built from `ClientConnected` and
             // pruned on `ConnectionClosed`. Only ever touched from this single
@@ -257,6 +284,7 @@ async fn build_daemon(
                         let peer = connections.get(&connection_id).copied();
                         let transfers = transfers.clone();
                         let mut updates = msg.rx;
+                        let send_done_tx = send_done_tx.clone();
                         tokio::spawn(async move {
                             let Some(peer) = peer else {
                                 // No resolved peer for this connection (a roster
@@ -281,7 +309,12 @@ async fn build_daemon(
                                         transfers.provider_progress(hash, peer, p.end_offset)
                                     }
                                     RequestUpdate::Completed(_) => {
-                                        transfers.provider_finished(hash, peer, true)
+                                        transfers.provider_finished(hash, peer, true);
+                                        // Full pull: the receiver has the bytes, so
+                                        // our copy can go. Dropped rather than
+                                        // awaited so a wedged drain cannot stall
+                                        // the provider's update stream.
+                                        let _ = send_done_tx.try_send((hash, peer));
                                     }
                                     RequestUpdate::Aborted(_) => {
                                         transfers.provider_finished(hash, peer, false)
@@ -433,6 +466,23 @@ async fn build_daemon(
         device_user_map.clone(),
         transfers.clone(),
     ));
+    // Drain completed pulls into the blob reclaim (see the channel above).
+    tokio::spawn({
+        let files = files.clone();
+        let token = token.clone();
+        async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    msg = send_done_rx.recv() => match msg {
+                        Some((hash, peer)) => files.note_send_completed(hash, peer),
+                        None => break,
+                    },
+                }
+            }
+        }
+    });
+
     let connect = Arc::new(ConnectService::new(
         transport.clone(),
         active.clone(),

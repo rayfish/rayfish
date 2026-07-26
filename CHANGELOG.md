@@ -46,6 +46,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **File transfers no longer leave a copy of every file behind.** The blob store
+  each transfer runs through was never cleaned up, so `blobs/` kept a copy of
+  everything you had ever sent, and everything you had ever received sat there a
+  second time next to the one in Downloads. Both ends now release their copy once
+  the transfer is done, and the store reclaims the space.
+
+- **Sending or receiving a large file no longer loads it entirely into memory.**
+  Both ends streamed to disk in the middle but still buffered the whole file at
+  the edges, so a big video could exhaust memory. Worst hit was the Android app,
+  which the system would kill outright.
+
 - **Sharing from the Android app no longer says "No peers online" when peers are
   right there.** The app runs the mesh on demand, so a link closes after a couple
   of idle minutes and the share picker, which only listed peers holding a live
