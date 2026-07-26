@@ -27,6 +27,14 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     #[cfg(not(target_os = "android"))]
     check_cgnat_conflict()?;
 
+    // Repair a leftover `/etc/resolv.conf` before anything reads it. A hard kill
+    // or reboot leaves ours in place (nameserver = our own Magic DNS), and the
+    // endpoint's DNS resolver snapshots the file once at construction, so
+    // building first would point every pkarr lookup at a resolver that has no
+    // upstreams until `activate` configures them. `DnsService::configure` calls
+    // this again later; it is idempotent (the backup is consumed here).
+    crate::dns::config::restore_stale_backups();
+
     // Build the always-on infrastructure without a packet interface, then attach
     // the desktop OS TUN device below. The headless builder is the same one
     // `build_headless()` exposes to embedders (mobile), so both paths share

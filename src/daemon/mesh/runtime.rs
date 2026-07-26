@@ -20,6 +20,10 @@ const EXIT_READY_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(target_os = "macos")]
 const NUDGE_REPLY_WAIT: Duration = Duration::from_millis(500);
 
+/// First and last backoff step for the member-network restore retry loop.
+const RESTORE_RETRY_MIN: Duration = Duration::from_secs(2);
+const RESTORE_RETRY_MAX: Duration = Duration::from_secs(60);
+
 /// The membership a coordinator restores at startup, sourced from the signed
 /// `GroupBlob` (authoritative) or the stale config roster as a fallback.
 struct RestoredRoster {
@@ -565,6 +569,81 @@ impl NetworkRegistry {
         }
     }
 
+    /// Restore one saved member network, retrying until it lands.
+    ///
+    /// Restoring a membership needs the network's signed pkarr record, so it
+    /// needs working DNS and a route off the box. After an abrupt reboot the
+    /// daemon can start before either is true: the service manager brings us up
+    /// as soon as the network target is nominally ready, and on Linux a leftover
+    /// rayfish `/etc/resolv.conf` points the process resolver at our own Magic
+    /// DNS before it has upstreams. A one-shot restore turned that transient
+    /// failure into a permanent one: the network never registered, `ray status`
+    /// showed it inactive, and only a manual `ray restart` brought it back. So
+    /// retry with backoff until the join lands, the network is gone from the
+    /// config (leave/nuke), or the daemon shuts down.
+    async fn restore_member_network(
+        self: Arc<Self>,
+        name: String,
+        net_pubkey: String,
+        persisted_hostname: Option<String>,
+        auto_accept_firewall: bool,
+        auto_accept_files: bool,
+    ) {
+        let mut delay = RESTORE_RETRY_MIN;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match self
+                .join_network_inner(
+                    &net_pubkey,
+                    Some(&name),
+                    persisted_hostname.clone(),
+                    None,
+                    None,
+                    auto_accept_firewall,
+                    auto_accept_files,
+                    false,
+                )
+                .await
+            {
+                Ok(TryJoin::Joined(IpcMessage::Joined { name, my_ip, .. })) => {
+                    tracing::info!(network = %name, ip = %my_ip, attempt, "restored member network");
+                    return;
+                }
+                // Pending approval on a closed network: a settled state that no
+                // amount of retrying improves.
+                Ok(_) => return,
+                Err(e) => {
+                    // The first failure is worth flagging; the rest are just the
+                    // shape of waiting for connectivity, so keep them at debug.
+                    if attempt == 1 {
+                        tracing::warn!(network = %name, error = %e, retry_in = ?delay, "failed to restore network, retrying");
+                    } else {
+                        tracing::debug!(network = %name, error = %e, attempt, retry_in = ?delay, "failed to restore network, retrying");
+                    }
+                }
+            }
+
+            tokio::select! {
+                _ = self.shutdown_token.cancelled() => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
+
+            // Stop quietly if the network registered by another path while we
+            // waited (an inbound handshake), or if it was left/nuked meanwhile.
+            if self.networks.contains_key(&name) {
+                return;
+            }
+            if let Ok(cfg) = config::load()
+                && !cfg.networks.iter().any(|n| n.name == name)
+            {
+                tracing::debug!(network = %name, "network no longer saved, giving up restore");
+                return;
+            }
+            delay = (delay * 2).min(RESTORE_RETRY_MAX);
+        }
+    }
+
     /// Connect to every saved network (control plane). Run once at daemon
     /// startup so mesh connections follow the daemon lifecycle, not the data
     /// plane: `ray down` keeps these connected so the node stays online to
@@ -614,29 +693,13 @@ impl NetworkRegistry {
                     }
                 };
                 let daemon_c = Arc::clone(self);
-                tokio::spawn(async move {
-                    match daemon_c
-                        .join_network_inner(
-                            &net_pubkey,
-                            Some(&name),
-                            persisted_hostname,
-                            None,
-                            None,
-                            net_auto_accept,
-                            net_auto_accept_files,
-                            false,
-                        )
-                        .await
-                    {
-                        Ok(TryJoin::Joined(IpcMessage::Joined { name, my_ip, .. })) => {
-                            tracing::info!(network = %name, ip = %my_ip, "restored member network");
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(network = %name, error = %e, "failed to restore network");
-                        }
-                    }
-                });
+                tokio::spawn(daemon_c.restore_member_network(
+                    name,
+                    net_pubkey,
+                    persisted_hostname,
+                    net_auto_accept,
+                    net_auto_accept_files,
+                ));
             }
         }
 

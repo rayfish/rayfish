@@ -16,6 +16,10 @@
 use super::*;
 use std::net::Ipv6Addr;
 
+/// First and last backoff step for the OS-DNS configuration retry loop.
+const DNS_CONFIG_RETRY_MIN: Duration = Duration::from_secs(5);
+const DNS_CONFIG_RETRY_MAX: Duration = Duration::from_secs(60);
+
 pub(crate) struct DnsService {
     /// `.ray` forward lookup table (hostname → IP). Cloned into `MeshCtx` and the
     /// resolver; the roster is the single source of truth that writes it.
@@ -30,6 +34,9 @@ pub(crate) struct DnsService {
     configurator: Arc<std::sync::Mutex<Option<Arc<dyn dns_config::DnsConfigurator>>>>,
     /// Cancellation token for the `run_resolv_reassert` task (Linux direct mode).
     reassert_token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    /// Cancellation token for the retry loop spawned when the initial OS-DNS
+    /// configuration fails (see [`DnsService::configure`]).
+    configure_retry: std::sync::Mutex<Option<CancellationToken>>,
 }
 
 impl DnsService {
@@ -44,6 +51,7 @@ impl DnsService {
             resolver,
             configurator: Arc::new(std::sync::Mutex::new(None)),
             reassert_token: std::sync::Mutex::new(None),
+            configure_retry: std::sync::Mutex::new(None),
         }
     }
 
@@ -74,42 +82,91 @@ impl DnsService {
     /// backend, merge any user-configured upstreams over the captured ones, and
     /// (Linux direct-resolv.conf mode) spawn the inotify re-assert watcher.
     /// Failures are non-fatal: pushed to `warnings` so `ray up` can surface them.
-    pub(crate) async fn configure(&self, tun_name: &str, warnings: &mut Vec<String>) {
+    pub(crate) async fn configure(self: &Arc<Self>, tun_name: &str, warnings: &mut Vec<String>) {
         // Configure system DNS to route .ray queries to our in-daemon resolver.
         dns_config::restore_stale_backups();
+        if let Some(retry) = self.configure_retry.lock().unwrap().take() {
+            retry.cancel();
+        }
         match dns_config::detect_and_configure(tun_name).await {
-            Ok(c) => {
-                let captured = c.captured_upstreams();
-                // Merge any user-configured DNS upstreams over the system-captured
-                // set (replace drops the captured ones; augment tries custom first).
-                let dns_override = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
-                let upstreams = config::resolve_upstreams(&dns_override, captured);
-                let is_direct = c.name() == "direct-resolv.conf";
-                #[cfg(target_os = "linux")]
-                let search = c.search_domains();
-                #[cfg(target_os = "linux")]
-                let fallback = c.fallback_upstream();
-                tracing::info!(backend = c.name(), resolver_ip = %crate::dns::MAGIC_DNS_V4, upstreams = ?upstreams, "Magic DNS active");
-                self.resolver.set_upstreams(upstreams);
-                *self.configurator.lock().unwrap() = Some(Arc::from(c));
-                // In direct mode, re-assert /etc/resolv.conf the instant another
-                // program (NetworkManager, dhclient) overwrites it (inotify watch).
-                #[cfg(target_os = "linux")]
-                if is_direct {
-                    let rt = tokio_util::sync::CancellationToken::new();
-                    *self.reassert_token.lock().unwrap() = Some(rt.clone());
-                    tokio::spawn(dns_config::run_resolv_reassert(search, fallback, rt));
-                }
-                #[cfg(not(target_os = "linux"))]
-                let _ = is_direct;
-            }
+            Ok(c) => self.adopt_configurator(c),
             Err(e) => {
-                tracing::warn!(error = %e, "failed to configure system DNS (Magic DNS requires manual setup)");
+                tracing::warn!(error = %e, "failed to configure system DNS, retrying in the background");
                 warnings.push(format!(
-                    "failed to configure system DNS, so .ray names won't resolve: {e}"
+                    "failed to configure system DNS, so .ray names won't resolve yet: {e}"
                 ));
+                self.spawn_configure_retry(tun_name.to_string());
             }
         }
+    }
+
+    /// Take ownership of a detected OS-DNS backend: seed the resolver's
+    /// upstreams, keep the configurator for `revert`, and (Linux direct mode)
+    /// start the inotify re-assert watcher.
+    fn adopt_configurator(&self, c: Box<dyn dns_config::DnsConfigurator>) {
+        let captured = c.captured_upstreams();
+        // Merge any user-configured DNS upstreams over the system-captured
+        // set (replace drops the captured ones; augment tries custom first).
+        let dns_override = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
+        let upstreams = config::resolve_upstreams(&dns_override, captured);
+        let is_direct = c.name() == "direct-resolv.conf";
+        #[cfg(target_os = "linux")]
+        let search = c.search_domains();
+        #[cfg(target_os = "linux")]
+        let fallback = c.fallback_upstream();
+        tracing::info!(backend = c.name(), resolver_ip = %crate::dns::MAGIC_DNS_V4, upstreams = ?upstreams, "Magic DNS active");
+        self.resolver.set_upstreams(upstreams);
+        *self.configurator.lock().unwrap() = Some(Arc::from(c));
+        // In direct mode, re-assert /etc/resolv.conf the instant another
+        // program (NetworkManager, dhclient) overwrites it (inotify watch).
+        #[cfg(target_os = "linux")]
+        if is_direct {
+            let rt = tokio_util::sync::CancellationToken::new();
+            *self.reassert_token.lock().unwrap() = Some(rt.clone());
+            tokio::spawn(dns_config::run_resolv_reassert(search, fallback, rt));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = is_direct;
+    }
+
+    /// Keep trying to configure OS DNS in the background after the first attempt
+    /// failed. Detection refuses to take DNS over when the host has no working
+    /// upstream to forward to, which is exactly the state a machine is in when
+    /// the daemon starts before the network settles after a reboot. Without a
+    /// retry that verdict was permanent: `.ray` names stayed unresolvable for
+    /// the daemon's lifetime even once the host's DNS came back. Cancelled by
+    /// `revert` (the data plane going down) and by a later `configure`.
+    fn spawn_configure_retry(self: &Arc<Self>, tun_name: String) {
+        let token = CancellationToken::new();
+        *self.configure_retry.lock().unwrap() = Some(token.clone());
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut delay = DNS_CONFIG_RETRY_MIN;
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                match dns_config::detect_and_configure(&tun_name).await {
+                    Ok(c) => {
+                        // `revert` may have run while detection was in flight; it
+                        // cancelled us, so drop the configuration on the floor
+                        // rather than pointing a downed data plane's DNS at us.
+                        if token.is_cancelled() {
+                            let _ = dns_config::revert(c.as_ref()).await;
+                            return;
+                        }
+                        me.adopt_configurator(c);
+                        me.configure_retry.lock().unwrap().take();
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, retry_in = ?delay, "system DNS still not configurable");
+                    }
+                }
+                delay = (delay * 2).min(DNS_CONFIG_RETRY_MAX);
+            }
+        });
     }
 
     /// Re-apply the current OS-DNS configuration in place (no re-detect, no
@@ -137,6 +194,9 @@ impl DnsService {
     pub(crate) async fn revert(&self, tun_name: &str) {
         if let Some(rt) = self.reassert_token.lock().unwrap().take() {
             rt.cancel();
+        }
+        if let Some(retry) = self.configure_retry.lock().unwrap().take() {
+            retry.cancel();
         }
 
         // Revert system DNS (extract the configurator before reverting so the

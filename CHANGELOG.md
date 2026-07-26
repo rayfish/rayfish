@@ -51,6 +51,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A node that reboots faster than its network comes up rejoins on its own.**
+  The daemon starts as soon as the service manager says the network is ready,
+  which on a hard reboot can be before DNS answers. Finding a saved network
+  needs a DNS lookup, and that one failed lookup used to be final: the network
+  showed as `·inactive·` in `ray status` and stayed that way, with peers still
+  seeing the node online, until someone ran `ray restart` by hand. Restoring a
+  network now retries with backoff until it lands.
+
+- **Magic DNS comes up on its own when the host's DNS was down at boot.**
+  rayfish refuses to take over `/etc/resolv.conf` while the host has no working
+  upstream to forward to (taking it over would break all resolution). That
+  verdict was permanent, so a node that booted before its DNS settled had no
+  `.ray` name resolution until the next restart. It now keeps trying in the
+  background and configures Magic DNS as soon as the host can resolve again.
+
 - **Magic DNS works on hosts where systemd-resolved runs but nothing asks it.**
   Many cloud images (Vultr, some Hetzner and DigitalOcean builds) leave
   `systemd-resolved` enabled while `/etc/resolv.conf` still points straight at
