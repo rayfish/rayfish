@@ -12,7 +12,9 @@ import io.sentry.android.core.SentryLogcatAdapter as Log
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
-import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 /**
@@ -40,7 +42,31 @@ class DnsProxy private constructor(
     private var running = true
 
     // rawQuery callbacks land here; a single thread serializes the socket sends.
-    private val executor = Executors.newSingleThreadExecutor()
+    //
+    // Built by hand rather than via Executors.newSingleThreadExecutor() for the
+    // rejected-execution policy: the default is AbortPolicy, which throws. A query
+    // still in flight when stop() shuts this down has already registered an fd
+    // listener with the platform resolver, and the platform delivers its answer by
+    // posting here. That post happens on the main looper, inside DnsResolver's own
+    // frames with none of ours on the stack, so an AbortPolicy throw reaches the
+    // default uncaught-exception handler and kills the process (the try/catch
+    // around rawQuery below only covers the dispatch, never the later callback).
+    // DiscardPolicy drops the late answer instead, which is the right outcome: the
+    // socket it would have been written to is closed by then anyway.
+    private val executor = ThreadPoolExecutor(
+        1, 1,
+        0L, TimeUnit.MILLISECONDS,
+        LinkedBlockingQueue(),
+        { r -> Thread(r, "rayfish-dns-proxy-cb").apply { isDaemon = true } },
+        ThreadPoolExecutor.DiscardPolicy(),
+    )
+
+    // CancellationSignals for queries that have been dispatched but whose callback
+    // has not fired yet. stop() cancels them so the platform tears the lookups down
+    // instead of leaving them to complete against a dead proxy. Guarded by its own
+    // lock: entries are added on the receive loop's thread and removed on the
+    // executor thread.
+    private val inFlight = mutableSetOf<CancellationSignal>()
 
     private fun loop() {
         val buf = ByteArray(4096)
@@ -55,19 +81,26 @@ class DnsProxy private constructor(
             val query = request.data.copyOfRange(0, request.length)
             val client = request.socketAddress
             val network = underlyingNetwork()
+            val signal = CancellationSignal()
+            // Registered before dispatch, not after: stop() can land in between,
+            // and a signal added afterwards would miss the cancellation sweep and
+            // leave the lookup running against a closed socket.
+            if (!register(signal)) break
             try {
                 resolver.rawQuery(
                     network,
                     query,
                     DnsResolver.FLAG_EMPTY,
                     executor,
-                    CancellationSignal(),
+                    signal,
                     object : DnsResolver.Callback<ByteArray> {
                         override fun onAnswer(answer: ByteArray, rcode: Int) {
+                            unregister(signal)
                             trySend(answer, client)
                         }
 
                         override fun onError(error: DnsResolver.DnsException) {
+                            unregister(signal)
                             // A servfail still deserves a DNS reply, but rawQuery
                             // hands us no packet on error; drop and let the client
                             // time out and retry. Logged sparsely to avoid spam.
@@ -76,9 +109,24 @@ class DnsProxy private constructor(
                     },
                 )
             } catch (t: Throwable) {
+                unregister(signal)
                 Log.w(TAG, "rawQuery dispatch failed", t)
             }
         }
+    }
+
+    // Track a query about to be dispatched. Returns false if the proxy has already
+    // been stopped, in which case the caller must not dispatch: `running` is read
+    // and written under the same lock that guards the set, so a query can never
+    // slip in after stop()'s sweep has run.
+    private fun register(signal: CancellationSignal): Boolean = synchronized(inFlight) {
+        if (!running) return false
+        inFlight.add(signal)
+        true
+    }
+
+    private fun unregister(signal: CancellationSignal) {
+        synchronized(inFlight) { inFlight.remove(signal) }
     }
 
     private fun trySend(answer: ByteArray, client: java.net.SocketAddress) {
@@ -105,8 +153,26 @@ class DnsProxy private constructor(
     }
 
     fun stop() {
-        running = false
+        // Take the in-flight queries and close the door on new ones in one step, so
+        // the receive loop cannot register another between the sweep and the
+        // shutdown below (see register()).
+        val pending = synchronized(inFlight) {
+            running = false
+            inFlight.toList().also { inFlight.clear() }
+        }
         socket.close()
+        // Cancelling unregisters the platform's fd listener, so the lookup is torn
+        // down rather than left to deliver an answer nobody can use. Cancelling an
+        // already-completed query is a no-op. Done before the executor shutdown so
+        // the common case never reaches the DiscardPolicy at all; that policy stays
+        // as the backstop for an answer that was already posted here.
+        for (signal in pending) {
+            try {
+                signal.cancel()
+            } catch (t: Throwable) {
+                Log.w(TAG, "cancelling an in-flight DNS query failed", t)
+            }
+        }
         executor.shutdownNow()
     }
 

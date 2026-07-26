@@ -25,6 +25,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Android: turning the VPN off no longer crashes the app.** If a DNS lookup was
+  still in flight the moment the tunnel came down, the system resolver delivered
+  its answer to the proxy's already-shut-down callback thread, and the resulting
+  rejection landed on the main thread outside any of our code, killing the
+  process. Teardown now cancels the outstanding lookups and drops any answer that
+  still arrives. Most likely to be hit when switching the VPN off, when another
+  VPN app takes the slot, or when bring-up fails.
+
 - **Magic DNS no longer takes a host's DNS down with it.** When rayfish falls
   back to managing `/etc/resolv.conf` itself, it used to forward every non-`.ray`
   lookup to whatever nameserver the file happened to list, without checking that
