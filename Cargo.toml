@@ -37,6 +37,11 @@ path = "src/main.rs"
 # library and skips this target instead of failing on desktop-only code.
 required-features = ["desktop"]
 
+[[bin]]
+name = "rayfish-gui"
+path = "src/bin/rayfish-gui.rs"
+required-features = ["desktop"]
+
 [features]
 default = ["desktop"]
 # Desktop-only surface: the TUN-backed daemon binary, the embedded mesh SSH
