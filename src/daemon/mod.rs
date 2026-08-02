@@ -41,6 +41,7 @@ use iroh_metrics::service::MetricsServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -55,7 +56,6 @@ use iroh::endpoint::{Connection, Endpoint, VarInt};
 use iroh::{EndpointId, SecretKey};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, HashAndFormat};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -87,6 +87,29 @@ use crate::transport;
 use crate::tun::{self, check_cgnat_conflict};
 use ray_proto::SuggestedFirewall;
 use smol_str::SmolStr;
+
+#[cfg(unix)]
+type IpcOwnedFd = OwnedFd;
+#[cfg(not(unix))]
+type IpcOwnedFd = ();
+
+#[derive(Clone, Debug)]
+pub(crate) enum PeerIdentity {
+    #[cfg(unix)]
+    Unix { uid: u32, gid: u32 },
+    #[cfg(windows)]
+    Windows { sid: String },
+}
+
+impl PeerIdentity {
+    fn unix_cred(&self) -> Option<(u32, u32)> {
+        #[cfg(unix)]
+        if let Self::Unix { uid, gid } = self {
+            return Some((*uid, *gid));
+        }
+        None
+    }
+}
 
 // `Daemon`'s IPC operations are split by domain into the `mesh/` submodule;
 // see `mesh/mod.rs`. Each holds an additional `impl Daemon` block. Nested a
@@ -756,7 +779,7 @@ impl Daemon {
     /// mode only has to permit the connection, not gate authority.
     pub(crate) fn check_authorized(
         req: &IpcMessage,
-        peer_cred: Option<(u32, u32)>,
+        peer: Option<&PeerIdentity>,
     ) -> Option<IpcMessage> {
         // Reads are available to everyone.
         if matches!(
@@ -782,10 +805,23 @@ impl Daemon {
             return None;
         }
 
-        let uid = peer_cred.map(|(uid, _)| uid);
+        #[cfg(unix)]
+        let uid = peer.and_then(|p| match p {
+            PeerIdentity::Unix { uid, .. } => Some(*uid),
+        });
+        #[cfg(windows)]
+        let sid = peer.map(|p| match p {
+            PeerIdentity::Windows { sid } => sid.as_str(),
+        });
 
         // Root may do anything.
+        #[cfg(unix)]
         if uid == Some(0) {
+            return None;
+        }
+
+        #[cfg(windows)]
+        if sid.is_some_and(|sid| config::operator_sid().ok().flatten().as_deref() == Some(sid)) {
             return None;
         }
 
@@ -799,9 +835,12 @@ impl Daemon {
         }
 
         // Otherwise the caller must be the configured operator.
-        let operator = config::load().ok().and_then(|c| c.operator_uid);
-        if uid.is_some() && uid == operator {
-            return None;
+        #[cfg(unix)]
+        {
+            let operator = config::load().ok().and_then(|c| c.operator_uid);
+            if uid.is_some() && uid == operator {
+                return None;
+            }
         }
 
         Some(ipc_err(
@@ -942,12 +981,13 @@ impl Daemon {
     pub(crate) async fn handle_request(
         self: &Arc<Self>,
         req: IpcMessage,
-        peer_cred: Option<(u32, u32)>,
-        mut fds: Vec<OwnedFd>,
+        peer: Option<PeerIdentity>,
+        fds: Vec<IpcOwnedFd>,
     ) -> IpcMessage {
-        if let Some(denied) = Self::check_authorized(&req, peer_cred) {
+        if let Some(denied) = Self::check_authorized(&req, peer.as_ref()) {
             return denied;
         }
+        let peer_cred = peer.as_ref().and_then(PeerIdentity::unix_cred);
         match req {
             IpcMessage::Create {
                 mode,
@@ -1078,10 +1118,30 @@ impl Daemon {
             }
             IpcMessage::AliasList { network } => self.registry.list_aliases(&network),
             IpcMessage::SendFile { path, peer } => self.send_file(&path, &peer).await,
-            IpcMessage::SendFileFd { filename, peer } => match fds.pop() {
-                Some(fd) => self.files.send_file_fd(fd, &filename, &peer).await,
-                None => ipc_err("SendFileFd request carried no file descriptor"),
-            },
+            IpcMessage::SendFileStaged {
+                path,
+                filename,
+                peer,
+            } => {
+                self.files
+                    .send_file_named(&path, Some(&filename), &peer)
+                    .await
+            }
+            IpcMessage::SendFileFd { filename, peer } => {
+                #[cfg(unix)]
+                {
+                    let mut fds = fds;
+                    match fds.pop() {
+                        Some(fd) => self.files.send_file_fd(fd, &filename, &peer).await,
+                        None => ipc_err("SendFileFd request carried no file descriptor"),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (filename, peer, fds);
+                    ipc_err("SendFileFd is unavailable on this platform")
+                }
+            }
             IpcMessage::CancelSend { id } => self.files.cancel_send(id),
             IpcMessage::ListFiles => self.list_files(),
             IpcMessage::AcceptFile { id, output } => {

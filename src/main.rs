@@ -779,6 +779,9 @@ pub(crate) enum FilesAction {
 }
 
 fn check_root() {
+    #[cfg(windows)]
+    return;
+    #[cfg(unix)]
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("rayfish requires root privileges to create TUN devices. Run with sudo.");
         std::process::exit(1);
@@ -1078,6 +1081,10 @@ async fn main() -> Result<()> {
         Command::Daemon => {
             check_root();
             install_panic_hook();
+            #[cfg(windows)]
+            if rayfish::windows_service::run_if_service()? {
+                return Ok(());
+            }
             let token = shutdown::token();
             let stats = Arc::new(stats::ForwardMetrics::default());
             stats.spawn_logger(token.clone());
@@ -1251,13 +1258,18 @@ async fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
 
 /// Resolve a username to its UID, falling back to parsing a numeric UID.
 pub(crate) fn uid_for_user(user: &str) -> Option<u32> {
-    use std::ffi::CString;
-    let cname = CString::new(user).ok()?;
-    let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
-    if !pw.is_null() {
-        return Some(unsafe { (*pw).pw_uid });
+    #[cfg(windows)]
+    return user.parse::<u32>().ok();
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        let cname = CString::new(user).ok()?;
+        let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
+        if !pw.is_null() {
+            return Some(unsafe { (*pw).pw_uid });
+        }
+        user.parse::<u32>().ok()
     }
-    user.parse::<u32>().ok()
 }
 
 /// `ray set-operator <user>`: authorize a local user to run mutating ray

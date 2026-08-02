@@ -461,6 +461,17 @@ pub(crate) fn cmd_uninstall_service() -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(windows)]
+    {
+        if rayfish::windows_service::exists() {
+            rayfish::windows_service::remove()?;
+            println!("Removed Windows service.");
+        } else {
+            println!("Service not installed.");
+        }
+        return Ok(());
+    }
+
     #[cfg(target_os = "macos")]
     {
         let path = Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist");

@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::fs::Permissions;
 use std::net::Ipv4Addr;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -715,12 +717,41 @@ pub fn config_dir() -> Result<PathBuf> {
     // library still compiles/runs standalone.
     #[cfg(target_os = "android")]
     let dir = PathBuf::from("/data/local/tmp/rayfish");
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    #[cfg(target_os = "windows")]
+    let dir = std::env::var_os("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::data_dir().unwrap_or_else(|| PathBuf::from(r"C:\ProgramData")))
+        .join("rayfish");
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows"
+    )))]
     let dir = dirs::config_dir()
         .context("could not determine config directory")?
         .join("rayfish");
     ensure_dir(&dir)?;
     Ok(dir)
+}
+
+#[cfg(windows)]
+const OPERATOR_SID_FILE: &str = "operator.sid";
+
+#[cfg(windows)]
+pub fn operator_sid() -> Result<Option<String>> {
+    let path = config_dir()?.join(OPERATOR_SID_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let sid = std::fs::read_to_string(path)?.trim().to_string();
+    Ok((!sid.is_empty()).then_some(sid))
+}
+
+#[cfg(windows)]
+pub fn set_operator_sid(sid: &str) -> Result<()> {
+    let path = config_dir()?.join(OPERATOR_SID_FILE);
+    write_atomic(&path, &format!("{sid}\n"), false)
 }
 
 /// Reject a network name that can't be a safe single path component (defence in
@@ -745,6 +776,8 @@ fn validate_net_name(name: &str) -> Result<()> {
 /// Public so every rayfish config writer (identity key, invite ledger, etc.)
 /// shares the same atomic + restrictive-perms guarantees under the config tree.
 pub fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
+    #[cfg(windows)]
+    let _ = secret;
     let dir = path.parent().context("config path has no parent")?;
     ensure_dir(dir)?;
     let fname = path
@@ -760,8 +793,11 @@ pub fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
             .with_context(|| format!("writing {}", tmp.display()))?;
         f.sync_all().ok();
     }
-    let mode = if secret { 0o600 } else { 0o640 };
-    let _ = std::fs::set_permissions(&tmp, Permissions::from_mode(mode));
+    #[cfg(unix)]
+    {
+        let mode = if secret { 0o600 } else { 0o640 };
+        let _ = std::fs::set_permissions(&tmp, Permissions::from_mode(mode));
+    }
     #[cfg(target_os = "linux")]
     set_owner(&tmp, secret);
     let renamed = std::fs::rename(&tmp, path);
@@ -781,8 +817,13 @@ fn write_atomic(path: &Path, contents: &str, secret: bool) -> Result<()> {
 /// For append-mode files (e.g. the audit log) that aren't rewritten via
 /// [`write_file`]. Best-effort.
 pub fn restrict_perms(path: &Path, secret: bool) {
-    let mode = if secret { 0o600 } else { 0o640 };
-    let _ = std::fs::set_permissions(path, Permissions::from_mode(mode));
+    #[cfg(windows)]
+    let _ = (path, secret);
+    #[cfg(unix)]
+    {
+        let mode = if secret { 0o600 } else { 0o640 };
+        let _ = std::fs::set_permissions(path, Permissions::from_mode(mode));
+    }
     #[cfg(target_os = "linux")]
     set_owner(path, secret);
 }

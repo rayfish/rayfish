@@ -328,6 +328,7 @@ pub(crate) fn is_unpaired_by(sender: EndpointId) -> bool {
 }
 
 /// (gid, home) for a uid via the passwd db, or None if it can't be resolved.
+#[cfg(unix)]
 fn pw_gid_home(uid: u32) -> Option<(u32, PathBuf)> {
     // SAFETY: getpwuid returns a pointer into a static buffer; copy fields out
     // immediately before any other libc call can clobber it.
@@ -345,16 +346,28 @@ fn pw_gid_home(uid: u32) -> Option<(u32, PathBuf)> {
 }
 
 /// A uid's ~/Downloads plus its (uid, gid) owner, if the uid resolves.
+#[cfg(unix)]
 fn user_downloads(uid: u32) -> Option<(PathBuf, (u32, u32))> {
     let (gid, home) = pw_gid_home(uid)?;
     Some((home.join("Downloads"), (uid, gid)))
 }
 
+#[cfg(not(unix))]
+fn user_downloads(_uid: u32) -> Option<(PathBuf, (u32, u32))> {
+    None
+}
+
 /// (uid, gid) that currently owns `path`, if it exists.
+#[cfg(unix)]
 fn dir_owner(path: &std::path::Path) -> Option<(u32, u32)> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::metadata(path).ok()?;
     Some((m.uid(), m.gid()))
+}
+
+#[cfg(not(unix))]
+fn dir_owner(_path: &std::path::Path) -> Option<(u32, u32)> {
+    None
 }
 
 /// Resolve the auto-accept target from live config, applying the precedence in

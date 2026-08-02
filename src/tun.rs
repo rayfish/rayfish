@@ -104,42 +104,62 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
 
 #[cfg(not(target_os = "android"))]
 pub fn check_cgnat_conflict() -> Result<()> {
-    let output = Command::new("ifconfig").output();
-
-    let output = match output {
-        Ok(o) => o,
-        Err(_) => return Ok(()),
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut current_iface = String::new();
-
-    for line in stdout.lines() {
-        if !line.starts_with('\t')
-            && !line.starts_with(' ')
-            && let Some(name) = line.split(':').next()
-        {
-            current_iface = name.to_string();
-        }
-        if line.contains("inet ") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let Some(pos) = parts.iter().position(|&p| p == "inet")
-                && let Some(ip_str) = parts.get(pos + 1)
-                && let Ok(ip) = ip_str.parse::<Ipv4Addr>()
+    #[cfg(target_os = "windows")]
+    {
+        let output = windows_powershell(
+            "Get-NetIPAddress -AddressFamily IPv4 | Select-Object -ExpandProperty IPAddress",
+        )?;
+        for value in output.lines() {
+            if let Ok(ip) = value.trim().parse::<Ipv4Addr>()
                 && is_cgnat(ip)
             {
                 bail!(
-                    "interface {} already has CGNAT address {} — another VPN \
-                     (e.g. Tailscale) is using the 100.64.0.0/10 range. \
-                     Disable it before starting rayfish.",
-                    current_iface,
-                    ip
+                    "Windows already has CGNAT address {ip} — another VPN is using the 100.64.0.0/10 range. Disable it before starting rayfish."
                 );
             }
         }
+        Ok(())
     }
 
-    Ok(())
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = Command::new("ifconfig").output();
+
+        let output = match output {
+            Ok(o) => o,
+            Err(_) => return Ok(()),
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut current_iface = String::new();
+
+        for line in stdout.lines() {
+            if !line.starts_with('\t')
+                && !line.starts_with(' ')
+                && let Some(name) = line.split(':').next()
+            {
+                current_iface = name.to_string();
+            }
+            if line.contains("inet ") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if let Some(pos) = parts.iter().position(|&p| p == "inet")
+                    && let Some(ip_str) = parts.get(pos + 1)
+                    && let Ok(ip) = ip_str.parse::<Ipv4Addr>()
+                    && is_cgnat(ip)
+                {
+                    bail!(
+                        "interface {} already has CGNAT address {} — another VPN \
+                     (e.g. Tailscale) is using the 100.64.0.0/10 range. \
+                     Disable it before starting rayfish.",
+                        current_iface,
+                        ip
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Creates a TUN device with the given virtual IPs and shares it between
@@ -178,6 +198,35 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
         TunWriter { dev },
         tun_name,
     ))
+}
+
+/// Platform seam for desktop packet acquisition and privileged interface ops.
+/// The Windows implementation delegates packet I/O to `tun-rs`/Wintun while
+/// keeping the existing `TunRead`/`TunWrite` forwarding path unchanged.
+#[cfg(not(target_os = "android"))]
+pub struct PlatformTun;
+
+#[cfg(not(target_os = "android"))]
+impl PlatformTun {
+    pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
+        create(v4, v6).await
+    }
+
+    pub fn set_link_up(name: &str) -> Result<()> {
+        set_link_up(name)
+    }
+
+    pub fn set_link_down(name: &str) -> Result<()> {
+        set_link_down(name)
+    }
+
+    pub async fn route_peer_range(name: &str) -> Result<()> {
+        route_peer_range(name).await
+    }
+
+    pub async fn route_magic_dns(name: &str) -> Result<()> {
+        route_magic_dns(name).await
+    }
 }
 
 /// Run `f` with a netlink handle and the interface index of `tun_name`.
@@ -291,6 +340,41 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+pub async fn unroute_peer_range(tun_name: &str) -> Result<()> {
+    let index = windows_interface_index(tun_name)?;
+    for prefix in ["100.64.0.0/10", "200::/7"] {
+        windows_powershell(&format!(
+            "Remove-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -Confirm:$false -ErrorAction SilentlyContinue",
+            prefix, index
+        ))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub async fn route_peer_range(tun_name: &str) -> Result<()> {
+    let index = windows_interface_index(tun_name)?;
+    let mut installed = Vec::new();
+    for (prefix, next_hop) in [("100.64.0.0/10", "0.0.0.0"), ("200::/7", "::")] {
+        let result = windows_powershell(&format!(
+            "Remove-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -Confirm:$false -ErrorAction SilentlyContinue; New-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -NextHop '{}' -PolicyStore ActiveStore -ErrorAction Stop",
+            prefix, index, prefix, index, next_hop
+        ));
+        if let Err(error) = result {
+            for previous in installed {
+                let _ = windows_powershell(&format!(
+                    "Remove-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -Confirm:$false -ErrorAction SilentlyContinue",
+                    previous, index
+                ));
+            }
+            return Err(error);
+        }
+        installed.push(prefix);
+    }
+    Ok(())
+}
+
 /// The full-tunnel default as two half-space routes per family: `0.0.0.0/1` +
 /// `128.0.0.0/1` and `::/1` + `8000::/1`. Each is more specific than a real
 /// default route, so together they capture everything by longest-prefix match
@@ -388,9 +472,23 @@ pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
 
 #[cfg(all(
     not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")),
-    not(target_os = "android")
+    not(target_os = "android"),
+    not(target_os = "windows")
 ))]
 pub async fn route_magic_dns(_tun_name: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
+    let index = windows_interface_index(tun_name)?;
+    windows_powershell(&format!(
+        "Remove-NetRoute -DestinationPrefix '{}/32' -InterfaceIndex {} -Confirm:$false -ErrorAction SilentlyContinue; New-NetRoute -DestinationPrefix '{}/32' -InterfaceIndex {} -NextHop '0.0.0.0' -PolicyStore ActiveStore -ErrorAction Stop",
+        crate::dns::MAGIC_DNS_V4,
+        index,
+        crate::dns::MAGIC_DNS_V4,
+        index
+    ))?;
     Ok(())
 }
 
@@ -471,7 +569,63 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
             .context("run ip link set")?;
         anyhow::ensure!(status.success(), "ip link set {state} failed with {status}");
     }
+    #[cfg(target_os = "windows")]
+    {
+        let state = if up { "enabled" } else { "disabled" };
+        let escaped = tun_name.to_owned();
+        let status = Command::new("netsh")
+            .args([
+                "interface",
+                "set",
+                "interface",
+                &format!("name={escaped}"),
+                &format!("admin={state}"),
+            ])
+            .status()
+            .context("run netsh interface set interface")?;
+        anyhow::ensure!(
+            status.success(),
+            "netsh interface {state} failed with {status}"
+        );
+    }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_powershell(script: &str) -> Result<String> {
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &format!("$ErrorActionPreference='Stop'; {script}"),
+        ])
+        .output()
+        .context("run Windows network PowerShell")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Windows network command failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_interface_index(tun_name: &str) -> Result<u32> {
+    let quoted = tun_name.replace('\'', "''");
+    let output = windows_powershell(&format!(
+        "@(Get-NetAdapter | Where-Object {{ $_.Name -eq '{}' }} | Select-Object -ExpandProperty ifIndex)",
+        quoted
+    ))?;
+    anyhow::ensure!(
+        !output.is_empty() && !output.contains('\n'),
+        "Windows TUN adapter {tun_name:?} was not uniquely found"
+    );
+    output
+        .parse()
+        .with_context(|| format!("resolve Windows interface index for {tun_name:?}"))
 }
 
 #[cfg(not(target_os = "android"))]

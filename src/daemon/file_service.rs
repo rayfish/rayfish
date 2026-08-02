@@ -10,12 +10,14 @@
 
 use super::transfers;
 use super::*;
+#[cfg(unix)]
 use std::ffi::CString;
 use std::path::PathBuf;
 
 use futures::StreamExt;
 use iroh_blobs::api::remote::GetProgressItem;
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use tokio_util::io::ReaderStream;
 
 /// Upper bound on one background offer dial. `Endpoint::connect` retries
@@ -321,6 +323,8 @@ impl FileService {
         output: Option<String>,
         peer_cred: Option<(u32, u32)>,
     ) -> IpcMessage {
+        #[cfg(windows)]
+        let _ = peer_cred;
         let pending_file = {
             let mut pending = self.pending_files.lock().unwrap();
             let idx = pending.iter().position(|f| f.id == id);
@@ -437,6 +441,7 @@ impl FileService {
         // duplication: every accepted file used to be kept twice, forever.
         self.reclaim_blob(recv_tag);
 
+        #[cfg(unix)]
         if let Some((uid, gid)) = peer_cred {
             use std::os::unix::ffi::OsStrExt;
             if let Ok(c) = CString::new(dest.as_os_str().as_bytes()) {
@@ -518,6 +523,15 @@ impl FileService {
     /// itself can see; IPC clients use `send_file_fd`. Kept for in-process
     /// callers (ray-mobile), where daemon and app share one privilege domain.
     pub(crate) async fn send_file(self: &Arc<Self>, path: &str, peer: &str) -> IpcMessage {
+        self.send_file_named(path, None, peer).await
+    }
+
+    pub(crate) async fn send_file_named(
+        self: &Arc<Self>,
+        path: &str,
+        requested_filename: Option<&str>,
+        peer: &str,
+    ) -> IpcMessage {
         let file_path = Path::new(path);
         // Same guard the fd path applies: a FIFO or a character device would
         // stall or balloon the import.
@@ -526,9 +540,14 @@ impl FileService {
             Ok(_) => return ipc_err(format!("not a regular file: '{}'", file_path.display())),
             Err(e) => return ipc_err(format!("cannot read '{}': {e}", file_path.display())),
         };
-        let filename = file_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
+        let filename = requested_filename
+            .and_then(|name| Path::new(name).file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .or_else(|| {
+                file_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
             .unwrap_or_else(|| "file".to_string());
 
         let peer_id = match self.registry.resolve_peer_flexible(peer).await {
@@ -558,6 +577,7 @@ impl FileService {
     /// client opened the file with its own privileges, the daemon never
     /// resolves a path. This is what lets `ray send` reach TCC-protected
     /// folders on macOS and files the daemon can't read but the caller can.
+    #[cfg(unix)]
     pub(crate) async fn send_file_fd(
         self: &Arc<Self>,
         fd: OwnedFd,

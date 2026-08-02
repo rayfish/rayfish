@@ -19,6 +19,7 @@ pub(crate) async fn ipc_send_files(files: &[String], peer: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     use std::fs::File;
     use std::os::fd::AsFd;
@@ -67,8 +68,72 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     };
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+        ipc::IpcMessage::Error { message } => anyhow::bail!("{message}"),
         other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    const CHUNK: usize = 256 * 1024;
+    let path = std::path::absolute(file).with_context(|| format!("cannot resolve '{file}'"))?;
+    let opened = tokio::fs::File::open(&path)
+        .await
+        .with_context(|| format!("cannot read '{}'", path.display()))?;
+    let metadata = opened.metadata().await?;
+    if !metadata.is_file() {
+        anyhow::bail!("cannot send '{}': not a regular file", path.display());
+    }
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_owned());
+    let size = metadata.len();
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::SendFileBegin {
+            filename,
+            peer: peer.to_owned(),
+            size,
+        },
+    )
+    .await?;
+    let mut opened = opened;
+    let mut sent = 0u64;
+    let mut buffer = vec![0u8; CHUNK];
+    loop {
+        let read = opened.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        sent += read as u64;
+        ipc::send(
+            &mut stream,
+            ipc::IpcMessage::SendFileChunk {
+                data: buffer[..read].to_vec(),
+                done: sent == size,
+            },
+        )
+        .await?;
+    }
+    if sent == 0 {
+        ipc::send(
+            &mut stream,
+            ipc::IpcMessage::SendFileChunk {
+                data: Vec::new(),
+                done: true,
+            },
+        )
+        .await?;
+    }
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Error { message } => anyhow::bail!("{message}"),
+        other => eprintln!("Unexpected response: {other:?}"),
     }
     Ok(())
 }

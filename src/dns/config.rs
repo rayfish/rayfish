@@ -11,7 +11,7 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 // Only the macOS/Linux configurators build resolver/backup file paths; Android
 // does no OS-level DNS configuration.
-#[cfg(not(target_os = "android"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::path::PathBuf;
 
 #[allow(unused_imports)]
@@ -63,7 +63,7 @@ pub async fn revert(configurator: &dyn DnsConfigurator) -> Result<()> {
 pub async fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigurator>> {
     // Only the macOS/Linux branches consume `tun_name`; on any other target
     // (e.g. Android) the function falls through to the unsupported-platform bail.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let _ = tun_name;
 
     #[cfg(target_os = "macos")]
@@ -113,6 +113,13 @@ pub async fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigura
         let c = DirectResolvConf::new().await;
         c.apply().await?;
         return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
+    }
+
+    #[cfg(windows)]
+    {
+        let configurator = WindowsDns::new(tun_name)?;
+        configurator.apply().await?;
+        return Ok(Box::new(configurator));
     }
 
     #[allow(unreachable_code)]
@@ -208,11 +215,158 @@ async fn set_search_domains(
     {
         set_search_domains_linux(rayfish_domains, network_names, tun_name).await
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        set_search_domains_windows(rayfish_domains, network_names, tun_name)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = (rayfish_domains, network_names, tun_name);
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Windows: Wintun adapter DNS + NRPT split-DNS rules
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+struct WindowsDns {
+    interface_alias: String,
+    upstreams: Vec<Ipv4Addr>,
+}
+
+#[cfg(windows)]
+impl WindowsDns {
+    fn new(tun_name: &str) -> Result<Self> {
+        let interface_alias = powershell_text(&format!(
+            "$ErrorActionPreference='Stop'; @(Get-NetAdapter | Where-Object {{ $_.Name -eq '{}' }} | Select-Object -ExpandProperty Name)",
+            ps_quote(tun_name)
+        ))?;
+        anyhow::ensure!(
+            !interface_alias.is_empty() && !interface_alias.contains('\n'),
+            "Windows TUN adapter {tun_name:?} was not uniquely found"
+        );
+        let upstreams = powershell_dns_servers(&interface_alias)?;
+        Ok(Self {
+            interface_alias,
+            upstreams,
+        })
+    }
+}
+
+#[cfg(windows)]
+#[async_trait]
+impl DnsConfigurator for WindowsDns {
+    async fn apply(&self) -> Result<()> {
+        powershell_status(&format!(
+            "Set-DnsClientServerAddress -InterfaceAlias '{}' -ServerAddresses '{}'",
+            ps_quote(&self.interface_alias),
+            RESOLVER_IP
+        ))
+    }
+
+    async fn revert(&self) -> Result<()> {
+        if self.upstreams.is_empty() {
+            powershell_status(&format!(
+                "Set-DnsClientServerAddress -InterfaceAlias '{}' -ResetServerAddresses",
+                ps_quote(&self.interface_alias)
+            ))
+        } else {
+            let servers = self
+                .upstreams
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("','");
+            powershell_status(&format!(
+                "Set-DnsClientServerAddress -InterfaceAlias '{}' -ServerAddresses '{}'",
+                ps_quote(&self.interface_alias),
+                servers
+            ))
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "windows-powershell-dns"
+    }
+
+    fn captured_upstreams(&self) -> Vec<Ipv4Addr> {
+        self.upstreams.clone()
+    }
+}
+
+#[cfg(windows)]
+fn ps_quote(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+#[cfg(windows)]
+fn powershell_text(script: &str) -> Result<String> {
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .output()
+        .context("run PowerShell")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "PowerShell failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+#[cfg(windows)]
+fn powershell_status(script: &str) -> Result<()> {
+    powershell_text(&format!("$ErrorActionPreference='Stop'; {script}"))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn powershell_dns_servers(alias: &str) -> Result<Vec<Ipv4Addr>> {
+    let text = powershell_text(&format!(
+        "@(Get-DnsClientServerAddress -InterfaceAlias '{}' -AddressFamily IPv4 | Select-Object -ExpandProperty ServerAddresses) | ConvertTo-Json -Compress",
+        ps_quote(alias)
+    ))?;
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    let values = match value {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::String(item) => vec![serde_json::Value::String(item)],
+        _ => Vec::new(),
+    };
+    Ok(values
+        .into_iter()
+        .filter_map(|item| item.as_str().and_then(|s| s.parse().ok()))
+        .collect())
+}
+
+#[cfg(windows)]
+fn set_search_domains_windows(
+    rayfish_domains: &[String],
+    _network_names: &[String],
+    _tun_name: &str,
+) -> Result<()> {
+    // NRPT rules are scoped to rayfish namespaces and are removed only by their
+    // explicit `rayfish:` display-name prefix, preserving operator rules.
+    powershell_status(
+        "Get-DnsClientNrptRule | Where-Object { $_.DisplayName -like 'rayfish:*' } | Remove-DnsClientNrptRule -Force",
+    )?;
+    for domain in rayfish_domains {
+        powershell_status(&format!(
+            "Add-DnsClientNrptRule -Namespace '.{}' -NameServers '{}' -DisplayName 'rayfish:{}' -ErrorAction Stop",
+            ps_quote(domain),
+            RESOLVER_IP,
+            ps_quote(domain)
+        ))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
