@@ -102,12 +102,14 @@ pub(crate) enum PeerIdentity {
 }
 
 impl PeerIdentity {
+    #[cfg(unix)]
     fn unix_cred(&self) -> Option<(u32, u32)> {
-        #[cfg(unix)]
-        {
-            let Self::Unix { uid, gid } = self;
-            return Some((*uid, *gid));
-        }
+        let Self::Unix { uid, gid } = self;
+        Some((*uid, *gid))
+    }
+
+    #[cfg(not(unix))]
+    fn unix_cred(&self) -> Option<(u32, u32)> {
         None
     }
 }
