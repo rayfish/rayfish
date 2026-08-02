@@ -15,10 +15,16 @@ use std::net::IpAddr;
 use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+use std::path::PathBuf;
 #[cfg(not(target_os = "android"))]
 use std::process::Command;
 #[cfg(not(target_os = "android"))]
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::thread;
+#[cfg(target_os = "windows")]
+use std::time::{Duration, Instant};
 
 #[cfg(not(target_os = "android"))]
 use anyhow::{Context, Result, bail};
@@ -178,13 +184,14 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
     // netlink/`ifconfig` `configure_ipv6` shell-out. `enable(true)` brings the
     // link up at creation (as the old `.up()` did); `set_link_up` and the
     // peer-range route helpers still run later on activate.
-    let device = DeviceBuilder::new()
+    let builder = DeviceBuilder::new()
         .ipv4(v4, 10, Some(gateway))
         .ipv6(v6, 128)
         .mtu(TUN_MTU)
-        .enable(true)
-        .build_async()
-        .context("create tun-rs device")?;
+        .enable(true);
+    #[cfg(target_os = "windows")]
+    let builder = builder.wintun_file(wintun_library_path().to_string_lossy().into_owned());
+    let device = builder.build_async().context("create tun-rs device")?;
 
     let tun_name = device.name().unwrap_or_else(|_| "unknown".to_string());
     tracing::info!(addr = %v4, ipv6 = %v6, tun = %tun_name, "TUN device created");
@@ -200,6 +207,15 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
         TunWriter { dev },
         tun_name,
     ))
+}
+
+#[cfg(target_os = "windows")]
+fn wintun_library_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("wintun.dll")))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("wintun.dll"))
 }
 
 /// Platform seam for desktop packet acquisition and privileged interface ops.
@@ -596,8 +612,11 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn windows_powershell(script: &str) -> Result<String> {
-    let output = Command::new("powershell.exe")
+    const POWERSHELL_TIMEOUT: Duration = Duration::from_secs(15);
+    let mut child = Command::new("powershell.exe")
         .creation_flags(0x0800_0000)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -606,8 +625,23 @@ fn windows_powershell(script: &str) -> Result<String> {
             "-Command",
             &format!("$ErrorActionPreference='Stop'; {script}"),
         ])
-        .output()
+        .spawn()
         .context("run Windows network PowerShell")?;
+    let deadline = Instant::now() + POWERSHELL_TIMEOUT;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("Windows network PowerShell timed out after {POWERSHELL_TIMEOUT:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let output = child
+        .wait_with_output()
+        .context("collect Windows network PowerShell output")?;
     anyhow::ensure!(
         output.status.success(),
         "Windows network command failed: {}",

@@ -847,6 +847,8 @@ impl Daemon {
             let tun_name = self.tun_name.load().as_str().to_owned();
             let my_v4 = self.transport.identity.local_ip();
             let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
+            #[cfg(target_os = "windows")]
+            tracing::info!(tun = %tun_name, "Windows activation: configure link and routes");
             if let Err(e) = tun::PlatformTun::set_link_up(&tun_name) {
                 tracing::warn!(error = %e, "failed to bring TUN interface up");
                 warnings.push(format!("failed to bring TUN interface up: {e}"));
@@ -869,10 +871,14 @@ impl Daemon {
                 tracing::warn!(error = %e, "failed to route 200::/7 into TUN");
                 warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
             }
+            #[cfg(target_os = "windows")]
+            tracing::info!("Windows activation: peer routes finished");
 
             if let Err(e) = tun::PlatformTun::route_magic_dns(&tun_name).await {
                 tracing::warn!(error = %e, "failed to route magic DNS IP into TUN");
             }
+            #[cfg(target_os = "windows")]
+            tracing::info!("Windows activation: magic-DNS route finished");
 
             // Loop our own addresses back through lo0 so self-traffic (e.g.
             // pinging our own hostname) is answered locally instead of leaving via
@@ -889,7 +895,11 @@ impl Daemon {
         // (mobile) stores it behind a mutex, and a std guard can't be held across
         // an await point.
         let dns_tun_name = self.tun_name.load().as_str().to_owned();
+        #[cfg(target_os = "windows")]
+        tracing::info!(tun = %dns_tun_name, "Windows activation: configure DNS");
         self.dns.configure(&dns_tun_name, &mut warnings).await;
+        #[cfg(target_os = "windows")]
+        tracing::info!("Windows activation: DNS configuration finished");
 
         // Start the embedded mesh SSH server if enabled. It binds the mesh IPs'
         // port 22, so it follows the data plane (mesh addresses must be up).

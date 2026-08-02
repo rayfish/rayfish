@@ -841,7 +841,9 @@ async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()>
 
 #[cfg(windows)]
 fn create_named_pipe(name: &str) -> Result<NamedPipeServer> {
-    let server = ServerOptions::new().create(name)?;
+    // SetSecurityInfo below needs WRITE_DAC on the pipe handle. Request it at
+    // creation time; applying the operator SID ACL must remain fail-closed.
+    let server = ServerOptions::new().write_dac(true).create(name)?;
     apply_named_pipe_acl(&server)?;
     Ok(server)
 }

@@ -15,6 +15,12 @@ use std::path::Path;
 use std::os::windows::process::CommandExt;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::path::PathBuf;
+#[cfg(target_os = "windows")]
+use std::process::Stdio;
+#[cfg(target_os = "windows")]
+use std::thread;
+#[cfg(target_os = "windows")]
+use std::time::{Duration, Instant};
 
 #[allow(unused_imports)]
 use anyhow::Context;
@@ -249,7 +255,9 @@ impl WindowsDns {
             !interface_alias.is_empty() && !interface_alias.contains('\n'),
             "Windows TUN adapter {tun_name:?} was not uniquely found"
         );
-        let upstreams = powershell_dns_servers(&interface_alias)?;
+        // Wintun has no upstream resolver of its own. Capture the host's
+        // physical-interface DNS servers before pointing the system at Magic DNS.
+        let upstreams = powershell_host_dns_servers(&interface_alias)?;
         Ok(Self {
             interface_alias,
             upstreams,
@@ -305,8 +313,11 @@ fn ps_quote(value: &str) -> String {
 
 #[cfg(windows)]
 fn powershell_text(script: &str) -> Result<String> {
-    let output = std::process::Command::new("powershell.exe")
+    const POWERSHELL_TIMEOUT: Duration = Duration::from_secs(15);
+    let mut child = std::process::Command::new("powershell.exe")
         .creation_flags(0x0800_0000)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -315,8 +326,23 @@ fn powershell_text(script: &str) -> Result<String> {
             "-Command",
             script,
         ])
-        .output()
+        .spawn()
         .context("run PowerShell")?;
+    let deadline = Instant::now() + POWERSHELL_TIMEOUT;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("PowerShell timed out after {POWERSHELL_TIMEOUT:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let output = child
+        .wait_with_output()
+        .context("collect PowerShell output")?;
     if !output.status.success() {
         anyhow::bail!(
             "PowerShell failed: {}",
@@ -333,21 +359,26 @@ fn powershell_status(script: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn powershell_dns_servers(alias: &str) -> Result<Vec<Ipv4Addr>> {
+fn powershell_host_dns_servers(exclude_alias: &str) -> Result<Vec<Ipv4Addr>> {
     let text = powershell_text(&format!(
-        "@(Get-DnsClientServerAddress -InterfaceAlias '{}' -AddressFamily IPv4 | Select-Object -ExpandProperty ServerAddresses) | ConvertTo-Json -Compress",
-        ps_quote(alias)
+        "@(Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object {{ $_.InterfaceAlias -ne '{}' }} | Select-Object -ExpandProperty ServerAddresses) | ConvertTo-Json -Compress",
+        ps_quote(exclude_alias)
     ))?;
     let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    Ok(parse_dns_server_values(value))
+}
+
+#[cfg(windows)]
+fn parse_dns_server_values(value: serde_json::Value) -> Vec<Ipv4Addr> {
     let values = match value {
         serde_json::Value::Array(items) => items,
         serde_json::Value::String(item) => vec![serde_json::Value::String(item)],
         _ => Vec::new(),
     };
-    Ok(values
+    values
         .into_iter()
         .filter_map(|item| item.as_str().and_then(|s| s.parse().ok()))
-        .collect())
+        .collect()
 }
 
 #[cfg(windows)]
