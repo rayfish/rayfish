@@ -305,10 +305,10 @@ impl Daemon {
             use std::os::unix::ffi::OsStrExt;
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
-            if let Some((uid, gid)) = peer_cred {
-                if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
-                    unsafe { libc::chown(c.as_ptr(), uid, gid) };
-                }
+            if let Some((uid, gid)) = peer_cred
+                && let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes())
+            {
+                unsafe { libc::chown(c.as_ptr(), uid, gid) };
             }
         }
 

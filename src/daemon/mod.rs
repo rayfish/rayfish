@@ -104,7 +104,8 @@ pub(crate) enum PeerIdentity {
 impl PeerIdentity {
     fn unix_cred(&self) -> Option<(u32, u32)> {
         #[cfg(unix)]
-        if let Self::Unix { uid, gid } = self {
+        {
+            let Self::Unix { uid, gid } = self;
             return Some((*uid, *gid));
         }
         None
@@ -806,8 +807,8 @@ impl Daemon {
         }
 
         #[cfg(unix)]
-        let uid = peer.and_then(|p| match p {
-            PeerIdentity::Unix { uid, .. } => Some(*uid),
+        let uid = peer.map(|p| match p {
+            PeerIdentity::Unix { uid, .. } => *uid,
         });
         #[cfg(windows)]
         let sid = peer.map(|p| match p {
