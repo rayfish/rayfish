@@ -13,6 +13,8 @@ use std::future::Future;
 use std::net::IpAddr;
 #[cfg(not(target_os = "android"))]
 use std::net::{Ipv4Addr, Ipv6Addr};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 #[cfg(not(target_os = "android"))]
 use std::process::Command;
 #[cfg(not(target_os = "android"))]
@@ -574,6 +576,7 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
         let state = if up { "enabled" } else { "disabled" };
         let escaped = tun_name.to_owned();
         let status = Command::new("netsh")
+            .creation_flags(0x0800_0000)
             .args([
                 "interface",
                 "set",
@@ -594,6 +597,7 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
 #[cfg(target_os = "windows")]
 fn windows_powershell(script: &str) -> Result<String> {
     let output = Command::new("powershell.exe")
+        .creation_flags(0x0800_0000)
         .args([
             "-NoProfile",
             "-NonInteractive",

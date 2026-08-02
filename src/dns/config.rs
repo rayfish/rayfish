@@ -11,6 +11,8 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 // Only the macOS/Linux configurators build resolver/backup file paths; Android
 // does no OS-level DNS configuration.
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::path::PathBuf;
 
@@ -304,6 +306,7 @@ fn ps_quote(value: &str) -> String {
 #[cfg(windows)]
 fn powershell_text(script: &str) -> Result<String> {
     let output = std::process::Command::new("powershell.exe")
+        .creation_flags(0x0800_0000)
         .args([
             "-NoProfile",
             "-NonInteractive",
