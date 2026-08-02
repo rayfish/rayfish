@@ -67,9 +67,7 @@ Rayfish runs on **Linux and macOS**; **Windows x64 is experimental** (Android is
 early and experimental). Windows uses a LocalSystem service, signed Wintun, and
 named-pipe IPC. Install the Windows MSI, then run `ray up` from an elevated
 terminal once to register the operator SID. Windows SSH/PTY commands are not
-available in this first port. The MSI also installs a `Rayfish` desktop
-shortcut backed by the console-free `rayfish-gui.exe`; keep using `ray.exe` in
-terminals and scripts.
+available in this first port; use `ray.exe` in terminals and scripts.
 Building from source needs a Rust toolchain (2024 edition, Rust 1.85+); see
 [Building](#building). Once the service is installed, `ray update` keeps it
 current without rebuilding.
