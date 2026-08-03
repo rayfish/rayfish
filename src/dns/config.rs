@@ -312,6 +312,22 @@ fn ps_quote(value: &str) -> String {
 }
 
 #[cfg(windows)]
+fn nrpt_scripts(rayfish_domains: &[String]) -> Vec<String> {
+    let mut scripts = vec![
+        "Get-DnsClientNrptRule | Where-Object { $_.DisplayName -like 'rayfish:*' } | Remove-DnsClientNrptRule -Force".to_owned(),
+    ];
+    scripts.extend(rayfish_domains.iter().map(|domain| {
+        format!(
+            "Add-DnsClientNrptRule -Namespace '.{}' -NameServers '{}' -DisplayName 'rayfish:{}' -ErrorAction Stop",
+            ps_quote(domain),
+            RESOLVER_IP,
+            ps_quote(domain)
+        )
+    }));
+    scripts
+}
+
+#[cfg(windows)]
 fn powershell_text(script: &str) -> Result<String> {
     const POWERSHELL_TIMEOUT: Duration = Duration::from_secs(15);
     let mut child = std::process::Command::new("powershell.exe")
@@ -389,16 +405,8 @@ fn set_search_domains_windows(
 ) -> Result<()> {
     // NRPT rules are scoped to rayfish namespaces and are removed only by their
     // explicit `rayfish:` display-name prefix, preserving operator rules.
-    powershell_status(
-        "Get-DnsClientNrptRule | Where-Object { $_.DisplayName -like 'rayfish:*' } | Remove-DnsClientNrptRule -Force",
-    )?;
-    for domain in rayfish_domains {
-        powershell_status(&format!(
-            "Add-DnsClientNrptRule -Namespace '.{}' -NameServers '{}' -DisplayName 'rayfish:{}' -ErrorAction Stop",
-            ps_quote(domain),
-            RESOLVER_IP,
-            ps_quote(domain)
-        ))?;
+    for script in nrpt_scripts(rayfish_domains) {
+        powershell_status(&script)?;
     }
     Ok(())
 }
@@ -1780,5 +1788,61 @@ mod tests {
         assert!(!nm_supports_split_dns("default"));
         assert!(!nm_supports_split_dns("unbound"));
         assert!(!nm_supports_split_dns(""));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_dns_upstreams_cover_zero_one_many_and_invalid_values() {
+        use super::parse_dns_server_values;
+        use serde_json::json;
+
+        assert!(parse_dns_server_values(serde_json::Value::Null).is_empty());
+        assert_eq!(
+            parse_dns_server_values(json!("1.1.1.1")),
+            vec!["1.1.1.1".parse::<Ipv4Addr>().unwrap()]
+        );
+        assert_eq!(
+            parse_dns_server_values(json!(["8.8.8.8", "not-an-ip", "9.9.9.9"])),
+            vec![
+                "8.8.8.8".parse::<Ipv4Addr>().unwrap(),
+                "9.9.9.9".parse::<Ipv4Addr>().unwrap()
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_dns_nrpt_scripts_are_scoped_and_quote_boundaries() {
+        use super::{nrpt_scripts, ps_quote};
+
+        assert_eq!(ps_quote(""), "");
+        assert_eq!(ps_quote("O'Brien"), "O''Brien");
+
+        let zero = nrpt_scripts(&[]);
+        assert_eq!(zero.len(), 1);
+        assert!(zero[0].contains("DisplayName -like 'rayfish:*'"));
+
+        let one = nrpt_scripts(&["corp.ray".to_string()]);
+        assert_eq!(one.len(), 2);
+        assert!(one[1].contains("Namespace '.corp.ray'"));
+        assert!(one[1].contains("NameServers '100.100.100.53'"));
+
+        let many = nrpt_scripts(&["a.ray".to_string(), "O'Brian.ray".to_string()]);
+        assert_eq!(many.len(), 3);
+        assert!(many[2].contains("O''Brian.ray"));
+        assert!(many.iter().skip(1).all(|s| s.contains("rayfish:")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_dns_adapter_exposes_stable_interface_contract() {
+        use super::{DnsConfigurator, WindowsDns};
+
+        let dns = WindowsDns {
+            interface_alias: "Rayfish Tunnel".to_string(),
+            upstreams: vec!["192.168.1.1".parse().unwrap()],
+        };
+        assert_eq!(dns.name(), "windows-powershell-dns");
+        assert_eq!(dns.captured_upstreams(), dns.upstreams);
     }
 }

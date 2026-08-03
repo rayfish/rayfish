@@ -141,16 +141,20 @@ fn status(
     handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: state,
-        controls_accepted: if state == ServiceState::Running {
-            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
-        } else {
-            ServiceControlAccept::empty()
-        },
+        controls_accepted: controls_accepted(state),
         exit_code: ServiceExitCode::Win32(0),
         checkpoint: 0,
         wait_hint: Duration::default(),
         process_id: None,
     })
+}
+
+fn controls_accepted(state: ServiceState) -> ServiceControlAccept {
+    if state == ServiceState::Running {
+        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
+    } else {
+        ServiceControlAccept::empty()
+    }
 }
 
 fn run_service() -> windows_service::Result<()> {
@@ -184,9 +188,56 @@ fn run_service() -> windows_service::Result<()> {
 pub fn run_if_service() -> Result<bool> {
     match windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
         Ok(()) => Ok(true),
-        Err(windows_service::Error::Winapi(error)) if error.raw_os_error() == Some(1063) => {
-            Ok(false)
-        }
+        Err(error) if is_console_dispatch_error(&error) => Ok(false),
         Err(error) => Err(anyhow::anyhow!(error)),
+    }
+}
+
+fn is_console_dispatch_error(error: &windows_service::Error) -> bool {
+    matches!(error, windows_service::Error::Winapi(error) if error.raw_os_error() == Some(1063))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{
+        SERVICE_NAME, ServiceStartType, ServiceState, controls_accepted, is_console_dispatch_error,
+        service_info,
+    };
+    use windows_service::service::{ServiceControlAccept, ServiceType};
+
+    #[test]
+    fn service_info_is_auto_starting_local_system_compatible_daemon() {
+        let info = service_info(Path::new(r"C:\Program Files\Rayfish\ray.exe"));
+        assert_eq!(info.name.to_string_lossy(), SERVICE_NAME);
+        assert_eq!(info.display_name.to_string_lossy(), "Rayfish Mesh VPN");
+        assert_eq!(info.service_type, ServiceType::OWN_PROCESS);
+        assert_eq!(info.start_type, ServiceStartType::AutoStart);
+        assert_eq!(
+            info.launch_arguments,
+            vec![std::ffi::OsString::from("daemon")]
+        );
+        assert!(info.dependencies.is_empty());
+        assert!(info.account_name.is_none());
+        assert!(info.account_password.is_none());
+    }
+
+    #[test]
+    fn service_controls_are_fail_closed_outside_running_state() {
+        assert_eq!(
+            controls_accepted(ServiceState::Running),
+            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
+        );
+        assert!(controls_accepted(ServiceState::Stopped).is_empty());
+        assert!(controls_accepted(ServiceState::StartPending).is_empty());
+    }
+
+    #[test]
+    fn console_dispatch_error_is_classified_without_touching_scm() {
+        let console = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(1063));
+        let denied = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(5));
+        assert!(is_console_dispatch_error(&console));
+        assert!(!is_console_dispatch_error(&denied));
     }
 }

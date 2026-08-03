@@ -16,9 +16,11 @@ jobs:
       - name: Cross-target compile
         run: cargo check --target x86_64-pc-windows-msvc --features desktop --bin ray
       - name: Host regression tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+      - name: Windows contract tests
+        run: cargo test --test windows_contracts --locked
       - name: Clippy quality gate
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   package:
     if: ${{ vars.RAYFISH_WINDOWS_PACKAGING == 'true' }}

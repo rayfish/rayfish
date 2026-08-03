@@ -89,3 +89,20 @@ pub(crate) fn named_pipe_client_sid(pipe: HANDLE) -> Option<String> {
     }
     sid
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{current_user_sid, named_pipe_client_sid};
+
+    #[test]
+    fn current_user_sid_is_a_nonempty_windows_sid() {
+        let sid = current_user_sid().expect("the test process should have a token SID");
+        assert!(sid.starts_with("S-"), "unexpected SID format: {sid}");
+        assert!(sid.split('-').count() >= 4);
+    }
+
+    #[test]
+    fn invalid_named_pipe_handle_fails_closed() {
+        assert!(named_pipe_client_sid(std::ptr::null_mut()).is_none());
+    }
+}

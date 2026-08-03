@@ -218,6 +218,49 @@ fn wintun_library_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("wintun.dll"))
 }
 
+#[cfg(target_os = "windows")]
+const WINDOWS_PEER_ROUTES: [(&str, &str); 2] = [("100.64.0.0/10", "0.0.0.0"), ("200::/7", "::")];
+
+#[cfg(target_os = "windows")]
+fn windows_link_args(tun_name: &str, up: bool) -> [String; 5] {
+    let state = if up { "enabled" } else { "disabled" };
+    [
+        "interface".to_owned(),
+        "set".to_owned(),
+        "interface".to_owned(),
+        format!("name={tun_name}"),
+        format!("admin={state}"),
+    ]
+}
+
+#[cfg(target_os = "windows")]
+fn windows_interface_query_script(tun_name: &str) -> String {
+    let quoted = tun_name.replace('\'', "''");
+    format!(
+        "@(Get-NetAdapter | Where-Object {{ $_.Name -eq '{}' }} | Select-Object -ExpandProperty ifIndex)",
+        quoted
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_remove_route_script(prefix: &str, index: u32) -> String {
+    format!(
+        "Remove-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -Confirm:$false -ErrorAction SilentlyContinue",
+        prefix, index
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_replace_route_script(prefix: &str, index: u32, next_hop: &str) -> String {
+    format!(
+        "{}; New-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -NextHop '{}' -PolicyStore ActiveStore -ErrorAction Stop",
+        windows_remove_route_script(prefix, index),
+        prefix,
+        index,
+        next_hop
+    )
+}
+
 /// Platform seam for desktop packet acquisition and privileged interface ops.
 /// The Windows implementation delegates packet I/O to `tun-rs`/Wintun while
 /// keeping the existing `TunRead`/`TunWrite` forwarding path unchanged.
@@ -361,11 +404,8 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
 #[cfg(target_os = "windows")]
 pub async fn unroute_peer_range(tun_name: &str) -> Result<()> {
     let index = windows_interface_index(tun_name)?;
-    for prefix in ["100.64.0.0/10", "200::/7"] {
-        windows_powershell(&format!(
-            "Remove-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -Confirm:$false -ErrorAction SilentlyContinue",
-            prefix, index
-        ))?;
+    for &(prefix, _) in &WINDOWS_PEER_ROUTES {
+        windows_powershell(&windows_remove_route_script(prefix, index))?;
     }
     Ok(())
 }
@@ -374,17 +414,11 @@ pub async fn unroute_peer_range(tun_name: &str) -> Result<()> {
 pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     let index = windows_interface_index(tun_name)?;
     let mut installed = Vec::new();
-    for (prefix, next_hop) in [("100.64.0.0/10", "0.0.0.0"), ("200::/7", "::")] {
-        let result = windows_powershell(&format!(
-            "Remove-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -Confirm:$false -ErrorAction SilentlyContinue; New-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -NextHop '{}' -PolicyStore ActiveStore -ErrorAction Stop",
-            prefix, index, prefix, index, next_hop
-        ));
+    for &(prefix, next_hop) in &WINDOWS_PEER_ROUTES {
+        let result = windows_powershell(&windows_replace_route_script(prefix, index, next_hop));
         if let Err(error) = result {
             for previous in installed {
-                let _ = windows_powershell(&format!(
-                    "Remove-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -Confirm:$false -ErrorAction SilentlyContinue",
-                    previous, index
-                ));
+                let _ = windows_powershell(&windows_remove_route_script(previous, index));
             }
             return Err(error);
         }
@@ -500,13 +534,8 @@ pub async fn route_magic_dns(_tun_name: &str) -> Result<()> {
 #[cfg(target_os = "windows")]
 pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
     let index = windows_interface_index(tun_name)?;
-    windows_powershell(&format!(
-        "Remove-NetRoute -DestinationPrefix '{}/32' -InterfaceIndex {} -Confirm:$false -ErrorAction SilentlyContinue; New-NetRoute -DestinationPrefix '{}/32' -InterfaceIndex {} -NextHop '0.0.0.0' -PolicyStore ActiveStore -ErrorAction Stop",
-        crate::dns::MAGIC_DNS_V4,
-        index,
-        crate::dns::MAGIC_DNS_V4,
-        index
-    ))?;
+    let prefix = format!("{}/32", crate::dns::MAGIC_DNS_V4);
+    windows_powershell(&windows_replace_route_script(&prefix, index, "0.0.0.0"))?;
     Ok(())
 }
 
@@ -589,22 +618,16 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let state = if up { "enabled" } else { "disabled" };
-        let escaped = tun_name.to_owned();
+        let args = windows_link_args(tun_name, up);
         let status = Command::new("netsh")
             .creation_flags(0x0800_0000)
-            .args([
-                "interface",
-                "set",
-                "interface",
-                &format!("name={escaped}"),
-                &format!("admin={state}"),
-            ])
+            .args(&args)
             .status()
             .context("run netsh interface set interface")?;
         anyhow::ensure!(
             status.success(),
-            "netsh interface {state} failed with {status}"
+            "netsh interface {} failed with {status}",
+            if up { "enabled" } else { "disabled" }
         );
     }
     Ok(())
@@ -652,11 +675,7 @@ fn windows_powershell(script: &str) -> Result<String> {
 
 #[cfg(target_os = "windows")]
 fn windows_interface_index(tun_name: &str) -> Result<u32> {
-    let quoted = tun_name.replace('\'', "''");
-    let output = windows_powershell(&format!(
-        "@(Get-NetAdapter | Where-Object {{ $_.Name -eq '{}' }} | Select-Object -ExpandProperty ifIndex)",
-        quoted
-    ))?;
+    let output = windows_powershell(&windows_interface_query_script(tun_name))?;
     anyhow::ensure!(
         !output.is_empty() && !output.contains('\n'),
         "Windows TUN adapter {tun_name:?} was not uniquely found"
@@ -690,5 +709,73 @@ impl TunWrite for TunWriter {
     async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
         self.dev.send(packet).await?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::{
+        WINDOWS_PEER_ROUTES, windows_interface_query_script, windows_link_args,
+        windows_remove_route_script, windows_replace_route_script, wintun_library_path,
+    };
+
+    #[test]
+    fn windows_link_args_cover_up_down_and_name_boundary() {
+        let up = windows_link_args("Rayfish Tunnel", true);
+        assert_eq!(
+            up,
+            [
+                "interface",
+                "set",
+                "interface",
+                "name=Rayfish Tunnel",
+                "admin=enabled",
+            ]
+        );
+
+        let down = windows_link_args("O'Brien", false);
+        assert_eq!(down[3], "name=O'Brien");
+        assert_eq!(down[4], "admin=disabled");
+    }
+
+    #[test]
+    fn windows_interface_query_quotes_powershell_boundaries() {
+        let script = windows_interface_query_script("O'Brien");
+        assert!(script.contains("Name -eq 'O''Brien'"));
+        assert!(script.contains("ExpandProperty ifIndex"));
+    }
+
+    #[test]
+    fn windows_peer_route_matrix_is_dual_stack_and_ordered() {
+        assert_eq!(WINDOWS_PEER_ROUTES.len(), 2);
+        assert_eq!(WINDOWS_PEER_ROUTES[0], ("100.64.0.0/10", "0.0.0.0"));
+        assert_eq!(WINDOWS_PEER_ROUTES[1], ("200::/7", "::"));
+    }
+
+    #[test]
+    fn windows_route_scripts_are_scoped_and_idempotent() {
+        let remove = windows_remove_route_script("100.64.0.0/10", 17);
+        assert!(remove.contains("Remove-NetRoute"));
+        assert!(remove.contains("-InterfaceIndex 17"));
+        assert!(remove.contains("-ErrorAction SilentlyContinue"));
+
+        let replace = windows_replace_route_script("200::/7", 17, "::");
+        let remove_v6 = windows_remove_route_script("200::/7", 17);
+        assert!(replace.starts_with(&remove_v6));
+        assert!(replace.contains("Remove-NetRoute"));
+        assert!(replace.contains("New-NetRoute"));
+        assert!(replace.contains("-DestinationPrefix '200::/7'"));
+        assert!(replace.contains("-NextHop '::'"));
+        assert!(replace.contains("-PolicyStore ActiveStore"));
+    }
+
+    #[test]
+    fn wintun_library_contract_ends_in_dll() {
+        assert_eq!(
+            wintun_library_path()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("wintun.dll")
+        );
     }
 }

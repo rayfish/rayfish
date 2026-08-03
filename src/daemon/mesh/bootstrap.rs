@@ -915,16 +915,38 @@ fn apply_named_pipe_acl(server: &NamedPipeServer) -> Result<()> {
 fn valid_windows_sid(sid: &str) -> bool {
     let mut parts = sid.split('-');
     matches!(parts.next(), Some("S"))
-        && parts
-            .next()
-            .is_some_and(|revision| revision.bytes().all(|b| b.is_ascii_digit()))
-        && parts
-            .next()
-            .is_some_and(|authority| authority.bytes().all(|b| b.is_ascii_digit()))
+        && parts.next().is_some_and(|revision| {
+            !revision.is_empty() && revision.bytes().all(|b| b.is_ascii_digit())
+        })
+        && parts.next().is_some_and(|authority| {
+            !authority.is_empty() && authority.bytes().all(|b| b.is_ascii_digit())
+        })
         && parts.count() > 0
         && sid.split('-').skip(3).all(|subauthority| {
             !subauthority.is_empty() && subauthority.bytes().all(|b| b.is_ascii_digit())
         })
+}
+
+#[cfg(all(test, windows))]
+mod windows_identity_tests {
+    use super::valid_windows_sid;
+
+    #[test]
+    fn sid_validation_covers_zero_one_many_and_boundaries() {
+        assert!(!valid_windows_sid(""));
+        assert!(!valid_windows_sid("S-1-5"));
+        assert!(valid_windows_sid("S-1-5-18"));
+        assert!(valid_windows_sid(
+            "S-1-5-21-111111111-222222222-333333333-1001"
+        ));
+
+        assert!(!valid_windows_sid("s-1-5-18"));
+        assert!(!valid_windows_sid("S--5-18"));
+        assert!(!valid_windows_sid("S-1--18"));
+        assert!(!valid_windows_sid("S-1-x-18"));
+        assert!(!valid_windows_sid("S-1-5-"));
+        assert!(!valid_windows_sid("S-1-5-18-extra"));
+    }
 }
 
 #[cfg(windows)]
