@@ -3,7 +3,7 @@ name: Windows
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, master]
 
 jobs:
   check:
@@ -13,8 +13,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "windows-ci"
+          cache-on-failure: true
       - name: Cross-target compile
-        run: cargo check --target x86_64-pc-windows-msvc --features desktop --bin ray
+        run: cargo check --locked --target x86_64-pc-windows-msvc --features desktop --bin ray
       - name: Host regression tests
         run: cargo test --workspace --locked
       - name: Windows contract tests
@@ -31,26 +36,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Download signed Wintun
-        shell: pwsh
-        run: |
-          $zip = Join-Path $env:RUNNER_TEMP 'wintun.zip'
-          Invoke-WebRequest -Uri 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile $zip
-          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'wintun') -Force
-          New-Item -ItemType Directory -Force -Path packaging/windows/wintun/amd64 | Out-Null
-          $dll = Get-ChildItem (Join-Path $env:RUNNER_TEMP 'wintun') -Recurse -Filter wintun.dll | Where-Object FullName -Match 'amd64' | Select-Object -First 1
-          if (-not $dll) { throw 'amd64/wintun.dll not found in upstream archive' }
-          Copy-Item $dll.FullName packaging/windows/wintun/amd64/wintun.dll
-          ./scripts/verify-wintun.ps1 -ArchivePath $zip
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "windows-package"
+          cache-on-failure: true
       - name: Install WiX 3
         shell: pwsh
         run: choco install wixtoolset --version=3.14.1 -y --no-progress
       - name: Install cargo-wix
         run: cargo install cargo-wix --version 0.3.9 --locked
-      - name: Build release binary
-        run: cargo build --release --target x86_64-pc-windows-msvc --features desktop --bin ray
-      - name: Stage Wintun beside binary
+      - name: Build MSI and sidecars
         shell: pwsh
-        run: Copy-Item packaging/windows/wintun/amd64/wintun.dll target/x86_64-pc-windows-msvc/release/wintun.dll
-      - name: Build MSI
-        run: cargo wix -p rayfish --no-build --target x86_64-pc-windows-msvc --target-bin-dir target/x86_64-pc-windows-msvc/release --output target/rayfish-windows-x64.msi
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq 'rayfish' | Select-Object -First 1).version
+          ./scripts/build-windows-msi.ps1 -Version $version -OutputPath "$env:RUNNER_TEMP\ray-windows-x86_64.msi"
+      - name: Upload MSI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ray-windows-x86_64-msi
+          path: ${{ runner.temp }}/ray-windows-x86_64.msi*
+          if-no-files-found: error

@@ -1111,11 +1111,21 @@ async fn auto_update_once() -> Result<()> {
     tracing::info!(current, target = %tag, "auto-update: found newer stable release, swapping");
     let expected = crate::update::fetch_checksum(&client, &tag, &asset).await?;
     let bin_url = crate::update::asset_download_url(&tag, &asset);
-    crate::update::download_and_swap(&client, &bin_url, &expected, &asset).await?;
+    #[cfg(windows)]
+    {
+        let msi = crate::update::download_msi_to_temp(&client, &bin_url, &expected, &asset).await?;
+        crate::update::install_msi(&msi, false)?;
+        tracing::info!(target = %tag, path = %msi.display(), "auto-update: Windows MSI installation scheduled");
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        crate::update::download_and_swap(&client, &bin_url, &expected, &asset).await?;
 
-    tracing::info!(target = %tag, "auto-update: binary swapped, restarting service onto it");
-    crate::update::trigger_detached_restart();
-    Ok(())
+        tracing::info!(target = %tag, "auto-update: binary swapped, restarting service onto it");
+        crate::update::trigger_detached_restart();
+        Ok(())
+    }
 }
 
 /// Current unix time in whole seconds (best-effort; 0 before the epoch, which

@@ -1389,11 +1389,15 @@ mod tests {
             release_asset_name("macos", "aarch64").unwrap(),
             "ray-macos-aarch64"
         );
+        assert_eq!(
+            release_asset_name("windows", "x86_64").unwrap(),
+            "ray-windows-x86_64.msi"
+        );
     }
 
     #[test]
     fn release_asset_name_rejects_unsupported_platforms() {
-        assert!(release_asset_name("windows", "x86_64").is_err());
+        assert!(release_asset_name("windows", "aarch64").is_err());
         assert!(release_asset_name("linux", "riscv64").is_err());
     }
 

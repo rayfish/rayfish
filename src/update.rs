@@ -1,9 +1,14 @@
 //! Reusable self-update engine shared by the `ray update` CLI and the daemon's
 //! opt-in auto-updater. Pure GitHub-release plumbing: resolve a release, fetch
-//! and verify its SHA-256 sidecar, and atomically swap the running binary. No
+//! and verify its SHA-256 sidecar, and atomically swap the running binary (or
+//! stage a verified MSI on Windows). No
 //! printing, no root checks, no service restart - those belong to the callers
 //! (the CLI in `src/cli/update.rs`, the daemon task in `src/daemon`).
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Stdio;
@@ -27,6 +32,12 @@ pub const REPO_SLUG: &str = "rayfish/rayfish";
 /// (which runs on any Linux) and a glibc binary to the plain gnu asset. Getting
 /// this wrong would hand a musl-only host a glibc binary that can't start.
 pub fn release_asset_name(os: &str, arch: &str) -> Result<String> {
+    if os == "windows" {
+        if arch != "x86_64" {
+            anyhow::bail!("no rayfish Windows MSI for architecture '{arch}'; build from source");
+        }
+        return Ok("ray-windows-x86_64.msi".to_string());
+    }
     let os = match os {
         "linux" => "linux",
         "macos" => "macos",
@@ -45,6 +56,30 @@ pub fn release_asset_name(os: &str, arch: &str) -> Result<String> {
         ""
     };
     Ok(format!("ray-{os}-{arch}{libc}"))
+}
+
+/// Parse a release version sidecar. Windows MSI assets use this because the
+/// installer checksum cannot be compared with the installed `ray.exe` bytes.
+pub fn parse_version_manifest(text: &str) -> Result<String> {
+    let version = text.trim();
+    Version::parse(version)
+        .with_context(|| format!("invalid release version sidecar: {version:?}"))?;
+    Ok(version.to_owned())
+}
+
+/// Parse the single DisplayVersion line returned by the Windows uninstall
+/// registry query. Multiple Rayfish entries are ambiguous and fail closed.
+pub fn parse_installed_version(output: &str) -> Result<Option<String>> {
+    let versions: Vec<_> = output
+        .lines()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect();
+    match versions.as_slice() {
+        [] => Ok(None),
+        [version] => parse_version_manifest(version).map(Some),
+        _ => anyhow::bail!("multiple Rayfish MSI versions are installed"),
+    }
 }
 
 /// Strip a leading `v` from a release tag for comparison with
@@ -182,6 +217,124 @@ pub async fn fetch_checksum(client: &Client, tag: &str, asset: &str) -> Result<S
     Ok(expected)
 }
 
+/// Fetch and validate a release asset's version sidecar.
+pub async fn fetch_version_manifest(client: &Client, tag: &str, asset: &str) -> Result<String> {
+    let url = format!("{}.version", asset_download_url(tag, asset));
+    let text = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()
+        .with_context(|| format!("no version manifest at {url}"))?
+        .text()
+        .await
+        .context("failed to fetch the published version manifest")?;
+    parse_version_manifest(&text)
+}
+
+#[cfg(windows)]
+pub fn installed_msi_version() -> Result<Option<String>> {
+    let output = Command::new("powershell.exe")
+        .creation_flags(0x0800_0000)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "@(Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' | Where-Object { $_.DisplayName -eq 'Rayfish' } | Select-Object -ExpandProperty DisplayVersion)",
+        ])
+        .output()
+        .context("query installed Rayfish MSI version")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Windows registry query for Rayfish MSI failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    parse_installed_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(windows)]
+pub async fn download_msi_to_temp(
+    client: &Client,
+    bin_url: &str,
+    expected: &str,
+    asset: &str,
+) -> Result<PathBuf> {
+    let bytes = client
+        .get(bin_url)
+        .send()
+        .await?
+        .error_for_status()
+        .with_context(|| format!("no release asset at {bin_url}"))?
+        .bytes()
+        .await
+        .map_err(Error::from)
+        .context("MSI download failed")?;
+    let actual = sha256_hex(&bytes);
+    if actual != expected {
+        anyhow::bail!(
+            "checksum mismatch for {asset}\n  expected: {expected}\n  got:      {actual}"
+        );
+    }
+    let path = std::env::temp_dir().join(format!(
+        "rayfish-update-{}-{}.msi",
+        std::process::id(),
+        asset.replace(['\\', '/', ':'], "_")
+    ));
+    std::fs::write(&path, &bytes)
+        .with_context(|| format!("write MSI temp file {}", path.display()))?;
+    Ok(path)
+}
+
+#[cfg(windows)]
+pub fn msi_install_args(path: &Path) -> [String; 4] {
+    [
+        "/i".to_string(),
+        path.to_string_lossy().into_owned(),
+        "/qn".to_string(),
+        "/norestart".to_string(),
+    ]
+}
+
+#[cfg(windows)]
+fn schedule_msi_temp_cleanup(path: &Path, installer_pid: u32) -> Result<()> {
+    let escaped_path = path.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "Wait-Process -Id {installer_pid} -Timeout 900 -ErrorAction SilentlyContinue; Remove-Item -LiteralPath '{escaped_path}' -Force -ErrorAction SilentlyContinue"
+    );
+    Command::new("powershell.exe")
+        .creation_flags(0x0800_0000)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .spawn()
+        .context("schedule MSI temp cleanup")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn msi_failure_message(code: Option<i32>) -> String {
+    format!(
+        "Windows Installer failed with exit code {} (run elevated and retry)",
+        code.unwrap_or(-1)
+    )
+}
+
+#[cfg(windows)]
+pub fn install_msi(path: &Path, wait: bool) -> Result<()> {
+    let mut command = Command::new("msiexec.exe");
+    let args = msi_install_args(path);
+    command.creation_flags(0x0800_0000).args(args);
+    if wait {
+        let status = command.status().context("launch Windows Installer")?;
+        if !status.success() {
+            anyhow::bail!("{}", msi_failure_message(status.code()));
+        }
+    } else {
+        let installer = command.spawn().context("schedule Windows Installer")?;
+        let _ = schedule_msi_temp_cleanup(path, installer.id());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
 /// Download the release asset, verify it against the (already-fetched)
 /// checksum, and atomically swap it in for the running binary. Stages the new
 /// binary in a temp file, marks it executable, then `self_replace`s (handles the
@@ -330,5 +483,51 @@ mod tests {
             1000 + 86_400,
             86_400
         ));
+    }
+
+    #[test]
+    fn windows_asset_and_version_contracts_are_stable() {
+        assert_eq!(
+            release_asset_name("windows", "x86_64").unwrap(),
+            "ray-windows-x86_64.msi"
+        );
+        assert!(release_asset_name("windows", "aarch64").is_err());
+        assert_eq!(parse_version_manifest("0.2.17\n").unwrap(), "0.2.17");
+        assert!(parse_version_manifest("nightly").is_err());
+    }
+
+    #[test]
+    fn installed_version_parser_is_zero_one_many_and_fail_closed() {
+        assert_eq!(parse_installed_version("").unwrap(), None);
+        assert_eq!(
+            parse_installed_version("0.2.17\r\n").unwrap(),
+            Some("0.2.17".to_string())
+        );
+        assert!(parse_installed_version("0.2.17\n0.2.18").is_err());
+        assert!(parse_installed_version("not-a-version").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn msi_install_args_are_quiet_and_no_restart() {
+        assert_eq!(
+            msi_install_args(Path::new(r"C:\Temp\rayfish.msi")),
+            [
+                "/i".to_string(),
+                r"C:\Temp\rayfish.msi".to_string(),
+                "/qn".to_string(),
+                "/norestart".to_string()
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn msi_failure_message_preserves_exit_code_and_uac_hint() {
+        assert_eq!(
+            msi_failure_message(Some(1603)),
+            "Windows Installer failed with exit code 1603 (run elevated and retry)"
+        );
+        assert!(msi_failure_message(None).contains("exit code -1"));
     }
 }

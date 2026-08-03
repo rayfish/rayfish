@@ -5,8 +5,11 @@
   <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
 <?endif ?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <?ifndef ProductVersion ?>
+    <?define ProductVersion = "0.0.0" ?>
+  <?endif ?>
   <Product Id="*" Name="Rayfish" Language="1033" Manufacturer="Rayfish"
-           Version="0.2.1" UpgradeCode="0fef36a5-5b12-45d3-a2d2-e10d3770d6f8">
+           Version="$(var.ProductVersion)" UpgradeCode="0fef36a5-5b12-45d3-a2d2-e10d3770d6f8">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />
     <MajorUpgrade DowngradeErrorMessage="A newer Rayfish version is already installed." />
     <MediaTemplate EmbedCab="yes" />
