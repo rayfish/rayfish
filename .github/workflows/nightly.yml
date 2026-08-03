@@ -162,7 +162,13 @@ jobs:
 
       - name: Install WiX 3
         shell: pwsh
-        run: choco install wixtoolset --version=3.14.1.20250415 -y --no-progress
+        run: |
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            choco install wixtoolset --version=3.14.1.20250415 -y --no-progress
+          }
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            throw 'WiX candle.exe was not found after installation.'
+          }
 
       - name: Install cargo-wix
         run: cargo install cargo-wix --version 0.3.9 --locked
