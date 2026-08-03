@@ -178,7 +178,7 @@ jobs:
 
       - name: Install WiX 3
         shell: pwsh
-        run: choco install wixtoolset --version=3.14.1 --allow-downgrade -y --no-progress
+        run: choco install wixtoolset --version=3.14.1.20250415 -y --no-progress
 
       - name: Install cargo-wix
         run: cargo install cargo-wix --version 0.3.9 --locked
