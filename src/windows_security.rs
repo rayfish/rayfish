@@ -25,9 +25,9 @@ use windows_sys::Win32::Security::{
     SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_ALWAYS, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    OPEN_ALWAYS,
+    CREATE_ALWAYS, CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
 };
 
 pub(crate) const PROTECTED_FILE_SDDL: &str = "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
@@ -140,6 +140,63 @@ pub(crate) fn create_protected_file(path: &Path) -> Result<File> {
             .with_context(|| format!("creating protected {}", path.display()));
     }
     Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+/// Atomically creates a new protected regular file without following a reparse
+/// point. Existing names always fail; callers generate unguessable names.
+pub(crate) fn create_protected_new_file(path: &Path) -> Result<File> {
+    let mut descriptor = OwnedSecurityDescriptor::from_sddl(PROTECTED_FILE_SDDL)?;
+    let attrs = descriptor.attributes();
+    let handle = unsafe {
+        CreateFileW(
+            wide(path.as_os_str()).as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ,
+            &attrs,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("creating protected new file {}", path.display()));
+    }
+    let file = unsafe { File::from_raw_handle(handle) };
+    verify_path_security(path, false)?;
+    Ok(file)
+}
+
+/// Reopens a protected file without following a reparse point and keeps a
+/// non-delete-sharing handle alive across the privileged consumer operation.
+pub(crate) fn open_protected_file_no_follow(path: &Path) -> Result<File> {
+    let handle = unsafe {
+        CreateFileW(
+            wide(path.as_os_str()).as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening protected file {}", path.display()));
+    }
+    let file = unsafe { File::from_raw_handle(handle) };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {}", path.display()))?;
+    validate_config_file_attributes(metadata.file_attributes(), path)?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "protected path is not a regular file: {}",
+        path.display()
+    );
+    verify_path_security(path, false)?;
+    Ok(file)
 }
 
 pub(crate) struct OperatorFileLock {

@@ -6,6 +6,8 @@
 //! (the CLI in `src/cli/update.rs`, the daemon task in `src/daemon`).
 
 #[cfg(windows)]
+use std::io::{Read, Write};
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
@@ -275,13 +277,12 @@ pub async fn download_msi_to_temp(
             "checksum mismatch for {asset}\n  expected: {expected}\n  got:      {actual}"
         );
     }
-    let path = std::env::temp_dir().join(format!(
-        "rayfish-update-{}-{}.msi",
-        std::process::id(),
-        asset.replace(['\\', '/', ':'], "_")
-    ));
-    std::fs::write(&path, &bytes)
-        .with_context(|| format!("write MSI temp file {}", path.display()))?;
+    let path = random_system_stage_path("rayfish-update", ".msi");
+    let mut file = crate::windows_security::create_protected_new_file(&path)?;
+    file.write_all(&bytes)
+        .with_context(|| format!("write protected MSI stage {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("flush protected MSI stage {}", path.display()))?;
     Ok(path)
 }
 
@@ -306,6 +307,30 @@ fn system_temp_dir() -> PathBuf {
 }
 
 #[cfg(windows)]
+fn random_system_stage_path(prefix: &str, suffix: &str) -> PathBuf {
+    let nonce = hex::encode(rand::random::<[u8; 16]>());
+    system_temp_dir().join(format!("{prefix}-{nonce}{suffix}"))
+}
+
+#[cfg(windows)]
+fn sha256_reader(mut reader: impl Read) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .context("read staged MSI for SHA-256")?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(windows)]
 pub fn msi_failure_message(code: Option<i32>) -> String {
     match code {
         Some(1603) => "Windows Installer failed with exit code 1603; confirm this helper is elevated and inspect the retained MSI log for the failing custom action or locked file".to_string(),
@@ -316,15 +341,29 @@ pub fn msi_failure_message(code: Option<i32>) -> String {
 }
 
 #[cfg(windows)]
-fn install_msi(path: &Path, log: &Path) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MsiInstallOutcome {
+    Installed,
+    RebootRequired(i32),
+}
+
+#[cfg(windows)]
+fn classify_msi_exit_code(code: Option<i32>) -> Result<MsiInstallOutcome> {
+    match code {
+        Some(0) => Ok(MsiInstallOutcome::Installed),
+        Some(code @ (1641 | 3010)) => Ok(MsiInstallOutcome::RebootRequired(code)),
+        code => anyhow::bail!("{}", msi_failure_message(code)),
+    }
+}
+
+#[cfg(windows)]
+fn install_msi(path: &Path, log: &Path) -> Result<MsiInstallOutcome> {
     let mut command = Command::new("msiexec.exe");
     let args = msi_install_args(path, log);
     command.creation_flags(0x0800_0000).args(args);
     let status = command.status().context("launch Windows Installer")?;
-    match status.code() {
-        Some(0 | 1641 | 3010) => Ok(()),
-        code => anyhow::bail!("{}; log: {}", msi_failure_message(code), log.display()),
-    }
+    classify_msi_exit_code(status.code())
+        .with_context(|| format!("Windows MSI installation failed; log: {}", log.display()))
 }
 
 #[cfg(windows)]
@@ -349,43 +388,139 @@ fn wait_for_parent(parent_pid: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn updater_helper_args(
+    path: &Path,
+    release_identity: &str,
+    expected_sha256: &str,
+    parent_pid: u32,
+) -> [std::ffi::OsString; 8] {
+    [
+        "windows-update-helper".into(),
+        "--msi".into(),
+        path.as_os_str().to_owned(),
+        "--identity".into(),
+        release_identity.into(),
+        "--sha256".into(),
+        expected_sha256.into(),
+        format!("--parent-pid={parent_pid}").into(),
+    ]
+}
+
 /// Copy this verified binary to the system temp directory and detach it. Both
 /// manual updates and daemon auto-updates use this exact scheduling path.
 #[cfg(windows)]
-pub fn schedule_msi_update(path: &Path, release_identity: &str) -> Result<PathBuf> {
+pub fn schedule_msi_update(
+    path: &Path,
+    release_identity: &str,
+    expected_sha256: &str,
+) -> Result<PathBuf> {
     let helper_dir = system_temp_dir();
     std::fs::create_dir_all(&helper_dir)
         .with_context(|| format!("create system temp directory {}", helper_dir.display()))?;
-    let helper = helper_dir.join(format!("rayfish-updater-{}.exe", std::process::id()));
-    std::fs::copy(std::env::current_exe()?, &helper)
+    let helper = random_system_stage_path("rayfish-updater", ".exe");
+    let mut source = std::fs::File::open(std::env::current_exe()?)
+        .context("open current executable for updater staging")?;
+    let mut staged_helper = crate::windows_security::create_protected_new_file(&helper)?;
+    std::io::copy(&mut source, &mut staged_helper)
         .with_context(|| format!("copy updater helper to {}", helper.display()))?;
+    staged_helper
+        .sync_all()
+        .with_context(|| format!("flush updater helper {}", helper.display()))?;
+    drop(staged_helper);
+    let helper_guard = crate::windows_security::open_protected_file_no_follow(&helper)?;
     Command::new(&helper)
         .creation_flags(0x0800_0000 | 0x0000_0008 | 0x0000_0200)
-        .args([
-            "windows-update-helper",
-            "--msi",
-            &path.to_string_lossy(),
-            "--identity",
+        .args(updater_helper_args(
+            path,
             release_identity,
-            "--parent-pid",
-            &std::process::id().to_string(),
-        ])
+            expected_sha256,
+            std::process::id(),
+        ))
         .spawn()
         .context("launch detached Windows updater helper")?;
+    drop(helper_guard);
     Ok(helper)
+}
+
+#[cfg(windows)]
+fn update_pending_reboot_state(release_identity: &str, code: i32, log: &Path) -> Result<()> {
+    let script = "$key='HKLM:\\Software\\Rayfish'; New-Item -Path $key -Force | Out-Null; New-ItemProperty -Path $key -Name PendingRebootIdentity -Value $args[0] -PropertyType String -Force | Out-Null; New-ItemProperty -Path $key -Name PendingRebootCode -Value ([int]$args[1]) -PropertyType DWord -Force | Out-Null; New-ItemProperty -Path $key -Name PendingRebootLog -Value $args[2] -PropertyType String -Force | Out-Null";
+    let output = Command::new("powershell.exe")
+        .creation_flags(0x0800_0000)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+            release_identity,
+            &code.to_string(),
+            &log.to_string_lossy(),
+        ])
+        .output()
+        .context("record pending Rayfish reboot state")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "record pending Rayfish reboot state failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn clear_pending_reboot_state() -> Result<()> {
+    let output = Command::new("powershell.exe")
+        .creation_flags(0x0800_0000)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Remove-ItemProperty -LiteralPath 'HKLM:\\Software\\Rayfish' -Name PendingRebootIdentity,PendingRebootCode,PendingRebootLog -ErrorAction SilentlyContinue",
+        ])
+        .output()
+        .context("clear pending Rayfish reboot state")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "clear pending Rayfish reboot state failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }
 
 /// Detached helper entry point. It waits for the caller/daemon to release the
 /// installed executable, runs MSI, restarts the service, then verifies identity.
 #[cfg(windows)]
-pub fn run_msi_update_helper(msi: &Path, release_identity: &str, parent_pid: u32) -> Result<()> {
+pub fn run_msi_update_helper(
+    msi: &Path,
+    release_identity: &str,
+    expected_sha256: &str,
+    parent_pid: u32,
+) -> Result<()> {
     anyhow::ensure!(
         crate::windows_identity::is_current_process_elevated_admin(),
         "Windows update helper requires an elevated Administrator token"
     );
     wait_for_parent(parent_pid)?;
-    let log = system_temp_dir().join(format!("rayfish-msi-update-{parent_pid}.log"));
-    install_msi(msi, &log)?;
+    let mut staged_msi = crate::windows_security::open_protected_file_no_follow(msi)?;
+    let actual_sha256 = sha256_reader(&mut staged_msi)?;
+    anyhow::ensure!(
+        actual_sha256.eq_ignore_ascii_case(expected_sha256),
+        "staged MSI SHA-256 changed before install: expected {expected_sha256}, got {actual_sha256}"
+    );
+    let log = random_system_stage_path("rayfish-msi-update", ".log");
+    drop(crate::windows_security::create_protected_new_file(&log)?);
+    let outcome = install_msi(msi, &log)?;
+    if let MsiInstallOutcome::RebootRequired(code) = outcome {
+        update_pending_reboot_state(release_identity, code, &log)?;
+        tracing::warn!(
+            code,
+            identity = release_identity,
+            log = %log.display(),
+            "Windows MSI update succeeded but requires reboot; service reachability and running identity are pending"
+        );
+        return Ok(());
+    }
+    clear_pending_reboot_state()?;
     crate::windows_service::start().context("restart rayfish Windows service after MSI update")?;
     let installed =
         installed_msi_version()?.context("Rayfish release identity missing after MSI update")?;
@@ -602,5 +737,46 @@ mod tests {
         assert!(msi_failure_message(Some(1603)).contains("MSI log"));
         assert!(msi_failure_message(Some(1638)).contains("upgrade ordering"));
         assert!(msi_failure_message(None).contains("without an exit code"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn helper_carries_the_expected_digest_and_uses_unguessable_names() {
+        let first = random_system_stage_path("rayfish-update", ".msi");
+        let second = random_system_stage_path("rayfish-update", ".msi");
+        assert_ne!(first, second);
+        let name = first.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("rayfish-update-"));
+        assert_eq!(name.len(), "rayfish-update-".len() + 32 + ".msi".len());
+
+        let args = updater_helper_args(
+            Path::new(r"C:\Windows\Temp\stage.msi"),
+            "0.2.1-nightly.7+abc12345",
+            "0123456789abcdef",
+            42,
+        );
+        assert!(args.iter().any(|arg| arg == "0123456789abcdef"));
+        assert!(args.iter().any(|arg| arg == "--parent-pid=42"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn helper_rehash_and_reboot_outcome_contracts_are_explicit() {
+        let digest = sha256_reader(std::io::Cursor::new(b"verified MSI".as_slice())).unwrap();
+        assert_eq!(digest, sha256_hex(b"verified MSI"));
+        assert_eq!(
+            classify_msi_exit_code(Some(0)).unwrap(),
+            MsiInstallOutcome::Installed
+        );
+        assert_eq!(
+            classify_msi_exit_code(Some(3010)).unwrap(),
+            MsiInstallOutcome::RebootRequired(3010)
+        );
+        assert_eq!(
+            classify_msi_exit_code(Some(1641)).unwrap(),
+            MsiInstallOutcome::RebootRequired(1641)
+        );
+        assert!(classify_msi_exit_code(Some(1603)).is_err());
+        assert!(classify_msi_exit_code(Some(1638)).is_err());
     }
 }

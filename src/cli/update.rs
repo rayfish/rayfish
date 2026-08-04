@@ -370,7 +370,7 @@ async fn download_verify_and_install(
             .ok()
             .flatten()
             .unwrap_or_else(|| current.to_string());
-        schedule_msi_update(&msi, target_identity)?;
+        schedule_msi_update(&msi, target_identity, expected)?;
         println!("scheduled detached Windows MSI update v{previous} → {remote_label}");
         Ok(())
     }

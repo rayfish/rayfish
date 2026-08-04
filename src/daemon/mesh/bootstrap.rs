@@ -1029,7 +1029,7 @@ async fn auto_update_once(shutdown: &CancellationToken) -> Result<()> {
     {
         let msi = crate::update::download_msi_to_temp(&client, &bin_url, &expected, &asset).await?;
         let identity = crate::update::fetch_version_manifest(&client, &tag, &asset).await?;
-        crate::update::schedule_msi_update(&msi, &identity)?;
+        crate::update::schedule_msi_update(&msi, &identity, &expected)?;
         tracing::info!(target = %identity, path = %msi.display(), "auto-update: detached Windows MSI installation scheduled");
         shutdown.cancel();
         Ok(())
