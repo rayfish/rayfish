@@ -10,8 +10,8 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, LocalFre
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
     CheckTokenMembership, CreateWellKnownSid, DuplicateToken, GetTokenInformation,
-    LookupAccountNameW, RevertToSelf, SecurityIdentification, TOKEN_QUERY, TOKEN_USER, TokenUser,
-    WinBuiltinAdministratorsSid,
+    LookupAccountNameW, RevertToSelf, SecurityIdentification, TOKEN_DUPLICATE, TOKEN_QUERY,
+    TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
 };
 use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
 use windows_sys::Win32::System::Threading::{
@@ -119,10 +119,9 @@ fn token_is_admin(token: HANDLE) -> bool {
     ok != 0 && is_member != 0
 }
 
-fn process_token() -> Option<OwnedHandle> {
+fn process_token(access: u32) -> Option<OwnedHandle> {
     let mut token = std::ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
-        || token.is_null()
+    if unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut token) } == 0 || token.is_null()
     {
         return None;
     }
@@ -130,11 +129,11 @@ fn process_token() -> Option<OwnedHandle> {
 }
 
 pub fn current_user_sid() -> Option<String> {
-    process_token().and_then(|token| token_sid(token.0))
+    process_token(TOKEN_QUERY).and_then(|token| token_sid(token.0))
 }
 
 pub fn is_current_process_elevated_admin() -> bool {
-    let Some(token) = process_token() else {
+    let Some(token) = process_token(TOKEN_DUPLICATE) else {
         return false;
     };
     let mut impersonation = std::ptr::null_mut();
@@ -230,5 +229,19 @@ mod tests {
     #[test]
     fn invalid_named_pipe_handle_fails_closed() {
         assert!(named_pipe_client_identity(std::ptr::null_mut()).is_err());
+    }
+
+    #[test]
+    fn process_token_can_be_duplicated_for_membership_checks() {
+        let token = process_token(TOKEN_DUPLICATE).expect("current process token");
+        let mut duplicate = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { DuplicateToken(token.0, SecurityIdentification, &mut duplicate) },
+            0,
+            "DuplicateToken failed with Win32 error {}",
+            unsafe { GetLastError() }
+        );
+        assert!(!duplicate.is_null());
+        drop(OwnedHandle(duplicate));
     }
 }

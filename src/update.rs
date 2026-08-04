@@ -503,9 +503,13 @@ fn cleanup_scheduling_failure(msi: &Path, helper: &Path) {
 }
 
 #[cfg(windows)]
+fn pending_reboot_script() -> &'static str {
+    "$ErrorActionPreference='Stop'; & { param([string]$Identity, [int]$Code) $key='HKLM:\\Software\\Rayfish'; if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key | Out-Null }; New-ItemProperty -Path $key -Name PendingRebootIdentity -Value $Identity -PropertyType String -Force | Out-Null; New-ItemProperty -Path $key -Name PendingRebootCode -Value $Code -PropertyType DWord -Force | Out-Null } -Identity $env:RAYFISH_PENDING_IDENTITY -Code ([int]$env:RAYFISH_PENDING_CODE)"
+}
+
+#[cfg(windows)]
 fn pending_reboot_command(release_identity: &str, code: i32) -> Command {
-    let script = "$ErrorActionPreference='Stop'; & { param([string]$Identity, [int]$Code) $key='HKLM:\\Software\\Rayfish'; New-Item -Path $key -Force | Out-Null; New-ItemProperty -Path $key -Name PendingRebootIdentity -Value $Identity -PropertyType String -Force | Out-Null; New-ItemProperty -Path $key -Name PendingRebootCode -Value $Code -PropertyType DWord -Force | Out-Null } -Identity $env:RAYFISH_PENDING_IDENTITY -Code ([int]$env:RAYFISH_PENDING_CODE)";
-    let mut command = encoded_powershell_command(script);
+    let mut command = encoded_powershell_command(pending_reboot_script());
     command
         .env("RAYFISH_PENDING_IDENTITY", release_identity)
         .env("RAYFISH_PENDING_CODE", code.to_string());
@@ -526,15 +530,76 @@ fn update_pending_reboot_state(release_identity: &str, code: i32) -> Result<()> 
 }
 
 #[cfg(windows)]
+fn clear_pending_reboot_script() -> &'static str {
+    "$ErrorActionPreference='Stop'; $path='HKLM:\\Software\\Rayfish'; if (Test-Path -LiteralPath $path) { $key=Get-Item -LiteralPath $path -ErrorAction Stop; foreach($name in @('PendingRebootIdentity','PendingRebootCode','PendingRebootLog')) { if ($key.GetValueNames() -contains $name) { Remove-ItemProperty -LiteralPath $path -Name $name -ErrorAction Stop } } }"
+}
+
+#[cfg(windows)]
 fn clear_pending_reboot_state() -> Result<()> {
-    let output = encoded_powershell_command(
-        "Remove-ItemProperty -LiteralPath 'HKLM:\\Software\\Rayfish' -Name PendingRebootIdentity,PendingRebootCode,PendingRebootLog -ErrorAction SilentlyContinue",
-    )
+    let output = encoded_powershell_command(clear_pending_reboot_script())
         .output()
         .context("clear pending Rayfish reboot state")?;
     anyhow::ensure!(
         output.status.success(),
         "clear pending Rayfish reboot state failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn update_failure_script() -> &'static str {
+    "$ErrorActionPreference='Stop'; & { param([string]$Identity, [string]$Message, [string]$Log) $key='HKLM:\\Software\\Rayfish'; if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key | Out-Null }; New-ItemProperty -Path $key -Name UpdateFailureIdentity -Value $Identity -PropertyType String -Force | Out-Null; New-ItemProperty -Path $key -Name UpdateFailureMessage -Value $Message -PropertyType String -Force | Out-Null; New-ItemProperty -Path $key -Name UpdateFailureLog -Value $Log -PropertyType String -Force | Out-Null; New-ItemProperty -Path $key -Name UpdateFailureTimestamp -Value ([DateTimeOffset]::UtcNow.ToString('o')) -PropertyType String -Force | Out-Null } -Identity $env:RAYFISH_FAILURE_IDENTITY -Message $env:RAYFISH_FAILURE_MESSAGE -Log $env:RAYFISH_FAILURE_LOG"
+}
+
+#[cfg(windows)]
+fn update_failure_command(release_identity: &str, message: &str, log: Option<&Path>) -> Command {
+    let mut command = encoded_powershell_command(update_failure_script());
+    command
+        .env("RAYFISH_FAILURE_IDENTITY", release_identity)
+        .env("RAYFISH_FAILURE_MESSAGE", message)
+        .env(
+            "RAYFISH_FAILURE_LOG",
+            log.map(|path| path.as_os_str()).unwrap_or_default(),
+        );
+    command
+}
+
+#[cfg(windows)]
+fn record_update_failure_state(
+    release_identity: &str,
+    message: &str,
+    log: Option<&Path>,
+) -> Result<()> {
+    let output = update_failure_command(release_identity, message, log)
+        .output()
+        .context("record Windows updater failure state")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "record Windows updater failure state failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn clear_update_failure_script() -> &'static str {
+    "$ErrorActionPreference='Stop'; $path='HKLM:\\Software\\Rayfish'; if (Test-Path -LiteralPath $path) { $key=Get-Item -LiteralPath $path -ErrorAction Stop; foreach($name in @('UpdateFailureIdentity','UpdateFailureMessage','UpdateFailureLog','UpdateFailureTimestamp')) { if ($key.GetValueNames() -contains $name) { Remove-ItemProperty -LiteralPath $path -Name $name -ErrorAction Stop } } }"
+}
+
+#[cfg(windows)]
+fn clear_update_failure_command() -> Command {
+    encoded_powershell_command(clear_update_failure_script())
+}
+
+#[cfg(windows)]
+fn clear_update_failure_state() -> Result<()> {
+    let output = clear_update_failure_command()
+        .output()
+        .context("clear Windows updater failure state")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "clear Windows updater failure state failed: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())
@@ -626,10 +691,50 @@ fn cleanup_helper_log(log: Option<&Path>, success: bool) {
     }
 }
 
+#[cfg(windows)]
+async fn wait_for_daemon_ipc_ready() -> Result<()> {
+    wait_for_daemon_ipc_ready_with(
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_millis(250),
+        || async {
+            let stream = ray_proto::ipc::connect().await?;
+            drop(stream);
+            Ok(())
+        },
+    )
+    .await
+}
+
+#[cfg(windows)]
+async fn wait_for_daemon_ipc_ready_with<F, Fut>(
+    ready_timeout: std::time::Duration,
+    retry_delay: std::time::Duration,
+    mut connect: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let deadline = tokio::time::Instant::now() + ready_timeout;
+    loop {
+        let detail = match connect().await {
+            Ok(()) => return Ok(()),
+            Err(error) => error.to_string(),
+        };
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "Rayfish service reached SCM Running but IPC was not ready within {} seconds: {detail}",
+                ready_timeout.as_secs_f64()
+            );
+        }
+        tokio::time::sleep(retry_delay).await;
+    }
+}
+
 /// Detached helper entry point. It waits for the caller/daemon to release the
 /// installed executable, runs MSI, restarts the service, then verifies identity.
 #[cfg(windows)]
-pub fn run_msi_update_helper(
+pub async fn run_msi_update_helper(
     msi: &Path,
     release_identity: &str,
     expected_sha256: &str,
@@ -648,7 +753,7 @@ pub fn run_msi_update_helper(
     let _helper_cleanup = RemoveFileOnDrop(helper.clone());
     schedule_self_delete(&helper)?;
     let mut log_path = None;
-    let result = (|| -> Result<()> {
+    let result = async {
         wait_for_parent(parent_pid)?;
         let mut staged_msi = crate::windows_security::open_protected_file_no_follow(msi)?;
         let actual_sha256 = sha256_reader(&mut staged_msi)?;
@@ -672,6 +777,8 @@ pub fn run_msi_update_helper(
         clear_pending_reboot_state()?;
         crate::windows_service::start()
             .context("restart rayfish Windows service after MSI update")?;
+        wait_for_daemon_ipc_ready().await
+            .context("wait for Rayfish service IPC after MSI update")?;
         let installed = installed_msi_version()?
             .context("Rayfish release identity missing after MSI update")?;
         anyhow::ensure!(
@@ -679,8 +786,22 @@ pub fn run_msi_update_helper(
             "installed Rayfish identity {installed:?} does not match expected {release_identity:?}; log: {}",
             log.display()
         );
+        clear_update_failure_state()?;
         Ok(())
-    })();
+    }
+    .await;
+    let result = match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let message = format!("{error:#}");
+            match record_update_failure_state(release_identity, &message, log_path.as_deref()) {
+                Ok(()) => Err(error),
+                Err(record_error) => Err(anyhow::anyhow!(
+                    "{message}; additionally failed to record updater failure state: {record_error:#}"
+                )),
+            }
+        }
+    };
     cleanup_helper_log(log_path.as_deref(), result.is_ok());
     result
 }
@@ -932,6 +1053,43 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[tokio::test]
+    async fn updater_waits_for_ipc_and_reports_the_last_failure() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        wait_for_daemon_ipc_ready_with(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(1),
+            move || {
+                let observed = Arc::clone(&observed);
+                async move {
+                    if observed.fetch_add(1, Ordering::SeqCst) < 2 {
+                        anyhow::bail!("pipe absent")
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        let error = wait_for_daemon_ipc_ready_with(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+            || async { anyhow::bail!("pipe still absent") },
+        )
+        .await
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("SCM Running"));
+        assert!(message.contains("pipe still absent"));
+    }
+
+    #[cfg(windows)]
     #[test]
     fn encoded_powershell_binds_pending_and_self_delete_arguments_via_environment() {
         let identity = "0.2.1-nightly.7+quote'is-data";
@@ -954,6 +1112,9 @@ mod tests {
             .collect();
         assert!(pending_args.iter().any(|arg| arg == "-EncodedCommand"));
         assert!(!pending_args.iter().any(|arg| arg.contains(identity)));
+        assert!(pending_reboot_script().contains("if (-not (Test-Path -LiteralPath $key))"));
+        assert!(clear_pending_reboot_script().contains("GetValueNames()"));
+        assert!(clear_pending_reboot_script().contains("-ErrorAction Stop"));
         assert_eq!(base64_encode(&[b'A', 0]), "QQA=");
 
         let helper = random_system_stage_path("rayfish-updater", ".exe");
@@ -975,6 +1136,41 @@ mod tests {
         assert_eq!(
             cleanup_env.get(std::ffi::OsStr::new("RAYFISH_HELPER_PID")),
             Some(&std::ffi::OsString::from("42"))
+        );
+
+        let failure = update_failure_command(
+            identity,
+            "IPC timeout; quote'is-data",
+            Some(Path::new(r"C:\Windows\Temp\update.log")),
+        );
+        let failure_env: std::collections::HashMap<_, _> = failure
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+            .collect();
+        assert_eq!(
+            failure_env.get(std::ffi::OsStr::new("RAYFISH_FAILURE_IDENTITY")),
+            Some(&std::ffi::OsString::from(identity))
+        );
+        assert_eq!(
+            failure_env.get(std::ffi::OsStr::new("RAYFISH_FAILURE_MESSAGE")),
+            Some(&std::ffi::OsString::from("IPC timeout; quote'is-data"))
+        );
+        for property in [
+            "UpdateFailureIdentity",
+            "UpdateFailureMessage",
+            "UpdateFailureLog",
+            "UpdateFailureTimestamp",
+        ] {
+            assert!(update_failure_script().contains(property));
+            assert!(clear_update_failure_script().contains(property));
+        }
+        assert!(update_failure_script().contains("if (-not (Test-Path -LiteralPath $key))"));
+        assert!(clear_update_failure_script().contains("GetValueNames()"));
+        assert!(clear_update_failure_script().contains("-ErrorAction Stop"));
+        assert!(
+            clear_update_failure_command()
+                .get_args()
+                .any(|argument| argument == "-EncodedCommand")
         );
     }
 

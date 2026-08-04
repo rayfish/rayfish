@@ -1172,7 +1172,7 @@ async fn main() -> Result<()> {
             identity,
             sha256,
             parent_pid,
-        } => rayfish::update::run_msi_update_helper(&msi, &identity, &sha256, parent_pid),
+        } => rayfish::update::run_msi_update_helper(&msi, &identity, &sha256, parent_pid).await,
     }
 }
 
