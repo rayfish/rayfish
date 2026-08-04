@@ -8,6 +8,8 @@
 #[cfg(windows)]
 use std::io::{Read, Write};
 #[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
@@ -544,8 +546,31 @@ struct RemoveFileOnDrop(PathBuf);
 #[cfg(windows)]
 impl Drop for RemoveFileOnDrop {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if let Err(error) = std::fs::remove_file(&self.0)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            let _ = schedule_delete_on_reboot(&self.0);
+        }
     }
+}
+
+#[cfg(windows)]
+fn schedule_delete_on_reboot(path: &Path) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let ok = unsafe { MoveFileExW(wide.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
+    anyhow::ensure!(
+        ok != 0,
+        "schedule delete-on-reboot for {} failed: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -572,9 +597,13 @@ fn is_staged_updater_helper(path: &Path) -> bool {
 }
 
 #[cfg(windows)]
+fn self_delete_script() -> &'static str {
+    "$ErrorActionPreference='SilentlyContinue'; & { param([string]$Path, [int]$ProcessId) Wait-Process -Id $ProcessId -ErrorAction SilentlyContinue; for($attempt=0; $attempt -lt 60; $attempt++){ Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue; if(-not (Test-Path -LiteralPath $Path)){ exit 0 }; Start-Sleep -Milliseconds 250 }; exit 1 } -Path $env:RAYFISH_HELPER_PATH -ProcessId ([int]$env:RAYFISH_HELPER_PID)"
+}
+
+#[cfg(windows)]
 fn self_delete_command(helper: &Path, helper_pid: u32) -> Command {
-    let script = "$ErrorActionPreference='SilentlyContinue'; & { param([string]$Path, [int]$ProcessId) Wait-Process -Id $ProcessId -Timeout 300 -ErrorAction SilentlyContinue; for($attempt=0; $attempt -lt 60; $attempt++){ Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue; if(-not (Test-Path -LiteralPath $Path)){ exit 0 }; Start-Sleep -Milliseconds 250 }; exit 1 } -Path $env:RAYFISH_HELPER_PATH -ProcessId ([int]$env:RAYFISH_HELPER_PID)";
-    let mut command = encoded_powershell_command(script);
+    let mut command = encoded_powershell_command(self_delete_script());
     command
         .creation_flags(0x0800_0000 | 0x0000_0008 | 0x0000_0200)
         .env("RAYFISH_HELPER_PATH", helper)
@@ -615,8 +644,9 @@ pub fn run_msi_update_helper(
         is_staged_updater_helper(&helper),
         "refusing updater self-delete outside the protected system-temp staging pattern"
     );
-    schedule_self_delete(&helper)?;
     let _msi_cleanup = RemoveFileOnDrop(msi.to_owned());
+    let _helper_cleanup = RemoveFileOnDrop(helper.clone());
+    schedule_self_delete(&helper)?;
     let mut log_path = None;
     let result = (|| -> Result<()> {
         wait_for_parent(parent_pid)?;
@@ -932,6 +962,8 @@ mod tests {
             r"C:\Program Files\Rayfish\ray.exe"
         )));
         let cleanup = self_delete_command(&helper, 42);
+        assert!(self_delete_script().contains("Wait-Process -Id $ProcessId"));
+        assert!(!self_delete_script().contains("-Timeout"));
         let cleanup_env: std::collections::HashMap<_, _> = cleanup
             .get_envs()
             .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
@@ -964,5 +996,12 @@ mod tests {
         assert!(log.exists());
         cleanup_helper_log(Some(&log), true);
         assert!(!log.exists());
+
+        let guarded = std::env::temp_dir().join(format!("rayfish-cleanup-{nonce}.guard"));
+        std::fs::write(&guarded, b"guarded").unwrap();
+        {
+            let _cleanup = RemoveFileOnDrop(guarded.clone());
+        }
+        assert!(!guarded.exists());
     }
 }
