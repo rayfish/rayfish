@@ -1134,7 +1134,15 @@ impl Daemon {
             IpcMessage::FilesAutoAccept { network, enabled } => {
                 self.files_auto_accept(&network, enabled).await
             }
-            IpcMessage::FirewallSshSet { enabled } => self.firewall_ssh_set(enabled),
+            IpcMessage::FirewallSshSet { enabled } => {
+                #[cfg(windows)]
+                if enabled {
+                    return ipc_err(
+                        "embedded SSH/PTY is not supported on Windows; no firewall or config state was changed",
+                    );
+                }
+                self.firewall_ssh_set(enabled)
+            }
             IpcMessage::FirewallSshAllow {
                 network,
                 peer,

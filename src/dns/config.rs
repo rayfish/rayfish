@@ -11,16 +11,8 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 // Only the macOS/Linux configurators build resolver/backup file paths; Android
 // does no OS-level DNS configuration.
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::path::PathBuf;
-#[cfg(target_os = "windows")]
-use std::process::Stdio;
-#[cfg(target_os = "windows")]
-use std::thread;
-#[cfg(target_os = "windows")]
-use std::time::{Duration, Instant};
 
 #[allow(unused_imports)]
 use anyhow::Context;
@@ -125,7 +117,7 @@ pub async fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigura
 
     #[cfg(windows)]
     {
-        let configurator = WindowsDns::new(tun_name)?;
+        let configurator = WindowsDns::new(tun_name).await?;
         configurator.apply().await?;
         return Ok(Box::new(configurator));
     }
@@ -225,7 +217,7 @@ async fn set_search_domains(
     }
     #[cfg(windows)]
     {
-        set_search_domains_windows(rayfish_domains, network_names, tun_name)
+        set_search_domains_windows(rayfish_domains, network_names, tun_name).await
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -246,18 +238,19 @@ struct WindowsDns {
 
 #[cfg(windows)]
 impl WindowsDns {
-    fn new(tun_name: &str) -> Result<Self> {
+    async fn new(tun_name: &str) -> Result<Self> {
         let interface_alias = powershell_text(&format!(
             "$ErrorActionPreference='Stop'; @(Get-NetAdapter | Where-Object {{ $_.Name -eq '{}' }} | Select-Object -ExpandProperty Name)",
             ps_quote(tun_name)
-        ))?;
+        ))
+        .await?;
         anyhow::ensure!(
             !interface_alias.is_empty() && !interface_alias.contains('\n'),
             "Windows TUN adapter {tun_name:?} was not uniquely found"
         );
         // Wintun has no upstream resolver of its own. Capture the host's
         // physical-interface DNS servers before pointing the system at Magic DNS.
-        let upstreams = powershell_host_dns_servers(&interface_alias)?;
+        let upstreams = powershell_host_dns_servers(&interface_alias).await?;
         Ok(Self {
             interface_alias,
             upstreams,
@@ -269,32 +262,20 @@ impl WindowsDns {
 #[async_trait]
 impl DnsConfigurator for WindowsDns {
     async fn apply(&self) -> Result<()> {
-        powershell_status(&format!(
+        let result = powershell_status(&format!(
             "Set-DnsClientServerAddress -InterfaceAlias '{}' -ServerAddresses '{}'",
             ps_quote(&self.interface_alias),
             RESOLVER_IP
         ))
+        .await;
+        if result.is_err() {
+            let _ = reset_wintun_dns(&self.interface_alias).await;
+        }
+        result
     }
 
     async fn revert(&self) -> Result<()> {
-        if self.upstreams.is_empty() {
-            powershell_status(&format!(
-                "Set-DnsClientServerAddress -InterfaceAlias '{}' -ResetServerAddresses",
-                ps_quote(&self.interface_alias)
-            ))
-        } else {
-            let servers = self
-                .upstreams
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("','");
-            powershell_status(&format!(
-                "Set-DnsClientServerAddress -InterfaceAlias '{}' -ServerAddresses '{}'",
-                ps_quote(&self.interface_alias),
-                servers
-            ))
-        }
+        reset_wintun_dns(&self.interface_alias).await
     }
 
     fn name(&self) -> &'static str {
@@ -312,74 +293,37 @@ fn ps_quote(value: &str) -> String {
 }
 
 #[cfg(windows)]
-fn nrpt_scripts(rayfish_domains: &[String]) -> Vec<String> {
-    let mut scripts = vec![
-        "Get-DnsClientNrptRule | Where-Object { $_.DisplayName -like 'rayfish:*' } | Remove-DnsClientNrptRule -Force".to_owned(),
-    ];
-    scripts.extend(rayfish_domains.iter().map(|domain| {
-        format!(
-            "Add-DnsClientNrptRule -Namespace '.{}' -NameServers '{}' -DisplayName 'rayfish:{}' -ErrorAction Stop",
-            ps_quote(domain),
-            RESOLVER_IP,
-            ps_quote(domain)
-        )
-    }));
-    scripts
+fn windows_dns_reconcile_script(rayfish_domains: &[String]) -> String {
+    let desired = rayfish_domains
+        .iter()
+        .map(|domain| format!("'{}'", ps_quote(domain)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "$statePath='HKLM:\\SOFTWARE\\Rayfish'; $desired=@({desired}); $before=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }} | Select-Object DisplayName,Namespace,NameServers); $current=@((Get-DnsClientGlobalSetting).SuffixSearchList); $previousManaged=@(); $previousMarkerExists=$false; if (Test-Path $statePath) {{ $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue; if ($null -ne $marker) {{ $previousMarkerExists=$true; $previousManaged=@($marker.ManagedDnsSuffixes) }} }}; $foreign=@($current | Where-Object {{ $previousManaged -notcontains $_ }}); $next=@($foreign + $desired | Select-Object -Unique); try {{ $owned=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }}); foreach ($rule in $owned) {{ $domain=$rule.DisplayName.Substring(8); if ($desired -notcontains $domain) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }} }}; foreach ($domain in $desired) {{ $display='rayfish:'+$domain; $present=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -eq $display }}); if ($present.Count -eq 0) {{ Add-DnsClientNrptRule -Namespace ('.'+$domain) -NameServers '{RESOLVER_IP}' -DisplayName $display -ErrorAction Stop }} }}; Set-DnsClientGlobalSetting -SuffixSearchList $next -ErrorAction Stop; New-Item -Path $statePath -Force -ErrorAction Stop | Out-Null; if ($desired.Count -eq 0) {{ Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }} else {{ Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -Value ([string[]]$desired) -ErrorAction Stop }} }} catch {{ Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }} | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue; foreach ($rule in $before) {{ Add-DnsClientNrptRule -Namespace $rule.Namespace -NameServers $rule.NameServers -DisplayName $rule.DisplayName -ErrorAction SilentlyContinue }}; Set-DnsClientGlobalSetting -SuffixSearchList $current -ErrorAction SilentlyContinue; if ($previousMarkerExists) {{ New-Item -Path $statePath -Force -ErrorAction SilentlyContinue | Out-Null; Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -Value ([string[]]$previousManaged) -ErrorAction SilentlyContinue }} else {{ Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }}; throw }}"
+    )
 }
 
 #[cfg(windows)]
-fn powershell_text(script: &str) -> Result<String> {
-    const POWERSHELL_TIMEOUT: Duration = Duration::from_secs(15);
-    let mut child = std::process::Command::new("powershell.exe")
-        .creation_flags(0x0800_0000)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .spawn()
-        .context("run PowerShell")?;
-    let deadline = Instant::now() + POWERSHELL_TIMEOUT;
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("PowerShell timed out after {POWERSHELL_TIMEOUT:?}");
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    let output = child
-        .wait_with_output()
-        .context("collect PowerShell output")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "PowerShell failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+async fn powershell_text(script: &str) -> Result<String> {
+    crate::windows_process::WindowsProcessRunner::default()
+        .powershell(script, "run DNS PowerShell")
+        .await
 }
 
 #[cfg(windows)]
-fn powershell_status(script: &str) -> Result<()> {
-    powershell_text(&format!("$ErrorActionPreference='Stop'; {script}"))?;
+async fn powershell_status(script: &str) -> Result<()> {
+    powershell_text(&format!("$ErrorActionPreference='Stop'; {script}")).await?;
     Ok(())
 }
 
 #[cfg(windows)]
-fn powershell_host_dns_servers(exclude_alias: &str) -> Result<Vec<Ipv4Addr>> {
+async fn powershell_host_dns_servers(exclude_alias: &str) -> Result<Vec<Ipv4Addr>> {
     let text = powershell_text(&format!(
         "@(Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object {{ $_.InterfaceAlias -ne '{}' }} | Select-Object -ExpandProperty ServerAddresses) | ConvertTo-Json -Compress",
         ps_quote(exclude_alias)
-    ))?;
+    ))
+    .await?;
     let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
     Ok(parse_dns_server_values(value))
 }
@@ -398,17 +342,28 @@ fn parse_dns_server_values(value: serde_json::Value) -> Vec<Ipv4Addr> {
 }
 
 #[cfg(windows)]
-fn set_search_domains_windows(
+fn reset_wintun_dns_script(interface_alias: &str) -> String {
+    format!(
+        "Set-DnsClientServerAddress -InterfaceAlias '{}' -ResetServerAddresses",
+        ps_quote(interface_alias)
+    )
+}
+
+#[cfg(windows)]
+async fn reset_wintun_dns(interface_alias: &str) -> Result<()> {
+    powershell_status(&reset_wintun_dns_script(interface_alias)).await
+}
+
+#[cfg(windows)]
+async fn set_search_domains_windows(
     rayfish_domains: &[String],
     _network_names: &[String],
     _tun_name: &str,
 ) -> Result<()> {
-    // NRPT rules are scoped to rayfish namespaces and are removed only by their
-    // explicit `rayfish:` display-name prefix, preserving operator rules.
-    for script in nrpt_scripts(rayfish_domains) {
-        powershell_status(&script)?;
-    }
-    Ok(())
+    // Reconcile only display-name-marked rules. The PowerShell transaction
+    // snapshots and restores those rules on partial failure; foreign NRPT state
+    // is never selected for mutation.
+    powershell_status(&windows_dns_reconcile_script(rayfish_domains)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1812,25 +1767,39 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_dns_nrpt_scripts_are_scoped_and_quote_boundaries() {
-        use super::{nrpt_scripts, ps_quote};
+    fn zombie_windows_dns_reconcile_is_scoped_transactional_and_quotes_boundaries() {
+        use super::{ps_quote, windows_dns_reconcile_script};
 
         assert_eq!(ps_quote(""), "");
         assert_eq!(ps_quote("O'Brien"), "O''Brien");
 
-        let zero = nrpt_scripts(&[]);
-        assert_eq!(zero.len(), 1);
-        assert!(zero[0].contains("DisplayName -like 'rayfish:*'"));
+        let zero = windows_dns_reconcile_script(&[]);
+        assert!(zero.contains("DisplayName -like 'rayfish:*'"));
+        assert!(zero.contains("$before="));
+        assert!(zero.contains("catch"));
+        assert!(zero.contains("throw"));
+        assert!(!zero.contains("Where-Object { $_.DisplayName -notlike"));
+        assert!(zero.contains("ManagedDnsSuffixes"));
+        assert!(zero.contains("$foreign=@($current | Where-Object"));
+        assert!(zero.contains("Set-DnsClientGlobalSetting -SuffixSearchList $current"));
 
-        let one = nrpt_scripts(&["corp.ray".to_string()]);
-        assert_eq!(one.len(), 2);
-        assert!(one[1].contains("Namespace '.corp.ray'"));
-        assert!(one[1].contains("NameServers '100.100.100.53'"));
+        let one = windows_dns_reconcile_script(&["corp.ray".to_string()]);
+        assert!(one.contains("$desired=@('corp.ray')"));
+        assert!(one.contains("NameServers '100.100.100.53'"));
+        assert!(one.contains("$present.Count -eq 0"));
 
-        let many = nrpt_scripts(&["a.ray".to_string(), "O'Brian.ray".to_string()]);
-        assert_eq!(many.len(), 3);
-        assert!(many[2].contains("O''Brian.ray"));
-        assert!(many.iter().skip(1).all(|s| s.contains("rayfish:")));
+        let many = windows_dns_reconcile_script(&["a.ray".to_string(), "O'Brian.ray".to_string()]);
+        assert!(many.contains("$desired=@('a.ray','O''Brian.ray')"));
+        assert!(many.contains("$display='rayfish:'+$domain"));
+        assert!(many.contains("foreach ($rule in $before)"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ddd_wintun_cleanup_resets_adapter_dns_instead_of_copying_host_upstreams() {
+        let reset = super::reset_wintun_dns_script("Rayfish Tunnel");
+        assert!(reset.contains("-ResetServerAddresses"));
+        assert!(!reset.contains("-ServerAddresses '192."));
     }
 
     #[cfg(windows)]

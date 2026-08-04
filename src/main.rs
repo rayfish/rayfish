@@ -1280,7 +1280,7 @@ async fn cmd_set_operator(user: &str) -> Result<()> {
     {
         let sid = rayfish::windows_service::set_operator_account(std::ffi::OsStr::new(user))?;
         println!("operator set to {user} ({sid})");
-        return Ok(());
+        Ok(())
     }
     #[cfg(unix)]
     {

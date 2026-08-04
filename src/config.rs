@@ -676,7 +676,7 @@ fn set_owner(path: &Path, secret: bool) {
 fn ensure_dir(dir: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        return crate::windows_security::ensure_protected_dir(dir);
+        crate::windows_security::ensure_protected_dir(dir)
     }
     #[cfg(not(windows))]
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;

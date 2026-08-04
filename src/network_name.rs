@@ -1,7 +1,5 @@
 //! Three-word network name generation (adjective-noun-noun).
 
-#![allow(dead_code)]
-
 use rand::RngExt;
 
 pub const ADJECTIVES: &[&str] = &[
@@ -104,7 +102,8 @@ pub fn generate_name() -> String {
     format!("{adj}-{n1}-{n2}")
 }
 
-pub fn is_valid_name(name: &str) -> bool {
+#[cfg(test)]
+fn is_valid_name(name: &str) -> bool {
     let parts: Vec<&str> = name.split('-').collect();
     if parts.len() != 3 {
         return false;

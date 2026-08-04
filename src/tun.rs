@@ -14,17 +14,11 @@ use std::net::IpAddr;
 #[cfg(not(target_os = "android"))]
 use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
-#[cfg(target_os = "windows")]
 use std::path::PathBuf;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
 use std::process::Command;
 #[cfg(not(target_os = "android"))]
 use std::sync::Arc;
-#[cfg(target_os = "windows")]
-use std::thread;
-#[cfg(target_os = "windows")]
-use std::time::{Duration, Instant};
 
 #[cfg(not(target_os = "android"))]
 use anyhow::{Context, Result, bail};
@@ -111,12 +105,13 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
 }
 
 #[cfg(not(target_os = "android"))]
-pub fn check_cgnat_conflict() -> Result<()> {
+pub async fn check_cgnat_conflict() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         let output = windows_powershell(
             "Get-NetIPAddress -AddressFamily IPv4 | Select-Object -ExpandProperty IPAddress",
-        )?;
+        )
+        .await?;
         for value in output.lines() {
             if let Ok(ip) = value.trim().parse::<Ipv4Addr>()
                 && is_cgnat(ip)
@@ -273,12 +268,12 @@ impl PlatformTun {
         create(v4, v6).await
     }
 
-    pub fn set_link_up(name: &str) -> Result<()> {
-        set_link_up(name)
+    pub async fn set_link_up(name: &str) -> Result<()> {
+        set_link_up(name).await
     }
 
-    pub fn set_link_down(name: &str) -> Result<()> {
-        set_link_down(name)
+    pub async fn set_link_down(name: &str) -> Result<()> {
+        set_link_down(name).await
     }
 
     pub async fn route_peer_range(name: &str) -> Result<()> {
@@ -287,6 +282,10 @@ impl PlatformTun {
 
     pub async fn route_magic_dns(name: &str) -> Result<()> {
         route_magic_dns(name).await
+    }
+
+    pub async fn unroute_peer_range(name: &str) -> Result<()> {
+        unroute_peer_range(name).await
     }
 }
 
@@ -403,22 +402,28 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 pub async fn unroute_peer_range(tun_name: &str) -> Result<()> {
-    let index = windows_interface_index(tun_name)?;
+    let index = windows_interface_index(tun_name).await?;
     for &(prefix, _) in &WINDOWS_PEER_ROUTES {
-        windows_powershell(&windows_remove_route_script(prefix, index))?;
+        windows_powershell(&windows_remove_route_script(prefix, index)).await?;
     }
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
+pub async fn unroute_peer_range(_tun_name: &str) -> Result<()> {
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
 pub async fn route_peer_range(tun_name: &str) -> Result<()> {
-    let index = windows_interface_index(tun_name)?;
+    let index = windows_interface_index(tun_name).await?;
     let mut installed = Vec::new();
     for &(prefix, next_hop) in &WINDOWS_PEER_ROUTES {
-        let result = windows_powershell(&windows_replace_route_script(prefix, index, next_hop));
+        let result =
+            windows_powershell(&windows_replace_route_script(prefix, index, next_hop)).await;
         if let Err(error) = result {
             for previous in installed {
-                let _ = windows_powershell(&windows_remove_route_script(previous, index));
+                let _ = windows_powershell(&windows_remove_route_script(previous, index)).await;
             }
             return Err(error);
         }
@@ -533,9 +538,9 @@ pub async fn route_magic_dns(_tun_name: &str) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
-    let index = windows_interface_index(tun_name)?;
+    let index = windows_interface_index(tun_name).await?;
     let prefix = format!("{}/32", crate::dns::MAGIC_DNS_V4);
-    windows_powershell(&windows_replace_route_script(&prefix, index, "0.0.0.0"))?;
+    windows_powershell(&windows_replace_route_script(&prefix, index, "0.0.0.0")).await?;
     Ok(())
 }
 
@@ -584,20 +589,20 @@ pub async fn route_self_loopback(_v4: Ipv4Addr, _v6: Ipv6Addr) -> Result<()> {
 
 /// Bring the TUN interface administratively up (used when activating the VPN).
 #[cfg(not(target_os = "android"))]
-pub fn set_link_up(tun_name: &str) -> Result<()> {
-    set_link_state(tun_name, true)
+pub async fn set_link_up(tun_name: &str) -> Result<()> {
+    set_link_state(tun_name, true).await
 }
 
 /// Bring the TUN interface administratively down (standby). The underlying file
 /// descriptor stays open, so the device can be brought back up without
 /// recreating it.
 #[cfg(not(target_os = "android"))]
-pub fn set_link_down(tun_name: &str) -> Result<()> {
-    set_link_state(tun_name, false)
+pub async fn set_link_down(tun_name: &str) -> Result<()> {
+    set_link_state(tun_name, false).await
 }
 
 #[cfg(not(target_os = "android"))]
-fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
+async fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     {
         let state = if up { "up" } else { "down" };
@@ -619,63 +624,33 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         let args = windows_link_args(tun_name, up);
-        let status = Command::new("netsh")
-            .creation_flags(0x0800_0000)
-            .args(&args)
-            .status()
+        let output = crate::windows_process::WindowsProcessRunner::default()
+            .output("netsh.exe", args)
+            .await
             .context("run netsh interface set interface")?;
         anyhow::ensure!(
-            status.success(),
-            "netsh interface {} failed with {status}",
-            if up { "enabled" } else { "disabled" }
+            output.status.success(),
+            "netsh interface {} failed: {}",
+            if up { "enabled" } else { "disabled" },
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn windows_powershell(script: &str) -> Result<String> {
-    const POWERSHELL_TIMEOUT: Duration = Duration::from_secs(15);
-    let mut child = Command::new("powershell.exe")
-        .creation_flags(0x0800_0000)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
+async fn windows_powershell(script: &str) -> Result<String> {
+    crate::windows_process::WindowsProcessRunner::default()
+        .powershell(
             &format!("$ErrorActionPreference='Stop'; {script}"),
-        ])
-        .spawn()
-        .context("run Windows network PowerShell")?;
-    let deadline = Instant::now() + POWERSHELL_TIMEOUT;
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("Windows network PowerShell timed out after {POWERSHELL_TIMEOUT:?}");
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    let output = child
-        .wait_with_output()
-        .context("collect Windows network PowerShell output")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "Windows network command failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            "run Windows network PowerShell",
+        )
+        .await
 }
 
 #[cfg(target_os = "windows")]
-fn windows_interface_index(tun_name: &str) -> Result<u32> {
-    let output = windows_powershell(&windows_interface_query_script(tun_name))?;
+async fn windows_interface_index(tun_name: &str) -> Result<u32> {
+    let output = windows_powershell(&windows_interface_query_script(tun_name)).await?;
     anyhow::ensure!(
         !output.is_empty() && !output.contains('\n'),
         "Windows TUN adapter {tun_name:?} was not uniquely found"

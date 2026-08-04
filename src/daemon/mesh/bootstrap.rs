@@ -36,7 +36,7 @@ const BLOB_GC_INTERVAL: Duration = Duration::from_secs(600);
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
     // Bail early on a CGNAT clash (e.g. Tailscale) before touching anything.
     #[cfg(not(target_os = "android"))]
-    check_cgnat_conflict()?;
+    check_cgnat_conflict().await?;
 
     // Repair a leftover `/etc/resolv.conf` before anything reads it. A hard kill
     // or reboot leaves ours in place (nameserver = our own Magic DNS), and the

@@ -64,7 +64,7 @@ pub mod hostname;
 pub mod identity;
 // Linux init-system abstraction (systemd / OpenRC / SysV) behind the service
 // management commands. Desktop-only: Android has no `ray` service to install.
-#[cfg(feature = "desktop")]
+#[cfg(all(feature = "desktop", target_os = "linux"))]
 pub mod init_system;
 pub mod invite;
 pub mod ipc;
@@ -89,6 +89,8 @@ pub mod transport;
 pub mod tun;
 #[cfg(windows)]
 pub mod windows_identity;
+#[cfg(windows)]
+pub(crate) mod windows_process;
 #[cfg(windows)]
 pub(crate) mod windows_security;
 #[cfg(windows)]
