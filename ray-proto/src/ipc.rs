@@ -11,6 +11,8 @@ use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 #[cfg(unix)]
 use tokio::io::Interest;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -949,7 +951,72 @@ pub async fn connect() -> Result<IpcFramed> {
     let stream = ClientOptions::new()
         .open(r"\\.\pipe\rayfish")
         .context("daemon not running — start the Rayfish service")?;
+    verify_windows_server_is_local_system(&stream)?;
     Ok(Framed::new(stream, MsgpackCodec::new()))
+}
+
+#[cfg(windows)]
+fn verify_windows_server_is_local_system(stream: &NamedPipeClient) -> Result<()> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let pipe = stream.as_raw_handle() as HANDLE;
+    let mut pid = 0;
+    anyhow::ensure!(
+        unsafe { GetNamedPipeServerProcessId(pipe, &mut pid) } != 0 && pid != 0,
+        "cannot verify Rayfish service identity"
+    );
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    anyhow::ensure!(!process.is_null(), "cannot open Rayfish service process");
+    let mut token = std::ptr::null_mut();
+    let token_ok = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
+    unsafe { CloseHandle(process) };
+    anyhow::ensure!(
+        token_ok != 0 && !token.is_null(),
+        "cannot read Rayfish service token"
+    );
+    let mut bytes = 0;
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut bytes) };
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(std::mem::size_of::<u64>())];
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+        )
+    };
+    unsafe { CloseHandle(token) };
+    anyhow::ensure!(ok != 0, "cannot read Rayfish service SID");
+    let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    let mut text = std::ptr::null_mut();
+    anyhow::ensure!(
+        unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) } != 0 && !text.is_null(),
+        "cannot format Rayfish service SID"
+    );
+    let mut len = 0;
+    unsafe {
+        while *text.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let sid = OsString::from_wide(unsafe { std::slice::from_raw_parts(text, len) })
+        .to_string_lossy()
+        .into_owned();
+    unsafe { LocalFree(text.cast()) };
+    anyhow::ensure!(
+        sid == "S-1-5-18",
+        "refusing IPC pipe owned by non-LocalSystem process ({sid})"
+    );
+    Ok(())
 }
 
 pub fn framed<S>(stream: S) -> Framed<S, MsgpackCodec<IpcMessage>>

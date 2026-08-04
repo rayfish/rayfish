@@ -94,10 +94,16 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
 /// service, which requires root.
 pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
     if let Ok(mut stream) = ipc::connect().await {
+        #[cfg(windows)]
+        let claimed_sid = claim_windows_operator_for_up()?;
         ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
         match ipc::recv(&mut stream).await? {
             ipc::IpcMessage::Ok { message } => println!("{message}"),
-            ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+            ipc::IpcMessage::Error { message } => {
+                #[cfg(windows)]
+                compensate_windows_operator_claim(claimed_sid.as_deref());
+                print_error("error", &message, None)
+            }
             other => eprintln!("Unexpected response: {other:?}"),
         }
         return Ok(());
@@ -123,6 +129,8 @@ pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
 /// VPN), we surface the tail of its log so the user knows what went wrong
 /// instead of seeing a cheerful "started" followed by a dead `ray status`.
 pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Result<()> {
+    #[cfg(windows)]
+    let claimed_sid = claim_windows_operator_for_up()?;
     ensure_service_installed()?;
 
     #[cfg(target_os = "linux")]
@@ -167,7 +175,11 @@ pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Resul
             ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
             match ipc::recv(&mut stream).await? {
                 ipc::IpcMessage::Ok { message } => println!("rayfish service started. {message}"),
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+                ipc::IpcMessage::Error { message } => {
+                    #[cfg(windows)]
+                    compensate_windows_operator_claim(claimed_sid.as_deref());
+                    print_error("error", &message, None)
+                }
                 other => eprintln!("Unexpected response: {other:?}"),
             }
             // We're root here (installing the service). Grant the invoking user
@@ -215,6 +227,10 @@ pub(crate) async fn grant_operator_to_invoking_user() {
 pub(crate) fn require_root() -> Result<()> {
     #[cfg(windows)]
     {
+        anyhow::ensure!(
+            rayfish::windows_identity::is_current_process_elevated_admin(),
+            "this command requires an elevated Administrator terminal"
+        );
         return Ok(());
     }
     #[cfg(unix)]
@@ -226,6 +242,25 @@ pub(crate) fn require_root() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn claim_windows_operator_for_up() -> Result<Option<String>> {
+    if !rayfish::windows_identity::is_current_process_elevated_admin() {
+        return Ok(None);
+    }
+    let sid = rayfish::windows_identity::current_user_sid()
+        .context("elevated Windows process has no user SID")?;
+    Ok(config::claim_operator_sid(&sid)?.then_some(sid))
+}
+
+#[cfg(windows)]
+fn compensate_windows_operator_claim(sid: Option<&str>) {
+    if let Some(sid) = sid
+        && let Err(error) = config::remove_operator_sid_if_matches(sid)
+    {
+        tracing::error!(%error, "failed to compensate Windows operator claim");
+    }
 }
 
 /// `ray install`: install the system service if needed (or refresh an existing

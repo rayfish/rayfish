@@ -1,17 +1,45 @@
 #![cfg(windows)]
 
-//! Small Win32 identity helpers shared by the service and named-pipe IPC.
+//! Win32 token identity helpers shared by service bootstrap and named-pipe IPC.
 
-use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
+use std::ffi::{OsStr, OsString};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+use anyhow::{Context, Result};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
-use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+use windows_sys::Win32::Security::{
+    CheckTokenMembership, CreateWellKnownSid, DuplicateToken, GetTokenInformation,
+    LookupAccountNameW, RevertToSelf, SecurityIdentification, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    WinBuiltinAdministratorsSid,
 };
+use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
+};
+
+#[derive(Clone, Debug)]
+pub(crate) struct WindowsPeerIdentity {
+    pub(crate) sid: String,
+    pub(crate) is_local_system: bool,
+    pub(crate) is_elevated_admin: bool,
+}
+
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+struct ImpersonationGuard;
+
+impl Drop for ImpersonationGuard {
+    fn drop(&mut self) {
+        unsafe { RevertToSelf() };
+    }
+}
 
 fn token_sid(token: HANDLE) -> Option<String> {
     let mut bytes = 0u32;
@@ -36,11 +64,15 @@ fn token_sid(token: HANDLE) -> Option<String> {
         return None;
     }
     let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
-    if user.User.Sid.is_null() {
+    sid_to_string(user.User.Sid)
+}
+
+fn sid_to_string(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
+    if sid.is_null() {
         return None;
     }
     let mut sid_text = std::ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_text) } == 0 || sid_text.is_null() {
+    if unsafe { ConvertSidToStringSidW(sid, &mut sid_text) } == 0 || sid_text.is_null() {
         return None;
     }
     let mut len = 0usize;
@@ -49,50 +81,138 @@ fn token_sid(token: HANDLE) -> Option<String> {
             len += 1;
         }
     }
-    let sid = OsString::from_wide(unsafe { std::slice::from_raw_parts(sid_text, len) })
+    let value = OsString::from_wide(unsafe { std::slice::from_raw_parts(sid_text, len) })
         .to_string_lossy()
         .into_owned();
-    unsafe {
-        LocalFree(sid_text.cast());
-    }
-    Some(sid)
+    unsafe { LocalFree(sid_text.cast()) };
+    Some(value)
 }
 
-fn process_sid(process: HANDLE) -> Option<String> {
+fn token_is_admin(token: HANDLE) -> bool {
+    let mut sid_size = 0u32;
+    unsafe {
+        let _ = CreateWellKnownSid(
+            WinBuiltinAdministratorsSid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sid_size,
+        );
+    }
+    if sid_size == 0 {
+        return false;
+    }
+    let words = (sid_size as usize).div_ceil(std::mem::size_of::<u64>());
+    let mut sid = vec![0u64; words];
+    if unsafe {
+        CreateWellKnownSid(
+            WinBuiltinAdministratorsSid,
+            std::ptr::null_mut(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_size,
+        )
+    } == 0
+    {
+        return false;
+    }
+    let mut is_member = 0;
+    let ok = unsafe { CheckTokenMembership(token, sid.as_mut_ptr().cast(), &mut is_member) };
+    ok != 0 && is_member != 0
+}
+
+fn process_token() -> Option<OwnedHandle> {
     let mut token = std::ptr::null_mut();
-    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 || token.is_null() {
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
+        || token.is_null()
+    {
         return None;
     }
-    let sid = token_sid(token);
-    unsafe {
-        CloseHandle(token);
-    }
-    sid
+    Some(OwnedHandle(token))
 }
 
-pub(crate) fn current_user_sid() -> Option<String> {
-    process_sid(unsafe { GetCurrentProcess() })
+pub fn current_user_sid() -> Option<String> {
+    process_token().and_then(|token| token_sid(token.0))
 }
 
-pub(crate) fn named_pipe_client_sid(pipe: HANDLE) -> Option<String> {
-    let mut pid = 0u32;
-    if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } == 0 || pid == 0 {
-        return None;
+pub fn is_current_process_elevated_admin() -> bool {
+    let Some(token) = process_token() else {
+        return false;
+    };
+    let mut impersonation = std::ptr::null_mut();
+    if unsafe { DuplicateToken(token.0, SecurityIdentification, &mut impersonation) } == 0
+        || impersonation.is_null()
+    {
+        return false;
     }
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if process.is_null() {
-        return None;
-    }
-    let sid = process_sid(process);
+    token_is_admin(OwnedHandle(impersonation).0)
+}
+
+pub fn account_sid(account: &OsStr) -> Result<String> {
+    let account: Vec<u16> = account.encode_wide().chain(std::iter::once(0)).collect();
+    let mut sid_size = 0u32;
+    let mut domain_size = 0u32;
+    let mut sid_use = 0;
     unsafe {
-        CloseHandle(process);
+        let _ = LookupAccountNameW(
+            std::ptr::null(),
+            account.as_ptr(),
+            std::ptr::null_mut(),
+            &mut sid_size,
+            std::ptr::null_mut(),
+            &mut domain_size,
+            &mut sid_use,
+        );
     }
-    sid
+    anyhow::ensure!(
+        sid_size > 0,
+        "account was not found (Win32 error {})",
+        unsafe { GetLastError() }
+    );
+    let sid_words = (sid_size as usize).div_ceil(std::mem::size_of::<u64>());
+    let mut sid = vec![0u64; sid_words];
+    let mut domain = vec![0u16; domain_size as usize];
+    let ok = unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            account.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_size,
+            domain.as_mut_ptr(),
+            &mut domain_size,
+            &mut sid_use,
+        )
+    };
+    anyhow::ensure!(ok != 0, "account lookup failed (Win32 error {})", unsafe {
+        GetLastError()
+    });
+    sid_to_string(sid.as_mut_ptr().cast()).context("account lookup returned an invalid SID")
+}
+
+pub(crate) fn named_pipe_client_identity(pipe: HANDLE) -> Result<WindowsPeerIdentity> {
+    anyhow::ensure!(
+        unsafe { ImpersonateNamedPipeClient(pipe) } != 0,
+        "failed to impersonate named-pipe client (Win32 error {})",
+        unsafe { GetLastError() }
+    );
+    let _guard = ImpersonationGuard;
+    let mut token = std::ptr::null_mut();
+    anyhow::ensure!(
+        unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } != 0
+            && !token.is_null(),
+        "failed to open named-pipe client token (Win32 error {})",
+        unsafe { GetLastError() }
+    );
+    let token = OwnedHandle(token);
+    let sid = token_sid(token.0).context("named-pipe client token has no SID")?;
+    Ok(WindowsPeerIdentity {
+        is_local_system: sid == "S-1-5-18",
+        is_elevated_admin: token_is_admin(token.0),
+        sid,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{current_user_sid, named_pipe_client_sid};
+    use super::*;
 
     #[test]
     fn current_user_sid_is_a_nonempty_windows_sid() {
@@ -102,7 +222,13 @@ mod tests {
     }
 
     #[test]
+    fn current_account_round_trips_through_lookup() {
+        let account = std::env::var_os("USERNAME").expect("USERNAME");
+        assert_eq!(account_sid(&account).unwrap(), current_user_sid().unwrap());
+    }
+
+    #[test]
     fn invalid_named_pipe_handle_fails_closed() {
-        assert!(named_pipe_client_sid(std::ptr::null_mut()).is_none());
+        assert!(named_pipe_client_identity(std::ptr::null_mut()).is_err());
     }
 }

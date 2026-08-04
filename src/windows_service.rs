@@ -79,9 +79,44 @@ pub fn install(executable: &Path) -> Result<()> {
             .map(|_| ())?,
     }
     if let Some(sid) = crate::windows_identity::current_user_sid() {
-        config::set_operator_sid(&sid).context("persist Windows operator SID")?;
+        config::claim_operator_sid(&sid).context("claim Windows operator SID")?;
     }
     Ok(())
+}
+
+pub fn set_operator_account(account: &OsStr) -> Result<String> {
+    anyhow::ensure!(
+        crate::windows_identity::is_current_process_elevated_admin(),
+        "setting the Windows operator requires an elevated Administrator terminal"
+    );
+    let sid = crate::windows_identity::account_sid(account)?;
+    let previous = config::operator_sid()?;
+    let was_running = open(ServiceAccess::QUERY_STATUS)?
+        .query_status()?
+        .current_state
+        == ServiceState::Running;
+    if was_running {
+        stop()?;
+    }
+    if let Err(error) = config::set_operator_sid(&sid) {
+        if was_running {
+            let _ = start();
+        }
+        return Err(error);
+    }
+    if was_running && let Err(error) = start() {
+        match previous.as_deref() {
+            Some(old) => {
+                let _ = config::set_operator_sid(old);
+            }
+            None => {
+                let _ = config::remove_operator_sid_if_matches(&sid);
+            }
+        }
+        let _ = start();
+        return Err(error).context("restart service after setting Windows operator");
+    }
+    Ok(sid)
 }
 
 fn open(access: ServiceAccess) -> Result<windows_service::service::Service> {

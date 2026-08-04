@@ -98,7 +98,61 @@ pub(crate) enum PeerIdentity {
     #[cfg(unix)]
     Unix { uid: u32, gid: u32 },
     #[cfg(windows)]
-    Windows { sid: String },
+    Windows {
+        sid: String,
+        is_local_system: bool,
+        is_elevated_admin: bool,
+    },
+}
+
+#[cfg(windows)]
+fn windows_peer_authorized(peer: Option<&PeerIdentity>, operator: Option<&str>) -> bool {
+    peer.is_some_and(|peer| match peer {
+        PeerIdentity::Windows {
+            sid,
+            is_local_system,
+            is_elevated_admin,
+        } => {
+            *is_local_system
+                || *is_elevated_admin
+                || operator.is_some_and(|operator| operator == sid)
+        }
+    })
+}
+
+#[cfg(all(test, windows))]
+mod windows_authorization_tests {
+    use super::{PeerIdentity, windows_peer_authorized};
+
+    fn peer(sid: &str, system: bool, admin: bool) -> PeerIdentity {
+        PeerIdentity::Windows {
+            sid: sid.to_owned(),
+            is_local_system: system,
+            is_elevated_admin: admin,
+        }
+    }
+
+    #[test]
+    fn zombie_authorization_matrix_fails_closed() {
+        let operator = "S-1-5-21-1-2-3-1001";
+        assert!(!windows_peer_authorized(None, Some(operator)));
+        assert!(!windows_peer_authorized(
+            Some(&peer("S-1-5-21-1-2-3-1002", false, false)),
+            Some(operator)
+        ));
+        assert!(windows_peer_authorized(
+            Some(&peer(operator, false, false)),
+            Some(operator)
+        ));
+        assert!(windows_peer_authorized(
+            Some(&peer("S-1-5-18", true, false)),
+            None
+        ));
+        assert!(windows_peer_authorized(
+            Some(&peer("S-1-5-21-1-2-3-500", false, true)),
+            None
+        ));
+    }
 }
 
 impl PeerIdentity {
@@ -812,19 +866,9 @@ impl Daemon {
         let uid = peer.map(|p| match p {
             PeerIdentity::Unix { uid, .. } => *uid,
         });
-        #[cfg(windows)]
-        let sid = peer.map(|p| match p {
-            PeerIdentity::Windows { sid } => sid.as_str(),
-        });
-
         // Root may do anything.
         #[cfg(unix)]
         if uid == Some(0) {
-            return None;
-        }
-
-        #[cfg(windows)]
-        if sid.is_some_and(|sid| config::operator_sid().ok().flatten().as_deref() == Some(sid)) {
             return None;
         }
 
@@ -835,6 +879,11 @@ impl Daemon {
                           (re-run with sudo)"
                     .to_string(),
             ));
+        }
+
+        #[cfg(windows)]
+        if windows_peer_authorized(peer, config::operator_sid().ok().flatten().as_deref()) {
+            return None;
         }
 
         // Otherwise the caller must be the configured operator.

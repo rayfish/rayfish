@@ -674,12 +674,18 @@ fn set_owner(path: &Path, secret: bool) {
 /// Create `dir` (and parents) with restrictive perms: 0750 root:rayfish on
 /// Linux. Idempotent.
 fn ensure_dir(dir: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        return crate::windows_security::ensure_protected_dir(dir);
+    }
+    #[cfg(not(windows))]
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     #[cfg(target_os = "linux")]
     {
         let _ = std::fs::set_permissions(dir, Permissions::from_mode(0o750));
         set_owner(dir, false);
     }
+    #[cfg(not(windows))]
     Ok(())
 }
 
@@ -750,8 +756,57 @@ pub fn operator_sid() -> Result<Option<String>> {
 
 #[cfg(windows)]
 pub fn set_operator_sid(sid: &str) -> Result<()> {
+    crate::windows_security::pipe_descriptor(Some(sid))?;
     let path = config_dir()?.join(OPERATOR_SID_FILE);
-    write_atomic(&path, &format!("{sid}\n"), false)
+    write_atomic(&path, &format!("{sid}\n"), true)
+}
+
+/// Atomically record the first Windows operator without replacing an existing
+/// non-empty SID. Returns `true` only to the process that won the claim.
+#[cfg(windows)]
+pub fn claim_operator_sid(sid: &str) -> Result<bool> {
+    crate::windows_security::pipe_descriptor(Some(sid))?;
+    if operator_sid()?.is_some() {
+        return Ok(false);
+    }
+    let dir = config_dir()?;
+    let path = dir.join(OPERATOR_SID_FILE);
+    if path.exists() && std::fs::metadata(&path)?.len() == 0 {
+        std::fs::remove_file(&path).context("remove incomplete operator SID claim")?;
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = dir.join(format!(
+        ".{OPERATOR_SID_FILE}.claim.{}.{}",
+        std::process::id(),
+        nonce
+    ));
+    let result = (|| -> Result<bool> {
+        use std::io::Write;
+        let mut file = crate::windows_security::create_protected_file(&tmp)?;
+        writeln!(file, "{sid}").context("write operator SID claim")?;
+        file.sync_all().context("flush operator SID claim")?;
+        drop(file);
+        crate::windows_security::move_no_replace(&tmp, &path)
+    })();
+    if tmp.exists() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Compensate only the exact claim made by this process. A concurrent explicit
+/// recovery that changed the operator is never removed.
+#[cfg(windows)]
+pub fn remove_operator_sid_if_matches(sid: &str) -> Result<bool> {
+    if operator_sid()?.as_deref() != Some(sid) {
+        return Ok(false);
+    }
+    let path = config_dir()?.join(OPERATOR_SID_FILE);
+    std::fs::remove_file(path).context("remove failed operator SID claim")?;
+    Ok(true)
 }
 
 /// Reject a network name that can't be a safe single path component (defence in
@@ -787,6 +842,13 @@ pub fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
     let tmp = dir.join(format!(".{fname}.tmp.{}", std::process::id()));
     {
         use std::io::Write;
+        #[cfg(windows)]
+        let mut f = if secret {
+            crate::windows_security::create_protected_file(&tmp)?
+        } else {
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?
+        };
+        #[cfg(not(windows))]
         let mut f =
             std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         f.write_all(bytes)
@@ -818,7 +880,9 @@ fn write_atomic(path: &Path, contents: &str, secret: bool) -> Result<()> {
 /// [`write_file`]. Best-effort.
 pub fn restrict_perms(path: &Path, secret: bool) {
     #[cfg(windows)]
-    let _ = (path, secret);
+    if secret && let Err(error) = crate::windows_security::protect_file(path) {
+        tracing::error!(path = %path.display(), %error, "failed to protect Windows config file");
+    }
     #[cfg(unix)]
     {
         let mode = if secret { 0o600 } else { 0o640 };

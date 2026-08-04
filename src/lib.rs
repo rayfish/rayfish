@@ -88,7 +88,9 @@ pub mod term;
 pub mod transport;
 pub mod tun;
 #[cfg(windows)]
-pub(crate) mod windows_identity;
+pub mod windows_identity;
+#[cfg(windows)]
+pub(crate) mod windows_security;
 #[cfg(windows)]
 pub mod windows_service;
 // Self-replacing binary update relies on `self-replace` (a desktop-only dep) and

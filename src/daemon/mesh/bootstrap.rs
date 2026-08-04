@@ -18,14 +18,6 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::net::{UnixListener, UnixStream};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::HANDLE;
-#[cfg(windows)]
-use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SE_KERNEL_OBJECT, SetSecurityInfo,
-};
-#[cfg(windows)]
-use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR,
-};
 
 use iroh_blobs::provider::events::{
     ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
@@ -816,7 +808,8 @@ async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()>
             }
         }
     }
-    let mut server = create_named_pipe(&pipe_name)?;
+    let mut server = create_named_pipe(&pipe_name, true)?;
+    let mut standby = create_named_pipe(&pipe_name, false)?;
     tracing::info!(pipe = %pipe_name, "IPC named pipe listening");
     loop {
         tokio::select! {
@@ -827,7 +820,14 @@ async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()>
             result = server.connect() => {
                 result.context("accept IPC named pipe client")?;
                 let client = server;
-                server = create_named_pipe(&pipe_name)?;
+                // Keep the old standby alive until two replacement instances
+                // have been created with the latest operator ACL. This removes
+                // the zero-listener window and refreshes ACLs after bootstrap.
+                let replacement = create_named_pipe(&pipe_name, false)?;
+                let replacement_standby = create_named_pipe(&pipe_name, false)?;
+                drop(standby);
+                server = replacement;
+                standby = replacement_standby;
                 let daemon = daemon.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_ipc_client(client, &daemon).await {
@@ -840,119 +840,29 @@ async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()>
 }
 
 #[cfg(windows)]
-fn create_named_pipe(name: &str) -> Result<NamedPipeServer> {
-    // SetSecurityInfo below needs WRITE_DAC on the pipe handle. Request it at
-    // creation time; applying the operator SID ACL must remain fail-closed.
-    let server = ServerOptions::new().write_dac(true).create(name)?;
-    apply_named_pipe_acl(&server)?;
-    Ok(server)
-}
-
-/// Restrict the pipe to LocalSystem, administrators, and the configured operator
-/// SID. Requests still perform a per-connection SID check in `Daemon` so an ACL
-/// regression cannot silently grant mutation authority.
-#[cfg(windows)]
-fn apply_named_pipe_acl(server: &NamedPipeServer) -> Result<()> {
+fn create_named_pipe(name: &str, first: bool) -> Result<NamedPipeServer> {
     let operator = crate::config::operator_sid()?;
-    if let Some(sid) = operator.as_deref() {
-        anyhow::ensure!(valid_windows_sid(sid), "invalid configured operator SID");
-    }
-    let sddl = match operator.as_deref() {
-        Some(sid) => format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})"),
-        None => "D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_owned(),
-    };
-    let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    let mut descriptor_size = 0u32;
-    let ok = unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            wide.as_ptr(),
-            1,
-            &mut descriptor,
-            &mut descriptor_size,
-        )
-    };
-    if ok == 0 || descriptor.is_null() {
-        anyhow::bail!("failed to build IPC named-pipe security descriptor");
-    }
-    let mut dacl_present = 0;
-    let mut dacl_defaulted = 0;
-    let mut dacl = std::ptr::null_mut();
-    let dacl_ok = unsafe {
-        GetSecurityDescriptorDacl(
-            descriptor,
-            &mut dacl_present,
-            &mut dacl,
-            &mut dacl_defaulted,
-        )
-    };
-    let result = (|| -> Result<()> {
-        anyhow::ensure!(
-            dacl_ok != 0 && dacl_present != 0,
-            "failed to read IPC named-pipe DACL"
-        );
-        let result = unsafe {
-            SetSecurityInfo(
-                server.as_raw_handle() as HANDLE,
-                SE_KERNEL_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                dacl,
-                std::ptr::null_mut(),
-            )
-        };
-        anyhow::ensure!(result == 0, "failed to apply IPC named-pipe ACL: {result}");
-        Ok(())
-    })();
+    let mut descriptor = crate::windows_security::pipe_descriptor(operator.as_deref())?;
+    let mut attributes = descriptor.attributes();
+    let mut options = ServerOptions::new();
+    options.first_pipe_instance(first);
     unsafe {
-        windows_sys::Win32::Foundation::LocalFree(descriptor);
+        options.create_with_security_attributes_raw(
+            name,
+            (&mut attributes as *mut windows_sys::Win32::Security::SECURITY_ATTRIBUTES).cast(),
+        )
     }
-    result
-}
-
-#[cfg(windows)]
-fn valid_windows_sid(sid: &str) -> bool {
-    let mut parts = sid.split('-');
-    matches!(parts.next(), Some("S"))
-        && parts.next().is_some_and(|revision| {
-            !revision.is_empty() && revision.bytes().all(|b| b.is_ascii_digit())
-        })
-        && parts.next().is_some_and(|authority| {
-            !authority.is_empty() && authority.bytes().all(|b| b.is_ascii_digit())
-        })
-        && parts.count() > 0
-        && sid.split('-').skip(3).all(|subauthority| {
-            !subauthority.is_empty() && subauthority.bytes().all(|b| b.is_ascii_digit())
-        })
-}
-
-#[cfg(all(test, windows))]
-mod windows_identity_tests {
-    use super::valid_windows_sid;
-
-    #[test]
-    fn sid_validation_covers_zero_one_many_and_boundaries() {
-        assert!(!valid_windows_sid(""));
-        assert!(!valid_windows_sid("S-1-5"));
-        assert!(valid_windows_sid("S-1-5-18"));
-        assert!(valid_windows_sid(
-            "S-1-5-21-111111111-222222222-333333333-1001"
-        ));
-
-        assert!(!valid_windows_sid("s-1-5-18"));
-        assert!(!valid_windows_sid("S--5-18"));
-        assert!(!valid_windows_sid("S-1--18"));
-        assert!(!valid_windows_sid("S-1-x-18"));
-        assert!(!valid_windows_sid("S-1-5-"));
-        assert!(!valid_windows_sid("S-1-5-18-extra"));
-    }
+    .context("create protected IPC named pipe")
 }
 
 #[cfg(windows)]
 async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Result<()> {
-    let peer = windows_identity::named_pipe_client_sid(stream.as_raw_handle() as HANDLE)
-        .map(|sid| PeerIdentity::Windows { sid });
+    let identity = windows_identity::named_pipe_client_identity(stream.as_raw_handle() as HANDLE)?;
+    let peer = Some(PeerIdentity::Windows {
+        sid: identity.sid,
+        is_local_system: identity.is_local_system,
+        is_elevated_admin: identity.is_elevated_admin,
+    });
     let mut framed = ipc::framed(stream);
     let req = ipc::recv(&mut framed).await?;
     if matches!(req, ipc::IpcMessage::SendFileBegin { .. })

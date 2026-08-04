@@ -1276,21 +1276,31 @@ pub(crate) fn uid_for_user(user: &str) -> Option<u32> {
 /// commands without sudo (Tailscale's `--operator` model). The daemon enforces
 /// that this call itself comes from root.
 async fn cmd_set_operator(user: &str) -> Result<()> {
-    let uid = uid_for_user(user)
-        .ok_or_else(|| anyhow::anyhow!("unknown user '{user}' (pass a valid username or UID)"))?;
-    let mut stream = ipc::connect()
-        .await
-        .context("rayfish daemon is not running; start it with: sudo ray up")?;
-    ipc::send(&mut stream, ipc::IpcMessage::SetOperator { uid }).await?;
-    match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::Error { message } => {
-            print_error("error", &message, None);
-            std::process::exit(1);
-        }
-        other => eprintln!("Unexpected response: {other:?}"),
+    #[cfg(windows)]
+    {
+        let sid = rayfish::windows_service::set_operator_account(std::ffi::OsStr::new(user))?;
+        println!("operator set to {user} ({sid})");
+        return Ok(());
     }
-    Ok(())
+    #[cfg(unix)]
+    {
+        let uid = uid_for_user(user).ok_or_else(|| {
+            anyhow::anyhow!("unknown user '{user}' (pass a valid username or UID)")
+        })?;
+        let mut stream = ipc::connect()
+            .await
+            .context("rayfish daemon is not running; start it with: sudo ray up")?;
+        ipc::send(&mut stream, ipc::IpcMessage::SetOperator { uid }).await?;
+        match ipc::recv(&mut stream).await? {
+            ipc::IpcMessage::Ok { message } => println!("{message}"),
+            ipc::IpcMessage::Error { message } => {
+                print_error("error", &message, None);
+                std::process::exit(1);
+            }
+            other => eprintln!("Unexpected response: {other:?}"),
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
