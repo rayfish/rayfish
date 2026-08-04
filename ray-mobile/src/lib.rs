@@ -61,6 +61,7 @@ mod android_jni {
 }
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 use android_tun::{AndroidTunReader, AndroidTunWriter};
@@ -1013,6 +1014,22 @@ impl Node {
     /// reader/writer to the running daemon and mark the data plane active.
     /// Requires [`Node::start`] first.
     pub fn up(&self, tun_fd: i32) -> Result<(), RayError> {
+        // Kotlin calls `up(pfd.detachFd())`, so this descriptor is ours before
+        // the first line of the body runs: its `ParcelFileDescriptor` no longer
+        // owns anything and cannot close it for us. Take ownership here, ahead
+        // of anything fallible, so every early return below closes it.
+        //
+        // Leaking it on a failure path is not a mere fd leak: the fd is the only
+        // handle on the `VpnService` interface, so an unowned one keeps that
+        // interface established for the life of the process. Android tears the
+        // VPN down when the interface disappears (the framework's
+        // `interfaceRemoved` observer), so a stranded fd leaves the system
+        // showing a connected VPN while the app has fallen back to standby and
+        // reports the tunnel off, with no way to disconnect short of Settings.
+        // SAFETY: `tun_fd` came from Kotlin's `detachFd()`; nothing else owns or
+        // closes it, so wrapping it here closes it exactly once.
+        let tun = unsafe { OwnedFd::from_raw_fd(tun_fd) };
+
         let state = self.state()?;
 
         // `AndroidTunReader`/`AndroidTunWriter` wrap the fd in a `tokio` `AsyncFd`,
@@ -1021,15 +1038,12 @@ impl Node {
         // the duration of this call before constructing them.
         let _guard = self.runtime.enter();
 
-        // The writer owns a single `dup` of the fd; the reader takes ownership of
-        // the detached fd itself. Build the writer's dup first so that if it fails
-        // we have not yet consumed the original fd. Two owned fds, each closed
-        // exactly once on drop (when `detach_tun`/`Drop` tears the tasks down).
-        let writer = AndroidTunWriter::new(tun_fd).map_err(RayError::network)?;
-        // SAFETY: `tun_fd` is the fd Kotlin transferred to us via `detachFd()`;
-        // nothing else owns or closes it, so the reader may take ownership.
-        let reader =
-            unsafe { AndroidTunReader::from_owned_fd(tun_fd) }.map_err(RayError::network)?;
+        // The writer owns a single `dup` of the fd; the reader consumes the
+        // detached fd itself. Build the writer's dup first, while `tun` is still
+        // owned here, so a failure closes it. Two owned fds, each closed exactly
+        // once on drop (when `detach_tun`/`Drop` tears the tasks down).
+        let writer = AndroidTunWriter::new(tun.as_raw_fd()).map_err(RayError::network)?;
+        let reader = AndroidTunReader::new(tun).map_err(RayError::network)?;
 
         self.runtime.block_on(async {
             state.attach_tun(reader, writer).await;
@@ -1259,5 +1273,72 @@ mod device_name_tests {
         // Invalid name is rejected and does not overwrite the stored value.
         assert!(node.set_default_hostname("BAD NAME".into()).is_err());
         assert_eq!(node.default_hostname(), "my-phone");
+    }
+}
+
+#[cfg(test)]
+mod tun_fd_ownership_tests {
+    use super::*;
+    use std::os::fd::RawFd;
+    use std::time::Duration;
+
+    /// A connected socket pair standing in for the `VpnService` tun fd: one end
+    /// is handed to `up()` (as Kotlin hands over the fd it detached), the other
+    /// is kept here to observe whether that end was closed. Watching the peer
+    /// rather than the fd number itself makes the assertion immune to another
+    /// thread reopening the same number.
+    fn socket_pair() -> (RawFd, RawFd) {
+        let mut fds = [0 as RawFd; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0,
+            "socketpair should succeed"
+        );
+        // The observer end must not block when the other end is still open.
+        let flags = unsafe { libc::fcntl(fds[1], libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_ne!(
+            unsafe { libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            -1
+        );
+        (fds[0], fds[1])
+    }
+
+    /// True once `peer`'s counterpart has been closed: a read on a socket whose
+    /// peer is gone returns 0 (EOF), where a live peer with no data pending
+    /// returns -1/EAGAIN. Polled briefly because the close can land on a runtime
+    /// worker thread rather than the calling one.
+    fn peer_closed(peer: RawFd) -> bool {
+        let mut byte = 0u8;
+        for _ in 0..200 {
+            let n = unsafe { libc::read(peer, (&raw mut byte).cast::<libc::c_void>(), 1) };
+            if n == 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// Kotlin calls `up(pfd.detachFd())`, so the fd is already detached by the
+    /// time `up` is entered: it owns that descriptor on every path out,
+    /// including the failures. Leaking it leaves the `VpnService` interface
+    /// established with nobody able to close it, so Android keeps showing a
+    /// connected VPN while the app believes the tunnel is off (issue #116).
+    #[test]
+    fn up_closes_the_detached_fd_when_the_node_is_not_started() {
+        let dir = std::env::temp_dir().join(format!("rayfish-updfd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = Node::new(dir.to_string_lossy().to_string());
+
+        let (tun, observer) = socket_pair();
+        // Never started, so this is the `NotStarted` early return.
+        assert!(node.up(tun).is_err(), "up() should fail on a stopped node");
+        assert!(
+            peer_closed(observer),
+            "up() must close the fd it was handed when it fails, or the tunnel lingers"
+        );
+        unsafe { libc::close(observer) };
     }
 }

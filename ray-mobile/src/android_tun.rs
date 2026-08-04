@@ -55,19 +55,15 @@ pub struct AndroidTunReader {
 }
 
 impl AndroidTunReader {
-    /// Take ownership of the detached `VpnService` fd directly (no dup). The fd
-    /// is closed on drop, so the caller must not close it again.
-    ///
-    /// # Safety
-    /// `fd` must be an open, owned descriptor (e.g. from Kotlin `detachFd()`)
-    /// that nothing else will close.
-    pub unsafe fn from_owned_fd(fd: RawFd) -> Result<Self> {
-        set_nonblocking(fd)?;
-        // SAFETY: caller guarantees `fd` is a valid, owned descriptor; wrap it so
-        // it closes exactly once on drop.
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    /// Take the detached `VpnService` fd directly (no dup), consuming the
+    /// caller's ownership of it. Taking `OwnedFd` rather than a raw `int` is
+    /// what makes the failure paths safe: if either step below fails, `fd` is
+    /// dropped and closed here instead of being stranded with no owner, which
+    /// would leave the `VpnService` interface up for the life of the process.
+    pub fn new(fd: OwnedFd) -> Result<Self> {
+        set_nonblocking(fd.as_raw_fd())?;
         Ok(Self {
-            fd: AsyncFd::new(owned)?,
+            fd: AsyncFd::new(fd)?,
         })
     }
 }

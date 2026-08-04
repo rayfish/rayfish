@@ -231,11 +231,26 @@ class RayfishVpnService : VpnService() {
     private fun startTunnelBlocking(startId: Int) {
         if (tunnel != null) return
 
-        // Bring the control plane up before building the tunnel so status() can
-        // report our real mesh IP. ensureStarted is idempotent.
+        // Bring the control plane up before building the tunnel. This is not
+        // optional: Node.up() returns NotStarted without it, so a tunnel built
+        // after it fails cannot come up. Establishing anyway would hand Android a
+        // VPN interface for a tunnel that will never carry traffic, which is how
+        // the system ended up showing a connected VPN while the app reported the
+        // tunnel off. Bail to the shared failure recovery instead.
+        // ensureStarted is idempotent, so this is a no-op when it is already up.
+        try {
+            runBlocking { NodeHolder.ensureStarted(applicationContext) }
+        } catch (t: Throwable) {
+            Log.e(TAG, "control plane failed to start; not building a tunnel", t)
+            handleBringUpFailure("ensureStarted failed before tunnel build", startId)
+            return
+        }
+
+        // The mesh IP is a different matter: the node is up, so a status() that
+        // fails or has no address yet (no networks joined) is not fatal. Fall
+        // back to the CGNAT base below so the tunnel still establishes.
         val (meshIp, meshV6) = try {
             runBlocking {
-                NodeHolder.ensureStarted(applicationContext)
                 val snapshot = NodeHolder.get(applicationContext).status()
                 snapshot.ipv4 to snapshot.ipv6
             }

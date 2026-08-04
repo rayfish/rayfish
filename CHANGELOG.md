@@ -61,6 +61,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Android no longer leaves a VPN connected after a failed tunnel start.** When
+  bringing the tunnel up failed partway (the mesh node had not started yet, say),
+  the app fell back to standby and reported the tunnel off, but the VPN interface
+  Android had already created stayed behind: the system kept showing a connected
+  VPN, and the only way out was disconnecting it from Settings, which then left
+  the app unable to start the tunnel again. Apps that refuse to run while a VPN
+  is up (Android Auto) saw a VPN that no longer existed as far as the app was
+  concerned. The tunnel handle is now released on every failure path, so the
+  system VPN goes away with it, and a mesh node that fails to start no longer
+  gets as far as asking Android for a VPN interface in the first place.
+
 - **"Copy code" on the Android QR sheet confirms the copy.** The sheet draws in
   its own window on top of the screen that hosts the confirmation, so the
   "Copied" message was hidden behind it and the button looked dead. The button
