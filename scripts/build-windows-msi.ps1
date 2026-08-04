@@ -33,6 +33,25 @@ function Assert-Command {
     }
 }
 
+function Enable-WixToolset {
+    if ((Get-Command 'candle.exe' -ErrorAction SilentlyContinue) -and
+        (Get-Command 'light.exe' -ErrorAction SilentlyContinue)) {
+        return
+    }
+
+    $candidates = @(
+        (Join-Path ${env:ProgramFiles(x86)} 'WiX Toolset v3.14\bin'),
+        (Join-Path $env:ProgramFiles 'WiX Toolset v3.14\bin')
+    )
+    $wixBin = $candidates | Where-Object {
+        (Test-Path (Join-Path $_ 'candle.exe')) -and (Test-Path (Join-Path $_ 'light.exe'))
+    } | Select-Object -First 1
+    if (-not $wixBin) {
+        throw "WiX Toolset 3.14 was not found in PATH or its standard install directories."
+    }
+    $env:PATH = "$wixBin;$env:PATH"
+}
+
 function Assert-MsiVersion {
     param([Parameter(Mandatory = $true)][string]$Value)
     $parts = $Value.Split('.') | ForEach-Object { [int]$_ }
@@ -42,6 +61,7 @@ function Assert-MsiVersion {
 }
 
 Assert-Command 'cargo'
+Enable-WixToolset
 Assert-MsiVersion $Version
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
