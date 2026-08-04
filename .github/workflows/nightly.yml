@@ -177,11 +177,9 @@ jobs:
         shell: pwsh
         run: |
           $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $base = [version](($metadata.packages | Where-Object name -eq 'rayfish' | Select-Object -First 1).version)
-          $run = [int]$env:GITHUB_RUN_NUMBER
-          if ($run -gt 65535) { throw "GITHUB_RUN_NUMBER $run exceeds MSI version range" }
-          $version = "$($base.Major).$($base.Minor).$run"
-          ./scripts/build-windows-msi.ps1 -Version $version -OutputPath "$env:RUNNER_TEMP\ray-windows-x86_64.msi"
+          $base = ($metadata.packages | Where-Object name -eq 'rayfish' | Select-Object -First 1).version
+          $identity = "${base}-nightly.$env:GITHUB_RUN_NUMBER+${{ needs.roll-tag.outputs.sha }}"
+          ./scripts/build-windows-msi.ps1 -Version $base -ReleaseIdentity $identity -Channel nightly -OutputPath "$env:RUNNER_TEMP\ray-windows-x86_64.msi"
 
       - name: Upload Windows nightly assets
         uses: softprops/action-gh-release@v2

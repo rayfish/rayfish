@@ -377,6 +377,17 @@ pub(crate) enum Command {
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
     },
+    /// Internal detached Windows MSI updater helper.
+    #[cfg(windows)]
+    #[command(name = "windows-update-helper", hide = true)]
+    WindowsUpdateHelper {
+        #[arg(long)]
+        msi: std::path::PathBuf,
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        parent_pid: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1153,6 +1164,12 @@ async fn main() -> Result<()> {
             list,
             version,
         } => cmd_update(force, check, nightly, list, version).await,
+        #[cfg(windows)]
+        Command::WindowsUpdateHelper {
+            msi,
+            identity,
+            parent_pid,
+        } => rayfish::update::run_msi_update_helper(&msi, &identity, parent_pid),
     }
 }
 

@@ -24,7 +24,7 @@ use rayfish::update::{
 };
 #[cfg(windows)]
 use rayfish::update::{
-    download_msi_to_temp, fetch_version_manifest, install_msi, installed_msi_version,
+    download_msi_to_temp, fetch_version_manifest, installed_msi_version, schedule_msi_update,
 };
 
 /// Whether a sibling temp file can be created in `dir` (i.e. it is writable by
@@ -223,17 +223,11 @@ pub(crate) async fn cmd_update(
     // semver can't tell them apart); stable gates on semver. If we can't read
     // our own executable on the nightly path, proceed rather than assume current.
     #[cfg(windows)]
+    let target_identity = fetch_version_manifest(&client, &tag, &asset).await?;
+    #[cfg(windows)]
     let up_to_date = {
         let installed = installed_msi_version()?;
-        if nightly || pinned_tag.is_some() {
-            let target = fetch_version_manifest(&client, &tag, &asset).await?;
-            installed.as_deref() == Some(target.as_str())
-        } else {
-            installed
-                .as_deref()
-                .map(|version| !version_is_newer(latest, version))
-                .unwrap_or(false)
-        }
+        installed.as_deref() == Some(target_identity.as_str())
     };
     #[cfg(not(windows))]
     let up_to_date = if pinned_tag.is_some() {
@@ -300,7 +294,20 @@ pub(crate) async fn cmd_update(
     )
     .await;
 
-    download_verify_and_install(&client, &bin_url, &expected, &asset, current, &remote_label).await
+    #[cfg(windows)]
+    let install_identity = target_identity.as_str();
+    #[cfg(not(windows))]
+    let install_identity = latest;
+    download_verify_and_install(
+        &client,
+        &bin_url,
+        &expected,
+        &asset,
+        current,
+        &remote_label,
+        install_identity,
+    )
+    .await
 }
 
 /// `ray update --list`: enumerate published releases (newest first) and exit.
@@ -347,9 +354,14 @@ async fn download_verify_and_install(
     asset: &str,
     current: &str,
     remote_label: &str,
+    target_identity: &str,
 ) -> Result<()> {
     #[cfg(windows)]
     {
+        anyhow::ensure!(
+            rayfish::windows_identity::is_current_process_elevated_admin(),
+            "Windows MSI update requires an elevated Administrator terminal; reopen PowerShell as Administrator and retry"
+        );
         let spinner = progress::spinner(format!("downloading {asset} ({remote_label})…"));
         let msi = download_msi_to_temp(client, bin_url, expected, asset).await;
         spinner.finish_and_clear();
@@ -358,24 +370,14 @@ async fn download_verify_and_install(
             .ok()
             .flatten()
             .unwrap_or_else(|| current.to_string());
-        let result = install_msi(&msi, true);
-        let _ = std::fs::remove_file(&msi);
-        result?;
-        println!("updated Windows MSI v{previous} → {remote_label}");
-        rayfish::windows_service::start()?;
-        match wait_for_daemon(DAEMON_REACHABLE_TIMEOUT).await {
-            Some(_) => {
-                println!("rayfish Windows service restarted.");
-                Ok(())
-            }
-            None => anyhow::bail!(
-                "Windows MSI installed, but the rayfish service never became reachable"
-            ),
-        }
+        schedule_msi_update(&msi, target_identity)?;
+        println!("scheduled detached Windows MSI update v{previous} → {remote_label}");
+        Ok(())
     }
 
     #[cfg(not(windows))]
     {
+        let _ = target_identity;
         // Replacing the installed binary (typically root-owned) and restarting the
         // service both need root. Decide up front so we exit with a clean sudo hint
         // before downloading.

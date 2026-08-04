@@ -671,21 +671,28 @@ fn set_owner(path: &Path, secret: bool) {
     }
 }
 
-/// Create `dir` (and parents) with restrictive perms: 0750 root:rayfish on
-/// Linux. Idempotent.
+/// Unit tests use caller-owned temporary directories and must not replace their
+/// inherited ACL with the service-only ProgramData ACL.
+#[cfg(all(windows, test))]
 fn ensure_dir(dir: &Path) -> Result<()> {
-    #[cfg(windows)]
-    {
-        crate::windows_security::ensure_protected_dir(dir)
-    }
-    #[cfg(not(windows))]
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
+}
+
+#[cfg(all(windows, not(test)))]
+fn ensure_dir(dir: &Path) -> Result<()> {
+    crate::windows_security::ensure_protected_dir(dir)
+}
+
+/// Create `dir` (and parents) with restrictive perms: 0750 root:rayfish on
+/// Unix. Idempotent.
+#[cfg(not(windows))]
+fn ensure_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     #[cfg(target_os = "linux")]
     {
         let _ = std::fs::set_permissions(dir, Permissions::from_mode(0o750));
         set_owner(dir, false);
     }
-    #[cfg(not(windows))]
     Ok(())
 }
 
@@ -842,12 +849,15 @@ pub fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
     let tmp = dir.join(format!(".{fname}.tmp.{}", std::process::id()));
     {
         use std::io::Write;
-        #[cfg(windows)]
+        #[cfg(all(windows, not(test)))]
         let mut f = if secret {
             crate::windows_security::create_protected_file(&tmp)?
         } else {
             std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?
         };
+        #[cfg(all(windows, test))]
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         #[cfg(not(windows))]
         let mut f =
             std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
@@ -879,7 +889,9 @@ fn write_atomic(path: &Path, contents: &str, secret: bool) -> Result<()> {
 /// For append-mode files (e.g. the audit log) that aren't rewritten via
 /// [`write_file`]. Best-effort.
 pub fn restrict_perms(path: &Path, secret: bool) {
-    #[cfg(windows)]
+    #[cfg(all(windows, test))]
+    let _ = (path, secret);
+    #[cfg(all(windows, not(test)))]
     if secret && let Err(error) = crate::windows_security::protect_file(path) {
         tracing::error!(path = %path.display(), %error, "failed to protect Windows config file");
     }

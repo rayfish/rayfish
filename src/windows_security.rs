@@ -58,6 +58,7 @@ impl OwnedSecurityDescriptor {
         }
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     fn dacl(&self) -> Result<*mut windows_sys::Win32::Security::ACL> {
         let mut present = 0;
         let mut defaulted = 0;
@@ -87,6 +88,7 @@ pub(crate) fn pipe_descriptor(operator_sid: Option<&str>) -> Result<OwnedSecurit
     OwnedSecurityDescriptor::from_sddl(&sddl)
 }
 
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn ensure_protected_dir(path: &Path) -> Result<()> {
     if !path.exists() {
         let parent = path.parent().context("config directory has no parent")?;
@@ -124,6 +126,7 @@ pub(crate) fn create_protected_file(path: &Path) -> Result<File> {
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn protect_file(path: &Path) -> Result<()> {
     protect_path(path, PROTECTED_FILE_SDDL)
 }
@@ -149,6 +152,7 @@ pub(crate) fn move_no_replace(from: &Path, to: &Path) -> Result<bool> {
         .with_context(|| format!("publishing protected {}", to.display()))
 }
 
+#[cfg_attr(test, allow(dead_code))]
 fn protect_path(path: &Path, sddl: &str) -> Result<()> {
     let descriptor = OwnedSecurityDescriptor::from_sddl(sddl)?;
     let result = unsafe {

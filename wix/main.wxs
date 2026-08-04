@@ -8,10 +8,17 @@
   <?ifndef ProductVersion ?>
     <?define ProductVersion = "0.0.0" ?>
   <?endif ?>
+  <?ifndef ReleaseIdentity ?>
+    <?define ReleaseIdentity = "$(var.ProductVersion)" ?>
+  <?endif ?>
+  <?ifndef ReleaseChannel ?>
+    <?define ReleaseChannel = "stable" ?>
+  <?endif ?>
   <Product Id="*" Name="Rayfish" Language="1033" Manufacturer="Rayfish"
            Version="$(var.ProductVersion)" UpgradeCode="0fef36a5-5b12-45d3-a2d2-e10d3770d6f8">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />
-    <MajorUpgrade DowngradeErrorMessage="A newer Rayfish version is already installed." />
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer Rayfish version is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Feature Id="ProductFeature" Title="Rayfish" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
@@ -40,6 +47,12 @@
       </Component>
       <Component Id="WintunLibrary" Guid="*">
         <File Id="WintunDll" Source="$(var.CargoTargetBinDir)\wintun.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="ReleaseIdentityRegistry" Guid="*" Win64="yes">
+        <RegistryValue Root="HKLM" Key="Software\Rayfish" Name="ReleaseIdentity"
+                       Type="string" Value="$(var.ReleaseIdentity)" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="Software\Rayfish" Name="Channel"
+                       Type="string" Value="$(var.ReleaseChannel)" />
       </Component>
     </ComponentGroup>
   </Fragment>

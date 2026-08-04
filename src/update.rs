@@ -67,8 +67,8 @@ pub fn parse_version_manifest(text: &str) -> Result<String> {
     Ok(version.to_owned())
 }
 
-/// Parse the single DisplayVersion line returned by the Windows uninstall
-/// registry query. Multiple Rayfish entries are ambiguous and fail closed.
+/// Parse the single release-identity line returned by the Windows registry
+/// query. Multiple Rayfish entries are ambiguous and fail closed.
 pub fn parse_installed_version(output: &str) -> Result<Option<String>> {
     let versions: Vec<_> = output
         .lines()
@@ -240,7 +240,7 @@ pub fn installed_msi_version() -> Result<Option<String>> {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "@(Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' | Where-Object { $_.DisplayName -eq 'Rayfish' } | Select-Object -ExpandProperty DisplayVersion)",
+            "$identity=(Get-ItemProperty -LiteralPath 'HKLM:\\Software\\Rayfish' -Name ReleaseIdentity -ErrorAction SilentlyContinue).ReleaseIdentity; if ($identity) { $identity } else { @(Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' | Where-Object { $_.DisplayName -eq 'Rayfish' } | Select-Object -ExpandProperty DisplayVersion) }",
         ])
         .output()
         .context("query installed Rayfish MSI version")?;
@@ -286,51 +286,116 @@ pub async fn download_msi_to_temp(
 }
 
 #[cfg(windows)]
-pub fn msi_install_args(path: &Path) -> [String; 4] {
+pub fn msi_install_args(path: &Path, log: &Path) -> [String; 6] {
     [
         "/i".to_string(),
         path.to_string_lossy().into_owned(),
         "/qn".to_string(),
         "/norestart".to_string(),
+        "/L*v".to_string(),
+        log.to_string_lossy().into_owned(),
     ]
 }
 
 #[cfg(windows)]
-fn schedule_msi_temp_cleanup(path: &Path, installer_pid: u32) -> Result<()> {
-    let escaped_path = path.to_string_lossy().replace('\'', "''");
-    let script = format!(
-        "Wait-Process -Id {installer_pid} -Timeout 900 -ErrorAction SilentlyContinue; Remove-Item -LiteralPath '{escaped_path}' -Force -ErrorAction SilentlyContinue"
-    );
-    Command::new("powershell.exe")
-        .creation_flags(0x0800_0000)
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .spawn()
-        .context("schedule MSI temp cleanup")?;
-    Ok(())
+fn system_temp_dir() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| root.join("Temp"))
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 #[cfg(windows)]
 pub fn msi_failure_message(code: Option<i32>) -> String {
-    format!(
-        "Windows Installer failed with exit code {} (run elevated and retry)",
-        code.unwrap_or(-1)
-    )
+    match code {
+        Some(1603) => "Windows Installer failed with exit code 1603; confirm this helper is elevated and inspect the retained MSI log for the failing custom action or locked file".to_string(),
+        Some(1638) => "Windows Installer failed with exit code 1638; another Rayfish version is registered and the MSI upgrade ordering or UpgradeCode is incompatible".to_string(),
+        Some(code) => format!("Windows Installer failed with exit code {code}; inspect the retained MSI log"),
+        None => "Windows Installer terminated without an exit code; inspect the retained MSI log".to_string(),
+    }
 }
 
 #[cfg(windows)]
-pub fn install_msi(path: &Path, wait: bool) -> Result<()> {
+fn install_msi(path: &Path, log: &Path) -> Result<()> {
     let mut command = Command::new("msiexec.exe");
-    let args = msi_install_args(path);
+    let args = msi_install_args(path, log);
     command.creation_flags(0x0800_0000).args(args);
-    if wait {
-        let status = command.status().context("launch Windows Installer")?;
-        if !status.success() {
-            anyhow::bail!("{}", msi_failure_message(status.code()));
-        }
-    } else {
-        let installer = command.spawn().context("schedule Windows Installer")?;
-        let _ = schedule_msi_temp_cleanup(path, installer.id());
+    let status = command.status().context("launch Windows Installer")?;
+    match status.code() {
+        Some(0 | 1641 | 3010) => Ok(()),
+        code => anyhow::bail!("{}; log: {}", msi_failure_message(code), log.display()),
     }
+}
+
+#[cfg(windows)]
+fn wait_for_parent(parent_pid: u32) -> Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_FAILED, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+
+    let handle = unsafe { OpenProcess(0x0010_0000, 0, parent_pid) };
+    if handle.is_null() {
+        return Ok(());
+    }
+    let wait = unsafe { WaitForSingleObject(handle, 120_000) };
+    unsafe { CloseHandle(handle) };
+    anyhow::ensure!(
+        wait != WAIT_FAILED,
+        "wait for updater parent process failed"
+    );
+    anyhow::ensure!(
+        wait != WAIT_TIMEOUT,
+        "timed out waiting for updater parent process to exit"
+    );
+    Ok(())
+}
+
+/// Copy this verified binary to the system temp directory and detach it. Both
+/// manual updates and daemon auto-updates use this exact scheduling path.
+#[cfg(windows)]
+pub fn schedule_msi_update(path: &Path, release_identity: &str) -> Result<PathBuf> {
+    let helper_dir = system_temp_dir();
+    std::fs::create_dir_all(&helper_dir)
+        .with_context(|| format!("create system temp directory {}", helper_dir.display()))?;
+    let helper = helper_dir.join(format!("rayfish-updater-{}.exe", std::process::id()));
+    std::fs::copy(std::env::current_exe()?, &helper)
+        .with_context(|| format!("copy updater helper to {}", helper.display()))?;
+    Command::new(&helper)
+        .creation_flags(0x0800_0000 | 0x0000_0008 | 0x0000_0200)
+        .args([
+            "windows-update-helper",
+            "--msi",
+            &path.to_string_lossy(),
+            "--identity",
+            release_identity,
+            "--parent-pid",
+            &std::process::id().to_string(),
+        ])
+        .spawn()
+        .context("launch detached Windows updater helper")?;
+    Ok(helper)
+}
+
+/// Detached helper entry point. It waits for the caller/daemon to release the
+/// installed executable, runs MSI, restarts the service, then verifies identity.
+#[cfg(windows)]
+pub fn run_msi_update_helper(msi: &Path, release_identity: &str, parent_pid: u32) -> Result<()> {
+    anyhow::ensure!(
+        crate::windows_identity::is_current_process_elevated_admin(),
+        "Windows update helper requires an elevated Administrator token"
+    );
+    wait_for_parent(parent_pid)?;
+    let log = system_temp_dir().join(format!("rayfish-msi-update-{parent_pid}.log"));
+    install_msi(msi, &log)?;
+    crate::windows_service::start().context("restart rayfish Windows service after MSI update")?;
+    let installed =
+        installed_msi_version()?.context("Rayfish release identity missing after MSI update")?;
+    anyhow::ensure!(
+        installed == release_identity,
+        "installed Rayfish identity {installed:?} does not match expected {release_identity:?}; log: {}",
+        log.display()
+    );
+    let _ = std::fs::remove_file(msi);
+    let _ = std::fs::remove_file(log);
     Ok(())
 }
 
@@ -493,6 +558,10 @@ mod tests {
         );
         assert!(release_asset_name("windows", "aarch64").is_err());
         assert_eq!(parse_version_manifest("0.2.17\n").unwrap(), "0.2.17");
+        assert_eq!(
+            parse_version_manifest("0.2.17-nightly.42+abc12345\n").unwrap(),
+            "0.2.17-nightly.42+abc12345"
+        );
         assert!(parse_version_manifest("nightly").is_err());
     }
 
@@ -511,23 +580,27 @@ mod tests {
     #[test]
     fn msi_install_args_are_quiet_and_no_restart() {
         assert_eq!(
-            msi_install_args(Path::new(r"C:\Temp\rayfish.msi")),
+            msi_install_args(
+                Path::new(r"C:\Temp\rayfish.msi"),
+                Path::new(r"C:\Temp\rayfish.log")
+            ),
             [
                 "/i".to_string(),
                 r"C:\Temp\rayfish.msi".to_string(),
                 "/qn".to_string(),
-                "/norestart".to_string()
+                "/norestart".to_string(),
+                "/L*v".to_string(),
+                r"C:\Temp\rayfish.log".to_string()
             ]
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn msi_failure_message_preserves_exit_code_and_uac_hint() {
-        assert_eq!(
-            msi_failure_message(Some(1603)),
-            "Windows Installer failed with exit code 1603 (run elevated and retry)"
-        );
-        assert!(msi_failure_message(None).contains("exit code -1"));
+    fn msi_failure_message_is_actionable_for_common_upgrade_codes() {
+        assert!(msi_failure_message(Some(1603)).contains("elevated"));
+        assert!(msi_failure_message(Some(1603)).contains("MSI log"));
+        assert!(msi_failure_message(Some(1638)).contains("upgrade ordering"));
+        assert!(msi_failure_message(None).contains("without an exit code"));
     }
 }

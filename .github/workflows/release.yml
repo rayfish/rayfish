@@ -195,16 +195,8 @@ jobs:
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
         run: |
           $tag = $env:RELEASE_TAG.TrimStart('v')
-          if ($tag -match '^(\d+)\.(\d+)\.(\d+)$') {
-            $version = $tag
-          }
-          else {
-            $base = [version](($tag -split '-', 2)[0])
-            $run = [int]$env:GITHUB_RUN_NUMBER
-            if ($run -gt 65535) { throw "GITHUB_RUN_NUMBER $run exceeds MSI version range" }
-            $version = "$($base.Major).$($base.Minor).$run"
-          }
-          ./scripts/build-windows-msi.ps1 -Version $version -OutputPath "$env:RUNNER_TEMP\ray-windows-x86_64.msi"
+          $version = ($tag -split '-', 2)[0]
+          ./scripts/build-windows-msi.ps1 -Version $version -ReleaseIdentity $tag -Channel stable -OutputPath "$env:RUNNER_TEMP\ray-windows-x86_64.msi"
 
       - name: Upload Windows release assets
         uses: softprops/action-gh-release@v2

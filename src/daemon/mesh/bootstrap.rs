@@ -963,7 +963,7 @@ fn spawn_auto_update(token: CancellationToken) -> tokio::task::JoinHandle<()> {
             _ = tokio::time::sleep(first) => {}
         }
         loop {
-            if let Err(e) = auto_update_once().await {
+            if let Err(e) = auto_update_once(&token).await {
                 tracing::warn!(error = %e, "auto-update check failed");
             }
             let next = AUTO_UPDATE_INTERVAL + Duration::from_secs(rand::random::<u64>() % 300);
@@ -980,7 +980,7 @@ fn spawn_auto_update(token: CancellationToken) -> tokio::task::JoinHandle<()> {
 /// needed doing (or the swap+restart was scheduled, the daemon is torn down and
 /// relaunched onto the new binary shortly after).
 #[cfg(feature = "desktop")]
-async fn auto_update_once() -> Result<()> {
+async fn auto_update_once(shutdown: &CancellationToken) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     let asset = crate::update::release_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
     let client = crate::update::build_http_client()?;
@@ -1024,8 +1024,10 @@ async fn auto_update_once() -> Result<()> {
     #[cfg(windows)]
     {
         let msi = crate::update::download_msi_to_temp(&client, &bin_url, &expected, &asset).await?;
-        crate::update::install_msi(&msi, false)?;
-        tracing::info!(target = %tag, path = %msi.display(), "auto-update: Windows MSI installation scheduled");
+        let identity = crate::update::fetch_version_manifest(&client, &tag, &asset).await?;
+        crate::update::schedule_msi_update(&msi, &identity)?;
+        tracing::info!(target = %identity, path = %msi.display(), "auto-update: detached Windows MSI installation scheduled");
+        shutdown.cancel();
         Ok(())
     }
     #[cfg(not(windows))]

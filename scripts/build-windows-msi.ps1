@@ -5,6 +5,14 @@ param(
     [string]$Version,
 
     [Parameter(Mandatory = $false)]
+    [ValidatePattern('^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$')]
+    [string]$ReleaseIdentity = $Version,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('stable', 'nightly')]
+    [string]$Channel = 'stable',
+
+    [Parameter(Mandatory = $false)]
     [ValidateSet('x86_64-pc-windows-msvc')]
     [string]$Target = 'x86_64-pc-windows-msvc',
 
@@ -28,8 +36,8 @@ function Assert-Command {
 function Assert-MsiVersion {
     param([Parameter(Mandatory = $true)][string]$Value)
     $parts = $Value.Split('.') | ForEach-Object { [int]$_ }
-    if ($parts.Count -ne 3 -or ($parts | Where-Object { $_ -lt 0 -or $_ -gt 65535 })) {
-        throw "MSI ProductVersion '$Value' must contain three numeric components in 0..65535."
+    if ($parts.Count -ne 3 -or $parts[0] -gt 255 -or $parts[1] -gt 255 -or $parts[2] -gt 65535) {
+        throw "MSI ProductVersion '$Value' must be major.minor.build with major/minor in 0..255 and build in 0..65535."
     }
 }
 
@@ -84,7 +92,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $targetBinDir 'ray.exe') -Destination (Join-Path $msiBinDir 'ray.exe') -Force
     Copy-Item -LiteralPath $dll.FullName -Destination $stagedDll -Force
 
-    Write-Host "Building MSI version $Version..."
+    Write-Host "Building MSI ProductVersion $Version ($Channel identity $ReleaseIdentity)..."
     Push-Location $repoRoot
     try {
         $wixArgs = @(
@@ -93,6 +101,8 @@ try {
             '--target-bin-dir', $msiBinDir,
             '--install-version', $Version,
             '--compiler-arg', "-dProductVersion=$Version",
+            '--compiler-arg', "-dReleaseIdentity=$ReleaseIdentity",
+            '--compiler-arg', "-dReleaseChannel=$Channel",
             '--output', $output
         )
         & cargo @wixArgs
@@ -110,7 +120,7 @@ try {
     $msiHash = (Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash.ToLowerInvariant()
     $msiName = Split-Path -Leaf $output
     Set-Content -LiteralPath "$output.sha256" -Value "$msiHash  $msiName" -Encoding ascii
-    Set-Content -LiteralPath "$output.version" -Value $Version -Encoding ascii
+    Set-Content -LiteralPath "$output.version" -Value $ReleaseIdentity -Encoding ascii
     Write-Output "MSI: $output"
     Write-Output "SHA256: $output.sha256"
     Write-Output "VERSION: $output.version"
