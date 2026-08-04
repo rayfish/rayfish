@@ -15,7 +15,7 @@ use windows_sys::Win32::Foundation::{
     GetLastError, INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
     SetNamedSecurityInfoW,
 };
@@ -30,8 +30,55 @@ use windows_sys::Win32::Storage::FileSystem::{
     OPEN_ALWAYS, OPEN_EXISTING,
 };
 
-pub(crate) const PROTECTED_FILE_SDDL: &str = "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
-pub(crate) const PROTECTED_DIR_SDDL: &str = "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+const PROTECTED_FILE_DACL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
+const PROTECTED_DIR_DACL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrustedOwner {
+    LocalSystem,
+    Administrators,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerAction {
+    Keep(TrustedOwner),
+    Set(TrustedOwner),
+}
+
+fn owner_action(
+    existing: Option<TrustedOwner>,
+    current: Option<TrustedOwner>,
+) -> Result<OwnerAction> {
+    if let Some(owner) = existing {
+        return Ok(OwnerAction::Keep(owner));
+    }
+    current.map(OwnerAction::Set).context(
+        "config owner is untrusted and the current process is not LocalSystem or elevated Administrator",
+    )
+}
+
+fn protected_sddl(owner: TrustedOwner, directory: bool) -> String {
+    let owner = match owner {
+        TrustedOwner::LocalSystem => "SY",
+        TrustedOwner::Administrators => "BA",
+    };
+    let dacl = if directory {
+        PROTECTED_DIR_DACL
+    } else {
+        PROTECTED_FILE_DACL
+    };
+    format!("O:{owner}{dacl}")
+}
+
+fn current_trusted_owner() -> Option<TrustedOwner> {
+    if crate::windows_identity::current_user_sid().as_deref() == Some("S-1-5-18") {
+        Some(TrustedOwner::LocalSystem)
+    } else if crate::windows_identity::is_current_process_elevated_admin() {
+        Some(TrustedOwner::Administrators)
+    } else {
+        None
+    }
+}
 
 pub(crate) struct OwnedSecurityDescriptor(PSECURITY_DESCRIPTOR);
 
@@ -110,7 +157,10 @@ pub(crate) fn ensure_protected_dir(path: &Path) -> Result<()> {
         let parent = path.parent().context("config directory has no parent")?;
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
-        let mut descriptor = OwnedSecurityDescriptor::from_sddl(PROTECTED_DIR_SDDL)?;
+        let owner = current_trusted_owner().context(
+            "creating the protected config directory requires LocalSystem or elevated Administrator",
+        )?;
+        let mut descriptor = OwnedSecurityDescriptor::from_sddl(&protected_sddl(owner, true))?;
         let attrs = descriptor.attributes();
         let ok = unsafe { CreateDirectoryW(wide(path.as_os_str()).as_ptr(), &attrs) };
         if ok == 0 && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
@@ -118,13 +168,16 @@ pub(crate) fn ensure_protected_dir(path: &Path) -> Result<()> {
                 .with_context(|| format!("creating protected {}", path.display()));
         }
     }
-    protect_path(path, PROTECTED_DIR_SDDL)
+    protect_path(path, true)
 }
 
 /// Atomically creates a new protected regular file without following a reparse
 /// point. Existing names always fail; callers generate unguessable names.
 pub(crate) fn create_protected_new_file(path: &Path) -> Result<File> {
-    let mut descriptor = OwnedSecurityDescriptor::from_sddl(PROTECTED_FILE_SDDL)?;
+    let owner = current_trusted_owner().context(
+        "creating protected config files requires LocalSystem or elevated Administrator",
+    )?;
+    let mut descriptor = OwnedSecurityDescriptor::from_sddl(&protected_sddl(owner, false))?;
     let attrs = descriptor.attributes();
     let handle = unsafe {
         CreateFileW(
@@ -176,7 +229,9 @@ pub(crate) struct OperatorFileLock {
 pub(crate) fn lock_operator_file(path: &Path) -> Result<OperatorFileLock> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let mut descriptor = OwnedSecurityDescriptor::from_sddl(PROTECTED_FILE_SDDL)?;
+        let owner = current_trusted_owner()
+            .context("creating the operator lock requires LocalSystem or elevated Administrator")?;
+        let mut descriptor = OwnedSecurityDescriptor::from_sddl(&protected_sddl(owner, false))?;
         let attrs = descriptor.attributes();
         let handle = unsafe {
             CreateFileW(
@@ -218,7 +273,7 @@ fn verify_open_protected_file(file: &File, path: &Path) -> Result<()> {
 
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn protect_file(path: &Path) -> Result<()> {
-    protect_path(path, PROTECTED_FILE_SDDL)
+    protect_path(path, false)
 }
 
 /// Atomically publish a complete sibling temp file without replacing an
@@ -243,27 +298,33 @@ pub(crate) fn move_no_replace(from: &Path, to: &Path) -> Result<bool> {
 }
 
 #[cfg_attr(test, allow(dead_code))]
-fn protect_path(path: &Path, sddl: &str) -> Result<()> {
+fn protect_path(path: &Path, directory: bool) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("inspect {} before ACL repair", path.display()))?;
     validate_config_file_attributes(metadata.file_attributes(), path)?;
-    let descriptor = OwnedSecurityDescriptor::from_sddl(sddl)?;
-    let owner_result = unsafe {
-        SetNamedSecurityInfoW(
-            wide(path.as_os_str()).as_ptr() as *mut u16,
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            descriptor.owner()?,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
+    let action = owner_action(path_trusted_owner(path)?, current_trusted_owner())?;
+    let owner = match action {
+        OwnerAction::Keep(owner) | OwnerAction::Set(owner) => owner,
     };
-    anyhow::ensure!(
-        owner_result == 0,
-        "failed to set trusted owner on {}: {owner_result}",
-        path.display()
-    );
+    let descriptor = OwnedSecurityDescriptor::from_sddl(&protected_sddl(owner, directory))?;
+    if matches!(action, OwnerAction::Set(_)) {
+        let owner_result = unsafe {
+            SetNamedSecurityInfoW(
+                wide(path.as_os_str()).as_ptr() as *mut u16,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                descriptor.owner()?,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        anyhow::ensure!(
+            owner_result == 0,
+            "failed to set trusted owner on {}: {owner_result}",
+            path.display()
+        );
+    }
     let dacl_result = unsafe {
         SetNamedSecurityInfoW(
             wide(path.as_os_str()).as_ptr() as *mut u16,
@@ -280,7 +341,58 @@ fn protect_path(path: &Path, sddl: &str) -> Result<()> {
         "failed to protect {}: {dacl_result}",
         path.display()
     );
-    verify_path_security(path, sddl.contains("OICI"))
+    verify_path_security(path, directory)
+}
+
+fn path_trusted_owner(path: &Path) -> Result<Option<TrustedOwner>> {
+    let mut owner = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    let result = unsafe {
+        GetNamedSecurityInfoW(
+            wide(path.as_os_str()).as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    anyhow::ensure!(
+        result == 0 && !descriptor.is_null() && !owner.is_null(),
+        "failed to read owner of {}: {result}",
+        path.display()
+    );
+    let mut text = std::ptr::null_mut();
+    let converted = unsafe { ConvertSidToStringSidW(owner, &mut text) };
+    let parsed = (|| -> Result<Option<TrustedOwner>> {
+        anyhow::ensure!(
+            converted != 0 && !text.is_null(),
+            "failed to render config owner SID"
+        );
+        let mut len = 0;
+        unsafe {
+            while *text.add(len) != 0 {
+                len += 1;
+            }
+        }
+        let sid = OsString::from_wide(unsafe { std::slice::from_raw_parts(text, len) })
+            .to_string_lossy()
+            .into_owned();
+        Ok(match sid.as_str() {
+            "S-1-5-18" => Some(TrustedOwner::LocalSystem),
+            "S-1-5-32-544" => Some(TrustedOwner::Administrators),
+            _ => None,
+        })
+    })();
+    unsafe {
+        if !text.is_null() {
+            LocalFree(text.cast());
+        }
+        LocalFree(descriptor.cast());
+    }
+    parsed
 }
 
 fn verify_path_security(path: &Path, directory: bool) -> Result<()> {
@@ -323,8 +435,8 @@ fn verify_path_security(path: &Path, directory: bool) -> Result<()> {
         .to_string_lossy()
         .into_owned();
         anyhow::ensure!(
-            actual.contains("O:SY"),
-            "config owner is not LocalSystem: {actual}"
+            actual.contains("O:SY") || actual.contains("O:BA"),
+            "config owner is not trusted: {actual}"
         );
         anyhow::ensure!(
             actual.contains("D:P"),
@@ -370,13 +482,37 @@ mod tests {
 
     #[test]
     fn descriptors_are_protected_and_exclude_regular_users() {
-        for sddl in [PROTECTED_FILE_SDDL, PROTECTED_DIR_SDDL] {
-            assert!(sddl.starts_with("O:SYD:P"));
+        for sddl in [
+            protected_sddl(TrustedOwner::LocalSystem, false),
+            protected_sddl(TrustedOwner::Administrators, true),
+        ] {
+            assert!(sddl.starts_with("O:SYD:P") || sddl.starts_with("O:BAD:P"));
             assert!(sddl.contains(";;;SY)"));
             assert!(sddl.contains(";;;BA)"));
             assert!(!sddl.contains(";;;BU)"));
             assert!(!sddl.contains(";;;WD)"));
         }
+    }
+
+    #[test]
+    fn trusted_owner_decision_matrix() {
+        assert_eq!(
+            owner_action(Some(TrustedOwner::LocalSystem), None).unwrap(),
+            OwnerAction::Keep(TrustedOwner::LocalSystem)
+        );
+        assert_eq!(
+            owner_action(Some(TrustedOwner::Administrators), None).unwrap(),
+            OwnerAction::Keep(TrustedOwner::Administrators)
+        );
+        assert_eq!(
+            owner_action(None, Some(TrustedOwner::LocalSystem)).unwrap(),
+            OwnerAction::Set(TrustedOwner::LocalSystem)
+        );
+        assert_eq!(
+            owner_action(None, Some(TrustedOwner::Administrators)).unwrap(),
+            OwnerAction::Set(TrustedOwner::Administrators)
+        );
+        assert!(owner_action(None, None).is_err());
     }
 
     #[test]
