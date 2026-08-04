@@ -7,9 +7,88 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::task::JoinHandle;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
+};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct KillOnCloseJob(HANDLE);
+
+// Kernel handles may be transferred between threads; this wrapper owns the
+// handle and closes it exactly once.
+unsafe impl Send for KillOnCloseJob {}
+
+impl KillOnCloseJob {
+    fn new() -> Result<Self> {
+        // SAFETY: null security/name creates an unnamed job; the returned handle
+        // is owned by this wrapper and closed in Drop.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error()).context("create Windows Job Object");
+        }
+        // SAFETY: the zeroed structure is a valid baseline and the API reads
+        // exactly the size supplied below.
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        };
+        if configured == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(error).context("configure kill-on-close Windows Job Object");
+        }
+        Ok(Self(handle))
+    }
+
+    fn assign(&self, child: &tokio::process::Child) -> Result<()> {
+        let process = child
+            .raw_handle()
+            .context("Windows child has no process handle")? as HANDLE;
+        // SAFETY: both handles are live for this call and ownership is retained.
+        if unsafe { AssignProcessToJobObject(self.0, process) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("assign Windows process to kill-on-close Job Object");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for KillOnCloseJob {
+    fn drop(&mut self) {
+        // Closing the last job handle terminates the full assigned process tree.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+async fn bounded_reader_join(mut task: JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
+    match tokio::time::timeout(CLEANUP_TIMEOUT, &mut task).await {
+        Ok(result) => result
+            .context("join Windows process pipe reader")?
+            .context("read Windows process pipe"),
+        Err(_) => {
+            task.abort();
+            let _ = tokio::time::timeout(CLEANUP_TIMEOUT, task).await;
+            anyhow::bail!("Windows process pipe reader did not close after {CLEANUP_TIMEOUT:?}")
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct WindowsProcessOutput {
@@ -56,9 +135,14 @@ impl WindowsProcessRunner {
             .stderr(Stdio::piped())
             .args(args);
 
+        let job = KillOnCloseJob::new()?;
         let mut child = command
             .spawn()
             .with_context(|| format!("spawn hidden Windows process {program:?}"))?;
+        if let Err(error) = job.assign(&child) {
+            let _ = child.start_kill();
+            return Err(error);
+        }
         let mut stdout = child.stdout.take().context("capture child stdout")?;
         let mut stderr = child.stderr.take().context("capture child stderr")?;
         let stdout_task = tokio::spawn(async move {
@@ -71,30 +155,37 @@ impl WindowsProcessRunner {
         });
 
         let status = match tokio::time::timeout(self.timeout, child.wait()).await {
-            Ok(status) => status.context("wait for Windows process")?,
+            Ok(status) => {
+                let status = status.context("wait for Windows process");
+                drop(job);
+                status?
+            }
             Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                drop(job);
+                if tokio::time::timeout(CLEANUP_TIMEOUT, child.wait())
+                    .await
+                    .is_err()
+                {
+                    let _ = tokio::time::timeout(CLEANUP_TIMEOUT, child.kill()).await;
+                }
+                let _ = tokio::join!(
+                    bounded_reader_join(stdout_task),
+                    bounded_reader_join(stderr_task)
+                );
                 anyhow::bail!(
                     "Windows process {program:?} timed out after {:?}",
                     self.timeout
                 );
             }
         };
-        let stdout = stdout_task
-            .await
-            .context("join child stdout reader")?
-            .context("read child stdout")?;
-        let stderr = stderr_task
-            .await
-            .context("join child stderr reader")?
-            .context("read child stderr")?;
+        let (stdout, stderr) = tokio::join!(
+            bounded_reader_join(stdout_task),
+            bounded_reader_join(stderr_task)
+        );
         Ok(WindowsProcessOutput {
             status,
-            stdout,
-            stderr,
+            stdout: stdout?,
+            stderr: stderr?,
         })
     }
 
@@ -126,6 +217,10 @@ impl WindowsProcessRunner {
 mod tests {
     use super::WindowsProcessRunner;
     use std::time::Duration;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
     #[tokio::test]
     async fn zombie_runner_covers_success_failure_and_timeout() {
@@ -148,5 +243,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(timeout.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn ddd_job_close_kills_descendants_and_releases_inherited_pipes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
+        let quoted_path = pid_file.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "$child=Start-Process powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -WindowStyle Hidden -PassThru; Set-Content -LiteralPath '{quoted_path}' -Value $child.Id; Start-Sleep -Seconds 30"
+        );
+        let error = WindowsProcessRunner::with_timeout(Duration::from_secs(3))
+            .powershell(&script, "spawn descendant tree")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("spawn descendant tree"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("timed out"))
+        );
+
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("parent must publish descendant pid before timeout")
+            .trim()
+            .parse()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // SAFETY: the handle is query-only, checked for null, and closed once.
+        let alive = unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                false
+            } else {
+                let mut exit_code = 0;
+                let queried = GetExitCodeProcess(process, &mut exit_code) != 0;
+                CloseHandle(process);
+                queried && exit_code == 259 // STILL_ACTIVE
+            }
+        };
+        assert!(!alive, "kill-on-close job leaked descendant pid {pid}");
     }
 }

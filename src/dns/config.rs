@@ -293,15 +293,88 @@ fn ps_quote(value: &str) -> String {
 }
 
 #[cfg(windows)]
-fn windows_dns_reconcile_script(rayfish_domains: &[String]) -> String {
-    let desired = rayfish_domains
-        .iter()
-        .map(|domain| format!("'{}'", ps_quote(domain)))
-        .collect::<Vec<_>>()
-        .join(",");
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct WindowsNrptRuleSnapshot {
+    display_name: String,
+    namespace: Vec<String>,
+    name_servers: Vec<String>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct WindowsDnsSnapshot {
+    nrpt_rules: Vec<WindowsNrptRuleSnapshot>,
+    suffix_search_list: Vec<String>,
+    managed_suffixes: Option<Vec<String>>,
+}
+
+#[cfg(windows)]
+fn ps_array(values: &[String]) -> String {
     format!(
-        "$statePath='HKLM:\\SOFTWARE\\Rayfish'; $desired=@({desired}); $before=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }} | Select-Object DisplayName,Namespace,NameServers); $current=@((Get-DnsClientGlobalSetting).SuffixSearchList); $previousManaged=@(); $previousMarkerExists=$false; if (Test-Path $statePath) {{ $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue; if ($null -ne $marker) {{ $previousMarkerExists=$true; $previousManaged=@($marker.ManagedDnsSuffixes) }} }}; $foreign=@($current | Where-Object {{ $previousManaged -notcontains $_ }}); $next=@($foreign + $desired | Select-Object -Unique); try {{ $owned=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }}); foreach ($rule in $owned) {{ $domain=$rule.DisplayName.Substring(8); if ($desired -notcontains $domain) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }} }}; foreach ($domain in $desired) {{ $display='rayfish:'+$domain; $present=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -eq $display }}); if ($present.Count -eq 0) {{ Add-DnsClientNrptRule -Namespace ('.'+$domain) -NameServers '{RESOLVER_IP}' -DisplayName $display -ErrorAction Stop }} }}; Set-DnsClientGlobalSetting -SuffixSearchList $next -ErrorAction Stop; New-Item -Path $statePath -Force -ErrorAction Stop | Out-Null; if ($desired.Count -eq 0) {{ Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }} else {{ Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -Value ([string[]]$desired) -ErrorAction Stop }} }} catch {{ Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }} | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue; foreach ($rule in $before) {{ Add-DnsClientNrptRule -Namespace $rule.Namespace -NameServers $rule.NameServers -DisplayName $rule.DisplayName -ErrorAction SilentlyContinue }}; Set-DnsClientGlobalSetting -SuffixSearchList $current -ErrorAction SilentlyContinue; if ($previousMarkerExists) {{ New-Item -Path $statePath -Force -ErrorAction SilentlyContinue | Out-Null; Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -Value ([string[]]$previousManaged) -ErrorAction SilentlyContinue }} else {{ Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }}; throw }}"
+        "@({})",
+        values
+            .iter()
+            .map(|value| format!("'{}'", ps_quote(value)))
+            .collect::<Vec<_>>()
+            .join(",")
     )
+}
+
+#[cfg(windows)]
+fn windows_dns_snapshot_script() -> &'static str {
+    "$statePath='HKLM:\\SOFTWARE\\Rayfish'; $marker=$null; if (Test-Path $statePath) { $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }; [pscustomobject]@{ nrpt_rules=@(Get-DnsClientNrptRule | Where-Object { $_.DisplayName -like 'rayfish:*' } | ForEach-Object { [pscustomobject]@{ display_name=$_.DisplayName; namespace=@($_.Namespace); name_servers=@($_.NameServers) } }); suffix_search_list=@((Get-DnsClientGlobalSetting).SuffixSearchList); managed_suffixes=if ($null -eq $marker) { $null } else { @($marker.ManagedDnsSuffixes) } } | ConvertTo-Json -Compress -Depth 5"
+}
+
+#[cfg(windows)]
+fn windows_dns_reconcile_script(rayfish_domains: &[String]) -> String {
+    let desired = ps_array(rayfish_domains);
+    format!(
+        "$statePath='HKLM:\\SOFTWARE\\Rayfish'; $desired={desired}; $current=@((Get-DnsClientGlobalSetting).SuffixSearchList); $marker=$null; if (Test-Path $statePath) {{ $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }}; $previousManaged=if ($null -eq $marker) {{ @() }} else {{ @($marker.ManagedDnsSuffixes) }}; $foreign=@($current | Where-Object {{ $previousManaged -notcontains $_ }}); $next=@($foreign + $desired | Select-Object -Unique); $owned=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }}); foreach ($rule in $owned) {{ $domain=$rule.DisplayName.Substring(8); if ($desired -notcontains $domain) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }} }}; foreach ($domain in $desired) {{ $display='rayfish:'+$domain; $namespace='.'+$domain; $matches=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -eq $display }}); $valid=@($matches | Where-Object {{ @($_.Namespace).Count -eq 1 -and @($_.Namespace)[0] -eq $namespace -and @($_.NameServers).Count -eq 1 -and @($_.NameServers)[0] -eq '{RESOLVER_IP}' }}); if ($matches.Count -ne 1 -or $valid.Count -ne 1) {{ foreach ($rule in $matches) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }}; Add-DnsClientNrptRule -Namespace $namespace -NameServers '{RESOLVER_IP}' -DisplayName $display -ErrorAction Stop }} }}; Set-DnsClientGlobalSetting -SuffixSearchList $next -ErrorAction Stop; New-Item -Path $statePath -Force -ErrorAction Stop | Out-Null; if ($desired.Count -eq 0) {{ Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }} else {{ Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -Value ([string[]]$desired) -ErrorAction Stop }}"
+    )
+}
+
+#[cfg(windows)]
+fn windows_dns_rollback_script(snapshot: &WindowsDnsSnapshot) -> String {
+    let restore_rules = snapshot
+        .nrpt_rules
+        .iter()
+        .map(|rule| {
+            format!(
+                "Add-DnsClientNrptRule -Namespace {} -NameServers {} -DisplayName '{}' -ErrorAction Stop",
+                ps_array(&rule.namespace),
+                ps_array(&rule.name_servers),
+                ps_quote(&rule.display_name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let marker = match &snapshot.managed_suffixes {
+        Some(values) => format!(
+            "New-Item -Path $statePath -Force -ErrorAction Stop | Out-Null; Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -Value ([string[]]{}) -ErrorAction Stop",
+            ps_array(values)
+        ),
+        None => "Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue".to_owned(),
+    };
+    format!(
+        "$statePath='HKLM:\\SOFTWARE\\Rayfish'; Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }} | Remove-DnsClientNrptRule -Force -ErrorAction Stop; {restore_rules}; Set-DnsClientGlobalSetting -SuffixSearchList {} -ErrorAction Stop; {marker}",
+        ps_array(&snapshot.suffix_search_list)
+    )
+}
+
+#[cfg(windows)]
+async fn rollback_on_error(
+    mutation: Result<()>,
+    rollback: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    match mutation {
+        Ok(()) => Ok(()),
+        Err(error) => match rollback.await {
+            Ok(()) => Err(error.context("Windows DNS mutation failed; snapshot restored")),
+            Err(rollback_error) => anyhow::bail!(
+                "Windows DNS mutation failed: {error:#}; snapshot rollback failed: {rollback_error:#}"
+            ),
+        },
+    }
 }
 
 #[cfg(windows)]
@@ -360,10 +433,15 @@ async fn set_search_domains_windows(
     _network_names: &[String],
     _tun_name: &str,
 ) -> Result<()> {
-    // Reconcile only display-name-marked rules. The PowerShell transaction
-    // snapshots and restores those rules on partial failure; foreign NRPT state
-    // is never selected for mutation.
-    powershell_status(&windows_dns_reconcile_script(rayfish_domains)).await
+    let snapshot_text = powershell_text(windows_dns_snapshot_script()).await?;
+    let snapshot: WindowsDnsSnapshot =
+        serde_json::from_str(&snapshot_text).context("parse Windows DNS snapshot")?;
+    let mutation = powershell_status(&windows_dns_reconcile_script(rayfish_domains)).await;
+    rollback_on_error(
+        mutation,
+        powershell_status(&windows_dns_rollback_script(&snapshot)),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1768,30 +1846,65 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn zombie_windows_dns_reconcile_is_scoped_transactional_and_quotes_boundaries() {
-        use super::{ps_quote, windows_dns_reconcile_script};
+        use super::{
+            WindowsDnsSnapshot, WindowsNrptRuleSnapshot, ps_quote, windows_dns_reconcile_script,
+            windows_dns_rollback_script, windows_dns_snapshot_script,
+        };
 
         assert_eq!(ps_quote(""), "");
         assert_eq!(ps_quote("O'Brien"), "O''Brien");
 
         let zero = windows_dns_reconcile_script(&[]);
         assert!(zero.contains("DisplayName -like 'rayfish:*'"));
-        assert!(zero.contains("$before="));
-        assert!(zero.contains("catch"));
-        assert!(zero.contains("throw"));
         assert!(!zero.contains("Where-Object { $_.DisplayName -notlike"));
         assert!(zero.contains("ManagedDnsSuffixes"));
         assert!(zero.contains("$foreign=@($current | Where-Object"));
-        assert!(zero.contains("Set-DnsClientGlobalSetting -SuffixSearchList $current"));
+        assert!(windows_dns_snapshot_script().contains("ConvertTo-Json"));
 
         let one = windows_dns_reconcile_script(&["corp.ray".to_string()]);
         assert!(one.contains("$desired=@('corp.ray')"));
-        assert!(one.contains("NameServers '100.100.100.53'"));
-        assert!(one.contains("$present.Count -eq 0"));
+        assert!(one.contains("$matches.Count -ne 1 -or $valid.Count -ne 1"));
+        assert!(one.contains("@($_.Namespace).Count -eq 1"));
+        assert!(one.contains("@($_.Namespace)[0] -eq $namespace"));
+        assert!(one.contains("@($_.NameServers).Count -eq 1"));
+        assert!(one.contains("@($_.NameServers)[0] -eq '100.100.100.53'"));
+        assert!(one.contains("foreach ($rule in $matches)"));
 
         let many = windows_dns_reconcile_script(&["a.ray".to_string(), "O'Brian.ray".to_string()]);
         assert!(many.contains("$desired=@('a.ray','O''Brian.ray')"));
         assert!(many.contains("$display='rayfish:'+$domain"));
-        assert!(many.contains("foreach ($rule in $before)"));
+
+        let rollback = windows_dns_rollback_script(&WindowsDnsSnapshot {
+            nrpt_rules: vec![WindowsNrptRuleSnapshot {
+                display_name: "rayfish:old.ray".to_owned(),
+                namespace: vec![".old.ray".to_owned()],
+                name_servers: vec!["100.100.100.53".to_owned()],
+            }],
+            suffix_search_list: vec!["foreign.example".to_owned(), "old.ray".to_owned()],
+            managed_suffixes: Some(vec!["old.ray".to_owned()]),
+        });
+        assert!(rollback.contains("DisplayName 'rayfish:old.ray'"));
+        assert!(rollback.contains("SuffixSearchList @('foreign.example','old.ray')"));
+        assert!(rollback.contains("ManagedDnsSuffixes"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn ddd_failed_or_timed_out_mutation_always_runs_external_rollback() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let rolled_back = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&rolled_back);
+        let result = super::rollback_on_error(Err(anyhow::anyhow!("timed out")), async move {
+            marker.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(rolled_back.load(Ordering::SeqCst));
     }
 
     #[cfg(windows)]
