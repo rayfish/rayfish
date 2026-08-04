@@ -861,7 +861,10 @@ mod tests {
         let mut named = UserPolicy::default();
         named.add(&["deploy".to_string(), "ci".to_string()]);
         let banner = auth_banner(&named, &peer, &[SmolStr::new("trade")]).expect("restricted");
-        assert!(banner.contains("ci, deploy"), "users listed sorted: {banner}");
+        assert!(
+            banner.contains("ci, deploy"),
+            "users listed sorted: {banner}"
+        );
     }
 
     #[test]

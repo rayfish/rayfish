@@ -110,9 +110,7 @@ impl NetworkRegistry {
                 let Some(id) = self.resolve_peer_flexible(name).await else {
                     return ipc_err(format!("could not resolve peer: {name}"));
                 };
-                let advertises = self
-                    .roster_member(network, id)
-                    .is_some_and(|m| m.exit_node);
+                let advertises = self.roster_member(network, id).is_some_and(|m| m.exit_node);
                 if !advertises {
                     return ipc_err(format!(
                         "{name} does not advertise an exit node on '{network}' \
@@ -157,7 +155,9 @@ impl NetworkRegistry {
                 // that would clear a live gateway's allow policy and tear down a
                 // live full tunnel, leaking the traffic the user chose to route.
                 tracing::warn!(error = %e, "config unreadable; exit-node state left as it was");
-                return Some(format!("config unreadable, exit-node state left as it was: {e}"));
+                return Some(format!(
+                    "config unreadable, exit-node state left as it was: {e}"
+                ));
             }
         };
         self.exit_server.reload(
@@ -344,8 +344,12 @@ impl NetworkRegistry {
                 );
                 continue;
             };
-            if let Err(e) =
-                open_and_send(&conn, Some(net_pubkey), &ControlMsg::ExitNodeOffer { enabled }).await
+            if let Err(e) = open_and_send(
+                &conn,
+                Some(net_pubkey),
+                &ControlMsg::ExitNodeOffer { enabled },
+            )
+            .await
             {
                 tracing::warn!(
                     network = %network,

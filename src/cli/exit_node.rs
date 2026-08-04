@@ -47,7 +47,11 @@ pub(crate) async fn ipc_exit_node(action: ExitNodeAction) -> Result<()> {
 /// note when nothing is routed through an exit.
 async fn clear_all_exit_selections() -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream, ipc::IpcMessage::ExitNodeStatus { network: None }).await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::ExitNodeStatus { network: None },
+    )
+    .await?;
     let active: Vec<String> = match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::ExitNodeState { networks } => networks
             .into_iter()

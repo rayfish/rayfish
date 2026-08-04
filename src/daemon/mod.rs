@@ -1640,7 +1640,10 @@ mod accept_handler_tests {
         // coordinator (the one node that can record the offer on the signed
         // roster) silently discarded it and no exit node was ever advertised.
         use crate::membership::{Member, derive_ip};
-        for handler in [sample_coordinator_handler().await, sample_member_handler().await] {
+        for handler in [
+            sample_coordinator_handler().await,
+            sample_member_handler().await,
+        ] {
             let (registry, state) = match &handler {
                 AcceptHandler::Coordinator(s) => (s.ctx.registry.clone(), s.state.clone()),
                 AcceptHandler::Member(s) => (s.ctx.registry.clone(), s.state.clone()),

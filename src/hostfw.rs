@@ -67,9 +67,9 @@ impl Manager {
             Manager::Iptables => {
                 format!("iptables -I INPUT -i {tun} -p tcp --dport {port} -j ACCEPT")
             }
-            Manager::Nftables => format!(
-                "nft add rule inet filter input iifname \"{tun}\" tcp dport {port} accept"
-            ),
+            Manager::Nftables => {
+                format!("nft add rule inet filter input iifname \"{tun}\" tcp dport {port} accept")
+            }
         }
     }
 }
@@ -286,7 +286,10 @@ mod tests {
     fn no_input_policy_line_is_inconclusive() {
         // Not "clear": we know nothing, so the caller must try nft instead of
         // reporting a firewall that lets everything through.
-        assert_eq!(iptables_blocks_port("-P OUTPUT ACCEPT\n", "tun0", 30022), None);
+        assert_eq!(
+            iptables_blocks_port("-P OUTPUT ACCEPT\n", "tun0", 30022),
+            None
+        );
     }
 
     #[test]

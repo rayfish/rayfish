@@ -1194,7 +1194,6 @@ impl Daemon {
         }
     }
 
-
     /// Resolve iroh's relay servers to their IPv4 addresses so they can be routed
     /// around the full tunnel. Resolved via the system resolver, so call this
     /// while DNS is still split (before the tunnel's DNS catch-all goes in).

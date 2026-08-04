@@ -92,9 +92,7 @@ pub async fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigura
             );
         }
 
-        if resolved_in_path
-            && let Some(c) = try_systemd_resolved_dbus(tun_name).await
-        {
+        if resolved_in_path && let Some(c) = try_systemd_resolved_dbus(tun_name).await {
             c.apply().await?;
             return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
         }
@@ -102,9 +100,7 @@ pub async fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigura
             c.apply().await?;
             return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
         }
-        if resolved_in_path
-            && let Some(c) = try_systemd_resolved_cli(tun_name)
-        {
+        if resolved_in_path && let Some(c) = try_systemd_resolved_cli(tun_name) {
             c.apply().await?;
             return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
         }
@@ -484,10 +480,8 @@ mod linux {
 /// The stub listeners systemd-resolved binds. A `nameserver` line naming either
 /// one means glibc queries reach resolved.
 #[cfg(target_os = "linux")]
-const RESOLVED_STUB_IPS: [Ipv4Addr; 2] = [
-    Ipv4Addr::new(127, 0, 0, 53),
-    Ipv4Addr::new(127, 0, 0, 54),
-];
+const RESOLVED_STUB_IPS: [Ipv4Addr; 2] =
+    [Ipv4Addr::new(127, 0, 0, 53), Ipv4Addr::new(127, 0, 0, 54)];
 
 /// Whether name lookups on this host actually reach systemd-resolved.
 ///
@@ -1518,7 +1512,9 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn stub_resolv_conf_counts_as_reaching_resolved() {
-        assert!(resolv_conf_points_at_resolved("nameserver 127.0.0.53\noptions edns0\n"));
+        assert!(resolv_conf_points_at_resolved(
+            "nameserver 127.0.0.53\noptions edns0\n"
+        ));
         assert!(resolv_conf_points_at_resolved("nameserver 127.0.0.54\n"));
     }
 

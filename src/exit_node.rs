@@ -22,10 +22,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "macos")]
 use std::num::NonZeroU32;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::{
     fs,
@@ -38,8 +38,8 @@ use anyhow::{Context as _, Result};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use iroh::EndpointId;
 use iroh::endpoint::SocketConfigurator;
-use socket2::{Domain, SockRef};
 use smol_str::SmolStr;
+use socket2::{Domain, SockRef};
 
 use crate::membership::is_overlay_ip;
 
@@ -136,7 +136,11 @@ pub fn capture_physical_defaults() {
     let v4 = default_interface("-inet").and_then(usable_pin_iface);
     let v6 = default_interface("-inet6").and_then(usable_pin_iface);
     let (v4, v6) = (v4.clone().or_else(|| v6.clone()), v6.or(v4));
-    tracing::debug!(?v4, ?v6, "captured physical default interfaces for the socket pin");
+    tracing::debug!(
+        ?v4,
+        ?v6,
+        "captured physical default interfaces for the socket pin"
+    );
     *PHYSICAL_DEFAULTS.lock().unwrap() = Some((v4, v6));
 }
 
@@ -991,15 +995,7 @@ fn remove_client_rules(family: &str) {
     // rules matching our exact shape at our pref are touched.
     for addr in installed_source_rules(family) {
         let _ = run_ip(&[
-            family,
-            "rule",
-            "del",
-            "from",
-            &addr,
-            "table",
-            "main",
-            "pref",
-            PREF_SRC,
+            family, "rule", "del", "from", &addr, "table", "main", "pref", PREF_SRC,
         ]);
     }
     let mark = format!("{SOCKET_MARK:#x}");
@@ -1025,7 +1021,15 @@ fn remove_client_rules(family: &str) {
         "pref",
         PREF_MAIN,
     ]);
-    let _ = run_ip(&[family, "rule", "del", "table", EXIT_TABLE, "pref", PREF_TUNNEL]);
+    let _ = run_ip(&[
+        family,
+        "rule",
+        "del",
+        "table",
+        EXIT_TABLE,
+        "pref",
+        PREF_TUNNEL,
+    ]);
 }
 
 /// nft script fragment that removes `table`, whether or not it exists: `delete
@@ -1277,8 +1281,11 @@ const PF_ENABLED_BY_US: &str = "pf-enabled-by-rayfish";
 fn pf_running() -> bool {
     pfctl(&["-s", "info"])
         .map(|out| {
-            out.lines()
-                .any(|l| l.trim_start().strip_prefix("Status:").is_some_and(|s| s.trim_start().starts_with("Enabled")))
+            out.lines().any(|l| {
+                l.trim_start()
+                    .strip_prefix("Status:")
+                    .is_some_and(|s| s.trim_start().starts_with("Enabled"))
+            })
         })
         .unwrap_or(true)
 }

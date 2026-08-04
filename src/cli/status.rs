@@ -927,7 +927,10 @@ mod grouping_tests {
         assert!(row("gw-b").contains("in use"), "{out}");
         // A peer with no exit role gets a blank cell, not a stray label.
         let plain = row("srv");
-        assert!(!plain.contains("offers") && !plain.contains("in use"), "{out}");
+        assert!(
+            !plain.contains("offers") && !plain.contains("in use"),
+            "{out}"
+        );
     }
 
     #[test]
