@@ -104,24 +104,55 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
     octets[0] == 100 && (octets[1] & 0xC0) == 64
 }
 
+#[cfg(target_os = "windows")]
+const WINDOWS_TUN_NAME: &str = "rayfish";
+
+#[cfg(target_os = "windows")]
+const WINDOWS_CGNAT_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(target_os = "windows")]
+const WINDOWS_CGNAT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[cfg(target_os = "windows")]
+const WINDOWS_CGNAT_QUERY: &str = "Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { [string]::Concat($_.InterfaceAlias, [char]9, $_.IPAddress) }";
+
+#[cfg(target_os = "windows")]
+fn windows_cgnat_conflicts(output: &str) -> Vec<(String, Ipv4Addr)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (alias, value) = line.split_once('\t')?;
+            let ip = value.trim().parse::<Ipv4Addr>().ok()?;
+            let alias = alias.trim();
+            (is_cgnat(ip) && !alias.eq_ignore_ascii_case(WINDOWS_TUN_NAME))
+                .then(|| (alias.to_owned(), ip))
+        })
+        .collect()
+}
+
 #[cfg(not(target_os = "android"))]
 pub async fn check_cgnat_conflict() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let output = windows_powershell(
-            "Get-NetIPAddress -AddressFamily IPv4 | Select-Object -ExpandProperty IPAddress",
-        )
-        .await?;
-        for value in output.lines() {
-            if let Ok(ip) = value.trim().parse::<Ipv4Addr>()
-                && is_cgnat(ip)
-            {
+        let deadline = tokio::time::Instant::now() + WINDOWS_CGNAT_RELEASE_TIMEOUT;
+        loop {
+            let output = windows_powershell(WINDOWS_CGNAT_QUERY).await?;
+            let conflicts = windows_cgnat_conflicts(&output);
+            if conflicts.is_empty() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let conflicts = conflicts
+                    .iter()
+                    .map(|(alias, ip)| format!("{alias} ({ip})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 bail!(
-                    "Windows already has CGNAT address {ip} — another VPN is using the 100.64.0.0/10 range. Disable it before starting rayfish."
+                    "Windows interfaces {conflicts} are using the 100.64.0.0/10 range. Disable the conflicting VPN before starting rayfish."
                 );
             }
+            tokio::time::sleep(WINDOWS_CGNAT_POLL_INTERVAL).await;
         }
-        Ok(())
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -185,7 +216,10 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
         .mtu(TUN_MTU)
         .enable(true);
     #[cfg(target_os = "windows")]
-    let builder = builder.wintun_file(wintun_library_path().to_string_lossy().into_owned());
+    let builder = builder
+        .name(WINDOWS_TUN_NAME)
+        .description("Rayfish")
+        .wintun_file(wintun_library_path().to_string_lossy().into_owned());
     let device = builder.build_async().context("create tun-rs device")?;
 
     let tun_name = device.name().unwrap_or_else(|_| "unknown".to_string());
@@ -690,9 +724,39 @@ impl TunWrite for TunWriter {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::{
-        WINDOWS_PEER_ROUTES, windows_interface_query_script, windows_link_args,
-        windows_remove_route_script, windows_replace_route_script, wintun_library_path,
+        WINDOWS_PEER_ROUTES, WINDOWS_TUN_NAME, windows_cgnat_conflicts,
+        windows_interface_query_script, windows_link_args, windows_remove_route_script,
+        windows_replace_route_script, wintun_library_path,
     };
+
+    #[test]
+    fn windows_cgnat_preflight_covers_zero_one_many_and_owned_adapter() {
+        assert!(windows_cgnat_conflicts("").is_empty());
+        assert!(windows_cgnat_conflicts("rayfish\t100.94.119.67\n").is_empty());
+        assert!(windows_cgnat_conflicts("RAYFISH\t100.94.119.67\n").is_empty());
+
+        let conflicts = windows_cgnat_conflicts(
+            "Ethernet\t192.168.1.2\nTailscale\t100.64.1.2\ntun0\t100.127.255.254\n",
+        );
+        assert_eq!(
+            conflicts,
+            vec![
+                ("Tailscale".to_owned(), "100.64.1.2".parse().unwrap()),
+                ("tun0".to_owned(), "100.127.255.254".parse().unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_cgnat_preflight_ignores_malformed_and_range_boundaries() {
+        let conflicts = windows_cgnat_conflicts(
+            "missing delimiter\nedge-low\t100.64.0.0\nedge-high\t100.127.255.255\noutside\t100.128.0.0\ninvalid\tnot-an-ip\n",
+        );
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].0, "edge-low");
+        assert_eq!(conflicts[1].0, "edge-high");
+        assert_eq!(WINDOWS_TUN_NAME, "rayfish");
+    }
 
     #[test]
     fn windows_link_args_cover_up_down_and_name_boundary() {
