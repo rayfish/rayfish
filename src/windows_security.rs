@@ -25,9 +25,9 @@ use windows_sys::Win32::Security::{
     SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_ALWAYS, CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-    MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
+    CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    OPEN_ALWAYS, OPEN_EXISTING,
 };
 
 pub(crate) const PROTECTED_FILE_SDDL: &str = "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
@@ -121,27 +121,6 @@ pub(crate) fn ensure_protected_dir(path: &Path) -> Result<()> {
     protect_path(path, PROTECTED_DIR_SDDL)
 }
 
-pub(crate) fn create_protected_file(path: &Path) -> Result<File> {
-    let mut descriptor = OwnedSecurityDescriptor::from_sddl(PROTECTED_FILE_SDDL)?;
-    let attrs = descriptor.attributes();
-    let handle = unsafe {
-        CreateFileW(
-            wide(path.as_os_str()).as_ptr(),
-            GENERIC_WRITE,
-            FILE_SHARE_READ,
-            &attrs,
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("creating protected {}", path.display()));
-    }
-    Ok(unsafe { File::from_raw_handle(handle) })
-}
-
 /// Atomically creates a new protected regular file without following a reparse
 /// point. Existing names always fail; callers generate unguessable names.
 pub(crate) fn create_protected_new_file(path: &Path) -> Result<File> {
@@ -163,7 +142,7 @@ pub(crate) fn create_protected_new_file(path: &Path) -> Result<File> {
             .with_context(|| format!("creating protected new file {}", path.display()));
     }
     let file = unsafe { File::from_raw_handle(handle) };
-    verify_path_security(path, false)?;
+    verify_open_protected_file(&file, path)?;
     Ok(file)
 }
 
@@ -186,16 +165,7 @@ pub(crate) fn open_protected_file_no_follow(path: &Path) -> Result<File> {
             .with_context(|| format!("opening protected file {}", path.display()));
     }
     let file = unsafe { File::from_raw_handle(handle) };
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("inspect {}", path.display()))?;
-    validate_config_file_attributes(metadata.file_attributes(), path)?;
-    anyhow::ensure!(
-        metadata.is_file(),
-        "protected path is not a regular file: {}",
-        path.display()
-    );
-    verify_path_security(path, false)?;
+    verify_open_protected_file(&file, path)?;
     Ok(file)
 }
 
@@ -215,13 +185,13 @@ pub(crate) fn lock_operator_file(path: &Path) -> Result<OperatorFileLock> {
                 0,
                 &attrs,
                 OPEN_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
                 std::ptr::null_mut(),
             )
         };
         if handle != INVALID_HANDLE_VALUE {
             let file = unsafe { File::from_raw_handle(handle) };
-            protect_file(path)?;
+            verify_open_protected_file(&file, path)?;
             return Ok(OperatorFileLock { _file: file });
         }
         let error = unsafe { GetLastError() };
@@ -231,6 +201,19 @@ pub(crate) fn lock_operator_file(path: &Path) -> Result<OperatorFileLock> {
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
+}
+
+fn verify_open_protected_file(file: &File, path: &Path) -> Result<()> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {}", path.display()))?;
+    validate_config_file_attributes(metadata.file_attributes(), path)?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "protected path is not a regular file: {}",
+        path.display()
+    );
+    verify_path_security(path, false)
 }
 
 #[cfg_attr(test, allow(dead_code))]

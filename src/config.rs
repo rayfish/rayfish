@@ -756,10 +756,23 @@ const OPERATOR_LOCK_FILE: &str = "operator.sid.lock";
 
 #[cfg(windows)]
 fn operator_sid_at(path: &Path) -> Result<Option<String>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let sid = std::fs::read_to_string(path)?.trim().to_string();
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect operator SID"),
+    };
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "operator SID is a reparse point"
+    );
+    use std::io::Read;
+    #[cfg(not(test))]
+    let mut file = crate::windows_security::open_protected_file_no_follow(path)?;
+    #[cfg(test)]
+    let mut file = std::fs::File::open(path)?;
+    let mut sid = String::new();
+    file.read_to_string(&mut sid)?;
+    let sid = sid.trim().to_string();
     Ok((!sid.is_empty()).then_some(sid))
 }
 
@@ -797,18 +810,10 @@ pub fn claim_operator_sid(sid: &str) -> Result<bool> {
     if path.exists() && std::fs::metadata(&path)?.len() == 0 {
         std::fs::remove_file(&path).context("remove incomplete operator SID claim")?;
     }
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let tmp = dir.join(format!(
-        ".{OPERATOR_SID_FILE}.claim.{}.{}",
-        std::process::id(),
-        nonce
-    ));
+    let tmp = windows_config_stage_path(&dir, OPERATOR_SID_FILE);
     let result = (|| -> Result<bool> {
         use std::io::Write;
-        let mut file = crate::windows_security::create_protected_file(&tmp)?;
+        let mut file = create_windows_config_stage(&tmp)?;
         writeln!(file, "{sid}").context("write operator SID claim")?;
         file.sync_all().context("flush operator SID claim")?;
         drop(file);
@@ -884,18 +889,14 @@ pub fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("config");
+    #[cfg(windows)]
+    let tmp = windows_config_stage_path(dir, fname);
+    #[cfg(not(windows))]
     let tmp = dir.join(format!(".{fname}.tmp.{}", std::process::id()));
     {
         use std::io::Write;
-        #[cfg(all(windows, not(test)))]
-        let mut f = if secret {
-            crate::windows_security::create_protected_file(&tmp)?
-        } else {
-            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?
-        };
-        #[cfg(all(windows, test))]
-        let mut f =
-            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        #[cfg(windows)]
+        let mut f = create_windows_config_stage(&tmp)?;
         #[cfg(not(windows))]
         let mut f =
             std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
@@ -910,12 +911,46 @@ pub fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     set_owner(&tmp, secret);
+    #[cfg(all(windows, not(test)))]
+    validate_existing_windows_config_child(path)?;
     let renamed = std::fs::rename(&tmp, path);
     if renamed.is_err() {
         // Clean up the temp file on a failed rename so we don't litter.
         let _ = std::fs::remove_file(&tmp);
     }
     renamed.with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_config_stage_path(dir: &Path, filename: &str) -> PathBuf {
+    let nonce = hex::encode(rand::random::<[u8; 32]>());
+    dir.join(format!(".{filename}.tmp.{nonce}"))
+}
+
+#[cfg(windows)]
+fn create_windows_config_stage(path: &Path) -> Result<std::fs::File> {
+    #[cfg(not(test))]
+    {
+        crate::windows_security::create_protected_new_file(path)
+    }
+    #[cfg(test)]
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("creating unique config stage {}", path.display()))
+}
+
+#[cfg(all(windows, not(test)))]
+fn validate_existing_windows_config_child(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => drop(crate::windows_security::open_protected_file_no_follow(
+            path,
+        )?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
     Ok(())
 }
 
@@ -1260,6 +1295,22 @@ mod tests {
             config_dir_override(Some(OsString::from("/srv/rayfish"))),
             Some(PathBuf::from("/srv/rayfish"))
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_stage_names_are_random_and_create_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = windows_config_stage_path(dir.path(), "settings.toml");
+        let second = windows_config_stage_path(dir.path(), "settings.toml");
+        assert_ne!(first, second);
+        let name = first.file_name().unwrap().to_string_lossy();
+        let nonce = name.strip_prefix(".settings.toml.tmp.").unwrap();
+        assert_eq!(nonce.len(), 64);
+        assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        drop(create_windows_config_stage(&first).unwrap());
+        assert!(create_windows_config_stage(&first).is_err());
     }
 
     #[test]
