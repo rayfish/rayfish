@@ -258,5 +258,5 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             dismissButton = { TextButton(onClick = { confirmUnpair = false }) { Text("Cancel", color = Rf.Body, fontFamily = Chakra) } },
         )
     }
-    pairingTicket?.let { t -> QrCodeSheet("Show this to your other device", t, context, onToast) { pairingTicket = null } }
+    pairingTicket?.let { t -> QrCodeSheet("Show this to your other device", t, context) { pairingTicket = null } }
 }

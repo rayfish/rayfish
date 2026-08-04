@@ -209,5 +209,5 @@ fun NetworkDetailScreen(
             dismissButton = { TextButton(onClick = { showAddRule = false }) { Text("Cancel", color = Rf.Body, fontFamily = Chakra) } },
         )
     }
-    inviteCode?.let { code -> QrCodeSheet("Invite to share", code, context, onToast) { inviteCode = null } }
+    inviteCode?.let { code -> QrCodeSheet("Invite to share", code, context) { inviteCode = null } }
 }

@@ -16,6 +16,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.NetworkDetail
@@ -127,7 +128,7 @@ fun NetworksScreen(
         )
     }
     inviteCode?.let { code ->
-        QrCodeSheet(title = "Invite to share", code = code, context = context, onToast = onToast) { inviteCode = null }
+        QrCodeSheet(title = "Invite to share", code = code, context = context) { inviteCode = null }
     }
 }
 
@@ -157,18 +158,45 @@ private fun AddNetworkSheet(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun QrCodeSheet(title: String, code: String, context: android.content.Context, onToast: (String) -> Unit, onDismiss: () -> Unit) {
+fun QrCodeSheet(title: String, code: String, context: android.content.Context, onDismiss: () -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Rf.Sheet) {
+        // The sheet has its own window, drawn above the Scaffold that hosts the
+        // snackbar, so a snackbar confirmation would be hidden behind it and the
+        // copy would look like it did nothing. Confirm in the button instead.
+        var taps by remember { mutableStateOf(0) }
+        var copied by remember { mutableStateOf(false) }
+        LaunchedEffect(taps) {
+            if (taps > 0) {
+                delay(2000)
+                taps = 0
+            }
+        }
         Column(Modifier.fillMaxWidth().padding(20.dp).padding(bottom = 24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
             SectionLabel(title)
             QrImage(code, size = 200.dp)
             Text(code, fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Muted, modifier = Modifier.fillMaxWidth())
-            PillButton("Copy code", onClick = { copyToClipboard(context, "Rayfish code", code); onToast("Copied") }, modifier = Modifier.fillMaxWidth())
+            PillButton(
+                if (taps == 0) "Copy code" else if (copied) "Copied" else "Copy failed",
+                onClick = {
+                    copied = copyToClipboard(context, "Rayfish code", code)
+                    taps++
+                },
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
     }
 }
 
-fun copyToClipboard(context: android.content.Context, label: String, text: String) {
-    val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-    cm.setPrimaryClip(android.content.ClipData.newPlainText(label, text))
+/** Returns false when the platform refused the write, so the caller can say so
+ *  rather than claim a copy that never landed. */
+fun copyToClipboard(context: android.content.Context, label: String, text: String): Boolean {
+    val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+        ?: return false
+    return try {
+        cm.setPrimaryClip(android.content.ClipData.newPlainText(label, text))
+        true
+    } catch (t: Throwable) {
+        android.util.Log.w("rayfish", "clipboard write failed", t)
+        false
+    }
 }

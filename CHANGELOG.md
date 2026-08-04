@@ -61,6 +61,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **"Copy code" on the Android QR sheet confirms the copy.** The sheet draws in
+  its own window on top of the screen that hosts the confirmation, so the
+  "Copied" message was hidden behind it and the button looked dead. The button
+  itself now says "Copied", or "Copy failed" if Android refuses the clipboard
+  write instead of failing silently.
+
 - **A node that reboots faster than its network comes up rejoins on its own.**
   The daemon starts as soon as the service manager says the network is ready,
   which on a hard reboot can be before DNS answers. Finding a saved network
