@@ -1,6 +1,9 @@
 //! CLI service-management handlers: up, install, start/stop/restart, operator.
 
 use crate::*;
+#[cfg(target_os = "linux")]
+use rayfish::init_system::InitSystem;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::process::Command;
@@ -54,12 +57,9 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
         // best-effort: the daemon falls back to root:root if the group is
         // absent (see config::set_owner).
         ensure_rayfish_group();
-        let path = Path::new("/etc/systemd/system/rayfish.service");
-        let service =
-            include_str!("../../contrib/rayfish.service").replace("/usr/local/bin/ray", &exe);
-        std::fs::write(path, service)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        run_cmd("systemctl", &["daemon-reload"]);
+        // systemd, OpenRC and SysV each get their own template; `require` fails
+        // with a "run `sudo ray daemon`" hint when the host runs none of them.
+        InitSystem::require()?.install_unit(&exe)?;
         return Ok(());
     }
 
@@ -120,8 +120,16 @@ pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Resul
 
     #[cfg(target_os = "linux")]
     {
-        run_cmd("systemctl", &["enable", "rayfish"]);
-        run_cmd("systemctl", &["restart", "rayfish"]);
+        let init = InitSystem::require()?;
+        init.enable();
+        init.restart();
+        if !init.supervises() {
+            println!(
+                "note: {} does not restart the daemon if it exits; \
+                 use `sudo ray start` to bring it back.",
+                init.label()
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -229,7 +237,7 @@ pub(crate) async fn cmd_install(auto_update: bool) -> Result<()> {
 pub(crate) fn service_unit_exists() -> bool {
     #[cfg(target_os = "linux")]
     {
-        return Path::new("/etc/systemd/system/rayfish.service").exists();
+        return InitSystem::installed().is_some();
     }
     #[cfg(target_os = "macos")]
     {
@@ -245,7 +253,7 @@ pub(crate) fn service_unit_exists() -> bool {
 #[allow(unreachable_code)]
 pub(crate) async fn restart_service_and_wait() -> Result<()> {
     #[cfg(target_os = "linux")]
-    run_cmd("systemctl", &["restart", "rayfish"]);
+    InitSystem::require()?.restart();
 
     #[cfg(target_os = "macos")]
     run_cmd("launchctl", &["kickstart", "-k", "system/com.rayfish.vpn"]);
@@ -290,7 +298,7 @@ pub(crate) async fn cmd_stop() -> Result<()> {
     }
 
     #[cfg(target_os = "linux")]
-    run_cmd("systemctl", &["stop", "rayfish"]);
+    InitSystem::require()?.stop();
 
     #[cfg(target_os = "macos")]
     run_cmd(
@@ -317,7 +325,7 @@ pub(crate) async fn cmd_start() -> Result<()> {
     }
 
     #[cfg(target_os = "linux")]
-    run_cmd("systemctl", &["start", "rayfish"]);
+    InitSystem::require()?.start();
 
     #[cfg(target_os = "macos")]
     run_cmd(

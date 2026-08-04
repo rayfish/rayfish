@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Service management works on Linux without systemd.** `ray up`, `install`,
+  `start`, `stop`, `restart` and `uninstall` now detect the host's init system
+  and install the matching service: a systemd unit, an OpenRC service (Alpine,
+  Gentoo), or an LSB SysV init script (MX Linux, Devuan, antiX). Previously
+  every one of these commands shelled out to `systemctl` and failed with
+  "systemctl not found" on a non-systemd host. If none of the three is
+  recognised, the error now tells you to run `sudo ray daemon` directly instead
+  of leaving you to guess. Under SysV init nothing supervises the daemon, so
+  `ray up` says so: a crash stays down until the next `ray start`.
+
 - **The Android app can cancel a queued send.** A send waiting on a peer that
   hasn't picked it up now shows under Notifications with a Cancel button, the
   same thing `ray files cancel` does on desktop. Only works before the offer

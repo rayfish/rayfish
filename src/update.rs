@@ -6,6 +6,8 @@
 
 use std::process::{Command, Stdio};
 
+#[cfg(target_os = "linux")]
+use crate::init_system::InitSystem;
 use anyhow::{Context, Error, Result};
 use reqwest::{Client, RequestBuilder};
 use semver::Version;
@@ -242,18 +244,18 @@ pub fn should_attempt_target(
 /// without waiting (the daemon is the process being restarted, so it can't wait
 /// for itself). Fire-and-forget and detached.
 ///
-/// On Linux the restart runs in a transient `systemd-run --scope` unit so it is
-/// **outside** `rayfish.service`'s cgroup: the service teardown
-/// (`KillMode=control-group`) can't kill this client before it enqueues the
-/// restart job with PID 1. On macOS `launchctl kickstart -k` asks launchd to do
-/// the kill+relaunch, so the client only submits the request and no in-cgroup
-/// kill hazard exists.
+/// On Linux the command comes from the detected init system (see
+/// [`InitSystem::detached_restart_command`], which handles systemd's cgroup
+/// kill hazard). On macOS `launchctl kickstart -k` asks launchd to do the
+/// kill+relaunch, so the client only submits the request.
 pub fn trigger_detached_restart() {
     #[cfg(target_os = "linux")]
     let mut cmd = {
-        let mut c = Command::new("systemd-run");
-        c.args(["--scope", "systemctl", "restart", "rayfish"]);
-        c
+        let Some(init) = InitSystem::installed() else {
+            tracing::error!("auto-update: no init system found, cannot restart the service");
+            return;
+        };
+        init.detached_restart_command()
     };
     #[cfg(target_os = "macos")]
     let mut cmd = {

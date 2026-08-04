@@ -21,6 +21,8 @@ Use `cargo -q` for all cargo commands. Keep `build` / `clippy` / `test` green at
 
 The daemon (`ray daemon`) owns the TUN device + iroh endpoint and runs as a system service; the CLI talks to it over Unix-socket IPC. Full command surface + flags: `ray --help`, `ray <cmd> --help`.
 
+Service management never calls `systemctl` directly: `init_system::InitSystem` detects systemd / OpenRC / SysV init and owns the per-init unit template (`contrib/rayfish.{service,openrc,init}`), install path, and start/stop/enable commands. macOS (launchd) is a `#[cfg]` branch at the call sites.
+
 ```bash
 sudo ray up | down            # activate / standby (down keeps peer connections, drops only the data plane)
 sudo ray start | stop | restart | install | uninstall | set-operator

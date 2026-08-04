@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+# OpenRC service for the rayfish P2P mesh VPN daemon.
+# `ray up` / `ray install` write this to /etc/init.d/rayfish with the path of
+# the running binary substituted for /usr/local/bin/ray.
+
+description="rayfish P2P mesh VPN"
+
+command="/usr/local/bin/ray"
+command_args="daemon"
+pidfile="/run/rayfish.pid"
+output_log="/var/log/rayfish.log"
+error_log="/var/log/rayfish.log"
+
+# supervise-daemon restarts the daemon if it exits non-zero, matching the
+# systemd unit's Restart=on-failure. The daemon's panic hook aborts on purpose
+# so the supervisor brings it back from a known-good state.
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+
+depend() {
+	need net
+	after firewall
+}

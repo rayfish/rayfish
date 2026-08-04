@@ -62,6 +62,10 @@ pub mod forward;
 pub mod hostfw;
 pub mod hostname;
 pub mod identity;
+// Linux init-system abstraction (systemd / OpenRC / SysV) behind the service
+// management commands. Desktop-only: Android has no `ray` service to install.
+#[cfg(feature = "desktop")]
+pub mod init_system;
 pub mod invite;
 pub mod ipc;
 pub mod logdir;

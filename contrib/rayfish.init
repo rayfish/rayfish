@@ -1,0 +1,94 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          rayfish
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: rayfish P2P mesh VPN
+# Description:       rayfish P2P mesh VPN daemon
+### END INIT INFO
+#
+# SysV init script for the rayfish daemon. `ray up` / `ray install` write this
+# to /etc/init.d/rayfish with the path of the running binary substituted for
+# /usr/local/bin/ray. Plain POSIX sh: start-stop-daemon is used when present
+# (Debian and derivatives), otherwise a portable kill/pidfile fallback.
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+NAME=rayfish
+DAEMON=/usr/local/bin/ray
+DAEMON_ARGS=daemon
+PIDFILE=/var/run/rayfish.pid
+LOGFILE=/var/log/rayfish.log
+
+[ -x "$DAEMON" ] || exit 5
+
+running() {
+	[ -f "$PIDFILE" ] || return 1
+	pid=$(cat "$PIDFILE" 2>/dev/null)
+	[ -n "$pid" ] || return 1
+	kill -0 "$pid" 2>/dev/null
+}
+
+do_start() {
+	if running; then
+		echo "$NAME is already running"
+		return 0
+	fi
+	echo "Starting $NAME"
+	if command -v start-stop-daemon >/dev/null 2>&1; then
+		start-stop-daemon --start --quiet --background --make-pidfile \
+			--pidfile "$PIDFILE" --exec "$DAEMON" -- $DAEMON_ARGS
+	else
+		"$DAEMON" $DAEMON_ARGS >>"$LOGFILE" 2>&1 &
+		echo $! >"$PIDFILE"
+	fi
+}
+
+do_stop() {
+	if ! running; then
+		echo "$NAME is not running"
+		rm -f "$PIDFILE"
+		return 0
+	fi
+	echo "Stopping $NAME"
+	if command -v start-stop-daemon >/dev/null 2>&1; then
+		start-stop-daemon --stop --quiet --retry=TERM/30/KILL/5 --pidfile "$PIDFILE"
+	else
+		pid=$(cat "$PIDFILE")
+		kill "$pid" 2>/dev/null
+		i=0
+		while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 30 ]; do
+			sleep 1
+			i=$((i + 1))
+		done
+		kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+	fi
+	rm -f "$PIDFILE"
+}
+
+case "$1" in
+start)
+	do_start
+	;;
+stop)
+	do_stop
+	;;
+restart | force-reload)
+	do_stop
+	sleep 1
+	do_start
+	;;
+status)
+	if running; then
+		echo "$NAME is running (pid $(cat "$PIDFILE"))"
+		exit 0
+	fi
+	echo "$NAME is not running"
+	exit 3
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart|force-reload|status}" >&2
+	exit 3
+	;;
+esac

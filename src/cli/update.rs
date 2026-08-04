@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use reqwest::Client;
 
 use crate::*;
+#[cfg(target_os = "linux")]
+use rayfish::init_system::InitSystem;
 use rayfish::update::{
     GhRelease, REPO_SLUG, authed, download_and_swap, fetch_checksum, github_token,
     normalize_version, release_asset_name, sha256_hex, version_is_newer,
@@ -443,14 +445,18 @@ pub(crate) fn run_cmd_quiet(program: &str, args: &[&str]) {
 pub(crate) fn cmd_uninstall_service() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let path = Path::new("/etc/systemd/system/rayfish.service");
-        if path.exists() {
-            run_cmd("systemctl", &["disable", "--now", "rayfish"]);
-            std::fs::remove_file(path)?;
-            run_cmd("systemctl", &["daemon-reload"]);
-            println!("Removed systemd service.");
-        } else {
-            println!("Service not installed.");
+        // Tear down whatever init the unit was installed under, not just the
+        // one running now, so a host that switched inits still cleans up.
+        match InitSystem::installed() {
+            Some(init) => {
+                init.disable();
+                std::fs::remove_file(init.unit_path())?;
+                if init == InitSystem::Systemd {
+                    run_cmd("systemctl", &["daemon-reload"]);
+                }
+                println!("Removed {} service.", init.label());
+            }
+            None => println!("Service not installed."),
         }
         return Ok(());
     }
