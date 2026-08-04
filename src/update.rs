@@ -279,10 +279,17 @@ pub async fn download_msi_to_temp(
     }
     let path = random_system_stage_path("rayfish-update", ".msi");
     let mut file = crate::windows_security::create_protected_new_file(&path)?;
-    file.write_all(&bytes)
-        .with_context(|| format!("write protected MSI stage {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("flush protected MSI stage {}", path.display()))?;
+    let write_result = (|| -> Result<()> {
+        file.write_all(&bytes)
+            .with_context(|| format!("write protected MSI stage {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("flush protected MSI stage {}", path.display()))
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
     Ok(path)
 }
 
@@ -304,6 +311,43 @@ fn system_temp_dir() -> PathBuf {
         .map(PathBuf::from)
         .map(|root| root.join("Temp"))
         .unwrap_or_else(std::env::temp_dir)
+}
+
+#[cfg(windows)]
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let bits = ((chunk[0] as u32) << 16)
+            | ((chunk.get(1).copied().unwrap_or(0) as u32) << 8)
+            | chunk.get(2).copied().unwrap_or(0) as u32;
+        encoded.push(TABLE[((bits >> 18) & 0x3f) as usize] as char);
+        encoded.push(TABLE[((bits >> 12) & 0x3f) as usize] as char);
+        encoded.push(if chunk.len() > 1 {
+            TABLE[((bits >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            TABLE[(bits & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    encoded
+}
+
+#[cfg(windows)]
+fn encoded_powershell_command(script: &str) -> Command {
+    let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut command = Command::new("powershell.exe");
+    command.creation_flags(0x0800_0000).args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        &base64_encode(&utf16le),
+    ]);
+    command
 }
 
 #[cfg(windows)]
@@ -416,47 +460,59 @@ pub fn schedule_msi_update(
     expected_sha256: &str,
 ) -> Result<PathBuf> {
     let helper_dir = system_temp_dir();
-    std::fs::create_dir_all(&helper_dir)
-        .with_context(|| format!("create system temp directory {}", helper_dir.display()))?;
     let helper = random_system_stage_path("rayfish-updater", ".exe");
-    let mut source = std::fs::File::open(std::env::current_exe()?)
-        .context("open current executable for updater staging")?;
-    let mut staged_helper = crate::windows_security::create_protected_new_file(&helper)?;
-    std::io::copy(&mut source, &mut staged_helper)
-        .with_context(|| format!("copy updater helper to {}", helper.display()))?;
-    staged_helper
-        .sync_all()
-        .with_context(|| format!("flush updater helper {}", helper.display()))?;
-    drop(staged_helper);
-    let helper_guard = crate::windows_security::open_protected_file_no_follow(&helper)?;
-    Command::new(&helper)
-        .creation_flags(0x0800_0000 | 0x0000_0008 | 0x0000_0200)
-        .args(updater_helper_args(
-            path,
-            release_identity,
-            expected_sha256,
-            std::process::id(),
-        ))
-        .spawn()
-        .context("launch detached Windows updater helper")?;
-    drop(helper_guard);
+    let result = (|| -> Result<()> {
+        std::fs::create_dir_all(&helper_dir)
+            .with_context(|| format!("create system temp directory {}", helper_dir.display()))?;
+        let mut source = std::fs::File::open(std::env::current_exe()?)
+            .context("open current executable for updater staging")?;
+        let mut staged_helper = crate::windows_security::create_protected_new_file(&helper)?;
+        std::io::copy(&mut source, &mut staged_helper)
+            .with_context(|| format!("copy updater helper to {}", helper.display()))?;
+        staged_helper
+            .sync_all()
+            .with_context(|| format!("flush updater helper {}", helper.display()))?;
+        drop(staged_helper);
+        let helper_guard = crate::windows_security::open_protected_file_no_follow(&helper)?;
+        Command::new(&helper)
+            .creation_flags(0x0800_0000 | 0x0000_0008 | 0x0000_0200)
+            .args(updater_helper_args(
+                path,
+                release_identity,
+                expected_sha256,
+                std::process::id(),
+            ))
+            .spawn()
+            .context("launch detached Windows updater helper")?;
+        drop(helper_guard);
+        Ok(())
+    })();
+    if let Err(error) = result {
+        cleanup_scheduling_failure(path, &helper);
+        return Err(error);
+    }
     Ok(helper)
 }
 
 #[cfg(windows)]
-fn update_pending_reboot_state(release_identity: &str, code: i32, log: &Path) -> Result<()> {
-    let script = "$key='HKLM:\\Software\\Rayfish'; New-Item -Path $key -Force | Out-Null; New-ItemProperty -Path $key -Name PendingRebootIdentity -Value $args[0] -PropertyType String -Force | Out-Null; New-ItemProperty -Path $key -Name PendingRebootCode -Value ([int]$args[1]) -PropertyType DWord -Force | Out-Null; New-ItemProperty -Path $key -Name PendingRebootLog -Value $args[2] -PropertyType String -Force | Out-Null";
-    let output = Command::new("powershell.exe")
-        .creation_flags(0x0800_0000)
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-            release_identity,
-            &code.to_string(),
-            &log.to_string_lossy(),
-        ])
+fn cleanup_scheduling_failure(msi: &Path, helper: &Path) {
+    let _ = std::fs::remove_file(helper);
+    let _ = std::fs::remove_file(msi);
+}
+
+#[cfg(windows)]
+fn pending_reboot_command(release_identity: &str, code: i32) -> Command {
+    let script = "$ErrorActionPreference='Stop'; & { param([string]$Identity, [int]$Code) $key='HKLM:\\Software\\Rayfish'; New-Item -Path $key -Force | Out-Null; New-ItemProperty -Path $key -Name PendingRebootIdentity -Value $Identity -PropertyType String -Force | Out-Null; New-ItemProperty -Path $key -Name PendingRebootCode -Value $Code -PropertyType DWord -Force | Out-Null } -Identity $env:RAYFISH_PENDING_IDENTITY -Code ([int]$env:RAYFISH_PENDING_CODE)";
+    let mut command = encoded_powershell_command(script);
+    command
+        .env("RAYFISH_PENDING_IDENTITY", release_identity)
+        .env("RAYFISH_PENDING_CODE", code.to_string());
+    command
+}
+
+#[cfg(windows)]
+fn update_pending_reboot_state(release_identity: &str, code: i32) -> Result<()> {
+    let output = pending_reboot_command(release_identity, code)
         .output()
         .context("record pending Rayfish reboot state")?;
     anyhow::ensure!(
@@ -469,14 +525,9 @@ fn update_pending_reboot_state(release_identity: &str, code: i32, log: &Path) ->
 
 #[cfg(windows)]
 fn clear_pending_reboot_state() -> Result<()> {
-    let output = Command::new("powershell.exe")
-        .creation_flags(0x0800_0000)
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Remove-ItemProperty -LiteralPath 'HKLM:\\Software\\Rayfish' -Name PendingRebootIdentity,PendingRebootCode,PendingRebootLog -ErrorAction SilentlyContinue",
-        ])
+    let output = encoded_powershell_command(
+        "Remove-ItemProperty -LiteralPath 'HKLM:\\Software\\Rayfish' -Name PendingRebootIdentity,PendingRebootCode,PendingRebootLog -ErrorAction SilentlyContinue",
+    )
         .output()
         .context("clear pending Rayfish reboot state")?;
     anyhow::ensure!(
@@ -485,6 +536,65 @@ fn clear_pending_reboot_state() -> Result<()> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())
+}
+
+#[cfg(windows)]
+struct RemoveFileOnDrop(PathBuf);
+
+#[cfg(windows)]
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(windows)]
+fn is_staged_updater_helper(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if !parent
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&system_temp_dir().to_string_lossy())
+    {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(nonce) = name
+        .strip_prefix("rayfish-updater-")
+        .and_then(|name| name.strip_suffix(".exe"))
+    else {
+        return false;
+    };
+    nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(windows)]
+fn self_delete_command(helper: &Path, helper_pid: u32) -> Command {
+    let script = "$ErrorActionPreference='SilentlyContinue'; & { param([string]$Path, [int]$ProcessId) Wait-Process -Id $ProcessId -Timeout 300 -ErrorAction SilentlyContinue; for($attempt=0; $attempt -lt 60; $attempt++){ Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue; if(-not (Test-Path -LiteralPath $Path)){ exit 0 }; Start-Sleep -Milliseconds 250 }; exit 1 } -Path $env:RAYFISH_HELPER_PATH -ProcessId ([int]$env:RAYFISH_HELPER_PID)";
+    let mut command = encoded_powershell_command(script);
+    command
+        .creation_flags(0x0800_0000 | 0x0000_0008 | 0x0000_0200)
+        .env("RAYFISH_HELPER_PATH", helper)
+        .env("RAYFISH_HELPER_PID", helper_pid.to_string());
+    command
+}
+
+#[cfg(windows)]
+fn schedule_self_delete(helper: &Path) -> Result<()> {
+    self_delete_command(helper, std::process::id())
+        .spawn()
+        .context("schedule updater helper self-delete")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cleanup_helper_log(log: Option<&Path>, success: bool) {
+    if success && let Some(log) = log {
+        let _ = std::fs::remove_file(log);
+    }
 }
 
 /// Detached helper entry point. It waits for the caller/daemon to release the
@@ -500,38 +610,49 @@ pub fn run_msi_update_helper(
         crate::windows_identity::is_current_process_elevated_admin(),
         "Windows update helper requires an elevated Administrator token"
     );
-    wait_for_parent(parent_pid)?;
-    let mut staged_msi = crate::windows_security::open_protected_file_no_follow(msi)?;
-    let actual_sha256 = sha256_reader(&mut staged_msi)?;
+    let helper = std::env::current_exe().context("locate updater helper executable")?;
     anyhow::ensure!(
-        actual_sha256.eq_ignore_ascii_case(expected_sha256),
-        "staged MSI SHA-256 changed before install: expected {expected_sha256}, got {actual_sha256}"
+        is_staged_updater_helper(&helper),
+        "refusing updater self-delete outside the protected system-temp staging pattern"
     );
-    let log = random_system_stage_path("rayfish-msi-update", ".log");
-    drop(crate::windows_security::create_protected_new_file(&log)?);
-    let outcome = install_msi(msi, &log)?;
-    if let MsiInstallOutcome::RebootRequired(code) = outcome {
-        update_pending_reboot_state(release_identity, code, &log)?;
-        tracing::warn!(
-            code,
-            identity = release_identity,
-            log = %log.display(),
-            "Windows MSI update succeeded but requires reboot; service reachability and running identity are pending"
+    schedule_self_delete(&helper)?;
+    let _msi_cleanup = RemoveFileOnDrop(msi.to_owned());
+    let mut log_path = None;
+    let result = (|| -> Result<()> {
+        wait_for_parent(parent_pid)?;
+        let mut staged_msi = crate::windows_security::open_protected_file_no_follow(msi)?;
+        let actual_sha256 = sha256_reader(&mut staged_msi)?;
+        anyhow::ensure!(
+            actual_sha256.eq_ignore_ascii_case(expected_sha256),
+            "staged MSI SHA-256 changed before install: expected {expected_sha256}, got {actual_sha256}"
         );
-        return Ok(());
-    }
-    clear_pending_reboot_state()?;
-    crate::windows_service::start().context("restart rayfish Windows service after MSI update")?;
-    let installed =
-        installed_msi_version()?.context("Rayfish release identity missing after MSI update")?;
-    anyhow::ensure!(
-        installed == release_identity,
-        "installed Rayfish identity {installed:?} does not match expected {release_identity:?}; log: {}",
-        log.display()
-    );
-    let _ = std::fs::remove_file(msi);
-    let _ = std::fs::remove_file(log);
-    Ok(())
+        let log = random_system_stage_path("rayfish-msi-update", ".log");
+        drop(crate::windows_security::create_protected_new_file(&log)?);
+        log_path = Some(log.clone());
+        let outcome = install_msi(msi, &log)?;
+        if let MsiInstallOutcome::RebootRequired(code) = outcome {
+            update_pending_reboot_state(release_identity, code)?;
+            tracing::warn!(
+                code,
+                identity = release_identity,
+                "Windows MSI update succeeded but requires reboot; service reachability and running identity are pending"
+            );
+            return Ok(());
+        }
+        clear_pending_reboot_state()?;
+        crate::windows_service::start()
+            .context("restart rayfish Windows service after MSI update")?;
+        let installed = installed_msi_version()?
+            .context("Rayfish release identity missing after MSI update")?;
+        anyhow::ensure!(
+            installed == release_identity,
+            "installed Rayfish identity {installed:?} does not match expected {release_identity:?}; log: {}",
+            log.display()
+        );
+        Ok(())
+    })();
+    cleanup_helper_log(log_path.as_deref(), result.is_ok());
+    result
 }
 
 #[cfg(not(windows))]
@@ -778,5 +899,70 @@ mod tests {
         );
         assert!(classify_msi_exit_code(Some(1603)).is_err());
         assert!(classify_msi_exit_code(Some(1638)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn encoded_powershell_binds_pending_and_self_delete_arguments_via_environment() {
+        let identity = "0.2.1-nightly.7+quote'is-data";
+        let pending = pending_reboot_command(identity, 3010);
+        let pending_env: std::collections::HashMap<_, _> = pending
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+            .collect();
+        assert_eq!(
+            pending_env.get(std::ffi::OsStr::new("RAYFISH_PENDING_IDENTITY")),
+            Some(&std::ffi::OsString::from(identity))
+        );
+        assert_eq!(
+            pending_env.get(std::ffi::OsStr::new("RAYFISH_PENDING_CODE")),
+            Some(&std::ffi::OsString::from("3010"))
+        );
+        let pending_args: Vec<_> = pending
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect();
+        assert!(pending_args.iter().any(|arg| arg == "-EncodedCommand"));
+        assert!(!pending_args.iter().any(|arg| arg.contains(identity)));
+        assert_eq!(base64_encode(&[b'A', 0]), "QQA=");
+
+        let helper = random_system_stage_path("rayfish-updater", ".exe");
+        assert!(is_staged_updater_helper(&helper));
+        assert!(!is_staged_updater_helper(Path::new(
+            r"C:\Program Files\Rayfish\ray.exe"
+        )));
+        let cleanup = self_delete_command(&helper, 42);
+        let cleanup_env: std::collections::HashMap<_, _> = cleanup
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+            .collect();
+        assert_eq!(
+            cleanup_env.get(std::ffi::OsStr::new("RAYFISH_HELPER_PATH")),
+            Some(&helper.into_os_string())
+        );
+        assert_eq!(
+            cleanup_env.get(std::ffi::OsStr::new("RAYFISH_HELPER_PID")),
+            Some(&std::ffi::OsString::from("42"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn updater_cleanup_policy_removes_success_artifacts_and_preserves_failure_log() {
+        let nonce = hex::encode(rand::random::<[u8; 16]>());
+        let msi = std::env::temp_dir().join(format!("rayfish-cleanup-{nonce}.msi"));
+        let helper = std::env::temp_dir().join(format!("rayfish-cleanup-{nonce}.exe"));
+        std::fs::write(&msi, b"msi").unwrap();
+        std::fs::write(&helper, b"helper").unwrap();
+        cleanup_scheduling_failure(&msi, &helper);
+        assert!(!msi.exists());
+        assert!(!helper.exists());
+
+        let log = std::env::temp_dir().join(format!("rayfish-cleanup-{nonce}.log"));
+        std::fs::write(&log, b"log").unwrap();
+        cleanup_helper_log(Some(&log), false);
+        assert!(log.exists());
+        cleanup_helper_log(Some(&log), true);
+        assert!(!log.exists());
     }
 }
