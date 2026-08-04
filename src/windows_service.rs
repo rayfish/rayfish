@@ -105,14 +105,7 @@ pub fn set_operator_account(account: &OsStr) -> Result<String> {
         return Err(error);
     }
     if was_running && let Err(error) = start() {
-        match previous.as_deref() {
-            Some(old) => {
-                let _ = config::set_operator_sid(old);
-            }
-            None => {
-                let _ = config::remove_operator_sid_if_matches(&sid);
-            }
-        }
+        let _ = config::replace_operator_sid_if_matches(&sid, previous.as_deref());
         let _ = start();
         return Err(error).context("restart service after setting Windows operator");
     }
