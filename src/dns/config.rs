@@ -309,6 +309,9 @@ struct WindowsDnsSnapshot {
 }
 
 #[cfg(windows)]
+static WINDOWS_DNS_TRANSACTION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(windows)]
 fn ps_array(values: &[String]) -> String {
     format!(
         "@({})",
@@ -322,7 +325,7 @@ fn ps_array(values: &[String]) -> String {
 
 #[cfg(windows)]
 fn windows_dns_snapshot_script() -> &'static str {
-    "$statePath='HKLM:\\SOFTWARE\\Rayfish'; $marker=$null; if (Test-Path $statePath) { $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }; [pscustomobject]@{ nrpt_rules=@(Get-DnsClientNrptRule | Where-Object { $_.DisplayName -like 'rayfish:*' } | ForEach-Object { [pscustomobject]@{ display_name=$_.DisplayName; namespace=@($_.Namespace); name_servers=@($_.NameServers) } }); suffix_search_list=@((Get-DnsClientGlobalSetting).SuffixSearchList); managed_suffixes=if ($null -eq $marker) { $null } else { @($marker.ManagedDnsSuffixes) } } | ConvertTo-Json -Compress -Depth 5"
+    "$ErrorActionPreference='Stop'; $statePath='HKLM:\\SOFTWARE\\Rayfish'; $marker=$null; if (Test-Path $statePath) { $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }; [pscustomobject]@{ nrpt_rules=@(Get-DnsClientNrptRule | Where-Object { $_.DisplayName -like 'rayfish:*' } | ForEach-Object { [pscustomobject]@{ display_name=$_.DisplayName; namespace=@($_.Namespace); name_servers=@($_.NameServers) } }); suffix_search_list=@((Get-DnsClientGlobalSetting).SuffixSearchList); managed_suffixes=if ($null -eq $marker) { $null } else { @($marker.ManagedDnsSuffixes) } } | ConvertTo-Json -Compress -Depth 5"
 }
 
 #[cfg(windows)]
@@ -433,6 +436,7 @@ async fn set_search_domains_windows(
     _network_names: &[String],
     _tun_name: &str,
 ) -> Result<()> {
+    let _transaction = WINDOWS_DNS_TRANSACTION.lock().await;
     let snapshot_text = powershell_text(windows_dns_snapshot_script()).await?;
     let snapshot: WindowsDnsSnapshot =
         serde_json::from_str(&snapshot_text).context("parse Windows DNS snapshot")?;
@@ -1859,6 +1863,7 @@ mod tests {
         assert!(!zero.contains("Where-Object { $_.DisplayName -notlike"));
         assert!(zero.contains("ManagedDnsSuffixes"));
         assert!(zero.contains("$foreign=@($current | Where-Object"));
+        assert!(windows_dns_snapshot_script().starts_with("$ErrorActionPreference='Stop';"));
         assert!(windows_dns_snapshot_script().contains("ConvertTo-Json"));
 
         let one = windows_dns_reconcile_script(&["corp.ray".to_string()]);
@@ -1905,6 +1910,29 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(rolled_back.load(Ordering::SeqCst));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn zombie_dns_transaction_lock_serializes_snapshot_through_rollback() {
+        let first = super::WINDOWS_DNS_TRANSACTION.lock().await;
+        let mut waiter = tokio::spawn(async {
+            let _second = super::WINDOWS_DNS_TRANSACTION.lock().await;
+            true
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut waiter)
+                .await
+                .is_err(),
+            "second reconcile entered while the first transaction was live"
+        );
+        drop(first);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+        );
     }
 
     #[cfg(windows)]

@@ -8,14 +8,21 @@ use anyhow::{Context, Result};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject,
 };
+use windows_sys::Win32::System::Threading::{
+    CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const WINDOWS_CREATION_FLAGS: u32 = CREATE_NO_WINDOW | CREATE_SUSPENDED;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -77,6 +84,48 @@ impl Drop for KillOnCloseJob {
     }
 }
 
+fn resume_suspended_process(process_id: u32) -> Result<()> {
+    // CREATE_SUSPENDED creates exactly one thread. Enumerate it while still
+    // suspended, then resume only after the process has joined our Job Object.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error()).context("snapshot suspended Windows threads");
+    }
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut found = None;
+    let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while has_entry {
+        if entry.th32OwnerProcessID == process_id {
+            found = Some(entry.th32ThreadID);
+            break;
+        }
+        has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    let thread_id = found.context("find primary thread of suspended Windows process")?;
+    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+    if thread.is_null() {
+        return Err(std::io::Error::last_os_error()).context("open suspended Windows thread");
+    }
+    let resumed = unsafe { ResumeThread(thread) };
+    unsafe {
+        CloseHandle(thread);
+    }
+    if resumed == u32::MAX {
+        return Err(std::io::Error::last_os_error()).context("resume suspended Windows process");
+    }
+    anyhow::ensure!(
+        resumed == 1,
+        "unexpected Windows primary-thread suspend count {resumed}; child terminated"
+    );
+    Ok(())
+}
+
 async fn bounded_reader_join(mut task: JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
     match tokio::time::timeout(CLEANUP_TIMEOUT, &mut task).await {
         Ok(result) => result
@@ -128,7 +177,7 @@ impl WindowsProcessRunner {
         let program = program.as_ref();
         let mut command = Command::new(program);
         command
-            .creation_flags(CREATE_NO_WINDOW)
+            .creation_flags(WINDOWS_CREATION_FLAGS)
             .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -140,6 +189,14 @@ impl WindowsProcessRunner {
             .spawn()
             .with_context(|| format!("spawn hidden Windows process {program:?}"))?;
         if let Err(error) = job.assign(&child) {
+            let _ = child.start_kill();
+            return Err(error);
+        }
+        let process_id = child
+            .id()
+            .context("suspended Windows child has no process id")?;
+        if let Err(error) = resume_suspended_process(process_id) {
+            drop(job);
             let _ = child.start_kill();
             return Err(error);
         }
@@ -215,7 +272,7 @@ impl WindowsProcessRunner {
 
 #[cfg(test)]
 mod tests {
-    use super::WindowsProcessRunner;
+    use super::{CREATE_NO_WINDOW, CREATE_SUSPENDED, WINDOWS_CREATION_FLAGS, WindowsProcessRunner};
     use std::time::Duration;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
@@ -224,6 +281,8 @@ mod tests {
 
     #[tokio::test]
     async fn zombie_runner_covers_success_failure_and_timeout() {
+        assert_eq!(WINDOWS_CREATION_FLAGS & CREATE_NO_WINDOW, CREATE_NO_WINDOW);
+        assert_eq!(WINDOWS_CREATION_FLAGS & CREATE_SUSPENDED, CREATE_SUSPENDED);
         let runner = WindowsProcessRunner::with_timeout(Duration::from_secs(2));
         let ok = runner
             .output("cmd.exe", ["/C", "echo", "rayfish"])
