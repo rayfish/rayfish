@@ -93,21 +93,24 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
 /// daemon is reachable do we fall back to installing/starting the system
 /// service, which requires root.
 pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
+    #[cfg(windows)]
+    let mut operator_claim = WindowsOperatorClaim::begin()?;
     if let Ok(mut stream) = ipc::connect().await {
-        #[cfg(windows)]
-        let claimed_sid = claim_windows_operator_for_up()?;
         ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
         match ipc::recv(&mut stream).await? {
-            ipc::IpcMessage::Ok { message } => println!("{message}"),
-            ipc::IpcMessage::Error { message } => {
+            ipc::IpcMessage::Ok { message } => {
                 #[cfg(windows)]
-                compensate_windows_operator_claim(claimed_sid.as_deref());
-                print_error("error", &message, None)
+                operator_claim.commit();
+                println!("{message}")
             }
+            ipc::IpcMessage::Error { message } => print_error("error", &message, None),
             other => eprintln!("Unexpected response: {other:?}"),
         }
         return Ok(());
     }
+
+    #[cfg(windows)]
+    drop(operator_claim);
 
     // No daemon reachable, install and start the system service (needs root).
     #[cfg(unix)]
@@ -130,7 +133,7 @@ pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
 /// instead of seeing a cheerful "started" followed by a dead `ray status`.
 pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Result<()> {
     #[cfg(windows)]
-    let claimed_sid = claim_windows_operator_for_up()?;
+    let mut operator_claim = WindowsOperatorClaim::begin()?;
     ensure_service_installed()?;
 
     #[cfg(target_os = "linux")]
@@ -174,12 +177,12 @@ pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Resul
         Some(mut stream) => {
             ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
             match ipc::recv(&mut stream).await? {
-                ipc::IpcMessage::Ok { message } => println!("rayfish service started. {message}"),
-                ipc::IpcMessage::Error { message } => {
+                ipc::IpcMessage::Ok { message } => {
                     #[cfg(windows)]
-                    compensate_windows_operator_claim(claimed_sid.as_deref());
-                    print_error("error", &message, None)
+                    operator_claim.commit();
+                    println!("rayfish service started. {message}")
                 }
+                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
                 other => eprintln!("Unexpected response: {other:?}"),
             }
             // We're root here (installing the service). Grant the invoking user
@@ -189,6 +192,8 @@ pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Resul
             Ok(())
         }
         None => {
+            #[cfg(windows)]
+            drop(operator_claim);
             eprintln!(
                 "rayfish service was started but the daemon never became reachable.\n\
                  It likely crashed on startup — a common cause is another VPN (e.g. Tailscale)\n\
@@ -245,21 +250,36 @@ pub(crate) fn require_root() -> Result<()> {
 }
 
 #[cfg(windows)]
-fn claim_windows_operator_for_up() -> Result<Option<String>> {
-    if !rayfish::windows_identity::is_current_process_elevated_admin() {
-        return Ok(None);
-    }
-    let sid = rayfish::windows_identity::current_user_sid()
-        .context("elevated Windows process has no user SID")?;
-    Ok(config::claim_operator_sid(&sid)?.then_some(sid))
+struct WindowsOperatorClaim {
+    sid: Option<String>,
 }
 
 #[cfg(windows)]
-fn compensate_windows_operator_claim(sid: Option<&str>) {
-    if let Some(sid) = sid
-        && let Err(error) = config::remove_operator_sid_if_matches(sid)
-    {
-        tracing::error!(%error, "failed to compensate Windows operator claim");
+impl WindowsOperatorClaim {
+    fn begin() -> Result<Self> {
+        if !rayfish::windows_identity::is_current_process_elevated_admin() {
+            return Ok(Self { sid: None });
+        }
+        let sid = rayfish::windows_identity::current_user_sid()
+            .context("elevated Windows process has no user SID")?;
+        Ok(Self {
+            sid: config::claim_operator_sid(&sid)?.then_some(sid),
+        })
+    }
+
+    fn commit(&mut self) {
+        self.sid = None;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsOperatorClaim {
+    fn drop(&mut self) {
+        if let Some(sid) = self.sid.take()
+            && let Err(error) = config::remove_operator_sid_if_matches(&sid)
+        {
+            tracing::error!(%error, "failed to compensate Windows operator claim");
+        }
     }
 }
 

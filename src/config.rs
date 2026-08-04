@@ -752,8 +752,10 @@ pub fn config_dir() -> Result<PathBuf> {
 const OPERATOR_SID_FILE: &str = "operator.sid";
 
 #[cfg(windows)]
-pub fn operator_sid() -> Result<Option<String>> {
-    let path = config_dir()?.join(OPERATOR_SID_FILE);
+const OPERATOR_LOCK_FILE: &str = "operator.sid.lock";
+
+#[cfg(windows)]
+fn operator_sid_at(path: &Path) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -762,9 +764,22 @@ pub fn operator_sid() -> Result<Option<String>> {
 }
 
 #[cfg(windows)]
+fn lock_operator(dir: &Path) -> Result<crate::windows_security::OperatorFileLock> {
+    crate::windows_security::lock_operator_file(&dir.join(OPERATOR_LOCK_FILE))
+}
+
+#[cfg(windows)]
+pub fn operator_sid() -> Result<Option<String>> {
+    let path = config_dir()?.join(OPERATOR_SID_FILE);
+    operator_sid_at(&path)
+}
+
+#[cfg(windows)]
 pub fn set_operator_sid(sid: &str) -> Result<()> {
     crate::windows_security::pipe_descriptor(Some(sid))?;
-    let path = config_dir()?.join(OPERATOR_SID_FILE);
+    let dir = config_dir()?;
+    let _lock = lock_operator(&dir)?;
+    let path = dir.join(OPERATOR_SID_FILE);
     write_atomic(&path, &format!("{sid}\n"), true)
 }
 
@@ -773,11 +788,12 @@ pub fn set_operator_sid(sid: &str) -> Result<()> {
 #[cfg(windows)]
 pub fn claim_operator_sid(sid: &str) -> Result<bool> {
     crate::windows_security::pipe_descriptor(Some(sid))?;
-    if operator_sid()?.is_some() {
+    let dir = config_dir()?;
+    let _lock = lock_operator(&dir)?;
+    let path = dir.join(OPERATOR_SID_FILE);
+    if operator_sid_at(&path)?.is_some() {
         return Ok(false);
     }
-    let dir = config_dir()?;
-    let path = dir.join(OPERATOR_SID_FILE);
     if path.exists() && std::fs::metadata(&path)?.len() == 0 {
         std::fs::remove_file(&path).context("remove incomplete operator SID claim")?;
     }
@@ -808,11 +824,33 @@ pub fn claim_operator_sid(sid: &str) -> Result<bool> {
 /// recovery that changed the operator is never removed.
 #[cfg(windows)]
 pub fn remove_operator_sid_if_matches(sid: &str) -> Result<bool> {
-    if operator_sid()?.as_deref() != Some(sid) {
+    let dir = config_dir()?;
+    let _lock = lock_operator(&dir)?;
+    let path = dir.join(OPERATOR_SID_FILE);
+    if operator_sid_at(&path)?.as_deref() != Some(sid) {
         return Ok(false);
     }
-    let path = config_dir()?.join(OPERATOR_SID_FILE);
     std::fs::remove_file(path).context("remove failed operator SID claim")?;
+    Ok(true)
+}
+
+/// Restore an operator value only if nobody replaced the value being
+/// compensated. Used by service-restart recovery to avoid stale rollback.
+#[cfg(windows)]
+pub fn replace_operator_sid_if_matches(expected: &str, replacement: Option<&str>) -> Result<bool> {
+    if let Some(sid) = replacement {
+        crate::windows_security::pipe_descriptor(Some(sid))?;
+    }
+    let dir = config_dir()?;
+    let _lock = lock_operator(&dir)?;
+    let path = dir.join(OPERATOR_SID_FILE);
+    if operator_sid_at(&path)?.as_deref() != Some(expected) {
+        return Ok(false);
+    }
+    match replacement {
+        Some(sid) => write_atomic(&path, &format!("{sid}\n"), true)?,
+        None => std::fs::remove_file(&path).context("remove compensated operator SID")?,
+    }
     Ok(true)
 }
 

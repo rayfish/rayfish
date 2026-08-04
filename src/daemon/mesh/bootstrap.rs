@@ -820,14 +820,18 @@ async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()>
             result = server.connect() => {
                 result.context("accept IPC named pipe client")?;
                 let client = server;
-                // Keep the old standby alive until two replacement instances
-                // have been created with the latest operator ACL. This removes
-                // the zero-listener window and refreshes ACLs after bootstrap.
-                let replacement = create_named_pipe(&pipe_name, false)?;
-                let replacement_standby = create_named_pipe(&pipe_name, false)?;
-                drop(standby);
-                server = replacement;
-                standby = replacement_standby;
+                server = create_named_pipe(&pipe_name, false)?;
+                let daemon = daemon.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_ipc_client(client, &daemon).await {
+                        tracing::debug!(error = %e, "IPC client error");
+                    }
+                });
+            }
+            result = standby.connect() => {
+                result.context("accept standby IPC named pipe client")?;
+                let client = standby;
+                standby = create_named_pipe(&pipe_name, false)?;
                 let daemon = daemon.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_ipc_client(client, &daemon).await {

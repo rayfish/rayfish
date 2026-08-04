@@ -2,31 +2,36 @@
 
 //! Win32 security descriptors used before creating privileged IPC and state.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE,
-    LocalFree,
+    ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE,
+    GetLastError, INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_ALWAYS, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
-    MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    CREATE_ALWAYS, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    OPEN_ALWAYS,
 };
 
-pub(crate) const PROTECTED_FILE_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
-pub(crate) const PROTECTED_DIR_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+pub(crate) const PROTECTED_FILE_SDDL: &str = "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+pub(crate) const PROTECTED_DIR_SDDL: &str = "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
 pub(crate) struct OwnedSecurityDescriptor(PSECURITY_DESCRIPTOR);
 
@@ -67,6 +72,17 @@ impl OwnedSecurityDescriptor {
             unsafe { GetSecurityDescriptorDacl(self.0, &mut present, &mut dacl, &mut defaulted) };
         anyhow::ensure!(ok != 0 && present != 0, "security descriptor has no DACL");
         Ok(dacl)
+    }
+
+    fn owner(&self) -> Result<PSID> {
+        let mut owner = std::ptr::null_mut();
+        let mut defaulted = 0;
+        let ok = unsafe { GetSecurityDescriptorOwner(self.0, &mut owner, &mut defaulted) };
+        anyhow::ensure!(
+            ok != 0 && !owner.is_null(),
+            "security descriptor has no owner"
+        );
+        Ok(owner)
     }
 }
 
@@ -126,6 +142,40 @@ pub(crate) fn create_protected_file(path: &Path) -> Result<File> {
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 
+pub(crate) struct OperatorFileLock {
+    _file: File,
+}
+
+pub(crate) fn lock_operator_file(path: &Path) -> Result<OperatorFileLock> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let mut descriptor = OwnedSecurityDescriptor::from_sddl(PROTECTED_FILE_SDDL)?;
+        let attrs = descriptor.attributes();
+        let handle = unsafe {
+            CreateFileW(
+                wide(path.as_os_str()).as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                &attrs,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE {
+            let file = unsafe { File::from_raw_handle(handle) };
+            protect_file(path)?;
+            return Ok(OperatorFileLock { _file: file });
+        }
+        let error = unsafe { GetLastError() };
+        if error != ERROR_SHARING_VIOLATION || std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::from_raw_os_error(error as i32))
+                .with_context(|| format!("locking {}", path.display()));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn protect_file(path: &Path) -> Result<()> {
     protect_path(path, PROTECTED_FILE_SDDL)
@@ -154,8 +204,27 @@ pub(crate) fn move_no_replace(from: &Path, to: &Path) -> Result<bool> {
 
 #[cfg_attr(test, allow(dead_code))]
 fn protect_path(path: &Path, sddl: &str) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {} before ACL repair", path.display()))?;
+    validate_config_file_attributes(metadata.file_attributes(), path)?;
     let descriptor = OwnedSecurityDescriptor::from_sddl(sddl)?;
-    let result = unsafe {
+    let owner_result = unsafe {
+        SetNamedSecurityInfoW(
+            wide(path.as_os_str()).as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            descriptor.owner()?,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    anyhow::ensure!(
+        owner_result == 0,
+        "failed to set trusted owner on {}: {owner_result}",
+        path.display()
+    );
+    let dacl_result = unsafe {
         SetNamedSecurityInfoW(
             wide(path.as_os_str()).as_ptr() as *mut u16,
             SE_FILE_OBJECT,
@@ -167,8 +236,89 @@ fn protect_path(path: &Path, sddl: &str) -> Result<()> {
         )
     };
     anyhow::ensure!(
-        result == 0,
-        "failed to protect {}: {result}",
+        dacl_result == 0,
+        "failed to protect {}: {dacl_result}",
+        path.display()
+    );
+    verify_path_security(path, sddl.contains("OICI"))
+}
+
+fn verify_path_security(path: &Path, directory: bool) -> Result<()> {
+    let mut owner = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    let result = unsafe {
+        GetNamedSecurityInfoW(
+            wide(path.as_os_str()).as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    anyhow::ensure!(
+        result == 0 && !descriptor.is_null(),
+        "failed to verify {}: {result}",
+        path.display()
+    );
+    let mut text = std::ptr::null_mut();
+    let mut text_len = 0;
+    let ok = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            1,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut text,
+            &mut text_len,
+        )
+    };
+    let verification = (|| -> Result<()> {
+        anyhow::ensure!(ok != 0 && !text.is_null(), "failed to render final ACL");
+        let actual = OsString::from_wide(unsafe {
+            std::slice::from_raw_parts(text, text_len.saturating_sub(1) as usize)
+        })
+        .to_string_lossy()
+        .into_owned();
+        anyhow::ensure!(
+            actual.contains("O:SY"),
+            "config owner is not LocalSystem: {actual}"
+        );
+        anyhow::ensure!(
+            actual.contains("D:P"),
+            "config DACL is not protected: {actual}"
+        );
+        anyhow::ensure!(
+            actual.matches("(A;").count() == 2,
+            "config DACL has unexpected ACEs: {actual}"
+        );
+        anyhow::ensure!(
+            actual.contains(";;;SY)") && actual.contains(";;;BA)"),
+            "config DACL lacks trusted principals: {actual}"
+        );
+        if directory {
+            anyhow::ensure!(
+                actual.matches("OICI").count() == 2,
+                "config directory ACEs do not inherit: {actual}"
+            );
+        }
+        Ok(())
+    })();
+    unsafe {
+        if !text.is_null() {
+            LocalFree(text.cast());
+        }
+        LocalFree(descriptor.cast());
+    }
+    verification
+}
+
+fn validate_config_file_attributes(attributes: u32, path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        "refusing to secure reparse-point config path {}",
         path.display()
     );
     Ok(())
@@ -181,7 +331,7 @@ mod tests {
     #[test]
     fn descriptors_are_protected_and_exclude_regular_users() {
         for sddl in [PROTECTED_FILE_SDDL, PROTECTED_DIR_SDDL] {
-            assert!(sddl.starts_with("D:P"));
+            assert!(sddl.starts_with("O:SYD:P"));
             assert!(sddl.contains(";;;SY)"));
             assert!(sddl.contains(";;;BA)"));
             assert!(!sddl.contains(";;;BU)"));
@@ -194,5 +344,12 @@ mod tests {
         pipe_descriptor(None).unwrap();
         pipe_descriptor(Some("S-1-5-18")).unwrap();
         assert!(pipe_descriptor(Some("not-a-sid")).is_err());
+    }
+
+    #[test]
+    fn zombie_reparse_policy_fails_closed() {
+        let path = Path::new(r"C:\ProgramData\rayfish");
+        assert!(validate_config_file_attributes(0, path).is_ok());
+        assert!(validate_config_file_attributes(FILE_ATTRIBUTE_REPARSE_POINT, path).is_err());
     }
 }
