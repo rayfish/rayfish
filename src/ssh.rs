@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Embedded mesh SSH server (`ray firewall ssh on`), Tailscale-style.
 //!
 //! The daemon runs a small SSH server bound to each of this node's mesh IPs on

@@ -11,6 +11,8 @@
 //! [`android_tun`], and everything else is a thin map from the core's
 //! `IpcMessage` results to the UniFFI records below.
 
+#![cfg(target_os = "android")]
+
 mod android_tun;
 mod diag;
 

@@ -73,6 +73,12 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(windows)]
+    {
+        rayfish::windows_service::install(std::path::Path::new(&exe))?;
+        return Ok(());
+    }
+
     #[allow(unreachable_code)]
     {
         anyhow::bail!("system service not supported on this platform");
@@ -87,17 +93,27 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
 /// daemon is reachable do we fall back to installing/starting the system
 /// service, which requires root.
 pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
+    #[cfg(windows)]
+    let mut operator_claim = WindowsOperatorClaim::begin()?;
     if let Ok(mut stream) = ipc::connect().await {
         ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
         match ipc::recv(&mut stream).await? {
-            ipc::IpcMessage::Ok { message } => println!("{message}"),
+            ipc::IpcMessage::Ok { message } => {
+                #[cfg(windows)]
+                operator_claim.commit();
+                println!("{message}")
+            }
             ipc::IpcMessage::Error { message } => print_error("error", &message, None),
             other => eprintln!("Unexpected response: {other:?}"),
         }
         return Ok(());
     }
 
+    #[cfg(windows)]
+    drop(operator_claim);
+
     // No daemon reachable, install and start the system service (needs root).
+    #[cfg(unix)]
     if unsafe { libc::geteuid() } != 0 {
         eprintln!(
             "rayfish service is not running. Start it with: sudo ray up\n\
@@ -116,6 +132,8 @@ pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
 /// VPN), we surface the tail of its log so the user knows what went wrong
 /// instead of seeing a cheerful "started" followed by a dead `ray status`.
 pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Result<()> {
+    #[cfg(windows)]
+    let mut operator_claim = WindowsOperatorClaim::begin()?;
     ensure_service_installed()?;
 
     #[cfg(target_os = "linux")]
@@ -141,7 +159,12 @@ pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Resul
         run_cmd("launchctl", &["load", "-w", path]);
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        rayfish::windows_service::start()?;
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         anyhow::bail!("system service not supported on this platform");
     }
@@ -154,7 +177,11 @@ pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Resul
         Some(mut stream) => {
             ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
             match ipc::recv(&mut stream).await? {
-                ipc::IpcMessage::Ok { message } => println!("rayfish service started. {message}"),
+                ipc::IpcMessage::Ok { message } => {
+                    #[cfg(windows)]
+                    operator_claim.commit();
+                    println!("rayfish service started. {message}")
+                }
                 ipc::IpcMessage::Error { message } => print_error("error", &message, None),
                 other => eprintln!("Unexpected response: {other:?}"),
             }
@@ -165,6 +192,8 @@ pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Resul
             Ok(())
         }
         None => {
+            #[cfg(windows)]
+            drop(operator_claim);
             eprintln!(
                 "rayfish service was started but the daemon never became reachable.\n\
                  It likely crashed on startup — a common cause is another VPN (e.g. Tailscale)\n\
@@ -199,7 +228,17 @@ pub(crate) async fn grant_operator_to_invoking_user() {
 
 /// Ensure the process is running as root for service-manager operations.
 /// Prints a clear `sudo` hint and exits non-zero otherwise.
+#[allow(unreachable_code)]
 pub(crate) fn require_root() -> Result<()> {
+    #[cfg(windows)]
+    {
+        anyhow::ensure!(
+            rayfish::windows_identity::is_current_process_elevated_admin(),
+            "this command requires an elevated Administrator terminal"
+        );
+        return Ok(());
+    }
+    #[cfg(unix)]
     if unsafe { libc::geteuid() } != 0 {
         eprintln!(
             "this command manages the system service and needs root.\n\
@@ -208,6 +247,40 @@ pub(crate) fn require_root() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsOperatorClaim {
+    sid: Option<String>,
+}
+
+#[cfg(windows)]
+impl WindowsOperatorClaim {
+    fn begin() -> Result<Self> {
+        if !rayfish::windows_identity::is_current_process_elevated_admin() {
+            return Ok(Self { sid: None });
+        }
+        let sid = rayfish::windows_identity::current_user_sid()
+            .context("elevated Windows process has no user SID")?;
+        Ok(Self {
+            sid: config::claim_operator_sid(&sid)?.then_some(sid),
+        })
+    }
+
+    fn commit(&mut self) {
+        self.sid = None;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsOperatorClaim {
+    fn drop(&mut self) {
+        if let Some(sid) = self.sid.take()
+            && let Err(error) = config::remove_operator_sid_if_matches(&sid)
+        {
+            tracing::error!(%error, "failed to compensate Windows operator claim");
+        }
+    }
 }
 
 /// `ray install`: install the system service if needed (or refresh an existing
@@ -243,6 +316,10 @@ pub(crate) fn service_unit_exists() -> bool {
     {
         return Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist").exists();
     }
+    #[cfg(windows)]
+    {
+        return rayfish::windows_service::exists();
+    }
     #[allow(unreachable_code)]
     false
 }
@@ -258,7 +335,10 @@ pub(crate) async fn restart_service_and_wait() -> Result<()> {
     #[cfg(target_os = "macos")]
     run_cmd("launchctl", &["kickstart", "-k", "system/com.rayfish.vpn"]);
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    rayfish::windows_service::stop().and_then(|_| rayfish::windows_service::start())?;
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     anyhow::bail!("system service not supported on this platform");
 
     match wait_for_daemon(DAEMON_REACHABLE_TIMEOUT).await {
@@ -306,7 +386,10 @@ pub(crate) async fn cmd_stop() -> Result<()> {
         &["unload", "/Library/LaunchDaemons/com.rayfish.vpn.plist"],
     );
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    rayfish::windows_service::stop()?;
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     anyhow::bail!("system service not supported on this platform");
 
     println!("rayfish service stopped.");
@@ -333,7 +416,10 @@ pub(crate) async fn cmd_start() -> Result<()> {
         &["load", "-w", "/Library/LaunchDaemons/com.rayfish.vpn.plist"],
     );
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    rayfish::windows_service::start()?;
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     anyhow::bail!("system service not supported on this platform");
 
     match wait_for_daemon(DAEMON_REACHABLE_TIMEOUT).await {

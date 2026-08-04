@@ -144,10 +144,6 @@ semver = "1"
 # Use the `ring` crypto backend (already in the tree via iroh) instead of the
 # default `aws-lc-rs`, whose C build breaks cross-compilation (`just cross`).
 russh = { version = "0.61.2", default-features = false, features = ["ring", "flate2"], optional = true }
-# PTY allocation + login-shell spawning for SSH sessions (async/tokio).
-pty-process = { version = "0.5", features = ["async"], optional = true }
-# getpwnam-style passwd lookup to resolve the requested SSH unix user.
-uzers = { version = "0.12", optional = true }
 # Build the mesh SSH listener socket with SO_REUSEADDR/SO_REUSEPORT so binding
 # a specific mesh IP's port 22 coexists with a host sshd on 0.0.0.0:22.
 socket2 = { version = "0.6", features = ["all"] }
@@ -184,9 +180,28 @@ inotify = { version = "0.11", default-features = false, features = ["stream"] }
 system-configuration = "0.7"
 core-foundation = "0.9"
 
+[target.'cfg(unix)'.dependencies]
+# PTY allocation + passwd lookup are Unix-only SSH shell dependencies.
+pty-process = { version = "0.5", features = ["async"], optional = true }
+uzers = { version = "0.12", optional = true }
+
 [target.'cfg(windows)'.dependencies]
 # Enables ANSI escape processing on legacy Windows consoles (no-op on modern terminals).
 enable-ansi-support = "0.3"
+windows-service = "0.8.1"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [patch.crates-io]
 # iroh fork carrying two rayfish features on the `rayfish-integration` branch:

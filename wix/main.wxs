@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+  <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+  <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <?ifndef ProductVersion ?>
+    <?define ProductVersion = "0.0.0" ?>
+  <?endif ?>
+  <?ifndef ReleaseIdentity ?>
+    <?define ReleaseIdentity = "$(var.ProductVersion)" ?>
+  <?endif ?>
+  <?ifndef ReleaseChannel ?>
+    <?define ReleaseChannel = "stable" ?>
+  <?endif ?>
+  <Product Id="*" Name="Rayfish" Language="1033" Manufacturer="Rayfish"
+           Version="$(var.ProductVersion)" UpgradeCode="0fef36a5-5b12-45d3-a2d2-e10d3770d6f8">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer Rayfish version is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Feature Id="ProductFeature" Title="Rayfish" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+  </Product>
+
+  <Fragment>
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="$(var.PlatformProgramFilesFolder)">
+        <Directory Id="INSTALLFOLDER" Name="Rayfish" />
+      </Directory>
+    </Directory>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="RayfishExecutable" Guid="*">
+        <File Id="RayExe" Source="$(var.CargoTargetBinDir)\ray.exe" KeyPath="yes" />
+        <ServiceInstall Id="RayfishServiceInstall" Type="ownProcess" Name="rayfish"
+                        DisplayName="Rayfish Mesh VPN" Description="Rayfish mesh VPN daemon"
+                        Start="auto" ErrorControl="normal" Account="LocalSystem"
+                        Arguments="daemon" />
+        <!-- The first elevated `ray up` records the invoking operator SID before start. -->
+        <ServiceControl Id="RayfishServiceControl" Name="rayfish"
+                        Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+      </Component>
+      <Component Id="WintunLibrary" Guid="*">
+        <File Id="WintunDll" Source="$(var.CargoTargetBinDir)\wintun.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="ReleaseIdentityRegistry" Guid="*" Win64="yes">
+        <RegistryValue Root="HKLM" Key="Software\Rayfish" Name="ReleaseIdentity"
+                       Type="string" Value="$(var.ReleaseIdentity)" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="Software\Rayfish" Name="Channel"
+                       Type="string" Value="$(var.ReleaseChannel)" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

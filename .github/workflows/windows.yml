@@ -1,0 +1,66 @@
+name: Windows
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "windows-ci"
+          cache-on-failure: true
+      - name: Cross-target compile
+        run: cargo check --locked --target x86_64-pc-windows-msvc --features desktop --bin ray
+      - name: Host regression tests
+        run: cargo test --workspace --locked
+      - name: Windows contract tests
+        run: cargo test --test windows_contracts --locked
+      - name: Clippy quality gate
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  package:
+    if: ${{ vars.RAYFISH_WINDOWS_PACKAGING == 'true' }}
+    runs-on: windows-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "windows-package"
+          cache-on-failure: true
+      - name: Install WiX 3
+        shell: pwsh
+        run: |
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            choco install wixtoolset --version=3.14.1.20250415 -y --no-progress
+          }
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            throw 'WiX candle.exe was not found after installation.'
+          }
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version 0.3.9 --locked
+      - name: Build MSI and sidecars
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq 'rayfish' | Select-Object -First 1).version
+          ./scripts/build-windows-msi.ps1 -Version $version -ReleaseIdentity $version -Channel stable -OutputPath "$env:RUNNER_TEMP\ray-windows-x86_64.msi"
+      - name: Upload MSI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ray-windows-x86_64-msi
+          path: ${{ runner.temp }}/ray-windows-x86_64.msi*
+          if-no-files-found: error

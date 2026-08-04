@@ -2,9 +2,8 @@ name: Nightly
 
 # Rolling pre-release built from every push to master. Moves the `nightly` tag
 # to the new commit, recreates the `nightly` pre-release, and overwrites its
-# Linux + macOS binaries. Consumed by `ray update --nightly`, which compares the
-# published checksum against the running binary (not the version) to decide
-# whether to swap — so a shared `0.x.y` across nightlies is fine.
+# Linux, macOS, Android, and Windows assets. Consumed by `ray update --nightly`,
+# which compares checksums for binaries and the published version manifest for MSI.
 on:
   push:
     branches:
@@ -141,6 +140,57 @@ jobs:
           files: |
             ${{ matrix.name }}
             ${{ matrix.name }}.sha256
+
+  windows:
+    needs: roll-tag
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-x86_64-pc-windows-msvc"
+          cache-on-failure: true
+
+      - name: Install WiX 3
+        shell: pwsh
+        run: |
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            choco install wixtoolset --version=3.14.1.20250415 -y --no-progress
+          }
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            throw 'WiX candle.exe was not found after installation.'
+          }
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version 0.3.9 --locked
+
+      - name: Build Windows MSI
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $base = ($metadata.packages | Where-Object name -eq 'rayfish' | Select-Object -First 1).version
+          $identity = "${base}-nightly.$env:GITHUB_RUN_NUMBER+${{ needs.roll-tag.outputs.sha }}"
+          ./scripts/build-windows-msi.ps1 -Version $base -ReleaseIdentity $identity -Channel nightly -OutputPath "$env:RUNNER_TEMP\ray-windows-x86_64.msi"
+
+      - name: Upload Windows nightly assets
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: nightly
+          files: |
+            ${{ runner.temp }}/ray-windows-x86_64.msi
+            ${{ runner.temp }}/ray-windows-x86_64.msi.sha256
+            ${{ runner.temp }}/ray-windows-x86_64.msi.version
 
   android:
     needs: roll-tag
