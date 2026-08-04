@@ -295,9 +295,11 @@ fn ps_quote(value: &str) -> String {
 #[cfg(windows)]
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 struct WindowsNrptRuleSnapshot {
+    name: String,
     display_name: String,
     namespace: Vec<String>,
     name_servers: Vec<String>,
+    comment: Option<String>,
 }
 
 #[cfg(windows)]
@@ -310,6 +312,10 @@ struct WindowsDnsSnapshot {
 
 #[cfg(windows)]
 static WINDOWS_DNS_TRANSACTION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(windows)]
+static WINDOWS_DNS_TXN_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 #[cfg(windows)]
 fn ps_array(values: &[String]) -> String {
@@ -325,42 +331,126 @@ fn ps_array(values: &[String]) -> String {
 
 #[cfg(windows)]
 fn windows_dns_snapshot_script() -> &'static str {
-    "$ErrorActionPreference='Stop'; $statePath='HKLM:\\SOFTWARE\\Rayfish'; $marker=$null; if (Test-Path $statePath) { $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }; [pscustomobject]@{ nrpt_rules=@(Get-DnsClientNrptRule | Where-Object { $_.DisplayName -like 'rayfish:*' } | ForEach-Object { [pscustomobject]@{ display_name=$_.DisplayName; namespace=@($_.Namespace); name_servers=@($_.NameServers) } }); suffix_search_list=@((Get-DnsClientGlobalSetting).SuffixSearchList); managed_suffixes=if ($null -eq $marker) { $null } else { @($marker.ManagedDnsSuffixes) } } | ConvertTo-Json -Compress -Depth 5"
+    "$ErrorActionPreference='Stop'; $statePath='HKLM:\\SOFTWARE\\Rayfish'; $marker=$null; if (Test-Path $statePath) { $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }; [pscustomobject]@{ nrpt_rules=@(Get-DnsClientNrptRule | Where-Object { $_.DisplayName -like 'rayfish:*' } | ForEach-Object { [pscustomobject]@{ name=$_.Name; display_name=$_.DisplayName; namespace=@($_.Namespace); name_servers=@($_.NameServers); comment=$_.Comment } }); suffix_search_list=@((Get-DnsClientGlobalSetting).SuffixSearchList); managed_suffixes=if ($null -eq $marker) { $null } else { @($marker.ManagedDnsSuffixes) } } | ConvertTo-Json -Compress -Depth 5"
 }
 
 #[cfg(windows)]
-fn windows_dns_reconcile_script(rayfish_domains: &[String]) -> String {
+fn next_windows_dns_transaction_id() -> String {
+    let sequence = WINDOWS_DNS_TXN_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("rayfish-txn-{}-{sequence}", std::process::id())
+}
+
+#[cfg(windows)]
+fn next_managed_suffixes(snapshot: &WindowsDnsSnapshot, desired: &[String]) -> Vec<String> {
+    let prior = snapshot.managed_suffixes.as_deref().unwrap_or_default();
+    desired
+        .iter()
+        .filter(|domain| prior.contains(domain) || !snapshot.suffix_search_list.contains(domain))
+        .cloned()
+        .collect()
+}
+
+#[cfg(windows)]
+fn touched_rule_displays(
+    snapshot: &WindowsDnsSnapshot,
+    desired: &[String],
+) -> std::collections::BTreeSet<String> {
+    let desired_set = desired
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut touched = snapshot
+        .nrpt_rules
+        .iter()
+        .filter_map(|rule| {
+            let domain = rule.display_name.strip_prefix("rayfish:")?;
+            (!desired_set.contains(domain)).then(|| rule.display_name.clone())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    for domain in desired {
+        let display = format!("rayfish:{domain}");
+        let rules = snapshot
+            .nrpt_rules
+            .iter()
+            .filter(|rule| rule.display_name == display)
+            .collect::<Vec<_>>();
+        let namespace = format!(".{domain}");
+        let exact = rules.len() == 1
+            && rules[0].namespace.len() == 1
+            && rules[0].namespace[0] == namespace
+            && rules[0].name_servers.len() == 1
+            && rules[0].name_servers[0] == RESOLVER_IP;
+        if !exact {
+            touched.insert(display);
+        }
+    }
+    touched
+}
+
+#[cfg(windows)]
+fn windows_dns_reconcile_script(
+    rayfish_domains: &[String],
+    managed_suffixes: &[String],
+    transaction_id: &str,
+) -> String {
     let desired = ps_array(rayfish_domains);
+    let next_managed = ps_array(managed_suffixes);
+    let transaction_id = ps_quote(transaction_id);
     format!(
-        "$statePath='HKLM:\\SOFTWARE\\Rayfish'; $desired={desired}; $current=@((Get-DnsClientGlobalSetting).SuffixSearchList); $marker=$null; if (Test-Path $statePath) {{ $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }}; $previousManaged=if ($null -eq $marker) {{ @() }} else {{ @($marker.ManagedDnsSuffixes) }}; $foreign=@($current | Where-Object {{ $previousManaged -notcontains $_ }}); $next=@($foreign + $desired | Select-Object -Unique); $owned=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }}); foreach ($rule in $owned) {{ $domain=$rule.DisplayName.Substring(8); if ($desired -notcontains $domain) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }} }}; foreach ($domain in $desired) {{ $display='rayfish:'+$domain; $namespace='.'+$domain; $matches=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -eq $display }}); $valid=@($matches | Where-Object {{ @($_.Namespace).Count -eq 1 -and @($_.Namespace)[0] -eq $namespace -and @($_.NameServers).Count -eq 1 -and @($_.NameServers)[0] -eq '{RESOLVER_IP}' }}); if ($matches.Count -ne 1 -or $valid.Count -ne 1) {{ foreach ($rule in $matches) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }}; Add-DnsClientNrptRule -Namespace $namespace -NameServers '{RESOLVER_IP}' -DisplayName $display -ErrorAction Stop }} }}; Set-DnsClientGlobalSetting -SuffixSearchList $next -ErrorAction Stop; New-Item -Path $statePath -Force -ErrorAction Stop | Out-Null; if ($desired.Count -eq 0) {{ Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }} else {{ Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -Value ([string[]]$desired) -ErrorAction Stop }}"
+        "$statePath='HKLM:\\SOFTWARE\\Rayfish'; $desired={desired}; $nextManaged={next_managed}; $txnMarker='{transaction_id}'; $current=@((Get-DnsClientGlobalSetting).SuffixSearchList); $marker=$null; if (Test-Path $statePath) {{ $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }}; $previousManaged=if ($null -eq $marker) {{ @() }} else {{ @($marker.ManagedDnsSuffixes) }}; $foreign=@($current | Where-Object {{ $previousManaged -notcontains $_ }}); $next=@($foreign + $desired | Select-Object -Unique); $owned=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }}); foreach ($rule in $owned) {{ $domain=$rule.DisplayName.Substring(8); if ($desired -notcontains $domain) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }} }}; foreach ($domain in $desired) {{ $display='rayfish:'+$domain; $namespace='.'+$domain; $matches=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -eq $display }}); $valid=@($matches | Where-Object {{ @($_.Namespace).Count -eq 1 -and @($_.Namespace)[0] -eq $namespace -and @($_.NameServers).Count -eq 1 -and @($_.NameServers)[0] -eq '{RESOLVER_IP}' }}); if ($matches.Count -ne 1 -or $valid.Count -ne 1) {{ foreach ($rule in $matches) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }}; Add-DnsClientNrptRule -Namespace $namespace -NameServers '{RESOLVER_IP}' -DisplayName $display -Comment $txnMarker -ErrorAction Stop }} }}; New-Item -Path $statePath -Force -ErrorAction Stop | Out-Null; Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixTransaction -Value $txnMarker -ErrorAction Stop; if ($nextManaged.Count -eq 0) {{ Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }} else {{ Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -Value ([string[]]$nextManaged) -ErrorAction Stop }}; Set-DnsClientGlobalSetting -SuffixSearchList $next -ErrorAction Stop; Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixTransaction -ErrorAction SilentlyContinue"
     )
 }
 
 #[cfg(windows)]
-fn windows_dns_rollback_script(snapshot: &WindowsDnsSnapshot) -> String {
-    let restore_rules = snapshot
-        .nrpt_rules
-        .iter()
-        .map(|rule| {
+fn windows_dns_rollback_script(
+    snapshot: &WindowsDnsSnapshot,
+    touched_displays: &std::collections::BTreeSet<String>,
+    transaction_managed_suffixes: &[String],
+    transaction_id: &str,
+) -> String {
+    let mut groups = std::collections::BTreeMap::<&str, Vec<&WindowsNrptRuleSnapshot>>::new();
+    for rule in &snapshot.nrpt_rules {
+        if touched_displays.contains(&rule.display_name) {
+            groups.entry(&rule.display_name).or_default().push(rule);
+        }
+    }
+    let restore_rules = groups
+        .into_iter()
+        .map(|(display, rules)| {
+            let prior_names = ps_array(
+                &rules
+                    .iter()
+                    .map(|rule| rule.name.clone())
+                    .collect::<Vec<_>>(),
+            );
+            let adds = rules
+                .into_iter()
+                .map(|rule| {
+                    let comment = rule.comment.as_deref().map_or_else(String::new, |comment| {
+                        format!(" -Comment '{}'", ps_quote(comment))
+                    });
+                    format!(
+                        "Add-DnsClientNrptRule -Namespace {} -NameServers {} -DisplayName '{}'{} -ErrorAction Stop",
+                        ps_array(&rule.namespace),
+                        ps_array(&rule.name_servers),
+                        ps_quote(&rule.display_name),
+                        comment
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
             format!(
-                "Add-DnsClientNrptRule -Namespace {} -NameServers {} -DisplayName '{}' -ErrorAction Stop",
-                ps_array(&rule.namespace),
-                ps_array(&rule.name_servers),
-                ps_quote(&rule.display_name)
+                "$priorNames={prior_names}; $current=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -eq '{}' }}); if ($current.Count -eq 0 -and $priorNames.Count -gt 0) {{ {adds} }}",
+                ps_quote(display)
             )
         })
         .collect::<Vec<_>>()
         .join("; ");
-    let marker = match &snapshot.managed_suffixes {
-        Some(values) => format!(
-            "New-Item -Path $statePath -Force -ErrorAction Stop | Out-Null; Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -Value ([string[]]{}) -ErrorAction Stop",
-            ps_array(values)
-        ),
-        None => "Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue".to_owned(),
-    };
+    let prior_managed = ps_array(snapshot.managed_suffixes.as_deref().unwrap_or_default());
+    let transaction_managed = ps_array(transaction_managed_suffixes);
+    let transaction_id = ps_quote(transaction_id);
     format!(
-        "$statePath='HKLM:\\SOFTWARE\\Rayfish'; Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }} | Remove-DnsClientNrptRule -Force -ErrorAction Stop; {restore_rules}; Set-DnsClientGlobalSetting -SuffixSearchList {} -ErrorAction Stop; {marker}",
-        ps_array(&snapshot.suffix_search_list)
+        "$ErrorActionPreference='Stop'; $statePath='HKLM:\\SOFTWARE\\Rayfish'; $txnMarker='{transaction_id}'; Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq $txnMarker }} | Remove-DnsClientNrptRule -Force -ErrorAction Stop; {restore_rules}; $txnManaged={transaction_managed}; $priorManaged={prior_managed}; $currentSuffix=@((Get-DnsClientGlobalSetting).SuffixSearchList); $foreignNow=@($currentSuffix | Where-Object {{ $txnManaged -notcontains $_ }}); $restoreSuffix=@($foreignNow + $priorManaged | Select-Object -Unique); Set-DnsClientGlobalSetting -SuffixSearchList $restoreSuffix -ErrorAction Stop; $state=if (Test-Path $statePath) {{ Get-ItemProperty -Path $statePath -ErrorAction SilentlyContinue }} else {{ $null }}; $currentManaged=if ($null -eq $state) {{ @() }} else {{ @($state.ManagedDnsSuffixes) }}; $markerIsOurs=@($currentManaged).Count -eq @($txnManaged).Count -and @($currentManaged | Where-Object {{ $txnManaged -notcontains $_ }}).Count -eq 0; if (($null -ne $state -and $state.ManagedDnsSuffixTransaction -eq $txnMarker) -or $markerIsOurs) {{ if ($priorManaged.Count -eq 0) {{ Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }} else {{ Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -Value ([string[]]$priorManaged) -ErrorAction Stop }} }}; if ($null -ne $state -and $state.ManagedDnsSuffixTransaction -eq $txnMarker) {{ Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixTransaction -ErrorAction SilentlyContinue }}"
     )
 }
 
@@ -440,10 +530,23 @@ async fn set_search_domains_windows(
     let snapshot_text = powershell_text(windows_dns_snapshot_script()).await?;
     let snapshot: WindowsDnsSnapshot =
         serde_json::from_str(&snapshot_text).context("parse Windows DNS snapshot")?;
-    let mutation = powershell_status(&windows_dns_reconcile_script(rayfish_domains)).await;
+    let transaction_id = next_windows_dns_transaction_id();
+    let managed_suffixes = next_managed_suffixes(&snapshot, rayfish_domains);
+    let touched_displays = touched_rule_displays(&snapshot, rayfish_domains);
+    let mutation = powershell_status(&windows_dns_reconcile_script(
+        rayfish_domains,
+        &managed_suffixes,
+        &transaction_id,
+    ))
+    .await;
     rollback_on_error(
         mutation,
-        powershell_status(&windows_dns_rollback_script(&snapshot)),
+        powershell_status(&windows_dns_rollback_script(
+            &snapshot,
+            &touched_displays,
+            &managed_suffixes,
+            &transaction_id,
+        )),
     )
     .await
 }
@@ -1851,14 +1954,15 @@ mod tests {
     #[test]
     fn zombie_windows_dns_reconcile_is_scoped_transactional_and_quotes_boundaries() {
         use super::{
-            WindowsDnsSnapshot, WindowsNrptRuleSnapshot, ps_quote, windows_dns_reconcile_script,
-            windows_dns_rollback_script, windows_dns_snapshot_script,
+            WindowsDnsSnapshot, WindowsNrptRuleSnapshot, next_managed_suffixes, ps_quote,
+            touched_rule_displays, windows_dns_reconcile_script, windows_dns_rollback_script,
+            windows_dns_snapshot_script,
         };
 
         assert_eq!(ps_quote(""), "");
         assert_eq!(ps_quote("O'Brien"), "O''Brien");
 
-        let zero = windows_dns_reconcile_script(&[]);
+        let zero = windows_dns_reconcile_script(&[], &[], "txn-zero");
         assert!(zero.contains("DisplayName -like 'rayfish:*'"));
         assert!(!zero.contains("Where-Object { $_.DisplayName -notlike"));
         assert!(zero.contains("ManagedDnsSuffixes"));
@@ -1866,7 +1970,11 @@ mod tests {
         assert!(windows_dns_snapshot_script().starts_with("$ErrorActionPreference='Stop';"));
         assert!(windows_dns_snapshot_script().contains("ConvertTo-Json"));
 
-        let one = windows_dns_reconcile_script(&["corp.ray".to_string()]);
+        let one = windows_dns_reconcile_script(
+            &["corp.ray".to_string()],
+            &["corp.ray".to_string()],
+            "txn-one",
+        );
         assert!(one.contains("$desired=@('corp.ray')"));
         assert!(one.contains("$matches.Count -ne 1 -or $valid.Count -ne 1"));
         assert!(one.contains("@($_.Namespace).Count -eq 1"));
@@ -1874,23 +1982,45 @@ mod tests {
         assert!(one.contains("@($_.NameServers).Count -eq 1"));
         assert!(one.contains("@($_.NameServers)[0] -eq '100.100.100.53'"));
         assert!(one.contains("foreach ($rule in $matches)"));
+        assert!(one.contains("-Comment $txnMarker"));
 
-        let many = windows_dns_reconcile_script(&["a.ray".to_string(), "O'Brian.ray".to_string()]);
+        let many = windows_dns_reconcile_script(
+            &["a.ray".to_string(), "O'Brian.ray".to_string()],
+            &["a.ray".to_string(), "O'Brian.ray".to_string()],
+            "txn-many",
+        );
         assert!(many.contains("$desired=@('a.ray','O''Brian.ray')"));
         assert!(many.contains("$display='rayfish:'+$domain"));
 
-        let rollback = windows_dns_rollback_script(&WindowsDnsSnapshot {
+        let snapshot = WindowsDnsSnapshot {
             nrpt_rules: vec![WindowsNrptRuleSnapshot {
+                name: "prior-rule-guid".to_owned(),
                 display_name: "rayfish:old.ray".to_owned(),
                 namespace: vec![".old.ray".to_owned()],
                 name_servers: vec!["100.100.100.53".to_owned()],
+                comment: Some("operator note".to_owned()),
             }],
             suffix_search_list: vec!["foreign.example".to_owned(), "old.ray".to_owned()],
             managed_suffixes: Some(vec!["old.ray".to_owned()]),
-        });
+        };
+        let touched = touched_rule_displays(&snapshot, &[]);
+        let rollback = windows_dns_rollback_script(
+            &snapshot,
+            &touched,
+            &["new.ray".to_owned()],
+            "txn-rollback",
+        );
         assert!(rollback.contains("DisplayName 'rayfish:old.ray'"));
-        assert!(rollback.contains("SuffixSearchList @('foreign.example','old.ray')"));
+        assert!(rollback.contains("Comment -eq $txnMarker"));
+        assert!(!rollback.contains("DisplayName -like 'rayfish:*'"));
+        assert!(rollback.contains("$foreignNow=@($currentSuffix | Where-Object"));
+        assert!(rollback.contains("$restoreSuffix=@($foreignNow + $priorManaged"));
+        assert!(rollback.contains("$current.Count -eq 0"));
+        assert!(rollback.contains("$priorNames=@('prior-rule-guid')"));
         assert!(rollback.contains("ManagedDnsSuffixes"));
+
+        let desired = vec!["foreign.example".to_owned(), "new.ray".to_owned()];
+        assert_eq!(next_managed_suffixes(&snapshot, &desired), vec!["new.ray"]);
     }
 
     #[cfg(windows)]
