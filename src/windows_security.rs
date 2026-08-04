@@ -6,7 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::MetadataExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -16,9 +16,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-    SetNamedSecurityInfoW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SE_FILE_OBJECT,
+    SetSecurityInfo,
 };
+#[cfg(test)]
+use windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION;
 use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
@@ -26,12 +28,15 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    OPEN_ALWAYS, OPEN_EXISTING,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
+    READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
 
 const PROTECTED_FILE_DACL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
 const PROTECTED_DIR_DACL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+const PROTECTED_DACL_SECURITY_INFO: u32 =
+    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TrustedOwner {
@@ -202,6 +207,7 @@ pub(crate) fn create_protected_new_file(path: &Path) -> Result<File> {
 /// Reopens a protected file without following a reparse point and keeps a
 /// non-delete-sharing handle alive across the privileged consumer operation.
 pub(crate) fn open_protected_file_no_follow(path: &Path) -> Result<File> {
+    protect_path_with_owner_policy(path, false, false)?;
     let handle = unsafe {
         CreateFileW(
             wide(path.as_os_str()).as_ptr(),
@@ -236,7 +242,7 @@ pub(crate) fn lock_operator_file(path: &Path) -> Result<OperatorFileLock> {
         let handle = unsafe {
             CreateFileW(
                 wide(path.as_os_str()).as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
                 0,
                 &attrs,
                 OPEN_ALWAYS,
@@ -246,6 +252,7 @@ pub(crate) fn lock_operator_file(path: &Path) -> Result<OperatorFileLock> {
         };
         if handle != INVALID_HANDLE_VALUE {
             let file = unsafe { File::from_raw_handle(handle) };
+            protect_open_handle(&file, path, false, true)?;
             verify_open_protected_file(&file, path)?;
             return Ok(OperatorFileLock { _file: file });
         }
@@ -268,7 +275,7 @@ fn verify_open_protected_file(file: &File, path: &Path) -> Result<()> {
         "protected path is not a regular file: {}",
         path.display()
     );
-    verify_path_security(path, false)
+    verify_handle_security(file, path, false)
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -299,18 +306,79 @@ pub(crate) fn move_no_replace(from: &Path, to: &Path) -> Result<bool> {
 
 #[cfg_attr(test, allow(dead_code))]
 fn protect_path(path: &Path, directory: bool) -> Result<()> {
+    protect_path_with_owner_policy(path, directory, true)
+}
+
+fn protect_path_with_owner_policy(
+    path: &Path,
+    directory: bool,
+    allow_owner_change: bool,
+) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("inspect {} before ACL repair", path.display()))?;
     validate_config_file_attributes(metadata.file_attributes(), path)?;
-    let action = owner_action(path_trusted_owner(path)?, current_trusted_owner())?;
+    let handle = open_security_handle(path, directory, allow_owner_change)?;
+    protect_open_handle(&handle, path, directory, allow_owner_change)
+}
+
+fn open_security_handle(path: &Path, directory: bool, allow_owner_change: bool) -> Result<File> {
+    let flags = FILE_ATTRIBUTE_NORMAL
+        | FILE_FLAG_OPEN_REPARSE_POINT
+        | if directory {
+            FILE_FLAG_BACKUP_SEMANTICS
+        } else {
+            0
+        };
+    let access = READ_CONTROL | WRITE_DAC | if allow_owner_change { WRITE_OWNER } else { 0 };
+    let handle = unsafe {
+        CreateFileW(
+            wide(path.as_os_str()).as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            flags,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening {} for ACL repair", path.display()));
+    }
+    let file = unsafe { File::from_raw_handle(handle) };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {} during ACL repair", path.display()))?;
+    validate_config_file_attributes(metadata.file_attributes(), path)?;
+    anyhow::ensure!(
+        metadata.is_dir() == directory,
+        "protected path type changed during ACL repair: {}",
+        path.display()
+    );
+    Ok(file)
+}
+
+fn protect_open_handle(
+    file: &File,
+    path: &Path,
+    directory: bool,
+    allow_owner_change: bool,
+) -> Result<()> {
+    let handle = file.as_raw_handle();
+    let current_owner = if allow_owner_change {
+        current_trusted_owner()
+    } else {
+        None
+    };
+    let action = owner_action(handle_trusted_owner(handle)?, current_owner)?;
     let owner = match action {
         OwnerAction::Keep(owner) | OwnerAction::Set(owner) => owner,
     };
     let descriptor = OwnedSecurityDescriptor::from_sddl(&protected_sddl(owner, directory))?;
     if matches!(action, OwnerAction::Set(_)) {
         let owner_result = unsafe {
-            SetNamedSecurityInfoW(
-                wide(path.as_os_str()).as_ptr() as *mut u16,
+            SetSecurityInfo(
+                handle,
                 SE_FILE_OBJECT,
                 OWNER_SECURITY_INFORMATION,
                 descriptor.owner()?,
@@ -326,10 +394,10 @@ fn protect_path(path: &Path, directory: bool) -> Result<()> {
         );
     }
     let dacl_result = unsafe {
-        SetNamedSecurityInfoW(
-            wide(path.as_os_str()).as_ptr() as *mut u16,
+        SetSecurityInfo(
+            handle,
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFO,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             descriptor.dacl()?,
@@ -341,15 +409,15 @@ fn protect_path(path: &Path, directory: bool) -> Result<()> {
         "failed to protect {}: {dacl_result}",
         path.display()
     );
-    verify_path_security(path, directory)
+    verify_handle_security(file, path, directory)
 }
 
-fn path_trusted_owner(path: &Path) -> Result<Option<TrustedOwner>> {
+fn handle_trusted_owner(handle: std::os::windows::io::RawHandle) -> Result<Option<TrustedOwner>> {
     let mut owner = std::ptr::null_mut();
     let mut descriptor = std::ptr::null_mut();
     let result = unsafe {
-        GetNamedSecurityInfoW(
-            wide(path.as_os_str()).as_ptr() as *mut u16,
+        GetSecurityInfo(
+            handle,
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION,
             &mut owner,
@@ -361,8 +429,7 @@ fn path_trusted_owner(path: &Path) -> Result<Option<TrustedOwner>> {
     };
     anyhow::ensure!(
         result == 0 && !descriptor.is_null() && !owner.is_null(),
-        "failed to read owner of {}: {result}",
-        path.display()
+        "failed to read config owner: {result}"
     );
     let mut text = std::ptr::null_mut();
     let converted = unsafe { ConvertSidToStringSidW(owner, &mut text) };
@@ -395,13 +462,13 @@ fn path_trusted_owner(path: &Path) -> Result<Option<TrustedOwner>> {
     parsed
 }
 
-fn verify_path_security(path: &Path, directory: bool) -> Result<()> {
+fn verify_handle_security(file: &File, path: &Path, directory: bool) -> Result<()> {
     let mut owner = std::ptr::null_mut();
     let mut dacl = std::ptr::null_mut();
     let mut descriptor = std::ptr::null_mut();
     let result = unsafe {
-        GetNamedSecurityInfoW(
-            wide(path.as_os_str()).as_ptr() as *mut u16,
+        GetSecurityInfo(
+            file.as_raw_handle(),
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut owner,
@@ -492,6 +559,22 @@ mod tests {
             assert!(!sddl.contains(";;;BU)"));
             assert!(!sddl.contains(";;;WD)"));
         }
+    }
+
+    #[test]
+    fn dacl_update_flags_disable_inheritance() {
+        assert_eq!(
+            PROTECTED_DACL_SECURITY_INFO,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+        );
+        assert_ne!(
+            PROTECTED_DACL_SECURITY_INFO & PROTECTED_DACL_SECURITY_INFORMATION,
+            0
+        );
+        assert_eq!(
+            PROTECTED_DACL_SECURITY_INFO & UNPROTECTED_DACL_SECURITY_INFORMATION,
+            0
+        );
     }
 
     #[test]
