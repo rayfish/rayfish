@@ -69,6 +69,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A saved network no longer stays dead until you restart the daemon.** If a
+  network was queued for approval while the daemon was restoring it at startup,
+  the restore gave up for good: the network stayed in your config but was never
+  connected, so peers on it were unreachable and their packets were dropped as
+  belonging to an unknown network. It now keeps retrying on a backoff, the way
+  the rest of the restore path already did for every other failure. `ray status`
+  also spells out what the `inactive` marker means (saved, not connected, peers
+  unreachable) instead of leaving it as a one-word footnote, and the daemon log
+  now records why a restore stopped rather than ending it silently.
+
 - **The Android app no longer crashes when Android restarts it in the
   background.** After the system killed the app to reclaim memory, it would
   restart the Rayfish service to put it back in standby (VPN off, files and mesh

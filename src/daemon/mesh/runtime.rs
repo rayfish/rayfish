@@ -610,9 +610,20 @@ impl NetworkRegistry {
                     tracing::info!(network = %name, ip = %my_ip, attempt, "restored member network");
                     return;
                 }
-                // Pending approval on a closed network: a settled state that no
-                // amount of retrying improves.
-                Ok(_) => return,
+                // Queued for live approval on a closed network. `TryJoin::Pending`
+                // and `dial_reconnect` both document that the caller retries until
+                // `ray accept` lets us in, so retry: settling here strands the
+                // network until someone notices and restarts the daemon.
+                Ok(TryJoin::Pending) => {
+                    tracing::warn!(network = %name, attempt, retry_in = ?delay, "restore queued for approval on a closed network, retrying");
+                }
+                // Not reachable today (a reconnect handshake only ever returns
+                // `Admitted`), and that is exactly why it must not be a silent
+                // `return`: a saved network that never registers is invisible
+                // except as a faint `inactive` marker in `ray status`.
+                Ok(TryJoin::Joined(other)) => {
+                    tracing::warn!(network = %name, attempt, response = ?other, retry_in = ?delay, "unexpected response restoring network, retrying");
+                }
                 Err(e) => {
                     // The first failure is worth flagging; the rest are just the
                     // shape of waiting for connectivity, so keep them at debug.
@@ -629,9 +640,12 @@ impl NetworkRegistry {
                 _ = tokio::time::sleep(delay) => {}
             }
 
-            // Stop quietly if the network registered by another path while we
-            // waited (an inbound handshake), or if it was left/nuked meanwhile.
+            // Stop if the network registered by another path while we waited (an
+            // inbound handshake), or if it was left/nuked meanwhile. Say so: every
+            // exit from this loop has to be greppable, otherwise a network that is
+            // saved but not live has no explanation anywhere.
             if self.networks.contains_key(&name) {
+                tracing::debug!(network = %name, attempt, "network registered by another path, ending restore");
                 return;
             }
             if let Ok(cfg) = config::load()

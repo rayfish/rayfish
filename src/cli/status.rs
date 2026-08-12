@@ -234,6 +234,18 @@ pub(crate) async fn ipc_status() -> Result<()> {
                         style::faint(&net.name),
                         style::marker("inactive")
                     );
+                    // The marker alone reads like a setting rather than a fault.
+                    // This state is always a failed restore: the network is saved
+                    // but the daemon never registered it, so peers on it are
+                    // unreachable and their packets are dropped as an unknown
+                    // network. Say that, and where the reason is.
+                    println!(
+                        "    {}",
+                        style::faint(
+                            "saved but not connected: peers on it are unreachable. \
+                             The daemon log has the reason; `ray restart` retries."
+                        )
+                    );
                 }
             }
 
