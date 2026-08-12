@@ -6,7 +6,7 @@ use std::net::Ipv4Addr;
 
 use anyhow::{bail, Context, Result};
 
-use super::{AppConfig, ServerOverride};
+use super::{AppConfig, NetworkConfig, ServerOverride};
 use crate::firewall::{Action, FirewallConfig};
 
 /// Which on-disk store backs a key, and therefore which handler serves it.
@@ -41,6 +41,9 @@ pub static KEYS: &[SettingKey] = &[
     SettingKey { name: "firewall.enabled", scope: Scope::Firewall, help: "enforce the firewall at all (on|off)" },
     SettingKey { name: "firewall.reject", scope: Scope::Firewall, help: "reply RST/unreachable instead of dropping (on|off)" },
     SettingKey { name: "firewall.default-in", scope: Scope::Firewall, help: "default action for inbound traffic (allow|deny)" },
+    SettingKey { name: "net.auto-accept-firewall", scope: Scope::Network, help: "install coordinator-suggested rules without review (on|off)" },
+    SettingKey { name: "net.auto-accept-files", scope: Scope::Network, help: "auto-accept file offers from your own devices (on|off)" },
+    SettingKey { name: "net.ephemeral-ttl", scope: Scope::Network, help: "coordinator: drop members offline longer than N seconds (>=3600, empty to disable)" },
 ];
 
 pub fn lookup(key: &str) -> Option<&'static SettingKey> {
@@ -166,6 +169,51 @@ pub fn render_firewall(cfg: &FirewallConfig, key: &str) -> Result<String> {
     Ok(out)
 }
 
+/// Minimum `net.ephemeral-ttl`. Below an hour, a laptop that closes its lid
+/// over lunch gets evicted from the roster.
+pub const EPHEMERAL_TTL_FLOOR_SECS: u64 = 3600;
+
+/// `networks/<name>.toml` (`NetworkConfig`) is a third store, distinct from
+/// `settings.toml` and `firewall.toml`. Pure over an owned `&mut
+/// NetworkConfig`: the caller persists (`config::save_network`) and applies
+/// any live re-materialization (e.g. re-installing suggested firewall rules,
+/// draining queued file offers), neither of which happens here.
+pub fn apply_network(cfg: &mut NetworkConfig, key: &str, value: &str) -> Result<()> {
+    match key {
+        "net.auto-accept-firewall" => cfg.auto_accept_firewall = parse_bool(value, false)?,
+        "net.auto-accept-files" => cfg.auto_accept_files = parse_bool(value, true)?,
+        "net.ephemeral-ttl" => {
+            let v = value.trim();
+            cfg.ephemeral_ttl_secs = if v.is_empty() {
+                None
+            } else {
+                let secs: u64 = v
+                    .parse()
+                    .with_context(|| format!("invalid ttl: {v} (expected seconds)"))?;
+                if secs < EPHEMERAL_TTL_FLOOR_SECS {
+                    bail!("ttl must be at least {EPHEMERAL_TTL_FLOOR_SECS} seconds (1 hour)");
+                }
+                Some(secs)
+            };
+        }
+        other => bail!("unknown config key: {other} ({})", key_list()),
+    }
+    Ok(())
+}
+
+pub fn render_network(cfg: &NetworkConfig, key: &str) -> Result<String> {
+    let out = match key {
+        "net.auto-accept-firewall" => on_off(cfg.auto_accept_firewall),
+        "net.auto-accept-files" => on_off(cfg.auto_accept_files),
+        "net.ephemeral-ttl" => match cfg.ephemeral_ttl_secs {
+            Some(s) => s.to_string(),
+            None => String::new(),
+        },
+        other => bail!("unknown config key: {other} ({})", key_list()),
+    };
+    Ok(out)
+}
+
 /// Parse an allow/deny value; empty resets to `default`.
 fn parse_action(value: &str, default: Action) -> Result<Action> {
     let v = value.trim();
@@ -179,7 +227,72 @@ fn parse_action(value: &str, default: Action) -> Result<Action> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use super::super::GroupMode;
+
+    fn empty_network(name: &str) -> super::super::NetworkConfig {
+        super::super::NetworkConfig {
+            name: name.to_string(),
+            group_mode: GroupMode::Open,
+            my_ip: None,
+            my_hostname: None,
+            pending_hostname: None,
+            members: vec![],
+            approved: vec![],
+            network_secret_key: None,
+            network_public_key: None,
+            transport: None,
+            auto_accept_firewall: false,
+            auto_accept_files: true,
+            admins: vec![],
+            direct: false,
+            ssh_allow: vec![],
+            aliases: BTreeMap::new(),
+            ephemeral_ttl_secs: None,
+            exit_allow: vec![],
+            exit_node_use: None,
+        }
+    }
+
+    #[test]
+    fn network_auto_accept_toggles_round_trip() {
+        let mut net = empty_network("gaming");
+        apply_network(&mut net, "net.auto-accept-firewall", "on").unwrap();
+        assert!(net.auto_accept_firewall);
+        apply_network(&mut net, "net.auto-accept-files", "off").unwrap();
+        assert!(!net.auto_accept_files);
+        // Unset returns to each key's own default, which differ.
+        apply_network(&mut net, "net.auto-accept-firewall", "").unwrap();
+        apply_network(&mut net, "net.auto-accept-files", "").unwrap();
+        assert!(!net.auto_accept_firewall);
+        assert!(net.auto_accept_files);
+    }
+
+    #[test]
+    fn ephemeral_ttl_enforces_the_one_hour_floor() {
+        let mut net = empty_network("gaming");
+        let err = apply_network(&mut net, "net.ephemeral-ttl", "600").unwrap_err();
+        assert!(err.to_string().contains("3600"), "error should name the floor: {err}");
+        assert_eq!(net.ephemeral_ttl_secs, None);
+
+        apply_network(&mut net, "net.ephemeral-ttl", "7200").unwrap();
+        assert_eq!(net.ephemeral_ttl_secs, Some(7200));
+        assert_eq!(render_network(&net, "net.ephemeral-ttl").unwrap(), "7200");
+
+        apply_network(&mut net, "net.ephemeral-ttl", "").unwrap();
+        assert_eq!(net.ephemeral_ttl_secs, None, "unset turns the policy off");
+    }
+
+    #[test]
+    fn every_registered_network_key_renders() {
+        let net = empty_network("gaming");
+        for k in keys_for(Scope::Network) {
+            render_network(&net, k.name)
+                .unwrap_or_else(|e| panic!("key {} has no render arm: {e}", k.name));
+        }
+    }
 
     #[test]
     fn lookup_finds_a_known_key_and_rejects_an_unknown_one() {
