@@ -244,7 +244,7 @@ fn validate_http_url(s: &str) -> Result<()> {
 
 /// Resolve one relay/discovery entry: the `rayfish` keyword maps to `preset`,
 /// anything else must be a valid http(s) URL (returned as-is).
-fn resolve_url_entry(entry: &str, preset: &str) -> Result<String> {
+pub(crate) fn resolve_url_entry(entry: &str, preset: &str) -> Result<String> {
     match entry {
         "rayfish" => Ok(preset.to_string()),
         other => {
@@ -287,7 +287,7 @@ pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<Ipv
 }
 
 /// Parse a comma list of entries (trimmed, empties dropped).
-fn parse_entries(value: &str) -> Vec<String> {
+pub(crate) fn parse_entries(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(|s| s.trim().to_string())
@@ -295,85 +295,16 @@ fn parse_entries(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Apply a `ray config set`/`unset` to the in-memory config. An empty value or
-/// the lone keyword `n0` resets the key to its default (iroh n0). Validates
-/// every entry, so a bad URL/IP or unknown preset is rejected before persist.
-/// The recognized `ray config` keys, for error messages. The list values
-/// (relay/discovery-dns/dns-upstreams) are set via `config set`; the on/off
-/// toggles (auto-update/on-demand) via their own `config` subcommands.
-const CONFIG_KEYS: &str = "expected relay, discovery-dns, dns-upstreams, auto-update, or on-demand";
-
 pub mod settings;
 
+/// Apply a `ray config set`/`unset` to the in-memory config. Delegates to the
+/// settings registry; kept as a thin wrapper so existing callers don't need to
+/// know about `settings::apply_global`.
 pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) -> Result<()> {
-    let entries = parse_entries(value);
-    let reset = entries.is_empty() || entries == ["n0"];
-    match key {
-        "relay" => {
-            if reset {
-                cfg.relay = ServerOverride::default();
-            } else {
-                for e in &entries {
-                    resolve_url_entry(e, RELAY_PRESET_RAYFISH)?;
-                }
-                cfg.relay = ServerOverride {
-                    servers: entries,
-                    replace,
-                };
-            }
-        }
-        "discovery-dns" => {
-            if reset {
-                cfg.discovery_dns = ServerOverride::default();
-            } else {
-                for e in &entries {
-                    resolve_url_entry(e, DISCOVERY_PRESET_RAYFISH)?;
-                }
-                cfg.discovery_dns = ServerOverride {
-                    servers: entries,
-                    replace,
-                };
-            }
-        }
-        "dns-upstreams" => {
-            if entries.is_empty() {
-                cfg.dns_upstreams = ServerOverride::default();
-            } else {
-                for e in &entries {
-                    e.parse::<Ipv4Addr>()
-                        .with_context(|| format!("invalid IPv4 address: {e}"))?;
-                }
-                cfg.dns_upstreams = ServerOverride {
-                    servers: entries,
-                    replace,
-                };
-            }
-        }
-        // On/off toggles: `set <key> on|off`, or `unset <key>` (empty value) to
-        // return to the default. `--replace` is meaningless here and ignored.
-        "auto-update" => cfg.auto_update = parse_bool_setting(value, false)?,
-        "on-demand" => cfg.on_demand = parse_bool_setting(value, true)?,
-        other => anyhow::bail!("unknown config key: {other} ({CONFIG_KEYS})"),
-    }
-    Ok(())
+    settings::apply_global(cfg, key, value, replace)
 }
 
-/// Parse an on/off config value. An empty value (from `config unset`) resets to
-/// `default`.
-fn parse_bool_setting(value: &str, default: bool) -> Result<bool> {
-    let v = value.trim();
-    if v.is_empty() {
-        return Ok(default);
-    }
-
-    match v.to_ascii_lowercase().as_str() {
-        "on" | "true" | "yes" | "1" => Ok(true),
-        "off" | "false" | "no" | "0" => Ok(false),
-        other => anyhow::bail!("'{other}' is not a valid on/off value (use 'on' or 'off')"),
-    }
-}
-
-fn render_override(o: &ServerOverride) -> String {
+pub(crate) fn render_override(o: &ServerOverride) -> String {
     if o.is_unset() {
         "<default>".to_string()
     } else {
@@ -385,18 +316,7 @@ fn render_override(o: &ServerOverride) -> String {
 /// Render config settings as `(key, value)` rows for `ray config get`. With a
 /// key, returns just that one (error on unknown key); without, all three.
 pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, String)>> {
-    let on_off = |v: bool| if v { "on" } else { "off" }.to_string();
-    let row = |k: &str| -> Result<(String, String)> {
-        let v = match k {
-            "relay" => render_override(&cfg.relay),
-            "discovery-dns" => render_override(&cfg.discovery_dns),
-            "dns-upstreams" => render_override(&cfg.dns_upstreams),
-            "auto-update" => on_off(cfg.auto_update),
-            "on-demand" => on_off(cfg.on_demand),
-            other => anyhow::bail!("unknown config key: {other} ({CONFIG_KEYS})"),
-        };
-        Ok((k.to_string(), v))
-    };
+    let row = |k: &str| -> Result<(String, String)> { Ok((k.to_string(), settings::render_global(cfg, k)?)) };
     match key {
         Some(k) => Ok(vec![row(k)?]),
         None => Ok(vec![
