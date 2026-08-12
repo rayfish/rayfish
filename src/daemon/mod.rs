@@ -884,9 +884,13 @@ impl Daemon {
         }
     }
 
-    /// Read global config rows for `ray config get` from the daemon's own config.
+    /// Read node config rows for `ray config get` from the daemon's own config.
     /// Firewall-scoped keys are read from the live config, not from disk, so a
     /// get always agrees with what the packet path is enforcing.
+    ///
+    /// Without a key this lists both stores, globals first: the two live in
+    /// different files behind different handlers, but the user typed one
+    /// command and expects every node setting back.
     fn config_get(&self, key: Option<NodeKey>) -> IpcMessage {
         let key = match key {
             Some(NodeKey::Firewall(k)) => return self.registry.firewall_config_get(k),
@@ -897,9 +901,11 @@ impl Daemon {
             Ok(c) => c,
             Err(e) => return ipc_err(format!("failed to load config: {e}")),
         };
-        IpcMessage::ConfigValues {
-            rows: config::config_get(&app_config, key),
+        let mut rows = config::config_get(&app_config, key);
+        if key.is_none() {
+            rows.extend(self.registry.firewall_config_rows(None));
         }
+        IpcMessage::ConfigValues { rows }
     }
 
     /// Apply one per-network setting and persist just that network's file, then

@@ -39,6 +39,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ray firewall ssh on`, `ray files download-dir`, `ray mdns off`, …) are
   unchanged and still the recommended spelling; they now share one code path
   with `ray config`, so a setting behaves the same whichever way you write it.
+  A bare `ray config get` prints all twelve, and `ray config set --help` lists
+  each key with a one-line description, so nothing is reachable only by
+  guessing its name.
+
+- **`ray firewall default ALLOW` is accepted**, matching
+  `ray config set firewall.default-in ALLOW`. The two spellings of the same
+  setting disagreed on capitalisation.
 
 - **A mistyped config key is reported by name, even with the daemon stopped.**
   `ray config get|set|unset <key>` checks the key before it connects, so a typo

@@ -342,7 +342,8 @@ impl NetworkRegistry {
 
     /// Read-modify-write the live firewall config: clone the current snapshot,
     /// apply `edit`, swap it into the lock-free `ArcSwap`, and persist (logging on
-    /// write error). Shared by the single-field toggles.
+    /// write error). For infallible edits; [`Self::firewall_config_set`] spells
+    /// the same sequence out because its edit can fail.
     fn edit_firewall(&self, edit: impl FnOnce(&mut firewall::FirewallConfig)) {
         let mut config = (*self.firewall.get_config()).clone();
         edit(&mut config);
@@ -353,10 +354,12 @@ impl NetworkRegistry {
     /// Apply one firewall settings key (`ray firewall on|off|reject|default`,
     /// or `ray config set firewall.*`).
     ///
-    /// Routed through [`Self::edit_firewall`] rather than a load/mutate/save:
-    /// the packet path reads the config from a lock-free `ArcSwap`, so the edit
-    /// has to be hot-swapped into it for `ray firewall off` to take effect now
-    /// instead of at the next daemon restart. Parsing and validation belong to
+    /// Hot-swaps rather than doing a load/mutate/save: the packet path reads the
+    /// config from a lock-free `ArcSwap`, so the edit has to be swapped into it
+    /// for `ray firewall off` to take effect now instead of at the next daemon
+    /// restart. It repeats [`Self::edit_firewall`]'s sequence instead of calling
+    /// it because `apply_firewall` can fail and that helper takes an infallible
+    /// closure, so a rejected value must not reach the swap. Parsing and validation belong to
     /// the registry (`settings::apply_firewall`); this method owns the live swap,
     /// the persist, and the per-key confirmation message.
     pub(crate) fn firewall_config_set(&self, key: FirewallKey, value: &str) -> IpcMessage {
@@ -373,10 +376,24 @@ impl NetworkRegistry {
 
     /// Render one firewall settings key from the live config.
     pub(crate) fn firewall_config_get(&self, key: FirewallKey) -> IpcMessage {
-        let value = settings::render_firewall(&self.firewall.get_config(), key);
         IpcMessage::ConfigValues {
-            rows: vec![(key.name().to_string(), value)],
+            rows: self.firewall_config_rows(Some(key)),
         }
+    }
+
+    /// Firewall settings as `(key, value)` rows, read from the live config so a
+    /// get agrees with what the packet path is enforcing. `None` renders every
+    /// key, which is how the bare `ray config get` picks them up alongside the
+    /// globals.
+    pub(crate) fn firewall_config_rows(&self, key: Option<FirewallKey>) -> Vec<(String, String)> {
+        let config = self.firewall.get_config();
+        let keys: Vec<FirewallKey> = match key {
+            Some(k) => vec![k],
+            None => FirewallKey::ALL.to_vec(),
+        };
+        keys.into_iter()
+            .map(|k| (k.name().to_string(), settings::render_firewall(&config, k)))
+            .collect()
     }
 
     // -----------------------------------------------------------------------

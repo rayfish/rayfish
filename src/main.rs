@@ -11,6 +11,7 @@ use std::sync::{Arc, atomic};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use ray_proto::settings::node_key_help;
 
 use membership::GroupMode;
 
@@ -312,8 +313,7 @@ pub(crate) enum Command {
         /// "on" or "off"
         state: String,
     },
-    /// View or change global daemon settings (relay, discovery-dns, dns-upstreams,
-    /// auto-update, on-demand)
+    /// View or change daemon settings (`ray config get` lists every key)
     Config {
         #[command(subcommand)]
         action: Option<ConfigAction>,
@@ -498,18 +498,26 @@ pub(crate) enum ConnectionsAction {
     },
 }
 
+/// `--help` text for a `ray config` key argument: the lead line plus the
+/// generated key list, so `-h` stays one line and `--help` names every key.
+fn key_long_help(lead: &str) -> String {
+    format!("{lead}\n\n{}", node_key_help())
+}
+
 #[derive(Subcommand)]
 pub(crate) enum ConfigAction {
     /// Show settings (all, or one key)
     #[command(visible_alias = "ls")]
     Get {
-        /// relay, discovery-dns, dns-upstreams, auto-update, or on-demand (omit for all)
+        /// A settings key (omit for all)
+        #[arg(long_help = key_long_help("A settings key (omit for all)."))]
         key: Option<String>,
     },
-    /// Set a key. List keys take a comma list of presets/URLs/IPs; auto-update and
-    /// on-demand take on/off.
+    /// Set a key. List keys take a comma list of presets/URLs/IPs; on/off keys
+    /// take on or off.
     Set {
-        /// relay, discovery-dns, dns-upstreams, auto-update, or on-demand
+        /// A settings key
+        #[arg(long_help = key_long_help("A settings key."))]
         key: String,
         /// A comma list of presets / URLs / IPv4s ("n0" or empty resets), or on/off
         value: String,
@@ -520,7 +528,8 @@ pub(crate) enum ConfigAction {
     /// Reset a key to its default
     #[command(visible_alias = "rm")]
     Unset {
-        /// relay, discovery-dns, dns-upstreams, auto-update, or on-demand
+        /// A settings key
+        #[arg(long_help = key_long_help("A settings key."))]
         key: String,
     },
 }

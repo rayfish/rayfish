@@ -48,7 +48,8 @@ macro_rules! setting_keys {
                 match self { $( Self::$variant => $key, )* }
             }
 
-            /// One-line description, for `ray config get` and the key list.
+            /// One-line description, for the `ray config` help text (see
+            /// [`node_key_help`]).
             pub const fn help(self) -> &'static str {
                 match self { $( Self::$variant => $help, )* }
             }
@@ -152,6 +153,16 @@ impl fmt::Display for NodeKey {
     }
 }
 
+/// Every node key with its one-line description, for `ray config --help`.
+/// Generated rather than written out, so a key cannot exist without being
+/// documented where the user goes looking for it.
+pub fn node_key_help() -> String {
+    NodeKey::all()
+        .map(|k| format!("  {:<24} {}", k.name(), k.help()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Every key name in every scope, comma-joined: the tail of the "unknown config
 /// key" error.
 pub fn key_list() -> String {
@@ -246,6 +257,18 @@ impl_key_serde!(NetworkKey);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `ray config --help` listing is generated, so a key added tomorrow is
+    /// documented without anyone remembering to edit clap. This pins that it
+    /// really covers all of them rather than a snapshot of today's set.
+    #[test]
+    fn the_help_listing_names_every_node_key() {
+        let help = node_key_help();
+        for k in NodeKey::all() {
+            assert!(help.contains(k.name()), "{} missing from help", k.name());
+            assert!(help.contains(k.help()), "{} has no description", k.name());
+        }
+    }
 
     #[test]
     fn every_key_round_trips_through_its_name() {

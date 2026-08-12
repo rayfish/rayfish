@@ -348,21 +348,16 @@ pub(crate) fn render_override(o: &ServerOverride) -> String {
     }
 }
 
-/// Render config settings as `(key, value)` rows for `ray config get`. With a
-/// key, returns just that one; without, the five keys the bare command has
-/// always listed.
+/// Render global settings as `(key, value)` rows for `ray config get`. With a
+/// key, returns just that one; without, every global key. Driven off
+/// `GlobalKey::ALL` rather than a hand-kept list, so a new key shows up here
+/// the moment it exists instead of being silently unlistable.
 pub fn config_get(cfg: &AppConfig, key: Option<settings::GlobalKey>) -> Vec<(String, String)> {
     use settings::GlobalKey;
     let row = |k: GlobalKey| (k.name().to_string(), settings::render_global(cfg, k));
     match key {
         Some(k) => vec![row(k)],
-        None => vec![
-            row(GlobalKey::Relay),
-            row(GlobalKey::DiscoveryDns),
-            row(GlobalKey::DnsUpstreams),
-            row(GlobalKey::AutoUpdate),
-            row(GlobalKey::OnDemand),
-        ],
+        None => GlobalKey::ALL.iter().copied().map(row).collect(),
     }
 }
 
@@ -1050,6 +1045,18 @@ mod tests {
         let mut key_bytes = [0u8; 32];
         key_bytes[0] = seed;
         SecretKey::from(key_bytes).public()
+    }
+
+    /// A bare `ray config get` used to print a hand-kept list of five keys, so a
+    /// new setting was reachable but invisible. It now lists the whole enum.
+    #[test]
+    fn the_bare_listing_covers_every_global_key() {
+        let rows = config_get(&AppConfig::default(), None);
+        let names: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+        for k in settings::GlobalKey::ALL {
+            assert!(names.contains(&k.name()), "{} not listed", k.name());
+        }
+        assert_eq!(rows.len(), settings::GlobalKey::ALL.len());
     }
 
     #[test]

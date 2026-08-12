@@ -87,6 +87,10 @@ fn to_ipc(action: FirewallAction) -> Result<ipc::IpcMessage> {
         FirewallAction::Remove { index } => ipc::IpcMessage::FirewallRemove { index },
         FirewallAction::Show => ipc::IpcMessage::FirewallShow,
         FirewallAction::Default { action } => {
+            // Lowercased to match the daemon's own parse (`settings::apply_firewall`):
+            // otherwise `ray firewall default ALLOW` fails here while
+            // `ray config set firewall.default-in ALLOW`, the same setting, works.
+            let action = action.to_lowercase();
             action
                 .parse::<firewall::Action>()
                 .map_err(anyhow::Error::msg)?;
