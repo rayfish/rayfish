@@ -18,18 +18,7 @@ use std::str::FromStr;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Which on-disk store backs a key, and therefore which handler serves it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scope {
-    /// `settings.toml` (`AppConfig`).
-    Global,
-    /// `firewall.toml` (`FirewallConfig`). Node-wide, but a separate file.
-    Firewall,
-    /// `networks/<name>.toml` (`NetworkConfig`). Needs a network argument.
-    Network,
-}
-
-/// Define one scope's key enum plus its name/help/scope metadata.
+/// Define one store's key enum plus its name/help metadata.
 ///
 /// Adding a setting means adding a line here and an arm in the daemon's
 /// matching `apply_*`/`render_*`, and nothing else: no IPC variant, no daemon
@@ -37,7 +26,7 @@ pub enum Scope {
 macro_rules! setting_keys {
     (
         $(#[$meta:meta])*
-        $name:ident($scope:expr) {
+        $name:ident {
             $( $variant:ident = $key:literal, $help:literal; )*
         }
     ) => {
@@ -64,10 +53,6 @@ macro_rules! setting_keys {
                 match self { $( Self::$variant => $help, )* }
             }
 
-            pub const fn scope(self) -> Scope {
-                $scope
-            }
-
             /// Match a name in this scope only. Returns `None` for a name that
             /// belongs to another scope, so callers can tell "wrong scope" from
             /// "no such key" and say which.
@@ -89,7 +74,7 @@ macro_rules! setting_keys {
 
 setting_keys! {
     /// Keys backed by `settings.toml`.
-    GlobalKey(Scope::Global) {
+    GlobalKey {
         Mdns = "mdns", "LAN peer discovery over mDNS (on|off)";
         Relay = "relay", "iroh relay servers (preset or URL, comma-separated)";
         DiscoveryDns = "discovery-dns", "pkarr discovery server (preset or URL)";
@@ -108,7 +93,7 @@ setting_keys! {
     /// `firewall.default-out` (`default_outbound`) is deliberately absent:
     /// no command has ever set it, so a key for it would be new user-facing
     /// surface rather than a migration of an existing one.
-    FirewallKey(Scope::Firewall) {
+    FirewallKey {
         Enabled = "firewall.enabled", "enforce the firewall at all (on|off)";
         Reject = "firewall.reject", "reply RST/unreachable instead of dropping (on|off)";
         DefaultIn = "firewall.default-in", "default action for inbound traffic (allow|deny)";
@@ -119,7 +104,7 @@ setting_keys! {
     /// Keys backed by `networks/<name>.toml`. Every one needs a network name
     /// alongside it, which is why they ride `NetConfigSet`/`NetConfigGet` and
     /// are unrepresentable on `ConfigSet`.
-    NetworkKey(Scope::Network) {
+    NetworkKey {
         AutoAcceptFirewall = "net.auto-accept-firewall", "install coordinator-suggested rules without review (on|off)";
         AutoAcceptFiles = "net.auto-accept-files", "auto-accept file offers from your own devices (on|off)";
         EphemeralTtl = "net.ephemeral-ttl", "coordinator: drop members offline longer than N seconds (>=3600, empty to disable)";
@@ -157,13 +142,6 @@ impl NodeKey {
         match self {
             NodeKey::Global(k) => k.help(),
             NodeKey::Firewall(k) => k.help(),
-        }
-    }
-
-    pub const fn scope(self) -> Scope {
-        match self {
-            NodeKey::Global(k) => k.scope(),
-            NodeKey::Firewall(k) => k.scope(),
         }
     }
 }
@@ -353,15 +331,5 @@ mod tests {
         let bytes = rmp_serde::to_vec_named("no-such-key").unwrap();
         let err = rmp_serde::from_slice::<NodeKey>(&bytes).unwrap_err();
         assert!(err.to_string().contains("unknown config key"), "{err}");
-    }
-
-    #[test]
-    fn scope_is_carried_by_the_type() {
-        assert_eq!(NodeKey::Global(GlobalKey::Mdns).scope(), Scope::Global);
-        assert_eq!(
-            NodeKey::Firewall(FirewallKey::Reject).scope(),
-            Scope::Firewall
-        );
-        assert_eq!(NetworkKey::EphemeralTtl.scope(), Scope::Network);
     }
 }

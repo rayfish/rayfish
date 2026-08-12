@@ -40,6 +40,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unchanged and still the recommended spelling; they now share one code path
   with `ray config`, so a setting behaves the same whichever way you write it.
 
+- **A mistyped config key is reported by name, even with the daemon stopped.**
+  `ray config get|set|unset <key>` checks the key before it connects, so a typo
+  reads as "unknown config key: …" with the list of valid ones instead of
+  "rayfish daemon is not running". A request the daemon cannot decode at all now
+  comes back as an error rather than a closed connection, which the client could
+  only report as "connection closed".
+
 - **Android crash reports now say how the app died when it dies silently.** A
   low-memory kill or a background stall used to leave either nothing at all or a
   report with no indication of what was stuck, which is the difference between a

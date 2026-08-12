@@ -589,7 +589,7 @@ impl Daemon {
     }
 }
 
-/// The confirmation line for a `Scope::Firewall` key, rendered from the config
+/// The confirmation line for a firewall key, rendered from the config
 /// as it stands after the write. Each key keeps the exact string its old handler
 /// produced. Note the absence of the global keys' "Restart the daemon" clause:
 /// these edits are live the moment the `ArcSwap` swap lands, so claiming

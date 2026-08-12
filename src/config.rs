@@ -1641,14 +1641,6 @@ name = "test"
         assert_eq!(resolve_upstreams(&rep, captured.clone()), vec![one]);
     }
 
-    /// An unknown key is no longer a runtime error here: it cannot be named.
-    /// The parse that rejects it lives in `ray-proto`, at the CLI edge and at
-    /// deserialization, so a bad key never reaches these functions.
-    #[test]
-    fn an_unknown_key_does_not_parse_into_one() {
-        assert!("bogus".parse::<settings::NodeKey>().is_err());
-    }
-
     #[test]
     fn config_set_n0_resets() {
         let mut cfg = AppConfig::default();

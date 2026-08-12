@@ -768,6 +768,23 @@ fn set_socket_permissions(path: &std::path::Path) {
     }
 }
 
+/// Cap on an error reply that quotes the request back. Comfortably fits the
+/// longest real one (the unknown-key error names every valid key, ~300 bytes)
+/// and any socket buffer, so the write completes even if nobody reads.
+const MAX_DECODE_ERROR_LEN: usize = 512;
+
+/// Truncate on a char boundary, marking that it happened.
+fn truncate(s: &str) -> String {
+    if s.len() <= MAX_DECODE_ERROR_LEN {
+        return s.to_string();
+    }
+    let end = (0..=MAX_DECODE_ERROR_LEN)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0);
+    format!("{}... (truncated)", &s[..end])
+}
+
 async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<()> {
     let peer_cred = stream.peer_cred().ok().map(|c| (c.uid(), c.gid()));
     // The request is read fd-aware: `SendFileFd` arrives with the file as
@@ -779,9 +796,17 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<(
         // hangup, which the client can only report as "connection closed". The
         // send is best-effort: the common cause is a client that has already
         // gone away.
+        //
+        // The reason is truncated because it quotes the request: an unknown key
+        // is reported as `unknown config key: <what the client sent>`, and a
+        // frame may carry a megabyte of it. Echoing that back unbounded would
+        // let any local user (the socket is 0666 by design) size the daemon's
+        // reply, then never read it, parking a task and an fd on a write that
+        // cannot complete. Bounded, the reply always fits the socket buffer.
         Err(e) => {
+            tracing::debug!(error = %e, "undecodable IPC request");
             let mut framed = ipc::framed(stream);
-            let _ = ipc::send(&mut framed, ipc_err(format!("{e:#}"))).await;
+            let _ = ipc::send(&mut framed, ipc_err(truncate(&format!("{e:#}")))).await;
             return Ok(());
         }
     };
@@ -888,4 +913,46 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The decode-error reply quotes the request, and a frame may carry up to
+    /// `MAX_FRAME_LEN` of it. Bounding the reply is what keeps a client that
+    /// sends a megabyte key and then never reads from parking a daemon task on
+    /// a write that cannot finish.
+    #[test]
+    fn a_decode_error_reply_is_bounded_however_long_the_request_was() {
+        let huge = format!("unknown config key: {}", "A".repeat(900_000));
+        let out = truncate(&huge);
+        assert!(out.len() < MAX_DECODE_ERROR_LEN + 32, "{}", out.len());
+        assert!(out.ends_with("... (truncated)"), "{out}");
+        // The useful prefix survives: the reader still learns what went wrong.
+        assert!(out.starts_with("unknown config key: AAA"), "{out}");
+    }
+
+    /// A real error is well under the cap and must come through untouched.
+    #[test]
+    fn a_normal_error_is_not_truncated() {
+        let msg = format!(
+            "decode IPC message: {}",
+            "unknown config key: bogus (mdns, relay, discovery-dns, dns-upstreams, \
+             auto-update, on-demand, ssh, download-dir, download-user, firewall.enabled, \
+             firewall.reject, firewall.default-in, net.auto-accept-firewall, \
+             net.auto-accept-files, net.ephemeral-ttl)"
+        );
+        assert!(msg.len() < MAX_DECODE_ERROR_LEN, "{}", msg.len());
+        assert_eq!(truncate(&msg), msg);
+    }
+
+    /// Truncation lands on a char boundary: a multi-byte char straddling the cap
+    /// would panic the slice.
+    #[test]
+    fn truncation_never_splits_a_multibyte_char() {
+        let s = "é".repeat(MAX_DECODE_ERROR_LEN);
+        let out = truncate(&s);
+        assert!(out.ends_with("... (truncated)"), "{out}");
+    }
 }

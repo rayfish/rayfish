@@ -853,7 +853,21 @@ impl Daemon {
             NodeKey::Firewall(k) => return self.registry.firewall_config_set(k, value),
             // Not a plain config write: see `Daemon::ssh_config_set`.
             NodeKey::Global(GlobalKey::Ssh) => return self.ssh_config_set(value),
-            NodeKey::Global(k) => k,
+            // Spelled out rather than caught by `_`, so a new global key cannot
+            // land here by default. Falling through silently is precisely the
+            // `ssh` bug: a key whose write needs a live side effect, getting
+            // none, with nothing to notice it. Adding a variant breaks this
+            // match and forces the choice.
+            NodeKey::Global(
+                k @ (GlobalKey::Mdns
+                | GlobalKey::Relay
+                | GlobalKey::DiscoveryDns
+                | GlobalKey::DnsUpstreams
+                | GlobalKey::AutoUpdate
+                | GlobalKey::OnDemand
+                | GlobalKey::DownloadDir
+                | GlobalKey::DownloadUser),
+            ) => k,
         };
         let mut app_config = match config::load() {
             Ok(c) => c,

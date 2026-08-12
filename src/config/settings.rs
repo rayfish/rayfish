@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-pub use ray_proto::settings::{FirewallKey, GlobalKey, NetworkKey, NodeKey, Scope};
+pub use ray_proto::settings::{FirewallKey, GlobalKey, NetworkKey, NodeKey};
 
 use super::{AppConfig, NetworkConfig, ServerOverride};
 use crate::firewall::{Action, FirewallConfig};
