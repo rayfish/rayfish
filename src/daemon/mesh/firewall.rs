@@ -337,10 +337,7 @@ impl NetworkRegistry {
     /// restores the old permissive inbound posture; `deny` is the secure default.
     /// Inbound ICMP-allow is a separate built-in default and is unaffected.
     pub fn firewall_default(&self, action: firewall::Action) -> IpcMessage {
-        self.edit_firewall(|c| c.default_inbound = action);
-        IpcMessage::Ok {
-            message: format!("inbound default set to {action}"),
-        }
+        self.firewall_config_set("firewall.default-in", &action.to_string())
     }
 
     /// Read-modify-write the live firewall config: clone the current snapshot,

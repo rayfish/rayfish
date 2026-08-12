@@ -1,7 +1,7 @@
 //! Firewall enums shared across the IPC boundary.
 //!
 //! These live here (rather than in `ray`'s `firewall` module) so the protocol
-//! crate can carry them typed — `FirewallState`, `FirewallRuleView` and
+//! crate can carry them typed: `FirewallState`, `FirewallRuleView` and
 //! `FirewallAdd` use these enums directly instead of stringly-typed fields.
 //! (The single-value toggles do not: `ray firewall default allow|deny` rides
 //! `ConfigSet` as a raw word, parsed by the settings registry daemon-side.)

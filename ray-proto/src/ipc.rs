@@ -322,6 +322,10 @@ pub enum IpcMessage {
     ConfigSet {
         key: String,
         value: String,
+        /// Only meaningful for list-valued global keys (`relay`,
+        /// `discovery-dns`, `dns-upstreams`): append when unset, replace the
+        /// whole list when set. Firewall- and network-scoped keys ignore it,
+        /// since none of those keys are list-valued today.
         #[serde(default)]
         replace: bool,
     },

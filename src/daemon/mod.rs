@@ -2624,6 +2624,46 @@ mod headless_tests {
         assert!(matches!(daemon.status(), IpcMessage::StatusResponse { .. }));
     }
 
+    /// `net_config_apply` gates on the network's presence ON DISK, not in the
+    /// live network map: the old `NetworkRegistry::contains` check it replaced
+    /// gated on the live map instead, so a saved-but-inactive network used to
+    /// error here. That drift was reviewed and kept deliberately (the daemon
+    /// connects every saved network at startup, so "on disk" and "live" agree
+    /// in practice); this test pins the disk-presence semantics so any future
+    /// change to that gate is a deliberate decision, not an accident.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn net_config_apply_gates_on_the_network_existing_on_disk() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
+
+        // No network saved yet: not-found, matching the old live-map check.
+        let msg = daemon
+            .net_config_apply("gaming", "net.auto-accept-files", "off")
+            .await;
+        assert!(
+            matches!(&msg, IpcMessage::Error { message } if message.contains("not found")),
+            "{msg:?}"
+        );
+
+        // Save the network to disk without registering it in the live map
+        // (nothing here calls `create_network`/`join_network`), i.e. exactly
+        // the "saved but inactive" case the review flagged.
+        config::save_network(&config::empty_network_config("gaming")).unwrap();
+
+        let msg = daemon
+            .net_config_apply("gaming", "net.auto-accept-files", "off")
+            .await;
+        assert!(matches!(msg, IpcMessage::Ok { .. }), "{msg:?}");
+    }
+
     /// In-memory TUN writer that records every written packet into a shared
     /// buffer, so a test can observe which writer the data plane routed to.
     #[derive(Clone, Default)]
