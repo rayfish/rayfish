@@ -7,6 +7,7 @@ use std::net::Ipv4Addr;
 use anyhow::{bail, Context, Result};
 
 use super::{AppConfig, ServerOverride};
+use crate::firewall::{Action, FirewallConfig};
 
 /// Which on-disk store backs a key, and therefore which handler serves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,9 @@ pub static KEYS: &[SettingKey] = &[
     SettingKey { name: "dns-upstreams", scope: Scope::Global, help: "Magic DNS upstream forwarders (IPv4, comma-separated)" },
     SettingKey { name: "auto-update", scope: Scope::Global, help: "install new releases automatically (on|off)" },
     SettingKey { name: "on-demand", scope: Scope::Global, help: "dial peers lazily on first packet (on|off)" },
+    SettingKey { name: "firewall.enabled", scope: Scope::Firewall, help: "enforce the firewall at all (on|off)" },
+    SettingKey { name: "firewall.reject", scope: Scope::Firewall, help: "reply RST/unreachable instead of dropping (on|off)" },
+    SettingKey { name: "firewall.default-in", scope: Scope::Firewall, help: "default action for inbound traffic (allow|deny)" },
 ];
 
 pub fn lookup(key: &str) -> Option<&'static SettingKey> {
@@ -129,6 +133,50 @@ fn on_off(v: bool) -> String {
     if v { "on".to_string() } else { "off".to_string() }
 }
 
+/// `firewall.toml` (`FirewallConfig`) is a separate store from `settings.toml`,
+/// so it gets its own accessor pair rather than being folded into
+/// `apply_global`/`render_global`. Pure functions over an owned `&mut
+/// FirewallConfig`: the caller is responsible for hot-swapping the live
+/// `ArcSwap` the data path reads from and persisting to disk (see
+/// `Daemon::edit_firewall`), neither of which happens here.
+///
+/// `firewall.default-out` (`default_outbound`) is deliberately not registered:
+/// there is no existing setter for it anywhere (`ray firewall default` only
+/// ever touches the inbound default), so adding it here would be new
+/// user-facing surface rather than a migration of an existing one.
+pub fn apply_firewall(cfg: &mut FirewallConfig, key: &str, value: &str) -> Result<()> {
+    match key {
+        // The field is stored inverted: `disabled: true` means the firewall is
+        // off. `on` (the enabled default) maps to `disabled = false`.
+        "firewall.enabled" => cfg.disabled = !parse_bool(value, true)?,
+        "firewall.reject" => cfg.reject = parse_bool(value, false)?,
+        "firewall.default-in" => cfg.default_inbound = parse_action(value, Action::Deny)?,
+        other => bail!("unknown config key: {other} ({})", key_list()),
+    }
+    Ok(())
+}
+
+pub fn render_firewall(cfg: &FirewallConfig, key: &str) -> Result<String> {
+    let out = match key {
+        "firewall.enabled" => on_off(!cfg.disabled),
+        "firewall.reject" => on_off(cfg.reject),
+        "firewall.default-in" => cfg.default_inbound.to_string(),
+        other => bail!("unknown config key: {other} ({})", key_list()),
+    };
+    Ok(out)
+}
+
+/// Parse an allow/deny value; empty resets to `default`.
+fn parse_action(value: &str, default: Action) -> Result<Action> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Ok(default);
+    }
+    v.to_ascii_lowercase()
+        .parse::<Action>()
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +251,45 @@ mod tests {
             render_global(&cfg, k.name)
                 .unwrap_or_else(|e| panic!("key {} has no render arm: {e}", k.name));
         }
+    }
+
+    #[test]
+    fn firewall_toggles_round_trip() {
+        let mut fw = FirewallConfig::default();
+        apply_firewall(&mut fw, "firewall.reject", "on").unwrap();
+        assert!(fw.reject);
+        assert_eq!(render_firewall(&fw, "firewall.reject").unwrap(), "on");
+
+        apply_firewall(&mut fw, "firewall.enabled", "off").unwrap();
+        assert!(fw.disabled, "enabled=off stores as disabled=true");
+        assert_eq!(render_firewall(&fw, "firewall.enabled").unwrap(), "off");
+    }
+
+    #[test]
+    fn firewall_default_in_parses_allow_and_deny_only() {
+        let mut fw = FirewallConfig::default();
+        apply_firewall(&mut fw, "firewall.default-in", "allow").unwrap();
+        assert_eq!(render_firewall(&fw, "firewall.default-in").unwrap(), "allow");
+        assert!(apply_firewall(&mut fw, "firewall.default-in", "maybe").is_err());
+    }
+
+    #[test]
+    fn every_registered_firewall_key_renders() {
+        let fw = FirewallConfig::default();
+        for k in keys_for(Scope::Firewall) {
+            render_firewall(&fw, k.name)
+                .unwrap_or_else(|e| panic!("key {} has no render arm: {e}", k.name));
+        }
+    }
+
+    #[test]
+    fn firewall_default_out_is_deliberately_not_registered() {
+        // No existing setter touches the outbound default; registering it would
+        // be new user-facing surface, not a migration of an existing one (see
+        // `hostname-default` in the global registry for the same rule).
+        let mut fw = FirewallConfig::default();
+        assert!(apply_firewall(&mut fw, "firewall.default-out", "allow").is_err());
+        assert!(render_firewall(&fw, "firewall.default-out").is_err());
+        assert!(lookup("firewall.default-out").is_none());
     }
 }
