@@ -797,16 +797,19 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<(
         // send is best-effort: the common cause is a client that has already
         // gone away.
         //
-        // The reason is truncated because it quotes the request: an unknown key
-        // is reported as `unknown config key: <what the client sent>`, and a
-        // frame may carry a megabyte of it. Echoing that back unbounded would
-        // let any local user (the socket is 0666 by design) size the daemon's
-        // reply, then never read it, parking a task and an fd on a write that
-        // cannot complete. Bounded, the reply always fits the socket buffer.
+        // The reason is truncated once, before it reaches either sink, because
+        // it quotes the request: an unknown key is reported as `unknown config
+        // key: <what the client sent>`, and a frame may carry a megabyte of it.
+        // Unbounded, any local user (the socket is 0666 by design) could size
+        // the reply and then never read it, parking a task and an fd on a write
+        // that cannot complete, and could flood the rolling log `ray report`
+        // bundles. This bounds the one reply attacker-sized input can generate;
+        // it is not a general cap on how long a client can hold a task.
         Err(e) => {
-            tracing::debug!(error = %e, "undecodable IPC request");
+            let msg = truncate(&format!("{e:#}"));
+            tracing::debug!(error = %msg, "undecodable IPC request");
             let mut framed = ipc::framed(stream);
-            let _ = ipc::send(&mut framed, ipc_err(truncate(&format!("{e:#}")))).await;
+            let _ = ipc::send(&mut framed, ipc_err(msg)).await;
             return Ok(());
         }
     };
@@ -951,8 +954,14 @@ mod tests {
     /// would panic the slice.
     #[test]
     fn truncation_never_splits_a_multibyte_char() {
-        let s = "é".repeat(MAX_DECODE_ERROR_LEN);
+        // 3 bytes per char, and the cap is not a multiple of 3, so the cut
+        // lands mid-char and the backtrack has to run. A 2-byte char would
+        // leave byte 512 already on a boundary and test nothing.
+        assert_ne!(MAX_DECODE_ERROR_LEN % 3, 0);
+        let s = "€".repeat(MAX_DECODE_ERROR_LEN);
         let out = truncate(&s);
         assert!(out.ends_with("... (truncated)"), "{out}");
+        let kept = out.strip_suffix("... (truncated)").unwrap();
+        assert_eq!(kept.len(), MAX_DECODE_ERROR_LEN - MAX_DECODE_ERROR_LEN % 3);
     }
 }

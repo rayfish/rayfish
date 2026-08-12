@@ -1336,8 +1336,22 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
             format!("download-user cleared. {restart}")
         }
         GlobalKey::DownloadUser => format!("download-user set. {restart}"),
-        _ if reset => format!("Reset {key} to default. {restart}"),
-        _ => format!("Set {key}. {restart}"),
+        // Spelled out rather than caught by `_`, so a new global key cannot
+        // inherit this generic wording (and its "Restart the daemon" claim) by
+        // default. `Ssh` never reaches here (`config_apply` routes it to
+        // `ssh_config_set`); it is listed only to keep the match exhaustive.
+        k @ (GlobalKey::Relay
+        | GlobalKey::DiscoveryDns
+        | GlobalKey::DnsUpstreams
+        | GlobalKey::AutoUpdate
+        | GlobalKey::OnDemand
+        | GlobalKey::Ssh) => {
+            if reset {
+                format!("Reset {k} to default. {restart}")
+            } else {
+                format!("Set {k}. {restart}")
+            }
+        }
     }
 }
 
