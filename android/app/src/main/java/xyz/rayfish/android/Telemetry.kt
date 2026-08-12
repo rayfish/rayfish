@@ -29,6 +29,11 @@ object Telemetry {
         SentryAndroid.init(context.applicationContext) { options ->
             options.dsn = dsn
             options.release = "rayfish-android@${BuildConfig.VERSION_NAME}"
+            // The commit the APK was built from. Without it Sentry defaults dist
+            // to versionCode, so every build of a version looks identical in the
+            // dashboard and a report cannot be placed against a fix. See
+            // rayGitSha in android/app/build.gradle.kts.
+            options.dist = BuildConfig.GIT_SHA
             // Debug builds (the `.dev` package) report under the `dev`
             // environment so they don't mix into production telemetry.
             options.environment = if (BuildConfig.DEBUG) "dev" else "production"
@@ -65,16 +70,18 @@ object Telemetry {
         if (!Sentry.isEnabled()) return null
         val node = NodeHolder.get(context)
         val logs = runCatching { node.logSnapshot() }.getOrDefault("")
-        // A per-send stamp so each report is its own Sentry issue instead of
-        // folding into one group. Without it every "Send diagnostics" click
-        // reuses the same message and only bumps the existing issue's count, so
-        // repeat sends look like nothing happened.
-        val stamp = System.currentTimeMillis().toString()
+        // Every report deliberately lands in one Sentry group. An earlier version
+        // set a per-send fingerprint (a millisecond stamp) to split each click
+        // into its own issue; it never actually split anything (488 reports in a
+        // single group), and splitting was the wrong goal anyway. Diagnostics are
+        // a mailbox, not a defect: hundreds of one-event issues would bury the
+        // real crashes in the same queue. The tags below are what make a
+        // particular report findable (`issue:<id> install_id:<uuid>`), and the
+        // caller gets the event id back to quote.
         var id: String? = null
         Sentry.withScope { scope ->
             scope.setTag("install_id", NodeHolder.installId(context))
             scope.setTag("transport", transportType(context))
-            scope.setFingerprint(listOf("rayfish-diagnostics", stamp))
             scope.addAttachment(Attachment(logs.toByteArray(), "rayfish-logs.txt", "text/plain"))
             runCatching {
                 val h = node.healthSnapshot()
