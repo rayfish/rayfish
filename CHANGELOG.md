@@ -32,6 +32,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Android crash reports now say how the app died when it dies silently.** A
+  low-memory kill or a background stall used to leave either nothing at all or a
+  report with no indication of what was stuck, which is the difference between a
+  bug that can be fixed and one that can only be guessed at. Reports now carry
+  Android's own record of the exit, including which component was busy. Still
+  covered by the crash reporting toggle in You: turn it off and nothing is read
+  or sent.
+
 - **Android transfer notifications show the percentage next to the progress
   bar.** A bar on its own says something is moving but not how far along it is,
   and on a large file it can look stuck.
