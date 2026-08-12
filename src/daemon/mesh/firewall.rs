@@ -337,7 +337,7 @@ impl NetworkRegistry {
     /// restores the old permissive inbound posture; `deny` is the secure default.
     /// Inbound ICMP-allow is a separate built-in default and is unaffected.
     pub fn firewall_default(&self, action: firewall::Action) -> IpcMessage {
-        self.firewall_config_set("firewall.default-in", &action.to_string())
+        self.firewall_config_set(FirewallKey::DefaultIn, &action.to_string())
     }
 
     /// Read-modify-write the live firewall config: clone the current snapshot,
@@ -350,8 +350,8 @@ impl NetworkRegistry {
         save_firewall_warn(&config);
     }
 
-    /// Apply one `Scope::Firewall` settings key (`ray firewall on|off|reject|
-    /// default`, or `ray config set firewall.*`).
+    /// Apply one firewall settings key (`ray firewall on|off|reject|default`,
+    /// or `ray config set firewall.*`).
     ///
     /// Routed through [`Self::edit_firewall`] rather than a load/mutate/save:
     /// the packet path reads the config from a lock-free `ArcSwap`, so the edit
@@ -359,7 +359,7 @@ impl NetworkRegistry {
     /// instead of at the next daemon restart. Parsing and validation belong to
     /// the registry (`settings::apply_firewall`); this method owns the live swap,
     /// the persist, and the per-key confirmation message.
-    pub(crate) fn firewall_config_set(&self, key: &str, value: &str) -> IpcMessage {
+    pub(crate) fn firewall_config_set(&self, key: FirewallKey, value: &str) -> IpcMessage {
         let mut config = (*self.firewall.get_config()).clone();
         if let Err(e) = settings::apply_firewall(&mut config, key, value) {
             return ipc_err(e.to_string());
@@ -371,13 +371,11 @@ impl NetworkRegistry {
         }
     }
 
-    /// Render one `Scope::Firewall` settings key from the live config.
-    pub(crate) fn firewall_config_get(&self, key: &str) -> IpcMessage {
-        match settings::render_firewall(&self.firewall.get_config(), key) {
-            Ok(v) => IpcMessage::ConfigValues {
-                rows: vec![(key.to_string(), v)],
-            },
-            Err(e) => ipc_err(e.to_string()),
+    /// Render one firewall settings key from the live config.
+    pub(crate) fn firewall_config_get(&self, key: FirewallKey) -> IpcMessage {
+        let value = settings::render_firewall(&self.firewall.get_config(), key);
+        IpcMessage::ConfigValues {
+            rows: vec![(key.name().to_string(), value)],
         }
     }
 
@@ -432,7 +430,7 @@ impl Daemon {
         };
         // The registry parses and writes the field; everything below is the side
         // effects it deliberately does not do.
-        if let Err(e) = settings::apply_global(&mut app_config, "ssh", value, false) {
+        if let Err(e) = settings::apply_global(&mut app_config, GlobalKey::Ssh, value, false) {
             return ipc_err(e.to_string());
         }
         let enabled = app_config.ssh_enabled;
@@ -596,18 +594,17 @@ impl Daemon {
 /// produced. Note the absence of the global keys' "Restart the daemon" clause:
 /// these edits are live the moment the `ArcSwap` swap lands, so claiming
 /// otherwise would be false.
-fn firewall_set_message(config: &firewall::FirewallConfig, key: &str) -> String {
+fn firewall_set_message(config: &firewall::FirewallConfig, key: FirewallKey) -> String {
     match key {
-        "firewall.enabled" if config.disabled => {
+        FirewallKey::Enabled if config.disabled => {
             "firewall off (all packets allowed on this device)".to_string()
         }
-        "firewall.enabled" => "firewall on (enforcing rules and defaults)".to_string(),
-        "firewall.reject" => format!(
+        FirewallKey::Enabled => "firewall on (enforcing rules and defaults)".to_string(),
+        FirewallKey::Reject => format!(
             "fail-fast reject {}",
             if config.reject { "on" } else { "off" }
         ),
-        "firewall.default-in" => format!("inbound default set to {}", config.default_inbound),
-        other => format!("Set {other}"),
+        FirewallKey::DefaultIn => format!("inbound default set to {}", config.default_inbound),
     }
 }
 
@@ -655,29 +652,29 @@ mod firewall_message_tests {
     #[test]
     fn firewall_keys_keep_the_exact_wording_their_handlers_printed() {
         assert_eq!(
-            firewall_set_message(&disabled(false), "firewall.enabled"),
+            firewall_set_message(&disabled(false), FirewallKey::Enabled),
             "firewall on (enforcing rules and defaults)"
         );
         assert_eq!(
-            firewall_set_message(&disabled(true), "firewall.enabled"),
+            firewall_set_message(&disabled(true), FirewallKey::Enabled),
             "firewall off (all packets allowed on this device)"
         );
 
         assert_eq!(
-            firewall_set_message(&reject(true), "firewall.reject"),
+            firewall_set_message(&reject(true), FirewallKey::Reject),
             "fail-fast reject on"
         );
         assert_eq!(
-            firewall_set_message(&reject(false), "firewall.reject"),
+            firewall_set_message(&reject(false), FirewallKey::Reject),
             "fail-fast reject off"
         );
 
         assert_eq!(
-            firewall_set_message(&default_in(firewall::Action::Deny), "firewall.default-in"),
+            firewall_set_message(&default_in(firewall::Action::Deny), FirewallKey::DefaultIn),
             "inbound default set to deny"
         );
         assert_eq!(
-            firewall_set_message(&default_in(firewall::Action::Allow), "firewall.default-in"),
+            firewall_set_message(&default_in(firewall::Action::Allow), FirewallKey::DefaultIn),
             "inbound default set to allow"
         );
     }
@@ -688,9 +685,9 @@ mod firewall_message_tests {
     #[test]
     fn firewall_messages_never_claim_a_restart_is_needed() {
         let fw = firewall::FirewallConfig::default();
-        for key in settings::keys_for(settings::Scope::Firewall) {
-            let msg = firewall_set_message(&fw, key.name);
-            assert!(!msg.contains("Restart"), "{}: {msg}", key.name);
+        for &key in FirewallKey::ALL {
+            let msg = firewall_set_message(&fw, key);
+            assert!(!msg.contains("Restart"), "{key}: {msg}");
         }
     }
 }

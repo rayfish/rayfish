@@ -1,6 +1,7 @@
 //! CLI handlers for network lifecycle: create / join / nuke / leave.
 
 use crate::*;
+use ipc::NetworkKey;
 
 pub(crate) async fn ipc_create(
     mode: GroupMode,
@@ -222,7 +223,7 @@ pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
             &mut stream,
             ipc::IpcMessage::NetConfigGet {
                 network: network.to_string(),
-                key: Some("net.ephemeral-ttl".to_string()),
+                key: Some(NetworkKey::EphemeralTtl),
             },
         )
         .await?;
@@ -257,7 +258,7 @@ pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
         &mut stream,
         ipc::IpcMessage::NetConfigSet {
             network: network.to_string(),
-            key: "net.ephemeral-ttl".to_string(),
+            key: NetworkKey::EphemeralTtl,
             // Empty disables the policy, matching `ConfigUnset` semantics.
             value: ttl_secs.map(|s| s.to_string()).unwrap_or_default(),
         },

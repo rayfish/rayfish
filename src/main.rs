@@ -1183,7 +1183,7 @@ async fn cmd_mdns(state: &str) -> Result<()> {
         std::process::exit(1);
     }
     ipc_mutate(ipc::IpcMessage::ConfigSet {
-        key: "mdns".to_string(),
+        key: ipc::NodeKey::Global(ipc::GlobalKey::Mdns),
         value: state.to_string(),
         replace: false,
     })
@@ -1195,7 +1195,7 @@ async fn cmd_mdns(state: &str) -> Result<()> {
 /// takes effect on the next daemon restart.
 async fn cmd_auto_update(state: &str) -> Result<()> {
     ipc_mutate(ipc::IpcMessage::ConfigSet {
-        key: "auto-update".to_string(),
+        key: ipc::NodeKey::Global(ipc::GlobalKey::AutoUpdate),
         value: state.to_string(),
         replace: false,
     })
@@ -1211,6 +1211,7 @@ async fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
             let mut stream = ipc::connect()
                 .await
                 .context("rayfish daemon is not running; start it with: sudo ray up")?;
+            let key = key.as_deref().map(parse_node_key);
             ipc::send(&mut stream, ipc::IpcMessage::ConfigGet { key }).await?;
             match ipc::recv(&mut stream).await? {
                 ipc::IpcMessage::ConfigValues { rows } => {
@@ -1240,13 +1241,35 @@ async fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
             replace,
         } => {
             ipc_mutate(ipc::IpcMessage::ConfigSet {
-                key,
+                key: parse_node_key(&key),
                 value,
                 replace,
             })
             .await
         }
-        ConfigAction::Unset { key } => ipc_mutate(ipc::IpcMessage::ConfigUnset { key }).await,
+        ConfigAction::Unset { key } => {
+            ipc_mutate(ipc::IpcMessage::ConfigUnset {
+                key: parse_node_key(&key),
+            })
+            .await
+        }
+    }
+}
+
+/// Resolve a user-typed key to the one the wire carries. `ray config` is the
+/// only command that takes a key as free text; every other caller names its key
+/// as a constant, so this is the single place a typo can enter.
+///
+/// Reported here rather than by the daemon, with the registry's own wording:
+/// the key type makes an unknown key unrepresentable on the wire, so without
+/// this the request would fail to encode instead of explaining itself.
+fn parse_node_key(key: &str) -> ipc::NodeKey {
+    match key.parse() {
+        Ok(k) => k,
+        Err(e) => {
+            print_error("error", &e, None);
+            std::process::exit(1);
+        }
     }
 }
 

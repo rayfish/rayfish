@@ -330,7 +330,12 @@ pub(crate) fn empty_network_config(name: &str) -> NetworkConfig {
 /// Apply a `ray config set`/`unset` to the in-memory config. Delegates to the
 /// settings registry; kept as a thin wrapper so existing callers don't need to
 /// know about `settings::apply_global`.
-pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) -> Result<()> {
+pub fn config_set(
+    cfg: &mut AppConfig,
+    key: settings::GlobalKey,
+    value: &str,
+    replace: bool,
+) -> Result<()> {
     settings::apply_global(cfg, key, value, replace)
 }
 
@@ -344,20 +349,20 @@ pub(crate) fn render_override(o: &ServerOverride) -> String {
 }
 
 /// Render config settings as `(key, value)` rows for `ray config get`. With a
-/// key, returns just that one (error on unknown key); without, all three.
-pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, String)>> {
-    let row = |k: &str| -> Result<(String, String)> {
-        Ok((k.to_string(), settings::render_global(cfg, k)?))
-    };
+/// key, returns just that one; without, the five keys the bare command has
+/// always listed.
+pub fn config_get(cfg: &AppConfig, key: Option<settings::GlobalKey>) -> Vec<(String, String)> {
+    use settings::GlobalKey;
+    let row = |k: GlobalKey| (k.name().to_string(), settings::render_global(cfg, k));
     match key {
-        Some(k) => Ok(vec![row(k)?]),
-        None => Ok(vec![
-            row("relay")?,
-            row("discovery-dns")?,
-            row("dns-upstreams")?,
-            row("auto-update")?,
-            row("on-demand")?,
-        ]),
+        Some(k) => vec![row(k)],
+        None => vec![
+            row(GlobalKey::Relay),
+            row(GlobalKey::DiscoveryDns),
+            row(GlobalKey::DnsUpstreams),
+            row(GlobalKey::AutoUpdate),
+            row(GlobalKey::OnDemand),
+        ],
     }
 }
 
@@ -1636,29 +1641,54 @@ name = "test"
         assert_eq!(resolve_upstreams(&rep, captured.clone()), vec![one]);
     }
 
+    /// An unknown key is no longer a runtime error here: it cannot be named.
+    /// The parse that rejects it lives in `ray-proto`, at the CLI edge and at
+    /// deserialization, so a bad key never reaches these functions.
     #[test]
-    fn config_set_unknown_key_errors() {
-        let mut cfg = AppConfig::default();
-        assert!(config_set(&mut cfg, "bogus", "rayfish", false).is_err());
-        assert!(config_get(&cfg, Some("bogus")).is_err());
+    fn an_unknown_key_does_not_parse_into_one() {
+        assert!("bogus".parse::<settings::NodeKey>().is_err());
     }
 
     #[test]
     fn config_set_n0_resets() {
         let mut cfg = AppConfig::default();
-        config_set(&mut cfg, "relay", "rayfish", true).unwrap();
+        config_set(&mut cfg, settings::GlobalKey::Relay, "rayfish", true).unwrap();
         assert!(!cfg.relay.is_unset());
-        config_set(&mut cfg, "relay", "n0", false).unwrap();
+        config_set(&mut cfg, settings::GlobalKey::Relay, "n0", false).unwrap();
         assert!(cfg.relay.is_unset());
     }
 
     #[test]
     fn config_set_dns_upstreams_rejects_non_ip() {
         let mut cfg = AppConfig::default();
-        assert!(config_set(&mut cfg, "dns-upstreams", "1.1.1.1", false).is_ok());
-        assert!(config_set(&mut cfg, "dns-upstreams", "not-an-ip", false).is_err());
+        assert!(
+            config_set(
+                &mut cfg,
+                settings::GlobalKey::DnsUpstreams,
+                "1.1.1.1",
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            config_set(
+                &mut cfg,
+                settings::GlobalKey::DnsUpstreams,
+                "not-an-ip",
+                false
+            )
+            .is_err()
+        );
         // rayfish is not a valid upstream keyword.
-        assert!(config_set(&mut cfg, "dns-upstreams", "rayfish", false).is_err());
+        assert!(
+            config_set(
+                &mut cfg,
+                settings::GlobalKey::DnsUpstreams,
+                "rayfish",
+                false
+            )
+            .is_err()
+        );
     }
 
     // Regression for the bug that prompted this change: concurrent saves of

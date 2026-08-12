@@ -13,7 +13,9 @@ use tokio::io::Interest;
 use tokio::net::UnixStream;
 use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
 
-use crate::{Action, Direction, GroupMode, Protocol, SuggestedFirewall, TransportMode};
+use crate::{
+    Action, Direction, GroupMode, NetworkKey, NodeKey, Protocol, SuggestedFirewall, TransportMode,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum IpcMessage {
@@ -320,7 +322,7 @@ pub enum IpcMessage {
     /// from a different `HOME` than the service's would silently miss it.
     /// Mutation (root/operator).
     ConfigSet {
-        key: String,
+        key: NodeKey,
         value: String,
         /// Only meaningful for list-valued global keys (`relay`,
         /// `discovery-dns`, `dns-upstreams`): append when unset, replace the
@@ -331,27 +333,27 @@ pub enum IpcMessage {
     },
     /// Reset a global config key to its default (`ray config unset`). Mutation.
     ConfigUnset {
-        key: String,
+        key: NodeKey,
     },
     /// Read global config keys (`ray config get`), answered with `ConfigValues`.
     /// `key = None` returns every key. Open read, like `Status` — routed through
     /// the daemon so reads and writes agree on which config dir is authoritative.
     ConfigGet {
-        key: Option<String>,
+        key: Option<NodeKey>,
     },
-    /// Set one per-network setting (`networks/<name>.toml`). The key namespace
-    /// is the `net.` prefix of the settings registry; an empty `value` resets
-    /// the key to its default, matching `ConfigUnset`.
+    /// Set one per-network setting (`networks/<name>.toml`). The key type is
+    /// what keeps a global or firewall key out of a network file; an empty
+    /// `value` resets the key to its default, matching `ConfigUnset`.
     NetConfigSet {
         network: String,
-        key: String,
+        key: NetworkKey,
         value: String,
     },
     /// Read per-network settings. `key: None` returns every `net.` key. Open
     /// read, like `ConfigGet` and `FirewallShow`.
     NetConfigGet {
         network: String,
-        key: Option<String>,
+        key: Option<NetworkKey>,
     },
 
     // Responses
@@ -1308,22 +1310,22 @@ mod tests {
         // the wire types must survive the named-map codec.
         for msg in [
             IpcMessage::ConfigSet {
-                key: "auto-update".to_string(),
+                key: NodeKey::Global(crate::GlobalKey::AutoUpdate),
                 value: "off".to_string(),
                 replace: false,
             },
             IpcMessage::ConfigSet {
-                key: "download-dir".to_string(),
+                key: NodeKey::Global(crate::GlobalKey::DownloadDir),
                 value: "/srv/dl".to_string(),
                 replace: false,
             },
             IpcMessage::ConfigUnset {
-                key: "relay".to_string(),
+                key: NodeKey::Global(crate::GlobalKey::Relay),
             },
             IpcMessage::ConfigGet { key: None },
             IpcMessage::NetConfigSet {
                 network: "gaming".to_string(),
-                key: "net.ephemeral-ttl".to_string(),
+                key: NetworkKey::EphemeralTtl,
                 value: "7200".to_string(),
             },
             IpcMessage::NetConfigGet {

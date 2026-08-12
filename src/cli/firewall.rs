@@ -1,6 +1,7 @@
 //! CLI firewall + declarative-apply handlers and their parsers/renderers.
 
 use crate::*;
+use ipc::{FirewallKey, GlobalKey, NetworkKey, NodeKey};
 
 pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
     if let FirewallAction::Suggest {
@@ -90,7 +91,7 @@ fn to_ipc(action: FirewallAction) -> Result<ipc::IpcMessage> {
                 .parse::<firewall::Action>()
                 .map_err(anyhow::Error::msg)?;
             ipc::IpcMessage::ConfigSet {
-                key: "firewall.default-in".to_string(),
+                key: NodeKey::Firewall(FirewallKey::DefaultIn),
                 value: action,
                 replace: false,
             }
@@ -98,18 +99,18 @@ fn to_ipc(action: FirewallAction) -> Result<ipc::IpcMessage> {
         FirewallAction::Reject { state } => {
             parse_on_off(&state)?;
             ipc::IpcMessage::ConfigSet {
-                key: "firewall.reject".to_string(),
+                key: NodeKey::Firewall(FirewallKey::Reject),
                 value: state,
                 replace: false,
             }
         }
         FirewallAction::On => ipc::IpcMessage::ConfigSet {
-            key: "firewall.enabled".to_string(),
+            key: NodeKey::Firewall(FirewallKey::Enabled),
             value: "on".to_string(),
             replace: false,
         },
         FirewallAction::Off => ipc::IpcMessage::ConfigSet {
-            key: "firewall.enabled".to_string(),
+            key: NodeKey::Firewall(FirewallKey::Enabled),
             value: "off".to_string(),
             replace: false,
         },
@@ -119,7 +120,7 @@ fn to_ipc(action: FirewallAction) -> Result<ipc::IpcMessage> {
             parse_on_off(&state)?;
             ipc::IpcMessage::NetConfigSet {
                 network,
-                key: "net.auto-accept-firewall".to_string(),
+                key: NetworkKey::AutoAcceptFirewall,
                 value: state,
             }
         }
@@ -136,12 +137,12 @@ fn to_ipc(action: FirewallAction) -> Result<ipc::IpcMessage> {
 fn ssh_to_ipc(action: SshAction) -> ipc::IpcMessage {
     match action {
         SshAction::On => ipc::IpcMessage::ConfigSet {
-            key: "ssh".to_string(),
+            key: NodeKey::Global(GlobalKey::Ssh),
             value: "on".to_string(),
             replace: false,
         },
         SshAction::Off => ipc::IpcMessage::ConfigSet {
-            key: "ssh".to_string(),
+            key: NodeKey::Global(GlobalKey::Ssh),
             value: "off".to_string(),
             replace: false,
         },
@@ -898,7 +899,7 @@ mod tests {
 
     /// `IpcMessage` has no `PartialEq` (it carries wire types that don't want
     /// one), so compare the settings-key mapping as a tuple.
-    fn config_set_of(action: FirewallAction) -> (String, String) {
+    fn config_set_of(action: FirewallAction) -> (NodeKey, String) {
         match to_ipc(action).unwrap() {
             ipc::IpcMessage::ConfigSet {
                 key,
@@ -919,21 +920,24 @@ mod tests {
     fn firewall_subcommands_map_onto_the_settings_keys() {
         assert_eq!(
             config_set_of(FirewallAction::Off),
-            ("firewall.enabled".to_string(), "off".to_string())
+            (NodeKey::Firewall(FirewallKey::Enabled), "off".to_string())
         );
         assert_eq!(
             config_set_of(FirewallAction::On),
-            ("firewall.enabled".to_string(), "on".to_string())
+            (NodeKey::Firewall(FirewallKey::Enabled), "on".to_string())
         );
         assert_eq!(
             config_set_of(FirewallAction::Default {
                 action: "deny".into()
             }),
-            ("firewall.default-in".to_string(), "deny".to_string())
+            (
+                NodeKey::Firewall(FirewallKey::DefaultIn),
+                "deny".to_string()
+            )
         );
         assert_eq!(
             config_set_of(FirewallAction::Reject { state: "on".into() }),
-            ("firewall.reject".to_string(), "on".to_string())
+            (NodeKey::Firewall(FirewallKey::Reject), "on".to_string())
         );
 
         // Auto-accept is per-network, so it takes the network-scoped variant.
@@ -949,7 +953,7 @@ mod tests {
                 value,
             } => {
                 assert_eq!(network, "gaming");
-                assert_eq!(key, "net.auto-accept-firewall");
+                assert_eq!(key, NetworkKey::AutoAcceptFirewall);
                 assert_eq!(value, "off");
             }
             other => panic!("expected NetConfigSet, got {other:?}"),
@@ -992,7 +996,7 @@ mod tests {
         for (action, want) in [(SshAction::On, "on"), (SshAction::Off, "off")] {
             match ssh_to_ipc(action) {
                 ipc::IpcMessage::ConfigSet { key, value, .. } => {
-                    assert_eq!(key, "ssh");
+                    assert_eq!(key, NodeKey::Global(GlobalKey::Ssh));
                     assert_eq!(value, want);
                 }
                 other => panic!("expected ConfigSet, got {other:?}"),

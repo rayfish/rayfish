@@ -1,6 +1,7 @@
 //! CLI file-sharing handlers: send / list / accept.
 
 use crate::*;
+use ipc::{GlobalKey, NetworkKey, NodeKey};
 
 /// `ray send <peer> <files...>`: one `SendFileFd` request per file. Each file
 /// gets its own IPC connection (the protocol is one request per connection);
@@ -76,15 +77,9 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
 /// Read one global settings key from the daemon. Returns the rendered value, or
 /// `None` once the daemon's error has been printed, so the caller can just
 /// return.
-async fn config_row(key: &str) -> Result<Option<String>> {
+async fn config_row(key: NodeKey) -> Result<Option<String>> {
     let mut stream = ipc::connect().await?;
-    ipc::send(
-        &mut stream,
-        ipc::IpcMessage::ConfigGet {
-            key: Some(key.to_string()),
-        },
-    )
-    .await?;
+    ipc::send(&mut stream, ipc::IpcMessage::ConfigGet { key: Some(key) }).await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::ConfigValues { rows } => Ok(Some(
             rows.into_iter().next().map(|(_, v)| v).unwrap_or_default(),
@@ -108,7 +103,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
         Some(FilesAction::DownloadDir { path, clear }) => {
             if *clear {
                 return crate::ipc_mutate(ipc::IpcMessage::ConfigUnset {
-                    key: "download-dir".to_string(),
+                    key: NodeKey::Global(GlobalKey::DownloadDir),
                 })
                 .await;
             } else if let Some(p) = path {
@@ -120,13 +115,13 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                     anyhow::bail!("download-dir must be an absolute path: {p}");
                 }
                 return crate::ipc_mutate(ipc::IpcMessage::ConfigSet {
-                    key: "download-dir".to_string(),
+                    key: NodeKey::Global(GlobalKey::DownloadDir),
                     value: p.clone(),
                     replace: false,
                 })
                 .await;
             }
-            if let Some(dir) = config_row("download-dir").await? {
+            if let Some(dir) = config_row(NodeKey::Global(GlobalKey::DownloadDir)).await? {
                 println!(
                     "download-dir = {}",
                     if dir.is_empty() { "<unset>" } else { &dir }
@@ -137,7 +132,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
         Some(FilesAction::DownloadUser { user, clear }) => {
             if *clear {
                 return crate::ipc_mutate(ipc::IpcMessage::ConfigUnset {
-                    key: "download-user".to_string(),
+                    key: NodeKey::Global(GlobalKey::DownloadUser),
                 })
                 .await;
             } else if let Some(u) = user {
@@ -147,13 +142,13 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                     anyhow::anyhow!("unknown user '{u}' (pass a valid username or uid)")
                 })?;
                 return crate::ipc_mutate(ipc::IpcMessage::ConfigSet {
-                    key: "download-user".to_string(),
+                    key: NodeKey::Global(GlobalKey::DownloadUser),
                     value: uid.to_string(),
                     replace: false,
                 })
                 .await;
             }
-            if let Some(uid) = config_row("download-user").await? {
+            if let Some(uid) = config_row(NodeKey::Global(GlobalKey::DownloadUser)).await? {
                 if uid.is_empty() {
                     println!("download-user = <unset>");
                 } else {
@@ -296,7 +291,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 &mut stream,
                 ipc::IpcMessage::NetConfigSet {
                     network,
-                    key: "net.auto-accept-files".to_string(),
+                    key: NetworkKey::AutoAcceptFiles,
                     value: state,
                 },
             )
