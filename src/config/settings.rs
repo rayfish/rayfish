@@ -37,10 +37,6 @@ pub static KEYS: &[SettingKey] = &[
     SettingKey { name: "dns-upstreams", scope: Scope::Global, help: "Magic DNS upstream forwarders (IPv4, comma-separated)" },
     SettingKey { name: "auto-update", scope: Scope::Global, help: "install new releases automatically (on|off)" },
     SettingKey { name: "on-demand", scope: Scope::Global, help: "dial peers lazily on first packet (on|off)" },
-    SettingKey { name: "ssh", scope: Scope::Global, help: "embedded mesh SSH server (on|off)" },
-    SettingKey { name: "download-dir", scope: Scope::Global, help: "where accepted files land (path, empty for default)" },
-    SettingKey { name: "download-user", scope: Scope::Global, help: "uid owning accepted files (number, empty for default)" },
-    SettingKey { name: "hostname-default", scope: Scope::Global, help: "hostname used when create/join omits --hostname" },
 ];
 
 pub fn lookup(key: &str) -> Option<&'static SettingKey> {
@@ -72,7 +68,6 @@ pub fn apply_global(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) 
         "mdns" => cfg.mdns_enabled = parse_bool(value, true)?,
         "auto-update" => cfg.auto_update = parse_bool(value, false)?,
         "on-demand" => cfg.on_demand = parse_bool(value, true)?,
-        "ssh" => cfg.ssh_enabled = parse_bool(value, false)?,
 
         "relay" => cfg.relay = server_override(entries, reset, replace, super::RELAY_PRESET_RAYFISH)?,
         "discovery-dns" => {
@@ -90,18 +85,6 @@ pub fn apply_global(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) 
                 cfg.dns_upstreams = ServerOverride { servers: entries, replace };
             }
         }
-
-        "download-dir" => cfg.download_dir = empty_to_none(value),
-        "download-user" => {
-            cfg.download_user = match empty_to_none(value) {
-                None => None,
-                Some(v) => Some(
-                    v.parse::<u32>()
-                        .with_context(|| format!("invalid uid: {v} (expected a number)"))?,
-                ),
-            }
-        }
-        "hostname-default" => cfg.default_hostname = empty_to_none(value),
 
         other => bail!("unknown config key: {other} ({})", key_list()),
     }
@@ -124,11 +107,6 @@ fn server_override(
     Ok(ServerOverride { servers: entries, replace })
 }
 
-fn empty_to_none(value: &str) -> Option<String> {
-    let v = value.trim();
-    if v.is_empty() { None } else { Some(v.to_string()) }
-}
-
 /// Comma-joined key names, for the "unknown key" error.
 pub fn key_list() -> String {
     KEYS.iter().map(|k| k.name).collect::<Vec<_>>().join(", ")
@@ -139,20 +117,12 @@ pub fn render_global(cfg: &AppConfig, key: &str) -> Result<String> {
         "mdns" => on_off(cfg.mdns_enabled),
         "auto-update" => on_off(cfg.auto_update),
         "on-demand" => on_off(cfg.on_demand),
-        "ssh" => on_off(cfg.ssh_enabled),
         "relay" => super::render_override(&cfg.relay),
         "discovery-dns" => super::render_override(&cfg.discovery_dns),
         "dns-upstreams" => super::render_override(&cfg.dns_upstreams),
-        "download-dir" => opt_or_default(cfg.download_dir.as_deref()),
-        "download-user" => opt_or_default(cfg.download_user.map(|u| u.to_string()).as_deref()),
-        "hostname-default" => opt_or_default(cfg.default_hostname.as_deref()),
         other => bail!("unknown config key: {other} ({})", key_list()),
     };
     Ok(out)
-}
-
-fn opt_or_default(v: Option<&str>) -> String {
-    v.unwrap_or("<default>").to_string()
 }
 
 fn on_off(v: bool) -> String {
@@ -191,34 +161,30 @@ mod tests {
     }
 
     #[test]
-    fn download_settings_round_trip_through_the_registry() {
+    fn toggles_round_trip_and_unset_returns_each_key_to_its_own_default() {
         let mut cfg = AppConfig::default();
-        apply_global(&mut cfg, "download-dir", "/srv/incoming", false).unwrap();
-        assert_eq!(cfg.download_dir.as_deref(), Some("/srv/incoming"));
-        assert_eq!(render_global(&cfg, "download-dir").unwrap(), "/srv/incoming");
+        apply_global(&mut cfg, "auto-update", "on", false).unwrap();
+        assert!(cfg.auto_update);
+        apply_global(&mut cfg, "on-demand", "off", false).unwrap();
+        assert!(!cfg.on_demand);
 
-        // Empty clears, matching the old `SetDownloadDir { path: None }`.
-        apply_global(&mut cfg, "download-dir", "", false).unwrap();
-        assert_eq!(cfg.download_dir, None);
-        assert_eq!(render_global(&cfg, "download-dir").unwrap(), "<default>");
+        // The two defaults differ, so a shared "reset to false" would pass one and
+        // fail the other.
+        apply_global(&mut cfg, "auto-update", "", false).unwrap();
+        apply_global(&mut cfg, "on-demand", "", false).unwrap();
+        assert!(!cfg.auto_update);
+        assert!(cfg.on_demand);
     }
 
     #[test]
-    fn download_user_rejects_a_non_numeric_uid() {
+    fn a_key_that_is_not_registered_here_is_rejected() {
+        // `ssh` / `download-dir` / `download-user` are registered in Task 6, in the
+        // same commit that migrates their side-effecting handlers. Until then they
+        // must not be reachable through the generic `ray config set`.
         let mut cfg = AppConfig::default();
-        assert!(apply_global(&mut cfg, "download-user", "dario", false).is_err());
-        assert!(apply_global(&mut cfg, "download-user", "1000", false).is_ok());
-        assert_eq!(cfg.download_user, Some(1000));
-    }
-
-    #[test]
-    fn ssh_toggle_is_registered_and_defaults_off() {
-        let mut cfg = AppConfig::default();
-        assert!(!cfg.ssh_enabled);
-        apply_global(&mut cfg, "ssh", "on", false).unwrap();
-        assert!(cfg.ssh_enabled);
-        apply_global(&mut cfg, "ssh", "", false).unwrap();
-        assert!(!cfg.ssh_enabled, "unset returns to the secure default");
+        assert!(apply_global(&mut cfg, "ssh", "on", false).is_err());
+        assert!(apply_global(&mut cfg, "download-dir", "/srv/x", false).is_err());
+        assert!(apply_global(&mut cfg, "hostname-default", "box", false).is_err());
     }
 
     #[test]
