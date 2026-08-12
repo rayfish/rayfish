@@ -10,8 +10,9 @@
 //! admit the session iff the peer is in a shared network's `ssh_allow` list.
 //!
 //! Authorization is the only gate; SSH auth itself is the `none` method (the
-//! identity is already proven). For now an authorized peer may log in as any
-//! local unix user, including root; tighter user-mapping is future work.
+//! identity is already proven). Which local accounts a peer may log in as comes
+//! from its `SshRule.users` (see [`UserPolicy`]): empty grants any non-root
+//! account, an explicit list grants exactly those, `*` grants any including root.
 //!
 //! Authorization is evaluated once, when the connection is accepted, so
 //! `ray firewall ssh allow/deny` changes apply to *new* sessions; an
