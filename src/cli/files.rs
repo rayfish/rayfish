@@ -112,8 +112,13 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 })
                 .await;
             } else if let Some(p) = path {
-                // The absolute-path check lives in the settings registry now, so
-                // it binds every writer and not just this arm.
+                // The registry enforces this too, so it binds every writer and
+                // not just this arm. Kept here as well because the daemon's
+                // error surfaces through `print_error`, which prints a different
+                // prefix than the bail this command has always produced.
+                if !std::path::Path::new(p).is_absolute() {
+                    anyhow::bail!("download-dir must be an absolute path: {p}");
+                }
                 return crate::ipc_mutate(ipc::IpcMessage::ConfigSet {
                     key: "download-dir".to_string(),
                     value: p.clone(),
@@ -284,10 +289,9 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             }
         }
         Some(FilesAction::AutoAccept { network, state }) => {
-            // Parsed here with the same registry function the daemon uses: this
-            // arm prints a daemon error without failing, so a typo caught only
-            // server-side would exit 0.
-            crate::config::settings::parse_bool(&state, true)?;
+            // This arm prints a daemon error without failing, so a typo caught
+            // only server-side would exit 0 instead of 1.
+            parse_on_off(&state)?;
             ipc::send(
                 &mut stream,
                 ipc::IpcMessage::NetConfigSet {

@@ -369,21 +369,9 @@ impl NetworkRegistry {
         }
         self.firewall.update(config.clone());
         save_firewall_warn(&config);
-        // These changes are live the moment the swap lands, so the message must
-        // not carry the "restart the daemon" wording the global keys use.
-        let message = match key {
-            "firewall.enabled" if config.disabled => {
-                "firewall off (all packets allowed on this device)".to_string()
-            }
-            "firewall.enabled" => "firewall on (enforcing rules and defaults)".to_string(),
-            "firewall.reject" => format!(
-                "fail-fast reject {}",
-                if config.reject { "on" } else { "off" }
-            ),
-            "firewall.default-in" => format!("inbound default set to {}", config.default_inbound),
-            other => format!("Set {other}"),
-        };
-        IpcMessage::Ok { message }
+        IpcMessage::Ok {
+            message: firewall_set_message(&config, key),
+        }
     }
 
     /// Render one `Scope::Firewall` settings key from the live config.
@@ -606,6 +594,26 @@ impl Daemon {
     }
 }
 
+/// The confirmation line for a `Scope::Firewall` key, rendered from the config
+/// as it stands after the write. Each key keeps the exact string its old handler
+/// produced. Note the absence of the global keys' "Restart the daemon" clause:
+/// these edits are live the moment the `ArcSwap` swap lands, so claiming
+/// otherwise would be false.
+fn firewall_set_message(config: &firewall::FirewallConfig, key: &str) -> String {
+    match key {
+        "firewall.enabled" if config.disabled => {
+            "firewall off (all packets allowed on this device)".to_string()
+        }
+        "firewall.enabled" => "firewall on (enforcing rules and defaults)".to_string(),
+        "firewall.reject" => format!(
+            "fail-fast reject {}",
+            if config.reject { "on" } else { "off" }
+        ),
+        "firewall.default-in" => format!("inbound default set to {}", config.default_inbound),
+        other => format!("Set {other}"),
+    }
+}
+
 /// Normalize an SSH allow rule's user list: a `*` (any user incl. root) collapses
 /// the whole list to just `*`; otherwise sort + dedupe. An empty list is left
 /// empty, meaning "any non-root user" (the secure default).
@@ -616,6 +624,78 @@ fn normalize_ssh_users(mut users: Vec<String>) -> Vec<String> {
     users.sort();
     users.dedup();
     users
+}
+
+#[cfg(test)]
+mod firewall_message_tests {
+    use super::*;
+
+    /// Pinned byte-for-byte: these strings used to live in `firewall_reject`,
+    /// `firewall_set_enabled` and `firewall_default`, and the settings-registry
+    /// migration was not allowed to change what the user reads. See the matching
+    /// test in `daemon::confirmation_message_tests` for the global keys.
+    fn disabled(v: bool) -> firewall::FirewallConfig {
+        firewall::FirewallConfig {
+            disabled: v,
+            ..Default::default()
+        }
+    }
+
+    fn reject(v: bool) -> firewall::FirewallConfig {
+        firewall::FirewallConfig {
+            reject: v,
+            ..Default::default()
+        }
+    }
+
+    fn default_in(v: firewall::Action) -> firewall::FirewallConfig {
+        firewall::FirewallConfig {
+            default_inbound: v,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn firewall_keys_keep_the_exact_wording_their_handlers_printed() {
+        assert_eq!(
+            firewall_set_message(&disabled(false), "firewall.enabled"),
+            "firewall on (enforcing rules and defaults)"
+        );
+        assert_eq!(
+            firewall_set_message(&disabled(true), "firewall.enabled"),
+            "firewall off (all packets allowed on this device)"
+        );
+
+        assert_eq!(
+            firewall_set_message(&reject(true), "firewall.reject"),
+            "fail-fast reject on"
+        );
+        assert_eq!(
+            firewall_set_message(&reject(false), "firewall.reject"),
+            "fail-fast reject off"
+        );
+
+        assert_eq!(
+            firewall_set_message(&default_in(firewall::Action::Deny), "firewall.default-in"),
+            "inbound default set to deny"
+        );
+        assert_eq!(
+            firewall_set_message(&default_in(firewall::Action::Allow), "firewall.default-in"),
+            "inbound default set to allow"
+        );
+    }
+
+    /// A firewall edit hot-swaps the `ArcSwap` the packet path reads, so it is
+    /// in force before the reply is written. Telling the user to restart would
+    /// be false, and would also mask a regression back to load/mutate/save.
+    #[test]
+    fn firewall_messages_never_claim_a_restart_is_needed() {
+        let fw = firewall::FirewallConfig::default();
+        for key in settings::keys_for(settings::Scope::Firewall) {
+            let msg = firewall_set_message(&fw, key.name);
+            assert!(!msg.contains("Restart"), "{}: {msg}", key.name);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -63,12 +63,10 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
 /// through the registry (`config::settings`). Kept as its own function so the
 /// mapping is unit-testable without a daemon.
 ///
-/// A bad word is rejected here too, by calling the same registry parser the
-/// daemon will: `ray firewall` prints a daemon error without failing the
-/// command, so a typo caught only server-side would exit 0.
+/// A bad word is still rejected here, by [`parse_on_off`]: `ray firewall` prints
+/// a daemon error without failing the command, so a typo caught only
+/// server-side would exit 0 instead of 1.
 fn to_ipc(action: FirewallAction) -> Result<ipc::IpcMessage> {
-    use crate::config::settings::parse_bool;
-
     Ok(match action {
         FirewallAction::Add {
             direction,
@@ -98,7 +96,7 @@ fn to_ipc(action: FirewallAction) -> Result<ipc::IpcMessage> {
             }
         }
         FirewallAction::Reject { state } => {
-            parse_bool(&state, false)?;
+            parse_on_off(&state)?;
             ipc::IpcMessage::ConfigSet {
                 key: "firewall.reject".to_string(),
                 value: state,
@@ -118,7 +116,7 @@ fn to_ipc(action: FirewallAction) -> Result<ipc::IpcMessage> {
         FirewallAction::Accept { network } => ipc::IpcMessage::FirewallAccept { network },
         FirewallAction::Deny { network } => ipc::IpcMessage::FirewallDeny { network },
         FirewallAction::AutoAccept { network, state } => {
-            parse_bool(&state, false)?;
+            parse_on_off(&state)?;
             ipc::IpcMessage::NetConfigSet {
                 network,
                 key: "net.auto-accept-firewall".to_string(),
@@ -956,6 +954,35 @@ mod tests {
             }
             other => panic!("expected NetConfigSet, got {other:?}"),
         }
+    }
+
+    /// A bad toggle word must still fail the command (exit 1, not a printed
+    /// daemon error and exit 0) and must fail with the wording these commands
+    /// have always used, which is not the settings registry's wording.
+    #[test]
+    fn a_bad_toggle_word_fails_with_the_original_message() {
+        let err = to_ipc(FirewallAction::Reject {
+            state: "maybe".into(),
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "expected `on` or `off`, got 'maybe'");
+
+        let err = to_ipc(FirewallAction::AutoAccept {
+            network: "gaming".into(),
+            state: "maybe".into(),
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "expected `on` or `off`, got 'maybe'");
+
+        // `firewall default` parses an allow/deny word, with its own message.
+        let err = to_ipc(FirewallAction::Default {
+            action: "maybe".into(),
+        })
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid action 'maybe' (expected 'allow' or 'deny')"
+        );
     }
 
     /// `ray firewall ssh on|off` must go through the `ssh` key, which is the

@@ -339,34 +339,8 @@ fn parse_action(value: &str, default: Action) -> Result<Action> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use super::super::GroupMode;
+    use super::super::empty_network_config as empty_network;
     use super::*;
-
-    fn empty_network(name: &str) -> super::super::NetworkConfig {
-        super::super::NetworkConfig {
-            name: name.to_string(),
-            group_mode: GroupMode::Open,
-            my_ip: None,
-            my_hostname: None,
-            pending_hostname: None,
-            members: vec![],
-            approved: vec![],
-            network_secret_key: None,
-            network_public_key: None,
-            transport: None,
-            auto_accept_firewall: false,
-            auto_accept_files: true,
-            admins: vec![],
-            direct: false,
-            ssh_allow: vec![],
-            aliases: BTreeMap::new(),
-            ephemeral_ttl_secs: None,
-            exit_allow: vec![],
-            exit_node_use: None,
-        }
-    }
 
     #[test]
     fn network_auto_accept_toggles_round_trip() {

@@ -299,6 +299,34 @@ pub(crate) fn parse_entries(value: &str) -> Vec<String> {
 
 pub mod settings;
 
+/// A minimal saved network, for tests that need a `NetworkConfig` to apply
+/// settings to or render messages from. Every field is at its default; only the
+/// name is meaningful.
+#[cfg(test)]
+pub(crate) fn empty_network_config(name: &str) -> NetworkConfig {
+    NetworkConfig {
+        name: name.to_string(),
+        group_mode: GroupMode::Open,
+        my_ip: None,
+        my_hostname: None,
+        pending_hostname: None,
+        members: vec![],
+        approved: vec![],
+        network_secret_key: None,
+        network_public_key: None,
+        transport: None,
+        auto_accept_firewall: false,
+        auto_accept_files: true,
+        admins: vec![],
+        direct: false,
+        ssh_allow: vec![],
+        aliases: BTreeMap::new(),
+        ephemeral_ttl_secs: None,
+        exit_allow: vec![],
+        exit_node_use: None,
+    }
+}
+
 /// Apply a `ray config set`/`unset` to the in-memory config. Delegates to the
 /// settings registry; kept as a thin wrapper so existing callers don't need to
 /// know about `settings::apply_global`.

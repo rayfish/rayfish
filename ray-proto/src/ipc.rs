@@ -307,10 +307,18 @@ pub enum IpcMessage {
     /// `ray netcheck`: local endpoint diagnostics (bound port, home relay,
     /// reachability). Open read.
     Netcheck,
-    /// Set a global config key (`ray config set`, `ray auto-update on|off`). The
-    /// daemon applies it to its own config and persists it. `value` uses the same
-    /// grammar as `config::config_set`. Same routing rationale as `SetMdns`.
-    /// Mutation.
+    /// Set one settings key (`config::settings`), whatever store backs it: the
+    /// daemon dispatches on the key's scope, so this one variant serves
+    /// `ray config set`, `ray mdns`, `ray auto-update`, `ray firewall
+    /// on|off|reject|default`, `ray firewall ssh on|off` and `ray files
+    /// download-dir|download-user`. `value` is the raw word; the registry parses
+    /// it.
+    ///
+    /// Routed through the daemon rather than written client-side so the write
+    /// always lands in the config dir the daemon reads: on non-Linux,
+    /// `config_dir()` comes from the process environment, so a client-side write
+    /// from a different `HOME` than the service's would silently miss it.
+    /// Mutation (root/operator).
     ConfigSet {
         key: String,
         value: String,
