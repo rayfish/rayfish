@@ -303,6 +303,8 @@ fn parse_entries(value: &str) -> Vec<String> {
 /// toggles (auto-update/on-demand) via their own `config` subcommands.
 const CONFIG_KEYS: &str = "expected relay, discovery-dns, dns-upstreams, auto-update, or on-demand";
 
+pub mod settings;
+
 pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) -> Result<()> {
     let entries = parse_entries(value);
     let reset = entries.is_empty() || entries == ["n0"];
