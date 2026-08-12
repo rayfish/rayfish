@@ -772,7 +772,19 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<(
     let peer_cred = stream.peer_cred().ok().map(|c| (c.uid(), c.gid()));
     // The request is read fd-aware: `SendFileFd` arrives with the file as
     // SCM_RIGHTS ancillary data, which a plain framed read would drop.
-    let (req, fds) = ipc::recv_with_fds(&stream).await?;
+    let (req, fds) = match ipc::recv_with_fds(&stream).await {
+        Ok(v) => v,
+        // A request this build cannot decode (a settings key it does not know, a
+        // variant from a newer `ray`) gets the reason back rather than a bare
+        // hangup, which the client can only report as "connection closed". The
+        // send is best-effort: the common cause is a client that has already
+        // gone away.
+        Err(e) => {
+            let mut framed = ipc::framed(stream);
+            let _ = ipc::send(&mut framed, ipc_err(format!("{e:#}"))).await;
+            return Ok(());
+        }
+    };
     let resp = daemon.handle_request(req, peer_cred, fds).await;
     let mut framed = ipc::framed(stream);
     ipc::send(&mut framed, resp).await?;

@@ -1208,10 +1208,12 @@ async fn cmd_auto_update(state: &str) -> Result<()> {
 async fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
     match action.unwrap_or(ConfigAction::Get { key: None }) {
         ConfigAction::Get { key } => {
+            // Before the connect, so a bad key reads the same whether or not the
+            // daemon happens to be running (and the same as `set`/`unset`).
+            let key = key.as_deref().map(parse_node_key);
             let mut stream = ipc::connect()
                 .await
                 .context("rayfish daemon is not running; start it with: sudo ray up")?;
-            let key = key.as_deref().map(parse_node_key);
             ipc::send(&mut stream, ipc::IpcMessage::ConfigGet { key }).await?;
             match ipc::recv(&mut stream).await? {
                 ipc::IpcMessage::ConfigValues { rows } => {
