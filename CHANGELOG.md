@@ -61,6 +61,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The Android app no longer crashes when Android restarts it in the
+  background.** After the system killed the app to reclaim memory, it would
+  restart the Rayfish service to put it back in standby (VPN off, files and mesh
+  visibility still working). Android refuses that kind of background start unless
+  a tunnel is up, and the refusal took the whole app down: a crash report, and a
+  device that quietly dropped off the mesh instead of coming back. The refusal is
+  now handled: the app stops cleanly and restores standby the next time you open
+  it or turn the VPN on.
+
 - **Android no longer leaves a VPN connected after a failed tunnel start.** When
   bringing the tunnel up failed partway (the mesh node had not started yet, say),
   the app fell back to standby and reported the tunnel off, but the VPN interface

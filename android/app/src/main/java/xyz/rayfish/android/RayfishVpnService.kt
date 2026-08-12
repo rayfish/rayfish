@@ -134,7 +134,16 @@ class RayfishVpnService : VpnService() {
                 // stopTunnel and therefore sees the settled value, and corrects
                 // the notification if needed.
                 Log.i(TAG, "ACTION_STANDBY received")
-                startForegroundNotification(standby = tunnel == null)
+                // Sent with startForegroundService from a visible Activity, so
+                // the exemption is normally held and this succeeds. If it is
+                // refused anyway, stop rather than leave the service owing a
+                // foreground start it can never make (which the system answers
+                // with a ForegroundServiceDidNotStartInTimeException kill).
+                if (!startForegroundNotification(standby = tunnel == null)) {
+                    Log.w(TAG, "ACTION_STANDBY refused a foreground start; stopping (startId=$startId)")
+                    stopSelf(startId)
+                    return START_NOT_STICKY
+                }
                 nodeExecutor.execute {
                     // See the ACTION_STOP execute() block for why this must never
                     // let a throwable escape.
@@ -216,7 +225,17 @@ class RayfishVpnService : VpnService() {
     private fun startTunnel(startId: Int) {
         // startForeground must be called promptly so the foreground-service
         // deadline is met; only the blocking node work goes to the executor.
-        startForegroundNotification()
+        //
+        // A refusal here is the null-intent restart path again (the Activity
+        // paths hold the exemption): we would be building a TUN for a service
+        // the OS is about to kill. Stop instead. stopSelf(startId), not the bare
+        // form, for the same reason as the ACTION_STOP path above: a newer start
+        // command that already landed must survive this one.
+        if (!startForegroundNotification()) {
+            Log.w(TAG, "tunnel bring-up refused a foreground start; stopping (startId=$startId)")
+            stopSelf(startId)
+            return
+        }
         nodeExecutor.execute {
             // See the ACTION_STOP execute() block for why this must never let a
             // throwable escape: an uncaught one here kills the process outright.
@@ -473,7 +492,20 @@ class RayfishVpnService : VpnService() {
      * so the node keeps serving files and stays visible in the mesh.
      */
     private fun enterStandby() {
-        startForegroundNotification(standby = true)
+        if (!startForegroundNotification(standby = true)) {
+            // Reached from the null-intent restart, so the app is in the
+            // background and the system refused the foreground start (see
+            // startForegroundNotification). Standby exists to keep the node
+            // alive, and a node with no foreground service is exactly the
+            // process Android kills, so there is nothing to keep alive here:
+            // stop instead of bringing a control plane up that cannot survive.
+            // The user gets standby back the next time they open the app or
+            // enable the VPN, both of which start us from the foreground.
+            // onDestroy queues the full teardown, so nothing is left running.
+            Log.w(TAG, "standby refused a foreground start; stopping instead of running unprotected")
+            stopSelf()
+            return
+        }
         nodeExecutor.execute {
             // See the ACTION_STOP execute() block for why this must never let a
             // throwable escape.
@@ -704,7 +736,33 @@ class RayfishVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun startForegroundNotification(standby: Boolean = false) {
+    /**
+     * Post (or update) the ongoing notification and put the service in the
+     * foreground. Returns false if the system refused the foreground start, in
+     * which case the caller must not assume the service can keep running.
+     *
+     * The refusal is real and was crashing the app: on the null-intent
+     * START_STICKY restart path the system recreates this service with the app in
+     * the background, and a background foreground-service start needs an
+     * exemption. `specialUse` (our type, see the manifest) has none. A VpnService
+     * does get one while a tunnel is established, but the standby path is
+     * precisely the case where there is no tunnel, so the start is denied and
+     * `startForeground` throws [android.app.ForegroundServiceStartNotAllowedException]
+     * on the main thread, killing the process.
+     *
+     * Caught as Throwable, not that one class: it only exists on API 31+, and the
+     * same call can also throw SecurityException (missing FGS-type permission)
+     * and InvalidForegroundServiceTypeException. None of them is worth a crash.
+     *
+     * Only the three call sites that are genuine foreground *starts* act on the
+     * result (startTunnel, enterStandby, ACTION_STANDBY). The rest just update
+     * the text of a notification this service already posted (the ACTION_STOP and
+     * onRevoke standby switches, handleBringUpFailure, the ACTION_STANDBY
+     * correction): an already-foreground service is not subject to the
+     * background-start check, so they ignore the result and let the log stand as
+     * the record if it ever does fail.
+     */
+    private fun startForegroundNotification(standby: Boolean = false): Boolean {
         val nm = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
@@ -754,10 +812,16 @@ class RayfishVpnService : VpnService() {
 
         val notification: Notification = builder.build()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTIF_ID, notification)
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIF_ID, notification)
+            }
+            true
+        } catch (t: Throwable) {
+            Log.e(TAG, "startForeground refused (standby=$standby); service cannot stay in the foreground", t)
+            false
         }
     }
 
