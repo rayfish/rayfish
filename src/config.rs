@@ -162,8 +162,10 @@ pub struct NetworkConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub aliases: BTreeMap<String, String>,
     /// Coordinator-local ephemeral policy: auto-remove a member offline
-    /// longer than this many seconds. `None` = off (default). A 1-hour floor
-    /// is enforced at the CLI. Local only (only the coordinator enforces);
+    /// longer than this many seconds. `None` = off (default). The 1-hour floor
+    /// is enforced by the settings registry (`settings::apply_network`), so it
+    /// binds every writer; the CLI's duration parser rejects it earlier only to
+    /// give a nicer message. Local only (only the coordinator enforces);
     /// never rides the signed blob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ephemeral_ttl_secs: Option<u64>,
@@ -316,7 +318,9 @@ pub(crate) fn render_override(o: &ServerOverride) -> String {
 /// Render config settings as `(key, value)` rows for `ray config get`. With a
 /// key, returns just that one (error on unknown key); without, all three.
 pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, String)>> {
-    let row = |k: &str| -> Result<(String, String)> { Ok((k.to_string(), settings::render_global(cfg, k)?)) };
+    let row = |k: &str| -> Result<(String, String)> {
+        Ok((k.to_string(), settings::render_global(cfg, k)?))
+    };
     match key {
         Some(k) => Ok(vec![row(k)?]),
         None => Ok(vec![

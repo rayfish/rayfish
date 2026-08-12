@@ -775,11 +775,9 @@ impl Daemon {
                 | IpcMessage::Ping { .. }
                 | IpcMessage::Netcheck
                 | IpcMessage::AliasList { .. }
-                | IpcMessage::GetEphemeral { .. }
                 | IpcMessage::ListPairedDevices
                 | IpcMessage::ConfigGet { .. }
                 | IpcMessage::NetConfigGet { .. }
-                | IpcMessage::GetDownloadSettings
         ) {
             return None;
         }
@@ -831,31 +829,36 @@ impl Daemon {
         }
     }
 
-    /// Persist the mDNS discovery toggle (`ray mdns on|off`). The daemon reads
-    /// `mdns_enabled` at startup, so this takes effect on the next restart. Done
-    /// here rather than client-side so the write lands in the config dir the
-    /// daemon actually reads (see `IpcMessage::SetMdns`).
-    pub(crate) fn set_mdns(&self, enabled: bool) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => return ipc_err(format!("failed to load config: {e}")),
-        };
-        app_config.mdns_enabled = enabled;
-        if let Err(e) = config::save_settings(&app_config) {
-            return ipc_err(format!("failed to save config: {e}"));
+    /// Apply one settings key and persist it. Serves `ray config set|unset` and
+    /// every single-value command that used to carry its own IPC variant
+    /// (`ray mdns`, `ray auto-update`, `ray firewall on|off|reject|default`,
+    /// `ray firewall ssh on|off`, `ray files download-dir|download-user`).
+    ///
+    /// Dispatch is on the key's [`Scope`], because the three stores are not
+    /// interchangeable: `Scope::Firewall` writes the live `ArcSwap` the packet
+    /// path reads (a load/mutate/save there would silently turn `ray firewall
+    /// off` into "restart required"), and `ssh` carries listener + passthrough
+    /// side effects. Only `Scope::Global` is the plain load/mutate/save below.
+    fn config_apply(
+        self: &Arc<Self>,
+        key: &str,
+        value: &str,
+        replace: bool,
+        reset: bool,
+    ) -> IpcMessage {
+        match settings::lookup(key).map(|k| k.scope) {
+            Some(Scope::Firewall) => return self.registry.firewall_config_set(key, value),
+            Some(Scope::Network) => {
+                return ipc_err(format!(
+                    "'{key}' is a per-network setting, not a global one; it needs a network"
+                ));
+            }
+            // Not a plain config write: see `Daemon::ssh_config_set`.
+            Some(Scope::Global) if key == "ssh" => return self.ssh_config_set(value),
+            // Global keys fall through; an unknown key gets the registry's
+            // "unknown config key" error, with the list of valid ones.
+            _ => {}
         }
-        IpcMessage::Ok {
-            message: format!(
-                "mDNS discovery {}. Restart the daemon for changes to take effect.",
-                if enabled { "enabled" } else { "disabled" }
-            ),
-        }
-    }
-
-    /// Apply a global config key change and persist it (`ray config set|unset`
-    /// and the `ray auto-update` alias). `reset` selects the "unset" wording; an
-    /// empty `value` (as `ConfigUnset` sends) resets the key to its default.
-    fn config_apply(&self, key: &str, value: &str, replace: bool, reset: bool) -> IpcMessage {
         let mut app_config = match config::load() {
             Ok(c) => c,
             Err(e) => return ipc_err(format!("failed to load config: {e}")),
@@ -877,7 +880,14 @@ impl Daemon {
     }
 
     /// Read global config rows for `ray config get` from the daemon's own config.
+    /// Firewall-scoped keys are read from the live config, not from disk, so a
+    /// get always agrees with what the packet path is enforcing.
     fn config_get(&self, key: Option<&str>) -> IpcMessage {
+        if let Some(k) = key
+            && settings::lookup(k).map(|s| s.scope) == Some(Scope::Firewall)
+        {
+            return self.registry.firewall_config_get(k);
+        }
         let app_config = match config::load() {
             Ok(c) => c,
             Err(e) => return ipc_err(format!("failed to load config: {e}")),
@@ -888,13 +898,19 @@ impl Daemon {
         }
     }
 
-    /// Apply one per-network setting and persist just that network's file.
-    fn net_config_apply(&self, network: &str, key: &str, value: &str) -> IpcMessage {
-        if settings::lookup(key).map(|k| k.scope) != Some(Scope::Network) {
-            return ipc_err(format!(
-                "'{key}' is not a per-network setting (try `ray config set {key}`)"
-            ));
-        }
+    /// Apply one per-network setting and persist just that network's file, then
+    /// run whatever live re-materialization the key implies (the registry's
+    /// `apply_network` is pure and deliberately does none of it).
+    async fn net_config_apply(
+        self: &Arc<Self>,
+        network: &str,
+        key: &str,
+        value: &str,
+    ) -> IpcMessage {
+        let key = match require_network_key(key) {
+            Ok(k) => k,
+            Err(e) => return ipc_err(e),
+        };
         let mut net = match config::load_network(network) {
             Ok(Some(n)) => n,
             Ok(None) => return ipc_err(format!("network '{network}' not found")),
@@ -906,9 +922,35 @@ impl Daemon {
         if let Err(e) = config::save_network(&net) {
             return ipc_err(format!("failed to save config: {e}"));
         }
-        IpcMessage::Ok {
-            message: format!("Set {key} on {network}"),
-        }
+        // Side effects + the per-key confirmation. These changes are live, so
+        // the message must not carry the global keys' "restart" wording.
+        let on_off = |v: bool| if v { "enabled" } else { "disabled" };
+        let message = match key {
+            "net.auto-accept-firewall" => {
+                self.registry.reapply_suggested_firewall(network);
+                format!(
+                    "auto-accept firewall suggestions {} for '{network}'",
+                    on_off(net.auto_accept_firewall)
+                )
+            }
+            "net.auto-accept-files" => {
+                if net.auto_accept_files {
+                    self.files.drain_auto_acceptable().await;
+                }
+                format!(
+                    "auto-accept files from your own devices {} for '{network}'",
+                    on_off(net.auto_accept_files)
+                )
+            }
+            // The pruner re-reads the TTL each tick, so there is nothing to do
+            // beyond the write.
+            "net.ephemeral-ttl" => match net.ephemeral_ttl_secs {
+                Some(s) => format!("ephemeral policy on '{network}' set to {s}s"),
+                None => format!("ephemeral policy on '{network}' disabled"),
+            },
+            other => format!("Set {other} on {network}"),
+        };
+        IpcMessage::Ok { message }
     }
 
     /// Read one or every per-network setting.
@@ -919,9 +961,9 @@ impl Daemon {
             Err(e) => return ipc_err(format!("failed to load network: {e}")),
         };
         let names: Vec<&'static str> = match key {
-            Some(k) => match settings::lookup(k) {
-                Some(sk) if sk.scope == Scope::Network => vec![sk.name],
-                _ => return ipc_err(format!("unknown per-network key: {k}")),
+            Some(k) => match require_network_key(k) {
+                Ok(name) => vec![name],
+                Err(e) => return ipc_err(e),
             },
             None => settings::keys_for(Scope::Network).map(|k| k.name).collect(),
         };
@@ -933,59 +975,6 @@ impl Daemon {
             }
         }
         IpcMessage::ConfigValues { rows }
-    }
-
-    /// Set/clear the accepted-files download directory (`ray files download-dir`)
-    /// and persist it to the daemon's own config. Takes effect at the next start.
-    fn set_download_dir(&self, path: Option<String>) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => return ipc_err(format!("failed to load config: {e}")),
-        };
-        let cleared = path.is_none();
-        app_config.download_dir = path;
-        if let Err(e) = config::save_settings(&app_config) {
-            return ipc_err(format!("failed to save config: {e}"));
-        }
-        IpcMessage::Ok {
-            message: if cleared {
-                "download-dir cleared. Restart the daemon for changes to take effect.".to_string()
-            } else {
-                "download-dir set. Restart the daemon for changes to take effect.".to_string()
-            },
-        }
-    }
-
-    /// Set/clear the accepted-files owner UID (`ray files download-user`) and
-    /// persist it. The client resolves the username to a UID before sending.
-    fn set_download_user(&self, uid: Option<u32>) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => return ipc_err(format!("failed to load config: {e}")),
-        };
-        let cleared = uid.is_none();
-        app_config.download_user = uid;
-        if let Err(e) = config::save_settings(&app_config) {
-            return ipc_err(format!("failed to save config: {e}"));
-        }
-        IpcMessage::Ok {
-            message: if cleared {
-                "download-user cleared. Restart the daemon for changes to take effect.".to_string()
-            } else {
-                "download-user set. Restart the daemon for changes to take effect.".to_string()
-            },
-        }
-    }
-
-    /// Read the file-download settings for `ray files download-dir`/`download-user`.
-    fn get_download_settings(&self) -> IpcMessage {
-        match config::load() {
-            Ok(c) => IpcMessage::DownloadSettings {
-                dir: c.download_dir,
-                uid: c.download_user,
-            },
-            Err(e) => ipc_err(format!("failed to load config: {e}")),
-        }
     }
 
     pub(crate) async fn handle_request(
@@ -1028,10 +1017,6 @@ impl Daemon {
             IpcMessage::Leave { name } => self.leave_network(&name).await,
             IpcMessage::Nuke { name, force } => self.registry.nuke_network(&name, force).await,
             IpcMessage::Kick { network, peer } => self.registry.kick_member(&network, &peer).await,
-            IpcMessage::SetEphemeral { network, ttl_secs } => {
-                self.registry.set_ephemeral(&network, ttl_secs).await
-            }
-            IpcMessage::GetEphemeral { network } => self.registry.get_ephemeral(&network),
             IpcMessage::Status => self.status(),
             IpcMessage::Report => self.build_report(peer_cred),
             IpcMessage::Up { hostname } => self.activate(hostname).await,
@@ -1063,11 +1048,6 @@ impl Daemon {
             }
             IpcMessage::FirewallRemove { index } => self.registry.firewall_remove(index),
             IpcMessage::FirewallShow => self.registry.firewall_show(),
-            IpcMessage::FirewallDefault { action } => self.registry.firewall_default(action),
-            IpcMessage::FirewallReject { enabled } => self.registry.firewall_reject(enabled),
-            IpcMessage::FirewallSetEnabled { enabled } => {
-                self.registry.firewall_set_enabled(enabled)
-            }
             IpcMessage::FirewallSuggest {
                 network,
                 suggestions,
@@ -1085,13 +1065,6 @@ impl Daemon {
             } => self
                 .registry
                 .firewall_resolve_suggestions(&network, &accept, &deny),
-            IpcMessage::FirewallAutoAccept { network, enabled } => {
-                self.registry.firewall_auto_accept(&network, enabled)
-            }
-            IpcMessage::FilesAutoAccept { network, enabled } => {
-                self.files_auto_accept(&network, enabled).await
-            }
-            IpcMessage::FirewallSshSet { enabled } => self.firewall_ssh_set(enabled),
             IpcMessage::FirewallSshAllow {
                 network,
                 peer,
@@ -1144,7 +1117,6 @@ impl Daemon {
             IpcMessage::ListPairedDevices => self.list_paired_devices(),
             IpcMessage::Unpair { device } => self.unpair(&device).await,
             IpcMessage::SetOperator { uid } => self.set_operator(uid),
-            IpcMessage::SetMdns { enabled } => self.set_mdns(enabled),
             IpcMessage::ConfigSet {
                 key,
                 value,
@@ -1156,13 +1128,10 @@ impl Daemon {
                 network,
                 key,
                 value,
-            } => self.net_config_apply(&network, &key, &value),
+            } => self.net_config_apply(&network, &key, &value).await,
             IpcMessage::NetConfigGet { network, key } => {
                 self.net_config_get(&network, key.as_deref())
             }
-            IpcMessage::SetDownloadDir { path } => self.set_download_dir(path),
-            IpcMessage::SetDownloadUser { uid } => self.set_download_user(uid),
-            IpcMessage::GetDownloadSettings => self.get_download_settings(),
             IpcMessage::InviteCreate {
                 network,
                 expires_secs,
@@ -1357,9 +1326,60 @@ impl Daemon {
     // -----------------------------------------------------------------------
 }
 
+/// Resolve `key` to a registered per-network setting, or explain what it is
+/// instead. Both `NetConfigSet` and `NetConfigGet` go through this, so a
+/// global or firewall key can never be written into a network file: the two
+/// stores share a namespace only by convention (`net.` prefix), not by type.
+/// The error names the command that does serve the key, per scope.
+fn require_network_key(key: &str) -> Result<&'static str, String> {
+    match settings::lookup(key) {
+        Some(k) if k.scope == Scope::Network => Ok(k.name),
+        Some(k) if k.scope == Scope::Firewall => Err(format!(
+            "'{key}' is a firewall setting, not a per-network one \
+             (set it with `ray config set {key} <value>`)"
+        )),
+        Some(_) => Err(format!(
+            "'{key}' is a global setting, not a per-network one \
+             (set it with `ray config set {key} <value>`)"
+        )),
+        None => Err(format!(
+            "unknown per-network key: {key} ({})",
+            settings::keys_for(Scope::Network)
+                .map(|k| k.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 #[cfg(test)]
 mod net_config_authz_tests {
     use super::*;
+
+    /// A global or firewall key reaching the per-network handlers would write a
+    /// key into `networks/<name>.toml` that nothing ever reads back, and (for
+    /// the firewall keys) skip the live `ArcSwap` swap entirely. Both handlers
+    /// gate on the scope before touching any file.
+    #[test]
+    fn per_network_handlers_reject_a_global_or_firewall_key() {
+        for key in ["mdns", "ssh", "download-dir"] {
+            let err = require_network_key(key).unwrap_err();
+            assert!(err.contains("global setting"), "{key}: {err}");
+            assert!(err.contains("ray config set"), "{key}: {err}");
+        }
+        for key in ["firewall.enabled", "firewall.reject", "firewall.default-in"] {
+            let err = require_network_key(key).unwrap_err();
+            assert!(err.contains("firewall setting"), "{key}: {err}");
+            assert!(err.contains("ray config set"), "{key}: {err}");
+        }
+        let err = require_network_key("not-a-key").unwrap_err();
+        assert!(err.contains("unknown per-network key"), "{err}");
+
+        assert_eq!(
+            require_network_key("net.ephemeral-ttl").unwrap(),
+            "net.ephemeral-ttl"
+        );
+    }
 
     #[test]
     fn net_config_set_is_a_mutation_and_net_config_get_is_an_open_read() {

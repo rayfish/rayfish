@@ -73,6 +73,33 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read one global settings key from the daemon. Returns the rendered value, or
+/// `None` once the daemon's error has been printed, so the caller can just
+/// return.
+async fn config_row(key: &str) -> Result<Option<String>> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::ConfigGet {
+            key: Some(key.to_string()),
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::ConfigValues { rows } => Ok(Some(
+            rows.into_iter().next().map(|(_, v)| v).unwrap_or_default(),
+        )),
+        ipc::IpcMessage::Error { message } => {
+            print_error("error", &message, None);
+            Ok(None)
+        }
+        other => {
+            eprintln!("Unexpected response: {other:?}");
+            Ok(None)
+        }
+    }
+}
+
 pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
     // These subcommands change (or read) global settings the daemon owns. They
     // route through the daemon so the write lands in the config dir the daemon
@@ -80,46 +107,53 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
     match &action {
         Some(FilesAction::DownloadDir { path, clear }) => {
             if *clear {
-                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadDir { path: None }).await;
+                return crate::ipc_mutate(ipc::IpcMessage::ConfigUnset {
+                    key: "download-dir".to_string(),
+                })
+                .await;
             } else if let Some(p) = path {
-                if !std::path::Path::new(p).is_absolute() {
-                    anyhow::bail!("download-dir must be an absolute path: {p}");
-                }
-                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadDir {
-                    path: Some(p.clone()),
+                // The absolute-path check lives in the settings registry now, so
+                // it binds every writer and not just this arm.
+                return crate::ipc_mutate(ipc::IpcMessage::ConfigSet {
+                    key: "download-dir".to_string(),
+                    value: p.clone(),
+                    replace: false,
                 })
                 .await;
             }
-            let mut stream = ipc::connect().await?;
-            ipc::send(&mut stream, ipc::IpcMessage::GetDownloadSettings).await?;
-            match ipc::recv(&mut stream).await? {
-                ipc::IpcMessage::DownloadSettings { dir, .. } => {
-                    println!("download-dir = {}", dir.as_deref().unwrap_or("<unset>"));
-                }
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-                other => eprintln!("Unexpected response: {other:?}"),
+            if let Some(dir) = config_row("download-dir").await? {
+                println!(
+                    "download-dir = {}",
+                    if dir.is_empty() { "<unset>" } else { &dir }
+                );
             }
             return Ok(());
         }
         Some(FilesAction::DownloadUser { user, clear }) => {
             if *clear {
-                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadUser { uid: None }).await;
+                return crate::ipc_mutate(ipc::IpcMessage::ConfigUnset {
+                    key: "download-user".to_string(),
+                })
+                .await;
             } else if let Some(u) = user {
+                // Resolve the username here: the daemon's key takes a numeric uid
+                // only, so it never has to read the local passwd database.
                 let uid = crate::uid_for_user(u).ok_or_else(|| {
                     anyhow::anyhow!("unknown user '{u}' (pass a valid username or uid)")
                 })?;
-                return crate::ipc_mutate(ipc::IpcMessage::SetDownloadUser { uid: Some(uid) })
-                    .await;
+                return crate::ipc_mutate(ipc::IpcMessage::ConfigSet {
+                    key: "download-user".to_string(),
+                    value: uid.to_string(),
+                    replace: false,
+                })
+                .await;
             }
-            let mut stream = ipc::connect().await?;
-            ipc::send(&mut stream, ipc::IpcMessage::GetDownloadSettings).await?;
-            match ipc::recv(&mut stream).await? {
-                ipc::IpcMessage::DownloadSettings { uid, .. } => match uid {
-                    Some(uid) => println!("download-user = uid {uid}"),
-                    None => println!("download-user = <unset>"),
-                },
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-                other => eprintln!("Unexpected response: {other:?}"),
+            if let Some(uid) = config_row("download-user").await? {
+                if uid.is_empty() {
+                    println!("download-user = <unset>");
+                } else {
+                    println!("download-user = uid {uid}");
+                }
             }
             return Ok(());
         }
@@ -250,14 +284,17 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             }
         }
         Some(FilesAction::AutoAccept { network, state }) => {
-            let enabled = match state.to_ascii_lowercase().as_str() {
-                "on" | "true" | "yes" => true,
-                "off" | "false" | "no" => false,
-                other => anyhow::bail!("expected `on` or `off`, got '{other}'"),
-            };
+            // Parsed here with the same registry function the daemon uses: this
+            // arm prints a daemon error without failing, so a typo caught only
+            // server-side would exit 0.
+            crate::config::settings::parse_bool(&state, true)?;
             ipc::send(
                 &mut stream,
-                ipc::IpcMessage::FilesAutoAccept { network, enabled },
+                ipc::IpcMessage::NetConfigSet {
+                    network,
+                    key: "net.auto-accept-files".to_string(),
+                    value: state,
+                },
             )
             .await?;
             let resp = ipc::recv(&mut stream).await?;

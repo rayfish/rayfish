@@ -59,23 +59,6 @@ pub enum IpcMessage {
         network: String,
         peer: String,
     },
-    /// Coordinator-local: set (or clear) the per-network ephemeral policy — the
-    /// TTL after which an offline member is auto-removed. `ttl_secs = None`
-    /// disables it. Mutation (root/operator).
-    SetEphemeral {
-        network: String,
-        ttl_secs: Option<u64>,
-    },
-    /// Read the per-network ephemeral TTL (open read). Answered with
-    /// `EphemeralStatus`.
-    GetEphemeral {
-        network: String,
-    },
-    /// Response to `GetEphemeral`: the network's current TTL (`None` = off).
-    EphemeralStatus {
-        network: String,
-        ttl_secs: Option<u64>,
-    },
     Status,
     /// Build a diagnostic bundle (logs + metrics + sanitized status) on disk and
     /// return its path plus a pre-filled GitHub issue title/body. Open to any
@@ -107,19 +90,6 @@ pub enum IpcMessage {
         index: usize,
     },
     FirewallShow,
-    FirewallDefault {
-        action: Action,
-    },
-    /// Toggle "fail fast" REJECT mode (opt-in, default off): when on, a denied
-    /// packet gets a TCP RST / ICMP-unreachable reply instead of a silent drop.
-    FirewallReject {
-        enabled: bool,
-    },
-    /// Global firewall kill switch (`ray firewall on|off`). When `enabled` is
-    /// false the firewall stops enforcing and allows every packet.
-    FirewallSetEnabled {
-        enabled: bool,
-    },
     /// Coordinator-only: replace the network's suggested firewall rules and
     /// republish the signed blob. Authority comes from holding the network's
     /// secret key; works on any network (suggestions are advisory).
@@ -137,19 +107,6 @@ pub enum IpcMessage {
     FirewallPending {
         network: String,
     },
-    /// Toggle per-network auto-accept of coordinator-suggested firewall rules.
-    /// `on` immediately installs the queued set; `off` stops future auto-install.
-    FirewallAutoAccept {
-        network: String,
-        enabled: bool,
-    },
-    /// Toggle per-network auto-accept of incoming file offers from our own
-    /// paired devices. `on` also drains any already-queued offers from own
-    /// devices; `off` stops future auto-accept.
-    FilesAutoAccept {
-        network: String,
-        enabled: bool,
-    },
     /// Accept the queued suggested rules for a network: install them (replacing
     /// the prior `Network(net)` set) and clear the queue.
     FirewallAccept {
@@ -166,12 +123,6 @@ pub enum IpcMessage {
         network: String,
         accept: Vec<FirewallRuleView>,
         deny: Vec<FirewallRuleView>,
-    },
-    /// Toggle the embedded mesh SSH server (`ray firewall ssh on|off`). When on,
-    /// the daemon listens on each mesh IP's port 22 and admits peers authorized
-    /// per-network; off stops the listeners and removes the tcp:22 passthrough.
-    FirewallSshSet {
-        enabled: bool,
     },
     /// Add (`allow=true`) or remove (`allow=false`) a peer from a network's SSH
     /// allow list. `peer` is a resolved peer EndpointId (hex) or `"*"` (any peer
@@ -356,15 +307,6 @@ pub enum IpcMessage {
     /// `ray netcheck`: local endpoint diagnostics (bound port, home relay,
     /// reachability). Open read.
     Netcheck,
-    /// Persist the mDNS discovery toggle (`ray mdns on|off`). Routed through the
-    /// daemon (not written client-side) so the setting always lands in the config
-    /// dir the daemon reads: on non-Linux, `config_dir()` is derived from the
-    /// process environment, so a client-side write from a different `HOME` than
-    /// the service's would silently miss the daemon's config. The daemon reads
-    /// this at startup, so it takes effect on restart. Mutation (root/operator).
-    SetMdns {
-        enabled: bool,
-    },
     /// Set a global config key (`ray config set`, `ray auto-update on|off`). The
     /// daemon applies it to its own config and persists it. `value` uses the same
     /// grammar as `config::config_set`. Same routing rationale as `SetMdns`.
@@ -399,21 +341,6 @@ pub enum IpcMessage {
         network: String,
         key: Option<String>,
     },
-    /// Set (or clear, with `None`) the directory accepted files land in
-    /// (`ray files download-dir`). Same daemon-writes-its-own-config rationale as
-    /// `SetMdns`; the path is validated absolute on the client. Mutation.
-    SetDownloadDir {
-        path: Option<String>,
-    },
-    /// Set (or clear, with `None`) the local UID that owns accepted files
-    /// (`ray files download-user`). The client resolves the username to a UID
-    /// (as it does for `SetOperator`) before sending. Mutation.
-    SetDownloadUser {
-        uid: Option<u32>,
-    },
-    /// Read the file-download settings (`ray files download-dir`/`download-user`
-    /// with no argument), answered with `DownloadSettings`. Open read.
-    GetDownloadSettings,
 
     // Responses
     Ok {
@@ -595,11 +522,6 @@ pub enum IpcMessage {
     /// Reply to `ConfigGet`: `(key, value)` rows as `config::config_get` renders.
     ConfigValues {
         rows: Vec<(String, String)>,
-    },
-    /// Reply to `GetDownloadSettings`: the daemon's current file-download config.
-    DownloadSettings {
-        dir: Option<String>,
-        uid: Option<u32>,
     },
 }
 
@@ -1369,27 +1291,32 @@ mod tests {
 
     #[test]
     fn config_mutation_messages_roundtrip() {
-        // `ray mdns off` / `ray config set` route through the daemon; the wire
-        // types must survive the named-map codec.
+        // Every single-value setting rides these three variants (`ray mdns`,
+        // `ray config set`, `ray files download-dir`, `ray firewall off`, ...);
+        // the wire types must survive the named-map codec.
         for msg in [
-            IpcMessage::SetMdns { enabled: false },
             IpcMessage::ConfigSet {
                 key: "auto-update".to_string(),
                 value: "off".to_string(),
+                replace: false,
+            },
+            IpcMessage::ConfigSet {
+                key: "download-dir".to_string(),
+                value: "/srv/dl".to_string(),
                 replace: false,
             },
             IpcMessage::ConfigUnset {
                 key: "relay".to_string(),
             },
             IpcMessage::ConfigGet { key: None },
-            IpcMessage::SetDownloadDir {
-                path: Some("/srv/dl".to_string()),
+            IpcMessage::NetConfigSet {
+                network: "gaming".to_string(),
+                key: "net.ephemeral-ttl".to_string(),
+                value: "7200".to_string(),
             },
-            IpcMessage::SetDownloadUser { uid: Some(501) },
-            IpcMessage::GetDownloadSettings,
-            IpcMessage::DownloadSettings {
-                dir: None,
-                uid: None,
+            IpcMessage::NetConfigGet {
+                network: "gaming".to_string(),
+                key: None,
             },
         ] {
             let bytes = rmp_serde::to_vec_named(&msg).unwrap();

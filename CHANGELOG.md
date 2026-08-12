@@ -32,6 +32,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`ray config get`/`set` now reaches every single-value setting**, not just
+  the relay/DNS ones: `firewall.enabled`, `firewall.reject`,
+  `firewall.default-in`, `ssh`, `mdns`, `download-dir` and `download-user` are
+  all settable by name. The dedicated commands (`ray firewall off`,
+  `ray firewall ssh on`, `ray files download-dir`, `ray mdns off`, …) are
+  unchanged and still the recommended spelling; they now share one code path
+  with `ray config`, so a setting behaves the same whichever way you write it.
+
 - **Android crash reports now say how the app died when it dies silently.** A
   low-memory kill or a background stall used to leave either nothing at all or a
   report with no indication of what was stuck, which is the difference between a

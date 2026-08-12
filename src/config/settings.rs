@@ -3,8 +3,9 @@
 //! here instead of carrying its own IPC variant and daemon handler.
 
 use std::net::Ipv4Addr;
+use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use super::{AppConfig, NetworkConfig, ServerOverride};
 use crate::firewall::{Action, FirewallConfig};
@@ -32,18 +33,81 @@ pub struct SettingKey {
 /// the matching `apply_*`/`render_*`, and nothing else: no IPC variant, no
 /// daemon handler, no new CLI plumbing.
 pub static KEYS: &[SettingKey] = &[
-    SettingKey { name: "mdns", scope: Scope::Global, help: "LAN peer discovery over mDNS (on|off)" },
-    SettingKey { name: "relay", scope: Scope::Global, help: "iroh relay servers (preset or URL, comma-separated)" },
-    SettingKey { name: "discovery-dns", scope: Scope::Global, help: "pkarr discovery server (preset or URL)" },
-    SettingKey { name: "dns-upstreams", scope: Scope::Global, help: "Magic DNS upstream forwarders (IPv4, comma-separated)" },
-    SettingKey { name: "auto-update", scope: Scope::Global, help: "install new releases automatically (on|off)" },
-    SettingKey { name: "on-demand", scope: Scope::Global, help: "dial peers lazily on first packet (on|off)" },
-    SettingKey { name: "firewall.enabled", scope: Scope::Firewall, help: "enforce the firewall at all (on|off)" },
-    SettingKey { name: "firewall.reject", scope: Scope::Firewall, help: "reply RST/unreachable instead of dropping (on|off)" },
-    SettingKey { name: "firewall.default-in", scope: Scope::Firewall, help: "default action for inbound traffic (allow|deny)" },
-    SettingKey { name: "net.auto-accept-firewall", scope: Scope::Network, help: "install coordinator-suggested rules without review (on|off)" },
-    SettingKey { name: "net.auto-accept-files", scope: Scope::Network, help: "auto-accept file offers from your own devices (on|off)" },
-    SettingKey { name: "net.ephemeral-ttl", scope: Scope::Network, help: "coordinator: drop members offline longer than N seconds (>=3600, empty to disable)" },
+    SettingKey {
+        name: "mdns",
+        scope: Scope::Global,
+        help: "LAN peer discovery over mDNS (on|off)",
+    },
+    SettingKey {
+        name: "relay",
+        scope: Scope::Global,
+        help: "iroh relay servers (preset or URL, comma-separated)",
+    },
+    SettingKey {
+        name: "discovery-dns",
+        scope: Scope::Global,
+        help: "pkarr discovery server (preset or URL)",
+    },
+    SettingKey {
+        name: "dns-upstreams",
+        scope: Scope::Global,
+        help: "Magic DNS upstream forwarders (IPv4, comma-separated)",
+    },
+    SettingKey {
+        name: "auto-update",
+        scope: Scope::Global,
+        help: "install new releases automatically (on|off)",
+    },
+    SettingKey {
+        name: "on-demand",
+        scope: Scope::Global,
+        help: "dial peers lazily on first packet (on|off)",
+    },
+    SettingKey {
+        name: "ssh",
+        scope: Scope::Global,
+        help: "embedded mesh SSH server (on|off)",
+    },
+    SettingKey {
+        name: "download-dir",
+        scope: Scope::Global,
+        help: "directory accepted files land in (absolute path, empty to clear)",
+    },
+    SettingKey {
+        name: "download-user",
+        scope: Scope::Global,
+        help: "uid that owns accepted files (numeric, empty to clear)",
+    },
+    SettingKey {
+        name: "firewall.enabled",
+        scope: Scope::Firewall,
+        help: "enforce the firewall at all (on|off)",
+    },
+    SettingKey {
+        name: "firewall.reject",
+        scope: Scope::Firewall,
+        help: "reply RST/unreachable instead of dropping (on|off)",
+    },
+    SettingKey {
+        name: "firewall.default-in",
+        scope: Scope::Firewall,
+        help: "default action for inbound traffic (allow|deny)",
+    },
+    SettingKey {
+        name: "net.auto-accept-firewall",
+        scope: Scope::Network,
+        help: "install coordinator-suggested rules without review (on|off)",
+    },
+    SettingKey {
+        name: "net.auto-accept-files",
+        scope: Scope::Network,
+        help: "auto-accept file offers from your own devices (on|off)",
+    },
+    SettingKey {
+        name: "net.ephemeral-ttl",
+        scope: Scope::Network,
+        help: "coordinator: drop members offline longer than N seconds (>=3600, empty to disable)",
+    },
 ];
 
 pub fn lookup(key: &str) -> Option<&'static SettingKey> {
@@ -76,7 +140,41 @@ pub fn apply_global(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) 
         "auto-update" => cfg.auto_update = parse_bool(value, false)?,
         "on-demand" => cfg.on_demand = parse_bool(value, true)?,
 
-        "relay" => cfg.relay = server_override(entries, reset, replace, super::RELAY_PRESET_RAYFISH)?,
+        // Writing `ssh_enabled` is only half of `ray firewall ssh on|off`: the
+        // caller must also seed/remove the `allow in tcp:22` passthrough and
+        // start/stop the live listener (see `Daemon::ssh_config_set`).
+        "ssh" => cfg.ssh_enabled = parse_bool(value, false)?,
+        // Validated here, not in the CLI arm, so every caller is bound by it: a
+        // relative download dir would resolve against the daemon's cwd, not the
+        // user's.
+        "download-dir" => {
+            let v = value.trim();
+            cfg.download_dir = if v.is_empty() {
+                None
+            } else {
+                if !Path::new(v).is_absolute() {
+                    bail!("download-dir must be an absolute path: {v}");
+                }
+                Some(v.to_string())
+            };
+        }
+        // A numeric uid only: the CLI resolves a username before sending, so the
+        // daemon never has to consult the local passwd database.
+        "download-user" => {
+            let v = value.trim();
+            cfg.download_user = if v.is_empty() {
+                None
+            } else {
+                Some(
+                    v.parse::<u32>()
+                        .with_context(|| format!("invalid uid: {v} (expected a numeric uid)"))?,
+                )
+            };
+        }
+
+        "relay" => {
+            cfg.relay = server_override(entries, reset, replace, super::RELAY_PRESET_RAYFISH)?
+        }
         "discovery-dns" => {
             cfg.discovery_dns =
                 server_override(entries, reset, replace, super::DISCOVERY_PRESET_RAYFISH)?
@@ -89,7 +187,10 @@ pub fn apply_global(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) 
                     e.parse::<Ipv4Addr>()
                         .with_context(|| format!("invalid IPv4 address: {e}"))?;
                 }
-                cfg.dns_upstreams = ServerOverride { servers: entries, replace };
+                cfg.dns_upstreams = ServerOverride {
+                    servers: entries,
+                    replace,
+                };
             }
         }
 
@@ -111,7 +212,10 @@ fn server_override(
     for e in &entries {
         super::resolve_url_entry(e, preset)?;
     }
-    Ok(ServerOverride { servers: entries, replace })
+    Ok(ServerOverride {
+        servers: entries,
+        replace,
+    })
 }
 
 /// Comma-joined key names, for the "unknown key" error.
@@ -124,6 +228,10 @@ pub fn render_global(cfg: &AppConfig, key: &str) -> Result<String> {
         "mdns" => on_off(cfg.mdns_enabled),
         "auto-update" => on_off(cfg.auto_update),
         "on-demand" => on_off(cfg.on_demand),
+        "ssh" => on_off(cfg.ssh_enabled),
+        // Empty renders as unset, matching the `net.ephemeral-ttl` convention.
+        "download-dir" => cfg.download_dir.clone().unwrap_or_default(),
+        "download-user" => cfg.download_user.map(|u| u.to_string()).unwrap_or_default(),
         "relay" => super::render_override(&cfg.relay),
         "discovery-dns" => super::render_override(&cfg.discovery_dns),
         "dns-upstreams" => super::render_override(&cfg.dns_upstreams),
@@ -133,7 +241,11 @@ pub fn render_global(cfg: &AppConfig, key: &str) -> Result<String> {
 }
 
 fn on_off(v: bool) -> String {
-    if v { "on".to_string() } else { "off".to_string() }
+    if v {
+        "on".to_string()
+    } else {
+        "off".to_string()
+    }
 }
 
 /// `firewall.toml` (`FirewallConfig`) is a separate store from `settings.toml`,
@@ -229,8 +341,8 @@ fn parse_action(value: &str, default: Action) -> Result<Action> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::*;
     use super::super::GroupMode;
+    use super::*;
 
     fn empty_network(name: &str) -> super::super::NetworkConfig {
         super::super::NetworkConfig {
@@ -274,7 +386,10 @@ mod tests {
     fn ephemeral_ttl_enforces_the_one_hour_floor() {
         let mut net = empty_network("gaming");
         let err = apply_network(&mut net, "net.ephemeral-ttl", "600").unwrap_err();
-        assert!(err.to_string().contains("3600"), "error should name the floor: {err}");
+        assert!(
+            err.to_string().contains("3600"),
+            "error should name the floor: {err}"
+        );
         assert_eq!(net.ephemeral_ttl_secs, None);
 
         apply_network(&mut net, "net.ephemeral-ttl", "7200").unwrap();
@@ -317,8 +432,14 @@ mod tests {
     fn apply_global_rejects_a_bad_bool_without_mutating() {
         let mut cfg = AppConfig::default();
         let err = apply_global(&mut cfg, "mdns", "maybe", false).unwrap_err();
-        assert!(err.to_string().contains("on"), "error should name the valid values: {err}");
-        assert!(cfg.mdns_enabled, "a rejected value must leave config untouched");
+        assert!(
+            err.to_string().contains("on"),
+            "error should name the valid values: {err}"
+        );
+        assert!(
+            cfg.mdns_enabled,
+            "a rejected value must leave config untouched"
+        );
     }
 
     #[test]
@@ -338,14 +459,63 @@ mod tests {
     }
 
     #[test]
-    fn a_key_that_is_not_registered_here_is_rejected() {
-        // `ssh` / `download-dir` / `download-user` are registered in Task 6, in the
-        // same commit that migrates their side-effecting handlers. Until then they
-        // must not be reachable through the generic `ray config set`.
+    fn hostname_default_is_deliberately_not_registered() {
+        // `default_hostname` is written internally (by the join/rename flow), and
+        // no command sets it. A key for it would be new user-facing surface.
         let mut cfg = AppConfig::default();
-        assert!(apply_global(&mut cfg, "ssh", "on", false).is_err());
-        assert!(apply_global(&mut cfg, "download-dir", "/srv/x", false).is_err());
         assert!(apply_global(&mut cfg, "hostname-default", "box", false).is_err());
+        assert!(render_global(&cfg, "hostname-default").is_err());
+        assert!(lookup("hostname-default").is_none());
+    }
+
+    #[test]
+    fn ssh_toggles_but_the_side_effects_are_the_callers_job() {
+        let mut cfg = AppConfig::default();
+        apply_global(&mut cfg, "ssh", "on", false).unwrap();
+        assert!(cfg.ssh_enabled);
+        assert_eq!(render_global(&cfg, "ssh").unwrap(), "on");
+        // Unset goes back to off, the secure default.
+        apply_global(&mut cfg, "ssh", "", false).unwrap();
+        assert!(!cfg.ssh_enabled);
+    }
+
+    #[test]
+    fn download_dir_must_be_absolute() {
+        let mut cfg = AppConfig::default();
+        let err = apply_global(&mut cfg, "download-dir", "relative/path", false).unwrap_err();
+        assert!(
+            err.to_string().contains("absolute"),
+            "error should say why: {err}"
+        );
+        assert_eq!(
+            cfg.download_dir, None,
+            "a rejected value must not be stored"
+        );
+
+        apply_global(&mut cfg, "download-dir", "/srv/inbox", false).unwrap();
+        assert_eq!(cfg.download_dir.as_deref(), Some("/srv/inbox"));
+        assert_eq!(render_global(&cfg, "download-dir").unwrap(), "/srv/inbox");
+
+        // Empty clears it (what `ray files download-dir --clear` sends).
+        apply_global(&mut cfg, "download-dir", "", false).unwrap();
+        assert_eq!(cfg.download_dir, None);
+        assert_eq!(render_global(&cfg, "download-dir").unwrap(), "");
+    }
+
+    #[test]
+    fn download_user_takes_a_numeric_uid_only() {
+        let mut cfg = AppConfig::default();
+        // The CLI resolves a username to a uid before sending; the registry does not.
+        assert!(apply_global(&mut cfg, "download-user", "alice", false).is_err());
+        assert_eq!(cfg.download_user, None);
+
+        apply_global(&mut cfg, "download-user", "501", false).unwrap();
+        assert_eq!(cfg.download_user, Some(501));
+        assert_eq!(render_global(&cfg, "download-user").unwrap(), "501");
+
+        apply_global(&mut cfg, "download-user", "", false).unwrap();
+        assert_eq!(cfg.download_user, None);
+        assert_eq!(render_global(&cfg, "download-user").unwrap(), "");
     }
 
     #[test]
@@ -382,7 +552,10 @@ mod tests {
     fn firewall_default_in_parses_allow_and_deny_only() {
         let mut fw = FirewallConfig::default();
         apply_firewall(&mut fw, "firewall.default-in", "allow").unwrap();
-        assert_eq!(render_firewall(&fw, "firewall.default-in").unwrap(), "allow");
+        assert_eq!(
+            render_firewall(&fw, "firewall.default-in").unwrap(),
+            "allow"
+        );
         assert!(apply_firewall(&mut fw, "firewall.default-in", "maybe").is_err());
     }
 

@@ -1178,15 +1178,16 @@ pub(crate) async fn ipc_mutate(msg: ipc::IpcMessage) -> Result<()> {
 }
 
 async fn cmd_mdns(state: &str) -> Result<()> {
-    let enabled = match state {
-        "on" => true,
-        "off" => false,
-        _ => {
-            eprintln!("Usage: rayfish mdns <on|off>");
-            std::process::exit(1);
-        }
-    };
-    ipc_mutate(ipc::IpcMessage::SetMdns { enabled }).await
+    if state != "on" && state != "off" {
+        eprintln!("Usage: rayfish mdns <on|off>");
+        std::process::exit(1);
+    }
+    ipc_mutate(ipc::IpcMessage::ConfigSet {
+        key: "mdns".to_string(),
+        value: state.to_string(),
+        replace: false,
+    })
+    .await
 }
 
 /// `ray auto-update on|off`: back-compat alias for `ray config set auto-update
