@@ -147,9 +147,9 @@ russh = { version = "0.61.2", default-features = false, features = ["ring", "fla
 # Build the mesh SSH listener socket with SO_REUSEADDR/SO_REUSEPORT so binding
 # a specific mesh IP's port 22 coexists with a host sshd on 0.0.0.0:22.
 socket2 = { version = "0.6", features = ["all"] }
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 criterion = "0.5"
 proptest = "1"
 
@@ -191,8 +191,6 @@ enable-ansi-support = "0.3"
 windows-service = "0.8.1"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
-    "Win32_NetworkManagement_IpHelper",
-    "Win32_NetworkManagement_Ndis",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Authentication_Identity",

@@ -351,6 +351,17 @@ fn next_managed_suffixes(snapshot: &WindowsDnsSnapshot, desired: &[String]) -> V
 }
 
 #[cfg(windows)]
+fn windows_nrpt_domains(rayfish_domains: &[String], network_names: &[String]) -> Vec<String> {
+    let mut domains = rayfish_domains.to_vec();
+    for name in network_names {
+        if !domains.contains(name) {
+            domains.push(name.clone());
+        }
+    }
+    domains
+}
+
+#[cfg(windows)]
 fn expected_suffixes_after(snapshot: &WindowsDnsSnapshot, desired: &[String]) -> Vec<String> {
     let prior_managed = snapshot.managed_suffixes.as_deref().unwrap_or_default();
     let mut expected = snapshot
@@ -555,7 +566,7 @@ async fn reset_wintun_dns(interface_alias: &str) -> Result<()> {
 #[cfg(windows)]
 async fn set_search_domains_windows(
     rayfish_domains: &[String],
-    _network_names: &[String],
+    network_names: &[String],
     _tun_name: &str,
 ) -> Result<()> {
     let _transaction = WINDOWS_DNS_TRANSACTION.lock().await;
@@ -563,11 +574,12 @@ async fn set_search_domains_windows(
     let snapshot: WindowsDnsSnapshot =
         serde_json::from_str(&snapshot_text).context("parse Windows DNS snapshot")?;
     let transaction_id = next_windows_dns_transaction_id();
+    let nrpt_domains = windows_nrpt_domains(rayfish_domains, network_names);
     let managed_suffixes = next_managed_suffixes(&snapshot, rayfish_domains);
     let expected_suffixes = expected_suffixes_after(&snapshot, rayfish_domains);
-    let touched_displays = touched_rule_displays(&snapshot, rayfish_domains);
+    let touched_displays = touched_rule_displays(&snapshot, &nrpt_domains);
     let mutation = powershell_status(&windows_dns_reconcile_script(
-        rayfish_domains,
+        &nrpt_domains,
         &managed_suffixes,
         &transaction_id,
     ))
@@ -1990,6 +2002,7 @@ mod tests {
             WindowsDnsSnapshot, WindowsNrptRuleSnapshot, expected_suffixes_after,
             next_managed_suffixes, ps_quote, suffix_rollback_cas_matches, touched_rule_displays,
             windows_dns_reconcile_script, windows_dns_rollback_script, windows_dns_snapshot_script,
+            windows_nrpt_domains,
         };
 
         assert_eq!(ps_quote(""), "");
@@ -2024,6 +2037,18 @@ mod tests {
         );
         assert!(many.contains("$desired=@('a.ray','O''Brian.ray')"));
         assert!(many.contains("$display='rayfish:'+$domain"));
+
+        let nrpt_domains = windows_nrpt_domains(
+            &["corp.ray".to_owned(), "ray".to_owned()],
+            &["corp".to_owned(), "other".to_owned()],
+        );
+        assert_eq!(nrpt_domains, ["corp.ray", "ray", "corp", "other"]);
+        let match_domains = windows_dns_reconcile_script(
+            &nrpt_domains,
+            &["corp.ray".to_owned(), "ray".to_owned()],
+            "txn-match",
+        );
+        assert!(match_domains.contains("$desired=@('corp.ray','ray','corp','other')"));
 
         let snapshot = WindowsDnsSnapshot {
             nrpt_rules: vec![WindowsNrptRuleSnapshot {

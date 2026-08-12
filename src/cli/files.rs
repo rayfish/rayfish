@@ -68,7 +68,7 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     };
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => anyhow::bail!("{message}"),
+        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())

@@ -21,3 +21,7 @@ Expected upstream artifact:
 
 Run `scripts/verify-wintun.ps1 -ArchivePath <zip>` for archive-only validation,
 or pass `-Path <dll>` as well to validate Authenticode.
+
+While the mesh is active, Windows NRPT also routes each configured network name
+as a match domain (alongside the `.ray` search domains). Existing NRPT rules and
+DNS suffixes outside Rayfish ownership are preserved and restored on shutdown.

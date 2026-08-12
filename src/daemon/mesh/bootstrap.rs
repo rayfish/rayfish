@@ -800,14 +800,6 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<(
 async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()> {
     let pipe_name = ipc::socket_path();
     let pipe_name = pipe_name.to_string_lossy().into_owned();
-    if let Ok(mut entries) = tokio::fs::read_dir(crate::config::config_dir()?).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("ipc-upload-") && name.ends_with(".part") {
-                let _ = tokio::fs::remove_file(entry.path()).await;
-            }
-        }
-    }
     let mut server = create_named_pipe(&pipe_name, true)?;
     let mut standby = create_named_pipe(&pipe_name, false)?;
     tracing::info!(pipe = %pipe_name, "IPC named pipe listening");
@@ -883,23 +875,22 @@ async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Res
     {
         const CHUNK: usize = 256 * 1024;
         const MAX_TRANSFER: u64 = 4 * 1024 * 1024 * 1024;
-        anyhow::ensure!(size <= MAX_TRANSFER, "in-band file exceeds 4 GiB limit");
-        anyhow::ensure!(
-            !filename.is_empty() && filename.len() <= 255,
-            "invalid file name"
-        );
-        let temp = crate::config::config_dir()?.join(format!(
-            "ipc-upload-{}-{}.part",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let mut output = tokio::fs::File::create(&temp).await?;
-        let mut received = 0u64;
         let result: Result<IpcMessage> = async {
-            loop {
+            anyhow::ensure!(size <= MAX_TRANSFER, "in-band file exceeds 4 GiB limit");
+            anyhow::ensure!(
+                !filename.is_empty() && filename.len() <= 255,
+                "invalid file name"
+            );
+            // Keep staged bytes in the system temp directory, not the protected
+            // config directory. `NamedTempFile` removes the file on every error
+            // path and also keeps it alive while the daemon consumes it.
+            let staged = tempfile::Builder::new()
+                .prefix("rayfish-ipc-upload-")
+                .tempfile()?;
+            let temp = staged.path().to_path_buf();
+            let mut output = tokio::fs::File::from_std(staged.reopen()?);
+            let mut received = 0u64;
+            let response = loop {
                 match tokio::time::timeout(Duration::from_secs(30), ipc::recv(&mut framed))
                     .await
                     .context("timed out waiting for in-band file chunk")??
@@ -917,7 +908,7 @@ async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Res
                             );
                             tokio::io::AsyncWriteExt::flush(&mut output).await?;
                             drop(output);
-                            break Ok(daemon
+                            break daemon
                                 .handle_request(
                                     ipc::IpcMessage::SendFileStaged {
                                         path: temp.to_string_lossy().into_owned(),
@@ -927,16 +918,22 @@ async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Res
                                     peer.clone(),
                                     Vec::new(),
                                 )
-                                .await);
+                                .await;
                         }
                     }
                     other => anyhow::bail!("unexpected in-band file frame: {other:?}"),
                 }
-            }
+            };
+            drop(staged);
+            Ok(response)
         }
         .await;
-        let _ = tokio::fs::remove_file(&temp).await;
-        result?
+        match result {
+            Ok(response) => response,
+            Err(error) => IpcMessage::Error {
+                message: format!("in-band file upload failed: {error:#}"),
+            },
+        }
     } else {
         daemon.handle_request(req, peer, Vec::new()).await
     };
@@ -1036,6 +1033,7 @@ async fn auto_update_once(shutdown: &CancellationToken) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
+        let _ = shutdown;
         crate::update::download_and_swap(&client, &bin_url, &expected, &asset).await?;
 
         tracing::info!(target = %tag, "auto-update: binary swapped, restarting service onto it");
