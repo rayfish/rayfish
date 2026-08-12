@@ -385,6 +385,20 @@ pub enum IpcMessage {
     ConfigGet {
         key: Option<String>,
     },
+    /// Set one per-network setting (`networks/<name>.toml`). The key namespace
+    /// is the `net.` prefix of the settings registry; an empty `value` resets
+    /// the key to its default, matching `ConfigUnset`.
+    NetConfigSet {
+        network: String,
+        key: String,
+        value: String,
+    },
+    /// Read per-network settings. `key: None` returns every `net.` key. Open
+    /// read, like `ConfigGet` and `FirewallShow`.
+    NetConfigGet {
+        network: String,
+        key: Option<String>,
+    },
     /// Set (or clear, with `None`) the directory accepted files land in
     /// (`ray files download-dir`). Same daemon-writes-its-own-config rationale as
     /// `SetMdns`; the path is validated absolute on the client. Mutation.

@@ -63,6 +63,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::audit;
 use crate::config;
+use crate::config::settings::{self, Scope};
 use crate::control::{self, ControlMsg};
 use crate::dht;
 use crate::dns;
@@ -777,6 +778,7 @@ impl Daemon {
                 | IpcMessage::GetEphemeral { .. }
                 | IpcMessage::ListPairedDevices
                 | IpcMessage::ConfigGet { .. }
+                | IpcMessage::NetConfigGet { .. }
                 | IpcMessage::GetDownloadSettings
         ) {
             return None;
@@ -884,6 +886,53 @@ impl Daemon {
             Ok(rows) => IpcMessage::ConfigValues { rows },
             Err(e) => ipc_err(e.to_string()),
         }
+    }
+
+    /// Apply one per-network setting and persist just that network's file.
+    fn net_config_apply(&self, network: &str, key: &str, value: &str) -> IpcMessage {
+        if settings::lookup(key).map(|k| k.scope) != Some(Scope::Network) {
+            return ipc_err(format!(
+                "'{key}' is not a per-network setting (try `ray config set {key}`)"
+            ));
+        }
+        let mut net = match config::load_network(network) {
+            Ok(Some(n)) => n,
+            Ok(None) => return ipc_err(format!("network '{network}' not found")),
+            Err(e) => return ipc_err(format!("failed to load network: {e}")),
+        };
+        if let Err(e) = settings::apply_network(&mut net, key, value) {
+            return ipc_err(e.to_string());
+        }
+        if let Err(e) = config::save_network(&net) {
+            return ipc_err(format!("failed to save config: {e}"));
+        }
+        IpcMessage::Ok {
+            message: format!("Set {key} on {network}"),
+        }
+    }
+
+    /// Read one or every per-network setting.
+    fn net_config_get(&self, network: &str, key: Option<&str>) -> IpcMessage {
+        let net = match config::load_network(network) {
+            Ok(Some(n)) => n,
+            Ok(None) => return ipc_err(format!("network '{network}' not found")),
+            Err(e) => return ipc_err(format!("failed to load network: {e}")),
+        };
+        let names: Vec<&'static str> = match key {
+            Some(k) => match settings::lookup(k) {
+                Some(sk) if sk.scope == Scope::Network => vec![sk.name],
+                _ => return ipc_err(format!("unknown per-network key: {k}")),
+            },
+            None => settings::keys_for(Scope::Network).map(|k| k.name).collect(),
+        };
+        let mut rows = Vec::with_capacity(names.len());
+        for name in names {
+            match settings::render_network(&net, name) {
+                Ok(v) => rows.push((name.to_string(), v)),
+                Err(e) => return ipc_err(e.to_string()),
+            }
+        }
+        IpcMessage::ConfigValues { rows }
     }
 
     /// Set/clear the accepted-files download directory (`ray files download-dir`)
@@ -1103,6 +1152,14 @@ impl Daemon {
             } => self.config_apply(&key, &value, replace, false),
             IpcMessage::ConfigUnset { key } => self.config_apply(&key, "", false, true),
             IpcMessage::ConfigGet { key } => self.config_get(key.as_deref()),
+            IpcMessage::NetConfigSet {
+                network,
+                key,
+                value,
+            } => self.net_config_apply(&network, &key, &value),
+            IpcMessage::NetConfigGet { network, key } => {
+                self.net_config_get(&network, key.as_deref())
+            }
             IpcMessage::SetDownloadDir { path } => self.set_download_dir(path),
             IpcMessage::SetDownloadUser { uid } => self.set_download_user(uid),
             IpcMessage::GetDownloadSettings => self.get_download_settings(),
@@ -1298,6 +1355,29 @@ impl Daemon {
     // -----------------------------------------------------------------------
     // Invite + join-request handlers (coordinator only)
     // -----------------------------------------------------------------------
+}
+
+#[cfg(test)]
+mod net_config_authz_tests {
+    use super::*;
+
+    #[test]
+    fn net_config_set_is_a_mutation_and_net_config_get_is_an_open_read() {
+        let set = IpcMessage::NetConfigSet {
+            network: "gaming".into(),
+            key: "net.auto-accept-files".into(),
+            value: "off".into(),
+        };
+        // Non-root, non-operator UID: mutations are refused, reads are not.
+        assert!(Daemon::check_authorized(&set, Some((1000, 1000))).is_some());
+        assert!(Daemon::check_authorized(&set, Some((0, 0))).is_none());
+
+        let get = IpcMessage::NetConfigGet {
+            network: "gaming".into(),
+            key: None,
+        };
+        assert!(Daemon::check_authorized(&get, Some((1000, 1000))).is_none());
+    }
 }
 
 pub(crate) fn guess_mime_type(filename: &str) -> String {
