@@ -66,15 +66,55 @@ object NodeHolder {
     // SharedPreferences is inert.
     private const val KEY_GO_OFFLINE_WHEN_DISABLED = "go_offline_when_disabled"
 
+    /**
+     * The one prefs file this app uses. Held once rather than looked up per call:
+     * the first getSharedPreferences in a process parses the XML off disk
+     * synchronously, and several of the call sites below run on the main thread.
+     */
+    fun prefs(context: Context) =
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    // The two flags [RayfishVpnService.onStartCommand] and onRevoke read on the
+    // main thread, cached in memory.
+    //
+    // Worth being precise about what this does and does not buy, because the
+    // obvious claim is wrong: it is NOT what keeps the disk read off the main
+    // thread. Application.onCreate reads this same prefs file (crash reporting
+    // has to be initialized before anything can crash), and getBoolean blocks on
+    // the file's load latch, so the one synchronous load is already paid on the
+    // main thread at process start, before any service can run. By the time
+    // onStartCommand reads these, the framework's own cache is warm.
+    //
+    // What it does buy: the service paths stop depending on that ordering
+    // holding, and [warm] gives the load a chance to happen on a background
+    // thread first. A read that beats the warm-up falls through to disk and is
+    // correct, just slower, so this is only ever an optimisation.
+    //
+    // Safe to cache because this process is the only writer (MODE_PRIVATE, single
+    // process) and every write goes through the setters below, which update the
+    // cache in the same call.
+    @Volatile
+    private var enabledCache: Boolean? = null
+
+    @Volatile
+    private var goOfflineCache: Boolean? = null
+
+    /**
+     * Load the main-thread-read prefs into memory. Does disk I/O, so call it off
+     * the main thread; [RayfishApplication] does at process start. Idempotent.
+     */
+    fun warm(context: Context) {
+        val p = prefs(context)
+        enabledCache = p.getBoolean(KEY_ENABLED, false)
+        goOfflineCache = p.getBoolean(KEY_GO_OFFLINE_WHEN_DISABLED, false)
+    }
+
     fun isEnabled(context: Context): Boolean =
-        context.applicationContext
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_ENABLED, false)
+        enabledCache ?: prefs(context).getBoolean(KEY_ENABLED, false).also { enabledCache = it }
 
     fun setEnabled(context: Context, value: Boolean) {
-        context.applicationContext
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit().putBoolean(KEY_ENABLED, value).apply()
+        enabledCache = value
+        prefs(context).edit().putBoolean(KEY_ENABLED, value).apply()
     }
 
     fun isAutoAcceptOwnDevices(context: Context): Boolean =
@@ -89,14 +129,13 @@ object NodeHolder {
     }
 
     fun isGoOfflineWhenDisabled(context: Context): Boolean =
-        context.applicationContext
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_GO_OFFLINE_WHEN_DISABLED, false)
+        goOfflineCache
+            ?: prefs(context).getBoolean(KEY_GO_OFFLINE_WHEN_DISABLED, false)
+                .also { goOfflineCache = it }
 
     fun setGoOfflineWhenDisabled(context: Context, value: Boolean) {
-        context.applicationContext
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit().putBoolean(KEY_GO_OFFLINE_WHEN_DISABLED, value).apply()
+        goOfflineCache = value
+        prefs(context).edit().putBoolean(KEY_GO_OFFLINE_WHEN_DISABLED, value).apply()
     }
 
     fun isCrashReportingEnabled(context: Context): Boolean =
