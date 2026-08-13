@@ -62,14 +62,11 @@ impl Daemon {
             pending_networks,
             // Only the neighbours you could still link up with: peers already on
             // one of our networks are visible in the network list, not here.
-            lan_peers_new: self
-                .transport
-                .lan_peers
-                .snapshot()
+            lan_peers: self
+                .lan_peer_infos()
                 .into_iter()
-                .filter(|(id, _)| *id != my_id)
-                .filter(|(id, _)| self.registry.network_shared_with(id).is_none())
-                .count(),
+                .filter(|p| p.shared_network.is_none())
+                .collect(),
         }
     }
 

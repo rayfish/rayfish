@@ -147,14 +147,22 @@ pub(crate) async fn ipc_status() -> Result<()> {
             bytes_tx,
             pending_files,
             pending_connects,
-            lan_peers_new,
+            lan_peers,
             ..
         } => {
             if json_enabled() {
                 print_json(&serde_json::json!({
                     "endpoint": endpoint_id.to_string(),
                     "mdns": mdns_enabled,
-                    "lan_peers_new": lan_peers_new,
+                    "lan_peers": lan_peers
+                        .iter()
+                        .map(|p| serde_json::json!({
+                            "endpoint_id": p.endpoint_id.to_string(),
+                            "short_id": p.short_id,
+                            "addrs": p.addrs,
+                            "last_seen_secs": p.last_seen_secs,
+                        }))
+                        .collect::<Vec<_>>(),
                     "auto_update": auto_update,
                     "active": active,
                     "contact_id": contact_id,
@@ -178,16 +186,8 @@ pub(crate) async fn ipc_status() -> Result<()> {
             } else {
                 format!("{} {}", style::dot_offline(), style::faint("standby"))
             };
-            // With mDNS on, the header carries the count of LAN neighbours we
-            // are not already on a network with, so discovery is visible without
-            // having to know `ray mdns scan` exists.
             let mdns = if mdns_enabled {
-                let found = match lan_peers_new {
-                    0 => String::new(),
-                    1 => format!(" {}", style::faint("(1 on LAN)")),
-                    n => format!(" {}", style::faint(&format!("({n} on LAN)"))),
-                };
-                format!("{} {}{}", style::label("mDNS"), style::green("on"), found)
+                format!("{} {}", style::label("mDNS"), style::green("on"))
             } else {
                 format!("{} {}", style::label("mDNS"), style::faint("off"))
             };
@@ -260,6 +260,8 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 }
             }
 
+            print_nearby(&lan_peers);
+
             print_pending_summary(&networks, pending_files, pending_connects);
 
             // Daemon/CLI version skew: after a self-update the CLI binary is new
@@ -286,6 +288,56 @@ pub(crate) async fn ipc_status() -> Result<()> {
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
+}
+
+/// How many LAN neighbours `ray status` lists before deferring to `ray mdns
+/// scan`. A busy office LAN shouldn't push your networks off the screen.
+const NEARBY_SHOWN: usize = 5;
+
+/// Render the "nearby" block: rayfish nodes seen on this LAN that we are not
+/// already on a network with. Prints nothing when there are none, so the common
+/// case (no strangers around) leaves status exactly as it was.
+fn print_nearby(peers: &[ipc::LanPeerInfo]) {
+    if peers.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "  {}  {}",
+        style::bold("nearby"),
+        style::faint("(on this LAN, not connected)")
+    );
+    let rows = peers
+        .iter()
+        .take(NEARBY_SHOWN)
+        .map(|p| {
+            let addrs = if p.addrs.is_empty() {
+                "—".to_string()
+            } else {
+                p.addrs.join(", ")
+            };
+            let seen = format!("{}s", p.last_seen_secs);
+            vec![
+                layout::Cell::new(p.short_id.clone(), style::rose(&p.short_id)),
+                layout::Cell::new(addrs.clone(), style::value(&addrs)),
+                layout::Cell::right(seen.clone(), style::faint(&seen)),
+            ]
+        })
+        .collect();
+    print!("{}", table(&["peer", "addresses", "seen"], rows, 4));
+    if peers.len() > NEARBY_SHOWN {
+        println!(
+            "    {}",
+            style::faint(&format!(
+                "and {} more — see them with: ray mdns scan",
+                peers.len() - NEARBY_SHOWN
+            ))
+        );
+    }
+    println!(
+        "    {}",
+        style::faint("link up with: ray connect <peer> (they approve it)")
+    );
 }
 
 /// Render one network block: header (name · role · dns · ip · member count),

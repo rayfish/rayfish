@@ -301,6 +301,9 @@ ray mdns scan                      # rayfish nodes seen on this LAN
 ray connect <peer>                 # link up with one, using the id from the scan
 ```
 
+`ray status` also lists LAN neighbours you're not connected to yet, under
+**nearby**, so you don't have to go looking.
+
 A sighting grants nothing. The scan marks which neighbours you already share a
 network with, and connecting to one still needs their `ray connections approve`.
 Because the scan gives you an id you can dial directly, the pair does not need

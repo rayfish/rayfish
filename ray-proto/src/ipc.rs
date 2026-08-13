@@ -462,10 +462,11 @@ pub enum IpcMessage {
         #[serde(default)]
         pending_networks: Vec<String>,
         /// Nodes seen on the LAN over mDNS that we do not already share a
-        /// network with, i.e. what `ray mdns scan` would list as connectable.
-        /// Always 0 when mDNS is off.
+        /// network with, i.e. the ones still to link up with. Peers we do share
+        /// a network with are omitted: they show in `networks` instead. Empty
+        /// when mDNS is off. `ray mdns scan` lists the full set.
         #[serde(default)]
-        lan_peers_new: usize,
+        lan_peers: Vec<LanPeerInfo>,
     },
     /// Reply to `Ping`. `probes` holds one entry per probe in send order: the
     /// measured round-trip in milliseconds, or `None` if that probe timed out.
@@ -1486,7 +1487,13 @@ mod tests {
             pending_files: 0,
             pending_connects: 0,
             pending_networks: vec![],
-            lan_peers_new: 2,
+            lan_peers: vec![LanPeerInfo {
+                endpoint_id: peer_id,
+                short_id: peer_id.fmt_short().to_string(),
+                addrs: vec!["192.168.1.31:57012".to_string()],
+                last_seen_secs: 4,
+                shared_network: None,
+            }],
         };
         // The IPC codec uses `to_vec_named`; positional encoding can't survive
         // NetworkStatus's `skip_serializing_if` fields (ephemeral_ttl_secs,
@@ -1497,11 +1504,14 @@ mod tests {
             IpcMessage::StatusResponse {
                 endpoint_id,
                 networks,
+                lan_peers,
                 ..
             } => {
                 assert_eq!(endpoint_id, ep_id);
                 assert_eq!(networks.len(), 1);
                 assert_eq!(networks[0].peers[0].endpoint_id, peer_id);
+                assert_eq!(lan_peers.len(), 1);
+                assert_eq!(lan_peers[0].endpoint_id, peer_id);
             }
             _ => panic!("wrong variant"),
         }

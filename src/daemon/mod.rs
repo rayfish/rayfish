@@ -835,14 +835,17 @@ impl Daemon {
         }
     }
 
-    /// `ray mdns scan`: the nodes mDNS has seen on this LAN, newest sighting
-    /// first, each marked with a network already shared with it (if any).
-    pub(crate) fn list_lan_peers(&self) -> IpcMessage {
+    /// The nodes mDNS has seen on this LAN, newest sighting first, each marked
+    /// with a network already shared with it (if any). Shared by `ray mdns scan`
+    /// and the nearby block in `ray status`, so the two never disagree.
+    pub(crate) fn lan_peer_infos(&self) -> Vec<LanPeerInfo> {
+        let me = self.transport.endpoint.id();
         let mut peers: Vec<LanPeerInfo> = self
             .transport
             .lan_peers
             .snapshot()
             .into_iter()
+            .filter(|(id, _)| *id != me)
             .map(|(id, peer)| LanPeerInfo {
                 endpoint_id: id,
                 short_id: id.fmt_short().to_string(),
@@ -852,8 +855,13 @@ impl Daemon {
             })
             .collect();
         peers.sort_by_key(|p| p.last_seen_secs);
+        peers
+    }
+
+    /// `ray mdns scan`: every LAN sighting, connected or not.
+    pub(crate) fn list_lan_peers(&self) -> IpcMessage {
         IpcMessage::LanPeersList {
-            peers,
+            peers: self.lan_peer_infos(),
             mdns_enabled: self.mdns_enabled,
         }
     }
@@ -2419,16 +2427,20 @@ mod headless_tests {
             other => panic!("expected LanPeersList, got {other:?}"),
         }
 
-        // The same sighting is counted in `ray status`.
+        // The same sighting is listed in `ray status`, with its addresses.
         match daemon.status() {
-            IpcMessage::StatusResponse { lan_peers_new, .. } => assert_eq!(lan_peers_new, 1),
+            IpcMessage::StatusResponse { lan_peers, .. } => {
+                assert_eq!(lan_peers.len(), 1);
+                assert_eq!(lan_peers[0].endpoint_id, peer);
+                assert_eq!(lan_peers[0].addrs, vec![addr.to_string()]);
+            }
             other => panic!("expected StatusResponse, got {other:?}"),
         }
 
         // An expiry clears it from both.
         daemon.transport.lan_peers.expired(&peer);
         match daemon.status() {
-            IpcMessage::StatusResponse { lan_peers_new, .. } => assert_eq!(lan_peers_new, 0),
+            IpcMessage::StatusResponse { lan_peers, .. } => assert!(lan_peers.is_empty()),
             other => panic!("expected StatusResponse, got {other:?}"),
         }
     }

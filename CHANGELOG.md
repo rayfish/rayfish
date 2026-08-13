@@ -12,9 +12,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   always run in the background, but it only fed the connection layer: there was
   no way to see what it found. The scan shows each neighbour's id, addresses,
   how long ago it was seen, and whether you already share a network with it.
-  `ray status` carries the same count in its mDNS field, so a new machine on the
-  LAN is visible without knowing the command exists. Seeing a node grants it
-  nothing: it is a sighting, not a relationship.
+  `ray status` grew a "nearby" block listing the ones you are not connected to
+  (up to five, then it points at the scan), so a new machine on the LAN is
+  visible without knowing the command exists. Seeing a node grants it nothing:
+  it is a sighting, not a relationship.
 
 - **`ray connect` accepts a LAN neighbour's id.** Passing an id from `ray mdns
   scan` dials that peer straight over the local network, skipping the DHT
