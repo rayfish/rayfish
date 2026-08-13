@@ -1,10 +1,15 @@
 //! Magic DNS for the `.ray` TLD.
 //!
-//! This module (`mod.rs`) is the `.ray` responder: it answers A, AAAA, PTR, and
-//! SOA queries for `*.ray` names. The resolver is reached via a magic IP
+//! This module (`mod.rs`) is the roster responder: it answers A, AAAA, PTR, and
+//! SOA queries for peer names. The resolver is reached via a magic IP
 //! (`MAGIC_DNS_V4` = 100.100.100.53) routed through the TUN, no host-level port
-//! 53 bind is made. `handle_query` is called directly by `forward::run_mesh`
-//! when it intercepts a UDP DNS packet destined for the magic IP.
+//! 53 bind is made: `forward::run_mesh` intercepts UDP DNS packets destined for
+//! the magic IP and hands them to [`resolver::Resolver`], which calls
+//! [`handle_query`] and forwards whatever it declines to the system upstreams.
+//!
+//! A name is answered here only when the roster actually holds it. Everything
+//! else, including a `<host>.<network>` whose host is not a peer, is declined
+//! so it can fall back to the real DNS.
 //!
 //! Submodules: [`config`] (OS resolver integration), [`resolver`] (in-daemon
 //! resolver reached via the magic IP), [`packet`] (UDP reply synthesis).
@@ -133,6 +138,12 @@ pub async fn remove_network(table: &HostnameTable, reverse: &ReverseLookupTable,
     }
 }
 
+/// Answer a query from the roster, or return `None` for "not mine": the caller
+/// forwards those to the system resolver.
+///
+/// The rule is that we claim a name only when we can actually answer it. That
+/// is what keeps a network named `dev` from swallowing `zed.dev`: the lookup
+/// misses the roster, we decline it, and it goes upstream like any public name.
 pub(crate) async fn handle_query(
     data: &[u8],
     table: &HostnameTable,
@@ -140,11 +151,7 @@ pub(crate) async fn handle_query(
 ) -> Option<Vec<u8>> {
     let packet = Packet::parse(data).ok()?;
 
-    if packet.questions.is_empty() {
-        return None;
-    }
-
-    let question = &packet.questions[0];
+    let question = packet.questions.first()?;
     let name_str = question.qname.to_string();
     let name_lower = name_str.trim_end_matches('.').to_lowercase();
 
@@ -160,41 +167,52 @@ pub(crate) async fn handle_query(
 
     let suffix = format!(".{DNS_DOMAIN}");
 
-    // SOA query for the zone apex
-    if is_soa && (name_lower == DNS_DOMAIN || name_lower.ends_with(&suffix)) {
-        return Some(make_soa_response(&packet, &question.qname));
-    }
-
-    // We only ever answer inside `.ray`. A bare `<host>.<network>` is a public
-    // DNS name (a network called `dev` would shadow `zed.dev`), so it is never
-    // ours to resolve.
-    let entry = if (is_a || is_aaaa) && name_lower.ends_with(&suffix) {
-        resolve_name(&name_lower, &suffix, table).await
-    } else {
-        None
-    };
-
-    if let Some((v4, v6)) = entry {
+    if name_lower == DNS_DOMAIN || name_lower.ends_with(&suffix) {
+        // Inside `.ray`, the zone is ours.
+        if is_soa {
+            return Some(make_soa_response(&packet, &question.qname));
+        }
+        let (v4, v6) = resolve_name(&name_lower, &suffix, table).await?;
         if is_a {
             tracing::info!(name = %name_lower, ip = %v4, "DNS resolved A");
             return Some(make_a_response(&packet, &question.qname, v4));
-        } else {
+        }
+        if is_aaaa {
             tracing::info!(name = %name_lower, ip = %v6, "DNS resolved AAAA");
             return Some(make_aaaa_response(&packet, &question.qname, v6));
         }
-    }
-
-    // For .ray names, return NXDOMAIN (A/AAAA) or NODATA (other types)
-    if name_lower.ends_with(&suffix) || name_lower == DNS_DOMAIN {
-        if is_a || is_aaaa {
-            tracing::info!(name = %name_lower, "DNS query NXDOMAIN");
-            return Some(make_nxdomain(&packet));
-        }
+        // The peer exists but holds no record of this type. NODATA is the
+        // authoritative answer; no upstream knows better.
         return Some(make_nodata(&packet));
     }
 
-    tracing::debug!(name = %name_lower, "DNS query for unknown domain, refusing");
-    Some(make_refused(&packet))
+    // Outside `.ray`, `<host>.<network>` is also a perfectly good public name,
+    // so we take it only for A/AAAA and only when the peer is really there.
+    if !(is_a || is_aaaa) {
+        return None;
+    }
+    let (v4, v6) = resolve_bare_network_name(&name_lower, table).await?;
+    if is_a {
+        tracing::info!(name = %name_lower, ip = %v4, "DNS resolved A");
+        Some(make_a_response(&packet, &question.qname, v4))
+    } else {
+        tracing::info!(name = %name_lower, ip = %v6, "DNS resolved AAAA");
+        Some(make_aaaa_response(&packet, &question.qname, v6))
+    }
+}
+
+/// NXDOMAIN for a `.ray` name, used when the upstream fallback found nobody to
+/// ask. The zone is ours, so failing it closed beats the SERVFAIL a client
+/// would otherwise keep retrying. Returns `None` for any other name.
+pub(crate) fn nxdomain_if_in_zone(data: &[u8]) -> Option<Vec<u8>> {
+    let packet = Packet::parse(data).ok()?;
+    let name = packet.questions.first()?.qname.to_string();
+    let name_lower = name.trim_end_matches('.').to_lowercase();
+    if name_lower != DNS_DOMAIN && !name_lower.ends_with(&format!(".{DNS_DOMAIN}")) {
+        return None;
+    }
+    tracing::info!(name = %name_lower, "DNS query NXDOMAIN");
+    Some(make_nxdomain(&packet))
 }
 
 async fn handle_ptr_query(
@@ -231,7 +249,17 @@ async fn handle_ptr_query(
         }
     }
 
-    Some(make_refused(packet))
+    // A PTR for an address outside our ranges: not ours, let it go upstream.
+    None
+}
+
+/// Resolve `<hostname>.<network>` (no `.ray` suffix), the form an app uses when
+/// the network name doubles as a search domain. Only a real roster hit counts:
+/// a miss leaves the name to the system resolver.
+async fn resolve_bare_network_name(name: &str, table: &HostnameTable) -> Option<HostnameEntry> {
+    let (hostname, network) = name.rsplit_once('.')?;
+    let table_guard = table.read().await;
+    table_guard.get(network)?.get(hostname).copied()
 }
 
 fn parse_ptr_name(name: &str) -> Option<IpAddr> {
@@ -398,15 +426,6 @@ fn make_nodata(query: &Packet) -> Vec<u8> {
     response.build_bytes_vec().unwrap_or_default()
 }
 
-fn make_refused(query: &Packet) -> Vec<u8> {
-    let mut response = Packet::new_reply(query.id());
-    response.set_flags(PacketFlag::RESPONSE);
-    response.questions = query.questions.clone();
-    *response.rcode_mut() = RCODE::Refused;
-    finalize_response(&mut response, query);
-    response.build_bytes_vec().unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,6 +528,63 @@ mod tests {
         let table = new_hostname_table();
         let result = resolve_name("nobody.ray", SUFFIX, &table).await;
         assert_eq!(result, None);
+    }
+
+    /// The decline contract: `handle_query` returns `None` for anything the
+    /// roster does not hold, which is what lets the caller fall back upstream.
+    #[tokio::test]
+    async fn declines_what_the_roster_does_not_hold() {
+        use simple_dns::{CLASS as C, PacketFlag, QCLASS, Question};
+
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+        let v4 = Ipv4Addr::new(100, 64, 10, 5);
+        update_hostname(&table, &reverse, "dev", "box", v4, entry(v4).1).await;
+
+        let query = |name: &str, qtype: QTYPE| {
+            let mut pkt = Packet::new_query(1);
+            pkt.set_flags(PacketFlag::RECURSION_DESIRED);
+            pkt.questions.push(Question::new(
+                Name::new_unchecked(name).into_owned(),
+                qtype,
+                QCLASS::CLASS(C::IN),
+                false,
+            ));
+            pkt.build_bytes_vec().expect("build query")
+        };
+        let a = QTYPE::TYPE(simple_dns::TYPE::A);
+        let declined = |name: &'static str, qtype| {
+            let (table, reverse) = (table.clone(), reverse.clone());
+            async move {
+                handle_query(&query(name, qtype), &table, &reverse)
+                    .await
+                    .is_none()
+            }
+        };
+
+        // A public name that collides with the network name, the case this
+        // exists for: `box` is a peer, `zed` is not.
+        assert!(declined("zed.dev", a).await);
+        assert!(!declined("box.dev", a).await);
+        // MX for a peer name outside `.ray` stays a public question.
+        assert!(declined("box.dev", QTYPE::TYPE(simple_dns::TYPE::MX)).await);
+        // Unknown `.ray` names and PTRs outside our ranges go upstream too.
+        assert!(declined("nobody.dev.ray", a).await);
+        assert!(
+            declined(
+                "34.216.184.93.in-addr.arpa",
+                QTYPE::TYPE(simple_dns::TYPE::PTR)
+            )
+            .await
+        );
+        // ...but a PTR inside our range is ours to answer, hit or miss.
+        assert!(
+            !declined(
+                "9.0.64.100.in-addr.arpa",
+                QTYPE::TYPE(simple_dns::TYPE::PTR)
+            )
+            .await
+        );
     }
 
     #[test]

@@ -1,15 +1,13 @@
 //! In-daemon DNS resolver reached via the magic IP (no host :53 socket).
-//! Answers `.ray` names from the hostname tables and forwards everything else
-//! to the captured system upstreams.
+//! Answers names held in the hostname tables and forwards everything else to
+//! the captured system upstreams.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use simple_dns::Packet;
 
-use crate::DNS_DOMAIN;
 use crate::dns::{HostnameTable, MAGIC_DNS_V4, ReverseLookupTable};
 
 pub struct Resolver {
@@ -49,17 +47,21 @@ impl Resolver {
         self.upstreams.load().as_ref().clone()
     }
 
+    /// Answer from the roster, and fall back to the system resolver for
+    /// everything the roster does not hold.
+    ///
+    /// The fallback is what makes a name that looks like a mesh name but isn't
+    /// work: with a network called `dev` joined, `zed.dev` misses the roster and
+    /// goes upstream to the real internet instead of failing.
     pub async fn resolve(&self, query: &[u8]) -> Option<Vec<u8>> {
-        let pkt = Packet::parse(query).ok()?;
-        let q = pkt.questions.first()?;
-        let name = q.qname.to_string();
-        let name_lower = name.trim_end_matches('.').to_lowercase();
-
-        if is_local_name(&name_lower) {
-            // Authoritative for .ray (handle_query returns NXDOMAIN/NODATA too).
-            return crate::dns::handle_query(query, &self.table, &self.reverse).await;
+        if let Some(local) = crate::dns::handle_query(query, &self.table, &self.reverse).await {
+            return Some(local);
         }
-        self.forward(query).await
+        if let Some(forwarded) = self.forward(query).await {
+            return Some(forwarded);
+        }
+        // Nobody to ask. A `.ray` name is still ours to fail.
+        crate::dns::nxdomain_if_in_zone(query)
     }
 
     /// Answer a DNS query that arrived addressed to the magic IP via the TUN.
@@ -98,7 +100,7 @@ impl Resolver {
     async fn forward(&self, query: &[u8]) -> Option<Vec<u8>> {
         let upstreams = self.upstreams.load();
         if upstreams.is_empty() {
-            tracing::warn!("no DNS upstream configured; cannot forward non-.ray queries");
+            tracing::warn!("no DNS upstream configured; cannot forward off-mesh queries");
             return None;
         }
         for up in upstreams.iter() {
@@ -184,16 +186,6 @@ fn servfail(query: &[u8]) -> Option<Vec<u8>> {
     resp[2] |= 0x80; // QR: this is a response
     resp[3] = 0x80 | 2; // RA=1, Z=0, RCODE=2 (server failure)
     Some(resp)
-}
-
-/// A name we answer locally: anything under `.ray`, plus the apex `ray`.
-///
-/// Deliberately nothing else. A bare `<host>.<network>` would mean a network
-/// named `dev` swallows every real `*.dev` lookup, so network names only ever
-/// appear as a label *inside* `.ray` (`<host>.<network>.ray`), and `<host>` on
-/// its own resolves through the search domains.
-pub fn is_local_name(name_lower: &str) -> bool {
-    name_lower == DNS_DOMAIN || name_lower.ends_with(&format!(".{DNS_DOMAIN}"))
 }
 
 #[cfg(test)]
@@ -318,24 +310,23 @@ mod tests {
         assert!(response_has_a(&resp, Ipv4Addr::new(100, 64, 0, 7)));
     }
 
-    /// A network named `dev` must not swallow `zed.dev`: names are only ours
-    /// under `.ray`, so `<host>.<network>` goes upstream like any public name.
+    /// A network named `dev` must not swallow `zed.dev`. The roster holds a
+    /// `box` peer and no `zed`, so the lookup misses and falls back to the real
+    /// internet, while `box.dev` still resolves to its mesh IP.
     #[tokio::test]
-    async fn bare_network_suffixed_name_is_forwarded() {
+    async fn unknown_bare_network_name_falls_back_upstream() {
+        let peer_ip = Ipv4Addr::new(100, 64, 0, 7);
         let table = crate::dns::new_hostname_table();
         let reverse = crate::dns::new_reverse_table();
         crate::dns::update_hostname(
             &table,
             &reverse,
             "dev",
-            "zed",
-            Ipv4Addr::new(100, 64, 0, 7),
+            "box",
+            peer_ip,
             "200::7".parse().unwrap(),
         )
         .await;
-
-        assert!(is_local_name("zed.dev.ray"));
-        assert!(!is_local_name("zed.dev"));
 
         let upstream_answer = Ipv4Addr::new(93, 184, 216, 34);
         let up = fake_upstream(upstream_answer).await;
@@ -346,7 +337,47 @@ mod tests {
             .resolve(&build_a_query("zed.dev"))
             .await
             .expect("forwarded answer");
+        assert!(
+            response_has_a(&resp, upstream_answer),
+            "a name no peer holds must come from the real DNS"
+        );
+
+        // The peer that does exist keeps resolving to the mesh, suffix or not.
+        for name in ["box.dev", "box.dev.ray", "box.ray"] {
+            let resp = r.resolve(&build_a_query(name)).await.expect("local answer");
+            assert!(
+                response_has_a(&resp, peer_ip),
+                "{name} must resolve locally"
+            );
+        }
+    }
+
+    /// A `.ray` name nobody holds also falls back before it is failed: the
+    /// upstream gets asked, and only a dead upstream produces NXDOMAIN.
+    #[tokio::test]
+    async fn unknown_ray_name_falls_back_then_nxdomains() {
+        let upstream_answer = Ipv4Addr::new(93, 184, 216, 34);
+        let up = fake_upstream(upstream_answer).await;
+        let r = Resolver::new(
+            crate::dns::new_hostname_table(),
+            crate::dns::new_reverse_table(),
+        );
+        r.set_upstream_addrs([up]);
+        let resp = r
+            .resolve(&build_a_query("nobody.ray"))
+            .await
+            .expect("forwarded answer");
         assert!(response_has_a(&resp, upstream_answer));
+
+        // With nothing listening upstream, the zone is ours to fail: NXDOMAIN,
+        // not the SERVFAIL a client would retry.
+        r.set_upstream_addrs([dead_upstream().await]);
+        let resp = r
+            .resolve(&build_a_query("nobody.ray"))
+            .await
+            .expect("local NXDOMAIN");
+        let pkt = Packet::parse(&resp).expect("parse NXDOMAIN");
+        assert_eq!(pkt.rcode(), simple_dns::RCODE::NameError);
     }
 
     /// Minimal upstream that answers every A query with `ip`. Returns its addr.

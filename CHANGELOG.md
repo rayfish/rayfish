@@ -49,14 +49,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **Magic DNS no longer answers `<host>.<network>` without the `.ray` suffix.**
-  A network named `dev` used to be registered with the OS as its own domain, so
-  every lookup under it, `zed.dev` included, was captured by rayfish and
-  answered NXDOMAIN instead of going to the real internet. Peer names now
-  resolve as `<host>` (bare, via the search domains), `<host>.ray`, or
-  `<host>.<network>.ray`, and everything outside `.ray` is forwarded upstream
-  as usual. If you relied on the suffix-less `<host>.<network>` form, add
-  `.ray`.
+- **Magic DNS falls back to your normal DNS for any name the mesh doesn't
+  hold.** A network named `dev` used to be registered with the OS as its own
+  domain, so every lookup under it, `zed.dev` included, was captured by rayfish
+  and answered NXDOMAIN instead of going to the real internet. Rayfish now
+  answers only names its roster actually has, and hands everything else to the
+  system resolver: `zed.dev` reaches the real site, while a peer named `box` on
+  network `dev` still resolves as `box`, `box.ray`, `box.dev` and
+  `box.dev.ray`. Bare network names are no longer registered with the OS, so
+  the suffix-less `<host>.<network>` form works where rayfish sees all your
+  queries (the resolv.conf backend, an active exit node, Android) and `.ray`
+  works everywhere. One consequence worth knowing: if a peer's name matches the
+  public name you wanted (a peer literally called `zed` on network `dev`), the
+  peer wins; use the public FQDN or rename the peer.
 
 - **Android crash reports now say how the app died when it dies silently.** A
   low-memory kill or a background stall used to leave either nothing at all or a
