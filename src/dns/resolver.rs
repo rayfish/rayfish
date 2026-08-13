@@ -55,7 +55,7 @@ impl Resolver {
         let name = q.qname.to_string();
         let name_lower = name.trim_end_matches('.').to_lowercase();
 
-        if is_local_name(&name_lower, &self.table).await {
+        if is_local_name(&name_lower) {
             // Authoritative for .ray (handle_query returns NXDOMAIN/NODATA too).
             return crate::dns::handle_query(query, &self.table, &self.reverse).await;
         }
@@ -186,18 +186,14 @@ fn servfail(query: &[u8]) -> Option<Vec<u8>> {
     Some(resp)
 }
 
-/// A name we answer locally: `.ray`, the apex `ray`, or `<host>.<network>`
-/// where `<network>` is a known network in the table.
-pub async fn is_local_name(name_lower: &str, table: &HostnameTable) -> bool {
-    let suffix = format!(".{DNS_DOMAIN}");
-    if name_lower == DNS_DOMAIN || name_lower.ends_with(&suffix) {
-        return true;
-    }
-    let tld = name_lower
-        .rsplit_once('.')
-        .map(|(_, t)| t)
-        .unwrap_or(name_lower);
-    table.read().await.contains_key(tld)
+/// A name we answer locally: anything under `.ray`, plus the apex `ray`.
+///
+/// Deliberately nothing else. A bare `<host>.<network>` would mean a network
+/// named `dev` swallows every real `*.dev` lookup, so network names only ever
+/// appear as a label *inside* `.ray` (`<host>.<network>.ray`), and `<host>` on
+/// its own resolves through the search domains.
+pub fn is_local_name(name_lower: &str) -> bool {
+    name_lower == DNS_DOMAIN || name_lower.ends_with(&format!(".{DNS_DOMAIN}"))
 }
 
 #[cfg(test)]
@@ -320,6 +316,37 @@ mod tests {
         let query = build_a_query("dario.homelab.ray");
         let resp = r.resolve(&query).await.expect("local answer");
         assert!(response_has_a(&resp, Ipv4Addr::new(100, 64, 0, 7)));
+    }
+
+    /// A network named `dev` must not swallow `zed.dev`: names are only ours
+    /// under `.ray`, so `<host>.<network>` goes upstream like any public name.
+    #[tokio::test]
+    async fn bare_network_suffixed_name_is_forwarded() {
+        let table = crate::dns::new_hostname_table();
+        let reverse = crate::dns::new_reverse_table();
+        crate::dns::update_hostname(
+            &table,
+            &reverse,
+            "dev",
+            "zed",
+            Ipv4Addr::new(100, 64, 0, 7),
+            "200::7".parse().unwrap(),
+        )
+        .await;
+
+        assert!(is_local_name("zed.dev.ray"));
+        assert!(!is_local_name("zed.dev"));
+
+        let upstream_answer = Ipv4Addr::new(93, 184, 216, 34);
+        let up = fake_upstream(upstream_answer).await;
+        let r = Resolver::new(table, reverse);
+        r.set_upstream_addrs([up]);
+
+        let resp = r
+            .resolve(&build_a_query("zed.dev"))
+            .await
+            .expect("forwarded answer");
+        assert!(response_has_a(&resp, upstream_answer));
     }
 
     /// Minimal upstream that answers every A query with `ip`. Returns its addr.

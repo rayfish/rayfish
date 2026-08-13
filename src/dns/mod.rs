@@ -165,13 +165,11 @@ pub(crate) async fn handle_query(
         return Some(make_soa_response(&packet, &question.qname));
     }
 
-    // Try resolving: first as .ray name, then as bare <host>.<network>
-    let entry = if is_a || is_aaaa {
-        if name_lower.ends_with(&suffix) {
-            resolve_name(&name_lower, &suffix, table).await
-        } else {
-            resolve_bare_network_name(&name_lower, table).await
-        }
+    // We only ever answer inside `.ray`. A bare `<host>.<network>` is a public
+    // DNS name (a network called `dev` would shadow `zed.dev`), so it is never
+    // ours to resolve.
+    let entry = if (is_a || is_aaaa) && name_lower.ends_with(&suffix) {
+        resolve_name(&name_lower, &suffix, table).await
     } else {
         None
     };
@@ -193,22 +191,6 @@ pub(crate) async fn handle_query(
             return Some(make_nxdomain(&packet));
         }
         return Some(make_nodata(&packet));
-    }
-
-    // Bare network name that didn't resolve, check if the TLD is a known network
-    {
-        let tld = name_lower
-            .rsplit_once('.')
-            .map(|(_, t)| t)
-            .unwrap_or(&name_lower);
-        let table_guard = table.read().await;
-        if table_guard.contains_key(tld) {
-            if is_a || is_aaaa {
-                tracing::info!(name = %name_lower, "DNS query NXDOMAIN (known network)");
-                return Some(make_nxdomain(&packet));
-            }
-            return Some(make_nodata(&packet));
-        }
     }
 
     tracing::debug!(name = %name_lower, "DNS query for unknown domain, refusing");
@@ -278,14 +260,6 @@ fn parse_ptr_name(name: &str) -> Option<IpAddr> {
     }
 
     None
-}
-
-/// Resolve `<hostname>.<network>` (without .ray suffix).
-/// Used when the OS routes a bare network domain to us via supplemental match.
-async fn resolve_bare_network_name(name: &str, table: &HostnameTable) -> Option<HostnameEntry> {
-    let (hostname, network) = name.rsplit_once('.')?;
-    let table_guard = table.read().await;
-    table_guard.get(network)?.get(hostname).copied()
 }
 
 pub async fn resolve_name(
