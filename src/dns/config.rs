@@ -359,7 +359,7 @@ mod macos {
     impl DnsConfigurator for MacosDynamicStoreDns {
         async fn apply(&self) -> Result<()> {
             init_store()?;
-            write_dns_config(&[DNS_DOMAIN.to_string()], &[])?;
+            write_dns_config(&[DNS_DOMAIN.to_string()])?;
             tracing::info!(
                 key = SC_DNS_KEY,
                 full_tunnel = crate::exit_node::full_tunnel_active(),
