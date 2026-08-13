@@ -613,23 +613,29 @@ impl NetworkRegistry {
                 )
                 .await
             {
-                Ok(TryJoin::Joined(IpcMessage::Joined { name, my_ip, .. })) => {
-                    tracing::info!(network = %name, ip = %my_ip, attempt, "restored member network");
-                    return;
-                }
+                // The reply is boxed (`TryJoin::Joined`), so the two Joined cases
+                // are told apart inside the arm rather than by pattern.
+                Ok(TryJoin::Joined(resp)) => match *resp {
+                    IpcMessage::Joined {
+                        ref name, my_ip, ..
+                    } => {
+                        tracing::info!(network = %name, ip = %my_ip, attempt, "restored member network");
+                        return;
+                    }
+                    // Not reachable today (a reconnect handshake only ever returns
+                    // `Admitted`), and that is exactly why it must not be a silent
+                    // `return`: a saved network that never registers is invisible
+                    // except as a faint `inactive` marker in `ray status`.
+                    ref other => {
+                        tracing::warn!(network = %name, attempt, response = ?other, retry_in = ?delay, "unexpected response restoring network, retrying");
+                    }
+                },
                 // Queued for live approval on a closed network. `TryJoin::Pending`
                 // and `dial_reconnect` both document that the caller retries until
                 // `ray accept` lets us in, so retry: settling here strands the
                 // network until someone notices and restarts the daemon.
                 Ok(TryJoin::Pending) => {
                     tracing::warn!(network = %name, attempt, retry_in = ?delay, "restore queued for approval on a closed network, retrying");
-                }
-                // Not reachable today (a reconnect handshake only ever returns
-                // `Admitted`), and that is exactly why it must not be a silent
-                // `return`: a saved network that never registers is invisible
-                // except as a faint `inactive` marker in `ray status`.
-                Ok(TryJoin::Joined(other)) => {
-                    tracing::warn!(network = %name, attempt, response = ?other, retry_in = ?delay, "unexpected response restoring network, retrying");
                 }
                 Err(e) => {
                     // The first failure is worth flagging; the rest are just the
