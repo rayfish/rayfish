@@ -566,7 +566,7 @@ impl Daemon {
         // Push the change to any live listener.
         #[cfg(feature = "desktop")]
         self.rebuild_ssh_authz();
-        let detail = if allow {
+        let mut detail = if allow {
             let r = net.ssh_allow.iter().find(|r| r.peer == entry);
             let as_users = match r.map(|r| r.users.as_slice()) {
                 Some([]) | None => " as any non-root user".to_string(),
@@ -577,6 +577,15 @@ impl Daemon {
         } else {
             format!("ssh deny {peer} on {network}")
         };
+        // Mirror of the `ssh on` nudge: a rule with the server off looks like it
+        // took effect, but `:22` still falls through to the host sshd (which
+        // asks for a password), so the failure doesn't point back here.
+        if allow && !app_config.ssh_enabled {
+            detail.push_str(
+                "\n\nmesh SSH is off, so this rule is not in effect yet. \
+                 Start the server with `ray firewall ssh on`.",
+            );
+        }
         IpcMessage::Ok { message: detail }
     }
 

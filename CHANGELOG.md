@@ -69,6 +69,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ray firewall ssh allow` now tells you when the SSH server is off.** The
+  rule was saved and reported as if it had taken effect, but with the server off
+  a connection falls through to the host's own sshd and asks for a password,
+  which looks like the rule was ignored rather than never applied. Both `allow`
+  and `ssh show` now say the rules are inactive and point at
+  `ray firewall ssh on`.
+
 - **A saved network no longer stays dead until you restart the daemon.** A
   network that failed to connect at startup stayed in your config but was never
   restored: peers on it were unreachable and their packets were dropped as
