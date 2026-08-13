@@ -310,9 +310,26 @@ struct PtyReq {
     row: u16,
 }
 
+/// State for one session channel. A connection carries many of them: OpenSSH's
+/// `ControlMaster` (and every IDE or tool that multiplexes over one connection)
+/// opens a channel per command, several of them at a time. None of this can
+/// live in a per-connection slot, or a later channel silently overwrites an
+/// earlier one's channel and PTY.
+#[derive(Default)]
+struct ChannelState {
+    /// The open channel, taken when its shell / exec / subsystem starts.
+    channel: Option<Channel<Msg>>,
+    /// A PTY requested for this channel before its session starts.
+    pty: Option<PtyReq>,
+    /// Set once the session starts; forwards window-resize events to the task
+    /// that owns this channel's PTY.
+    resize_tx: Option<mpsc::UnboundedSender<Size>>,
+}
+
 /// Per-connection SSH handler. The peer's login policy is precomputed from its
 /// identity before the handshake; `auth_none` resolves the requested unix user
-/// and checks it against that policy.
+/// and checks it against that policy. Everything that belongs to a single
+/// session lives in `channels`, keyed by channel id.
 struct SshHandler {
     /// Which local users this peer may log in as (computed at connect time).
     policy: UserPolicy,
@@ -324,13 +341,11 @@ struct SshHandler {
     /// The unix user the client asked to log in as (the `user` in `user@host`).
     login_user: String,
     /// The resolved login account, set in `auth_none` once the requested user
-    /// passes the policy, so the session task doesn't re-run `getpwnam`.
-    login: Option<LoginInfo>,
-    pty: Option<PtyReq>,
-    channel: Option<Channel<Msg>>,
-    /// Set once a shell/exec session starts; forwards window-resize events to
-    /// the task that owns the PTY.
-    resize_tx: Option<mpsc::UnboundedSender<Size>>,
+    /// passes the policy, so the session task doesn't re-run `getpwnam`. Shared,
+    /// never consumed: every channel on the connection logs in as this account.
+    login: Option<Arc<LoginInfo>>,
+    /// The session channels currently open on this connection.
+    channels: HashMap<ChannelId, ChannelState>,
 }
 
 impl SshHandler {
@@ -341,31 +356,38 @@ impl SshHandler {
             banner,
             login_user: String::new(),
             login: None,
-            pty: None,
-            channel: None,
-            resize_tx: None,
+            channels: HashMap::new(),
         }
     }
 
-    /// Take the opened session channel and spawn the login shell (or the `exec`
-    /// / subsystem command), wiring it to the channel. Returns immediately so
-    /// the russh session task stays free to process further requests (resize, …).
-    fn start(&mut self, command: Option<String>, session: &mut Session) {
-        let Some(channel) = self.channel.take() else {
-            return;
-        };
+    /// Take `id`'s opened channel and spawn the login shell (or the `exec` /
+    /// subsystem command), wiring it to that channel. Returns immediately so
+    /// the russh session task stays free to process further requests (resize,
+    /// more channels, …). `false` means nothing was spawned and the caller must
+    /// fail the request instead of reporting success.
+    fn start(
+        &mut self,
+        channel_id: ChannelId,
+        command: Option<String>,
+        session: &mut Session,
+    ) -> bool {
         // `login` is set in `auth_none` once the requested user is authorized;
-        // a session can't reach here without a successful auth, so this holds.
-        let Some(info) = self.login.take() else {
-            return;
+        // cloned, never taken, so every channel on this connection gets it.
+        let Some(info) = self.login.clone() else {
+            return false;
         };
-        let channel_id = channel.id();
+        let Some(state) = self.channels.get_mut(&channel_id) else {
+            return false;
+        };
+        let Some(channel) = state.channel.take() else {
+            return false;
+        };
         let handle = session.handle();
         let login_name = info.name.clone();
-        let pty = self.pty.take();
+        let pty = state.pty.take();
         let peer = self.user;
         let (resize_tx, resize_rx) = mpsc::unbounded_channel();
-        self.resize_tx = Some(resize_tx);
+        state.resize_tx = Some(resize_tx);
 
         tokio::spawn(async move {
             // A PTY was requested -> interactive terminal. Otherwise (`ssh host
@@ -386,6 +408,27 @@ impl SshHandler {
             let _ = handle.eof(channel_id).await;
             let _ = handle.close(channel_id).await;
         });
+        true
+    }
+
+    /// Answer a session request we cannot serve, and end the channel with it.
+    /// Every "cannot happen" path has to reach the client: answering success
+    /// with nothing spawned behind it (or not answering at all) leaves the
+    /// client waiting forever, with the reason only in this node's log.
+    fn fail(
+        &mut self,
+        channel_id: ChannelId,
+        reason: &str,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        warn!(peer = %self.user.fmt_short(), channel = %channel_id, reason,
+            "mesh SSH: cannot start a session on this channel");
+        session.channel_failure(channel_id)?;
+        session.exit_status_request(channel_id, 1)?;
+        session.eof(channel_id)?;
+        session.close(channel_id)?;
+        self.channels.remove(&channel_id);
+        Ok(())
     }
 }
 
@@ -408,7 +451,7 @@ impl Handler for SshHandler {
         // after a shell spawn. The resolved info is reused by the session task.
         match resolve_login(user) {
             Ok(info) if self.policy.permits(user, info.uid) => {
-                self.login = Some(info);
+                self.login = Some(Arc::new(info));
                 Ok(Auth::Accept)
             }
             Ok(info) => {
@@ -429,8 +472,26 @@ impl Handler for SshHandler {
         channel: Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        self.channel = Some(channel);
+        self.channels.insert(
+            channel.id(),
+            ChannelState {
+                channel: Some(channel),
+                ..Default::default()
+            },
+        );
         Ok(true)
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // Either the client closed the channel or it is answering the close the
+        // session task sent when the process exited. Either way this channel's
+        // state is dead; the rest of the connection's channels carry on.
+        self.channels.remove(&channel);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -445,7 +506,16 @@ impl Handler for SshHandler {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.pty = Some(PtyReq {
+        // The PTY belongs to this channel alone: a second channel on the same
+        // connection must keep its plain pipes.
+        let Some(state) = self.channels.get_mut(&channel) else {
+            return self.fail(
+                channel,
+                "pty requested on a channel that is not open",
+                session,
+            );
+        };
+        state.pty = Some(PtyReq {
             term: term.to_string(),
             col: col_width as u16,
             row: row_height as u16,
@@ -459,7 +529,13 @@ impl Handler for SshHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.start(None, session);
+        if !self.start(channel, None, session) {
+            return self.fail(
+                channel,
+                "shell requested on a channel with no session",
+                session,
+            );
+        }
         session.channel_success(channel)?;
         Ok(())
     }
@@ -471,7 +547,13 @@ impl Handler for SshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         let cmd = String::from_utf8_lossy(data).to_string();
-        self.start(Some(cmd), session);
+        if !self.start(channel, Some(cmd), session) {
+            return self.fail(
+                channel,
+                "exec requested on a channel with no session",
+                session,
+            );
+        }
         session.channel_success(channel)?;
         Ok(())
     }
@@ -503,7 +585,13 @@ impl Handler for SshHandler {
         };
         // Run it through the login shell like the exec path, which is what a
         // stock sshd does for a subsystem too.
-        self.start(Some(command), session);
+        if !self.start(channel, Some(command), session) {
+            return self.fail(
+                channel,
+                "subsystem requested on a channel with no session",
+                session,
+            );
+        }
         session.channel_success(channel)?;
         Ok(())
     }
@@ -517,7 +605,13 @@ impl Handler for SshHandler {
         _pix_height: u32,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(tx) = &self.resize_tx {
+        // Only the channel that asked for a PTY has somewhere to send this; a
+        // resize on any other channel is not an error, just nothing to do.
+        if let Some(tx) = self
+            .channels
+            .get(&channel)
+            .and_then(|s| s.resize_tx.as_ref())
+        {
             let _ = tx.send(Size::new(row_height as u16, col_width as u16));
         }
         session.channel_success(channel)?;
@@ -525,7 +619,9 @@ impl Handler for SshHandler {
     }
 }
 
-/// The resolved local account a session logs in as.
+/// The resolved local account a session logs in as. Held in an [`Arc`] on the
+/// handler and cloned per channel, since every session on one connection logs
+/// in as the same account.
 struct LoginInfo {
     uid: u32,
     gid: u32,
@@ -560,7 +656,18 @@ fn drop_privs(
     name: &str,
 ) -> Result<impl FnMut() -> std::io::Result<()> + Send + Sync + 'static> {
     let cname = std::ffi::CString::new(name).context("user name contains NUL")?;
+    // Nothing to drop when the server already *is* the target account. The
+    // daemon runs as root in production, so uid 0 never takes this branch and
+    // the drop below is unchanged there; it is the unprivileged case (a
+    // hand-run daemon, or the tests) where these calls would fail with EPERM
+    // and fail the session closed even though the child gains nothing.
+    // SAFETY: geteuid/getegid take no arguments and cannot fail.
+    let already_dropped =
+        uid != 0 && unsafe { libc::geteuid() } == uid && unsafe { libc::getegid() } == gid;
     Ok(move || {
+        if already_dropped {
+            return Ok(());
+        }
         // SAFETY: only direct syscalls, in the child after fork, before exec.
         unsafe {
             #[cfg(target_os = "macos")]
@@ -600,7 +707,7 @@ fn login_env<'a>(home: &Path, shell: &Path, name: &str) -> [(&'a str, std::ffi::
 /// exits. Returns the child's exit code.
 async fn run_pty_session(
     channel: Channel<Msg>,
-    info: LoginInfo,
+    info: Arc<LoginInfo>,
     command: Option<String>,
     pty_req: PtyReq,
     mut resize_rx: mpsc::UnboundedReceiver<Size>,
@@ -670,7 +777,7 @@ async fn run_pipe_session(
     channel: Channel<Msg>,
     handle: Handle,
     channel_id: ChannelId,
-    info: LoginInfo,
+    info: Arc<LoginInfo>,
     command: Option<String>,
 ) -> Result<u32> {
     let drop = drop_privs(info.uid, info.gid, &info.name)?;
@@ -901,6 +1008,13 @@ fn load_or_generate_host_key() -> Result<PrivateKey> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
+    use russh::client;
+    use russh::keys::ssh_key::PublicKey;
+    use russh::{ChannelMsg, client::Msg as ClientMsg};
+    use tokio::time::timeout;
+
     use super::*;
 
     fn id(seed: u8) -> EndpointId {
@@ -1052,6 +1166,168 @@ mod tests {
             !p.permits("toor", 0),
             "any uid-0 account blocked, not just 'root'"
         );
+    }
+
+    /// Client side of the loopback tests: the host key is generated per test,
+    /// so there is nothing to verify against.
+    struct AcceptAnyHost;
+
+    impl client::Handler for AcceptAnyHost {
+        type Error = russh::Error;
+
+        async fn check_server_key(&mut self, _key: &PublicKey) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    /// The account the tests log in as: the one running them, which is also the
+    /// one the server runs as, so the session needs no privilege drop.
+    fn test_account() -> String {
+        let uid = uzers::get_effective_uid();
+        uzers::get_user_by_uid(uid)
+            .expect("these tests need a passwd entry for the uid running them")
+            .name()
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// Serve the real [`SshHandler`] on loopback and return an authenticated
+    /// client connection to it. The peer is authorized for any user, the same
+    /// state a live mesh connection reaches before it opens a channel.
+    async fn connect_to_test_server() -> client::Handle<AcceptAnyHost> {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("host key");
+        let config = Arc::new(Config {
+            keys: vec![key],
+            methods: MethodSet::from(&[MethodKind::None][..]),
+            auth_rejection_time: Duration::ZERO,
+            ..Default::default()
+        });
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut policy = UserPolicy::default();
+            policy.add(&["*".to_string()]);
+            let handler = SshHandler::new(policy, id(1), None);
+            if let Ok(session) = russh::server::run_stream(config, stream, handler).await {
+                let _ = session.await;
+            }
+        });
+
+        let mut handle = client::connect(Arc::new(client::Config::default()), addr, AcceptAnyHost)
+            .await
+            .expect("client connect");
+        assert!(
+            handle
+                .authenticate_none(test_account())
+                .await
+                .expect("auth")
+                .success(),
+            "the `none` method is the mesh SSH auth gate"
+        );
+        handle
+    }
+
+    /// Drain one channel to its close, returning what the command wrote to
+    /// stdout and the exit status it reported. Bounded: a channel that never
+    /// finishes is exactly the bug under test, and it must fail, not hang.
+    async fn drain(channel: &mut Channel<ClientMsg>) -> (String, Option<u32>) {
+        let collect = async {
+            let mut out = Vec::new();
+            let mut code = None;
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                    ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            (String::from_utf8_lossy(&out).to_string(), code)
+        };
+        timeout(Duration::from_secs(20), collect)
+            .await
+            .expect("the channel never finished: no output, no exit status, no close")
+    }
+
+    #[tokio::test]
+    async fn every_channel_on_one_connection_runs_its_command() {
+        // The `ssh -M` / ControlMaster case, and what Zed remote development
+        // does: several commands in a row, each its own session channel on one
+        // connection. Per-connection state used to be consumed by the first
+        // channel, so every later one silently ran nothing and hung.
+        let handle = connect_to_test_server().await;
+        for n in 1..=3 {
+            let mut channel = handle
+                .channel_open_session()
+                .await
+                .expect("open session channel");
+            channel
+                .exec(true, format!("echo ran-{n}"))
+                .await
+                .expect("exec");
+            let (out, code) = drain(&mut channel).await;
+            assert!(
+                out.contains(&format!("ran-{n}")),
+                "channel {n} output: {out}"
+            );
+            assert_eq!(code, Some(0), "channel {n} exit status");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_channels_keep_their_own_output_and_pty() {
+        // Both channels are open before either one starts a command, so a
+        // single per-connection slot would let the second clobber the first.
+        // `$TERM` is the tell: it is set only for a PTY session, so the pipe
+        // channel seeing it would mean the PTY request leaked across channels.
+        let handle = connect_to_test_server().await;
+        let mut tty = handle
+            .channel_open_session()
+            .await
+            .expect("open pty channel");
+        let mut pipe = handle
+            .channel_open_session()
+            .await
+            .expect("open pipe channel");
+
+        tty.request_pty(true, "xterm-rayfish", 80, 24, 0, 0, &[])
+            .await
+            .expect("request pty");
+        tty.exec(true, "echo on-tty term=$TERM")
+            .await
+            .expect("exec");
+        pipe.exec(true, "echo on-pipe term=$TERM")
+            .await
+            .expect("exec");
+
+        let (tty_out, tty_code) = drain(&mut tty).await;
+        let (pipe_out, pipe_code) = drain(&mut pipe).await;
+
+        assert!(tty_out.contains("on-tty"), "pty channel output: {tty_out}");
+        assert!(!tty_out.contains("on-pipe"), "cross-talk: {tty_out}");
+        assert!(
+            tty_out.contains("term=xterm-rayfish"),
+            "the pty channel gets its terminal: {tty_out}"
+        );
+        assert_eq!(tty_code, Some(0));
+
+        assert!(
+            pipe_out.contains("on-pipe"),
+            "pipe channel output: {pipe_out}"
+        );
+        assert!(!pipe_out.contains("on-tty"), "cross-talk: {pipe_out}");
+        assert!(
+            !pipe_out.contains("xterm-rayfish"),
+            "the pty must not leak onto the other channel: {pipe_out}"
+        );
+        assert!(
+            !pipe_out.contains('\r'),
+            "a pipe session is not line-translated: {pipe_out:?}"
+        );
+        assert_eq!(pipe_code, Some(0));
     }
 
     #[test]

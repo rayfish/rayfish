@@ -95,6 +95,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Mesh SSH serves every session on a multiplexed connection, not just the
+  first.** With `ControlMaster` (`ssh -M`, and every tool that reuses one
+  connection, such as Zed remote development) only the first command ran: each
+  later one hung forever with no output, no exit status, and no error on either
+  side. The server kept the login and channel state in one slot per connection,
+  so the first session consumed it and the rest quietly started nothing.
+  Sessions are now tracked per channel, concurrent channels no longer take over
+  each other's PTY or output, and a session that cannot start closes its channel
+  with an error instead of hanging.
+
 - **`scp` and `sftp` work over mesh SSH.** Both hung with no output and no
   error until you interrupted them. OpenSSH 9.0 and newer `scp` copies files
   over the SFTP protocol rather than the old rcp one, and the mesh SSH server
