@@ -112,6 +112,49 @@ pub(crate) struct NetworkRegistry {
     /// fires while the data plane is down (boot, standby) from withdrawing an
     /// offer that `activate()` is about to re-advertise.
     pub(crate) exit_sync_enabled: AtomicBool,
+    /// Networks whose restore is already running, so a sweep never starts a
+    /// second one for the same network. Removed when the restore finishes,
+    /// however it finishes.
+    pub(crate) restoring: Arc<DashSet<String>>,
+    /// Nudges [`Self::run_restore_supervisor`] to sweep now instead of at its
+    /// next tick. Fired when a peer sends a control frame for a network we have
+    /// saved but not live: their traffic is proof the network is reachable
+    /// again, so recovery shouldn't wait out the tick.
+    pub(crate) restore_nudge: Arc<Notify>,
+}
+
+/// One saved network the restore supervisor found missing from the live map,
+/// and how it has to be restored. The two paths differ: a coordinator holds the
+/// network key and restores locally, a member has to reconverge from the signed
+/// record.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MissingNetwork {
+    pub name: String,
+    /// `None` for a member network (restore needs the pkarr lookup), `Some` for
+    /// a coordinator network (we hold the key, so the restore is local).
+    pub coordinator_mode: Option<GroupMode>,
+}
+
+/// Decide which saved networks the supervisor should restore: everything in
+/// config that is neither live nor already being restored.
+///
+/// Split out as a pure function over the three inputs so the decision is
+/// testable without a running daemon, which is the part worth pinning down: the
+/// sweep runs on a timer and on peer traffic, so starting a duplicate restore
+/// (or skipping a genuinely dead network) is the failure mode that matters.
+pub(crate) fn missing_networks(
+    saved: &[config::NetworkConfig],
+    is_live: impl Fn(&str) -> bool,
+    is_restoring: impl Fn(&str) -> bool,
+) -> Vec<MissingNetwork> {
+    saved
+        .iter()
+        .filter(|n| !is_live(&n.name) && !is_restoring(&n.name))
+        .map(|n| MissingNetwork {
+            name: n.name.clone(),
+            coordinator_mode: n.network_secret_key.as_ref().map(|_| n.group_mode),
+        })
+        .collect()
 }
 
 impl NetworkRegistry {
@@ -157,6 +200,8 @@ impl NetworkRegistry {
             exit_selection_pending: AtomicBool::new(false),
             exit_reapply: Arc::new(Notify::new()),
             exit_sync_enabled: AtomicBool::new(false),
+            restoring: Arc::new(DashSet::new()),
+            restore_nudge: Arc::new(Notify::new()),
         }
     }
 
@@ -1000,5 +1045,69 @@ impl NetworkRegistry {
         if changed {
             tracing::info!(device = %device.fmt_short(), "re-authorized device (cleared nullifier)");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn net(name: &str) -> config::NetworkConfig {
+        config::NetworkConfig {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn coordinator_net(name: &str) -> config::NetworkConfig {
+        config::NetworkConfig {
+            name: name.to_string(),
+            group_mode: GroupMode::Restricted,
+            network_secret_key: Some(SecretKey::generate()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn restores_only_saved_networks_that_are_not_live() {
+        let saved = vec![net("homelab"), net("trade")];
+        let missing = missing_networks(&saved, |n| n == "trade", |_| false);
+        assert_eq!(
+            missing,
+            vec![MissingNetwork {
+                name: "homelab".to_string(),
+                coordinator_mode: None,
+            }]
+        );
+    }
+
+    /// The sweep runs on a timer *and* on peer traffic, so the same network can
+    /// be swept twice while its restore is still in flight. Without this guard
+    /// each inbound frame for a dead network would start another restore.
+    #[test]
+    fn skips_a_network_whose_restore_is_already_running() {
+        let saved = vec![net("homelab")];
+        assert!(missing_networks(&saved, |_| false, |n| n == "homelab").is_empty());
+    }
+
+    /// Holding the network key means the restore is local (no pkarr lookup), so
+    /// the two are dispatched to different restore paths.
+    #[test]
+    fn tags_a_key_holding_network_as_a_coordinator_restore() {
+        let saved = vec![coordinator_net("field")];
+        let missing = missing_networks(&saved, |_| false, |_| false);
+        assert_eq!(
+            missing,
+            vec![MissingNetwork {
+                name: "field".to_string(),
+                coordinator_mode: Some(GroupMode::Restricted),
+            }]
+        );
+    }
+
+    #[test]
+    fn nothing_to_do_when_every_saved_network_is_live() {
+        let saved = vec![net("homelab"), coordinator_net("field")];
+        assert!(missing_networks(&saved, |_| true, |_| false).is_empty());
     }
 }

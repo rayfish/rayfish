@@ -23,6 +23,13 @@ const NUDGE_REPLY_WAIT: Duration = Duration::from_millis(500);
 /// First and last backoff step for the member-network restore retry loop.
 const RESTORE_RETRY_MIN: Duration = Duration::from_secs(2);
 const RESTORE_RETRY_MAX: Duration = Duration::from_secs(60);
+/// How often the restore supervisor re-checks that every saved network is live.
+/// Matches [`RESTORE_RETRY_MAX`]: a network being restored is already retrying
+/// at that rate, so sweeping faster only re-reads the config for nothing.
+const RESTORE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Minimum spacing between two peer-triggered sweeps. See
+/// [`NetworkRegistry::run_restore_supervisor`].
+const NUDGE_DEBOUNCE: Duration = Duration::from_secs(5);
 
 /// The membership a coordinator restores at startup, sourced from the signed
 /// `GroupBlob` (authoritative) or the stale config roster as a fallback.
@@ -658,6 +665,144 @@ impl NetworkRegistry {
         }
     }
 
+    /// Start a member network's restore loop, unless one is already running for
+    /// it. The [`restoring`](NetworkRegistry::restoring) guard is what lets the
+    /// startup path and the supervisor's sweep both call this freely.
+    fn spawn_member_restore(self: &Arc<Self>, net: &config::NetworkConfig) {
+        let Some(net_pubkey) = net.network_public_key.map(|k| k.to_string()) else {
+            tracing::warn!(network = %net.name, "no network public key in config, skipping restore");
+            return;
+        };
+        if !self.restoring.insert(net.name.clone()) {
+            return;
+        }
+        let me = Arc::clone(self);
+        let name = net.name.clone();
+        let guard = net.name.clone();
+        let persisted_hostname = net.my_hostname.clone();
+        let auto_accept_firewall = net.auto_accept_firewall;
+        let auto_accept_files = net.auto_accept_files;
+        tokio::spawn(async move {
+            Arc::clone(&me)
+                .restore_member_network(
+                    name,
+                    net_pubkey,
+                    persisted_hostname,
+                    auto_accept_firewall,
+                    auto_accept_files,
+                )
+                .await;
+            me.restoring.remove(&guard);
+        });
+    }
+
+    /// Start a coordinator network's restore, unless one is already running for
+    /// it. Returns the handle so startup can await it as a barrier; the sweep
+    /// drops it. Unlike the member path this is a single attempt, so the sweep's
+    /// tick is what retries it.
+    fn spawn_coordinator_restore(
+        self: &Arc<Self>,
+        net: &config::NetworkConfig,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.restoring.insert(net.name.clone()) {
+            return None;
+        }
+        let me = Arc::clone(self);
+        let name = net.name.clone();
+        let mode = net.group_mode;
+        Some(tokio::spawn(async move {
+            match me.restore_coordinator_network(&name, mode).await {
+                Ok(IpcMessage::Created { .. }) => {
+                    tracing::info!(network = %name, "restored coordinator network");
+                }
+                Ok(IpcMessage::Error { message }) => {
+                    tracing::warn!(network = %name, error = %message, "failed to restore network");
+                }
+                Err(e) => {
+                    tracing::warn!(network = %name, error = %e, "failed to restore network");
+                }
+                _ => {}
+            }
+            me.restoring.remove(&name);
+        }))
+    }
+
+    /// Keep every saved network live. Sweeps on a tick and whenever a peer sends
+    /// traffic for a network we have saved but not registered, restarting the
+    /// restore for anything missing.
+    ///
+    /// The startup restore alone is not enough: it can end (a member loop that
+    /// gives up because the network registered by another path, a coordinator
+    /// restore that failed once) and nothing revisits the decision, leaving a
+    /// network that is saved but dead until someone notices and restarts the
+    /// daemon. A node in that state looks healthy: it stays connected to its
+    /// peers and answers `ray ping`, while every packet for the missing network
+    /// is dropped as belonging to an unknown one.
+    pub(crate) async fn run_restore_supervisor(self: Arc<Self>) {
+        loop {
+            let nudged = tokio::select! {
+                _ = self.shutdown_token.cancelled() => return,
+                _ = tokio::time::sleep(RESTORE_SWEEP_INTERVAL) => false,
+                _ = self.restore_nudge.notified() => true,
+            };
+            self.sweep_missing_networks();
+            // A nudge comes from peer traffic, so its rate is the peer's to
+            // choose. Hold the floor after serving one: `Notify` collapses
+            // everything that arrives meanwhile into a single pending wake-up, so
+            // a peer spraying frames for an unknown network costs one sweep per
+            // debounce window rather than one per frame.
+            if nudged {
+                tokio::select! {
+                    _ = self.shutdown_token.cancelled() => return,
+                    _ = tokio::time::sleep(NUDGE_DEBOUNCE) => {}
+                }
+            }
+        }
+    }
+
+    /// One pass: start a restore for every saved network that is neither live
+    /// nor already being restored.
+    fn sweep_missing_networks(self: &Arc<Self>) {
+        let app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to load config during restore sweep");
+                return;
+            }
+        };
+        let missing = missing_networks(
+            &app_config.networks,
+            |name| self.networks.contains_key(name),
+            |name| self.restoring.contains(name),
+        );
+        for m in missing {
+            let Some(net) = app_config.networks.iter().find(|n| n.name == m.name) else {
+                continue;
+            };
+            // Debug, not info: this repeats every sweep for as long as a network
+            // stays unrestorable. The restore it starts logs its own outcome
+            // (info on success, warn on failure), which is the part worth seeing.
+            tracing::debug!(network = %m.name, "saved network is not live, restoring it");
+            if m.coordinator_mode.is_some() {
+                self.spawn_coordinator_restore(net);
+            } else {
+                self.spawn_member_restore(net);
+            }
+        }
+    }
+
+    /// Ask the restore supervisor to sweep now. Called from the control demux
+    /// when a peer sends a frame for a network we have saved but not live: the
+    /// peer is back, so there is no reason to sit out the rest of the tick.
+    ///
+    /// Deliberately does no work of its own (no config read, no map scan) beyond
+    /// waking the supervisor: it runs per dropped frame, at a rate the peer
+    /// chooses. The supervisor decides whether anything actually needs restoring
+    /// and rate-limits itself.
+    pub(crate) fn nudge_restore(&self) {
+        self.restore_nudge.notify_one();
+    }
+
     /// Connect to every saved network (control plane). Run once at daemon
     /// startup so mesh connections follow the daemon lifecycle, not the data
     /// plane: `ray down` keeps these connected so the node stays online to
@@ -676,44 +821,10 @@ impl NetworkRegistry {
             count += 1;
             if net.network_secret_key.is_some() {
                 // We hold the secret key, restore as coordinator.
-                let name = net.name.clone();
-                let mode = net.group_mode;
-                let daemon_c = Arc::clone(self);
-                coordinator_restores.push(tokio::spawn(async move {
-                    match daemon_c.restore_coordinator_network(&name, mode).await {
-                        Ok(IpcMessage::Created { name, .. }) => {
-                            tracing::info!(network = %name, "restored coordinator network");
-                        }
-                        Ok(IpcMessage::Error { message }) => {
-                            tracing::warn!(network = %name, error = %message, "failed to restore network");
-                        }
-                        Err(e) => {
-                            tracing::warn!(network = %name, error = %e, "failed to restore network");
-                        }
-                        _ => {}
-                    }
-                }));
+                coordinator_restores.extend(self.spawn_coordinator_restore(net));
             } else {
                 // We're a member, rejoin via DHT lookup.
-                let name = net.name.clone();
-                let persisted_hostname = net.my_hostname.clone();
-                let net_auto_accept = net.auto_accept_firewall;
-                let net_auto_accept_files = net.auto_accept_files;
-                let net_pubkey = match &net.network_public_key {
-                    Some(k) => k.to_string(),
-                    None => {
-                        tracing::warn!(network = %name, "no network public key in config, skipping restore");
-                        continue;
-                    }
-                };
-                let daemon_c = Arc::clone(self);
-                tokio::spawn(daemon_c.restore_member_network(
-                    name,
-                    net_pubkey,
-                    persisted_hostname,
-                    net_auto_accept,
-                    net_auto_accept_files,
-                ));
+                self.spawn_member_restore(net);
             }
         }
 

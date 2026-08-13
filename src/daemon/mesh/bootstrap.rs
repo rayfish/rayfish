@@ -63,6 +63,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // only the data plane after this; connections persist across `down` so the
     // node stays online to peers.
     daemon.registry.connect_all_networks().await;
+    tokio::spawn(Arc::clone(&daemon.registry).run_restore_supervisor());
     daemon.spawn_exit_reapply_listener();
     daemon.activate(None).await;
 
@@ -125,6 +126,7 @@ pub async fn build_headless(on_demand: bool) -> Result<Arc<Daemon>> {
     let daemon = build_daemon(token, stats, Some(on_demand)).await?;
     // Bring the saved networks' control plane up, matching `run_daemon`.
     daemon.registry.connect_all_networks().await;
+    tokio::spawn(Arc::clone(&daemon.registry).run_restore_supervisor());
     daemon.spawn_exit_reapply_listener();
     // Control readers and the join path now run their network ops (promotion,
     // self-unpair) directly via NetworkRegistry, so a headless embedder needs no

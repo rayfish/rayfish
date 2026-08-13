@@ -238,12 +238,13 @@ pub(crate) async fn ipc_status() -> Result<()> {
                     // This state is always a failed restore: the network is saved
                     // but the daemon never registered it, so peers on it are
                     // unreachable and their packets are dropped as an unknown
-                    // network. Say that, and where the reason is.
+                    // network. Say that, and say it is being worked on, so this
+                    // doesn't read as something the user has to go fix.
                     println!(
                         "    {}",
                         style::faint(
                             "saved but not connected: peers on it are unreachable. \
-                             The daemon log has the reason; `ray restart` retries."
+                             The daemon keeps retrying; its log has the reason."
                         )
                     );
                 }

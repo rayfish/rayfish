@@ -95,7 +95,10 @@ pub struct ApprovedConfigEntry {
 }
 
 /// A single saved network membership.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` is for tests that care about two or three fields: the struct has
+/// twenty, and spelling them all out buries what a case is actually about.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// Human-friendly network alias (local only, not used for discovery).
     pub name: String,

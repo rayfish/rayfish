@@ -69,15 +69,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **A saved network no longer stays dead until you restart the daemon.** If a
-  network was queued for approval while the daemon was restoring it at startup,
-  the restore gave up for good: the network stayed in your config but was never
-  connected, so peers on it were unreachable and their packets were dropped as
-  belonging to an unknown network. It now keeps retrying on a backoff, the way
-  the rest of the restore path already did for every other failure. `ray status`
-  also spells out what the `inactive` marker means (saved, not connected, peers
-  unreachable) instead of leaving it as a one-word footnote, and the daemon log
-  now records why a restore stopped rather than ending it silently.
+- **A saved network no longer stays dead until you restart the daemon.** A
+  network that failed to connect at startup stayed in your config but was never
+  restored: peers on it were unreachable and their packets were dropped as
+  belonging to an unknown network, while the node otherwise looked healthy. The
+  daemon now re-checks every minute that each saved network is actually
+  connected and restarts the ones that aren't, and a peer sending traffic for a
+  network in that state triggers the retry immediately instead of waiting for
+  the next check. This covers coordinator networks too, which previously got one
+  attempt at startup and no retry at all. `ray status` spells out what the
+  `inactive` marker means (saved, not connected, peers unreachable, being
+  retried) instead of leaving it as a one-word footnote, and the daemon log
+  records why a restore stopped rather than ending it silently.
 
 - **The Android app no longer crashes when Android restarts it in the
   background.** After the system killed the app to reclaim memory, it would

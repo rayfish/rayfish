@@ -121,7 +121,7 @@ pub(crate) use mesh_connection::MeshConnection;
 
 // The service that owns the set of active networks (M5 migration seam).
 mod network_registry;
-pub(crate) use network_registry::{DialTarget, NetworkRegistry};
+pub(crate) use network_registry::{DialTarget, NetworkRegistry, missing_networks};
 
 // Domain satellites with their own owned state (and ALPN accept arms), held by
 // `Daemon` as fields rather than loose on the core. See each module.
