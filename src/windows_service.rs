@@ -12,7 +12,8 @@ use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 use windows_service::define_windows_service;
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+    ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
+    ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
     ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
@@ -63,7 +64,7 @@ fn wait_for_state(
 pub fn install(executable: &Path) -> Result<()> {
     let info = service_info(executable);
     let scm = manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
-    match scm.open_service(SERVICE_NAME, ServiceAccess::ALL_ACCESS) {
+    let service = match scm.open_service(SERVICE_NAME, ServiceAccess::ALL_ACCESS) {
         Ok(service) => {
             if service.query_status()?.current_state != ServiceState::Stopped {
                 let _ = service.stop();
@@ -72,12 +73,13 @@ pub fn install(executable: &Path) -> Result<()> {
             service
                 .change_config(&info)
                 .context("refresh rayfish service")?;
+            service
         }
         Err(_) => scm
             .create_service(&info, ServiceAccess::ALL_ACCESS)
-            .context("create rayfish Windows service")
-            .map(|_| ())?,
-    }
+            .context("create rayfish Windows service")?,
+    };
+    configure_failure_actions(&service)?;
     if let Some(sid) = crate::windows_identity::current_user_sid() {
         config::claim_operator_sid(&sid).context("claim Windows operator SID")?;
     }
@@ -124,11 +126,16 @@ pub fn exists() -> bool {
 
 pub fn start() -> Result<()> {
     let service = open(ServiceAccess::START | ServiceAccess::QUERY_STATUS)?;
-    if service.query_status()?.current_state == ServiceState::Running {
-        return Ok(());
-    }
-    if service.query_status()?.current_state != ServiceState::Stopped {
-        wait_for_state(&service, ServiceState::Stopped)?;
+    match start_transition(service.query_status()?.current_state) {
+        StartTransition::AlreadyRunning => return Ok(()),
+        StartTransition::WaitForRunning => return wait_for_state(&service, ServiceState::Running),
+        StartTransition::WaitForStoppedThenStart => {
+            wait_for_state(&service, ServiceState::Stopped)?;
+        }
+        StartTransition::StartNow => {}
+        StartTransition::RejectPaused => {
+            anyhow::bail!("cannot start rayfish Windows service while it is paused")
+        }
     }
     service
         .start::<OsString>(&[])
@@ -166,11 +173,19 @@ fn status(
     handle: &windows_service::service_control_handler::ServiceStatusHandle,
     state: ServiceState,
 ) -> windows_service::Result<()> {
+    status_with_exit_code(handle, state, ServiceExitCode::NO_ERROR)
+}
+
+fn status_with_exit_code(
+    handle: &windows_service::service_control_handler::ServiceStatusHandle,
+    state: ServiceState,
+    exit_code: ServiceExitCode,
+) -> windows_service::Result<()> {
     handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: state,
         controls_accepted: controls_accepted(state),
-        exit_code: ServiceExitCode::Win32(0),
+        exit_code,
         checkpoint: 0,
         wait_hint: Duration::default(),
         process_id: None,
@@ -207,8 +222,68 @@ fn run_service() -> windows_service::Result<()> {
         metrics.spawn_logger(token.clone());
         daemon::run_daemon(token, metrics).await
     });
-    status(&handle, ServiceState::Stopped)?;
-    result.map_err(|error| windows_service::Error::Winapi(std::io::Error::other(error.to_string())))
+    match result {
+        Ok(()) => status(&handle, ServiceState::Stopped),
+        Err(error) => {
+            status_with_exit_code(&handle, ServiceState::Stopped, ServiceExitCode::Win32(1))?;
+            Err(windows_service::Error::Winapi(std::io::Error::other(
+                error.to_string(),
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartTransition {
+    AlreadyRunning,
+    WaitForRunning,
+    WaitForStoppedThenStart,
+    StartNow,
+    RejectPaused,
+}
+
+fn start_transition(state: ServiceState) -> StartTransition {
+    match state {
+        ServiceState::Running => StartTransition::AlreadyRunning,
+        ServiceState::StartPending | ServiceState::ContinuePending => {
+            StartTransition::WaitForRunning
+        }
+        ServiceState::StopPending => StartTransition::WaitForStoppedThenStart,
+        ServiceState::Stopped => StartTransition::StartNow,
+        ServiceState::PausePending | ServiceState::Paused => StartTransition::RejectPaused,
+    }
+}
+
+fn failure_actions() -> ServiceFailureActions {
+    ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 60 * 60)),
+        reboot_msg: None,
+        command: None,
+        actions: Some(vec![
+            ServiceAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(5),
+            },
+            ServiceAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(30),
+            },
+            ServiceAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(60),
+            },
+        ]),
+    }
+}
+
+fn configure_failure_actions(service: &windows_service::service::Service) -> Result<()> {
+    service
+        .update_failure_actions(failure_actions())
+        .context("configure Windows service failure actions")?;
+    service
+        .set_failure_actions_on_non_crash_failures(true)
+        .context("enable restart for non-crash Windows service failures")?;
+    Ok(())
 }
 
 /// Start the SCM dispatcher. A normal console invocation returns `Ok(false)`
@@ -230,8 +305,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        SERVICE_NAME, ServiceStartType, ServiceState, controls_accepted, is_console_dispatch_error,
-        service_info,
+        SERVICE_NAME, ServiceActionType, ServiceStartType, ServiceState, StartTransition,
+        controls_accepted, failure_actions, is_console_dispatch_error, service_info,
+        start_transition,
     };
     use windows_service::service::{ServiceControlAccept, ServiceType};
 
@@ -259,6 +335,47 @@ mod tests {
         );
         assert!(controls_accepted(ServiceState::Stopped).is_empty());
         assert!(controls_accepted(ServiceState::StartPending).is_empty());
+    }
+
+    #[test]
+    fn start_transition_waits_for_the_state_that_can_actually_arrive() {
+        assert_eq!(
+            start_transition(ServiceState::StartPending),
+            StartTransition::WaitForRunning
+        );
+        assert_eq!(
+            start_transition(ServiceState::ContinuePending),
+            StartTransition::WaitForRunning
+        );
+        assert_eq!(
+            start_transition(ServiceState::StopPending),
+            StartTransition::WaitForStoppedThenStart
+        );
+        assert_eq!(
+            start_transition(ServiceState::Stopped),
+            StartTransition::StartNow
+        );
+        assert_eq!(
+            start_transition(ServiceState::Paused),
+            StartTransition::RejectPaused
+        );
+    }
+
+    #[test]
+    fn failure_policy_restarts_three_times_and_resets_daily() {
+        let policy = failure_actions();
+        assert!(matches!(
+            policy.reset_period,
+            windows_service::service::ServiceFailureResetPeriod::After(duration)
+                if duration == std::time::Duration::from_secs(24 * 60 * 60)
+        ));
+        let actions = policy.actions.unwrap();
+        assert_eq!(actions.len(), 3);
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.action_type == ServiceActionType::Restart)
+        );
     }
 
     #[test]

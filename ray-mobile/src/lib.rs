@@ -1273,45 +1273,34 @@ impl Node {
     }
 }
 
-// The Windows core enforces ProgramData ACLs in dependency builds, so this
-// caller-owned temp-dir test stays on platforms where it is admin-free.
-#[cfg(all(test, not(windows)))]
-mod device_name_tests {
+// Node::new mutates the process-wide config-dir environment variable. Keep all
+// host-side Node coverage in one test so parallel Rust test workers cannot race
+// two different values through the core.
+#[cfg(all(test, not(target_os = "android")))]
+mod host_surface_tests {
     use super::*;
 
     #[test]
-    fn set_default_hostname_persists_and_rejects_invalid() {
-        // Isolated config dir; Node::new points RAYFISH_CONFIG_DIR at it.
-        let dir = std::env::temp_dir().join(format!("rayfish-dn-{}", std::process::id()));
+    fn host_node_surface_uses_one_config_dir() {
+        let dir = std::env::temp_dir().join(format!("rayfish-host-surface-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let node = Node::new(dir.to_string_lossy().to_string());
 
-        node.set_default_hostname("my-phone".into()).unwrap();
-        assert_eq!(node.default_hostname(), "my-phone");
-        assert_eq!(
-            rayfish::config::load().unwrap().default_hostname.as_deref(),
-            Some("my-phone")
-        );
+        #[cfg(not(windows))]
+        {
+            node.set_default_hostname("my-phone".into()).unwrap();
+            assert_eq!(node.default_hostname(), "my-phone");
+            assert_eq!(
+                rayfish::config::load().unwrap().default_hostname.as_deref(),
+                Some("my-phone")
+            );
 
-        // Invalid name is rejected and does not overwrite the stored value.
-        assert!(node.set_default_hostname("BAD NAME".into()).is_err());
-        assert_eq!(node.default_hostname(), "my-phone");
-    }
-}
+            // Invalid name is rejected and does not overwrite the stored value.
+            assert!(node.set_default_hostname("BAD NAME".into()).is_err());
+            assert_eq!(node.default_hostname(), "my-phone");
+        }
 
-#[cfg(all(test, not(target_os = "android")))]
-mod non_android_surface_tests {
-    use super::*;
-
-    #[test]
-    fn android_vpn_methods_fail_explicitly_off_android() {
-        let node = Node::new(
-            std::env::temp_dir()
-                .join("rayfish-host-surface")
-                .to_string_lossy()
-                .into(),
-        );
         assert!(node.up(-1).is_err());
         assert!(node.down().is_err());
     }

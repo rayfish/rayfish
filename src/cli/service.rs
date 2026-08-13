@@ -133,6 +133,15 @@ pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
 /// instead of seeing a cheerful "started" followed by a dead `ray status`.
 pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Result<()> {
     #[cfg(windows)]
+    if !rayfish::windows_identity::is_current_process_elevated_admin() {
+        eprintln!(
+            "rayfish service is not running. Reopen this terminal as Administrator and rerun: ray up"
+        );
+        anyhow::bail!(
+            "an elevated Administrator terminal is required to start the Windows service"
+        );
+    }
+    #[cfg(windows)]
     let mut operator_claim = WindowsOperatorClaim::begin()?;
     ensure_service_installed()?;
 

@@ -147,10 +147,10 @@ russh = { version = "0.61.2", default-features = false, features = ["ring", "fla
 # Build the mesh SSH listener socket with SO_REUSEADDR/SO_REUSEPORT so binding
 # a specific mesh IP's port 22 coexists with a host sshd on 0.0.0.0:22.
 socket2 = { version = "0.6", features = ["all"] }
-tempfile = "3"
 
 [dev-dependencies]
 criterion = "0.5"
+tempfile = "3"
 proptest = "1"
 
 # Microbenchmarks for the per-packet data path (firewall eval + the zero-copy
@@ -188,6 +188,7 @@ uzers = { version = "0.12", optional = true }
 [target.'cfg(windows)'.dependencies]
 # Enables ANSI escape processing on legacy Windows consoles (no-op on modern terminals).
 enable-ansi-support = "0.3"
+tempfile = "3"
 windows-service = "0.8.1"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",

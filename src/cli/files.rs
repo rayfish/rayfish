@@ -103,33 +103,29 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     )
     .await?;
     let mut opened = opened;
-    let mut sent = 0u64;
     let mut buffer = vec![0u8; CHUNK];
     loop {
         let read = opened.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
-        sent += read as u64;
         ipc::send(
             &mut stream,
             ipc::IpcMessage::SendFileChunk {
                 data: buffer[..read].to_vec(),
-                done: sent == size,
+                done: false,
             },
         )
         .await?;
     }
-    if sent == 0 {
-        ipc::send(
-            &mut stream,
-            ipc::IpcMessage::SendFileChunk {
-                data: Vec::new(),
-                done: true,
-            },
-        )
-        .await?;
-    }
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::SendFileChunk {
+            data: Vec::new(),
+            done: true,
+        },
+    )
+    .await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
         ipc::IpcMessage::Error { message } => anyhow::bail!("{message}"),

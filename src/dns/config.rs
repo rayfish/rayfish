@@ -431,15 +431,17 @@ fn touched_rule_displays(
 
 #[cfg(windows)]
 fn windows_dns_reconcile_script(
-    rayfish_domains: &[String],
+    nrpt_domains: &[String],
+    suffix_domains: &[String],
     managed_suffixes: &[String],
     transaction_id: &str,
 ) -> String {
-    let desired = ps_array(rayfish_domains);
+    let desired = ps_array(nrpt_domains);
+    let suffix_desired = ps_array(suffix_domains);
     let next_managed = ps_array(managed_suffixes);
     let transaction_id = ps_quote(transaction_id);
     format!(
-        "$statePath='HKLM:\\SOFTWARE\\Rayfish'; $desired={desired}; $nextManaged={next_managed}; $txnMarker='{transaction_id}'; $current=@((Get-DnsClientGlobalSetting).SuffixSearchList); $marker=$null; if (Test-Path $statePath) {{ $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }}; $previousManaged=if ($null -eq $marker) {{ @() }} else {{ @($marker.ManagedDnsSuffixes) }}; $foreign=@($current | Where-Object {{ $previousManaged -notcontains $_ }}); $next=@($foreign + $desired | Select-Object -Unique); $owned=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }}); foreach ($rule in $owned) {{ $domain=$rule.DisplayName.Substring(8); if ($desired -notcontains $domain) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }} }}; foreach ($domain in $desired) {{ $display='rayfish:'+$domain; $namespace='.'+$domain; $matches=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -eq $display }}); $valid=@($matches | Where-Object {{ @($_.Namespace).Count -eq 1 -and @($_.Namespace)[0] -eq $namespace -and @($_.NameServers).Count -eq 1 -and @($_.NameServers)[0] -eq '{RESOLVER_IP}' }}); if ($matches.Count -ne 1 -or $valid.Count -ne 1) {{ foreach ($rule in $matches) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }}; Add-DnsClientNrptRule -Namespace $namespace -NameServers '{RESOLVER_IP}' -DisplayName $display -Comment $txnMarker -ErrorAction Stop }} }}; New-Item -Path $statePath -Force -ErrorAction Stop | Out-Null; Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixTransaction -Value $txnMarker -ErrorAction Stop; Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixExpected -Value ([string[]]$next) -ErrorAction Stop; if ($nextManaged.Count -eq 0) {{ Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }} else {{ Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -Value ([string[]]$nextManaged) -ErrorAction Stop }}; Set-DnsClientGlobalSetting -SuffixSearchList $next -ErrorAction Stop; Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixTransaction -ErrorAction SilentlyContinue; Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixExpected -ErrorAction SilentlyContinue"
+        "$statePath='HKLM:\\SOFTWARE\\Rayfish'; $desired={desired}; $suffixDesired={suffix_desired}; $nextManaged={next_managed}; $txnMarker='{transaction_id}'; $current=@((Get-DnsClientGlobalSetting).SuffixSearchList); $marker=$null; if (Test-Path $statePath) {{ $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }}; $previousManaged=if ($null -eq $marker) {{ @() }} else {{ @($marker.ManagedDnsSuffixes) }}; $foreign=@($current | Where-Object {{ $previousManaged -notcontains $_ }}); $next=@($foreign + $suffixDesired | Select-Object -Unique); $owned=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }}); foreach ($rule in $owned) {{ $domain=$rule.DisplayName.Substring(8); if ($desired -notcontains $domain) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }} }}; foreach ($domain in $desired) {{ $display='rayfish:'+$domain; $namespace='.'+$domain; $matches=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -eq $display }}); $valid=@($matches | Where-Object {{ @($_.Namespace).Count -eq 1 -and @($_.Namespace)[0] -eq $namespace -and @($_.NameServers).Count -eq 1 -and @($_.NameServers)[0] -eq '{RESOLVER_IP}' }}); if ($matches.Count -ne 1 -or $valid.Count -ne 1) {{ foreach ($rule in $matches) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }}; Add-DnsClientNrptRule -Namespace $namespace -NameServers '{RESOLVER_IP}' -DisplayName $display -Comment $txnMarker -ErrorAction Stop }} }}; New-Item -Path $statePath -Force -ErrorAction Stop | Out-Null; Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixTransaction -Value $txnMarker -ErrorAction Stop; Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixExpected -Value ([string[]]$next) -ErrorAction Stop; if ($nextManaged.Count -eq 0) {{ Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }} else {{ Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -Value ([string[]]$nextManaged) -ErrorAction Stop }}; Set-DnsClientGlobalSetting -SuffixSearchList $next -ErrorAction Stop; Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixTransaction -ErrorAction SilentlyContinue; Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixExpected -ErrorAction SilentlyContinue"
     )
 }
 
@@ -580,6 +582,7 @@ async fn set_search_domains_windows(
     let touched_displays = touched_rule_displays(&snapshot, &nrpt_domains);
     let mutation = powershell_status(&windows_dns_reconcile_script(
         &nrpt_domains,
+        rayfish_domains,
         &managed_suffixes,
         &transaction_id,
     ))
@@ -2008,7 +2011,7 @@ mod tests {
         assert_eq!(ps_quote(""), "");
         assert_eq!(ps_quote("O'Brien"), "O''Brien");
 
-        let zero = windows_dns_reconcile_script(&[], &[], "txn-zero");
+        let zero = windows_dns_reconcile_script(&[], &[], &[], "txn-zero");
         assert!(zero.contains("DisplayName -like 'rayfish:*'"));
         assert!(!zero.contains("Where-Object { $_.DisplayName -notlike"));
         assert!(zero.contains("ManagedDnsSuffixes"));
@@ -2017,6 +2020,7 @@ mod tests {
         assert!(windows_dns_snapshot_script().contains("ConvertTo-Json"));
 
         let one = windows_dns_reconcile_script(
+            &["corp.ray".to_string()],
             &["corp.ray".to_string()],
             &["corp.ray".to_string()],
             "txn-one",
@@ -2033,6 +2037,7 @@ mod tests {
         let many = windows_dns_reconcile_script(
             &["a.ray".to_string(), "O'Brian.ray".to_string()],
             &["a.ray".to_string(), "O'Brian.ray".to_string()],
+            &["a.ray".to_string(), "O'Brian.ray".to_string()],
             "txn-many",
         );
         assert!(many.contains("$desired=@('a.ray','O''Brian.ray')"));
@@ -2046,9 +2051,14 @@ mod tests {
         let match_domains = windows_dns_reconcile_script(
             &nrpt_domains,
             &["corp.ray".to_owned(), "ray".to_owned()],
+            &["corp.ray".to_owned(), "ray".to_owned()],
             "txn-match",
         );
         assert!(match_domains.contains("$desired=@('corp.ray','ray','corp','other')"));
+        assert!(match_domains.contains("$suffixDesired=@('corp.ray','ray')"));
+        assert!(match_domains.contains("$nextManaged=@('corp.ray','ray')"));
+        assert!(match_domains.contains("$next=@($foreign + $suffixDesired"));
+        assert!(!match_domains.contains("$suffixDesired=@('corp.ray','ray','corp','other')"));
 
         let snapshot = WindowsDnsSnapshot {
             nrpt_rules: vec![WindowsNrptRuleSnapshot {

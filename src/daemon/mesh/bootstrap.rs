@@ -11,7 +11,11 @@
 use std::sync::Mutex;
 
 #[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+#[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 #[cfg(unix)]
@@ -800,6 +804,8 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<(
 async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()> {
     let pipe_name = ipc::socket_path();
     let pipe_name = pipe_name.to_string_lossy().into_owned();
+    let staging_dir = prepare_ipc_upload_dir()?;
+    sweep_ipc_upload_orphans(&staging_dir)?;
     let mut server = create_named_pipe(&pipe_name, true)?;
     let mut standby = create_named_pipe(&pipe_name, false)?;
     tracing::info!(pipe = %pipe_name, "IPC named pipe listening");
@@ -810,26 +816,155 @@ async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()>
                 return Ok(());
             }
             result = server.connect() => {
-                result.context("accept IPC named pipe client")?;
+                if let Err(error) = result {
+                    tracing::warn!(error = %error, "IPC named pipe accept failed; recovering listener");
+                    match recreate_named_pipe(&pipe_name, &token).await {
+                        Some(replacement) => server = replacement,
+                        None => {
+                            daemon.deactivate().await;
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
                 let client = server;
-                server = create_named_pipe(&pipe_name, false)?;
-                let daemon = daemon.clone();
+                let client_daemon = daemon.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_ipc_client(client, &daemon).await {
+                    if let Err(e) = handle_ipc_client(client, &client_daemon).await {
                         tracing::debug!(error = %e, "IPC client error");
                     }
                 });
+                match recreate_named_pipe(&pipe_name, &token).await {
+                    Some(replacement) => server = replacement,
+                    None => {
+                        daemon.deactivate().await;
+                        return Ok(());
+                    }
+                }
             }
             result = standby.connect() => {
-                result.context("accept standby IPC named pipe client")?;
+                if let Err(error) = result {
+                    tracing::warn!(error = %error, "standby IPC named pipe accept failed; recovering listener");
+                    match recreate_named_pipe(&pipe_name, &token).await {
+                        Some(replacement) => standby = replacement,
+                        None => {
+                            daemon.deactivate().await;
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
                 let client = standby;
-                standby = create_named_pipe(&pipe_name, false)?;
-                let daemon = daemon.clone();
+                let client_daemon = daemon.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_ipc_client(client, &daemon).await {
+                    if let Err(e) = handle_ipc_client(client, &client_daemon).await {
                         tracing::debug!(error = %e, "IPC client error");
                     }
                 });
+                match recreate_named_pipe(&pipe_name, &token).await {
+                    Some(replacement) => standby = replacement,
+                    None => {
+                        daemon.deactivate().await;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+const IPC_UPLOAD_PREFIX: &str = "rayfish-ipc-upload-";
+#[cfg(windows)]
+const IPC_UPLOAD_SUFFIX: &str = ".part";
+#[cfg(windows)]
+const IPC_MAX_TRANSFER: u64 = 4 * 1024 * 1024 * 1024;
+
+#[cfg(windows)]
+fn prepare_ipc_upload_dir() -> Result<PathBuf> {
+    let dir = crate::config::config_dir()?.join("ipc-upload");
+    crate::windows_security::ensure_protected_dir(&dir)?;
+    Ok(dir)
+}
+
+#[cfg(windows)]
+fn is_ipc_upload_temp_name(name: &str) -> bool {
+    name.starts_with(IPC_UPLOAD_PREFIX) && name.ends_with(IPC_UPLOAD_SUFFIX)
+}
+
+#[cfg(windows)]
+fn is_internal_file_frame(message: &IpcMessage) -> bool {
+    matches!(
+        message,
+        IpcMessage::SendFileStaged { .. } | IpcMessage::SendFileChunk { .. }
+    )
+}
+
+#[cfg(windows)]
+fn sweep_ipc_upload_orphans(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("enumerate IPC upload staging directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !is_ipc_upload_temp_name(name) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect IPC upload staging path {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.file_attributes() & 0x400 == 0,
+            "refusing to sweep reparse-point IPC upload staging path {}",
+            path.display()
+        );
+        if metadata.is_file() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("remove orphaned IPC upload {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_ipc_tests {
+    use super::{IpcMessage, is_internal_file_frame, is_ipc_upload_temp_name};
+
+    #[test]
+    fn only_rayfish_partial_upload_names_are_sweep_candidates() {
+        assert!(is_ipc_upload_temp_name("rayfish-ipc-upload-a.part"));
+        assert!(!is_ipc_upload_temp_name("rayfish-ipc-upload-a"));
+        assert!(!is_ipc_upload_temp_name("unrelated.part"));
+    }
+
+    #[test]
+    fn staged_and_chunk_frames_are_internal_only() {
+        assert!(is_internal_file_frame(&IpcMessage::SendFileStaged {
+            path: "x".into(),
+            filename: "x".into(),
+            peer: "p".into(),
+        }));
+        assert!(is_internal_file_frame(&IpcMessage::SendFileChunk {
+            data: vec![1],
+            done: false,
+        }));
+        assert!(!is_internal_file_frame(&IpcMessage::Status));
+    }
+}
+
+#[cfg(windows)]
+async fn recreate_named_pipe(name: &str, token: &CancellationToken) -> Option<NamedPipeServer> {
+    loop {
+        match create_named_pipe(name, false) {
+            Ok(pipe) => return Some(pipe),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to recreate IPC named pipe; retrying");
+                tokio::select! {
+                    _ = token.cancelled() => return None,
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
             }
         }
     }
@@ -861,6 +996,17 @@ async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Res
     });
     let mut framed = ipc::framed(stream);
     let req = ipc::recv(&mut framed).await?;
+    if is_internal_file_frame(&req) {
+        ipc::send(
+            &mut framed,
+            IpcMessage::Error {
+                message: "internal file-transfer frame is not accepted at the IPC boundary"
+                    .to_owned(),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
     if matches!(req, ipc::IpcMessage::SendFileBegin { .. })
         && let Some(error) = Daemon::check_authorized(&req, peer.as_ref())
     {
@@ -870,23 +1016,21 @@ async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Res
     let resp = if let ipc::IpcMessage::SendFileBegin {
         filename,
         peer: target,
-        size,
+        size: _declared_size,
     } = req
     {
         const CHUNK: usize = 256 * 1024;
-        const MAX_TRANSFER: u64 = 4 * 1024 * 1024 * 1024;
         let result: Result<IpcMessage> = async {
-            anyhow::ensure!(size <= MAX_TRANSFER, "in-band file exceeds 4 GiB limit");
             anyhow::ensure!(
                 !filename.is_empty() && filename.len() <= 255,
                 "invalid file name"
             );
-            // Keep staged bytes in the system temp directory, not the protected
-            // config directory. `NamedTempFile` removes the file on every error
-            // path and also keeps it alive while the daemon consumes it.
+            let staging_dir = prepare_ipc_upload_dir()?;
             let staged = tempfile::Builder::new()
-                .prefix("rayfish-ipc-upload-")
-                .tempfile()?;
+                .prefix(IPC_UPLOAD_PREFIX)
+                .suffix(IPC_UPLOAD_SUFFIX)
+                .tempfile_in(&staging_dir)?;
+            crate::windows_security::protect_file(staged.path())?;
             let temp = staged.path().to_path_buf();
             let mut output = tokio::fs::File::from_std(staged.reopen()?);
             let mut received = 0u64;
@@ -897,15 +1041,16 @@ async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Res
                 {
                     ipc::IpcMessage::SendFileChunk { data, done } => {
                         anyhow::ensure!(data.len() <= CHUNK, "in-band file chunk exceeds 256 KiB");
-                        received = received.saturating_add(data.len() as u64);
-                        anyhow::ensure!(received <= size, "in-band file exceeds declared size");
-                        anyhow::ensure!(done || received < size, "missing final chunk marker");
+                        anyhow::ensure!(done || !data.is_empty(), "empty non-final file chunk");
+                        received = received
+                            .checked_add(data.len() as u64)
+                            .context("in-band file size overflow")?;
+                        anyhow::ensure!(
+                            received <= IPC_MAX_TRANSFER,
+                            "in-band file exceeds 4 GiB limit"
+                        );
                         tokio::io::AsyncWriteExt::write_all(&mut output, &data).await?;
                         if done {
-                            anyhow::ensure!(
-                                received == size,
-                                "in-band file ended before declared size"
-                            );
                             tokio::io::AsyncWriteExt::flush(&mut output).await?;
                             drop(output);
                             break daemon
