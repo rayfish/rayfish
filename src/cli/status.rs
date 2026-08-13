@@ -147,12 +147,14 @@ pub(crate) async fn ipc_status() -> Result<()> {
             bytes_tx,
             pending_files,
             pending_connects,
+            lan_peers_new,
             ..
         } => {
             if json_enabled() {
                 print_json(&serde_json::json!({
                     "endpoint": endpoint_id.to_string(),
                     "mdns": mdns_enabled,
+                    "lan_peers_new": lan_peers_new,
                     "auto_update": auto_update,
                     "active": active,
                     "contact_id": contact_id,
@@ -176,8 +178,16 @@ pub(crate) async fn ipc_status() -> Result<()> {
             } else {
                 format!("{} {}", style::dot_offline(), style::faint("standby"))
             };
+            // With mDNS on, the header carries the count of LAN neighbours we
+            // are not already on a network with, so discovery is visible without
+            // having to know `ray mdns scan` exists.
             let mdns = if mdns_enabled {
-                format!("{} {}", style::label("mDNS"), style::green("on"))
+                let found = match lan_peers_new {
+                    0 => String::new(),
+                    1 => format!(" {}", style::faint("(1 on LAN)")),
+                    n => format!(" {}", style::faint(&format!("({n} on LAN)"))),
+                };
+                format!("{} {}{}", style::label("mDNS"), style::green("on"), found)
             } else {
                 format!("{} {}", style::label("mDNS"), style::faint("off"))
             };

@@ -60,6 +60,16 @@ impl Daemon {
             pending_files: self.files.pending_files.lock().unwrap().len(),
             pending_connects: self.connect.pending_connects.len(),
             pending_networks,
+            // Only the neighbours you could still link up with: peers already on
+            // one of our networks are visible in the network list, not here.
+            lan_peers_new: self
+                .transport
+                .lan_peers
+                .snapshot()
+                .into_iter()
+                .filter(|(id, _)| *id != my_id)
+                .filter(|(id, _)| self.registry.network_shared_with(id).is_none())
+                .count(),
         }
     }
 

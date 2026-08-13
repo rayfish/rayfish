@@ -340,6 +340,10 @@ pub enum IpcMessage {
     ApproveConnection {
         id: String,
     },
+    /// `ray mdns scan`: list rayfish nodes seen on the LAN over mDNS. A sighting
+    /// is not a relationship, so this is an open read.
+    /// Reply: [`IpcMessage::LanPeersList`].
+    ListLanPeers,
     /// `ray contact id`: print this node's contact id. Open read.
     ContactId,
     /// `ray contact rotate`: rotate this node's contact key (old id stops
@@ -457,6 +461,11 @@ pub enum IpcMessage {
         /// active. Shown in the UI as "waiting for approval".
         #[serde(default)]
         pending_networks: Vec<String>,
+        /// Nodes seen on the LAN over mDNS that we do not already share a
+        /// network with, i.e. what `ray mdns scan` would list as connectable.
+        /// Always 0 when mDNS is off.
+        #[serde(default)]
+        lan_peers_new: usize,
     },
     /// Reply to `Ping`. `probes` holds one entry per probe in send order: the
     /// measured round-trip in milliseconds, or `None` if that probe timed out.
@@ -546,6 +555,13 @@ pub enum IpcMessage {
     /// This user's paired devices (reply to `ListPairedDevices`).
     PairedDevices {
         devices: Vec<PairedDeviceInfo>,
+    },
+    /// Nodes seen on the LAN over mDNS (reply to `ListLanPeers`).
+    LanPeersList {
+        peers: Vec<LanPeerInfo>,
+        /// `false` when mDNS is off, so the client can say so instead of
+        /// reporting an empty LAN.
+        mdns_enabled: bool,
     },
     /// A diagnostic bundle was written to `path` (a `.tgz`, owned by the caller).
     /// `issue_title`/`issue_body` pre-fill a GitHub issue; the user attaches the
@@ -654,6 +670,23 @@ pub struct PairedDeviceInfo {
     pub hostname: Option<String>,
     /// Networks this device is currently a member of.
     pub networks: Vec<String>,
+}
+
+/// One rayfish node seen on the local network over mDNS. A sighting says only
+/// that the node exists and where it is; it carries no membership or trust.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LanPeerInfo {
+    /// The peer's transport endpoint id (what `ray connect` accepts for a
+    /// neighbour on the LAN).
+    pub endpoint_id: EndpointId,
+    /// Short id form for display.
+    pub short_id: String,
+    /// Socket addresses the peer advertised, already formatted.
+    pub addrs: Vec<String>,
+    /// Seconds since the peer was last advertised.
+    pub last_seen_secs: u64,
+    /// A network already shared with this peer, if any.
+    pub shared_network: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1453,6 +1486,7 @@ mod tests {
             pending_files: 0,
             pending_connects: 0,
             pending_networks: vec![],
+            lan_peers_new: 2,
         };
         // The IPC codec uses `to_vec_named`; positional encoding can't survive
         // NetworkStatus's `skip_serializing_if` fields (ephemeral_ttl_secs,
@@ -1468,6 +1502,41 @@ mod tests {
                 assert_eq!(endpoint_id, ep_id);
                 assert_eq!(networks.len(), 1);
                 assert_eq!(networks[0].peers[0].endpoint_id, peer_id);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn lan_peer_messages_roundtrip() {
+        let ep_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let req = rmp_serde::to_vec_named(&IpcMessage::ListLanPeers).unwrap();
+        assert!(matches!(
+            rmp_serde::from_slice::<IpcMessage>(&req).unwrap(),
+            IpcMessage::ListLanPeers
+        ));
+
+        let resp = IpcMessage::LanPeersList {
+            peers: vec![LanPeerInfo {
+                endpoint_id: ep_id,
+                short_id: ep_id.fmt_short().to_string(),
+                addrs: vec!["192.168.1.24:41641".to_string()],
+                last_seen_secs: 3,
+                shared_network: Some("home".to_string()),
+            }],
+            mdns_enabled: true,
+        };
+        let bytes = rmp_serde::to_vec_named(&resp).unwrap();
+        match rmp_serde::from_slice::<IpcMessage>(&bytes).unwrap() {
+            IpcMessage::LanPeersList {
+                peers,
+                mdns_enabled,
+            } => {
+                assert!(mdns_enabled);
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].endpoint_id, ep_id);
+                assert_eq!(peers[0].addrs, vec!["192.168.1.24:41641".to_string()]);
+                assert_eq!(peers[0].shared_network.as_deref(), Some("home"));
             }
             _ => panic!("wrong variant"),
         }

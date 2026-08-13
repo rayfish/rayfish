@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ray mdns scan` lists the rayfish nodes on your LAN.** mDNS discovery has
+  always run in the background, but it only fed the connection layer: there was
+  no way to see what it found. The scan shows each neighbour's id, addresses,
+  how long ago it was seen, and whether you already share a network with it.
+  `ray status` carries the same count in its mDNS field, so a new machine on the
+  LAN is visible without knowing the command exists. Seeing a node grants it
+  nothing: it is a sighting, not a relationship.
+
+- **`ray connect` accepts a LAN neighbour's id.** Passing an id from `ray mdns
+  scan` dials that peer straight over the local network, skipping the DHT
+  contact lookup, so two machines can link up on a LAN with no internet.
+  Approval is unchanged: the other side still has to run `ray connections
+  approve`. Note this means anyone on your LAN can send you a connect request
+  without knowing your contact id, so rotating that id no longer stops local
+  requests. They still cannot link to you without your approval.
+
 - **Service management works on Linux without systemd.** `ray up`, `install`,
   `start`, `stop`, `restart` and `uninstall` now detect the host's init system
   and install the matching service: a systemd unit, an OpenRC service (Alpine,

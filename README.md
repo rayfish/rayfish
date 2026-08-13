@@ -290,6 +290,25 @@ ray connections approve <id>       # …and approve it
 
 Approval creates a private **2-peer network** automatically (shown as `[direct]` in `ray status`). It's a real network, so firewall rules, Magic DNS, and the mesh all work the same. Approval is recipient-only: the requester consents by asking, the recipient consents by approving. Rotate your contact id anytime with `ray contact rotate` to stop new requests (existing links keep working). To stay unreachable, don't share the id.
 
+### Finding peers on your LAN
+
+Nodes on the same local network announce themselves over mDNS (on by default,
+`ray mdns on|off`). That normally just keeps connections direct instead of
+relayed, but you can also look at what it found:
+
+```bash
+ray mdns scan                      # rayfish nodes seen on this LAN
+ray connect <peer>                 # link up with one, using the id from the scan
+```
+
+A sighting grants nothing. The scan marks which neighbours you already share a
+network with, and connecting to one still needs their `ray connections approve`.
+Because the scan gives you an id you can dial directly, the pair does not need
+the DHT: two machines can link up on a LAN with no internet. The flip side is
+that anyone on your LAN can send you a connect request without knowing your
+contact id, so `ray contact rotate` doesn't stop local requests (your approval
+still does).
+
 ## Firewall
 
 Rayfish ships a small userspace firewall that governs **mesh traffic only**. It

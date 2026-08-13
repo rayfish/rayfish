@@ -448,6 +448,18 @@ impl NetworkRegistry {
         Ok((handle.network_key, handle.invite_lock.clone()))
     }
 
+    /// The name of any network whose roster already holds `peer`, if any. Used
+    /// by `ray mdns scan` to mark which LAN neighbours are already reachable;
+    /// unlike `existing_direct_network_with` this looks at every network, not
+    /// just the direct ones.
+    pub(crate) fn network_shared_with(&self, peer: &EndpointId) -> Option<String> {
+        self.networks.iter().find_map(|h| {
+            let s = h.state.read().ok()?;
+            let has = s.members.all().iter().any(|m| &m.identity == peer);
+            has.then(|| h.key().clone())
+        })
+    }
+
     /// The name of an existing direct (`ray connect`) network already linking us
     /// to `peer` (as a member or approved), if any. Used to keep `approve` /
     /// re-connect idempotent.

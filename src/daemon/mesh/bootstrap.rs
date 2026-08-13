@@ -430,8 +430,11 @@ async fn build_daemon(
         dns_resolver.clone(),
     ));
     let mdns_enabled = app_config.mdns_enabled;
+    // Stays empty when mDNS is off, so `ray mdns scan` reports nothing rather
+    // than stale sightings from a previous run.
+    let lan_peers = Arc::new(LanPeers::new());
     if mdns_enabled {
-        spawn_mdns_discovery(&ep, token.clone());
+        spawn_mdns_discovery(&ep, token.clone(), lan_peers.clone());
     } else {
         tracing::info!("mDNS discovery disabled");
     }
@@ -447,6 +450,7 @@ async fn build_daemon(
         blob_store.clone(),
         stats.clone(),
         contact_public,
+        lan_peers,
     ));
     // The per-peer connection driver is built once here and shared by the
     // ProtocolRouter (which delegates the mesh ALPN to it) and the
@@ -643,7 +647,7 @@ async fn build_daemon(
 /// Advertise this endpoint over mDNS (`_rayfish._udp.local`) and log LAN peer
 /// discovery events until cancellation. Non-fatal: a failure just means no
 /// local discovery.
-fn spawn_mdns_discovery(ep: &Endpoint, token: CancellationToken) {
+fn spawn_mdns_discovery(ep: &Endpoint, token: CancellationToken, lan_peers: Arc<LanPeers>) {
     let mdns = match iroh_mdns_address_lookup::MdnsAddressLookup::builder()
         .service_name("rayfish")
         .advertise(true)
@@ -673,12 +677,17 @@ fn spawn_mdns_discovery(ep: &Endpoint, token: CancellationToken) {
                             peer = %endpoint_info.endpoint_id.fmt_short(),
                             "mDNS: peer discovered on LAN"
                         );
+                        lan_peers.discovered(
+                            endpoint_info.endpoint_id,
+                            endpoint_info.ip_addrs().copied().collect(),
+                        );
                     }
                     Some(iroh_mdns_address_lookup::DiscoveryEvent::Expired { endpoint_id }) => {
                         tracing::info!(
                             peer = %endpoint_id.fmt_short(),
                             "mDNS: peer left LAN"
                         );
+                        lan_peers.expired(&endpoint_id);
                     }
                     None => break,
                     _ => {}

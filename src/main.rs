@@ -301,10 +301,10 @@ pub(crate) enum Command {
         /// Hostname to look up
         hostname: String,
     },
-    /// Enable or disable mDNS local peer discovery
+    /// Local (LAN) peer discovery over mDNS: toggle it, or list what it found
     Mdns {
-        /// "on" or "off"
-        state: String,
+        #[command(subcommand)]
+        action: MdnsAction,
     },
     /// Enable or disable automatic stable updates (applied by the daemon)
     #[command(name = "auto-update")]
@@ -523,6 +523,17 @@ pub(crate) enum ConfigAction {
         /// relay, discovery-dns, dns-upstreams, auto-update, or on-demand
         key: String,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum MdnsAction {
+    /// Enable mDNS local peer discovery (takes effect on daemon restart)
+    On,
+    /// Disable mDNS local peer discovery (takes effect on daemon restart)
+    Off,
+    /// List rayfish nodes seen on this LAN. Seeing a node grants it nothing:
+    /// linking up still needs `ray connect` and the other side's approval.
+    Scan,
 }
 
 #[derive(Subcommand)]
@@ -1126,7 +1137,7 @@ async fn main() -> Result<()> {
             cmd_identityof(&network, &hostname, cli.json).await
         }
         Command::Alias { network, action } => cmd_alias(&network, action, cli.json).await,
-        Command::Mdns { state } => cmd_mdns(&state).await,
+        Command::Mdns { action } => cmd_mdns(action).await,
         Command::AutoUpdate { state } => cmd_auto_update(&state).await,
         Command::Config { action } => cmd_config(action, cli.json).await,
         Command::SetOperator { user } => cmd_set_operator(&user).await,
@@ -1177,16 +1188,12 @@ pub(crate) async fn ipc_mutate(msg: ipc::IpcMessage) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_mdns(state: &str) -> Result<()> {
-    let enabled = match state {
-        "on" => true,
-        "off" => false,
-        _ => {
-            eprintln!("Usage: rayfish mdns <on|off>");
-            std::process::exit(1);
-        }
-    };
-    ipc_mutate(ipc::IpcMessage::SetMdns { enabled }).await
+async fn cmd_mdns(action: MdnsAction) -> Result<()> {
+    match action {
+        MdnsAction::On => ipc_mutate(ipc::IpcMessage::SetMdns { enabled: true }).await,
+        MdnsAction::Off => ipc_mutate(ipc::IpcMessage::SetMdns { enabled: false }).await,
+        MdnsAction::Scan => ipc_lan_peers().await,
+    }
 }
 
 /// `ray auto-update on|off`: back-compat alias for `ray config set auto-update

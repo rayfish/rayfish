@@ -91,6 +91,76 @@ pub(crate) async fn ipc_connections_approve(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// `ray mdns scan`: the rayfish nodes mDNS has seen on this LAN.
+pub(crate) async fn ipc_lan_peers() -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(&mut stream, ipc::IpcMessage::ListLanPeers).await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::LanPeersList {
+            peers,
+            mdns_enabled,
+        } => {
+            if json_enabled() {
+                print_json(&serde_json::json!({
+                    "mdns_enabled": mdns_enabled,
+                    "peers": peers
+                        .iter()
+                        .map(|p| serde_json::json!({
+                            "endpoint_id": p.endpoint_id.to_string(),
+                            "short_id": p.short_id,
+                            "addrs": p.addrs,
+                            "last_seen_secs": p.last_seen_secs,
+                            "shared_network": p.shared_network,
+                        }))
+                        .collect::<Vec<_>>(),
+                }));
+            } else if !mdns_enabled {
+                println!(
+                    "\n  {}\n",
+                    style::faint("mDNS discovery is off — turn it on with: ray mdns on")
+                );
+            } else if peers.is_empty() {
+                println!("\n  {}\n", style::faint("no rayfish nodes seen on this LAN"));
+            } else {
+                let rows = peers
+                    .iter()
+                    .map(|p| {
+                        let addrs = if p.addrs.is_empty() {
+                            "—".to_string()
+                        } else {
+                            p.addrs.join(", ")
+                        };
+                        let seen = format!("{}s", p.last_seen_secs);
+                        let status = match &p.shared_network {
+                            Some(net) => format!("shared: {net}"),
+                            None => "not connected".to_string(),
+                        };
+                        let status_cell = match &p.shared_network {
+                            Some(_) => style::green(&status),
+                            None => style::faint(&status),
+                        };
+                        vec![
+                            layout::Cell::new(p.short_id.clone(), style::rose(&p.short_id)),
+                            layout::Cell::new(addrs.clone(), style::value(&addrs)),
+                            layout::Cell::right(seen.clone(), style::faint(&seen)),
+                            layout::Cell::new(status, status_cell),
+                        ]
+                    })
+                    .collect();
+                println!();
+                print!("{}", table(&["peer", "addresses", "seen", "status"], rows, 2));
+                println!(
+                    "\n  {}",
+                    style::faint("link up with: ray connect <peer> (they approve it)")
+                );
+            }
+        }
+        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
 pub(crate) async fn ipc_contact(action: Option<ContactAction>) -> Result<()> {
     let req = match action.unwrap_or(ContactAction::Id) {
         ContactAction::Id => ipc::IpcMessage::ContactId,
