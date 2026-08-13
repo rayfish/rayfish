@@ -86,6 +86,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`scp` and `sftp` work over mesh SSH.** Both hung with no output and no
+  error until you interrupted them. OpenSSH 9.0 and newer `scp` copies files
+  over the SFTP protocol rather than the old rcp one, and the mesh SSH server
+  had no handler for the `sftp` subsystem, so it never answered the request and
+  the client waited forever. It now serves the subsystem using the host's
+  sftp-server, picking up the path and flags from the host's own sshd config.
+  On a host with no sftp-server installed the client is told so straight away
+  instead of hanging, and the daemon log names the package to install.
+  Interactive `ssh` was unaffected.
+
 - **`ray firewall ssh allow` now tells you when the SSH server is off.** The
   rule was saved and reported as if it had taken effect, but with the server off
   a connection falls through to the host's own sshd and asks for a password,

@@ -348,6 +348,7 @@ with a stock client:
 
 ```bash
 ssh user@host.ray
+scp file user@host.ray:            # scp and sftp need an sftp-server on the host
 ```
 
 The peer is authenticated by its mesh identity, so there are no `authorized_keys`

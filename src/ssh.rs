@@ -347,8 +347,8 @@ impl SshHandler {
         }
     }
 
-    /// Take the opened session channel and spawn the login shell (or `exec`
-    /// command) on a fresh PTY, wiring it to the channel. Returns immediately so
+    /// Take the opened session channel and spawn the login shell (or the `exec`
+    /// / subsystem command), wiring it to the channel. Returns immediately so
     /// the russh session task stays free to process further requests (resize, …).
     fn start(&mut self, command: Option<String>, session: &mut Session) {
         let Some(channel) = self.channel.take() else {
@@ -472,6 +472,38 @@ impl Handler for SshHandler {
     ) -> Result<(), Self::Error> {
         let cmd = String::from_utf8_lossy(data).to_string();
         self.start(Some(cmd), session);
+        session.channel_success(channel)?;
+        Ok(())
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // `sftp` is not optional in practice: OpenSSH 9.0+ `scp` speaks the SFTP
+        // protocol by default, so without this both `scp` and `sftp` to a mesh
+        // host fail. Every branch must answer the request -- russh's default
+        // handler replies nothing at all, which leaves the client waiting
+        // forever instead of reporting an error.
+        if name != "sftp" {
+            debug!(peer = %self.user.fmt_short(), subsystem = name,
+                "mesh SSH: rejecting unsupported subsystem");
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
+        let Some(command) = sftp_subsystem_command() else {
+            warn!(peer = %self.user.fmt_short(),
+                "mesh SSH: no sftp-server binary found, so scp and sftp cannot work. \
+                 Install the OpenSSH sftp server package (openssh-sftp-server on Debian \
+                 and Ubuntu, openssh-server elsewhere)");
+            session.channel_failure(channel)?;
+            return Ok(());
+        };
+        // Run it through the login shell like the exec path, which is what a
+        // stock sshd does for a subsystem too.
+        self.start(Some(command), session);
         session.channel_success(channel)?;
         Ok(())
     }
@@ -806,6 +838,48 @@ fn parse_hostkey_paths(dump: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Where the OpenSSH sftp-server binary lives, per distribution. Used when the
+/// host has no sshd to ask (a container, or a machine where mesh SSH *is* the
+/// SSH server); all of these are shell-safe as written.
+const SFTP_SERVER_PATHS: [&str; 5] = [
+    "/usr/lib/openssh/sftp-server",     // Debian, Ubuntu
+    "/usr/libexec/openssh/sftp-server", // Fedora, RHEL, SUSE
+    "/usr/libexec/sftp-server",         // macOS, BSD
+    "/usr/lib/ssh/sftp-server",         // Arch, Alpine
+    "/usr/lib/sftp-server",             // last resort
+];
+
+/// The shell command that serves the `sftp` subsystem, or `None` when this host
+/// has no sftp-server to run.
+///
+/// Prefers whatever the host's own sshd is configured to use, arguments and all
+/// (`sshd -T` prints `subsystem sftp <command>`), so a non-default location or
+/// an admin's logging flags are honoured. Falls back to the standard paths.
+fn sftp_subsystem_command() -> Option<String> {
+    if let Some(cmd) = run_sshd_dump().as_deref().and_then(parse_sftp_subsystem) {
+        return Some(cmd);
+    }
+    SFTP_SERVER_PATHS
+        .iter()
+        .find(|path| Path::new(path).is_file())
+        .map(|path| (*path).to_string())
+}
+
+/// Extract the `subsystem sftp <command>` entry from `sshd -T` output, keeping
+/// any arguments. Rejects a command that isn't an absolute path: sshd's
+/// `internal-sftp` is code inside sshd itself, not a binary we can spawn.
+fn parse_sftp_subsystem(dump: &str) -> Option<String> {
+    dump.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        if !parts.next()?.eq_ignore_ascii_case("subsystem") || parts.next()? != "sftp" {
+            return None;
+        }
+        let rest = parts.collect::<Vec<_>>();
+        let binary = Path::new(rest.first()?);
+        (binary.is_absolute() && binary.is_file()).then(|| rest.join(" "))
+    })
+}
+
 /// Load the persisted SSH host key, generating and persisting one on first use.
 /// Stored as OpenSSH PEM at `<config_dir>/ssh_host_key`, mode 0600.
 fn load_or_generate_host_key() -> Result<PrivateKey> {
@@ -906,6 +980,32 @@ mod tests {
         assert!(!authorized(&alice, &["net3"]));
         // union across shared networks: alice shares net3 (no rule) + net2 (*).
         assert!(authorized(&alice, &["net3", "net2"]));
+    }
+
+    #[test]
+    fn parse_sftp_subsystem_keeps_the_command_and_its_arguments() {
+        // `/bin/sh` stands in for sftp-server: the parser only requires an
+        // absolute path that exists, and every unix host has this one.
+        let dump = "permitrootlogin no\nsubsystem sftp /bin/sh -f AUTH -l INFO\n";
+        assert_eq!(
+            parse_sftp_subsystem(dump).as_deref(),
+            Some("/bin/sh -f AUTH -l INFO")
+        );
+    }
+
+    #[test]
+    fn parse_sftp_subsystem_rejects_what_it_cannot_spawn() {
+        // internal-sftp is code inside sshd, not a binary.
+        assert_eq!(parse_sftp_subsystem("subsystem sftp internal-sftp\n"), None);
+        // A path this host doesn't have (sshd config copied from elsewhere).
+        assert_eq!(
+            parse_sftp_subsystem("subsystem sftp /nonexistent/sftp-server\n"),
+            None
+        );
+        // Another subsystem, and a bare directive, must not match.
+        assert_eq!(parse_sftp_subsystem("subsystem netconf /bin/sh\n"), None);
+        assert_eq!(parse_sftp_subsystem("subsystem\nsubsystem sftp\n"), None);
+        assert_eq!(parse_sftp_subsystem(""), None);
     }
 
     #[test]
