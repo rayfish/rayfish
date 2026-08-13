@@ -7,9 +7,10 @@
 //! the magic IP and hands them to [`resolver::Resolver`], which calls
 //! [`handle_query`] and forwards whatever it declines to the system upstreams.
 //!
-//! A name is answered here only when the roster actually holds it. Everything
-//! else, including a `<host>.<network>` whose host is not a peer, is declined
-//! so it can fall back to the real DNS.
+//! Outside `.ray` a name is answered only when the roster actually holds it: a
+//! `<host>.<network>` whose host is not a peer is declined so it can fall back
+//! to the real DNS. Inside `.ray` every name is answered here, a miss included,
+//! because no upstream can resolve a `.ray` name and only we can say it is gone.
 //!
 //! Submodules: [`config`] (OS resolver integration), [`resolver`] (in-daemon
 //! resolver reached via the magic IP), [`packet`] (UDP reply synthesis).
@@ -141,9 +142,14 @@ pub async fn remove_network(table: &HostnameTable, reverse: &ReverseLookupTable,
 /// Answer a query from the roster, or return `None` for "not mine": the caller
 /// forwards those to the system resolver.
 ///
-/// The rule is that we claim a name only when we can actually answer it. That
-/// is what keeps a network named `dev` from swallowing `zed.dev`: the lookup
-/// misses the roster, we decline it, and it goes upstream like any public name.
+/// Outside `.ray` we claim a name only when we can actually answer it. That is
+/// what keeps a network named `dev` from swallowing `zed.dev`: the lookup misses
+/// the roster, we decline it, and it goes upstream like any public name.
+///
+/// Inside `.ray` the zone is ours whether or not the roster holds the name, so
+/// a miss is answered here with NXDOMAIN rather than declined. Declining it
+/// would put a public resolver's 86400 negative TTL on a name only we can ever
+/// resolve.
 pub(crate) async fn handle_query(
     data: &[u8],
     table: &HostnameTable,
@@ -172,7 +178,15 @@ pub(crate) async fn handle_query(
         if is_soa {
             return Some(make_soa_response(&packet, &question.qname));
         }
-        let (v4, v6) = resolve_name(&name_lower, &suffix, table).await?;
+        // A miss here is an authoritative answer, not a reason to ask the
+        // internet. `.ray` is not a delegated TLD, so a forwarded query can only
+        // come back NXDOMAIN carrying the root's SOA and its 86400 negative TTL.
+        // Trading our own 60s SOA for that turns a roster still filling in at
+        // startup into a name the OS caches as dead for a day.
+        let Some((v4, v6)) = resolve_name(&name_lower, &suffix, table).await else {
+            tracing::info!(name = %name_lower, "DNS query NXDOMAIN");
+            return Some(make_nxdomain(&packet));
+        };
         if is_a {
             tracing::info!(name = %name_lower, ip = %v4, "DNS resolved A");
             return Some(make_a_response(&packet, &question.qname, v4));
@@ -568,8 +582,9 @@ mod tests {
         assert!(!declined("box.dev", a).await);
         // MX for a peer name outside `.ray` stays a public question.
         assert!(declined("box.dev", QTYPE::TYPE(simple_dns::TYPE::MX)).await);
-        // Unknown `.ray` names and PTRs outside our ranges go upstream too.
-        assert!(declined("nobody.dev.ray", a).await);
+        // An unknown `.ray` name is ours to fail, never upstream's to answer.
+        assert!(!declined("nobody.dev.ray", a).await);
+        // PTRs outside our ranges do go upstream.
         assert!(
             declined(
                 "34.216.184.93.in-addr.arpa",
@@ -585,6 +600,45 @@ mod tests {
             )
             .await
         );
+    }
+
+    /// A `.ray` name the roster does not hold has to fail with *our* SOA and its
+    /// 60s negative TTL. Declining it instead sends it to a public resolver,
+    /// whose NXDOMAIN carries the root's 86400: a name queried during the gap
+    /// between DNS coming up and a roster reconverging then stays dead in the OS
+    /// cache for a day, long after the peer is back.
+    #[tokio::test]
+    async fn unknown_ray_name_nxdomains_with_our_short_soa() {
+        use simple_dns::{CLASS as C, PacketFlag, QCLASS, Question};
+
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+
+        let mut pkt = Packet::new_query(1);
+        pkt.set_flags(PacketFlag::RECURSION_DESIRED);
+        pkt.questions.push(Question::new(
+            Name::new_unchecked("srv.devbox.ray").into_owned(),
+            QTYPE::TYPE(simple_dns::TYPE::A),
+            QCLASS::CLASS(C::IN),
+            false,
+        ));
+        let query = pkt.build_bytes_vec().expect("build query");
+
+        let resp = handle_query(&query, &table, &reverse)
+            .await
+            .expect("an empty roster still answers inside our own zone");
+        let resp = Packet::parse(&resp).expect("parse NXDOMAIN");
+        assert_eq!(resp.rcode(), RCODE::NameError);
+
+        let soa = resp
+            .name_servers
+            .first()
+            .expect("NXDOMAIN carries an authority SOA");
+        assert_eq!(soa.ttl, 60, "the negative TTL the client will cache");
+        match &soa.rdata {
+            RData::SOA(soa) => assert_eq!(soa.minimum, 60, "our SOA, not the root's"),
+            other => panic!("expected SOA, got {other:?}"),
+        }
     }
 
     #[test]

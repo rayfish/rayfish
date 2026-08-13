@@ -56,7 +56,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   answers only names its roster actually has, and hands everything else to the
   system resolver: `zed.dev` reaches the real site, while a peer named `box` on
   network `dev` still resolves as `box`, `box.ray`, `box.dev` and
-  `box.dev.ray`. Bare network names are no longer registered with the OS, so
+  `box.dev.ray`. The `.ray` suffix itself stays rayfish's either way: a name
+  under it that no peer holds is failed here rather than asked of a public
+  resolver, so it starts resolving the moment the peer appears instead of
+  staying cached as missing for up to a day. Bare network names are no longer
+  registered with the OS, so
   the suffix-less `<host>.<network>` form works where rayfish sees all your
   queries (the resolv.conf backend, an active exit node, Android) and `.ray`
   works everywhere. One consequence worth knowing: if a peer's name matches the

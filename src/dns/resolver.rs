@@ -52,7 +52,8 @@ impl Resolver {
     ///
     /// The fallback is what makes a name that looks like a mesh name but isn't
     /// work: with a network called `dev` joined, `zed.dev` misses the roster and
-    /// goes upstream to the real internet instead of failing.
+    /// goes upstream to the real internet instead of failing. It does not apply
+    /// inside `.ray`, where [`crate::dns::handle_query`] answers a miss itself.
     pub async fn resolve(&self, query: &[u8]) -> Option<Vec<u8>> {
         if let Some(local) = crate::dns::handle_query(query, &self.table, &self.reverse).await {
             return Some(local);
@@ -352,10 +353,12 @@ mod tests {
         }
     }
 
-    /// A `.ray` name nobody holds also falls back before it is failed: the
-    /// upstream gets asked, and only a dead upstream produces NXDOMAIN.
+    /// A `.ray` name nobody holds is failed here, never forwarded. The zone is
+    /// ours, so even an upstream that would gladly answer must not be asked: its
+    /// NXDOMAIN carries the public root's 86400 negative TTL, which would cache
+    /// the name dead for a day once the roster does hold it.
     #[tokio::test]
-    async fn unknown_ray_name_falls_back_then_nxdomains() {
+    async fn unknown_ray_name_nxdomains_without_asking_upstream() {
         let upstream_answer = Ipv4Addr::new(93, 184, 216, 34);
         let up = fake_upstream(upstream_answer).await;
         let r = Resolver::new(
@@ -363,19 +366,15 @@ mod tests {
             crate::dns::new_reverse_table(),
         );
         r.set_upstream_addrs([up]);
-        let resp = r
-            .resolve(&build_a_query("nobody.ray"))
-            .await
-            .expect("forwarded answer");
-        assert!(response_has_a(&resp, upstream_answer));
 
-        // With nothing listening upstream, the zone is ours to fail: NXDOMAIN,
-        // not the SERVFAIL a client would retry.
-        r.set_upstream_addrs([dead_upstream().await]);
         let resp = r
             .resolve(&build_a_query("nobody.ray"))
             .await
             .expect("local NXDOMAIN");
+        assert!(
+            !response_has_a(&resp, upstream_answer),
+            "a `.ray` name must not be answered by the upstream"
+        );
         let pkt = Packet::parse(&resp).expect("parse NXDOMAIN");
         assert_eq!(pkt.rcode(), simple_dns::RCODE::NameError);
     }
