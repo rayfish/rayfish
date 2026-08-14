@@ -447,9 +447,14 @@ pub struct ForwardCtx {
     pub exit: ExitContext,
 }
 
-/// True when a parsed packet is a DNS query addressed to the magic resolver IP.
+/// True when a parsed packet is a DNS query addressed to the magic resolver IP,
+/// in either family. The IPv6 address is the one an IPv6-only data plane hands
+/// the OS (see [`dns::MAGIC_DNS_V6`]); both are always intercepted, so a host
+/// that names either one gets an answer.
 pub(crate) fn is_magic_dns(info: &firewall::PacketInfo) -> bool {
-    info.dst_port == 53 && info.dst_ip == IpAddr::V4(dns::MAGIC_DNS_V4)
+    info.dst_port == 53
+        && (info.dst_ip == IpAddr::V4(dns::MAGIC_DNS_V4)
+            || info.dst_ip == IpAddr::V6(dns::MAGIC_DNS_V6))
 }
 
 /// Main TUN read loop. Reads outgoing packets from the TUN device and sends each

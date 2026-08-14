@@ -51,7 +51,9 @@ impl Resolver {
     pub fn set_upstream_addrs(&self, addrs: impl IntoIterator<Item = SocketAddr>) {
         let v: Vec<SocketAddr> = addrs
             .into_iter()
-            .filter(|a| a.ip() != IpAddr::V4(MAGIC_DNS_V4))
+            .filter(|a| {
+                a.ip() != IpAddr::V4(MAGIC_DNS_V4) && a.ip() != IpAddr::V6(crate::dns::MAGIC_DNS_V6)
+            })
             .collect();
         self.upstreams.store(Arc::new(v));
     }
@@ -92,9 +94,15 @@ impl Resolver {
         if info.protocol != 17 {
             return; // TCP/other: drop cleanly.
         }
-        // UDP payload begins after the IPv4 header (IHL*4) + 8-byte UDP header.
-        let ihl = ((pkt.first().copied().unwrap_or(0) & 0x0f) as usize) * 4;
-        let payload_start = ihl + 8;
+        // UDP payload begins after the IP header + the 8-byte UDP header. IPv4's
+        // header is IHL words long; IPv6's is a fixed 40 bytes (`parse_packet_info`
+        // read the next-header field directly, so there are no extension headers
+        // to walk past here).
+        let ip_header_len = match info.dst_ip {
+            IpAddr::V6(_) => 40,
+            IpAddr::V4(_) => ((pkt.first().copied().unwrap_or(0) & 0x0f) as usize) * 4,
+        };
+        let payload_start = ip_header_len + 8;
         let Some(dns_query) = pkt.get(payload_start..) else {
             return;
         };

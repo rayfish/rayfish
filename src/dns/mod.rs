@@ -41,6 +41,23 @@ use crate::DNS_DOMAIN;
 /// Tailscale's 100.100.100.100 so both can coexist.
 pub const MAGIC_DNS_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 53);
 
+/// The same resolver, addressed inside our own IPv6 range, used when the data
+/// plane is IPv6-only (`AppConfig::ipv6_only`).
+///
+/// The v4 address above is unusable on the hosts that mode exists for. Tailscale
+/// installs an anti-spoof rule (`-s 100.64.0.0/10 ! -i tailscale0 -j DROP`) that
+/// drops anything sourced from the CGNAT range arriving on another interface,
+/// and our reply is synthesized with the magic IP as its source and injected
+/// into the TUN. The host route delivers the query fine; the reply dies in
+/// netfilter, so `.ray` resolution just times out. `200::/7` is ours alone and
+/// nothing filters it.
+///
+/// Needs no host route of its own: [`crate::tun::route_peer_range`] already
+/// points all of `200::/7` at the TUN. Never assigned to a member, like the v4
+/// one, though here that is a statement of intent rather than a guard:
+/// [`crate::membership::derive_ipv6`] would have to hash to these exact 15 bytes.
+pub const MAGIC_DNS_V6: Ipv6Addr = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 0x53);
+
 /// Per-network hostname to (IPv4, IPv6) mapping. The IPv4 is `None` for a peer
 /// running an IPv6-only data plane (`Member.ipv6_only`): its mesh IPv4 exists on
 /// the roster but is not routed on that host, so answering with it would send

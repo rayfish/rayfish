@@ -210,10 +210,14 @@ pub async fn check_cgnat_conflict() -> Result<()> {
 ///
 /// In `ipv6_only` mode the IPv4 address is assigned as a `/32` instead, so no
 /// connected route for the `/10` is installed and another VPN keeps the range.
-/// The address itself stays: the Magic DNS reply is synthesized back into the
-/// TUN addressed to whatever source the kernel picked for the query, and with no
-/// IPv4 on the device that source would come from another interface and the
-/// reply would be dropped as a martian.
+/// The `/10` is the part that collides; a single address does not.
+///
+/// The address itself stays because it is still this node's identity-derived
+/// handle: the peer table is keyed on it (`conn_for_ip`), `ray status` reports
+/// it, and the roster carries it for every member. Dropping it would mean
+/// reworking all of that to buy nothing, since an unrouted `/32` carries no
+/// traffic either way. Magic DNS does not depend on it in this mode: it is
+/// reached at [`crate::dns::MAGIC_DNS_V6`] instead.
 #[cfg(not(target_os = "android"))]
 pub async fn create(
     v4: Ipv4Addr,

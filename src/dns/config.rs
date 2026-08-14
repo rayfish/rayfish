@@ -6,9 +6,11 @@
 
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::net::Ipv4Addr;
 #[cfg(target_os = "linux")]
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 // Only the macOS/Linux configurators build resolver/backup file paths; Android
 // does no OS-level DNS configuration.
 #[cfg(not(target_os = "android"))]
@@ -25,8 +27,29 @@ use zbus::zvariant::Value;
 
 use crate::DNS_DOMAIN;
 
-// Must equal dns::MAGIC_DNS_V4.
-const RESOLVER_IP: &str = "100.100.100.53";
+/// Whether this node's data plane is IPv6-only, which decides *which* magic
+/// resolver address the OS is pointed at. Set once at daemon start, before any
+/// backend is detected; process-wide because every configurator below needs it
+/// and none of them is constructed anywhere the daemon's config is in scope.
+static IPV6_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Record the data-plane mode for the DNS backends. Called at daemon start.
+pub fn set_ipv6_only(on: bool) {
+    IPV6_ONLY.store(on, Ordering::Relaxed);
+}
+
+/// The address to hand the OS as the `.ray` nameserver.
+///
+/// IPv6-only hosts must not be given the v4 one: it lives in `100.64.0.0/10`,
+/// and the VPN that owns that range on such a host drops our reply before it
+/// reaches the stub resolver. See [`crate::dns::MAGIC_DNS_V6`].
+pub fn resolver_addr() -> IpAddr {
+    if IPV6_ONLY.load(Ordering::Relaxed) {
+        IpAddr::V6(crate::dns::MAGIC_DNS_V6)
+    } else {
+        IpAddr::V4(crate::dns::MAGIC_DNS_V4)
+    }
+}
 
 #[async_trait]
 pub trait DnsConfigurator: Send + Sync {
@@ -233,7 +256,7 @@ mod macos {
 
     use async_trait::async_trait;
 
-    use super::{DNS_DOMAIN, DnsConfigurator, RESOLVER_IP};
+    use super::{DNS_DOMAIN, DnsConfigurator};
 
     const SC_DNS_KEY: &str = "State:/Network/Service/rayfish/DNS";
 
@@ -269,7 +292,8 @@ mod macos {
         let store = store.lock().unwrap();
 
         let server_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSServerAddresses) };
-        let server_val = CFArray::from_CFTypes(&[CFString::from_static_string(RESOLVER_IP)]);
+        let server_val =
+            CFArray::from_CFTypes(&[CFString::new(&super::resolver_addr().to_string())]);
 
         // Route .ray to our resolver. Only .ray: a bare network name as a match
         // domain would hijack the public domain of the same name.
@@ -318,7 +342,7 @@ mod macos {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default();
-        let magic: std::net::Ipv4Addr = super::RESOLVER_IP.parse().unwrap();
+        let magic = crate::dns::MAGIC_DNS_V4;
         let mut ups = Vec::new();
         let mut in_first = false;
         for line in out.lines() {
@@ -557,9 +581,12 @@ impl DnsConfigurator for SystemdResolvedDBus {
             .context("failed to connect to system D-Bus")?;
 
         // SetLinkDNS(ifindex, [(family, address)])
-        // AF_INET = 2; the address is the magic resolver IP, routed into the TUN.
-        let dns_addrs: Vec<(i32, Vec<u8>)> =
-            vec![(2i32, crate::dns::MAGIC_DNS_V4.octets().to_vec())];
+        // AF_INET = 2 / AF_INET6 = 10; the address is the magic resolver IP,
+        // routed into the TUN (the v6 one by the `200::/7` peer-range route).
+        let dns_addrs: Vec<(i32, Vec<u8>)> = match resolver_addr() {
+            IpAddr::V4(v4) => vec![(2i32, v4.octets().to_vec())],
+            IpAddr::V6(v6) => vec![(10i32, v6.octets().to_vec())],
+        };
         conn.call_method(
             Some("org.freedesktop.resolve1"),
             "/org/freedesktop/resolve1",
@@ -631,6 +658,18 @@ fn nm_supports_split_dns(mode: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 async fn try_networkmanager_dbus(tun_name: &str) -> Option<NetworkManagerDns> {
+    // This backend sets nameservers through NM's `IP4Config.Nameservers`, which
+    // is typed as an array of u32 and so cannot carry the IPv6 resolver an
+    // IPv6-only data plane needs. Decline the rung rather than install a v4
+    // address that gets dropped on such a host; the ladder falls through to
+    // resolvconf or direct resolv.conf, both of which take either family.
+    if IPV6_ONLY.load(Ordering::Relaxed) {
+        tracing::info!(
+            "skipping the NetworkManager DNS backend: it can only carry an IPv4 \
+             nameserver, and this node's data plane is IPv6-only"
+        );
+        return None;
+    }
     let conn = Connection::system().await.ok()?;
 
     // Check that NetworkManager is on the bus
@@ -798,7 +837,7 @@ impl DnsConfigurator for SystemdResolvedCli {
     async fn apply(&self) -> Result<()> {
         use tokio::process::Command;
         let status = Command::new("resolvectl")
-            .args(["dns", &self.tun_iface, RESOLVER_IP])
+            .args(["dns", &self.tun_iface, &resolver_addr().to_string()])
             .status()
             .await
             .context("resolvectl dns")?;
@@ -888,7 +927,7 @@ impl DnsConfigurator for Resolvconf {
 
         use tokio::io::AsyncWriteExt;
         use tokio::process::Command;
-        let config = format!("nameserver {RESOLVER_IP}\nsearch {DNS_DOMAIN}\n");
+        let config = format!("nameserver {}\nsearch {DNS_DOMAIN}\n", resolver_addr());
         let iface = self.iface_name();
         let mut child = Command::new("resolvconf")
             .args(["-a", iface])
@@ -967,8 +1006,19 @@ fn parse_resolv_nameservers(contents: &str) -> Vec<Ipv4Addr> {
 /// on to a real server instead of the machine having no DNS at all.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn render_direct_resolv_conf(search: &[String], fallback: Option<Ipv4Addr>) -> String {
+    render_direct_resolv_conf_with(resolver_addr(), search, fallback)
+}
+
+/// The body of [`render_direct_resolv_conf`], with the resolver address passed
+/// in so the rendering is testable without the process-wide mode.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn render_direct_resolv_conf_with(
+    resolver: IpAddr,
+    search: &[String],
+    fallback: Option<Ipv4Addr>,
+) -> String {
     let mut s = String::from(HEADER_COMMENT);
-    s.push_str(&format!("nameserver {RESOLVER_IP}\n"));
+    s.push_str(&format!("nameserver {resolver}\n"));
     if let Some(ip) = fallback {
         s.push_str(&format!("nameserver {ip}\n"));
     }
@@ -1233,7 +1283,11 @@ async fn restore_file(path: &Path) -> Result<()> {
 /// domains rather than an empty or missing file.
 #[cfg(target_os = "linux")]
 fn strip_our_resolv_entries(contents: &str) -> String {
-    let magic = crate::dns::MAGIC_DNS_V4.to_string();
+    // Both families: a file written before a switch to (or from) IPv6-only mode
+    // names the other address, and leaving it behind would point the host at a
+    // resolver that is no longer listening.
+    let magic_v4 = crate::dns::MAGIC_DNS_V4.to_string();
+    let magic_v6 = crate::dns::MAGIC_DNS_V6.to_string();
     let kept: Vec<&str> = contents
         .lines()
         .filter(|l| {
@@ -1243,7 +1297,7 @@ fn strip_our_resolv_entries(contents: &str) -> String {
             }
             // `nameserver <our ip>` in any spacing; other nameservers stay.
             !matches!(t.split_whitespace().collect::<Vec<_>>().as_slice(),
-                ["nameserver", ip] if *ip == magic)
+                ["nameserver", ip] if *ip == magic_v4 || *ip == magic_v6)
         })
         .collect();
     let mut out = kept.join("\n");
@@ -1404,7 +1458,7 @@ impl DnsConfigurator for DirectResolvConf {
                  over would leave the two rewriting it against each other; run \
                  systemd-resolved so both can register their own domains, or add \
                  `nameserver {}` to that file yourself",
-                crate::dns::MAGIC_DNS_V4
+                resolver_addr()
             );
         }
 
@@ -1455,8 +1509,8 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::{
-        RESOLVER_IP, foreign_mesh_resolver, nm_dns_none_dropin, parse_resolv_nameservers,
-        render_direct_resolv_conf, resolv_conf_is_ours,
+        foreign_mesh_resolver, nm_dns_none_dropin, parse_resolv_nameservers,
+        render_direct_resolv_conf, render_direct_resolv_conf_with, resolv_conf_is_ours,
     };
     #[cfg(target_os = "linux")]
     use super::{nsswitch_uses_resolve, resolv_conf_points_at_resolved, strip_our_resolv_entries};
@@ -1499,14 +1553,6 @@ mod tests {
     }
 
     #[test]
-    fn resolver_ip_matches_magic_dns_constant() {
-        assert_eq!(
-            RESOLVER_IP.parse::<Ipv4Addr>().unwrap(),
-            crate::dns::MAGIC_DNS_V4
-        );
-    }
-
-    #[test]
     fn parse_resolv_nameservers_extracts_ipv4_excluding_magic() {
         let c = "# Generated by NetworkManager\nsearch home\nnameserver 192.168.1.1\nnameserver 8.8.8.8\nnameserver 100.100.100.53\n";
         assert_eq!(
@@ -1524,6 +1570,35 @@ mod tests {
         assert!(out.starts_with("# Added by rayfish"));
         assert!(out.contains("nameserver 100.100.100.53"));
         assert!(out.contains("search homelab.ray ray"));
+    }
+
+    /// An IPv6-only host must be pointed at the v6 resolver: the v4 one sits in
+    /// `100.64.0.0/10`, which on such a host belongs to another VPN that drops
+    /// our reply on the way back in.
+    #[test]
+    fn render_direct_resolv_conf_can_point_at_the_v6_magic_ip() {
+        let out = render_direct_resolv_conf_with(
+            std::net::IpAddr::V6(crate::dns::MAGIC_DNS_V6),
+            &["ray".to_string()],
+            Some("1.1.1.1".parse().unwrap()),
+        );
+        assert!(out.contains("nameserver 200::53"));
+        assert!(!out.contains("100.100.100.53"));
+        // The upstream fallback is still IPv4: it is a real resolver reached
+        // over the underlay, not something the mesh carries.
+        assert!(out.contains("nameserver 1.1.1.1"));
+    }
+
+    /// Whichever address we installed, a revert has to take it back out. A
+    /// switch into or out of IPv6-only mode leaves the other one in the file.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strip_removes_either_magic_address() {
+        let v6 = "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 9.9.9.9\n";
+        assert_eq!(strip_our_resolv_entries(v6), "nameserver 9.9.9.9\n");
+        let v4 =
+            "# Added by rayfish - do not edit\nnameserver 100.100.100.53\nnameserver 9.9.9.9\n";
+        assert_eq!(strip_our_resolv_entries(v4), "nameserver 9.9.9.9\n");
     }
 
     #[test]

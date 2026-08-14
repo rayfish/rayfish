@@ -209,6 +209,9 @@ async fn build_daemon_inner(
     // Tell the forwarding core whether mesh IPv4 carries traffic on this node.
     // Before any packet moves: the data plane is attached further down.
     forward::set_ipv6_only(app_config.ipv6_only);
+    // Same for the DNS backends, which pick the magic resolver address from it.
+    // Before `activate` runs detection.
+    crate::dns::config::set_ipv6_only(app_config.ipv6_only);
     // On-demand mode: the platform (mobile embedder) may force it; otherwise honor
     // config (on by default). Computed here so it can thread into the registry.
     let on_demand = on_demand_override.unwrap_or(app_config.on_demand);

@@ -114,7 +114,7 @@ impl DnsService {
         let search = c.search_domains();
         #[cfg(target_os = "linux")]
         let fallback = c.fallback_upstream();
-        tracing::info!(backend = c.name(), resolver_ip = %crate::dns::MAGIC_DNS_V4, upstreams = ?upstreams, "Magic DNS active");
+        tracing::info!(backend = c.name(), resolver_ip = %dns_config::resolver_addr(), upstreams = ?upstreams, "Magic DNS active");
         self.resolver.set_upstreams(upstreams);
         *self.configurator.lock().unwrap() = Some(Arc::from(c));
         // In direct mode, re-assert /etc/resolv.conf the instant another

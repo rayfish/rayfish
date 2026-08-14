@@ -511,14 +511,20 @@ ray config set ipv6-only on && sudo ray restart   # or: sudo ray up --ipv6-only
 
 Peers, mesh SSH, file transfer, and `.ray` names all keep working over IPv6;
 `.ray` answers AAAA only, and peers are told not to use your mesh IPv4 either.
+Magic DNS moves to `200::53` in this mode, because the usual `100.100.100.53`
+sits in the range the other VPN is filtering (Tailscale drops anything sourced
+from `100.64.0.0/10` that doesn't arrive on `tailscale0`, which includes our own
+DNS replies).
+
 The one thing that doesn't work is `ray exit-node use`: the full tunnel is IPv4
 policy routing, so it's refused in this mode. Serving as an exit node for others
-is unaffected.
+is unaffected. NetworkManager's DNS backend is skipped too (it can only carry an
+IPv4 nameserver); the next backend down takes over.
 
 If both VPNs manage `/etc/resolv.conf` directly (no systemd-resolved), rayfish
 leaves the file to whoever holds it rather than fighting over it, and `.ray`
-names won't resolve until you add `nameserver 100.100.100.53` yourself or put a
-DNS manager both can register with in the path.
+names won't resolve until you add rayfish's resolver to that file yourself or
+put a DNS manager both can register with in the path.
 
 ## Troubleshooting
 
