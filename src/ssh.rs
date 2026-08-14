@@ -13,6 +13,13 @@
 //! identity is already proven). For now an authorized peer may log in as any
 //! local unix user, including root; tighter user-mapping is future work.
 //!
+//! An authorized peer gets sessions (shell, `exec`, sftp) and local port
+//! forwarding (`ssh -L`, `ssh -D`, `ProxyJump`), which is a `direct-tcpip`
+//! channel. The forwarded socket is opened by the daemon, not by the login
+//! account, so it reaches whatever the host can reach, loopback-only services
+//! included: the same surface a shell on that host already has. Remote
+//! forwarding (`ssh -R`) is not implemented and is refused.
+//!
 //! Authorization is evaluated once, when the connection is accepted, so
 //! `ray firewall ssh allow/deny` changes apply to *new* sessions; an
 //! already-established session is not torn down by a later `deny`.
@@ -35,8 +42,9 @@ use russh::server::{Auth, Config, Handle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use smol_str::SmolStr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -51,6 +59,11 @@ use crate::peers::{DeviceUserMap, PeerTable};
 // binds `SSH_LISTEN_PORT` and translates the port in the forwarding path instead
 // of an OS-firewall redirect. Re-exported here so the public path stays stable.
 pub(crate) use crate::forward::SSH_LISTEN_PORT;
+
+/// How long a `ssh -L` / `-D` forwarded connection may take to reach its target
+/// before the channel is dropped. Short enough that a black-holed address fails
+/// while the person who typed the command is still watching.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Per-network SSH authorization snapshot: network name -> the network's SSH
 /// allow rules (peer + permitted login users). Held in an [`ArcSwap`] so
@@ -479,6 +492,65 @@ impl Handler for SshHandler {
                 ..Default::default()
             },
         );
+        Ok(true)
+    }
+
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // `ssh -L`, `ssh -D` and `ProxyJump` all ride this channel type. russh
+        // dispatches channel opens only after auth succeeded, so the policy is
+        // already satisfied here; re-checking keeps the gate in one place if
+        // that ever changes.
+        if !self.policy.authorized() || self.login.is_none() {
+            return Ok(false);
+        }
+        let Ok(port) = u16::try_from(port_to_connect) else {
+            debug!(peer = %self.user.fmt_short(), port_to_connect,
+                "mesh SSH: rejecting forward to an out-of-range port");
+            return Ok(false);
+        };
+        let target = format!("{host_to_connect}:{port}");
+        let peer = self.user;
+        let handle = session.handle();
+        let channel_id = channel.id();
+        // Connect off the session task: it is shared by every channel on this
+        // connection, so a slow or black-holed connect here would stall the
+        // peer's shells and its other forwards. The cost is that a failed
+        // connect closes an already-confirmed channel instead of failing the
+        // open, so the client reports a dropped connection rather than
+        // "connect failed"; the reason is logged here.
+        tokio::spawn(async move {
+            let connected = timeout(CONNECT_TIMEOUT, TcpStream::connect(&target)).await;
+            let mut upstream = match connected {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    debug!(peer = %peer.fmt_short(), %target, error = %e,
+                        "mesh SSH: forwarded connection failed");
+                    let _ = handle.close(channel_id).await;
+                    return;
+                }
+                Err(_) => {
+                    debug!(peer = %peer.fmt_short(), %target,
+                        "mesh SSH: forwarded connection timed out");
+                    let _ = handle.close(channel_id).await;
+                    return;
+                }
+            };
+            debug!(peer = %peer.fmt_short(), %target, "mesh SSH: forwarding to");
+            let mut stream = channel.into_stream();
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+            // Dropping the stream closes the channel, but say so explicitly so
+            // the client sees the close even if the peer half is still held.
+            let _ = handle.eof(channel_id).await;
+            let _ = handle.close(channel_id).await;
+        });
         Ok(true)
     }
 
@@ -1328,6 +1400,64 @@ mod tests {
             "a pipe session is not line-translated: {pipe_out:?}"
         );
         assert_eq!(pipe_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn direct_tcpip_channel_carries_a_forwarded_connection() {
+        // `ssh -L`, `ssh -D` and `ProxyJump` all open this channel type. With
+        // no handler for it russh refuses the open ("administratively
+        // prohibited"), so every forward through a mesh host failed.
+        let echo = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind echo listener");
+        let port = echo.local_addr().expect("echo address").port();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo.accept().await.expect("accept forwarded connection");
+            let (mut r, mut w) = sock.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        let handle = connect_to_test_server().await;
+        let channel = handle
+            .channel_open_direct_tcpip("127.0.0.1", port as u32, "127.0.0.1", 1234)
+            .await
+            .expect("open direct-tcpip channel");
+
+        let mut stream = channel.into_stream();
+        stream.write_all(b"ping").await.expect("write to forward");
+        let mut buf = [0u8; 4];
+        timeout(Duration::from_secs(20), stream.read_exact(&mut buf))
+            .await
+            .expect("the forwarded connection never answered")
+            .expect("read from forward");
+        assert_eq!(&buf, b"ping", "bytes come back off the forwarded socket");
+    }
+
+    #[tokio::test]
+    async fn direct_tcpip_channel_closes_when_the_target_refuses() {
+        // Nothing listens on the port, so the channel must end instead of
+        // hanging the client on a forward that will never carry data.
+        let dead = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind to claim a port");
+        let port = dead.local_addr().expect("address").port();
+        drop(dead);
+
+        let handle = connect_to_test_server().await;
+        let channel = handle
+            .channel_open_direct_tcpip("127.0.0.1", port as u32, "127.0.0.1", 1234)
+            .await
+            .expect("open direct-tcpip channel");
+
+        let mut stream = channel.into_stream();
+        let mut buf = [0u8; 1];
+        let read = timeout(Duration::from_secs(20), stream.read(&mut buf))
+            .await
+            .expect("a forward to a refused port must not hang");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "the channel ends at EOF, not with data"
+        );
     }
 
     #[test]

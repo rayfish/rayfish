@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Mesh SSH supports port forwarding.** `ssh -L`, `ssh -D` and `ProxyJump`
+  through a mesh host work now. Before, the embedded SSH server had no handler
+  for forwarded connections, so every one of them was refused with "channel N:
+  open failed: administratively prohibited" while the shell on the same
+  connection kept working. Any peer allowed to log in can forward; the target
+  socket is opened by the daemon on the remote host, so it reaches loopback-only
+  services there, the same as a shell on that host. Remote forwarding (`ssh -R`)
+  is still not supported.
+
 - **`ray mdns scan` lists the rayfish nodes on your LAN.** mDNS discovery has
   always run in the background, but it only fed the connection layer: there was
   no way to see what it found. The scan shows each neighbour's id, addresses,
