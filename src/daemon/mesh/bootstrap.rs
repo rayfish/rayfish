@@ -463,6 +463,9 @@ async fn build_daemon_inner(
         hostname_table.clone(),
         reverse_table.clone(),
     ));
+    // Withhold A records when mesh IPv4 is not routed on this node; without
+    // this, apps here would resolve peers to addresses owned by another VPN.
+    dns_resolver.set_ipv6_only(app_config.ipv6_only);
     // Built here (not in the struct literal) so NetworkRegistry can share it for
     // the leave/teardown DNS cleanup.
     let dns = Arc::new(DnsService::new(

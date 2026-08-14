@@ -150,10 +150,17 @@ pub async fn remove_network(table: &HostnameTable, reverse: &ReverseLookupTable,
 /// a miss is answered here with NXDOMAIN rather than declined. Declining it
 /// would put a public resolver's 86400 negative TTL on a name only we can ever
 /// resolve.
+///
+/// `ipv6_only` is this node's data-plane mode. When set, mesh IPv4 is not routed
+/// here (another VPN owns `100.64.0.0/10`), so an A record would resolve to an
+/// address that goes nowhere: the answer becomes NODATA, and the AAAA lookup for
+/// the same name still works. NODATA rather than NXDOMAIN because the name
+/// exists, and NXDOMAIN would fail the AAAA alongside it in most stub resolvers.
 pub(crate) async fn handle_query(
     data: &[u8],
     table: &HostnameTable,
     reverse: &ReverseLookupTable,
+    ipv6_only: bool,
 ) -> Option<Vec<u8>> {
     let packet = Packet::parse(data).ok()?;
 
@@ -168,7 +175,7 @@ pub(crate) async fn handle_query(
 
     // PTR queries for in-addr.arpa / ip6.arpa
     if is_ptr {
-        return handle_ptr_query(&packet, &name_lower, reverse).await;
+        return handle_ptr_query(&packet, &name_lower, reverse, ipv6_only).await;
     }
 
     let suffix = format!(".{DNS_DOMAIN}");
@@ -188,6 +195,10 @@ pub(crate) async fn handle_query(
             return Some(make_nxdomain(&packet));
         };
         if is_a {
+            if ipv6_only {
+                tracing::debug!(name = %name_lower, "DNS A withheld (IPv6-only)");
+                return Some(make_nodata(&packet));
+            }
             tracing::info!(name = %name_lower, ip = %v4, "DNS resolved A");
             return Some(make_a_response(&packet, &question.qname, v4));
         }
@@ -207,6 +218,13 @@ pub(crate) async fn handle_query(
     }
     let (v4, v6) = resolve_bare_network_name(&name_lower, table).await?;
     if is_a {
+        if ipv6_only {
+            // The roster holds the name, so this is ours to answer even though
+            // we are withholding the address; going upstream would resolve a
+            // mesh peer to whatever public name happens to collide with it.
+            tracing::debug!(name = %name_lower, "DNS A withheld (IPv6-only)");
+            return Some(make_nodata(&packet));
+        }
         tracing::info!(name = %name_lower, ip = %v4, "DNS resolved A");
         Some(make_a_response(&packet, &question.qname, v4))
     } else {
@@ -233,6 +251,7 @@ async fn handle_ptr_query(
     packet: &Packet<'_>,
     name: &str,
     reverse: &ReverseLookupTable,
+    ipv6_only: bool,
 ) -> Option<Vec<u8>> {
     let ip = parse_ptr_name(name)?;
 
@@ -245,6 +264,12 @@ async fn handle_ptr_query(
 
     // If IP is in our range but not found, NXDOMAIN
     match ip {
+        // In IPv6-only mode `100.64.0.0/10` is not ours to speak for: it belongs
+        // to whichever VPN we are sharing the host with, and answering an
+        // authoritative NXDOMAIN would break reverse lookups for its nodes.
+        // Only reachable when we are the system-wide resolver; with split DNS,
+        // `in-addr.arpa` is not routed to us at all.
+        IpAddr::V4(_) if ipv6_only => {}
         IpAddr::V4(v4) => {
             let octets = v4.octets();
             // 100.64.0.0/10
@@ -544,6 +569,83 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    /// IPv6-only mode: the mesh IPv4 is not routed on this node, so an A record
+    /// would point an app at an address owned by another VPN. The name still
+    /// resolves over IPv6, and NODATA (not NXDOMAIN) is what keeps it that way.
+    #[tokio::test]
+    async fn ipv6_only_withholds_a_but_still_answers_aaaa() {
+        use simple_dns::{CLASS as C, PacketFlag, QCLASS, Question};
+
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+        let v4 = Ipv4Addr::new(100, 64, 10, 5);
+        let v6 = entry(v4).1;
+        update_hostname(&table, &reverse, "dev", "box", v4, v6).await;
+
+        let query = |name: &str, qtype: QTYPE| {
+            let mut pkt = Packet::new_query(1);
+            pkt.set_flags(PacketFlag::RECURSION_DESIRED);
+            pkt.questions.push(Question::new(
+                Name::new_unchecked(name).into_owned(),
+                qtype,
+                QCLASS::CLASS(C::IN),
+                false,
+            ));
+            pkt.build_bytes_vec().expect("build query")
+        };
+        let a = QTYPE::TYPE(simple_dns::TYPE::A);
+        let aaaa = QTYPE::TYPE(simple_dns::TYPE::AAAA);
+        let ask = async |name: &str, qtype| {
+            handle_query(&query(name, qtype), &table, &reverse, true)
+                .await
+                .expect("the roster holds this name, so it is ours to answer")
+        };
+
+        // A: answered, but with nothing in it. NOERROR keeps the stub resolver
+        // going to the AAAA instead of failing the name outright.
+        for name in ["box.dev.ray", "box.dev"] {
+            let bytes = ask(name, a).await;
+            let resp = Packet::parse(&bytes).expect("parse response");
+            assert_eq!(resp.rcode(), RCODE::NoError, "{name} should be NODATA");
+            assert!(resp.answers.is_empty(), "{name} must not carry an A record");
+        }
+
+        // AAAA still resolves: this is the address that actually carries traffic.
+        let bytes = ask("box.dev.ray", aaaa).await;
+        let resp = Packet::parse(&bytes).expect("parse response");
+        assert_eq!(resp.answers.len(), 1);
+        assert!(
+            matches!(resp.answers[0].rdata, RData::AAAA(ref got) if Ipv6Addr::from(got.address) == v6)
+        );
+
+        // A PTR for the CGNAT range belongs to whichever VPN owns it here, so we
+        // decline rather than claiming an authoritative NXDOMAIN for its nodes.
+        assert!(
+            handle_query(
+                &query("9.0.64.100.in-addr.arpa", QTYPE::TYPE(simple_dns::TYPE::PTR)),
+                &table,
+                &reverse,
+                true,
+            )
+            .await
+            .is_none()
+        );
+        // Our own IPv6 range is still ours to speak for.
+        assert!(
+            handle_query(
+                &query(
+                    "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0.ip6.arpa",
+                    QTYPE::TYPE(simple_dns::TYPE::PTR)
+                ),
+                &table,
+                &reverse,
+                true,
+            )
+            .await
+            .is_some()
+        );
+    }
+
     /// The decline contract: `handle_query` returns `None` for anything the
     /// roster does not hold, which is what lets the caller fall back upstream.
     #[tokio::test]
@@ -570,7 +672,7 @@ mod tests {
         let declined = |name: &'static str, qtype| {
             let (table, reverse) = (table.clone(), reverse.clone());
             async move {
-                handle_query(&query(name, qtype), &table, &reverse)
+                handle_query(&query(name, qtype), &table, &reverse, false)
                     .await
                     .is_none()
             }
@@ -624,7 +726,7 @@ mod tests {
         ));
         let query = pkt.build_bytes_vec().expect("build query");
 
-        let resp = handle_query(&query, &table, &reverse)
+        let resp = handle_query(&query, &table, &reverse, false)
             .await
             .expect("an empty roster still answers inside our own zone");
         let resp = Packet::parse(&resp).expect("parse NXDOMAIN");

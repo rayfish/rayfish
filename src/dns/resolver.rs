@@ -4,6 +4,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -14,6 +15,10 @@ pub struct Resolver {
     table: HostnameTable,
     reverse: ReverseLookupTable,
     upstreams: Arc<ArcSwap<Vec<SocketAddr>>>,
+    /// Whether this node's data plane is IPv6-only. When set, the roster
+    /// responder withholds A records (see [`crate::dns::handle_query`]): mesh
+    /// IPv4 is not routed here, so handing an app one is a black hole.
+    ipv6_only: AtomicBool,
 }
 
 impl Resolver {
@@ -22,7 +27,15 @@ impl Resolver {
             table,
             reverse,
             upstreams: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            ipv6_only: AtomicBool::new(false),
         }
+    }
+
+    /// Record whether mesh IPv4 is usable on this node. Called once at daemon
+    /// start; a setter rather than a `new` parameter so the mode stays out of
+    /// every construction site.
+    pub fn set_ipv6_only(&self, on: bool) {
+        self.ipv6_only.store(on, Ordering::Relaxed);
     }
 
     /// Replace the upstream set (bare IPv4 on port 53), dropping the magic IP to
@@ -55,7 +68,10 @@ impl Resolver {
     /// goes upstream to the real internet instead of failing. It does not apply
     /// inside `.ray`, where [`crate::dns::handle_query`] answers a miss itself.
     pub async fn resolve(&self, query: &[u8]) -> Option<Vec<u8>> {
-        if let Some(local) = crate::dns::handle_query(query, &self.table, &self.reverse).await {
+        let ipv6_only = self.ipv6_only.load(Ordering::Relaxed);
+        if let Some(local) =
+            crate::dns::handle_query(query, &self.table, &self.reverse, ipv6_only).await
+        {
             return Some(local);
         }
         if let Some(forwarded) = self.forward(query).await {
