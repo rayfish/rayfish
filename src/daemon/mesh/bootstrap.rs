@@ -525,6 +525,7 @@ async fn build_daemon_inner(
         disconnect_tx.clone(),
         on_demand,
         app_config.idle_timeout(),
+        app_config.ipv6_only,
     ));
     // FileService owns file transfer + pairing. It evaluates own-device auto-accept
     // directly (no worker channel) and clears a re-paired device's nullifier by

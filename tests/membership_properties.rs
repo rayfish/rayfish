@@ -38,6 +38,7 @@ fn member(identity: EndpointId, ip: Ipv4Addr, collision_index: u32) -> Member {
         collision_index,
         last_seen: None,
         exit_node: false,
+        ipv6_only: false,
     }
 }
 

@@ -98,6 +98,7 @@ impl NetworkRegistry {
                             collision_index: 0,
                             last_seen: None,
                             exit_node: false,
+                            ipv6_only: false,
                         });
                     }
                     for entry in &nc.approved {
@@ -126,6 +127,7 @@ impl NetworkRegistry {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    ipv6_only: self.ipv6_only,
                 })
                 .expect("self-add cannot collide");
         }
@@ -267,9 +269,13 @@ impl NetworkRegistry {
                     .all()
                     .into_iter()
                     .filter_map(|m| {
-                        m.hostname
-                            .as_ref()
-                            .map(|h| (h.clone(), m.ip, derive_ipv6(&m.identity)))
+                        m.hostname.as_ref().map(|h| {
+                            (
+                                h.clone(),
+                                (!m.ipv6_only).then_some(m.ip),
+                                derive_ipv6(&m.identity),
+                            )
+                        })
                     })
                     .collect()
             };
@@ -1127,6 +1133,7 @@ impl Daemon {
         // the offers, so this also withdraws a stale advertisement rather than
         // keeping clients routed into a gateway that forwards nothing.
         self.registry.sync_exit_offers().await;
+        self.registry.sync_ipv6_only().await;
         // This runs inside the IPC request, so anything slow here is time the user
         // spends staring at `ray exit-node use`. Timed per phase because a stall in
         // any of them is indistinguishable from the outside.
@@ -1470,6 +1477,7 @@ impl Daemon {
         // otherwise. `activate()` re-advertises. Then disable syncing, so a
         // reconverge during standby leaves the (withdrawn) flag alone.
         self.registry.sync_exit_offers().await;
+        self.registry.sync_ipv6_only().await;
         self.registry
             .exit_sync_enabled
             .store(false, Ordering::SeqCst);

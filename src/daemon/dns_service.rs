@@ -61,7 +61,7 @@ impl DnsService {
     pub(crate) async fn sync_network(
         &self,
         network: &str,
-        entries: &[(String, Ipv4Addr, Ipv6Addr)],
+        entries: &[(String, Option<Ipv4Addr>, Ipv6Addr)],
     ) {
         dns::sync_network_hostnames(&self.hostname_table, &self.reverse_table, network, entries)
             .await;

@@ -1276,7 +1276,7 @@ impl Daemon {
             &self.dns.reverse_table,
             network,
             &new_hostname,
-            my_ip,
+            (!self.ipv6_only).then_some(my_ip),
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
@@ -1658,6 +1658,7 @@ mod accept_handler_tests {
             disconnect_tx,
             false,
             Duration::from_secs(config::DEFAULT_IDLE_TIMEOUT_SECS),
+            false,
         ))
     }
 
@@ -1735,6 +1736,7 @@ mod accept_handler_tests {
                         collision_index: 0,
                         last_seen: None,
                         exit_node: false,
+                        ipv6_only: false,
                     })
                     .unwrap();
             }
@@ -1841,6 +1843,7 @@ mod accept_handler_tests {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    ipv6_only: false,
                 })
                 .unwrap();
         }
@@ -1991,6 +1994,7 @@ mod accept_handler_tests {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    ipv6_only: false,
                 },
                 Member {
                     identity: member_id,
@@ -2002,6 +2006,7 @@ mod accept_handler_tests {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    ipv6_only: false,
                 },
             ]
         };
@@ -2233,6 +2238,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
         // minter = b: b first, then the other coordinator a, never c (not coord), never me.
@@ -2252,6 +2258,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
 
         // No coordinators in the roster ⇒ empty order (caller bails).
@@ -2313,6 +2320,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         let members = vec![mk(a, true), mk(b, false), mk(c, true)];
         let me = a;
@@ -2333,6 +2341,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         // Only members are us (coordinator) and a plain member: nobody to gossip to.
         let members = vec![mk(me, true), mk(test_id(2), false)];

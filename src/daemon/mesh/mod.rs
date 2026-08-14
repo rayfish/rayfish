@@ -20,6 +20,7 @@ mod exit_node;
 mod files;
 mod firewall;
 mod invite;
+mod ipv6_only;
 mod join;
 mod publish;
 mod reconverge;

@@ -243,7 +243,7 @@ mod tests {
             &reverse,
             "homelab",
             "dario",
-            Ipv4Addr::new(100, 64, 0, 7),
+            Some(Ipv4Addr::new(100, 64, 0, 7)),
             "200::7".parse().unwrap(),
         )
         .await;
@@ -316,7 +316,7 @@ mod tests {
             &reverse,
             "homelab",
             "dario",
-            Ipv4Addr::new(100, 64, 0, 7),
+            Some(Ipv4Addr::new(100, 64, 0, 7)),
             "200::7".parse().unwrap(),
         )
         .await;
@@ -340,7 +340,7 @@ mod tests {
             &reverse,
             "dev",
             "box",
-            peer_ip,
+            Some(peer_ip),
             "200::7".parse().unwrap(),
         )
         .await;

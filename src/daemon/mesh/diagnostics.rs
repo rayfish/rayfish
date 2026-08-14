@@ -96,12 +96,15 @@ impl Daemon {
             .unwrap_or_default();
         let ephemeral_ttl_secs = net_cfg.as_ref().and_then(|n| n.ephemeral_ttl_secs);
         // Resolve a mesh IPv4 back to its `.ray` hostname via the DNS snapshot.
-        let lookup_hostname = |ip| {
+        // A member running an IPv6-only data plane holds no IPv4 in the table, so
+        // fall back to matching on its derived IPv6.
+        let lookup_hostname = |ip: Ipv4Addr, id: EndpointId| {
+            let v6 = derive_ipv6(&id);
             hostname_snapshot.and_then(|table| {
                 table.get(&h.name).and_then(|hosts| {
                     hosts
                         .iter()
-                        .find(|(_, v)| v.0 == ip)
+                        .find(|(_, v)| v.0 == Some(ip) || v.1 == v6)
                         .map(|(k, _)| k.clone())
                 })
             })
@@ -164,7 +167,7 @@ impl Daemon {
             .iter()
             .filter(|m| m.identity != my_id)
             .map(|m| {
-                let hostname = m.hostname.clone().or_else(|| lookup_hostname(m.ip));
+                let hostname = m.hostname.clone().or_else(|| lookup_hostname(m.ip, m.identity));
                 let connection = connected.get(&m.identity).map(Self::gather_conn_info);
                 let user_id = self.registry.device_user_map.resolve(&m.identity);
                 let user_identity = (user_id != m.identity).then_some(user_id);
@@ -212,7 +215,7 @@ impl Daemon {
                 Some(m) => m
                     .hostname
                     .clone()
-                    .or_else(|| lookup_hostname(m.ip))
+                    .or_else(|| lookup_hostname(m.ip, m.identity))
                     .unwrap_or_else(|| m.identity.fmt_short().to_string()),
                 None => stored,
             });
@@ -221,7 +224,7 @@ impl Daemon {
             role,
             my_ip: h.my_ip,
             my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
-            my_hostname: lookup_hostname(h.my_ip),
+            my_hostname: lookup_hostname(h.my_ip, self.transport.identity.local_identity()),
             network_key: Some(h.network_key.to_string()),
             member_count,
             peers,

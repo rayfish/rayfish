@@ -112,6 +112,11 @@ pub(crate) struct NetworkRegistry {
     /// fires while the data plane is down (boot, standby) from withdrawing an
     /// offer that `activate()` is about to re-advertise.
     pub(crate) exit_sync_enabled: AtomicBool,
+    /// Whether this node's data plane is IPv6-only (`AppConfig::ipv6_only`).
+    /// Fixed for the daemon's lifetime (the TUN's addressing is decided at
+    /// startup), and advertised on every network's signed roster so peers stop
+    /// resolving us to a mesh IPv4 that carries nothing. See `mesh/ipv6_only.rs`.
+    pub(crate) ipv6_only: bool,
     /// Networks whose restore is already running, so a sweep never starts a
     /// second one for the same network. Removed when the restore finishes,
     /// however it finishes.
@@ -175,6 +180,7 @@ impl NetworkRegistry {
         disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
         on_demand: bool,
         idle_timeout: Duration,
+        ipv6_only: bool,
     ) -> Self {
         Self {
             networks,
@@ -200,6 +206,7 @@ impl NetworkRegistry {
             exit_selection_pending: AtomicBool::new(false),
             exit_reapply: Arc::new(Notify::new()),
             exit_sync_enabled: AtomicBool::new(false),
+            ipv6_only,
             restoring: Arc::new(DashSet::new()),
             restore_nudge: Arc::new(Notify::new()),
         }
@@ -561,7 +568,7 @@ impl NetworkRegistry {
             &self.dns.reverse_table,
             &name,
             &my_hostname,
-            my_ip,
+            (!self.ipv6_only).then_some(my_ip),
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
@@ -665,6 +672,9 @@ impl NetworkRegistry {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                // Our own entry starts out truthful, so the first published blob
+                // already tells peers not to use our mesh IPv4.
+                ipv6_only: self.ipv6_only,
             })
             .expect("self-add cannot collide");
 
@@ -862,13 +872,24 @@ impl NetworkRegistry {
         } else {
             format!("{name}{suffix}")
         };
-        if let Some((ip, _)) = self.dns.resolve(&qualified, &suffix).await {
-            if let Some(route) = self.peers.lookup_v4(&ip) {
+        // The IPv4 half is absent for a peer running an IPv6-only data plane; its
+        // IPv6 is always there, so match on that when there is no address to key
+        // on. (Both halves derive from the same identity, so either resolves it.)
+        if let Some((v4, v6)) = self.dns.resolve(&qualified, &suffix).await {
+            if let Some(route) = v4
+                .and_then(|ip| self.peers.lookup_v4(&ip))
+                .or_else(|| self.peers.lookup_v6(&v6))
+            {
                 return Some(route.endpoint_id);
             }
             for entry in self.networks.iter() {
                 let state = entry.value().state.read().unwrap();
-                if let Some(m) = state.members.all().iter().find(|m| m.ip == ip) {
+                if let Some(m) = state
+                    .members
+                    .all()
+                    .iter()
+                    .find(|m| Some(m.ip) == v4 || derive_ipv6(&m.identity) == v6)
+                {
                     return Some(m.identity);
                 }
             }
