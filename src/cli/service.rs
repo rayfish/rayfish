@@ -117,6 +117,11 @@ pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
 /// instead of seeing a cheerful "started" followed by a dead `ray status`.
 pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Result<()> {
     ensure_service_installed()?;
+    // We are root here, which is what it takes to write into the directories
+    // the shells already search. Doing it from the service installer is what
+    // makes tab completion something you have rather than something you set up,
+    // and `ray update` comes back through here, so the stubs stay current.
+    complete::install_with_service();
 
     #[cfg(target_os = "linux")]
     {

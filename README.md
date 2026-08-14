@@ -204,6 +204,34 @@ Prefer buttons and forms? Run `ray gui` to open a local browser GUI. It wraps
 the same CLI commands, so anything available in `ray --help` is available there
 too; commands that need root still need the GUI to be launched with `sudo`.
 
+### Tab completion
+
+Installed for you: the installer and `sudo ray up` write the completion scripts
+into the directories bash, zsh and fish already search, so there is nothing to
+source and no rc file to edit. Open a new shell and press tab.
+
+It is not a static script. Each tab asks the running `ray`, so the answers are
+the networks and peers you have right now:
+
+```
+$ ray leave <TAB>
+gaming  homelab
+
+$ ray ping <TAB>
+alice   100.64.3.1, active
+nas     100.64.9.4, idle
+
+$ ray exit-node use homelab <TAB>
+gateway 100.64.2.7, active
+```
+
+A tab never starts the daemon and never blocks: with the service stopped it
+answers from your saved config where it can, and offers nothing where it can't.
+
+If you installed the binary by hand, `ray completions --install` sets it up
+(system-wide under `sudo`, otherwise for your user only). `ray completions zsh`
+prints the script instead, for placing yourself.
+
 ## Managing your network
 
 Once a network exists, running it is a handful of commands. Here are the ones

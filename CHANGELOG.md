@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Tab completion, already installed.** The installer and `sudo ray up` write
+  completion scripts for bash, zsh and fish into the directories those shells
+  already search, so there is nothing to source and no rc file to edit: open a
+  new shell and press tab. Completion is live rather than a frozen script, so it
+  offers the networks and peers you actually have (`ray leave <TAB>`,
+  `ray ping <TAB>`, `ray exit-node use <net> <TAB>`), scoped to the network you
+  already named on the line, with each peer's mesh IP and state alongside it.
+  Fixed-choice arguments (`in`/`out`, `allow`/`deny`, `on`/`off`, protocols,
+  settings keys) complete too, and `ray config set <TAB>` shows what each key is
+  currently set to. A tab never starts the daemon and gives up rather than
+  blocking your shell if it is wedged. `ray uninstall` removes the scripts;
+  `ray completions --install` sets them up on a binary-only install.
+
 - **Mesh SSH supports port forwarding.** `ssh -L`, `ssh -D` and `ProxyJump`
   through a mesh host work now. Before, the embedded SSH server had no handler
   for forwarded connections, so every one of them was refused with "channel N:

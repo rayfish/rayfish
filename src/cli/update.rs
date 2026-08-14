@@ -443,6 +443,11 @@ pub(crate) fn run_cmd_quiet(program: &str, args: &[&str]) {
 }
 
 pub(crate) fn cmd_uninstall_service() -> Result<()> {
+    // Take the completion stubs with it: `ray up` installed them, so an
+    // uninstall that left them behind would leave three files pointing at a
+    // binary that may be going away too.
+    complete::uninstall_system();
+
     #[cfg(target_os = "linux")]
     {
         // Tear down whatever init the unit was installed under, not just the

@@ -298,14 +298,25 @@ fn parse_entries(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Apply a `ray config set`/`unset` to the in-memory config. An empty value or
-/// the lone keyword `n0` resets the key to its default (iroh n0). Validates
-/// every entry, so a bad URL/IP or unknown preset is rejected before persist.
+/// Every recognized `ray config` key, in the order `ray config get` prints
+/// them. Single source of truth: `config_get` iterates it, and the CLI offers it
+/// on tab, so a key added here needs no second edit to show up in either.
+pub const CONFIG_KEY_NAMES: [&str; 5] = [
+    "relay",
+    "discovery-dns",
+    "dns-upstreams",
+    "auto-update",
+    "on-demand",
+];
+
 /// The recognized `ray config` keys, for error messages. The list values
 /// (relay/discovery-dns/dns-upstreams) are set via `config set`; the on/off
 /// toggles (auto-update/on-demand) via their own `config` subcommands.
 const CONFIG_KEYS: &str = "expected relay, discovery-dns, dns-upstreams, auto-update, or on-demand";
 
+/// Apply a `ray config set`/`unset` to the in-memory config. An empty value or
+/// the lone keyword `n0` resets the key to its default (iroh n0). Validates
+/// every entry, so a bad URL/IP or unknown preset is rejected before persist.
 pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) -> Result<()> {
     let entries = parse_entries(value);
     let reset = entries.is_empty() || entries == ["n0"];
@@ -400,13 +411,7 @@ pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, Str
     };
     match key {
         Some(k) => Ok(vec![row(k)?]),
-        None => Ok(vec![
-            row("relay")?,
-            row("discovery-dns")?,
-            row("dns-upstreams")?,
-            row("auto-update")?,
-            row("on-demand")?,
-        ]),
+        None => CONFIG_KEY_NAMES.iter().map(|k| row(k)).collect(),
     }
 }
 

@@ -35,6 +35,7 @@ ray connect | connections | contact | pair | unpair  # direct links + multi-devi
 ray firewall … | apply | alias | identityof          # policy
 ray exit-node allow | disallow | use | none | status  # internet gateway (offer: Linux/macOS/BSD, use: Linux/macOS)
 ray send | files | config | gui | mdns | auto-update | update | ping | netcheck | report
+ray completions [shell] [--install]                  # tab completion (installed by `ray up`)
 ```
 
 **Privilege (Tailscale operator model):** the always-root daemon does privileged work; clients are unprivileged. The IPC socket is `0666`; authority is a per-request `SO_PEERCRED` UID check (`Daemon::check_authorized`), not socket permissions. Reads are open to any local user; mutations need root or the configured `operator_uid`. Only service management (`install`/`start`/`stop`/`restart`/`uninstall`/`set-operator`/`daemon`) needs `sudo`; `up`/`down` and everything else is IPC. `ray up`/`install` auto-grant operator to `$SUDO_USER`.
@@ -58,7 +59,7 @@ The daemon (`src/daemon/`) is an **acyclic graph of `Arc` services** rooted at *
 
 | Area | Files |
 |---|---|
-| CLI + IPC client | `src/main.rs`, `src/cli/*` |
+| CLI + IPC client | `src/main.rs`, `src/cli/*` (tab completion: `src/cli/complete.rs`) |
 | Daemon core + network ops | `src/daemon/mod.rs`, `network_registry.rs`, `mesh/*` |
 | Services | `src/daemon/{foundation,connection_manager,dns_service,file_service,connect_service}.rs` |
 | Wire / transport | `src/transport.rs` (ALPNs, endpoint bind), `src/control.rs` (control protocol), `src/ipc.rs` |
@@ -91,6 +92,7 @@ The rules the code upholds. Read the code for the mechanics.
 - **Firewall is secure-by-default.** Inbound TCP/UDP denied, inbound ICMP allowed (a seeded, removable rule), outbound allowed; a stateful conntrack lets return traffic back. Coordinator suggestions are advisory and consented per-node; local rules are never touched by reconverge.
 - **Hostname authority = invite binding.** An invite-bound hostname is assigned exactly and a colliding claim is rejected; a free hostname gets suffix collision resolution. The roster is the single source of truth for `*.ray` DNS.
 - **Data plane vs control plane.** The daemon connects every saved network at startup and keeps those connections for its lifetime (dropped only on leave/nuke/shutdown). `up`/`down` (`activate`/`deactivate`) toggle only the data plane (TUN link, routes, Magic DNS, forward gate); `start`/`stop` toggle the whole process.
+- **A tab never starts the daemon and never blocks the shell.** Completion is dynamic (the installed script is a stub that calls the binary), so it runs on a keystroke: it answers from an open IPC read within a 300ms budget, and every failure — no socket, no daemon, no reply in time — is the same answer, no candidates. `ray up` installs the stubs system-wide because that is where shells find them without an rc edit.
 
 ## Conventions
 
