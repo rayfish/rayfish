@@ -981,26 +981,24 @@ impl Daemon {
         // start, so this can only take effect on the next restart; say so
         // instead of reporting a mode the data plane is not actually in.
         let restart_note = match ipv6_only {
-            Some(want) if want != self.ipv6_only => {
-                match config::load() {
-                    Ok(mut app_config) => {
-                        app_config.ipv6_only = want;
-                        match config::save_settings(&app_config) {
-                            Ok(()) => Some(
-                                ". IPv6-only mode set; restart the daemon for changes to take effect.",
-                            ),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "failed to persist ipv6-only setting");
-                                Some(". Failed to persist the IPv6-only setting, see the log.")
-                            }
+            Some(want) if want != self.ipv6_only => match config::load() {
+                Ok(mut app_config) => {
+                    app_config.ipv6_only = want;
+                    match config::save_settings(&app_config) {
+                        Ok(()) => Some(
+                            ". IPv6-only mode set; restart the daemon for changes to take effect.",
+                        ),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to persist ipv6-only setting");
+                            Some(". Failed to persist the IPv6-only setting, see the log.")
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to load config to set ipv6-only");
-                        Some(". Failed to persist the IPv6-only setting, see the log.")
-                    }
                 }
-            }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load config to set ipv6-only");
+                    Some(". Failed to persist the IPv6-only setting, see the log.")
+                }
+            },
             _ => None,
         };
         let restart_note = restart_note.unwrap_or("");

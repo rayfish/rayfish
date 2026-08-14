@@ -120,7 +120,10 @@ pub(crate) async fn ipc_lan_peers() -> Result<()> {
                     style::faint("mDNS discovery is off — turn it on with: ray mdns on")
                 );
             } else if peers.is_empty() {
-                println!("\n  {}\n", style::faint("no rayfish nodes seen on this LAN"));
+                println!(
+                    "\n  {}\n",
+                    style::faint("no rayfish nodes seen on this LAN")
+                );
             } else {
                 let rows = peers
                     .iter()
@@ -148,7 +151,10 @@ pub(crate) async fn ipc_lan_peers() -> Result<()> {
                     })
                     .collect();
                 println!();
-                print!("{}", table(&["peer", "addresses", "seen", "status"], rows, 2));
+                print!(
+                    "{}",
+                    table(&["peer", "addresses", "seen", "status"], rows, 2)
+                );
                 println!(
                     "\n  {}",
                     style::faint("link up with: ray connect <peer> (they approve it)")

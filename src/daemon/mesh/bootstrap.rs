@@ -56,14 +56,13 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     #[cfg(not(target_os = "android"))]
     {
         let my_ipv6 = derive_ipv6(&daemon.transport.identity.local_identity());
-        let (tun_reader, tun_writer, tun_name) =
-            tun::create(
-                daemon.transport.identity.local_ip(),
-                my_ipv6,
-                daemon.ipv6_only,
-            )
-                .await
-                .context("failed to create TUN device")?;
+        let (tun_reader, tun_writer, tun_name) = tun::create(
+            daemon.transport.identity.local_ip(),
+            my_ipv6,
+            daemon.ipv6_only,
+        )
+        .await
+        .context("failed to create TUN device")?;
         daemon.tun_name.store(Arc::new(tun_name));
         daemon.attach_tun(tun_reader, tun_writer).await;
     }

@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Run alongside Tailscale (or any VPN on `100.64.0.0/10`).** Both claim that
+  range, so until now one of the two lost its IPv4 half and the daemon refused
+  to start. `ray config set ipv6-only on` (or `ray up --ipv6-only`, then a
+  restart) runs the data plane over `200::/7` only, leaving the CGNAT range to
+  the other VPN. Everything keeps working over IPv6: peers, mesh SSH, file
+  transfer, and `.ray` names, which now answer AAAA only so nothing hands an app
+  an address that goes nowhere. Peers are told, too, so they stop handing out
+  yours. Exit nodes are the exception; `ray exit-node use` says so.
+
 - **Tab completion, already installed.** The installer and `sudo ray up` write
   completion scripts for bash, zsh and fish into the directories those shells
   already search, so there is nothing to source and no rc file to edit: open a
@@ -154,6 +163,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   peer on a build older than this one cannot redeem them.
 
 ### Fixed
+
+- **A tailnet address is no longer published in your public record.** A host
+  running Rayfish next to Tailscale advertised its `fd7a:115c:a1e0::/48` address
+  as a way to reach it. No peer could route to it, and it told anyone reading
+  the record that the tailnet exists.
+
+- **Two VPNs no longer fight over `/etc/resolv.conf`.** Where Rayfish manages
+  that file directly and re-asserts it on every write, another VPN doing the
+  same thing meant the pair rewrote each other and the host's DNS came and went.
+  Rayfish now leaves the file to whoever holds it and says what to do instead.
+
+- **A clash on `100.64.0.0/10` is now detected on a stock server.** The startup
+  check shelled out to `ifconfig` and treated a missing binary as "no clash", so
+  on hosts without net-tools (most of them) Rayfish started anyway and quietly
+  lost its IPv4 half to the other VPN. It reads the kernel's address list now.
 
 - **On Android, Rayfish comes back after being turned off with "go fully
   offline when disabled" set.** Turning it back on could leave the phone

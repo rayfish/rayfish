@@ -185,8 +185,7 @@ mod tests {
         let (a, b) = (1..64u8)
             .flat_map(|i| (1..64u8).map(move |j| (i, j)))
             .find(|(i, j)| {
-                i != j
-                    && id(*i).to_string().as_bytes()[0] == id(*j).to_string().as_bytes()[0]
+                i != j && id(*i).to_string().as_bytes()[0] == id(*j).to_string().as_bytes()[0]
             })
             .expect("two ids sharing a leading character");
         peers.discovered(id(a), vec![]);

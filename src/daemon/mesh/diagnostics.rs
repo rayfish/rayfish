@@ -167,7 +167,10 @@ impl Daemon {
             .iter()
             .filter(|m| m.identity != my_id)
             .map(|m| {
-                let hostname = m.hostname.clone().or_else(|| lookup_hostname(m.ip, m.identity));
+                let hostname = m
+                    .hostname
+                    .clone()
+                    .or_else(|| lookup_hostname(m.ip, m.identity));
                 let connection = connected.get(&m.identity).map(Self::gather_conn_info);
                 let user_id = self.registry.device_user_map.resolve(&m.identity);
                 let user_identity = (user_id != m.identity).then_some(user_id);

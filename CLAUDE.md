@@ -66,7 +66,7 @@ The daemon (`src/daemon/`) is an **acyclic graph of `Arc` services** rooted at *
 | Data path | `src/forward.rs` (TUN<->peer, firewall enforce, Magic-DNS intercept), `src/tun.rs`, `src/peers.rs` |
 | Membership | `src/membership.rs` (GroupBlob, IP derivation), `src/invite.rs`, `src/dht.rs` (pkarr) |
 | Policy | `src/firewall.rs`, `src/apply.rs`, `src/reject.rs`, `src/ssh.rs` |
-| DNS | `src/dns.rs` (`.ray` responder), `src/dns_config.rs` (OS DNS integration) |
+| DNS | `src/dns/mod.rs` (`.ray` responder), `resolver.rs` (in-daemon resolver), `packet.rs` (UDP reply synthesis), `config.rs` (OS DNS integration) |
 | Config / identity | `src/config.rs`, `src/identity.rs` |
 | Misc | `src/stats.rs`, `src/ratelimit.rs`, `src/audit.rs`, `src/logdir.rs`, `src/onepassword.rs` |
 | Mobile core | `ray-mobile/src/lib.rs` (UniFFI `Node`), `android_tun.rs` (VpnService fd) |
@@ -92,6 +92,7 @@ The rules the code upholds. Read the code for the mechanics.
 - **Firewall is secure-by-default.** Inbound TCP/UDP denied, inbound ICMP allowed (a seeded, removable rule), outbound allowed; a stateful conntrack lets return traffic back. Coordinator suggestions are advisory and consented per-node; local rules are never touched by reconverge.
 - **Hostname authority = invite binding.** An invite-bound hostname is assigned exactly and a colliding claim is rejected; a free hostname gets suffix collision resolution. The roster is the single source of truth for `*.ray` DNS.
 - **Data plane vs control plane.** The daemon connects every saved network at startup and keeps those connections for its lifetime (dropped only on leave/nuke/shutdown). `up`/`down` (`activate`/`deactivate`) toggle only the data plane (TUN link, routes, Magic DNS, forward gate); `start`/`stop` toggle the whole process.
+- **IPv6-only is a start-time mode, and the v4 address stays.** `ipv6_only` (for sharing a host with a VPN that owns `100.64.0.0/10`) is read once at startup because the TUN's addressing is fixed when the device is created. The derived IPv4 is still assigned, as a `/32` instead of a `/10`: only the connected route collides, and Magic DNS depends on the address. Its reply is synthesized back into the TUN addressed to whatever source the kernel picked for the query, so with no IPv4 on the device that source comes from another interface and the reply dies as a martian. Two separate facts drive DNS answers, and both are needed: *this node* cannot use mesh v4 (a flag on `Resolver`), and *that peer* cannot (`Member.ipv6_only` on the signed roster, `HostnameEntry`'s `Option<Ipv4Addr>`). Withheld A records are NODATA, never NXDOMAIN, which would fail the AAAA alongside them.
 - **A tab never starts the daemon and never blocks the shell.** Completion is dynamic (the installed script is a stub that calls the binary), so it runs on a keystroke: it answers from an open IPC read within a 300ms budget, and every failure — no socket, no daemon, no reply in time — is the same answer, no candidates. `ray up` installs the stubs system-wide because that is where shells find them without an rc edit.
 
 ## Conventions

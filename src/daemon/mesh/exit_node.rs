@@ -311,7 +311,11 @@ impl NetworkRegistry {
     /// delivers.
     async fn publish_exit_offer(&self, network: &str, enabled: bool) {
         if self
-            .deliver_self_flag(network, &ControlMsg::ExitNodeOffer { enabled }, "exit offer")
+            .deliver_self_flag(
+                network,
+                &ControlMsg::ExitNodeOffer { enabled },
+                "exit offer",
+            )
             .await
         {
             self.record_exit_offer(network, self.transport.endpoint.id(), enabled)

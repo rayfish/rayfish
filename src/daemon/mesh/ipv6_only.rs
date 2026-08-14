@@ -62,12 +62,7 @@ impl NetworkRegistry {
     }
 
     /// Coordinator side: record a member's IPv6-only claim and republish.
-    pub(crate) async fn record_ipv6_only(
-        &self,
-        network: &str,
-        sender: EndpointId,
-        enabled: bool,
-    ) {
+    pub(crate) async fn record_ipv6_only(&self, network: &str, sender: EndpointId, enabled: bool) {
         self.record_self_flag(network, sender, "ipv6-only claim", |m| {
             let changed = m.ipv6_only != enabled;
             m.ipv6_only = enabled;

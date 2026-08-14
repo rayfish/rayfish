@@ -499,7 +499,10 @@ mod tests {
             t.insert("gaming".to_string(), hosts);
         }
         let result = resolve_name("alice.gaming.ray", SUFFIX, &table).await;
-        assert_eq!(result.map(|(v4, _)| v4), Some(Some(Ipv4Addr::new(100, 64, 10, 5))));
+        assert_eq!(
+            result.map(|(v4, _)| v4),
+            Some(Some(Ipv4Addr::new(100, 64, 10, 5)))
+        );
     }
 
     #[tokio::test]
@@ -566,7 +569,10 @@ mod tests {
             t.insert("work".to_string(), hosts);
         }
         let result = resolve_name("bob.ray", SUFFIX, &table).await;
-        assert_eq!(result.map(|(v4, _)| v4), Some(Some(Ipv4Addr::new(100, 64, 20, 3))));
+        assert_eq!(
+            result.map(|(v4, _)| v4),
+            Some(Some(Ipv4Addr::new(100, 64, 20, 3)))
+        );
     }
 
     #[tokio::test]
@@ -629,7 +635,10 @@ mod tests {
         // decline rather than claiming an authoritative NXDOMAIN for its nodes.
         assert!(
             handle_query(
-                &query("9.0.64.100.in-addr.arpa", QTYPE::TYPE(simple_dns::TYPE::PTR)),
+                &query(
+                    "9.0.64.100.in-addr.arpa",
+                    QTYPE::TYPE(simple_dns::TYPE::PTR)
+                ),
                 &table,
                 &reverse,
                 true,

@@ -1559,11 +1559,7 @@ mod tests {
         claiming.ipv6_only = true;
         let claimed = rmp_serde::to_vec_named(&claiming).unwrap();
         assert!(claimed.len() > plain.len());
-        assert!(
-            rmp_serde::from_slice::<Member>(&claimed)
-                .unwrap()
-                .ipv6_only
-        );
+        assert!(rmp_serde::from_slice::<Member>(&claimed).unwrap().ipv6_only);
     }
 
     // -- reusable keys --------------------------------------------------------

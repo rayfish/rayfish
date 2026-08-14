@@ -1723,6 +1723,52 @@ name = "test"
         assert!(cfg.relay.is_unset());
     }
 
+    /// The on/off keys round-trip through `set`/`get`, and `unset` puts each
+    /// back to its own default rather than a blanket `false`. `CONFIG_KEY_NAMES`
+    /// is the single list `config get` and tab completion both read, so a key
+    /// missing from it is invisible even though `set` accepts it.
+    #[test]
+    fn config_set_toggles_round_trip() {
+        let mut cfg = AppConfig::default();
+        for (key, default) in [
+            ("ipv6-only", false),
+            ("auto-update", false),
+            ("on-demand", true),
+        ] {
+            assert!(
+                CONFIG_KEY_NAMES.contains(&key),
+                "{key} missing from the list"
+            );
+            config_set(&mut cfg, key, "on", false).unwrap();
+            assert_eq!(config_get(&cfg, Some(key)).unwrap()[0].1, "on");
+            config_set(&mut cfg, key, "off", false).unwrap();
+            assert_eq!(config_get(&cfg, Some(key)).unwrap()[0].1, "off");
+            // Empty value = `config unset`.
+            config_set(&mut cfg, key, "", false).unwrap();
+            let want = if default { "on" } else { "off" };
+            assert_eq!(config_get(&cfg, Some(key)).unwrap()[0].1, want);
+            assert!(config_set(&mut cfg, key, "maybe", false).is_err());
+        }
+        assert!(!cfg.ipv6_only);
+        // Every listed key renders, so `config get` with no key cannot panic or
+        // silently drop one.
+        assert_eq!(
+            config_get(&cfg, None).unwrap().len(),
+            CONFIG_KEY_NAMES.len()
+        );
+    }
+
+    /// `ipv6_only` has to survive the settings.toml round trip, or the daemon
+    /// would come back dual-stack after the restart the mode requires.
+    #[test]
+    fn ipv6_only_persists_through_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        config_set(&mut cfg, "ipv6-only", "on", false).unwrap();
+        save_settings_in(dir.path(), &cfg).unwrap();
+        assert!(load_in(dir.path()).unwrap().ipv6_only);
+    }
+
     #[test]
     fn config_set_dns_upstreams_rejects_non_ip() {
         let mut cfg = AppConfig::default();

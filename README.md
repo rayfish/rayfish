@@ -498,6 +498,28 @@ added alongside the defaults; `--replace` swaps them out (a bad custom server
 with no fallback can isolate the node). Settings are saved to `settings.toml` and
 take effect on `sudo ray restart`.
 
+## Running alongside another VPN
+
+Tailscale (and anything else built on CGNAT space) routes all of
+`100.64.0.0/10`, the same range rayfish derives its IPv4 from, so on a host
+running both, one of the two loses its IPv4 half. The IPv6 ranges don't overlap,
+so rayfish can step aside and use only its own:
+
+```bash
+ray config set ipv6-only on && sudo ray restart   # or: sudo ray up --ipv6-only
+```
+
+Peers, mesh SSH, file transfer, and `.ray` names all keep working over IPv6;
+`.ray` answers AAAA only, and peers are told not to use your mesh IPv4 either.
+The one thing that doesn't work is `ray exit-node use`: the full tunnel is IPv4
+policy routing, so it's refused in this mode. Serving as an exit node for others
+is unaffected.
+
+If both VPNs manage `/etc/resolv.conf` directly (no systemd-resolved), rayfish
+leaves the file to whoever holds it rather than fighting over it, and `.ray`
+names won't resolve until you add `nameserver 100.100.100.53` yourself or put a
+DNS manager both can register with in the path.
+
 ## Troubleshooting
 
 ```bash
