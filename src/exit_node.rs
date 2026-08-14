@@ -437,6 +437,7 @@ fn host_addresses() -> HashSet<IpAddr> {
 /// Pull the addresses out of `ip -o addr show` or `ifconfig -a` output: any token
 /// following an `inet`/`inet6` keyword, with the Linux `/prefix` and BSD `%zone`
 /// suffixes stripped.
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_host_addresses(out: &str) -> HashSet<IpAddr> {
     let mut addrs = HashSet::new();
     let mut tokens = out.split_whitespace().peekable();

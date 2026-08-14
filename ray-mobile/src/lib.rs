@@ -11,6 +11,7 @@
 //! [`android_tun`], and everything else is a thin map from the core's
 //! `IpcMessage` results to the UniFFI records below.
 
+#[cfg(target_os = "android")]
 mod android_tun;
 mod diag;
 
@@ -61,9 +62,11 @@ mod android_jni {
 }
 
 use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(target_os = "android")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "android")]
 use android_tun::{AndroidTunReader, AndroidTunWriter};
 use rayfish::config;
 use rayfish::control;
@@ -354,7 +357,7 @@ fn saved_networks_status() -> Status {
     };
     // Same stable alphabetical order as the live snapshot below.
     let mut sorted = cfg.networks.clone();
-    sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    sorted.sort_by_key(|a| a.name.to_lowercase());
     let networks = sorted
         .iter()
         .map(|net| {
@@ -1014,52 +1017,71 @@ impl Node {
     /// reader/writer to the running daemon and mark the data plane active.
     /// Requires [`Node::start`] first.
     pub fn up(&self, tun_fd: i32) -> Result<(), RayError> {
-        // Kotlin calls `up(pfd.detachFd())`, so this descriptor is ours before
-        // the first line of the body runs: its `ParcelFileDescriptor` no longer
-        // owns anything and cannot close it for us. Take ownership here, ahead
-        // of anything fallible, so every early return below closes it.
-        //
-        // Leaking it on a failure path is not a mere fd leak: the fd is the only
-        // handle on the `VpnService` interface, so an unowned one keeps that
-        // interface established for the life of the process. Android tears the
-        // VPN down when the interface disappears (the framework's
-        // `interfaceRemoved` observer), so a stranded fd leaves the system
-        // showing a connected VPN while the app has fallen back to standby and
-        // reports the tunnel off, with no way to disconnect short of Settings.
-        // SAFETY: `tun_fd` came from Kotlin's `detachFd()`; nothing else owns or
-        // closes it, so wrapping it here closes it exactly once.
-        let tun = unsafe { OwnedFd::from_raw_fd(tun_fd) };
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = tun_fd;
+            Err(RayError::Network(
+                "VpnService data plane is only supported on Android".to_owned(),
+            ))
+        }
+        #[cfg(target_os = "android")]
+        {
+            // Kotlin calls `up(pfd.detachFd())`, so this descriptor is ours before
+            // the first line of the body runs: its `ParcelFileDescriptor` no longer
+            // owns anything and cannot close it for us. Take ownership here, ahead
+            // of anything fallible, so every early return below closes it.
+            //
+            // Leaking it on a failure path is not a mere fd leak: the fd is the only
+            // handle on the `VpnService` interface, so an unowned one keeps that
+            // interface established for the life of the process. Android tears the
+            // VPN down when the interface disappears (the framework's
+            // `interfaceRemoved` observer), so a stranded fd leaves the system
+            // showing a connected VPN while the app has fallen back to standby and
+            // reports the tunnel off, with no way to disconnect short of Settings.
+            // SAFETY: `tun_fd` came from Kotlin's `detachFd()`; nothing else owns or
+            // closes it, so wrapping it here closes it exactly once.
+            let tun = unsafe { OwnedFd::from_raw_fd(tun_fd) };
 
-        let state = self.state()?;
+            let state = self.state()?;
 
-        // `AndroidTunReader`/`AndroidTunWriter` wrap the fd in a `tokio` `AsyncFd`,
-        // which registers with the reactor and must be built inside the runtime
-        // context. `up` runs on a plain service thread, so enter the runtime for
-        // the duration of this call before constructing them.
-        let _guard = self.runtime.enter();
+            // `AndroidTunReader`/`AndroidTunWriter` wrap the fd in a `tokio` `AsyncFd`,
+            // which registers with the reactor and must be built inside the runtime
+            // context. `up` runs on a plain service thread, so enter the runtime for
+            // the duration of this call before constructing them.
+            let _guard = self.runtime.enter();
 
-        // The writer owns a single `dup` of the fd; the reader consumes the
-        // detached fd itself. Build the writer's dup first, while `tun` is still
-        // owned here, so a failure closes it. Two owned fds, each closed exactly
-        // once on drop (when `detach_tun`/`Drop` tears the tasks down).
-        let writer = AndroidTunWriter::new(tun.as_raw_fd()).map_err(RayError::network)?;
-        let reader = AndroidTunReader::new(tun).map_err(RayError::network)?;
+            // The writer owns a single `dup` of the fd; the reader consumes the
+            // detached fd itself. Build the writer's dup first, while `tun` is still
+            // owned here, so a failure closes it. Two owned fds, each closed exactly
+            // once on drop (when `detach_tun`/`Drop` tears the tasks down).
+            let writer = AndroidTunWriter::new(tun.as_raw_fd()).map_err(RayError::network)?;
+            let reader = AndroidTunReader::new(tun).map_err(RayError::network)?;
 
-        self.runtime.block_on(async {
-            state.attach_tun(reader, writer).await;
-            // Mark the data plane active (and configure Magic DNS) the same way
-            // `run_daemon` does after attaching the desktop TUN.
-            state.activate(None).await;
-        });
-        Ok(())
+            self.runtime.block_on(async {
+                state.attach_tun(reader, writer).await;
+                // Mark the data plane active (and configure Magic DNS) the same way
+                // `run_daemon` does after attaching the desktop TUN.
+                state.activate(None).await;
+            });
+            Ok(())
+        }
     }
 
     /// Tear the data plane down (stop the forward loop, close the fds) while
     /// keeping the control plane connected. Requires [`Node::start`] first.
     pub fn down(&self) -> Result<(), RayError> {
-        let state = self.state()?;
-        state.detach_tun();
-        Ok(())
+        #[cfg(not(target_os = "android"))]
+        {
+            Err(RayError::Network(
+                "VpnService data plane is only supported on Android".to_owned(),
+            ))
+        }
+        #[cfg(target_os = "android")]
+        {
+            let state = self.state()?;
+            state.detach_tun();
+            Ok(())
+        }
     }
 
     /// Fully tear down the control plane so the device goes offline: peers can
@@ -1152,7 +1174,7 @@ impl Node {
         }
         // Present networks in a stable alphabetical order so the UI list does
         // not shuffle between status refreshes with the core's iteration order.
-        detail.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        detail.sort_by_key(|a| a.name.to_lowercase());
         // The node's own mesh IPs are the same across networks (derived
         // from its identity); take them from the first network if any. With no
         // networks yet, derive the IPv4 from our identity so the tunnel still
@@ -1251,32 +1273,40 @@ impl Node {
     }
 }
 
-#[cfg(test)]
-mod device_name_tests {
+// Node::new mutates the process-wide config-dir environment variable. Keep all
+// host-side Node coverage in one test so parallel Rust test workers cannot race
+// two different values through the core.
+#[cfg(all(test, not(target_os = "android")))]
+mod host_surface_tests {
     use super::*;
 
     #[test]
-    fn set_default_hostname_persists_and_rejects_invalid() {
-        // Isolated config dir; Node::new points RAYFISH_CONFIG_DIR at it.
-        let dir = std::env::temp_dir().join(format!("rayfish-dn-{}", std::process::id()));
+    fn host_node_surface_uses_one_config_dir() {
+        let dir = std::env::temp_dir().join(format!("rayfish-host-surface-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let node = Node::new(dir.to_string_lossy().to_string());
 
-        node.set_default_hostname("my-phone".into()).unwrap();
-        assert_eq!(node.default_hostname(), "my-phone");
-        assert_eq!(
-            rayfish::config::load().unwrap().default_hostname.as_deref(),
-            Some("my-phone")
-        );
+        #[cfg(not(windows))]
+        {
+            node.set_default_hostname("my-phone".into()).unwrap();
+            assert_eq!(node.default_hostname(), "my-phone");
+            assert_eq!(
+                rayfish::config::load().unwrap().default_hostname.as_deref(),
+                Some("my-phone")
+            );
 
-        // Invalid name is rejected and does not overwrite the stored value.
-        assert!(node.set_default_hostname("BAD NAME".into()).is_err());
-        assert_eq!(node.default_hostname(), "my-phone");
+            // Invalid name is rejected and does not overwrite the stored value.
+            assert!(node.set_default_hostname("BAD NAME".into()).is_err());
+            assert_eq!(node.default_hostname(), "my-phone");
+        }
+
+        assert!(node.up(-1).is_err());
+        assert!(node.down().is_err());
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "android"))]
 mod tun_fd_ownership_tests {
     use super::*;
     use std::os::fd::RawFd;

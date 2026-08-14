@@ -243,6 +243,8 @@ impl Daemon {
     /// `StatusResponse` (which never carries secret keys), counters, and the log
     /// files. It never touches `secret_key` or `network_secret_key`.
     pub(crate) fn build_report(&self, peer_cred: Option<(u32, u32)>) -> IpcMessage {
+        #[cfg(windows)]
+        let _ = peer_cred;
         use std::fmt::Write as _;
 
         // --- sysinfo.txt ---
@@ -305,11 +307,14 @@ impl Daemon {
         }
 
         // Make it readable by, and owned by, the user who invoked `ray report`.
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
-        if let Some((uid, gid)) = peer_cred {
+        #[cfg(unix)]
+        {
             use std::os::unix::ffi::OsStrExt;
-            if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+            if let Some((uid, gid)) = peer_cred
+                && let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes())
+            {
                 unsafe { libc::chown(c.as_ptr(), uid, gid) };
             }
         }

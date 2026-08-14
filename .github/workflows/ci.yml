@@ -27,10 +27,10 @@ jobs:
           cache-on-failure: true
 
       - name: Check
-        run: cargo check --all-targets --locked
+        run: cargo check --workspace --all-targets --locked
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --workspace --locked

@@ -1,16 +1,29 @@
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::io::{IoSlice, IoSliceMut};
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, Ipv6Addr};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(unix)]
 use tokio::io::Interest;
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(unix)]
 use tokio::net::UnixStream;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+#[cfg(windows)]
+use tokio::time::Instant;
 use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
 
 use crate::{Action, Direction, GroupMode, Protocol, SuggestedFirewall, TransportMode};
@@ -239,6 +252,14 @@ pub enum IpcMessage {
         path: String,
         peer: String,
     },
+    /// Internal daemon request after a Windows in-band upload has been staged.
+    /// This frame is generated inside the daemon and must be rejected at the IPC
+    /// wire boundary; it is never a client-authorized file-transfer request.
+    SendFileStaged {
+        path: String,
+        filename: String,
+        peer: String,
+    },
     /// Send a file to a peer, passing the already-open file as an SCM_RIGHTS
     /// descriptor on the same connection (see [`send_with_fd`]). The client
     /// opens the file with its own privileges, so filesystem permissions and
@@ -247,6 +268,21 @@ pub enum IpcMessage {
     SendFileFd {
         filename: String,
         peer: String,
+    },
+    /// Windows named-pipe file transfer. The path never crosses IPC; the daemon
+    /// receives the bytes into a server-created temporary file.
+    SendFileBegin {
+        filename: String,
+        peer: String,
+        /// Initial metadata hint; stream completion is determined by the EOF
+        /// `SendFileChunk { done: true }` frame because the file may change.
+        size: u64,
+    },
+    /// A data chunk. The terminal frame has `done=true` and an empty payload;
+    /// declared metadata size is not used to decide stream completion.
+    SendFileChunk {
+        data: Vec<u8>,
+        done: bool,
     },
     ListFiles,
     /// Cancel a queued outbound send (`ray files cancel <id>`). Only reaches
@@ -929,16 +965,22 @@ impl<T: DeserializeOwned> Decoder for MsgpackCodec<T> {
     }
 }
 
+#[cfg(unix)]
 pub type IpcFramed = Framed<UnixStream, MsgpackCodec<IpcMessage>>;
+#[cfg(windows)]
+pub type IpcFramed = Framed<NamedPipeClient, MsgpackCodec<IpcMessage>>;
 
 pub fn socket_path() -> PathBuf {
-    if cfg!(target_os = "macos") {
+    if cfg!(windows) {
+        PathBuf::from(r"\\.\pipe\rayfish")
+    } else if cfg!(target_os = "macos") {
         PathBuf::from("/var/run/rayfish.sock")
     } else {
         PathBuf::from("/var/run/rayfish/rayfish.sock")
     }
 }
 
+#[cfg(unix)]
 pub async fn connect() -> Result<IpcFramed> {
     let path = socket_path();
     let stream = UnixStream::connect(&path)
@@ -947,16 +989,141 @@ pub async fn connect() -> Result<IpcFramed> {
     Ok(Framed::new(stream, MsgpackCodec::new()))
 }
 
-pub fn framed(stream: UnixStream) -> IpcFramed {
+#[cfg(windows)]
+pub async fn connect() -> Result<IpcFramed> {
+    const PIPE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    let deadline = Instant::now() + PIPE_CONNECT_TIMEOUT;
+    let stream = loop {
+        match ClientOptions::new().open(r"\\.\pipe\rayfish") {
+            Ok(stream) => break stream,
+            Err(error) => match classify_pipe_open_error(&error) {
+                PipeOpenError::Busy if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                PipeOpenError::Busy => {
+                    anyhow::bail!(
+                        "Rayfish service pipe remained busy for {PIPE_CONNECT_TIMEOUT:?}; retry later"
+                    )
+                }
+                PipeOpenError::NotFound => {
+                    return Err(error).context("daemon not running — start the Rayfish service");
+                }
+                PipeOpenError::Other(code) => {
+                    return Err(error).context(format!(
+                        "cannot connect to Rayfish service pipe (Windows error {code})"
+                    ));
+                }
+            },
+        }
+    };
+    verify_windows_server_is_local_system(&stream)?;
+    Ok(Framed::new(stream, MsgpackCodec::new()))
+}
+
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+enum PipeOpenError {
+    Busy,
+    NotFound,
+    Other(i32),
+}
+
+#[cfg(windows)]
+fn classify_pipe_open_error(error: &std::io::Error) -> PipeOpenError {
+    match error.raw_os_error() {
+        Some(231) => PipeOpenError::Busy,       // ERROR_PIPE_BUSY
+        Some(2 | 3) => PipeOpenError::NotFound, // FILE/PATH_NOT_FOUND
+        Some(code) => PipeOpenError::Other(code),
+        None => PipeOpenError::Other(-1),
+    }
+}
+
+#[cfg(windows)]
+fn verify_windows_server_is_local_system(stream: &NamedPipeClient) -> Result<()> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let pipe = stream.as_raw_handle() as HANDLE;
+    let mut pid = 0;
+    anyhow::ensure!(
+        unsafe { GetNamedPipeServerProcessId(pipe, &mut pid) } != 0 && pid != 0,
+        "cannot verify Rayfish service identity"
+    );
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    anyhow::ensure!(!process.is_null(), "cannot open Rayfish service process");
+    let mut token = std::ptr::null_mut();
+    let token_ok = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
+    unsafe { CloseHandle(process) };
+    anyhow::ensure!(
+        token_ok != 0 && !token.is_null(),
+        "cannot read Rayfish service token"
+    );
+    let mut bytes = 0;
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut bytes) };
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(std::mem::size_of::<u64>())];
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+        )
+    };
+    unsafe { CloseHandle(token) };
+    anyhow::ensure!(ok != 0, "cannot read Rayfish service SID");
+    let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    let mut text = std::ptr::null_mut();
+    anyhow::ensure!(
+        unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) } != 0 && !text.is_null(),
+        "cannot format Rayfish service SID"
+    );
+    let mut len = 0;
+    unsafe {
+        while *text.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let sid = OsString::from_wide(unsafe { std::slice::from_raw_parts(text, len) })
+        .to_string_lossy()
+        .into_owned();
+    unsafe { LocalFree(text.cast()) };
+    anyhow::ensure!(
+        sid == "S-1-5-18",
+        "refusing IPC pipe owned by non-LocalSystem process ({sid})"
+    );
+    Ok(())
+}
+
+pub fn framed<S>(stream: S) -> Framed<S, MsgpackCodec<IpcMessage>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     Framed::new(stream, MsgpackCodec::new())
 }
 
-pub async fn send(framed: &mut IpcFramed, msg: IpcMessage) -> Result<()> {
+pub async fn send<S>(
+    framed: &mut Framed<S, MsgpackCodec<IpcMessage>>,
+    msg: IpcMessage,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     use futures::SinkExt;
     framed.send(msg).await
 }
 
-pub async fn recv(framed: &mut IpcFramed) -> Result<IpcMessage> {
+pub async fn recv<S>(framed: &mut Framed<S, MsgpackCodec<IpcMessage>>) -> Result<IpcMessage>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     use futures::StreamExt;
     framed.next().await.context("connection closed")?
 }
@@ -970,6 +1137,7 @@ pub const MAX_IPC_FDS: usize = 4;
 /// first byte as SCM_RIGHTS ancillary data. The receiver must read with
 /// [`recv_with_fds`]: a plain `read()` consumes the bytes but silently drops
 /// the descriptor.
+#[cfg(unix)]
 pub async fn send_with_fd(stream: &UnixStream, msg: &IpcMessage, fd: BorrowedFd<'_>) -> Result<()> {
     use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 
@@ -1006,6 +1174,7 @@ pub async fn send_with_fd(stream: &UnixStream, msg: &IpcMessage, fd: BorrowedFd<
 /// with it. The daemon reads every request through this (not through the
 /// framed codec) because ancillary data is only surfaced by `recvmsg` with a
 /// control buffer; any other read on the socket would drop the descriptors.
+#[cfg(unix)]
 pub async fn recv_with_fds(stream: &UnixStream) -> Result<(IpcMessage, Vec<OwnedFd>)> {
     use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
 
@@ -1081,6 +1250,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn in_band_file_frames_roundtrip() {
+        for request in [
+            IpcMessage::SendFileBegin {
+                filename: "a.txt".into(),
+                peer: "peer1".into(),
+                size: 5,
+            },
+            IpcMessage::SendFileChunk {
+                data: b"hello".to_vec(),
+                done: true,
+            },
+        ] {
+            let bytes = rmp_serde::to_vec_named(&request).unwrap();
+            let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+            assert!(matches!(
+                decoded,
+                IpcMessage::SendFileBegin { .. } | IpcMessage::SendFileChunk { .. }
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_open_errors_keep_busy_distinct_from_absence() {
+        assert_eq!(
+            classify_pipe_open_error(&std::io::Error::from_raw_os_error(231)),
+            PipeOpenError::Busy
+        );
+        assert_eq!(
+            classify_pipe_open_error(&std::io::Error::from_raw_os_error(2)),
+            PipeOpenError::NotFound
+        );
+        assert_eq!(
+            classify_pipe_open_error(&std::io::Error::from_raw_os_error(5)),
+            PipeOpenError::Other(5)
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn send_file_fd_roundtrip() {
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -1113,6 +1322,7 @@ mod tests {
         assert_eq!(contents, "payload bytes");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn recv_with_fds_handles_plain_frames() {
         use futures::SinkExt;
@@ -1126,6 +1336,7 @@ mod tests {
         assert!(fds.is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn send_file_fd_survives_multi_chunk_frames() {
         use std::os::fd::AsFd;

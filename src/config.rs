@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::fs::Permissions;
 use std::net::Ipv4Addr;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -672,8 +674,21 @@ fn set_owner(path: &Path, secret: bool) {
     }
 }
 
+/// Unit tests use caller-owned temporary directories and must not replace their
+/// inherited ACL with the service-only ProgramData ACL.
+#[cfg(all(windows, test))]
+fn ensure_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
+}
+
+#[cfg(all(windows, not(test)))]
+fn ensure_dir(dir: &Path) -> Result<()> {
+    crate::windows_security::ensure_protected_dir(dir)
+}
+
 /// Create `dir` (and parents) with restrictive perms: 0750 root:rayfish on
-/// Linux. Idempotent.
+/// Unix. Idempotent.
+#[cfg(not(windows))]
 fn ensure_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     #[cfg(target_os = "linux")]
@@ -718,12 +733,133 @@ pub fn config_dir() -> Result<PathBuf> {
     // library still compiles/runs standalone.
     #[cfg(target_os = "android")]
     let dir = PathBuf::from("/data/local/tmp/rayfish");
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    #[cfg(target_os = "windows")]
+    let dir = std::env::var_os("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::data_dir().unwrap_or_else(|| PathBuf::from(r"C:\ProgramData")))
+        .join("rayfish");
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows"
+    )))]
     let dir = dirs::config_dir()
         .context("could not determine config directory")?
         .join("rayfish");
     ensure_dir(&dir)?;
     Ok(dir)
+}
+
+#[cfg(windows)]
+const OPERATOR_SID_FILE: &str = "operator.sid";
+
+#[cfg(windows)]
+const OPERATOR_LOCK_FILE: &str = "operator.sid.lock";
+
+#[cfg(windows)]
+fn operator_sid_at(path: &Path) -> Result<Option<String>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect operator SID"),
+    };
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "operator SID is a reparse point"
+    );
+    use std::io::Read;
+    #[cfg(not(test))]
+    let mut file = crate::windows_security::open_protected_file_no_follow(path)?;
+    #[cfg(test)]
+    let mut file = std::fs::File::open(path)?;
+    let mut sid = String::new();
+    file.read_to_string(&mut sid)?;
+    let sid = sid.trim().to_string();
+    Ok((!sid.is_empty()).then_some(sid))
+}
+
+#[cfg(windows)]
+fn lock_operator(dir: &Path) -> Result<crate::windows_security::OperatorFileLock> {
+    crate::windows_security::lock_operator_file(&dir.join(OPERATOR_LOCK_FILE))
+}
+
+#[cfg(windows)]
+pub fn operator_sid() -> Result<Option<String>> {
+    let path = config_dir()?.join(OPERATOR_SID_FILE);
+    operator_sid_at(&path)
+}
+
+#[cfg(windows)]
+pub fn set_operator_sid(sid: &str) -> Result<()> {
+    crate::windows_security::pipe_descriptor(Some(sid))?;
+    let dir = config_dir()?;
+    let _lock = lock_operator(&dir)?;
+    let path = dir.join(OPERATOR_SID_FILE);
+    write_atomic(&path, &format!("{sid}\n"), true)
+}
+
+/// Atomically record the first Windows operator without replacing an existing
+/// non-empty SID. Returns `true` only to the process that won the claim.
+#[cfg(windows)]
+pub fn claim_operator_sid(sid: &str) -> Result<bool> {
+    crate::windows_security::pipe_descriptor(Some(sid))?;
+    let dir = config_dir()?;
+    let _lock = lock_operator(&dir)?;
+    let path = dir.join(OPERATOR_SID_FILE);
+    if operator_sid_at(&path)?.is_some() {
+        return Ok(false);
+    }
+    if path.exists() && std::fs::metadata(&path)?.len() == 0 {
+        std::fs::remove_file(&path).context("remove incomplete operator SID claim")?;
+    }
+    let tmp = windows_config_stage_path(&dir, OPERATOR_SID_FILE);
+    let result = (|| -> Result<bool> {
+        use std::io::Write;
+        let mut file = create_windows_config_stage(&tmp)?;
+        writeln!(file, "{sid}").context("write operator SID claim")?;
+        file.sync_all().context("flush operator SID claim")?;
+        drop(file);
+        crate::windows_security::move_no_replace(&tmp, &path)
+    })();
+    if tmp.exists() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Compensate only the exact claim made by this process. A concurrent explicit
+/// recovery that changed the operator is never removed.
+#[cfg(windows)]
+pub fn remove_operator_sid_if_matches(sid: &str) -> Result<bool> {
+    let dir = config_dir()?;
+    let _lock = lock_operator(&dir)?;
+    let path = dir.join(OPERATOR_SID_FILE);
+    if operator_sid_at(&path)?.as_deref() != Some(sid) {
+        return Ok(false);
+    }
+    std::fs::remove_file(path).context("remove failed operator SID claim")?;
+    Ok(true)
+}
+
+/// Restore an operator value only if nobody replaced the value being
+/// compensated. Used by service-restart recovery to avoid stale rollback.
+#[cfg(windows)]
+pub fn replace_operator_sid_if_matches(expected: &str, replacement: Option<&str>) -> Result<bool> {
+    if let Some(sid) = replacement {
+        crate::windows_security::pipe_descriptor(Some(sid))?;
+    }
+    let dir = config_dir()?;
+    let _lock = lock_operator(&dir)?;
+    let path = dir.join(OPERATOR_SID_FILE);
+    if operator_sid_at(&path)?.as_deref() != Some(expected) {
+        return Ok(false);
+    }
+    match replacement {
+        Some(sid) => write_atomic(&path, &format!("{sid}\n"), true)?,
+        None => std::fs::remove_file(&path).context("remove compensated operator SID")?,
+    }
+    Ok(true)
 }
 
 /// Reject a network name that can't be a safe single path component (defence in
@@ -748,31 +884,76 @@ fn validate_net_name(name: &str) -> Result<()> {
 /// Public so every rayfish config writer (identity key, invite ledger, etc.)
 /// shares the same atomic + restrictive-perms guarantees under the config tree.
 pub fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
+    #[cfg(windows)]
+    let _ = secret;
     let dir = path.parent().context("config path has no parent")?;
     ensure_dir(dir)?;
     let fname = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("config");
+    #[cfg(windows)]
+    let tmp = windows_config_stage_path(dir, fname);
+    #[cfg(not(windows))]
     let tmp = dir.join(format!(".{fname}.tmp.{}", std::process::id()));
     {
         use std::io::Write;
+        #[cfg(windows)]
+        let mut f = create_windows_config_stage(&tmp)?;
+        #[cfg(not(windows))]
         let mut f =
             std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         f.write_all(bytes)
             .with_context(|| format!("writing {}", tmp.display()))?;
         f.sync_all().ok();
     }
-    let mode = if secret { 0o600 } else { 0o640 };
-    let _ = std::fs::set_permissions(&tmp, Permissions::from_mode(mode));
+    #[cfg(unix)]
+    {
+        let mode = if secret { 0o600 } else { 0o640 };
+        let _ = std::fs::set_permissions(&tmp, Permissions::from_mode(mode));
+    }
     #[cfg(target_os = "linux")]
     set_owner(&tmp, secret);
+    #[cfg(all(windows, not(test)))]
+    validate_existing_windows_config_child(path)?;
     let renamed = std::fs::rename(&tmp, path);
     if renamed.is_err() {
         // Clean up the temp file on a failed rename so we don't litter.
         let _ = std::fs::remove_file(&tmp);
     }
     renamed.with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_config_stage_path(dir: &Path, filename: &str) -> PathBuf {
+    let nonce = hex::encode(rand::random::<[u8; 32]>());
+    dir.join(format!(".{filename}.tmp.{nonce}"))
+}
+
+#[cfg(windows)]
+fn create_windows_config_stage(path: &Path) -> Result<std::fs::File> {
+    #[cfg(not(test))]
+    {
+        crate::windows_security::create_protected_new_file(path)
+    }
+    #[cfg(test)]
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("creating unique config stage {}", path.display()))
+}
+
+#[cfg(all(windows, not(test)))]
+fn validate_existing_windows_config_child(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => drop(crate::windows_security::open_protected_file_no_follow(
+            path,
+        )?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
     Ok(())
 }
 
@@ -784,8 +965,17 @@ fn write_atomic(path: &Path, contents: &str, secret: bool) -> Result<()> {
 /// For append-mode files (e.g. the audit log) that aren't rewritten via
 /// [`write_file`]. Best-effort.
 pub fn restrict_perms(path: &Path, secret: bool) {
-    let mode = if secret { 0o600 } else { 0o640 };
-    let _ = std::fs::set_permissions(path, Permissions::from_mode(mode));
+    #[cfg(all(windows, test))]
+    let _ = (path, secret);
+    #[cfg(all(windows, not(test)))]
+    if secret && let Err(error) = crate::windows_security::protect_file(path) {
+        tracing::error!(path = %path.display(), %error, "failed to protect Windows config file");
+    }
+    #[cfg(unix)]
+    {
+        let mode = if secret { 0o600 } else { 0o640 };
+        let _ = std::fs::set_permissions(path, Permissions::from_mode(mode));
+    }
     #[cfg(target_os = "linux")]
     set_owner(path, secret);
 }
@@ -1108,6 +1298,22 @@ mod tests {
             config_dir_override(Some(OsString::from("/srv/rayfish"))),
             Some(PathBuf::from("/srv/rayfish"))
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_stage_names_are_random_and_create_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = windows_config_stage_path(dir.path(), "settings.toml");
+        let second = windows_config_stage_path(dir.path(), "settings.toml");
+        assert_ne!(first, second);
+        let name = first.file_name().unwrap().to_string_lossy();
+        let nonce = name.strip_prefix(".settings.toml.tmp.").unwrap();
+        assert_eq!(nonce.len(), 64);
+        assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        drop(create_windows_config_stage(&first).unwrap());
+        assert!(create_windows_config_stage(&first).is_err());
     }
 
     #[test]

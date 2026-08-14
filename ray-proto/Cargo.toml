@@ -19,12 +19,23 @@ bytes = "1"
 derive_more = { version = "2", features = ["is_variant", "display"] }
 futures = "0.3"
 iroh = { version = "1" }
-# SCM_RIGHTS fd passing for `SendFileFd` (sendmsg/recvmsg with ancillary data).
-nix = { version = "0.30", features = ["socket", "uio"] }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["net"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+
+[target.'cfg(unix)'.dependencies]
+# SCM_RIGHTS fd passing for `SendFileFd` (sendmsg/recvmsg with ancillary data).
+nix = { version = "0.30", features = ["socket", "uio"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"

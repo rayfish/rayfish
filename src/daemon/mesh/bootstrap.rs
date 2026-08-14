@@ -10,11 +10,26 @@
 
 use std::sync::Mutex;
 
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HANDLE;
+
 use iroh_blobs::provider::events::{
     ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
 };
 
 use super::super::*;
+#[cfg(windows)]
+use crate::windows_identity;
 
 /// How often the blob store sweeps untagged blobs. This is reclaim latency, not
 /// correctness: a finished transfer's bytes linger at most this long after its
@@ -25,7 +40,7 @@ const BLOB_GC_INTERVAL: Duration = Duration::from_secs(600);
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
     // Bail early on a CGNAT clash (e.g. Tailscale) before touching anything.
     #[cfg(not(target_os = "android"))]
-    check_cgnat_conflict()?;
+    check_cgnat_conflict().await?;
 
     // Repair a leftover `/etc/resolv.conf` before anything reads it. A hard kill
     // or reboot leaves ours in place (nameserver = our own Magic DNS), and the
@@ -51,7 +66,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     {
         let my_ipv6 = derive_ipv6(&daemon.transport.identity.local_identity());
         let (tun_reader, tun_writer, tun_name) =
-            tun::create(daemon.transport.identity.local_ip(), my_ipv6)
+            tun::PlatformTun::create(daemon.transport.identity.local_ip(), my_ipv6)
                 .await
                 .context("failed to create TUN device")?;
         daemon.tun_name.store(Arc::new(tun_name));
@@ -730,6 +745,7 @@ async fn spawn_metrics_server(
 /// `token` is cancelled. On shutdown, put the VPN on standby (revert DNS, drop
 /// connections, bring the TUN down) and remove the socket file. Each request is
 /// handled on its own task so a slow client can't block the accept loop.
+#[cfg(unix)]
 async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()> {
     let socket_path = ipc::socket_path();
     if let Some(parent) = socket_path.parent() {
@@ -769,6 +785,7 @@ async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()>
 /// by reaching the socket: every mutating request is authorized per-connection
 /// in `check_authorized` via `SO_PEERCRED` (root or the configured operator
 /// UID), Tailscale's model, so the file mode only has to permit the connect().
+#[cfg(unix)]
 fn set_socket_permissions(path: &std::path::Path) {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -779,8 +796,12 @@ fn set_socket_permissions(path: &std::path::Path) {
     }
 }
 
+#[cfg(unix)]
 async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<()> {
-    let peer_cred = stream.peer_cred().ok().map(|c| (c.uid(), c.gid()));
+    let peer_cred = stream.peer_cred().ok().map(|c| PeerIdentity::Unix {
+        uid: c.uid(),
+        gid: c.gid(),
+    });
     // The request is read fd-aware: `SendFileFd` arrives with the file as
     // SCM_RIGHTS ancillary data, which a plain framed read would drop.
     let (req, fds) = ipc::recv_with_fds(&stream).await?;
@@ -788,6 +809,291 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<(
     let mut framed = ipc::framed(stream);
     ipc::send(&mut framed, resp).await?;
     Ok(())
+}
+
+#[cfg(windows)]
+async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()> {
+    let pipe_name = ipc::socket_path();
+    let pipe_name = pipe_name.to_string_lossy().into_owned();
+    let staging_dir = prepare_ipc_upload_dir()?;
+    sweep_ipc_upload_orphans(&staging_dir)?;
+    let mut server = create_named_pipe(&pipe_name, true)?;
+    let mut standby = create_named_pipe(&pipe_name, false)?;
+    tracing::info!(pipe = %pipe_name, "IPC named pipe listening");
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                daemon.deactivate().await;
+                return Ok(());
+            }
+            result = server.connect() => {
+                if let Err(error) = result {
+                    tracing::warn!(error = %error, "IPC named pipe accept failed; recovering listener");
+                    match recreate_named_pipe(&pipe_name, &token).await {
+                        Some(replacement) => server = replacement,
+                        None => {
+                            daemon.deactivate().await;
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
+                let client = server;
+                let client_daemon = daemon.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_ipc_client(client, &client_daemon).await {
+                        tracing::debug!(error = %e, "IPC client error");
+                    }
+                });
+                match recreate_named_pipe(&pipe_name, &token).await {
+                    Some(replacement) => server = replacement,
+                    None => {
+                        daemon.deactivate().await;
+                        return Ok(());
+                    }
+                }
+            }
+            result = standby.connect() => {
+                if let Err(error) = result {
+                    tracing::warn!(error = %error, "standby IPC named pipe accept failed; recovering listener");
+                    match recreate_named_pipe(&pipe_name, &token).await {
+                        Some(replacement) => standby = replacement,
+                        None => {
+                            daemon.deactivate().await;
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
+                let client = standby;
+                let client_daemon = daemon.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_ipc_client(client, &client_daemon).await {
+                        tracing::debug!(error = %e, "IPC client error");
+                    }
+                });
+                match recreate_named_pipe(&pipe_name, &token).await {
+                    Some(replacement) => standby = replacement,
+                    None => {
+                        daemon.deactivate().await;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+const IPC_UPLOAD_PREFIX: &str = "rayfish-ipc-upload-";
+#[cfg(windows)]
+const IPC_UPLOAD_SUFFIX: &str = ".part";
+#[cfg(windows)]
+const IPC_MAX_TRANSFER: u64 = 4 * 1024 * 1024 * 1024;
+
+#[cfg(windows)]
+fn prepare_ipc_upload_dir() -> Result<PathBuf> {
+    let dir = crate::config::config_dir()?.join("ipc-upload");
+    crate::windows_security::ensure_protected_dir(&dir)?;
+    Ok(dir)
+}
+
+#[cfg(windows)]
+fn is_ipc_upload_temp_name(name: &str) -> bool {
+    name.starts_with(IPC_UPLOAD_PREFIX) && name.ends_with(IPC_UPLOAD_SUFFIX)
+}
+
+#[cfg(windows)]
+fn is_internal_file_frame(message: &IpcMessage) -> bool {
+    matches!(
+        message,
+        IpcMessage::SendFileStaged { .. } | IpcMessage::SendFileChunk { .. }
+    )
+}
+
+#[cfg(windows)]
+fn sweep_ipc_upload_orphans(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("enumerate IPC upload staging directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !is_ipc_upload_temp_name(name) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect IPC upload staging path {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.file_attributes() & 0x400 == 0,
+            "refusing to sweep reparse-point IPC upload staging path {}",
+            path.display()
+        );
+        if metadata.is_file() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("remove orphaned IPC upload {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_ipc_tests {
+    use super::{IpcMessage, is_internal_file_frame, is_ipc_upload_temp_name};
+
+    #[test]
+    fn only_rayfish_partial_upload_names_are_sweep_candidates() {
+        assert!(is_ipc_upload_temp_name("rayfish-ipc-upload-a.part"));
+        assert!(!is_ipc_upload_temp_name("rayfish-ipc-upload-a"));
+        assert!(!is_ipc_upload_temp_name("unrelated.part"));
+    }
+
+    #[test]
+    fn staged_and_chunk_frames_are_internal_only() {
+        assert!(is_internal_file_frame(&IpcMessage::SendFileStaged {
+            path: "x".into(),
+            filename: "x".into(),
+            peer: "p".into(),
+        }));
+        assert!(is_internal_file_frame(&IpcMessage::SendFileChunk {
+            data: vec![1],
+            done: false,
+        }));
+        assert!(!is_internal_file_frame(&IpcMessage::Status));
+    }
+}
+
+#[cfg(windows)]
+async fn recreate_named_pipe(name: &str, token: &CancellationToken) -> Option<NamedPipeServer> {
+    loop {
+        match create_named_pipe(name, false) {
+            Ok(pipe) => return Some(pipe),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to recreate IPC named pipe; retrying");
+                tokio::select! {
+                    _ = token.cancelled() => return None,
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_named_pipe(name: &str, first: bool) -> Result<NamedPipeServer> {
+    let operator = crate::config::operator_sid()?;
+    let mut descriptor = crate::windows_security::pipe_descriptor(operator.as_deref())?;
+    let mut attributes = descriptor.attributes();
+    let mut options = ServerOptions::new();
+    options.first_pipe_instance(first);
+    unsafe {
+        options.create_with_security_attributes_raw(
+            name,
+            (&mut attributes as *mut windows_sys::Win32::Security::SECURITY_ATTRIBUTES).cast(),
+        )
+    }
+    .context("create protected IPC named pipe")
+}
+
+#[cfg(windows)]
+async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Result<()> {
+    let identity = windows_identity::named_pipe_client_identity(stream.as_raw_handle() as HANDLE)?;
+    let peer = Some(PeerIdentity::Windows {
+        sid: identity.sid,
+        is_local_system: identity.is_local_system,
+        is_elevated_admin: identity.is_elevated_admin,
+    });
+    let mut framed = ipc::framed(stream);
+    let req = ipc::recv(&mut framed).await?;
+    if is_internal_file_frame(&req) {
+        ipc::send(
+            &mut framed,
+            IpcMessage::Error {
+                message: "internal file-transfer frame is not accepted at the IPC boundary"
+                    .to_owned(),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    if matches!(req, ipc::IpcMessage::SendFileBegin { .. })
+        && let Some(error) = Daemon::check_authorized(&req, peer.as_ref())
+    {
+        ipc::send(&mut framed, error).await?;
+        return Ok(());
+    }
+    let resp = if let ipc::IpcMessage::SendFileBegin {
+        filename,
+        peer: target,
+        size: _declared_size,
+    } = req
+    {
+        const CHUNK: usize = 256 * 1024;
+        let result: Result<IpcMessage> = async {
+            anyhow::ensure!(
+                !filename.is_empty() && filename.len() <= 255,
+                "invalid file name"
+            );
+            let staging_dir = prepare_ipc_upload_dir()?;
+            let staged = tempfile::Builder::new()
+                .prefix(IPC_UPLOAD_PREFIX)
+                .suffix(IPC_UPLOAD_SUFFIX)
+                .tempfile_in(&staging_dir)?;
+            crate::windows_security::protect_file(staged.path())?;
+            let temp = staged.path().to_path_buf();
+            let mut output = tokio::fs::File::from_std(staged.reopen()?);
+            let mut received = 0u64;
+            let response = loop {
+                match tokio::time::timeout(Duration::from_secs(30), ipc::recv(&mut framed))
+                    .await
+                    .context("timed out waiting for in-band file chunk")??
+                {
+                    ipc::IpcMessage::SendFileChunk { data, done } => {
+                        anyhow::ensure!(data.len() <= CHUNK, "in-band file chunk exceeds 256 KiB");
+                        anyhow::ensure!(done || !data.is_empty(), "empty non-final file chunk");
+                        received = received
+                            .checked_add(data.len() as u64)
+                            .context("in-band file size overflow")?;
+                        anyhow::ensure!(
+                            received <= IPC_MAX_TRANSFER,
+                            "in-band file exceeds 4 GiB limit"
+                        );
+                        tokio::io::AsyncWriteExt::write_all(&mut output, &data).await?;
+                        if done {
+                            tokio::io::AsyncWriteExt::flush(&mut output).await?;
+                            drop(output);
+                            break daemon
+                                .handle_request(
+                                    ipc::IpcMessage::SendFileStaged {
+                                        path: temp.to_string_lossy().into_owned(),
+                                        filename,
+                                        peer: target,
+                                    },
+                                    peer.clone(),
+                                    Vec::new(),
+                                )
+                                .await;
+                        }
+                    }
+                    other => anyhow::bail!("unexpected in-band file frame: {other:?}"),
+                }
+            };
+            drop(staged);
+            Ok(response)
+        }
+        .await;
+        match result {
+            Ok(response) => response,
+            Err(error) => IpcMessage::Error {
+                message: format!("in-band file upload failed: {error:#}"),
+            },
+        }
+    } else {
+        daemon.handle_request(req, peer, Vec::new()).await
+    };
+    ipc::send(&mut framed, resp).await
 }
 
 /// First auto-update check runs ~5 min after boot (jittered), then every 6h.
@@ -814,7 +1120,7 @@ fn spawn_auto_update(token: CancellationToken) -> tokio::task::JoinHandle<()> {
             _ = tokio::time::sleep(first) => {}
         }
         loop {
-            if let Err(e) = auto_update_once().await {
+            if let Err(e) = auto_update_once(&token).await {
                 tracing::warn!(error = %e, "auto-update check failed");
             }
             let next = AUTO_UPDATE_INTERVAL + Duration::from_secs(rand::random::<u64>() % 300);
@@ -831,7 +1137,7 @@ fn spawn_auto_update(token: CancellationToken) -> tokio::task::JoinHandle<()> {
 /// needed doing (or the swap+restart was scheduled, the daemon is torn down and
 /// relaunched onto the new binary shortly after).
 #[cfg(feature = "desktop")]
-async fn auto_update_once() -> Result<()> {
+async fn auto_update_once(shutdown: &CancellationToken) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     let asset = crate::update::release_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
     let client = crate::update::build_http_client()?;
@@ -872,11 +1178,24 @@ async fn auto_update_once() -> Result<()> {
     tracing::info!(current, target = %tag, "auto-update: found newer stable release, swapping");
     let expected = crate::update::fetch_checksum(&client, &tag, &asset).await?;
     let bin_url = crate::update::asset_download_url(&tag, &asset);
-    crate::update::download_and_swap(&client, &bin_url, &expected, &asset).await?;
+    #[cfg(windows)]
+    {
+        let msi = crate::update::download_msi_to_temp(&client, &bin_url, &expected, &asset).await?;
+        let identity = crate::update::fetch_version_manifest(&client, &tag, &asset).await?;
+        crate::update::schedule_msi_update(&msi, &identity, &expected)?;
+        tracing::info!(target = %identity, path = %msi.display(), "auto-update: detached Windows MSI installation scheduled");
+        shutdown.cancel();
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = shutdown;
+        crate::update::download_and_swap(&client, &bin_url, &expected, &asset).await?;
 
-    tracing::info!(target = %tag, "auto-update: binary swapped, restarting service onto it");
-    crate::update::trigger_detached_restart();
-    Ok(())
+        tracing::info!(target = %tag, "auto-update: binary swapped, restarting service onto it");
+        crate::update::trigger_detached_restart();
+        Ok(())
+    }
 }
 
 /// Current unix time in whole seconds (best-effort; 0 before the epoch, which

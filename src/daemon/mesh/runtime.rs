@@ -978,7 +978,7 @@ impl Daemon {
             let tun_name = self.tun_name.load().as_str().to_owned();
             let my_v4 = self.transport.identity.local_ip();
             let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
-            if let Err(e) = tun::set_link_up(&tun_name) {
+            if let Err(e) = tun::PlatformTun::set_link_up(&tun_name).await {
                 tracing::warn!(error = %e, "failed to bring TUN interface up");
                 warnings.push(format!("failed to bring TUN interface up: {e}"));
             }
@@ -996,12 +996,11 @@ impl Daemon {
             // link-up: on Linux the kernel won't install an IPv6 connected route
             // while the link is down, so without this peer traffic leaks out the
             // default route.
-            if let Err(e) = tun::route_peer_range(&tun_name).await {
+            if let Err(e) = tun::PlatformTun::route_peer_range(&tun_name).await {
                 tracing::warn!(error = %e, "failed to route 200::/7 into TUN");
                 warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
             }
-
-            if let Err(e) = tun::route_magic_dns(&tun_name).await {
+            if let Err(e) = tun::PlatformTun::route_magic_dns(&tun_name).await {
                 tracing::warn!(error = %e, "failed to route magic DNS IP into TUN");
             }
 
@@ -1408,8 +1407,13 @@ impl Daemon {
         let tun_name = self.tun_name.load().as_str().to_owned();
         self.dns.revert(&tun_name).await;
 
+        #[cfg(target_os = "windows")]
+        if let Err(e) = tun::PlatformTun::unroute_peer_range(&tun_name).await {
+            tracing::warn!(error = %e, "failed to remove Windows TUN routes");
+        }
+
         #[cfg(not(target_os = "android"))]
-        if let Err(e) = tun::set_link_down(&tun_name) {
+        if let Err(e) = tun::PlatformTun::set_link_down(&tun_name).await {
             tracing::warn!(error = %e, "failed to bring TUN interface down");
         }
 

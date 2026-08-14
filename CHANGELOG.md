@@ -73,6 +73,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of leaving you to guess. Under SysV init nothing supervises the daemon, so
   `ray up` says so: a crash stays down until the next `ray start`.
 
+- **Windows x64 desktop build path.** The daemon now has a LocalSystem service,
+  SID-authorized named-pipe IPC, signed Wintun/MSI packaging, Windows route/DNS
+  integration, and bounded in-band file transfer. Windows SSH/PTY remains
+  explicitly unsupported in this first port.
+
 - **The Android app can cancel a queued send.** A send waiting on a peer that
   hasn't picked it up now shows under Notifications with a Cancel button, the
   same thing `ray files cancel` does on desktop. Only works before the offer

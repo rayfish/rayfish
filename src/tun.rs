@@ -13,7 +13,9 @@ use std::future::Future;
 use std::net::IpAddr;
 #[cfg(not(target_os = "android"))]
 use std::net::{Ipv4Addr, Ipv6Addr};
-#[cfg(not(target_os = "android"))]
+#[cfg(target_os = "windows")]
+use std::path::PathBuf;
+#[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
 use std::process::Command;
 #[cfg(not(target_os = "android"))]
 use std::sync::Arc;
@@ -102,44 +104,96 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
     octets[0] == 100 && (octets[1] & 0xC0) == 64
 }
 
+#[cfg(target_os = "windows")]
+const WINDOWS_TUN_NAME: &str = "rayfish";
+
+#[cfg(target_os = "windows")]
+const WINDOWS_CGNAT_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(target_os = "windows")]
+const WINDOWS_CGNAT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[cfg(target_os = "windows")]
+const WINDOWS_CGNAT_QUERY: &str = "Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { [string]::Concat($_.InterfaceAlias, [char]9, $_.IPAddress) }";
+
+#[cfg(target_os = "windows")]
+fn windows_cgnat_conflicts(output: &str) -> Vec<(String, Ipv4Addr)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (alias, value) = line.split_once('\t')?;
+            let ip = value.trim().parse::<Ipv4Addr>().ok()?;
+            let alias = alias.trim();
+            (is_cgnat(ip) && !alias.eq_ignore_ascii_case(WINDOWS_TUN_NAME))
+                .then(|| (alias.to_owned(), ip))
+        })
+        .collect()
+}
+
 #[cfg(not(target_os = "android"))]
-pub fn check_cgnat_conflict() -> Result<()> {
-    let output = Command::new("ifconfig").output();
-
-    let output = match output {
-        Ok(o) => o,
-        Err(_) => return Ok(()),
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut current_iface = String::new();
-
-    for line in stdout.lines() {
-        if !line.starts_with('\t')
-            && !line.starts_with(' ')
-            && let Some(name) = line.split(':').next()
-        {
-            current_iface = name.to_string();
-        }
-        if line.contains("inet ") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let Some(pos) = parts.iter().position(|&p| p == "inet")
-                && let Some(ip_str) = parts.get(pos + 1)
-                && let Ok(ip) = ip_str.parse::<Ipv4Addr>()
-                && is_cgnat(ip)
-            {
+pub async fn check_cgnat_conflict() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let deadline = tokio::time::Instant::now() + WINDOWS_CGNAT_RELEASE_TIMEOUT;
+        loop {
+            let output = windows_powershell(WINDOWS_CGNAT_QUERY).await?;
+            let conflicts = windows_cgnat_conflicts(&output);
+            if conflicts.is_empty() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let conflicts = conflicts
+                    .iter()
+                    .map(|(alias, ip)| format!("{alias} ({ip})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 bail!(
-                    "interface {} already has CGNAT address {} — another VPN \
-                     (e.g. Tailscale) is using the 100.64.0.0/10 range. \
-                     Disable it before starting rayfish.",
-                    current_iface,
-                    ip
+                    "Windows interfaces {conflicts} are using the 100.64.0.0/10 range. Disable the conflicting VPN before starting rayfish."
                 );
             }
+            tokio::time::sleep(WINDOWS_CGNAT_POLL_INTERVAL).await;
         }
     }
 
-    Ok(())
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = Command::new("ifconfig").output();
+
+        let output = match output {
+            Ok(o) => o,
+            Err(_) => return Ok(()),
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut current_iface = String::new();
+
+        for line in stdout.lines() {
+            if !line.starts_with('\t')
+                && !line.starts_with(' ')
+                && let Some(name) = line.split(':').next()
+            {
+                current_iface = name.to_string();
+            }
+            if line.contains("inet ") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if let Some(pos) = parts.iter().position(|&p| p == "inet")
+                    && let Some(ip_str) = parts.get(pos + 1)
+                    && let Ok(ip) = ip_str.parse::<Ipv4Addr>()
+                    && is_cgnat(ip)
+                {
+                    bail!(
+                        "interface {} already has CGNAT address {} — another VPN \
+                     (e.g. Tailscale) is using the 100.64.0.0/10 range. \
+                     Disable it before starting rayfish.",
+                        current_iface,
+                        ip
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Creates a TUN device with the given virtual IPs and shares it between
@@ -156,13 +210,17 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
     // netlink/`ifconfig` `configure_ipv6` shell-out. `enable(true)` brings the
     // link up at creation (as the old `.up()` did); `set_link_up` and the
     // peer-range route helpers still run later on activate.
-    let device = DeviceBuilder::new()
+    let builder = DeviceBuilder::new()
         .ipv4(v4, 10, Some(gateway))
         .ipv6(v6, 128)
         .mtu(TUN_MTU)
-        .enable(true)
-        .build_async()
-        .context("create tun-rs device")?;
+        .enable(true);
+    #[cfg(target_os = "windows")]
+    let builder = builder
+        .name(WINDOWS_TUN_NAME)
+        .description("Rayfish")
+        .wintun_file(wintun_library_path().to_string_lossy().into_owned());
+    let device = builder.build_async().context("create tun-rs device")?;
 
     let tun_name = device.name().unwrap_or_else(|_| "unknown".to_string());
     tracing::info!(addr = %v4, ipv6 = %v6, tun = %tun_name, "TUN device created");
@@ -178,6 +236,91 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
         TunWriter { dev },
         tun_name,
     ))
+}
+
+#[cfg(target_os = "windows")]
+fn wintun_library_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("wintun.dll")))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("wintun.dll"))
+}
+
+#[cfg(target_os = "windows")]
+const WINDOWS_PEER_ROUTES: [(&str, &str); 2] = [("100.64.0.0/10", "0.0.0.0"), ("200::/7", "::")];
+
+#[cfg(target_os = "windows")]
+fn windows_link_args(tun_name: &str, up: bool) -> [String; 5] {
+    let state = if up { "enabled" } else { "disabled" };
+    [
+        "interface".to_owned(),
+        "set".to_owned(),
+        "interface".to_owned(),
+        format!("name={tun_name}"),
+        format!("admin={state}"),
+    ]
+}
+
+#[cfg(target_os = "windows")]
+fn windows_interface_query_script(tun_name: &str) -> String {
+    let quoted = tun_name.replace('\'', "''");
+    format!(
+        "@(Get-NetAdapter | Where-Object {{ $_.Name -eq '{}' }} | Select-Object -ExpandProperty ifIndex)",
+        quoted
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_remove_route_script(prefix: &str, index: u32) -> String {
+    format!(
+        "Remove-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -Confirm:$false -ErrorAction SilentlyContinue",
+        prefix, index
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_replace_route_script(prefix: &str, index: u32, next_hop: &str) -> String {
+    format!(
+        "{}; New-NetRoute -DestinationPrefix '{}' -InterfaceIndex {} -NextHop '{}' -PolicyStore ActiveStore -ErrorAction Stop",
+        windows_remove_route_script(prefix, index),
+        prefix,
+        index,
+        next_hop
+    )
+}
+
+/// Platform seam for desktop packet acquisition and privileged interface ops.
+/// The Windows implementation delegates packet I/O to `tun-rs`/Wintun while
+/// keeping the existing `TunRead`/`TunWrite` forwarding path unchanged.
+#[cfg(not(target_os = "android"))]
+pub struct PlatformTun;
+
+#[cfg(not(target_os = "android"))]
+impl PlatformTun {
+    pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
+        create(v4, v6).await
+    }
+
+    pub async fn set_link_up(name: &str) -> Result<()> {
+        set_link_up(name).await
+    }
+
+    pub async fn set_link_down(name: &str) -> Result<()> {
+        set_link_down(name).await
+    }
+
+    pub async fn route_peer_range(name: &str) -> Result<()> {
+        route_peer_range(name).await
+    }
+
+    pub async fn route_magic_dns(name: &str) -> Result<()> {
+        route_magic_dns(name).await
+    }
+
+    pub async fn unroute_peer_range(name: &str) -> Result<()> {
+        unroute_peer_range(name).await
+    }
 }
 
 /// Run `f` with a netlink handle and the interface index of `tun_name`.
@@ -291,6 +434,38 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+pub async fn unroute_peer_range(tun_name: &str) -> Result<()> {
+    let index = windows_interface_index(tun_name).await?;
+    for &(prefix, _) in &WINDOWS_PEER_ROUTES {
+        windows_powershell(&windows_remove_route_script(prefix, index)).await?;
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
+pub async fn unroute_peer_range(_tun_name: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub async fn route_peer_range(tun_name: &str) -> Result<()> {
+    let index = windows_interface_index(tun_name).await?;
+    let mut installed = Vec::new();
+    for &(prefix, next_hop) in &WINDOWS_PEER_ROUTES {
+        let result =
+            windows_powershell(&windows_replace_route_script(prefix, index, next_hop)).await;
+        if let Err(error) = result {
+            for previous in installed {
+                let _ = windows_powershell(&windows_remove_route_script(previous, index)).await;
+            }
+            return Err(error);
+        }
+        installed.push(prefix);
+    }
+    Ok(())
+}
+
 /// The full-tunnel default as two half-space routes per family: `0.0.0.0/1` +
 /// `128.0.0.0/1` and `::/1` + `8000::/1`. Each is more specific than a real
 /// default route, so together they capture everything by longest-prefix match
@@ -388,9 +563,18 @@ pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
 
 #[cfg(all(
     not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")),
-    not(target_os = "android")
+    not(target_os = "android"),
+    not(target_os = "windows")
 ))]
 pub async fn route_magic_dns(_tun_name: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
+    let index = windows_interface_index(tun_name).await?;
+    let prefix = format!("{}/32", crate::dns::MAGIC_DNS_V4);
+    windows_powershell(&windows_replace_route_script(&prefix, index, "0.0.0.0")).await?;
     Ok(())
 }
 
@@ -439,20 +623,20 @@ pub async fn route_self_loopback(_v4: Ipv4Addr, _v6: Ipv6Addr) -> Result<()> {
 
 /// Bring the TUN interface administratively up (used when activating the VPN).
 #[cfg(not(target_os = "android"))]
-pub fn set_link_up(tun_name: &str) -> Result<()> {
-    set_link_state(tun_name, true)
+pub async fn set_link_up(tun_name: &str) -> Result<()> {
+    set_link_state(tun_name, true).await
 }
 
 /// Bring the TUN interface administratively down (standby). The underlying file
 /// descriptor stays open, so the device can be brought back up without
 /// recreating it.
 #[cfg(not(target_os = "android"))]
-pub fn set_link_down(tun_name: &str) -> Result<()> {
-    set_link_state(tun_name, false)
+pub async fn set_link_down(tun_name: &str) -> Result<()> {
+    set_link_state(tun_name, false).await
 }
 
 #[cfg(not(target_os = "android"))]
-fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
+async fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     {
         let state = if up { "up" } else { "down" };
@@ -471,7 +655,43 @@ fn set_link_state(tun_name: &str, up: bool) -> Result<()> {
             .context("run ip link set")?;
         anyhow::ensure!(status.success(), "ip link set {state} failed with {status}");
     }
+    #[cfg(target_os = "windows")]
+    {
+        let args = windows_link_args(tun_name, up);
+        let output = crate::windows_process::WindowsProcessRunner::default()
+            .output("netsh.exe", args)
+            .await
+            .context("run netsh interface set interface")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "netsh interface {} failed: {}",
+            if up { "enabled" } else { "disabled" },
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn windows_powershell(script: &str) -> Result<String> {
+    crate::windows_process::WindowsProcessRunner::default()
+        .powershell(
+            &format!("$ErrorActionPreference='Stop'; {script}"),
+            "run Windows network PowerShell",
+        )
+        .await
+}
+
+#[cfg(target_os = "windows")]
+async fn windows_interface_index(tun_name: &str) -> Result<u32> {
+    let output = windows_powershell(&windows_interface_query_script(tun_name)).await?;
+    anyhow::ensure!(
+        !output.is_empty() && !output.contains('\n'),
+        "Windows TUN adapter {tun_name:?} was not uniquely found"
+    );
+    output
+        .parse()
+        .with_context(|| format!("resolve Windows interface index for {tun_name:?}"))
 }
 
 #[cfg(not(target_os = "android"))]
@@ -498,5 +718,103 @@ impl TunWrite for TunWriter {
     async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
         self.dev.send(packet).await?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::{
+        WINDOWS_PEER_ROUTES, WINDOWS_TUN_NAME, windows_cgnat_conflicts,
+        windows_interface_query_script, windows_link_args, windows_remove_route_script,
+        windows_replace_route_script, wintun_library_path,
+    };
+
+    #[test]
+    fn windows_cgnat_preflight_covers_zero_one_many_and_owned_adapter() {
+        assert!(windows_cgnat_conflicts("").is_empty());
+        assert!(windows_cgnat_conflicts("rayfish\t100.94.119.67\n").is_empty());
+        assert!(windows_cgnat_conflicts("RAYFISH\t100.94.119.67\n").is_empty());
+
+        let conflicts = windows_cgnat_conflicts(
+            "Ethernet\t192.168.1.2\nTailscale\t100.64.1.2\ntun0\t100.127.255.254\n",
+        );
+        assert_eq!(
+            conflicts,
+            vec![
+                ("Tailscale".to_owned(), "100.64.1.2".parse().unwrap()),
+                ("tun0".to_owned(), "100.127.255.254".parse().unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_cgnat_preflight_ignores_malformed_and_range_boundaries() {
+        let conflicts = windows_cgnat_conflicts(
+            "missing delimiter\nedge-low\t100.64.0.0\nedge-high\t100.127.255.255\noutside\t100.128.0.0\ninvalid\tnot-an-ip\n",
+        );
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].0, "edge-low");
+        assert_eq!(conflicts[1].0, "edge-high");
+        assert_eq!(WINDOWS_TUN_NAME, "rayfish");
+    }
+
+    #[test]
+    fn windows_link_args_cover_up_down_and_name_boundary() {
+        let up = windows_link_args("Rayfish Tunnel", true);
+        assert_eq!(
+            up,
+            [
+                "interface",
+                "set",
+                "interface",
+                "name=Rayfish Tunnel",
+                "admin=enabled",
+            ]
+        );
+
+        let down = windows_link_args("O'Brien", false);
+        assert_eq!(down[3], "name=O'Brien");
+        assert_eq!(down[4], "admin=disabled");
+    }
+
+    #[test]
+    fn windows_interface_query_quotes_powershell_boundaries() {
+        let script = windows_interface_query_script("O'Brien");
+        assert!(script.contains("Name -eq 'O''Brien'"));
+        assert!(script.contains("ExpandProperty ifIndex"));
+    }
+
+    #[test]
+    fn windows_peer_route_matrix_is_dual_stack_and_ordered() {
+        assert_eq!(WINDOWS_PEER_ROUTES.len(), 2);
+        assert_eq!(WINDOWS_PEER_ROUTES[0], ("100.64.0.0/10", "0.0.0.0"));
+        assert_eq!(WINDOWS_PEER_ROUTES[1], ("200::/7", "::"));
+    }
+
+    #[test]
+    fn windows_route_scripts_are_scoped_and_idempotent() {
+        let remove = windows_remove_route_script("100.64.0.0/10", 17);
+        assert!(remove.contains("Remove-NetRoute"));
+        assert!(remove.contains("-InterfaceIndex 17"));
+        assert!(remove.contains("-ErrorAction SilentlyContinue"));
+
+        let replace = windows_replace_route_script("200::/7", 17, "::");
+        let remove_v6 = windows_remove_route_script("200::/7", 17);
+        assert!(replace.starts_with(&remove_v6));
+        assert!(replace.contains("Remove-NetRoute"));
+        assert!(replace.contains("New-NetRoute"));
+        assert!(replace.contains("-DestinationPrefix '200::/7'"));
+        assert!(replace.contains("-NextHop '::'"));
+        assert!(replace.contains("-PolicyStore ActiveStore"));
+    }
+
+    #[test]
+    fn wintun_library_contract_ends_in_dll() {
+        assert_eq!(
+            wintun_library_path()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("wintun.dll")
+        );
     }
 }

@@ -1,8 +1,8 @@
 name: Release
 
 # Continuous releases: pushing a tag like `v0.1.0` cuts a release with
-# Linux + macOS binaries. Can also be run manually from the Actions tab.
-# Windows support: TODO.
+# Linux, macOS, Android, and Windows assets. Can also be run manually from the
+# Actions tab.
 on:
   push:
     tags:
@@ -156,6 +156,58 @@ jobs:
           files: |
             ${{ matrix.name }}
             ${{ matrix.name }}.sha256
+
+  windows:
+    needs: create-release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-x86_64-pc-windows-msvc"
+          cache-on-failure: true
+
+      - name: Install WiX 3
+        shell: pwsh
+        run: |
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            choco install wixtoolset --version=3.14.1.20250415 -y --no-progress
+          }
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            throw 'WiX candle.exe was not found after installation.'
+          }
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version 0.3.9 --locked
+
+      - name: Build Windows MSI
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          $tag = $env:RELEASE_TAG.TrimStart('v')
+          $version = ($tag -split '-', 2)[0]
+          ./scripts/build-windows-msi.ps1 -Version $version -ReleaseIdentity $tag -Channel stable -OutputPath "$env:RUNNER_TEMP\ray-windows-x86_64.msi"
+
+      - name: Upload Windows release assets
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: |
+            ${{ runner.temp }}/ray-windows-x86_64.msi
+            ${{ runner.temp }}/ray-windows-x86_64.msi.sha256
+            ${{ runner.temp }}/ray-windows-x86_64.msi.version
 
   android:
     needs: create-release
