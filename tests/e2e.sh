@@ -22,19 +22,41 @@
 #
 # Actions:
 #   run           (default) provision instances if needed, then run the scenario
-#   provision     create the Scaleway instances only (-> <dir>/.servers)
-#   teardown      destroy the instances and remove .servers
+#   provision     create the hosts only (-> <dir>/.servers)
+#   teardown      destroy the hosts and remove .servers
+#
+# Backends (E2E_BACKEND, default scaleway):
+#   scaleway      real instances, one fleet per scenario (needs scw + jq)
+#   docker        local containers on one bridge (needs docker + /dev/net/tun).
+#                 exit-node, reliability and bench are Scaleway-only: they need
+#                 hosts with distinct public IPs and a real WAN baseline.
 #
 # Each scenario's fleet (instance names + role labels) is declared in the
 # registry below; the actual run steps live in <dir>/run.sh. The shared
 # provision/teardown/assert bodies live in tests/lib/ and are sourced here.
 #
-# Env overrides: ZONE/TYPE/IMAGE (provision); SSH_KEY, KEEP_STATE (run).
+# Env overrides: ZONE/TYPE/IMAGE (scaleway provision); E2E_DOCKER_* (docker
+# provision, see tests/lib/docker.sh); SSH_KEY, KEEP_STATE (run).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-usage(){ sed -n '2,28p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
+# Exported: the `all` path re-invokes this script per scenario, and a plain shell
+# variable would silently drop back to scaleway halfway through.
+export E2E_BACKEND="${E2E_BACKEND:-scaleway}"
+
+usage(){ sed -n '2,33p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
+
+# Scenarios the docker backend cannot run faithfully (see tests/e2e/README.md).
+DOCKER_UNSUPPORTED=(exit-node reliability bench)
+
+# docker_supports <scenario> : exit 1 if the active backend can't run it.
+docker_supports(){
+  [[ "$E2E_BACKEND" != "docker" ]] && return 0
+  local s
+  for s in "${DOCKER_UNSUPPORTED[@]}"; do [[ "$1" == "$s" ]] && return 1; done
+  return 0
+}
 
 # scenario_meta <scenario> : set DIR / NAMES / LABELS for a scenario, or return 1.
 scenario_meta(){
@@ -88,36 +110,68 @@ case "$scenario" in -h|--help|help|"") usage 0 ;; esac
 # pass/fail summary and exits non-zero if any scenario failed.
 if [[ "$scenario" == all ]]; then
   all_scenarios=(device-cert connect firewall closed-net apply dns ssh reliability restore-offline unpair exit-node)
-  passed=(); failed=()
+  passed=(); failed=(); skipped=()
+  hint="check 'scw instance server list'"
+  [[ "$E2E_BACKEND" == "docker" ]] && hint="check 'docker ps -a'"
   for s in "${all_scenarios[@]}"; do
+    if ! docker_supports "$s"; then skipped+=("$s"); continue; fi
     echo "==================== $s ===================="
     if bash "$0" "$s" run; then passed+=("$s"); else failed+=("$s"); fi
     # Always tear the fleet down, pass or fail, before the next scenario.
-    bash "$0" "$s" teardown || echo ">> warning: teardown failed for $s (check 'scw instance server list')"
+    bash "$0" "$s" teardown || echo ">> warning: teardown failed for $s ($hint)"
   done
   echo "==================== e2e summary ===================="
   echo "passed (${#passed[@]}): ${passed[*]:-none}"
   echo "failed (${#failed[@]}): ${failed[*]:-none}"
+  if [[ ${#skipped[@]} -gt 0 ]]; then
+    echo "skipped on the $E2E_BACKEND backend (${#skipped[@]}): ${skipped[*]}"
+  fi
   if [[ ${#failed[@]} -eq 0 ]]; then exit 0; else exit 1; fi
 fi
 
 scenario_meta "$scenario" || { echo "unknown scenario: $scenario" >&2; usage 1; }
 
+if ! docker_supports "$scenario"; then
+  echo "$scenario does not run on the docker backend: it needs hosts with" >&2
+  echo "distinct public IPs and a real WAN baseline (see tests/e2e/README.md)." >&2
+  echo "Run it without E2E_BACKEND=docker." >&2
+  exit 2
+fi
+
 SERVERS="$DIR/.servers"
-NEXT="$0 $scenario run"   # printed by lib/provision.sh's do_provision
+NEXT="$0 $scenario run"   # printed by the backend's do_provision
+
+# provision <how> : run the active backend's provisioner. The docker backend
+# recreates its fleet on every run: device-cert and unpair never call `ray up`
+# after deploying, so against an already-deployed fleet the daemon comes back in
+# standby and every data-plane check fails. Containers are cheap; VMs are not.
+provision(){
+  if [[ "$E2E_BACKEND" == "docker" ]]; then
+    DOCKER_ACTION=provision
+    # shellcheck source=lib/docker.sh
+    source "$ROOT/tests/lib/docker.sh"        # consumes NAMES/LABELS/SERVERS/NEXT
+  else
+    # shellcheck source=lib/provision.sh
+    source "$ROOT/tests/lib/provision.sh"     # consumes NAMES/LABELS/SERVERS/NEXT
+  fi
+}
 
 case "$action" in
   provision)
-    # shellcheck source=lib/provision.sh
-    source "$ROOT/tests/lib/provision.sh" ;;   # consumes NAMES/LABELS/SERVERS/NEXT
+    provision ;;
   teardown)
-    # shellcheck source=lib/teardown.sh
-    source "$ROOT/tests/lib/teardown.sh" ;;    # consumes SERVERS
+    if [[ "$E2E_BACKEND" == "docker" ]]; then
+      DOCKER_ACTION=teardown
+      # shellcheck source=lib/docker.sh
+      source "$ROOT/tests/lib/docker.sh"      # consumes SERVERS
+    else
+      # shellcheck source=lib/teardown.sh
+      source "$ROOT/tests/lib/teardown.sh"    # consumes SERVERS
+    fi ;;
   run)
-    if [[ ! -f "$SERVERS" ]]; then
-      echo ">> no $SERVERS yet — provisioning first"
-      # shellcheck source=lib/provision.sh
-      source "$ROOT/tests/lib/provision.sh"
+    if [[ "$E2E_BACKEND" == "docker" || ! -f "$SERVERS" ]]; then
+      [[ -f "$SERVERS" ]] || echo ">> no $SERVERS yet — provisioning first"
+      provision
     fi
     exec bash "$DIR/run.sh" ;;
   *)

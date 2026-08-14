@@ -16,6 +16,14 @@ do_provision(){
   local TYPE="${TYPE:-DEV1-S}"
   local IMAGE="${IMAGE:-ubuntu_jammy}"
 
+  # The zone column doubles as the backend marker; don't drive a docker fleet
+  # from the Scaleway path (or silently bill new instances alongside it).
+  if [[ -f "$SERVERS" ]] && grep -qE '^[^ ]+ [^ ]+ [^ ]+ docker$' "$SERVERS"; then
+    echo "Refusing: $SERVERS was written by the docker backend." >&2
+    echo "Tear it down first, or run with E2E_BACKEND=docker." >&2
+    exit 1
+  fi
+
   if [[ -f "$SERVERS" ]]; then
     echo "Found existing $SERVERS — skipping provisioning."
     echo "(delete it to provision a fresh set)"

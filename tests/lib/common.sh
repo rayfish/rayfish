@@ -312,7 +312,7 @@ send_recv(){
   local pfx="${SR_PREFIX:-/tmp/ray_e2e}"
   on "$from" "head -c 1048576 /dev/urandom > ${pfx}_src.bin; sha256sum ${pfx}_src.bin | cut -d' ' -f1 > ${pfx}_src.sha"
   local src_sha; src_sha="$(on "$from" "cat ${pfx}_src.sha")"
-  on "$from" "ray send ${pfx}_src.bin $peer" 2>&1 | strip | sed 's/^/      send| /'
+  on "$from" "ray send $peer ${pfx}_src.bin" 2>&1 | strip | sed 's/^/      send| /'
   # `ray files` rows are `<id> <from> <size> <file> …` with a numeric id; the
   # header row's first column is the literal "id", so match a numeric id.
   local fid=""
