@@ -13,12 +13,18 @@
 //! identity is already proven). For now an authorized peer may log in as any
 //! local unix user, including root; tighter user-mapping is future work.
 //!
-//! An authorized peer gets sessions (shell, `exec`, sftp) and local port
-//! forwarding (`ssh -L`, `ssh -D`, `ProxyJump`), which is a `direct-tcpip`
-//! channel. The forwarded socket is opened by the daemon, not by the login
-//! account, so it reaches whatever the host can reach, loopback-only services
-//! included: the same surface a shell on that host already has. Remote
-//! forwarding (`ssh -R`) is not implemented and is refused.
+//! An authorized peer gets what a stock sshd session gives it: shells, `exec`,
+//! sftp (so `scp` works), forwarding in both directions (`ssh -L`, `-D`,
+//! `ProxyJump`, `-R`, and the unix-socket forms of both), agent forwarding
+//! (`ssh -A`), locale environment variables, and signals. X11 forwarding is the
+//! one thing missing, and it is refused explicitly rather than left hanging.
+//!
+//! Forwarding runs in the daemon, which is root, so two rules keep it from
+//! being worth more than a shell on the same host. A TCP forward goes anywhere
+//! the host can reach (loopback services included), exactly like a shell would.
+//! A unix-socket forward is checked against the login account's own permission
+//! on the socket (or on the directory it would be created in) first, because
+//! there the filesystem *is* the access control and root ignores it.
 //!
 //! Authorization is evaluated once, when the connection is accepted, so
 //! `ray firewall ssh allow/deny` changes apply to *new* sessions; an
@@ -26,10 +32,12 @@
 
 use std::collections::HashMap;
 use std::io::Error;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -39,10 +47,10 @@ use iroh::EndpointId;
 use pty_process::Size;
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, Config, Handle, Handler, Msg, Session};
-use russh::{Channel, ChannelId, MethodKind, MethodSet};
+use russh::{Channel, ChannelId, MethodKind, MethodSet, Sig};
 use smol_str::SmolStr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -337,6 +345,72 @@ struct ChannelState {
     /// Set once the session starts; forwards window-resize events to the task
     /// that owns this channel's PTY.
     resize_tx: Option<mpsc::UnboundedSender<Size>>,
+    /// Environment the client asked to pass in (`SendEnv` / `SetEnv`), already
+    /// filtered by [`env_accepted`], plus `SSH_AUTH_SOCK` and `DISPLAY` when
+    /// this channel forwards an agent or X11. Applied on top of the login
+    /// environment when the session starts.
+    env: Vec<(String, String)>,
+    /// Live agent-forwarding socket, if the client asked for one (`ssh -A`).
+    /// Dropped with the channel, which removes the socket and its directory.
+    agent: Option<AgentSocket>,
+    /// The running child, for `signal` requests. Empty until the session starts.
+    child: Option<ChildProc>,
+}
+
+/// The agent-forwarding socket serving one channel: the private directory
+/// holding the socket the session's `SSH_AUTH_SOCK` points at, and the token
+/// that stops its accept loop. Dropping it (when the channel closes, or with
+/// the whole connection) cancels the loop and takes the directory with it.
+struct AgentSocket {
+    dir: PathBuf,
+    token: CancellationToken,
+}
+
+impl Drop for AgentSocket {
+    fn drop(&mut self) {
+        self.token.cancel();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A handle for signalling the process behind a session channel. The pid is
+/// published by the session task once it has spawned, so a `signal` request
+/// that arrives first finds 0 and is dropped rather than hitting some unrelated
+/// process.
+#[derive(Clone)]
+struct ChildProc {
+    pid: Arc<AtomicU32>,
+    /// A PTY child is a session leader, so its pid is also its process group
+    /// and the signal goes to the whole foreground job, like a terminal's
+    /// ^C. A pipe child shares this daemon's group: signal the process alone.
+    process_group: bool,
+}
+
+impl ChildProc {
+    fn new(process_group: bool) -> Self {
+        Self {
+            pid: Arc::new(AtomicU32::new(0)),
+            process_group,
+        }
+    }
+
+    /// Send `sig` to the child, or do nothing if it has not started (or has
+    /// already been reaped, in which case the pid is cleared).
+    fn signal(&self, sig: i32) {
+        let pid = self.pid.load(Ordering::Relaxed);
+        if pid == 0 {
+            return;
+        }
+        let target = if self.process_group {
+            -(pid as i32)
+        } else {
+            pid as i32
+        };
+        // SAFETY: a plain kill(2); an already-exited pid fails with ESRCH.
+        unsafe {
+            libc::kill(target, sig);
+        }
+    }
 }
 
 /// Per-connection SSH handler. The peer's login policy is precomputed from its
@@ -359,6 +433,28 @@ struct SshHandler {
     login: Option<Arc<LoginInfo>>,
     /// The session channels currently open on this connection.
     channels: HashMap<ChannelId, ChannelState>,
+    /// Reverse forwards (`ssh -R`) this connection asked for, keyed by the
+    /// address and port the client named so `cancel-tcpip-forward` finds them,
+    /// and the same for unix-socket reverse forwards keyed by path.
+    forwards: HashMap<(String, u32), CancellationToken>,
+    socket_forwards: HashMap<String, CancellationToken>,
+    /// Parent of every token above: cancelled when the handler drops, so a
+    /// connection that goes away takes its listeners with it.
+    token: CancellationToken,
+}
+
+impl Drop for SshHandler {
+    fn drop(&mut self) {
+        self.token.cancel();
+        // The connection is gone, so the sessions it carried have no terminal
+        // and no client left: hang them up the way sshd does, or a peer that
+        // drops off the mesh leaves a login shell running here forever.
+        for state in self.channels.values() {
+            if let Some(child) = &state.child {
+                child.signal(libc::SIGHUP);
+            }
+        }
+    }
 }
 
 impl SshHandler {
@@ -370,7 +466,21 @@ impl SshHandler {
             login_user: String::new(),
             login: None,
             channels: HashMap::new(),
+            forwards: HashMap::new(),
+            socket_forwards: HashMap::new(),
+            token: CancellationToken::new(),
         }
+    }
+
+    /// The login this connection authenticated as, if any. Every forwarding
+    /// path goes through here: russh dispatches channel opens and global
+    /// requests only after auth succeeded, so this is `Some` by then, and a
+    /// `None` means something is wrong and the request must be refused.
+    fn authorized_login(&self) -> Option<Arc<LoginInfo>> {
+        if !self.policy.authorized() {
+            return None;
+        }
+        self.login.clone()
     }
 
     /// Take `id`'s opened channel and spawn the login shell (or the `exec` /
@@ -398,26 +508,46 @@ impl SshHandler {
         let handle = session.handle();
         let login_name = info.name.clone();
         let pty = state.pty.take();
+        let env = std::mem::take(&mut state.env);
         let peer = self.user;
         let (resize_tx, resize_rx) = mpsc::unbounded_channel();
         state.resize_tx = Some(resize_tx);
+        let child = ChildProc::new(pty.is_some());
+        state.child = Some(child.clone());
 
         tokio::spawn(async move {
             // A PTY was requested -> interactive terminal. Otherwise (`ssh host
             // cmd` with no -t) use plain pipes so stdout/stderr aren't merged or
             // CRLF-translated, matching a conventional sshd.
             let result = match pty {
-                Some(pty_req) => run_pty_session(channel, info, command, pty_req, resize_rx).await,
-                None => run_pipe_session(channel, handle.clone(), channel_id, info, command).await,
-            };
-            let code = match result {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(peer = %peer.fmt_short(), user = %login_name, error = %e, "mesh SSH session failed");
-                    1
+                Some(pty_req) => {
+                    run_pty_session(channel, info, command, pty_req, env, resize_rx, child).await
+                }
+                None => {
+                    run_pipe_session(channel, handle.clone(), channel_id, info, command, env, child)
+                        .await
                 }
             };
-            let _ = handle.exit_status_request(channel_id, code).await;
+            let exit = match result {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(peer = %peer.fmt_short(), user = %login_name, error = %e, "mesh SSH session failed");
+                    Exit::Code(1)
+                }
+            };
+            // A process killed by a signal is reported as one, the way a stock
+            // sshd does, so the client prints "killed by SIGKILL" instead of a
+            // made-up status.
+            match exit {
+                Exit::Code(code) => {
+                    let _ = handle.exit_status_request(channel_id, code).await;
+                }
+                Exit::Signal(sig) => {
+                    let _ = handle
+                        .exit_signal_request(channel_id, sig, false, String::new(), String::new())
+                        .await;
+                }
+            }
             let _ = handle.eof(channel_id).await;
             let _ = handle.close(channel_id).await;
         });
@@ -504,11 +634,8 @@ impl Handler for SshHandler {
         _originator_port: u32,
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        // `ssh -L`, `ssh -D` and `ProxyJump` all ride this channel type. russh
-        // dispatches channel opens only after auth succeeded, so the policy is
-        // already satisfied here; re-checking keeps the gate in one place if
-        // that ever changes.
-        if !self.policy.authorized() || self.login.is_none() {
+        // `ssh -L`, `ssh -D` and `ProxyJump` all ride this channel type.
+        if self.authorized_login().is_none() {
             return Ok(false);
         }
         let Ok(port) = u16::try_from(port_to_connect) else {
@@ -528,7 +655,7 @@ impl Handler for SshHandler {
         // "connect failed"; the reason is logged here.
         tokio::spawn(async move {
             let connected = timeout(CONNECT_TIMEOUT, TcpStream::connect(&target)).await;
-            let mut upstream = match connected {
+            let upstream = match connected {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
                     debug!(peer = %peer.fmt_short(), %target, error = %e,
@@ -544,14 +671,371 @@ impl Handler for SshHandler {
                 }
             };
             debug!(peer = %peer.fmt_short(), %target, "mesh SSH: forwarding to");
-            let mut stream = channel.into_stream();
-            let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
-            // Dropping the stream closes the channel, but say so explicitly so
-            // the client sees the close even if the peer half is still held.
-            let _ = handle.eof(channel_id).await;
-            let _ = handle.close(channel_id).await;
+            splice(channel, handle, upstream).await;
         });
         Ok(true)
+    }
+
+    async fn channel_open_direct_streamlocal(
+        &mut self,
+        channel: Channel<Msg>,
+        socket_path: &str,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // `ssh -L <port>:/run/some.sock` and anything forwarding a unix socket
+        // (docker, gpg-agent, a database's local socket).
+        let Some(info) = self.authorized_login() else {
+            return Ok(false);
+        };
+        let path = PathBuf::from(socket_path);
+        if !account_can(&path, &info, 0o6) {
+            warn!(peer = %self.user.fmt_short(), user = %info.name, socket = socket_path,
+                "mesh SSH: refusing to forward a socket this account cannot use");
+            return Ok(false);
+        }
+        let peer = self.user;
+        let handle = session.handle();
+        let channel_id = channel.id();
+        tokio::spawn(async move {
+            match timeout(CONNECT_TIMEOUT, UnixStream::connect(&path)).await {
+                Ok(Ok(sock)) => {
+                    debug!(peer = %peer.fmt_short(), socket = %path.display(),
+                        "mesh SSH: forwarding to");
+                    splice(channel, handle, sock).await;
+                }
+                Ok(Err(e)) => {
+                    debug!(peer = %peer.fmt_short(), socket = %path.display(), error = %e,
+                        "mesh SSH: forwarded socket connection failed");
+                    let _ = handle.close(channel_id).await;
+                }
+                Err(_) => {
+                    debug!(peer = %peer.fmt_short(), socket = %path.display(),
+                        "mesh SSH: forwarded socket connection timed out");
+                    let _ = handle.close(channel_id).await;
+                }
+            }
+        });
+        Ok(true)
+    }
+
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // `ssh -R`: this host listens, the peer's side answers.
+        if self.authorized_login().is_none() {
+            return Ok(false);
+        }
+        let Ok(requested) = u16::try_from(*port) else {
+            return Ok(false);
+        };
+        let bind = SocketAddr::new(reverse_bind_addr(address), requested);
+        let listener = match TcpListener::bind(bind).await {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(peer = %self.user.fmt_short(), %bind, error = %e,
+                    "mesh SSH: cannot bind a reverse forward");
+                return Ok(false);
+            }
+        };
+        // Port 0 means "pick one and tell me": the client needs the real port
+        // back, both to print it and to cancel the forward later.
+        let bound = listener.local_addr().map(|a| a.port()).unwrap_or(requested);
+        *port = bound as u32;
+
+        let key = (address.to_string(), *port);
+        if let Some(previous) = self.forwards.remove(&key) {
+            previous.cancel();
+        }
+        let token = self.token.child_token();
+        self.forwards.insert(key, token.clone());
+
+        info!(peer = %self.user.fmt_short(), listen = %SocketAddr::new(bind.ip(), bound),
+            "mesh SSH: reverse forward open");
+        let handle = session.handle();
+        let peer = self.user;
+        // The client matches an incoming forwarded connection against the
+        // address it asked to have bound, so echo that back rather than the
+        // address we narrowed it to.
+        let advertised = address.to_string();
+        tokio::spawn(async move {
+            loop {
+                let (sock, origin) = tokio::select! {
+                    _ = token.cancelled() => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok(v) => v,
+                        Err(e) => {
+                            debug!(error = %e, "mesh SSH: reverse forward accept failed");
+                            continue;
+                        }
+                    },
+                };
+                let handle = handle.clone();
+                let advertised = advertised.clone();
+                tokio::spawn(async move {
+                    let opened = handle
+                        .channel_open_forwarded_tcpip(
+                            advertised,
+                            bound as u32,
+                            origin.ip().to_string(),
+                            origin.port() as u32,
+                        )
+                        .await;
+                    match opened {
+                        Ok(channel) => splice(channel, handle, sock).await,
+                        Err(e) => debug!(peer = %peer.fmt_short(), error = %e,
+                            "mesh SSH: peer refused a reverse-forwarded connection"),
+                    }
+                });
+            }
+            debug!(port = bound, "mesh SSH: reverse forward closed");
+        });
+        Ok(true)
+    }
+
+    async fn cancel_tcpip_forward(
+        &mut self,
+        address: &str,
+        port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        match self.forwards.remove(&(address.to_string(), port)) {
+            Some(token) => {
+                token.cancel();
+                Ok(true)
+            }
+            // Not ours to cancel: say so instead of reporting a success the
+            // client would read as "the port is free now".
+            None => Ok(false),
+        }
+    }
+
+    async fn streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // `ssh -R /path/on/this/host.sock:...`, how gpg-agent and ssh-agent
+        // sockets are published onto a remote host.
+        let Some(info) = self.authorized_login() else {
+            return Ok(false);
+        };
+        let path = PathBuf::from(socket_path);
+        let Some(parent) = path.parent() else {
+            return Ok(false);
+        };
+        // The daemon is root and could create this socket anywhere. Bind only
+        // where the login account could have created it itself.
+        if !account_can(parent, &info, 0o3) {
+            warn!(peer = %self.user.fmt_short(), user = %info.name, socket = socket_path,
+                "mesh SSH: refusing a reverse socket forward outside the account's reach");
+            return Ok(false);
+        }
+        // A socket left behind by an earlier session of this same account is
+        // stale and ours to clear. Anything else stays where it is.
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            use std::os::unix::fs::FileTypeExt;
+            if meta.file_type().is_socket() && (meta.uid() == info.uid || info.uid == 0) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        let listener = match UnixListener::bind(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(peer = %self.user.fmt_short(), socket = socket_path, error = %e,
+                    "mesh SSH: cannot bind a reverse socket forward");
+                return Ok(false);
+            }
+        };
+        if let Err(e) = hand_over(&path, &info, 0o600) {
+            warn!(peer = %self.user.fmt_short(), socket = socket_path, error = %e,
+                "mesh SSH: cannot hand the forwarded socket to the login account");
+            let _ = std::fs::remove_file(&path);
+            return Ok(false);
+        }
+
+        if let Some(previous) = self.socket_forwards.remove(socket_path) {
+            previous.cancel();
+        }
+        let token = self.token.child_token();
+        self.socket_forwards
+            .insert(socket_path.to_string(), token.clone());
+
+        info!(peer = %self.user.fmt_short(), socket = socket_path,
+            "mesh SSH: reverse socket forward open");
+        let handle = session.handle();
+        let peer = self.user;
+        let advertised = socket_path.to_string();
+        tokio::spawn(async move {
+            loop {
+                let (sock, _) = tokio::select! {
+                    _ = token.cancelled() => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok(v) => v,
+                        Err(e) => {
+                            debug!(error = %e, "mesh SSH: reverse socket accept failed");
+                            continue;
+                        }
+                    },
+                };
+                let handle = handle.clone();
+                let advertised = advertised.clone();
+                tokio::spawn(async move {
+                    match handle.channel_open_forwarded_streamlocal(advertised).await {
+                        Ok(channel) => splice(channel, handle, sock).await,
+                        Err(e) => debug!(peer = %peer.fmt_short(), error = %e,
+                            "mesh SSH: peer refused a reverse-forwarded socket connection"),
+                    }
+                });
+            }
+            // The listener holds the only reference to this path; take the
+            // socket file with it so the next session can bind again.
+            let _ = std::fs::remove_file(&path);
+            debug!(socket = %path.display(), "mesh SSH: reverse socket forward closed");
+        });
+        Ok(true)
+    }
+
+    async fn cancel_streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        match self.socket_forwards.remove(socket_path) {
+            Some(token) => {
+                token.cancel();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn agent_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // `ssh -A`: a socket on this host that speaks to the client's agent, so
+        // a key never leaves the machine it lives on. The socket belongs to
+        // this channel and goes away with it.
+        let Some(info) = self.authorized_login() else {
+            return Ok(false);
+        };
+        if !self.channels.contains_key(&channel) {
+            return Ok(false);
+        }
+        let peer = self.user;
+        let (agent_dir, listener, path) = match open_agent_socket(&info) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(peer = %peer.fmt_short(), error = %e,
+                    "mesh SSH: cannot set up agent forwarding");
+                return Ok(false);
+            }
+        };
+        let token = self.token.child_token();
+        let accept_token = token.clone();
+        let socket = path.clone();
+        let handle = session.handle();
+        tokio::spawn(async move {
+            loop {
+                let (sock, _) = tokio::select! {
+                    _ = accept_token.cancelled() => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok(v) => v,
+                        Err(e) => {
+                            debug!(error = %e, "mesh SSH: agent socket accept failed");
+                            continue;
+                        }
+                    },
+                };
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    match handle.channel_open_agent().await {
+                        Ok(channel) => splice(channel, handle, sock).await,
+                        Err(e) => debug!(peer = %peer.fmt_short(), error = %e,
+                            "mesh SSH: peer refused an agent connection"),
+                    }
+                });
+            }
+            debug!(socket = %socket.display(), "mesh SSH: agent forwarding closed");
+        });
+
+        // Safe: the channel was there at the top of this method and `&mut self`
+        // has not been released since.
+        if let Some(state) = self.channels.get_mut(&channel) {
+            state
+                .env
+                .push(("SSH_AUTH_SOCK".to_string(), path.display().to_string()));
+            state.agent = Some(AgentSocket {
+                dir: agent_dir,
+                token,
+            });
+        }
+        Ok(true)
+    }
+
+    async fn env_request(
+        &mut self,
+        channel: ChannelId,
+        variable_name: &str,
+        variable_value: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if !env_accepted(variable_name) {
+            debug!(peer = %self.user.fmt_short(), variable = variable_name,
+                "mesh SSH: not accepting this environment variable");
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
+        let Some(state) = self.channels.get_mut(&channel) else {
+            session.channel_failure(channel)?;
+            return Ok(());
+        };
+        state.env.push((
+            variable_name.to_string(),
+            variable_value.to_string(),
+        ));
+        session.channel_success(channel)?;
+        Ok(())
+    }
+
+    async fn signal(
+        &mut self,
+        channel: ChannelId,
+        signal: Sig,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let Some(number) = signal_number(&signal) else {
+            debug!(peer = %self.user.fmt_short(), ?signal, "mesh SSH: unknown signal, ignored");
+            return Ok(());
+        };
+        if let Some(child) = self.channels.get(&channel).and_then(|s| s.child.as_ref()) {
+            debug!(peer = %self.user.fmt_short(), ?signal, "mesh SSH: signalling the session");
+            child.signal(number);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn x11_request(
+        &mut self,
+        channel: ChannelId,
+        _single_connection: bool,
+        _x11_auth_protocol: &str,
+        _x11_auth_cookie: &str,
+        _x11_screen_number: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // X11 forwarding is not implemented. Answer it: russh's default replies
+        // nothing at all, and `ssh -X` then waits on a request that will never
+        // come back instead of printing "X11 forwarding request failed" and
+        // carrying on with a working shell.
+        debug!(peer = %self.user.fmt_short(), "mesh SSH: refusing X11 forwarding (not supported)");
+        session.channel_failure(channel)?;
+        Ok(())
     }
 
     async fn channel_close(
@@ -562,7 +1046,13 @@ impl Handler for SshHandler {
         // Either the client closed the channel or it is answering the close the
         // session task sent when the process exited. Either way this channel's
         // state is dead; the rest of the connection's channels carry on.
-        self.channels.remove(&channel);
+        // Anything still running under it loses its client here, so hang it up
+        // (a process that already exited has no pid left to signal).
+        if let Some(state) = self.channels.remove(&channel)
+            && let Some(child) = &state.child
+        {
+            child.signal(libc::SIGHUP);
+        }
         Ok(())
     }
 
@@ -691,6 +1181,189 @@ impl Handler for SshHandler {
     }
 }
 
+/// How a session's process ended. SSH reports the two cases differently, and a
+/// client that gets a status for a signalled process prints a wrong exit code.
+enum Exit {
+    Code(u32),
+    Signal(Sig),
+}
+
+impl Exit {
+    fn from_status(status: std::process::ExitStatus) -> Self {
+        use std::os::unix::process::ExitStatusExt;
+        match (status.code(), status.signal()) {
+            (Some(code), _) => Exit::Code(code as u32),
+            (None, Some(sig)) => Exit::Signal(signal_name(sig)),
+            (None, None) => Exit::Code(0),
+        }
+    }
+}
+
+/// The SSH name of a unix signal number. The protocol names a fixed set; the
+/// rest go over the wire as their number, which is what OpenSSH does too.
+fn signal_name(sig: i32) -> Sig {
+    match sig {
+        libc::SIGABRT => Sig::ABRT,
+        libc::SIGALRM => Sig::ALRM,
+        libc::SIGFPE => Sig::FPE,
+        libc::SIGHUP => Sig::HUP,
+        libc::SIGILL => Sig::ILL,
+        libc::SIGINT => Sig::INT,
+        libc::SIGKILL => Sig::KILL,
+        libc::SIGPIPE => Sig::PIPE,
+        libc::SIGQUIT => Sig::QUIT,
+        libc::SIGSEGV => Sig::SEGV,
+        libc::SIGTERM => Sig::TERM,
+        libc::SIGUSR1 => Sig::USR1,
+        other => Sig::Custom(other.to_string()),
+    }
+}
+
+/// The unix signal a client's `signal` request names, or `None` for a name this
+/// host has no signal for.
+fn signal_number(sig: &Sig) -> Option<i32> {
+    Some(match sig {
+        Sig::ABRT => libc::SIGABRT,
+        Sig::ALRM => libc::SIGALRM,
+        Sig::FPE => libc::SIGFPE,
+        Sig::HUP => libc::SIGHUP,
+        Sig::ILL => libc::SIGILL,
+        Sig::INT => libc::SIGINT,
+        Sig::KILL => libc::SIGKILL,
+        Sig::PIPE => libc::SIGPIPE,
+        Sig::QUIT => libc::SIGQUIT,
+        Sig::SEGV => libc::SIGSEGV,
+        Sig::TERM => libc::SIGTERM,
+        Sig::USR1 => libc::SIGUSR1,
+        Sig::Custom(name) => match name.as_str() {
+            "USR2" => libc::SIGUSR2,
+            "TSTP" => libc::SIGTSTP,
+            "CONT" => libc::SIGCONT,
+            "WINCH" => libc::SIGWINCH,
+            _ => return None,
+        },
+    })
+}
+
+/// Pump an SSH channel and a local socket against each other until either side
+/// closes, then end the channel. Every forwarded connection is this: the
+/// channel *is* the socket, whichever side asked for it.
+async fn splice<S>(channel: Channel<Msg>, handle: Handle, mut local: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let channel_id = channel.id();
+    let mut stream = channel.into_stream();
+    if let Err(e) = tokio::io::copy_bidirectional(&mut stream, &mut local).await {
+        debug!(channel = %channel_id, error = %e, "mesh SSH: forwarded connection ended early");
+    }
+    let _ = handle.eof(channel_id).await;
+    let _ = handle.close(channel_id).await;
+}
+
+/// Create the agent-forwarding socket for one session: a private directory
+/// holding a single unix socket, both owned by the login account, so nothing
+/// but that account can talk to the peer's ssh-agent through it. Returns the
+/// directory, the bound listener, and the socket path the session's
+/// `SSH_AUTH_SOCK` will name.
+///
+/// The directory name is random and created exclusively (`create_dir` fails on
+/// an existing path), so nothing can be waiting at the path to be handed the
+/// socket when the daemon chowns it away from root.
+fn open_agent_socket(info: &LoginInfo) -> Result<(PathBuf, UnixListener, PathBuf)> {
+    let dir = std::env::temp_dir().join(format!("rayfish-ssh-agent.{:016x}", rand::random::<u64>()));
+    std::fs::create_dir(&dir).context("creating the agent socket directory")?;
+    hand_over(&dir, info, 0o700)?;
+    let path = dir.join("agent.sock");
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e).context("binding the agent socket");
+        }
+    };
+    if let Err(e) = hand_over(&path, info, 0o600) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
+    }
+    Ok((dir, listener, path))
+}
+
+/// Environment variables a client may set on a session (`ssh -o SendEnv=` /
+/// `SetEnv=`). Locale and terminal hints only, the same shape as the stock
+/// `AcceptEnv LANG LC_*`: anything else lets the peer steer the login shell
+/// (`LD_PRELOAD`, `PATH`, `BASH_ENV`) instead of just describing itself.
+fn env_accepted(name: &str) -> bool {
+    matches!(name, "LANG" | "TZ" | "COLORTERM" | "TERM") || name.starts_with("LC_")
+}
+
+/// Which local address an `ssh -R` listener binds. A reverse forward publishes
+/// the *peer's* service on this host, so a wildcard or external bind address is
+/// narrowed to loopback, exactly what a stock sshd does with its default
+/// `GatewayPorts no`. The client's default (`localhost`) already lands there.
+fn reverse_bind_addr(address: &str) -> IpAddr {
+    match address {
+        "" | "localhost" | "127.0.0.1" => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        "::1" => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        other => {
+            debug!(
+                requested = other,
+                "mesh SSH: reverse forward narrowed to loopback"
+            );
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        }
+    }
+}
+
+/// Whether `info`'s account has `want` (a unix permission triad: 4 read, 2
+/// write, 1 execute/search) on `path`.
+///
+/// Unix-socket forwarding is the one place where the daemon's root privilege
+/// would buy the peer something a shell wouldn't: the filesystem *is* the
+/// access control on a socket, and connecting as root ignores it. So the
+/// permission the login account has is checked here first. Like any check made
+/// before the open, it is not atomic against a path swapped underneath it; it
+/// stops the peer reaching sockets its account plainly cannot, not a local user
+/// racing their own directory.
+fn account_can(path: &Path, info: &LoginInfo, want: u32) -> bool {
+    if info.uid == 0 {
+        return true;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let mode = meta.permissions().mode();
+    let bits = if meta.uid() == info.uid {
+        (mode >> 6) & 7
+    } else if meta.gid() == info.gid || in_group(info, meta.gid()) {
+        (mode >> 3) & 7
+    } else {
+        mode & 7
+    };
+    bits & want == want
+}
+
+/// Whether the account is a member of `gid` through its supplementary groups.
+fn in_group(info: &LoginInfo, gid: u32) -> bool {
+    uzers::get_user_groups(&info.name, info.gid)
+        .map(|groups| {
+            groups
+                .iter()
+                .any(|g| g.gid() == gid)
+        })
+        .unwrap_or(false)
+}
+
+/// Hand `path` to the login account with `mode`, so a socket this root daemon
+/// created is usable by (and only by) the user whose session it belongs to.
+fn hand_over(path: &Path, info: &LoginInfo, mode: u32) -> Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("setting mode on {}", path.display()))?;
+    std::os::unix::fs::chown(path, Some(info.uid), Some(info.gid))
+        .with_context(|| format!("handing {} to {}", path.display(), info.name))?;
+    Ok(())
+}
+
 /// The resolved local account a session logs in as. Held in an [`Arc`] on the
 /// handler and cloned per channel, since every session on one connection logs
 /// in as the same account.
@@ -782,8 +1455,10 @@ async fn run_pty_session(
     info: Arc<LoginInfo>,
     command: Option<String>,
     pty_req: PtyReq,
+    env: Vec<(String, String)>,
     mut resize_rx: mpsc::UnboundedReceiver<Size>,
-) -> Result<u32> {
+    child_proc: ChildProc,
+) -> Result<Exit> {
     let drop = drop_privs(info.uid, info.gid, &info.name)?;
 
     let (pty, pts) = pty_process::open().context("opening pty")?;
@@ -798,12 +1473,16 @@ async fn run_pty_session(
         .current_dir(&info.home)
         .env_clear()
         .envs(login_env(&info.home, &info.shell, &info.name))
-        .env("TERM", &pty_req.term);
+        .env("TERM", &pty_req.term)
+        .envs(env);
     // SAFETY: drops privileges (initgroups+setgid+setuid) before exec; we do NOT
     // use `.uid()/.gid()` because std applies those *after* pre_exec, too late to
     // also drop supplementary groups.
     cmd = unsafe { cmd.pre_exec(drop) };
     let mut child = cmd.spawn(pts).context("spawning login shell")?;
+    // Publish the pid so `signal` requests reach it, and clear it again below
+    // once it is reaped: a stale pid gets reused by an unrelated process.
+    child_proc.pid.store(child.id().unwrap_or(0), Ordering::Relaxed);
 
     let stream = channel.into_stream();
     let (mut chan_read, mut chan_write) = tokio::io::split(stream);
@@ -836,9 +1515,10 @@ async fn run_pty_session(
     });
 
     let status = child.wait().await.context("waiting on child")?;
+    child_proc.pid.store(0, Ordering::Relaxed);
     let _ = p2c.await;
     c2p.abort();
-    Ok(status.code().unwrap_or(0) as u32)
+    Ok(Exit::from_status(status))
 }
 
 /// Run a command (or shell) with **pipes** instead of a PTY, for a non-`-t`
@@ -851,7 +1531,9 @@ async fn run_pipe_session(
     channel_id: ChannelId,
     info: Arc<LoginInfo>,
     command: Option<String>,
-) -> Result<u32> {
+    env: Vec<(String, String)>,
+    child_proc: ChildProc,
+) -> Result<Exit> {
     let drop = drop_privs(info.uid, info.gid, &info.name)?;
 
     let mut cmd = tokio::process::Command::new(&info.shell);
@@ -866,6 +1548,7 @@ async fn run_pipe_session(
     cmd.current_dir(&info.home)
         .env_clear()
         .envs(login_env(&info.home, &info.shell, &info.name))
+        .envs(env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -874,6 +1557,7 @@ async fn run_pipe_session(
         cmd.pre_exec(drop);
     }
     let mut child = cmd.spawn().context("spawning command")?;
+    child_proc.pid.store(child.id().unwrap_or(0), Ordering::Relaxed);
     let mut stdin = child.stdin.take().context("child stdin")?;
     let mut stdout = child.stdout.take().context("child stdout")?;
     let mut stderr = child.stderr.take().context("child stderr")?;
@@ -931,10 +1615,11 @@ async fn run_pipe_session(
     });
 
     let status = child.wait().await.context("waiting on child")?;
+    child_proc.pid.store(0, Ordering::Relaxed);
     let _ = out_task.await;
     let _ = err_task.await;
     stdin_task.abort();
-    Ok(status.code().unwrap_or(0) as u32)
+    Ok(Exit::from_status(status))
 }
 
 /// Load the SSH host key the embedded server presents.
@@ -1241,14 +1926,44 @@ mod tests {
     }
 
     /// Client side of the loopback tests: the host key is generated per test,
-    /// so there is nothing to verify against.
-    struct AcceptAnyHost;
+    /// so there is nothing to verify against. Channels the *server* opens back
+    /// to us (reverse forwards, agent connections) are handed to whichever test
+    /// asked to watch for them.
+    struct AcceptAnyHost {
+        opened: Option<mpsc::UnboundedSender<Channel<ClientMsg>>>,
+    }
 
     impl client::Handler for AcceptAnyHost {
         type Error = russh::Error;
 
         async fn check_server_key(&mut self, _key: &PublicKey) -> Result<bool, Self::Error> {
             Ok(true)
+        }
+
+        async fn server_channel_open_forwarded_tcpip(
+            &mut self,
+            channel: Channel<ClientMsg>,
+            _connected_address: &str,
+            _connected_port: u32,
+            _originator_address: &str,
+            _originator_port: u32,
+            _session: &mut client::Session,
+        ) -> Result<(), Self::Error> {
+            if let Some(tx) = &self.opened {
+                let _ = tx.send(channel);
+            }
+            Ok(())
+        }
+
+        async fn server_channel_open_agent_forward(
+            &mut self,
+            channel: Channel<ClientMsg>,
+            _session: &mut client::Session,
+        ) -> Result<(), Self::Error> {
+            if let Some(tx) = &self.opened {
+                let _ = tx.send(channel);
+            }
+            Ok(())
         }
     }
 
@@ -1267,6 +1982,22 @@ mod tests {
     /// client connection to it. The peer is authorized for any user, the same
     /// state a live mesh connection reaches before it opens a channel.
     async fn connect_to_test_server() -> client::Handle<AcceptAnyHost> {
+        connect_watching_openings(None).await
+    }
+
+    /// The same, plus the channels the server opens back to the client: what a
+    /// reverse forward and agent forwarding deliver.
+    async fn connect_and_watch_openings() -> (
+        client::Handle<AcceptAnyHost>,
+        mpsc::UnboundedReceiver<Channel<ClientMsg>>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (connect_watching_openings(Some(tx)).await, rx)
+    }
+
+    async fn connect_watching_openings(
+        opened: Option<mpsc::UnboundedSender<Channel<ClientMsg>>>,
+    ) -> client::Handle<AcceptAnyHost> {
         let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("host key");
         let config = Arc::new(Config {
             keys: vec![key],
@@ -1288,9 +2019,13 @@ mod tests {
             }
         });
 
-        let mut handle = client::connect(Arc::new(client::Config::default()), addr, AcceptAnyHost)
-            .await
-            .expect("client connect");
+        let mut handle = client::connect(
+            Arc::new(client::Config::default()),
+            addr,
+            AcceptAnyHost { opened },
+        )
+        .await
+        .expect("client connect");
         assert!(
             handle
                 .authenticate_none(test_account())
@@ -1458,6 +2193,236 @@ mod tests {
             matches!(read, Ok(0) | Err(_)),
             "the channel ends at EOF, not with data"
         );
+    }
+
+    #[tokio::test]
+    async fn reverse_forward_carries_a_connection_back_to_the_client() {
+        // `ssh -R`: this host listens, and each connection to the bound port
+        // becomes a channel the *server* opens to the client.
+        let (handle, mut opened) = connect_and_watch_openings().await;
+        let port = handle
+            .tcpip_forward("localhost", 0)
+            .await
+            .expect("reverse forward request");
+        assert_ne!(port, 0, "a port-0 request must come back with the real one");
+
+        let mut local = TcpStream::connect((Ipv4Addr::LOCALHOST, port as u16))
+            .await
+            .expect("connect to the reverse-forwarded port");
+        let channel = timeout(Duration::from_secs(20), opened.recv())
+            .await
+            .expect("no forwarded channel arrived")
+            .expect("the connection dropped");
+
+        let mut stream = channel.into_stream();
+        local.write_all(b"ping").await.expect("write on the socket");
+        let mut buf = [0u8; 4];
+        timeout(Duration::from_secs(20), stream.read_exact(&mut buf))
+            .await
+            .expect("the forwarded bytes never arrived")
+            .expect("read from the channel");
+        assert_eq!(&buf, b"ping");
+
+        stream.write_all(b"pong").await.expect("write back");
+        timeout(Duration::from_secs(20), local.read_exact(&mut buf))
+            .await
+            .expect("nothing came back the other way")
+            .expect("read from the socket");
+        assert_eq!(&buf, b"pong", "the forward carries both directions");
+
+        handle
+            .cancel_tcpip_forward("localhost", port)
+            .await
+            .expect("cancel the forward");
+        // The listener goes with the cancellation, so the port stops answering.
+        let mut refused = false;
+        for _ in 0..40 {
+            if TcpStream::connect((Ipv4Addr::LOCALHOST, port as u16))
+                .await
+                .is_err()
+            {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(refused, "a cancelled forward must release its port");
+    }
+
+    #[tokio::test]
+    async fn direct_streamlocal_channel_reaches_a_unix_socket() {
+        // `ssh -L <port>:/path/to.sock`: docker, gpg-agent, database sockets.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("echo.sock");
+        let echo = UnixListener::bind(&path).expect("bind echo socket");
+        tokio::spawn(async move {
+            let (mut sock, _) = echo.accept().await.expect("accept");
+            let (mut r, mut w) = sock.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        let handle = connect_to_test_server().await;
+        let channel = handle
+            .channel_open_direct_streamlocal(path.display().to_string())
+            .await
+            .expect("open direct-streamlocal channel");
+
+        let mut stream = channel.into_stream();
+        stream.write_all(b"ping").await.expect("write");
+        let mut buf = [0u8; 4];
+        timeout(Duration::from_secs(20), stream.read_exact(&mut buf))
+            .await
+            .expect("the forwarded socket never answered")
+            .expect("read");
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn session_env_takes_locale_and_drops_the_rest() {
+        // `SendEnv`/`SetEnv` may describe the client's locale, not steer the
+        // login shell: a peer that could set LD_PRELOAD would be running its
+        // own code inside every session.
+        let handle = connect_to_test_server().await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("open session channel");
+        channel
+            .set_env(false, "LC_RAYFISH", "kept")
+            .await
+            .expect("set an accepted variable");
+        channel
+            .set_env(false, "LD_PRELOAD", "/tmp/evil.so")
+            .await
+            .expect("set a rejected variable");
+        channel
+            .exec(true, "echo env:$LC_RAYFISH:$LD_PRELOAD:")
+            .await
+            .expect("exec");
+        let (out, code) = drain(&mut channel).await;
+        assert!(out.contains("env:kept::"), "session environment: {out}");
+        assert_eq!(code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_signal_request_reaches_the_session_process() {
+        // The client asking to kill what it started, and the exit reported as
+        // the signal it was rather than an invented status code.
+        let handle = connect_to_test_server().await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("open session channel");
+        channel.exec(true, "sleep 30").await.expect("exec");
+
+        // The signal is repeated because it is only deliverable once the child
+        // exists, and nothing on the wire says when that is.
+        let mut signalled = None;
+        for _ in 0..100 {
+            let _ = channel.signal(Sig::TERM).await;
+            match timeout(Duration::from_millis(200), channel.wait()).await {
+                Ok(Some(ChannelMsg::ExitSignal { signal_name, .. })) => {
+                    signalled = Some(format!("{signal_name:?}"));
+                }
+                Ok(Some(ChannelMsg::Close)) | Ok(None) => break,
+                Ok(Some(_)) => {}
+                Err(_) => continue,
+            }
+        }
+        assert_eq!(
+            signalled.as_deref(),
+            Some("TERM"),
+            "the session must end reported as killed by SIGTERM"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_forwarding_hands_the_session_a_socket_that_reaches_the_client() {
+        // `ssh -A`: the session gets an SSH_AUTH_SOCK whose other end is the
+        // client's agent, so a key never has to live on this host.
+        let (handle, mut opened) = connect_and_watch_openings().await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("open session channel");
+        channel.agent_forward(true).await.expect("request an agent");
+        channel
+            .exec(true, "printf '%s\\n' \"$SSH_AUTH_SOCK\"; sleep 5")
+            .await
+            .expect("exec");
+
+        // Read the path the session was given, while it is still running (the
+        // socket lives exactly as long as the channel).
+        let mut path = String::new();
+        for _ in 0..100 {
+            match timeout(Duration::from_secs(20), channel.wait()).await {
+                Ok(Some(ChannelMsg::Data { data })) => {
+                    path.push_str(&String::from_utf8_lossy(&data));
+                    if path.contains('\n') {
+                        break;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        let path = path.trim().to_string();
+        assert!(
+            path.contains("rayfish-ssh-agent"),
+            "the session's SSH_AUTH_SOCK: {path:?}"
+        );
+
+        let mut sock = UnixStream::connect(&path)
+            .await
+            .expect("the session's agent socket must accept connections");
+        let agent = timeout(Duration::from_secs(20), opened.recv())
+            .await
+            .expect("no agent channel reached the client")
+            .expect("the connection dropped");
+
+        // What the session writes to the socket comes out on the client's side
+        // of the agent channel, which is where a real ssh-agent would answer.
+        sock.write_all(b"ping").await.expect("write to the socket");
+        let mut stream = agent.into_stream();
+        let mut buf = [0u8; 4];
+        timeout(Duration::from_secs(20), stream.read_exact(&mut buf))
+            .await
+            .expect("the agent bytes never arrived")
+            .expect("read from the agent channel");
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[test]
+    fn reverse_forwards_bind_loopback_only() {
+        // A reverse forward publishes the peer's service on this host, so a
+        // wildcard bind is narrowed, like sshd's default `GatewayPorts no`.
+        assert_eq!(
+            reverse_bind_addr("localhost"),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(reverse_bind_addr(""), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(reverse_bind_addr("::1"), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(reverse_bind_addr("*"), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(reverse_bind_addr("0.0.0.0"), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            reverse_bind_addr("10.0.0.1"),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn accepted_env_is_locale_only() {
+        assert!(env_accepted("LANG"));
+        assert!(env_accepted("LC_ALL"));
+        assert!(env_accepted("LC_CTYPE"));
+        assert!(env_accepted("TZ"));
+        assert!(env_accepted("TERM"));
+        // The ones that would run the peer's code inside the session.
+        assert!(!env_accepted("LD_PRELOAD"));
+        assert!(!env_accepted("LD_LIBRARY_PATH"));
+        assert!(!env_accepted("PATH"));
+        assert!(!env_accepted("BASH_ENV"));
+        assert!(!env_accepted("SSH_AUTH_SOCK"));
     }
 
     #[test]

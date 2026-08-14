@@ -349,12 +349,17 @@ with a stock client:
 ```bash
 ssh user@host.ray
 scp file user@host.ray:            # scp and sftp need an sftp-server on the host
+ssh -L 8080:localhost:80 host.ray  # forwarding works in both directions, -A too
 ```
 
 The peer is authenticated by its mesh identity, so there are no `authorized_keys`
-to distribute (the same model as Tailscale SSH). One limitation to know: an
-authorized peer may currently log in as **any** local user, so only enable it on
-networks whose members you trust at that level.
+to distribute (the same model as Tailscale SSH). An allow rule grants any
+non-root user by default; `-u <users>` names the accounts a peer may log in as,
+and `-u '*'` includes root.
+
+Sessions, `scp`/`sftp`, port and unix-socket forwarding (`-L`, `-D`, `-R`,
+`ProxyJump`) and agent forwarding (`-A`) all work with a stock client. X11
+forwarding does not.
 
 ## Declarative provisioning
 

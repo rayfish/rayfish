@@ -14,8 +14,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   open failed: administratively prohibited" while the shell on the same
   connection kept working. Any peer allowed to log in can forward; the target
   socket is opened by the daemon on the remote host, so it reaches loopback-only
-  services there, the same as a shell on that host. Remote forwarding (`ssh -R`)
-  is still not supported.
+  services there, the same as a shell on that host.
+
+- **Mesh SSH supports reverse forwarding, unix sockets and agent forwarding.**
+  `ssh -R` publishes a port (or a unix socket) from your machine on the remote
+  one, `ssh -L <port>:/path/to.sock` reaches a socket like docker's or
+  gpg-agent's, and `ssh -A` gives the session an `SSH_AUTH_SOCK` that talks back
+  to your agent, so keys stay on your machine. Reverse forwards bind loopback on
+  the remote host, matching sshd's default `GatewayPorts no`. A socket forward
+  is allowed only where the account you logged in as could have used or created
+  that socket itself, so the root daemon doing the work grants nothing extra.
+
+- **Mesh SSH passes locale environment variables and signals.** `SendEnv` /
+  `SetEnv` of `LANG`, `LC_*`, `TZ`, `TERM` and `COLORTERM` reach the session
+  (anything else is refused, since it would let the other side steer your login
+  shell), a client's signal request reaches the running process, and a process
+  killed by a signal is reported as that signal instead of a made-up exit code.
+  X11 forwarding is still not supported, but `ssh -X` now says so instead of
+  waiting on a reply that never came.
 
 - **`ray mdns scan` lists the rayfish nodes on your LAN.** mDNS discovery has
   always run in the background, but it only fed the connection layer: there was
@@ -112,6 +128,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   peer on a build older than this one cannot redeem them.
 
 ### Fixed
+
+- **A dropped mesh SSH connection no longer leaves your login shell running.**
+  When a session channel closed, or the whole connection went away, whatever was
+  running under it kept running on the remote host. It now gets hung up, the way
+  a stock sshd does.
 
 - **Mesh SSH serves every session on a multiplexed connection, not just the
   first.** With `ControlMaster` (`ssh -M`, and every tool that reuses one
