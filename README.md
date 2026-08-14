@@ -361,6 +361,11 @@ Sessions, `scp`/`sftp`, port and unix-socket forwarding (`-L`, `-D`, `-R`,
 `ProxyJump`) and agent forwarding (`-A`) all work with a stock client. X11
 forwarding does not.
 
+Interactive sessions are handed to the host's `login(1)`, so PAM applies (a
+locked or expired account is refused), the session shows up in `who` / `last` /
+`loginctl`, and you get the motd. Root sessions and `ssh host <cmd>` spawn the
+shell directly, since `login` won't take a root session on a pseudo-terminal.
+
 ## Declarative provisioning
 
 For fleets and repeatable setups, `ray apply deploy.yaml` reconciles your

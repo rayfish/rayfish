@@ -25,6 +25,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is allowed only where the account you logged in as could have used or created
   that socket itself, so the root daemon doing the work grants nothing extra.
 
+- **A mesh SSH login is a real login now.** An interactive session goes through
+  the host's `login(1)`, so it gets what a directly-spawned shell skipped: the
+  PAM account check (a locked or expired account is refused instead of let in),
+  a proper PAM/logind session with its `XDG_RUNTIME_DIR` and resource limits,
+  the utmp/wtmp records behind `who` and `last`, `/etc/nologin`, and the motd.
+  Root sessions and non-interactive commands still spawn the shell directly:
+  `login` refuses root on a pseudo-terminal, by hanging rather than failing.
+  Set `RAYFISH_SSH_NO_LOGIN=1` on the daemon to turn the handoff off.
+
+- **Sessions know they are remote.** `SSH_CONNECTION`, `SSH_CLIENT` and (on a
+  terminal) `SSH_TTY` are set, so prompts, `screen`, and scripts that check
+  whether they are running over SSH behave the way they do everywhere else.
+
 - **Mesh SSH passes locale environment variables and signals.** `SendEnv` /
   `SetEnv` of `LANG`, `LC_*`, `TZ`, `TERM` and `COLORTERM` reach the session
   (anything else is refused, since it would let the other side steer your login
@@ -128,6 +141,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   peer on a build older than this one cannot redeem them.
 
 ### Fixed
+
+- **A mesh SSH terminal session can no longer go silent while its shell keeps
+  running.** If the program on the far end closed and reopened its terminal
+  while starting up, the daemon's read of the pseudo-terminal ended there and
+  nothing it printed after that reached you, with the session apparently hung.
 
 - **A dropped mesh SSH connection no longer leaves your login shell running.**
   When a session channel closed, or the whole connection went away, whatever was

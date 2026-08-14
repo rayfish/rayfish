@@ -19,6 +19,16 @@
 //! (`ssh -A`), locale environment variables, and signals. X11 forwarding is the
 //! one thing missing, and it is refused explicitly rather than left hanging.
 //!
+//! An interactive session is handed to `login(1)` where the host has one, so
+//! the things a directly-spawned shell silently skips come from the system
+//! instead of from us: the PAM account check (a locked or expired account is
+//! refused), the PAM session (logind session, `XDG_RUNTIME_DIR`, resource
+//! limits), the utmp/wtmp records behind `who` and `last`, `/etc/nologin` and
+//! the motd. Root is the exception: `login` refuses a root session on a tty
+//! outside `/etc/securetty`, and refuses it by hanging, so root (and every
+//! non-interactive session, which has no login record either way) still spawns
+//! the shell directly.
+//!
 //! Forwarding runs in the daemon, which is root, so two rules keep it from
 //! being worth more than a shell on the same host. A TCP forward goes anywhere
 //! the host can reach (loopback services included), exactly like a shell would.
@@ -33,6 +43,7 @@
 use std::collections::HashMap;
 use std::io::Error;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -66,7 +77,7 @@ use crate::peers::{DeviceUserMap, PeerTable};
 // kernel reject a more-specific `<mesh-ip>:22` bind (EADDRINUSE), so the daemon
 // binds `SSH_LISTEN_PORT` and translates the port in the forwarding path instead
 // of an OS-firewall redirect. Re-exported here so the public path stays stable.
-pub(crate) use crate::forward::SSH_LISTEN_PORT;
+pub(crate) use crate::forward::{SSH_LISTEN_PORT, SSH_PORT};
 
 /// How long a `ssh -L` / `-D` forwarded connection may take to reach its target
 /// before the channel is dropped. Short enough that a black-holed address fails
@@ -315,12 +326,45 @@ async fn handle_conn(
     let policy = resolve_user_policy(&authz, &user_identity, &networks);
     debug!(%src, peer = %user_identity.fmt_short(), authorized = policy.authorized(), "mesh SSH connection");
     let banner = auth_banner(&policy, &user_identity, &networks);
-    let handler = SshHandler::new(policy, user_identity, banner);
+    // The address the client believes it reached, not the internal listen port
+    // the SSH NAT sent it to: this is what the session reports in
+    // `SSH_CONNECTION` and what `login` records as the origin.
+    let server = stream
+        .local_addr()
+        .map(|a| SocketAddr::new(a.ip(), SSH_PORT))
+        .unwrap_or_else(|_| SocketAddr::new(src, SSH_PORT));
+    let handler = SshHandler::new(policy, user_identity, banner, Origin { client: peer, server });
     match russh::server::run_stream(config, stream, handler).await {
         Ok(session) => {
             let _ = session.await;
         }
         Err(e) => debug!(error = %e, "mesh SSH session ended with error"),
+    }
+}
+
+/// Where a connection came from and where it landed, as the client sees it.
+/// Feeds `SSH_CONNECTION` / `SSH_CLIENT` and the origin `login(1)` records.
+#[derive(Clone, Copy)]
+struct Origin {
+    client: SocketAddr,
+    server: SocketAddr,
+}
+
+impl Origin {
+    /// The two variables every sshd sets, so a session can tell it is remote
+    /// and from where. Same field order as OpenSSH.
+    fn env(&self) -> [(String, String); 2] {
+        let (c, s) = (self.client, self.server);
+        [
+            (
+                "SSH_CONNECTION".to_string(),
+                format!("{} {} {} {}", c.ip(), c.port(), s.ip(), s.port()),
+            ),
+            (
+                "SSH_CLIENT".to_string(),
+                format!("{} {} {}", c.ip(), c.port(), s.port()),
+            ),
+        ]
     }
 }
 
@@ -441,6 +485,9 @@ struct SshHandler {
     /// Parent of every token above: cancelled when the handler drops, so a
     /// connection that goes away takes its listeners with it.
     token: CancellationToken,
+    /// Where this connection came from, for the session environment and the
+    /// login record.
+    origin: Origin,
 }
 
 impl Drop for SshHandler {
@@ -458,7 +505,12 @@ impl Drop for SshHandler {
 }
 
 impl SshHandler {
-    fn new(policy: UserPolicy, user: EndpointId, banner: Option<String>) -> Self {
+    fn new(
+        policy: UserPolicy,
+        user: EndpointId,
+        banner: Option<String>,
+        origin: Origin,
+    ) -> Self {
         Self {
             policy,
             user,
@@ -469,6 +521,7 @@ impl SshHandler {
             forwards: HashMap::new(),
             socket_forwards: HashMap::new(),
             token: CancellationToken::new(),
+            origin,
         }
     }
 
@@ -508,7 +561,9 @@ impl SshHandler {
         let handle = session.handle();
         let login_name = info.name.clone();
         let pty = state.pty.take();
-        let env = std::mem::take(&mut state.env);
+        let mut env = std::mem::take(&mut state.env);
+        env.extend(self.origin.env());
+        let origin = self.origin;
         let peer = self.user;
         let (resize_tx, resize_rx) = mpsc::unbounded_channel();
         state.resize_tx = Some(resize_tx);
@@ -519,14 +574,16 @@ impl SshHandler {
             // A PTY was requested -> interactive terminal. Otherwise (`ssh host
             // cmd` with no -t) use plain pipes so stdout/stderr aren't merged or
             // CRLF-translated, matching a conventional sshd.
+            let spec = SessionSpec {
+                info,
+                command,
+                env,
+                child_proc: child,
+                origin,
+            };
             let result = match pty {
-                Some(pty_req) => {
-                    run_pty_session(channel, info, command, pty_req, env, resize_rx, child).await
-                }
-                None => {
-                    run_pipe_session(channel, handle.clone(), channel_id, info, command, env, child)
-                        .await
-                }
+                Some(pty_req) => run_pty_session(channel, spec, pty_req, resize_rx).await,
+                None => run_pipe_session(channel, handle.clone(), channel_id, spec).await,
             };
             let exit = match result {
                 Ok(e) => e,
@@ -1389,6 +1446,40 @@ fn resolve_login(login_user: &str) -> Result<LoginInfo> {
     })
 }
 
+/// The `login(1)` this host has, or `None` when the handoff cannot be used.
+///
+/// It needs root (it does the setuid itself) and an actual login binary, so a
+/// daemon running unprivileged, or a host without one (a minimal container),
+/// falls back to spawning the shell directly. `RAYFISH_SSH_NO_LOGIN` turns the
+/// handoff off, for a host whose `login` does something surprising.
+fn login_program() -> Option<PathBuf> {
+    if uzers::get_effective_uid() != 0 || std::env::var_os("RAYFISH_SSH_NO_LOGIN").is_some() {
+        return None;
+    }
+    ["/bin/login", "/usr/bin/login"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| {
+            std::fs::metadata(p)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+}
+
+/// The terminal a pty's child end will see, for `SSH_TTY`.
+fn tty_name(pts: &impl std::os::fd::AsRawFd) -> Option<String> {
+    let mut buf = [0 as libc::c_char; 128];
+    // SAFETY: `buf` is a live array of `buf.len()` chars; ttyname_r writes a
+    // NUL-terminated name into it or returns non-zero without touching it.
+    let rc = unsafe { libc::ttyname_r(pts.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: ttyname_r returned success, so `buf` holds a NUL-terminated name.
+    let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    name.to_str().ok().map(str::to_string)
+}
+
 /// Build a `pre_exec` closure that drops the root daemon's privileges to the
 /// target user **completely**: supplementary groups first (`initgroups`, so the
 /// child does NOT inherit root's groups like gid 0/wheel), then `setgid`, then
@@ -1447,38 +1538,91 @@ fn login_env<'a>(home: &Path, shell: &Path, name: &str) -> [(&'a str, std::ffi::
     ]
 }
 
+/// What a session runs and who it runs as: everything the two session paths
+/// need beyond the channel itself.
+struct SessionSpec {
+    info: Arc<LoginInfo>,
+    /// The `exec` command, or `None` for a login shell.
+    command: Option<String>,
+    env: Vec<(String, String)>,
+    child_proc: ChildProc,
+    origin: Origin,
+}
+
 /// Allocate a PTY, spawn the login shell (or `exec` command) as the requested
 /// unix user, and pump bytes between the SSH channel and the PTY until the child
 /// exits. Returns the child's exit code.
 async fn run_pty_session(
     channel: Channel<Msg>,
-    info: Arc<LoginInfo>,
-    command: Option<String>,
+    spec: SessionSpec,
     pty_req: PtyReq,
-    env: Vec<(String, String)>,
     mut resize_rx: mpsc::UnboundedReceiver<Size>,
-    child_proc: ChildProc,
 ) -> Result<Exit> {
-    let drop = drop_privs(info.uid, info.gid, &info.name)?;
-
+    let SessionSpec {
+        info,
+        command,
+        env,
+        child_proc,
+        origin,
+    } = spec;
     let (pty, pts) = pty_process::open().context("opening pty")?;
     let _ = pty.resize(Size::new(pty_req.row, pty_req.col));
+    let tty = tty_name(&pts);
+    // Hold a terminal fd of our own for as long as the child runs. Reading the
+    // master end returns EIO the instant the *last* slave fd closes, and a
+    // child that closes and reopens its terminal while starting up (`login`
+    // does, between the PAM session and the shell) hits exactly that window:
+    // the read half would end there and the session would go silent with the
+    // shell still running behind it. Dropped below, once the child is gone, so
+    // the read half can finish.
+    let keep_open = pts.as_fd().try_clone_to_owned().ok();
 
-    let mut cmd = pty_process::Command::new(&info.shell);
-    match &command {
-        Some(c) => cmd = cmd.arg("-c").arg(c),
-        None => cmd = cmd.arg("-l"),
-    }
+    // An interactive terminal with no command is a login, so hand it to
+    // `login(1)` when this host has one: it owns the things a session gets
+    // wrong when it is spawned directly. PAM (so a locked or expired account is
+    // refused, and logind gives the session an XDG_RUNTIME_DIR and its
+    // resource limits), the utmp/wtmp/lastlog records behind `who` and `last`,
+    // `/etc/nologin`, and the motd. It is also what does the setuid, so this
+    // branch keeps root and drops nothing itself.
+    //
+    // Not for root: `login` refuses a root session on a tty that is not in
+    // `/etc/securetty` (a pts never is), and it refuses it by hanging with no
+    // output rather than failing, which would leave `ssh root@host.ray` staring
+    // at nothing. Root keeps the direct path.
+    let handoff = (command.is_none() && info.uid != 0)
+        .then(login_program)
+        .flatten();
+    let mut cmd = match &handoff {
+        Some(login) => pty_process::Command::new(login)
+            // Keep the environment we curated (login sets HOME/USER/SHELL/PATH
+            // itself either way); record where the session came from; and log
+            // the user in without asking for a password we cannot check.
+            .arg("-p")
+            .arg("-h")
+            .arg(origin.client.ip().to_string())
+            .arg("-f")
+            .arg(&info.name),
+        None => match &command {
+            Some(c) => pty_process::Command::new(&info.shell).arg("-c").arg(c),
+            None => pty_process::Command::new(&info.shell).arg("-l"),
+        },
+    };
     cmd = cmd
-        .current_dir(&info.home)
         .env_clear()
         .envs(login_env(&info.home, &info.shell, &info.name))
         .env("TERM", &pty_req.term)
+        .envs(tty.map(|t| ("SSH_TTY".to_string(), t)))
         .envs(env);
-    // SAFETY: drops privileges (initgroups+setgid+setuid) before exec; we do NOT
-    // use `.uid()/.gid()` because std applies those *after* pre_exec, too late to
-    // also drop supplementary groups.
-    cmd = unsafe { cmd.pre_exec(drop) };
+    if handoff.is_none() {
+        // `login` chdirs itself, and copes with a home directory that is gone;
+        // spawning into a missing directory would just fail.
+        cmd = cmd.current_dir(&info.home);
+        let drop = drop_privs(info.uid, info.gid, &info.name)?;
+        // SAFETY: drops privileges (initgroups+setgid+setuid) before exec; we do NOT
+        // use `.uid()/.gid()` because std applies those *after* pre_exec, too late to
+        // also drop supplementary groups.
+        cmd = unsafe { cmd.pre_exec(drop) };
+    }
     let mut child = cmd.spawn(pts).context("spawning login shell")?;
     // Publish the pid so `signal` requests reach it, and clear it again below
     // once it is reaped: a stale pid gets reused by an unrelated process.
@@ -1516,6 +1660,9 @@ async fn run_pty_session(
 
     let status = child.wait().await.context("waiting on child")?;
     child_proc.pid.store(0, Ordering::Relaxed);
+    // The child is gone, so let the terminal go: with no slave fd left the
+    // master reaches EIO and the reader below finishes instead of blocking.
+    drop(keep_open);
     let _ = p2c.await;
     c2p.abort();
     Ok(Exit::from_status(status))
@@ -1529,11 +1676,15 @@ async fn run_pipe_session(
     channel: Channel<Msg>,
     handle: Handle,
     channel_id: ChannelId,
-    info: Arc<LoginInfo>,
-    command: Option<String>,
-    env: Vec<(String, String)>,
-    child_proc: ChildProc,
+    spec: SessionSpec,
 ) -> Result<Exit> {
+    let SessionSpec {
+        info,
+        command,
+        env,
+        child_proc,
+        ..
+    } = spec;
     let drop = drop_privs(info.uid, info.gid, &info.name)?;
 
     let mut cmd = tokio::process::Command::new(&info.shell);
@@ -1982,7 +2133,7 @@ mod tests {
     /// client connection to it. The peer is authorized for any user, the same
     /// state a live mesh connection reaches before it opens a channel.
     async fn connect_to_test_server() -> client::Handle<AcceptAnyHost> {
-        connect_watching_openings(None).await
+        connect_watching_openings(None, test_account()).await
     }
 
     /// The same, plus the channels the server opens back to the client: what a
@@ -1992,11 +2143,12 @@ mod tests {
         mpsc::UnboundedReceiver<Channel<ClientMsg>>,
     ) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (connect_watching_openings(Some(tx)).await, rx)
+        (connect_watching_openings(Some(tx), test_account()).await, rx)
     }
 
     async fn connect_watching_openings(
         opened: Option<mpsc::UnboundedSender<Channel<ClientMsg>>>,
+        login_as: String,
     ) -> client::Handle<AcceptAnyHost> {
         let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("host key");
         let config = Arc::new(Config {
@@ -2010,10 +2162,16 @@ mod tests {
             .expect("bind loopback listener");
         let addr = listener.local_addr().expect("listener address");
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
+            let (stream, client) = listener.accept().await.expect("accept");
             let mut policy = UserPolicy::default();
             policy.add(&["*".to_string()]);
-            let handler = SshHandler::new(policy, id(1), None);
+            // The same origin the live path builds: the client's real address,
+            // and :22 for our side, which is where the client thinks it is.
+            let origin = Origin {
+                client,
+                server: SocketAddr::new(addr.ip(), SSH_PORT),
+            };
+            let handler = SshHandler::new(policy, id(1), None, origin);
             if let Ok(session) = russh::server::run_stream(config, stream, handler).await {
                 let _ = session.await;
             }
@@ -2028,7 +2186,7 @@ mod tests {
         .expect("client connect");
         assert!(
             handle
-                .authenticate_none(test_account())
+                .authenticate_none(login_as)
                 .await
                 .expect("auth")
                 .success(),
@@ -2390,6 +2548,105 @@ mod tests {
             .expect("the agent bytes never arrived")
             .expect("read from the agent channel");
         assert_eq!(&buf, b"ping");
+    }
+
+    /// Kept out of the normal run: an interactive login shell depends on the
+    /// host's shell and its rc files, and as root it goes through `login(1)`,
+    /// which writes real utmp/wtmp records. Run it deliberately, as root, to
+    /// exercise the login handoff:
+    ///
+    /// ```text
+    /// cargo test --lib -- --ignored --exact ssh::tests::a_login_shell_runs_and_exits
+    /// ```
+    #[tokio::test]
+    #[ignore]
+    async fn a_login_shell_runs_and_exits() {
+        // Reaching `login(1)` needs a root server and a non-root login, which
+        // under `sudo` is the account that invoked it.
+        let login_as = match uzers::get_effective_uid() {
+            0 => std::env::var("SUDO_USER").unwrap_or_else(|_| test_account()),
+            _ => test_account(),
+        };
+        let handle = connect_watching_openings(None, login_as).await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("open session channel");
+        channel
+            .request_pty(true, "xterm-rayfish", 80, 24, 0, 0, &[])
+            .await
+            .expect("request pty");
+        channel.request_shell(true).await.expect("request shell");
+        // The quotes matter: the terminal echoes what we type, so the command
+        // has to look different from its own output for the marker to mean the
+        // shell ran it. And it is offered repeatedly because `login` flushes
+        // the terminal before exec'ing the shell, so anything typed while it
+        // was still printing the motd is gone.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut retype = tokio::time::Instant::now();
+        let mut out = String::new();
+        let mut ran = false;
+        while tokio::time::Instant::now() < deadline {
+            if !ran && tokio::time::Instant::now() >= retype {
+                let _ = channel.data(&b"echo ray\"fish\"-marker\n"[..]).await;
+                retype = tokio::time::Instant::now() + Duration::from_millis(500);
+            }
+            match timeout(Duration::from_millis(200), channel.wait()).await {
+                Ok(Some(ChannelMsg::Data { data })) => {
+                    out.push_str(&String::from_utf8_lossy(&data));
+                    if !ran && out.contains("rayfish-marker") {
+                        ran = true;
+                        let _ = channel.data(&b"exit\n"[..]).await;
+                    }
+                }
+                Ok(Some(ChannelMsg::Close)) | Ok(None) => break,
+                Ok(Some(_)) => {}
+                Err(_) => continue,
+            }
+        }
+        assert!(ran, "the login shell never ran our command: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn a_session_knows_it_is_remote() {
+        // Prompts, `screen`, and any script that asks "am I over ssh" read
+        // these. A session without them looks local.
+        let handle = connect_to_test_server().await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("open session channel");
+        channel
+            .exec(true, "echo conn:$SSH_CONNECTION client:$SSH_CLIENT")
+            .await
+            .expect("exec");
+        let (out, code) = drain(&mut channel).await;
+        assert_eq!(code, Some(0));
+        // "<client ip> <client port> <server ip> <server port>", and the server
+        // port is the 22 the client dialled, not the internal listen port.
+        let conn = out
+            .split_whitespace()
+            .find(|w| w.starts_with("conn:"))
+            .map(|w| w.trim_start_matches("conn:").to_string())
+            .expect("SSH_CONNECTION is set");
+        assert_eq!(conn, "127.0.0.1", "SSH_CONNECTION starts at the client: {out}");
+        assert!(
+            out.contains(&format!(" {SSH_PORT} ")) || out.ends_with(&format!(" {SSH_PORT}")),
+            "the server port is the one the client dialled: {out}"
+        );
+        assert!(out.contains("client:127.0.0.1"), "SSH_CLIENT is set: {out}");
+    }
+
+    #[tokio::test]
+    async fn a_pty_reports_its_terminal() {
+        // SSH_TTY names the pts the session runs on; `write`, `who` and
+        // anything that talks to a terminal by path need it.
+        let (_pty, pts) = pty_process::open().expect("open a pty");
+        let name = tty_name(&pts).expect("the child end of a pty has a name");
+        assert!(
+            name.starts_with("/dev/"),
+            "a terminal path, got {name:?}"
+        );
     }
 
     #[test]
