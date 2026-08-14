@@ -204,6 +204,34 @@ Prefer buttons and forms? Run `ray gui` to open a local browser GUI. It wraps
 the same CLI commands, so anything available in `ray --help` is available there
 too; commands that need root still need the GUI to be launched with `sudo`.
 
+### Tab completion
+
+Installed for you: the installer and `sudo ray up` write the completion scripts
+into the directories bash, zsh and fish already search, so there is nothing to
+source and no rc file to edit. Open a new shell and press tab.
+
+It is not a static script. Each tab asks the running `ray`, so the answers are
+the networks and peers you have right now:
+
+```
+$ ray leave <TAB>
+gaming  homelab
+
+$ ray ping <TAB>
+alice   100.64.3.1, active
+nas     100.64.9.4, idle
+
+$ ray exit-node use homelab <TAB>
+gateway 100.64.2.7, active
+```
+
+A tab never starts the daemon and never blocks: with the service stopped it
+answers from your saved config where it can, and offers nothing where it can't.
+
+If you installed the binary by hand, `ray completions --install` sets it up
+(system-wide under `sudo`, otherwise for your user only). `ray completions zsh`
+prints the script instead, for placing yourself.
+
 ## Managing your network
 
 Once a network exists, running it is a handful of commands. Here are the ones
@@ -290,6 +318,28 @@ ray connections approve <id>       # …and approve it
 
 Approval creates a private **2-peer network** automatically (shown as `[direct]` in `ray status`). It's a real network, so firewall rules, Magic DNS, and the mesh all work the same. Approval is recipient-only: the requester consents by asking, the recipient consents by approving. Rotate your contact id anytime with `ray contact rotate` to stop new requests (existing links keep working). To stay unreachable, don't share the id.
 
+### Finding peers on your LAN
+
+Nodes on the same local network announce themselves over mDNS (on by default,
+`ray mdns on|off`). That normally just keeps connections direct instead of
+relayed, but you can also look at what it found:
+
+```bash
+ray mdns scan                      # rayfish nodes seen on this LAN
+ray connect <peer>                 # link up with one, using the id from the scan
+```
+
+`ray status` also lists LAN neighbours you're not connected to yet, under
+**nearby**, so you don't have to go looking.
+
+A sighting grants nothing. The scan marks which neighbours you already share a
+network with, and connecting to one still needs their `ray connections approve`.
+Because the scan gives you an id you can dial directly, the pair does not need
+the DHT: two machines can link up on a LAN with no internet. The flip side is
+that anyone on your LAN can send you a connect request without knowing your
+contact id, so `ray contact rotate` doesn't stop local requests (your approval
+still does).
+
 ## Firewall
 
 Rayfish ships a small userspace firewall that governs **mesh traffic only**. It
@@ -326,12 +376,23 @@ with a stock client:
 
 ```bash
 ssh user@host.ray
+scp file user@host.ray:            # scp and sftp need an sftp-server on the host
+ssh -L 8080:localhost:80 host.ray  # forwarding works in both directions, -A too
 ```
 
 The peer is authenticated by its mesh identity, so there are no `authorized_keys`
-to distribute (the same model as Tailscale SSH). One limitation to know: an
-authorized peer may currently log in as **any** local user, so only enable it on
-networks whose members you trust at that level.
+to distribute (the same model as Tailscale SSH). An allow rule grants any
+non-root user by default; `-u <users>` names the accounts a peer may log in as,
+and `-u '*'` includes root.
+
+Sessions, `scp`/`sftp`, port and unix-socket forwarding (`-L`, `-D`, `-R`,
+`ProxyJump`) and agent forwarding (`-A`) all work with a stock client. X11
+forwarding does not.
+
+Interactive sessions are handed to the host's `login(1)`, so PAM applies (a
+locked or expired account is refused), the session shows up in `who` / `last` /
+`loginctl`, and you get the motd. Root sessions and `ssh host <cmd>` spawn the
+shell directly, since `login` won't take a root session on a pseudo-terminal.
 
 ## Declarative provisioning
 

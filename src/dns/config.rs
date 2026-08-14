@@ -169,9 +169,11 @@ pub fn restore_stale_backups() {
     }
 }
 
-/// Update system DNS routing so bare hostnames and `<host>.<network>` resolve.
-/// Configures search domains (`<network>.ray`, `pi`) and supplemental match
-/// domains (each network name + `pi`) so the OS routes queries to rayfish.
+/// Update system DNS routing so bare hostnames resolve. Configures search
+/// domains (`<network>.ray`, then `ray`) so a bare `<host>` is tried as
+/// `<host>.<network>.ray` and `<host>.ray`; `.ray` itself is the only domain
+/// routed to us. Bare network names are deliberately never registered: a
+/// network called `dev` would otherwise capture every `*.dev` lookup.
 /// Call whenever networks are joined or left.
 pub async fn update_search_domains(network_names: &[String], tun_name: &str) {
     let mut search: Vec<String> = network_names
@@ -180,37 +182,33 @@ pub async fn update_search_domains(network_names: &[String], tun_name: &str) {
         .collect();
     search.push(DNS_DOMAIN.to_string());
 
-    if let Err(e) = set_search_domains(&search, network_names, tun_name).await {
+    if let Err(e) = set_search_domains(&search, tun_name).await {
         tracing::warn!(error = %e, "failed to update search domains");
     } else {
-        tracing::info!(search = ?search, match_domains = ?network_names, "updated search domains");
+        tracing::info!(search = ?search, "updated search domains");
     }
 }
 
 /// Remove all rayfish search domains (called on daemon shutdown).
 pub async fn clear_search_domains(tun_name: &str) {
-    if let Err(e) = set_search_domains(&[], &[], tun_name).await {
+    if let Err(e) = set_search_domains(&[], tun_name).await {
         tracing::warn!(error = %e, "failed to clear search domains");
     }
 }
 
-async fn set_search_domains(
-    rayfish_domains: &[String],
-    network_names: &[String],
-    tun_name: &str,
-) -> Result<()> {
+async fn set_search_domains(rayfish_domains: &[String], tun_name: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let _ = tun_name;
-        write_dns_config_macos(rayfish_domains, network_names)
+        write_dns_config_macos(rayfish_domains)
     }
     #[cfg(target_os = "linux")]
     {
-        set_search_domains_linux(rayfish_domains, network_names, tun_name).await
+        set_search_domains_linux(rayfish_domains, tun_name).await
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (rayfish_domains, network_names, tun_name);
+        let _ = (rayfish_domains, tun_name);
         Ok(())
     }
 }
@@ -266,20 +264,18 @@ mod macos {
         Ok(STORE.get().unwrap())
     }
 
-    pub fn write_dns_config(search_domains: &[String], network_names: &[String]) -> Result<()> {
+    pub fn write_dns_config(search_domains: &[String]) -> Result<()> {
         let store = get_or_init_store()?;
         let store = store.lock().unwrap();
 
         let server_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSServerAddresses) };
         let server_val = CFArray::from_CFTypes(&[CFString::from_static_string(RESOLVER_IP)]);
 
-        // Route .ray + each bare network name to our resolver
+        // Route .ray to our resolver. Only .ray: a bare network name as a match
+        // domain would hijack the public domain of the same name.
         let match_key =
             unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSSupplementalMatchDomains) };
         let mut match_domains: Vec<CFString> = vec![CFString::new(DNS_DOMAIN)];
-        for name in network_names {
-            match_domains.push(CFString::new(name));
-        }
         // Full tunnel (an exit node is selected): become the default resolver for
         // *all* queries too. An empty match domain is macOS's catch-all: it makes
         // our resolver handle everything not matched more specifically, so name
@@ -363,7 +359,7 @@ mod macos {
     impl DnsConfigurator for MacosDynamicStoreDns {
         async fn apply(&self) -> Result<()> {
             init_store()?;
-            write_dns_config(&[DNS_DOMAIN.to_string()], &[])?;
+            write_dns_config(&[DNS_DOMAIN.to_string()])?;
             tracing::info!(
                 key = SC_DNS_KEY,
                 full_tunnel = crate::exit_node::full_tunnel_active(),
@@ -395,8 +391,8 @@ mod macos {
 use macos::MacosDynamicStoreDns;
 
 #[cfg(target_os = "macos")]
-fn write_dns_config_macos(search_domains: &[String], network_names: &[String]) -> Result<()> {
-    macos::write_dns_config(search_domains, network_names)
+fn write_dns_config_macos(search_domains: &[String]) -> Result<()> {
+    macos::write_dns_config(search_domains)
 }
 
 // ---------------------------------------------------------------------------
@@ -404,22 +400,16 @@ fn write_dns_config_macos(search_domains: &[String], network_names: &[String]) -
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-async fn set_search_domains_linux(
-    rayfish_domains: &[String],
-    network_names: &[String],
-    tun_name: &str,
-) -> Result<()> {
+async fn set_search_domains_linux(rayfish_domains: &[String], tun_name: &str) -> Result<()> {
     let ifindex = linux::get_ifindex(tun_name);
 
     // Try D-Bus first
     if let Some(idx) = ifindex
         && let Ok(conn) = Connection::system().await
     {
+        // `.ray` is the only routing domain (~ray); bare network names are not
+        // registered, so a network named `dev` never captures `*.dev`.
         let mut domains: Vec<(String, bool)> = vec![(DNS_DOMAIN.to_string(), true)];
-        // Each network name as a routing domain (~network)
-        for name in network_names {
-            domains.push((name.clone(), true));
-        }
         for d in rayfish_domains {
             domains.push((d.clone(), false));
         }
@@ -446,9 +436,6 @@ async fn set_search_domains_linux(
     {
         let mut args = vec!["domain".to_string(), tun_name.to_string()];
         args.push(format!("~{DNS_DOMAIN}"));
-        for name in network_names {
-            args.push(format!("~{name}"));
-        }
         args.extend(rayfish_domains.iter().cloned());
         let status = Command::new("resolvectl")
             .args(&args)

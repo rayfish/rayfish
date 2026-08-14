@@ -9,8 +9,15 @@
 //! are kept private (`mod`, not `pub mod`) so only their *contents* are
 //! re-exported, avoiding a name clash with the `use rayfish::{firewall, …}`
 //! aliases in the crate root.
+//!
+//! `complete` is the one exception: its contents are generic names (`networks`,
+//! `peers`, `aliases`) that would collide the moment they were flattened, and
+//! the clap attributes in `main.rs` read better qualified anyway
+//! (`#[arg(add = complete::networks())]`), so the module itself is what's
+//! exported.
 
 mod alias;
+pub(crate) mod complete;
 mod connect;
 mod exit_node;
 mod files;

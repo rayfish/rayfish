@@ -59,6 +59,33 @@ impl ConnectService {
         }
     }
 
+    /// Turn a `ray connect` argument into the peer endpoint to dial.
+    ///
+    /// A LAN sighting wins over the DHT: if the argument names a neighbour from
+    /// `ray mdns scan` we already know where that peer is, so there is nothing
+    /// to look up. Otherwise the argument is a contact id and resolves through
+    /// pkarr as before. Contact ids and transport endpoint ids are distinct
+    /// keys, so the two cases cannot collide.
+    async fn resolve_connect_target(&self, arg: &str) -> Result<EndpointId, IpcMessage> {
+        let me = self.transport.endpoint.id();
+        if let Some(peer) = self.transport.lan_peers.resolve(arg, me) {
+            return Ok(peer);
+        }
+        let contact_pubkey = arg
+            .parse::<EndpointId>()
+            .map_err(|e| ipc_err(format!("invalid contact id: {e}")))?;
+        if contact_pubkey == self.transport.contact_public {
+            return Err(ipc_err("cannot connect to your own contact id".to_string()));
+        }
+        let pkarr = dht::create_pkarr_client(&self.transport.endpoint)
+            .map_err(|e| ipc_err(format!("failed to create pkarr client: {e}")))?;
+        dht::resolve_contact(&pkarr, contact_pubkey)
+            .await
+            .map_err(|_| {
+                ipc_err("contact offline or unknown (could not resolve contact id)".to_string())
+            })
+    }
+
     /// Approve a pending `ray connect` request by contact-id prefix: mint a
     /// restricted 2-peer network with the requester pre-approved (idempotent if
     /// already linked; defers to the higher endpoint id on a simultaneous
@@ -139,33 +166,18 @@ impl ConnectService {
     /// `ray connect <contact-id>`: resolve the contact to an endpoint, dial it
     /// over CONNECT_ALPN, and send a request. If approved immediately we join the
     /// minted direct network; if pending we retry on a backoff.
+    ///
+    /// The argument may also be the endpoint id of a neighbour from `ray mdns
+    /// scan`; that path skips the pkarr lookup entirely, so it works on a LAN
+    /// with no internet. Approval is still recipient-only either way.
     pub(crate) async fn connect(
         self: &Arc<Self>,
         contact_id: &str,
         hostname: Option<String>,
     ) -> IpcMessage {
-        let contact_pubkey = match contact_id.parse::<EndpointId>() {
-            Ok(id) => id,
-            Err(e) => {
-                return ipc_err(format!("invalid contact id: {e}"));
-            }
-        };
-        if contact_pubkey == self.transport.contact_public {
-            return ipc_err("cannot connect to your own contact id".to_string());
-        }
-        let pkarr = match dht::create_pkarr_client(&self.transport.endpoint) {
-            Ok(c) => c,
-            Err(e) => {
-                return ipc_err(format!("failed to create pkarr client: {e}"));
-            }
-        };
-        let peer = match dht::resolve_contact(&pkarr, contact_pubkey).await {
-            Ok(id) => id,
-            Err(_) => {
-                return ipc_err(
-                    "contact offline or unknown (could not resolve contact id)".to_string(),
-                );
-            }
+        let peer = match self.resolve_connect_target(contact_id).await {
+            Ok(peer) => peer,
+            Err(e) => return e,
         };
         if let Some(name) = self.registry.existing_direct_network_with(&peer) {
             return IpcMessage::Ok {

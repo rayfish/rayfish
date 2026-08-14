@@ -27,6 +27,8 @@ pub(crate) struct Transport {
     pub(crate) stats: Arc<ForwardMetrics>,
     /// Public half of this node's rotatable `ray connect` contact key.
     pub(crate) contact_public: EndpointId,
+    /// Nodes seen on the LAN over mDNS. Empty when mDNS is disabled.
+    pub(crate) lan_peers: Arc<LanPeers>,
 }
 
 impl Transport {
@@ -36,6 +38,7 @@ impl Transport {
         blob_store: FsStore,
         stats: Arc<ForwardMetrics>,
         contact_public: EndpointId,
+        lan_peers: Arc<LanPeers>,
     ) -> Self {
         Self {
             endpoint,
@@ -43,6 +46,7 @@ impl Transport {
             blob_store,
             stats,
             contact_public,
+            lan_peers,
         }
     }
 }

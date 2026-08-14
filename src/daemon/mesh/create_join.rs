@@ -146,7 +146,7 @@ impl NetworkRegistry {
         {
             Ok(TryJoin::Joined(resp)) => {
                 let _ = config::remove_pending_join(network_key);
-                resp
+                *resp
             }
             Ok(TryJoin::Pending) => {
                 // Persist so the retry resumes after a restart.
@@ -767,11 +767,11 @@ impl NetworkRegistry {
 
         tracing::info!(network = %display_name, key = %net_pubkey, ip = %my_ip, "joined network");
 
-        Ok(TryJoin::Joined(IpcMessage::Joined {
+        Ok(TryJoin::Joined(Box::new(IpcMessage::Joined {
             name: display_name.to_string(),
             my_ip,
             my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
-        }))
+        })))
     }
 
     /// Fetch the authoritative GroupBlob for a network we coordinate, used to

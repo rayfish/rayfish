@@ -293,6 +293,13 @@ impl MeshConnection {
             };
             let Some(handler) = self.manager.handler_for(&net_pubkey) else {
                 tracing::debug!(peer = %self.peer_id.fmt_short(), net = %net_pubkey.fmt_short(), "control frame for unknown network; ignoring");
+                // A peer talking to us about a network we have saved but never
+                // registered means our restore of it is still owed: the network
+                // is plainly reachable, since its traffic just arrived. Nudge the
+                // supervisor to retry now rather than at its next tick. This
+                // frame is still dropped (there is no handler to give it to), but
+                // the peer's own reconnect loop will be back.
+                self.ctx.registry.nudge_restore();
                 continue;
             };
             drop(recv); // one message per stream; the reply rides `send`

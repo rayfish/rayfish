@@ -10,7 +10,7 @@ use rayfish::{
 use std::sync::{Arc, atomic};
 
 use anyhow::{Context, Result};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use ray_proto::settings::node_key_help;
 
 use membership::GroupMode;
@@ -26,6 +26,15 @@ use cli::*;
 /// `build.rs` (e.g. `0.1.0 (abc12345)`). The SHA distinguishes nightly builds
 /// that share a crate version, and is what a tester quotes in a `ray report`.
 const FULL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("RAY_GIT_SHA"), ")");
+
+/// The `on`/`off` domain shared by the toggle arguments. Suggestions, not a
+/// `value_parser`: these arguments also take `true`/`yes`/`1` (see
+/// `config::parse_bool_setting`), and restricting them to two words here would
+/// start rejecting spellings that work today.
+const ON_OFF: [&str; 2] = ["on", "off"];
+
+/// The firewall's verdict words, shared by `firewall add` and `firewall default`.
+const ALLOW_DENY: [&str; 2] = ["allow", "deny"];
 
 #[derive(Parser)]
 #[command(
@@ -101,11 +110,13 @@ pub(crate) enum Command {
     #[command(visible_alias = "rm")]
     Leave {
         /// Three-word network name
+        #[arg(add = complete::networks())]
         name: String,
     },
     /// Destroy a network (coordinator only)
     Nuke {
         /// Three-word network name
+        #[arg(add = complete::networks())]
         name: String,
         /// Force destroy even if other members exist
         #[arg(long)]
@@ -115,16 +126,20 @@ pub(crate) enum Command {
     #[command(visible_alias = "boot")]
     Kick {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         /// Member to remove: hostname, mesh IP, or short id
+        #[arg(add = complete::peers())]
         peer: String,
     },
     /// Set or show a per-network ephemeral policy: auto-remove members offline
     /// longer than the given duration (coordinator only)
     Ephemeral {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         /// `Nh`/`Nd`/`Nw` to enable, `off` to disable, or `show` to print
+        #[arg(add = complete::ephemeral_args())]
         arg: String,
     },
     /// Show status of all networks (active + saved)
@@ -159,10 +174,15 @@ pub(crate) enum Command {
     },
     /// Restart the system service (requires root)
     Restart,
-    /// Generate shell completions
+    /// Set up tab completion for your shell (installed for you by `ray up`)
     Completions {
-        /// Shell to generate completions for
-        shell: clap_complete::Shell,
+        /// Shell to generate for. Guessed from $SHELL when left out; as root,
+        /// left out means every shell
+        shell: Option<clap_complete::Shell>,
+        /// Write the script where the shell will find it, rather than printing
+        /// it for you to redirect somewhere yourself
+        #[arg(long)]
+        install: bool,
     },
     /// Start a local browser GUI for common workflows and every CLI command
     Gui {
@@ -176,6 +196,7 @@ pub(crate) enum Command {
     /// Mint and manage one-time invite codes for a network (coordinator only)
     Invite {
         /// Network name to issue/manage invites for
+        #[arg(add = complete::networks())]
         network: String,
         #[command(subcommand)]
         action: Option<InviteAction>,
@@ -183,11 +204,13 @@ pub(crate) enum Command {
     /// List peers awaiting approval on a closed network (coordinator only)
     Requests {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
     },
     /// Admit a peer waiting for approval (coordinator only)
     Accept {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         /// Short id of the pending peer (from `ray requests`)
         id: String,
@@ -195,6 +218,7 @@ pub(crate) enum Command {
     /// Reject a peer waiting for approval (coordinator only)
     Deny {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         /// Short id of the pending peer (from `ray requests`)
         id: String,
@@ -224,6 +248,7 @@ pub(crate) enum Command {
     /// echo probes that verify the round-trip end to end.
     Ping {
         /// Peer to probe: hostname, mesh IP, or short id.
+        #[arg(add = complete::peers())]
         peer: String,
         /// Number of probes to send.
         #[arg(short, long, default_value_t = 3)]
@@ -240,6 +265,7 @@ pub(crate) enum Command {
     /// rules. Trusted-network multi-admin.
     Admin {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         #[command(subcommand)]
         action: AdminAction,
@@ -249,6 +275,7 @@ pub(crate) enum Command {
     /// a `ray apply` spec's `aliases:` map. Never published to the network.
     Alias {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         #[command(subcommand)]
         action: AliasAction,
@@ -269,6 +296,7 @@ pub(crate) enum Command {
     /// reports the membership gap (expected vs joined hosts). Never joins.
     Apply {
         /// Path to a TOML spec file (see `ray apply --example`).
+        #[arg(value_hint = clap::ValueHint::FilePath)]
         spec: Option<String>,
         /// Drop suggested-firewall subjects that are no longer in the spec.
         #[arg(long)]
@@ -288,6 +316,7 @@ pub(crate) enum Command {
     /// Change your hostname on a network
     Hostname {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         /// New hostname (e.g. "alice" → alice.network.ray)
         name: String,
@@ -298,19 +327,22 @@ pub(crate) enum Command {
     #[command(visible_alias = "whois")]
     Identityof {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         /// Hostname to look up
+        #[arg(add = complete::peers())]
         hostname: String,
     },
-    /// Enable or disable mDNS local peer discovery
+    /// Local (LAN) peer discovery over mDNS: toggle it, or list what it found
     Mdns {
-        /// "on" or "off"
-        state: String,
+        #[command(subcommand)]
+        action: MdnsAction,
     },
     /// Enable or disable automatic stable updates (applied by the daemon)
     #[command(name = "auto-update")]
     AutoUpdate {
         /// "on" or "off"
+        #[arg(add = complete::words(&ON_OFF))]
         state: String,
     },
     /// View or change daemon settings (`ray config get` lists every key)
@@ -321,14 +353,16 @@ pub(crate) enum Command {
     /// Authorize a user to run ray without sudo (requires root)
     SetOperator {
         /// Username or numeric UID to grant operator access
+        #[arg(value_hint = clap::ValueHint::Username)]
         user: String,
     },
     /// Send one or more files to a peer (queued if the peer is offline)
     Send {
         /// Peer hostname, mesh IP, or short ID
+        #[arg(add = complete::peers())]
         peer: String,
         /// File paths to send
-        #[arg(required = true)]
+        #[arg(required = true, value_hint = clap::ValueHint::AnyPath)]
         files: Vec<String>,
     },
     /// Manage incoming file transfers
@@ -347,6 +381,7 @@ pub(crate) enum Command {
     Unpair {
         /// Device to revoke: hostname, mesh IP, short id, or full endpoint id
         /// (see `ray pair list`)
+        #[arg(add = complete::paired_devices())]
         device: String,
     },
     /// Handle a rayfish:// deep link (join or pair)
@@ -457,6 +492,7 @@ pub(crate) enum AdminAction {
     /// Grant the network key to a member (coordinator only)
     Add {
         /// Short id of the member to promote (from `ray status`)
+        #[arg(add = complete::peers())]
         identity: String,
     },
     /// List this network's key-holders (the local node + granted members)
@@ -470,6 +506,7 @@ pub(crate) enum AliasAction {
     /// identityof`) or a currently-joined hostname, resolved to its identity.
     Set {
         /// Identity string or a joined hostname
+        #[arg(add = complete::peers())]
         key: String,
         /// The alias to assign
         alias: String,
@@ -481,6 +518,7 @@ pub(crate) enum AliasAction {
     #[command(visible_aliases = ["rm", "del"])]
     Remove {
         /// The alias to remove
+        #[arg(add = complete::aliases())]
         alias: String,
     },
 }
@@ -510,16 +548,23 @@ pub(crate) enum ConfigAction {
     #[command(visible_alias = "ls")]
     Get {
         /// A settings key (omit for all)
-        #[arg(long_help = key_long_help("A settings key (omit for all)."))]
+        #[arg(
+            long_help = key_long_help("A settings key (omit for all)."),
+            add = complete::node_settings_keys()
+        )]
         key: Option<String>,
     },
     /// Set a key. List keys take a comma list of presets/URLs/IPs; on/off keys
     /// take on or off.
     Set {
         /// A settings key
-        #[arg(long_help = key_long_help("A settings key."))]
+        #[arg(
+            long_help = key_long_help("A settings key."),
+            add = complete::node_settings_keys()
+        )]
         key: String,
         /// A comma list of presets / URLs / IPv4s ("n0" or empty resets), or on/off
+        #[arg(add = complete::settings_values())]
         value: String,
         /// Replace the defaults instead of augmenting them (list keys only)
         #[arg(long)]
@@ -529,9 +574,23 @@ pub(crate) enum ConfigAction {
     #[command(visible_alias = "rm")]
     Unset {
         /// A settings key
-        #[arg(long_help = key_long_help("A settings key."))]
+        #[arg(
+            long_help = key_long_help("A settings key."),
+            add = complete::node_settings_keys()
+        )]
         key: String,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum MdnsAction {
+    /// Enable mDNS local peer discovery (takes effect on daemon restart)
+    On,
+    /// Disable mDNS local peer discovery (takes effect on daemon restart)
+    Off,
+    /// List rayfish nodes seen on this LAN. Seeing a node grants it nothing:
+    /// linking up still needs `ray connect` and the other side's approval.
+    Scan,
 }
 
 #[derive(Subcommand)]
@@ -552,11 +611,13 @@ pub(crate) enum FirewallAction {
     #[command(visible_alias = "a")]
     Add {
         /// Direction: in or out
+        #[arg(add = complete::words(&["in", "out"]))]
         direction: String,
         /// Action: allow or deny
+        #[arg(add = complete::words(&ALLOW_DENY))]
         action: String,
         /// Protocol: tcp, udp, icmp, any
-        #[arg(long, short = 'p', default_value = "any")]
+        #[arg(long, short = 'p', default_value = "any", add = complete::words(&["tcp", "udp", "icmp", "any"]))]
         proto: String,
         /// Port, range, or comma list (e.g. 22, 80-443, 80,443, or * for all).
         /// A comma list adds one rule per item.
@@ -564,10 +625,10 @@ pub(crate) enum FirewallAction {
         port: Option<String>,
         /// Peer: hostname, mesh IP, short id, endpoint id, or user identity
         /// (omit for any peer)
-        #[arg(long)]
+        #[arg(long, add = complete::peers())]
         peer: Option<String>,
         /// Restrict to a network (omit to match any network the peer is reached through)
-        #[arg(long)]
+        #[arg(long, add = complete::networks())]
         network: Option<String>,
     },
     /// Remove a rule by index
@@ -586,6 +647,7 @@ pub(crate) enum FirewallAction {
     /// allow and is unaffected.
     Default {
         /// Default inbound action: allow or deny
+        #[arg(add = complete::words(&ALLOW_DENY))]
         action: String,
     },
     /// Toggle "fail fast" REJECT mode (opt-in, default off). When `on`, a denied
@@ -594,6 +656,7 @@ pub(crate) enum FirewallAction {
     /// `off`, denied packets are silently dropped (stealthy, the default).
     Reject {
         /// on or off
+        #[arg(add = complete::words(&ON_OFF))]
         state: String,
     },
     /// Turn the firewall back on (resume enforcing rules and defaults). Undoes
@@ -611,10 +674,11 @@ pub(crate) enum FirewallAction {
     /// Distributed in the signed blob; each node takes them per its own consent.
     Suggest {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         /// Subject host (the hostname the rules protect). Use `*` to target every
         /// node on the network (e.g. "everyone opens this port").
-        #[arg(long)]
+        #[arg(long, add = complete::peers_or_any())]
         subject: String,
         /// Allow inbound traffic, e.g. `--allow tcp:22` (any peer) or
         /// `--allow earn01:tcp:9000,tcp:8123` (repeatable). The `PEER:` prefix is
@@ -632,24 +696,29 @@ pub(crate) enum FirewallAction {
     /// (a node that did not join with `--auto-accept-firewall`).
     Pending {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
     },
     /// Accept and install a network's queued suggested rules
     Accept {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
     },
     /// Discard a network's queued suggested rules without installing them
     Deny {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
     },
     /// Toggle auto-accepting this network's suggested firewall rules on this node
     /// (`on` installs the current queue; `off` stops future auto-install).
     AutoAccept {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         /// `on` or `off`
+        #[arg(add = complete::words(&ON_OFF))]
         state: String,
     },
     /// Embedded mesh SSH server (Tailscale-style): SSH into this node by mesh
@@ -673,8 +742,10 @@ pub(crate) enum SshAction {
     #[command(visible_alias = "ok")]
     Allow {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         /// Peer (hostname / mesh IP / short id) or `*`
+        #[arg(add = complete::peers_or_any())]
         peer: String,
         /// Local unix users this peer may log in as (comma-separated). Omit for
         /// any non-root user; pass `*` for any user including root.
@@ -685,14 +756,17 @@ pub(crate) enum SshAction {
     #[command(visible_aliases = ["rm", "del"])]
     Deny {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         /// Peer (hostname / mesh IP / short id) or `*`
+        #[arg(add = complete::peers_or_any())]
         peer: String,
     },
     /// Show the mesh SSH server state and per-network allow lists.
     #[command(visible_aliases = ["ls", "list"])]
     Show {
         /// Optional network to filter to
+        #[arg(add = complete::networks())]
         network: Option<String>,
     },
 }
@@ -706,8 +780,10 @@ pub(crate) enum ExitNodeAction {
     #[command(visible_alias = "ok")]
     Allow {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         /// Peer (hostname / mesh IP / short id) or `*`
+        #[arg(add = complete::peers_or_any())]
         peer: String,
     },
     /// Revoke a peer's exit-node permission on a network. Removing the last peer
@@ -715,8 +791,10 @@ pub(crate) enum ExitNodeAction {
     #[command(visible_aliases = ["rm", "del", "deny"])]
     Disallow {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         /// Peer (hostname / mesh IP / short id) or `*`
+        #[arg(add = complete::peers_or_any())]
         peer: String,
     },
     /// Route all this node's non-mesh traffic through an exit peer on a network.
@@ -724,8 +802,10 @@ pub(crate) enum ExitNodeAction {
     /// effect on the next `ray up`.
     Use {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         /// Exit peer (hostname / mesh IP / short id)
+        #[arg(add = complete::exit_peers())]
         peer: String,
     },
     /// Stop routing through an exit node (restore direct egress). With no
@@ -733,12 +813,14 @@ pub(crate) enum ExitNodeAction {
     #[command(visible_aliases = ["off", "disable"])]
     None {
         /// Network name (omit to clear every network's exit selection)
+        #[arg(add = complete::networks())]
         network: Option<String>,
     },
     /// Show exit-node state: this node's offer + selection, and available peers.
     #[command(visible_aliases = ["ls", "list", "show"])]
     Status {
         /// Optional network to filter to
+        #[arg(add = complete::networks())]
         network: Option<String>,
     },
 }
@@ -750,7 +832,7 @@ pub(crate) enum FilesAction {
         /// Transfer ID (from 'rayfish files')
         id: u64,
         /// Output directory (default: ~/Downloads)
-        #[arg(long, short)]
+        #[arg(long, short, value_hint = clap::ValueHint::DirPath)]
         output: Option<String>,
     },
     /// Cancel a queued send that hasn't reached its peer yet
@@ -763,14 +845,17 @@ pub(crate) enum FilesAction {
     /// `off` stops future auto-accept). Only your own devices are auto-accepted.
     AutoAccept {
         /// Network name
+        #[arg(add = complete::networks())]
         network: String,
         /// `on` or `off`
+        #[arg(add = complete::words(&ON_OFF))]
         state: String,
     },
     /// Set/show/clear the directory where auto-accepted files are written
     /// (absolute path). With no argument, prints the current value.
     DownloadDir {
         /// Absolute path (omit to show current)
+        #[arg(value_hint = clap::ValueHint::DirPath)]
         path: Option<String>,
         /// Clear the setting (revert to download-user / operator fallback)
         #[arg(long)]
@@ -780,6 +865,7 @@ pub(crate) enum FilesAction {
     /// ~/Downloads receives them when no download-dir is set).
     DownloadUser {
         /// Username or numeric uid (omit to show current)
+        #[arg(value_hint = clap::ValueHint::Username)]
         user: Option<String>,
         /// Clear the setting
         #[arg(long)]
@@ -1034,8 +1120,16 @@ fn append_panic_log(
     Ok(())
 }
 
+fn main() -> Result<()> {
+    // Before anything else: before stdout is touched, before the arguments are
+    // parsed (a completion request is not a command line this parser accepts),
+    // and outside the runtime, since the completers build one of their own.
+    complete::intercept();
+    run()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     if cli.json {
         JSON_FLAG.store(true, atomic::Ordering::Relaxed);
@@ -1099,10 +1193,7 @@ async fn main() -> Result<()> {
         Command::Uninstall => cmd_uninstall_service(),
         Command::Install { auto_update } => cmd_install(auto_update).await,
         Command::Restart => cmd_restart().await,
-        Command::Completions { shell } => {
-            clap_complete::generate(shell, &mut Cli::command(), "ray", &mut std::io::stdout());
-            Ok(())
-        }
+        Command::Completions { shell, install } => complete::cmd_completions(shell, install),
         Command::Gui { port, no_open } => cmd_gui(port, no_open),
         Command::Invite { network, action } => ipc_invite(&network, action).await,
         Command::Requests { network } => ipc_requests(&network).await,
@@ -1135,7 +1226,7 @@ async fn main() -> Result<()> {
             cmd_identityof(&network, &hostname, cli.json).await
         }
         Command::Alias { network, action } => cmd_alias(&network, action, cli.json).await,
-        Command::Mdns { state } => cmd_mdns(&state).await,
+        Command::Mdns { action } => cmd_mdns(action).await,
         Command::AutoUpdate { state } => cmd_auto_update(&state).await,
         Command::Config { action } => cmd_config(action, cli.json).await,
         Command::SetOperator { user } => cmd_set_operator(&user).await,
@@ -1186,11 +1277,14 @@ pub(crate) async fn ipc_mutate(msg: ipc::IpcMessage) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_mdns(state: &str) -> Result<()> {
-    if state != "on" && state != "off" {
-        eprintln!("Usage: rayfish mdns <on|off>");
-        std::process::exit(1);
-    }
+/// `ray mdns on|off|scan`. The two toggles are the `mdns` settings key under
+/// another name; `scan` is a read and goes its own way.
+async fn cmd_mdns(action: MdnsAction) -> Result<()> {
+    let state = match action {
+        MdnsAction::On => "on",
+        MdnsAction::Off => "off",
+        MdnsAction::Scan => return ipc_lan_peers().await,
+    };
     ipc_mutate(ipc::IpcMessage::ConfigSet {
         key: ipc::NodeKey::Global(ipc::GlobalKey::Mdns),
         value: state.to_string(),

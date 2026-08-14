@@ -73,7 +73,8 @@ use crate::firewall::{self, SharedFirewall};
 use crate::forward;
 use crate::identity;
 use crate::ipc::{
-    self, FirewallRuleView, IpcMessage, NetworkRole, NetworkStatus, PeerState, PeerStatus, ipc_err,
+    self, FirewallRuleView, IpcMessage, LanPeerInfo, NetworkRole, NetworkStatus, PeerState,
+    PeerStatus, ipc_err,
 };
 use crate::membership::{
     ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
@@ -123,7 +124,7 @@ pub(crate) use mesh_connection::MeshConnection;
 
 // The service that owns the set of active networks (M5 migration seam).
 mod network_registry;
-pub(crate) use network_registry::{DialTarget, NetworkRegistry};
+pub(crate) use network_registry::{DialTarget, NetworkRegistry, missing_networks};
 
 // Domain satellites with their own owned state (and ALPN accept arms), held by
 // `Daemon` as fields rather than loose on the core. See each module.
@@ -138,6 +139,10 @@ pub mod transfers;
 
 mod connect_service;
 pub(crate) use connect_service::ConnectService;
+
+// Nodes seen on the local network over mDNS (`ray mdns scan`).
+mod lan_discovery;
+pub(crate) use lan_discovery::LanPeers;
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -777,6 +782,7 @@ impl Daemon {
                 | IpcMessage::Netcheck
                 | IpcMessage::AliasList { .. }
                 | IpcMessage::ListPairedDevices
+                | IpcMessage::ListLanPeers
                 | IpcMessage::ConfigGet { .. }
                 | IpcMessage::NetConfigGet { .. }
         ) {
@@ -827,6 +833,37 @@ impl Daemon {
         }
         IpcMessage::Ok {
             message: format!("operator set to uid {uid}; that user can now run ray without sudo"),
+        }
+    }
+
+    /// The nodes mDNS has seen on this LAN, newest sighting first, each marked
+    /// with a network already shared with it (if any). Shared by `ray mdns scan`
+    /// and the nearby block in `ray status`, so the two never disagree.
+    pub(crate) fn lan_peer_infos(&self) -> Vec<LanPeerInfo> {
+        let me = self.transport.endpoint.id();
+        let mut peers: Vec<LanPeerInfo> = self
+            .transport
+            .lan_peers
+            .snapshot()
+            .into_iter()
+            .filter(|(id, _)| *id != me)
+            .map(|(id, peer)| LanPeerInfo {
+                endpoint_id: id,
+                short_id: id.fmt_short().to_string(),
+                addrs: peer.addrs.iter().map(|a| a.to_string()).collect(),
+                last_seen_secs: peer.last_seen.elapsed().as_secs(),
+                shared_network: self.registry.network_shared_with(&id),
+            })
+            .collect();
+        peers.sort_by_key(|p| p.last_seen_secs);
+        peers
+    }
+
+    /// `ray mdns scan`: every LAN sighting, connected or not.
+    pub(crate) fn list_lan_peers(&self) -> IpcMessage {
+        IpcMessage::LanPeersList {
+            peers: self.lan_peer_infos(),
+            mdns_enabled: self.mdns_enabled,
         }
     }
 
@@ -1101,6 +1138,7 @@ impl Daemon {
             IpcMessage::ListPairedDevices => self.list_paired_devices(),
             IpcMessage::Unpair { device } => self.unpair(&device).await,
             IpcMessage::SetOperator { uid } => self.set_operator(uid),
+            IpcMessage::ListLanPeers => self.list_lan_peers(),
             IpcMessage::ConfigSet {
                 key,
                 value,
@@ -1825,6 +1863,7 @@ mod accept_handler_tests {
             blob_store,
             Arc::new(ForwardMetrics::default()),
             contact,
+            Arc::new(LanPeers::new()),
         ));
         let hostname_table = dns::new_hostname_table();
         let reverse_table = dns::new_reverse_table();
@@ -2650,6 +2689,64 @@ mod headless_tests {
             .net_config_apply("gaming", NetworkKey::AutoAcceptFiles, "off")
             .await;
         assert!(matches!(msg, IpcMessage::Ok { .. }), "{msg:?}");
+    }
+
+    // See `build_headless_returns_usable_state_without_ipc_socket`: `ENV_LOCK`
+    // only serializes tests and guards no data across the awaits.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lan_peers_reach_status_and_the_scan_reply() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
+
+        // Nothing seen yet: the scan reply is empty and status counts nothing.
+        match daemon.list_lan_peers() {
+            IpcMessage::LanPeersList { peers, .. } => assert!(peers.is_empty()),
+            other => panic!("expected LanPeersList, got {other:?}"),
+        }
+
+        // Feed the map the way the mDNS browse loop does.
+        let peer = SecretKey::from_bytes(&[42u8; 32]).public();
+        let addr = SocketAddr::from(([192, 168, 1, 24], 41641));
+        daemon.transport.lan_peers.discovered(peer, vec![addr]);
+
+        match daemon.list_lan_peers() {
+            IpcMessage::LanPeersList {
+                peers,
+                mdns_enabled: _,
+            } => {
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].endpoint_id, peer);
+                assert_eq!(peers[0].addrs, vec![addr.to_string()]);
+                // We share no network with this sighting, so it is connectable.
+                assert_eq!(peers[0].shared_network, None);
+            }
+            other => panic!("expected LanPeersList, got {other:?}"),
+        }
+
+        // The same sighting is listed in `ray status`, with its addresses.
+        match daemon.status() {
+            IpcMessage::StatusResponse { lan_peers, .. } => {
+                assert_eq!(lan_peers.len(), 1);
+                assert_eq!(lan_peers[0].endpoint_id, peer);
+                assert_eq!(lan_peers[0].addrs, vec![addr.to_string()]);
+            }
+            other => panic!("expected StatusResponse, got {other:?}"),
+        }
+
+        // An expiry clears it from both.
+        daemon.transport.lan_peers.expired(&peer);
+        match daemon.status() {
+            IpcMessage::StatusResponse { lan_peers, .. } => assert!(lan_peers.is_empty()),
+            other => panic!("expected StatusResponse, got {other:?}"),
+        }
     }
 
     /// In-memory TUN writer that records every written packet into a shared

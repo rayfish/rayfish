@@ -244,6 +244,12 @@ fn render_ssh_state(
             .collect();
         println!("  {net}: {}", entries.join("; "));
     }
+    // Rules listed under an off server never fire: mesh `:22` still goes to the
+    // host sshd. Say so here rather than leaving the two lines unconnected.
+    if !enabled {
+        println!("\nThese rules are not in effect: mesh SSH is off.");
+        println!("Start the server with `ray firewall ssh on`.");
+    }
 }
 
 /// Print a JSON value as one compact line to stdout (jq-friendly).

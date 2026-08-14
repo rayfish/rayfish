@@ -8,6 +8,76 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Tab completion, already installed.** The installer and `sudo ray up` write
+  completion scripts for bash, zsh and fish into the directories those shells
+  already search, so there is nothing to source and no rc file to edit: open a
+  new shell and press tab. Completion is live rather than a frozen script, so it
+  offers the networks and peers you actually have (`ray leave <TAB>`,
+  `ray ping <TAB>`, `ray exit-node use <net> <TAB>`), scoped to the network you
+  already named on the line, with each peer's mesh IP and state alongside it.
+  Fixed-choice arguments (`in`/`out`, `allow`/`deny`, `on`/`off`, protocols)
+  complete too. `ray config set <TAB>` lists every settings key with its
+  one-line description, and `ray config set <key> <TAB>` offers that key's
+  values where it has a fixed set (`on`/`off`, `allow`/`deny`) and stays out of
+  the way where it doesn't. A tab never starts the daemon and gives up rather
+  than blocking your shell if it is wedged. `ray uninstall` removes the
+  scripts; `ray completions --install` sets them up on a binary-only install.
+
+- **Mesh SSH supports port forwarding.** `ssh -L`, `ssh -D` and `ProxyJump`
+  through a mesh host work now. Before, the embedded SSH server had no handler
+  for forwarded connections, so every one of them was refused with "channel N:
+  open failed: administratively prohibited" while the shell on the same
+  connection kept working. Any peer allowed to log in can forward; the target
+  socket is opened by the daemon on the remote host, so it reaches loopback-only
+  services there, the same as a shell on that host.
+
+- **Mesh SSH supports reverse forwarding, unix sockets and agent forwarding.**
+  `ssh -R` publishes a port (or a unix socket) from your machine on the remote
+  one, `ssh -L <port>:/path/to.sock` reaches a socket like docker's or
+  gpg-agent's, and `ssh -A` gives the session an `SSH_AUTH_SOCK` that talks back
+  to your agent, so keys stay on your machine. Reverse forwards bind loopback on
+  the remote host, matching sshd's default `GatewayPorts no`. A socket forward
+  is allowed only where the account you logged in as could have used or created
+  that socket itself, so the root daemon doing the work grants nothing extra.
+
+- **A mesh SSH login is a real login now.** An interactive session goes through
+  the host's `login(1)`, so it gets what a directly-spawned shell skipped: the
+  PAM account check (a locked or expired account is refused instead of let in),
+  a proper PAM/logind session with its `XDG_RUNTIME_DIR` and resource limits,
+  the utmp/wtmp records behind `who` and `last`, `/etc/nologin`, and the motd.
+  Root sessions and non-interactive commands still spawn the shell directly:
+  `login` refuses root on a pseudo-terminal, by hanging rather than failing.
+  Set `RAYFISH_SSH_NO_LOGIN=1` on the daemon to turn the handoff off.
+
+- **Sessions know they are remote.** `SSH_CONNECTION`, `SSH_CLIENT` and (on a
+  terminal) `SSH_TTY` are set, so prompts, `screen`, and scripts that check
+  whether they are running over SSH behave the way they do everywhere else.
+
+- **Mesh SSH passes locale environment variables and signals.** `SendEnv` /
+  `SetEnv` of `LANG`, `LC_*`, `TZ`, `TERM` and `COLORTERM` reach the session
+  (anything else is refused, since it would let the other side steer your login
+  shell), a client's signal request reaches the running process, and a process
+  killed by a signal is reported as that signal instead of a made-up exit code.
+  X11 forwarding is still not supported, but `ssh -X` now says so instead of
+  waiting on a reply that never came.
+
+- **`ray mdns scan` lists the rayfish nodes on your LAN.** mDNS discovery has
+  always run in the background, but it only fed the connection layer: there was
+  no way to see what it found. The scan shows each neighbour's id, addresses,
+  how long ago it was seen, and whether you already share a network with it.
+  `ray status` grew a "nearby" block listing the ones you are not connected to
+  (up to five, then it points at the scan), so a new machine on the LAN is
+  visible without knowing the command exists. Seeing a node grants it nothing:
+  it is a sighting, not a relationship.
+
+- **`ray connect` accepts a LAN neighbour's id.** Passing an id from `ray mdns
+  scan` dials that peer straight over the local network, skipping the DHT
+  contact lookup, so two machines can link up on a LAN with no internet.
+  Approval is unchanged: the other side still has to run `ray connections
+  approve`. Note this means anyone on your LAN can send you a connect request
+  without knowing your contact id, so rotating that id no longer stops local
+  requests. They still cannot link to you without your approval.
+
 - **Service management works on Linux without systemd.** `ray up`, `install`,
   `start`, `stop`, `restart` and `uninstall` now detect the host's init system
   and install the matching service: a systemd unit, an OpenRC service (Alpine,
@@ -53,6 +123,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "rayfish daemon is not running". A request the daemon cannot decode at all now
   comes back as an error rather than a closed connection, which the client could
   only report as "connection closed".
+- **Magic DNS falls back to your normal DNS for any name the mesh doesn't
+  hold.** A network named `dev` used to be registered with the OS as its own
+  domain, so every lookup under it, `zed.dev` included, was captured by rayfish
+  and answered NXDOMAIN instead of going to the real internet. Rayfish now
+  answers only names its roster actually has, and hands everything else to the
+  system resolver: `zed.dev` reaches the real site, while a peer named `box` on
+  network `dev` still resolves as `box`, `box.ray`, `box.dev` and
+  `box.dev.ray`. The `.ray` suffix itself stays rayfish's either way: a name
+  under it that no peer holds is failed here rather than asked of a public
+  resolver, so it starts resolving the moment the peer appears instead of
+  staying cached as missing for up to a day. Bare network names are no longer
+  registered with the OS, so
+  the suffix-less `<host>.<network>` form works where rayfish sees all your
+  queries (the resolv.conf backend, an active exit node, Android) and `.ray`
+  works everywhere. One consequence worth knowing: if a peer's name matches the
+  public name you wanted (a peer literally called `zed` on network `dev`), the
+  peer wins; use the public FQDN or rename the peer.
 
 - **Android crash reports now say how the app died when it dies silently.** A
   low-memory kill or a background stall used to leave either nothing at all or a
@@ -90,6 +177,56 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   peer on a build older than this one cannot redeem them.
 
 ### Fixed
+
+- **A mesh SSH terminal session can no longer go silent while its shell keeps
+  running.** If the program on the far end closed and reopened its terminal
+  while starting up, the daemon's read of the pseudo-terminal ended there and
+  nothing it printed after that reached you, with the session apparently hung.
+
+- **A dropped mesh SSH connection no longer leaves your login shell running.**
+  When a session channel closed, or the whole connection went away, whatever was
+  running under it kept running on the remote host. It now gets hung up, the way
+  a stock sshd does.
+
+- **Mesh SSH serves every session on a multiplexed connection, not just the
+  first.** With `ControlMaster` (`ssh -M`, and every tool that reuses one
+  connection, such as Zed remote development) only the first command ran: each
+  later one hung forever with no output, no exit status, and no error on either
+  side. The server kept the login and channel state in one slot per connection,
+  so the first session consumed it and the rest quietly started nothing.
+  Sessions are now tracked per channel, concurrent channels no longer take over
+  each other's PTY or output, and a session that cannot start closes its channel
+  with an error instead of hanging.
+
+- **`scp` and `sftp` work over mesh SSH.** Both hung with no output and no
+  error until you interrupted them. OpenSSH 9.0 and newer `scp` copies files
+  over the SFTP protocol rather than the old rcp one, and the mesh SSH server
+  had no handler for the `sftp` subsystem, so it never answered the request and
+  the client waited forever. It now serves the subsystem using the host's
+  sftp-server, picking up the path and flags from the host's own sshd config.
+  On a host with no sftp-server installed the client is told so straight away
+  instead of hanging, and the daemon log names the package to install.
+  Interactive `ssh` was unaffected.
+
+- **`ray firewall ssh allow` now tells you when the SSH server is off.** The
+  rule was saved and reported as if it had taken effect, but with the server off
+  a connection falls through to the host's own sshd and asks for a password,
+  which looks like the rule was ignored rather than never applied. Both `allow`
+  and `ssh show` now say the rules are inactive and point at
+  `ray firewall ssh on`.
+
+- **A saved network no longer stays dead until you restart the daemon.** A
+  network that failed to connect at startup stayed in your config but was never
+  restored: peers on it were unreachable and their packets were dropped as
+  belonging to an unknown network, while the node otherwise looked healthy. The
+  daemon now re-checks every minute that each saved network is actually
+  connected and restarts the ones that aren't, and a peer sending traffic for a
+  network in that state triggers the retry immediately instead of waiting for
+  the next check. This covers coordinator networks too, which previously got one
+  attempt at startup and no retry at all. `ray status` spells out what the
+  `inactive` marker means (saved, not connected, peers unreachable, being
+  retried) instead of leaving it as a one-word footnote, and the daemon log
+  records why a restore stopped rather than ending it silently.
 
 - **The Android app no longer crashes when Android restarts it in the
   background.** After the system killed the app to reclaim memory, it would
