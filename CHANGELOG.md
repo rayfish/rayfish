@@ -179,6 +179,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on hosts without net-tools (most of them) Rayfish started anyway and quietly
   lost its IPv4 half to the other VPN. It reads the kernel's address list now.
 
+- **The host-firewall warning now reads the ruleset that actually applies.** It
+  always checked `iptables`, but in IPv6-only mode mesh SSH listens on IPv6, so
+  a host with a default-DROP `ip6tables` policy was told everything was fine and
+  `ssh` hung with no explanation. It reads `ip6tables` in that mode, and the
+  command it prints opens the right family.
+
+- **An exit node no longer masquerades another VPN's traffic.** The NAT rule
+  matched any packet sourced from `100.64.0.0/10`, a range Rayfish does not own
+  exclusively, so a host acting as both a Rayfish exit node and a Tailscale
+  subnet router NAT'd the other's forwarded traffic too. It now matches only
+  what arrived on the Rayfish interface.
+
 - **On Android, Rayfish comes back after being turned off with "go fully
   offline when disabled" set.** Turning it back on could leave the phone
   offline for good: the previous node released its blob store only after the

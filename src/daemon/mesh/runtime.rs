@@ -1045,7 +1045,13 @@ impl Daemon {
                 warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
             }
 
-            if let Err(e) = tun::route_magic_dns(&tun_name).await {
+            // IPv6-only mode answers on `dns::MAGIC_DNS_V6`, which the `200::/7`
+            // route above already delivers. Installing the v4 `/32` there would
+            // plant a dead route inside the `100.64.0.0/10` range this mode
+            // exists to hand over to another VPN.
+            if !self.ipv6_only
+                && let Err(e) = tun::route_magic_dns(&tun_name).await
+            {
                 tracing::warn!(error = %e, "failed to route magic DNS IP into TUN");
             }
 
@@ -1075,9 +1081,12 @@ impl Daemon {
             // "22/tcp" still drops it and the failure looks like a dead network
             // rather than a firewall rule. Surface it with the other `ray up`
             // warnings; we only read the ruleset, never edit it.
-            if let Some(w) =
-                crate::hostfw::check_inbound_tcp(&dns_tun_name, crate::ssh::SSH_LISTEN_PORT)
-                    .warning(crate::ssh::SSH_LISTEN_PORT)
+            if let Some(w) = crate::hostfw::check_inbound_tcp(
+                &dns_tun_name,
+                crate::ssh::SSH_LISTEN_PORT,
+                self.ipv6_only,
+            )
+            .warning(crate::ssh::SSH_LISTEN_PORT)
             {
                 tracing::warn!("{w}");
                 warnings.push(w);

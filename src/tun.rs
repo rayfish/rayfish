@@ -357,8 +357,8 @@ pub async fn route_peer_range(tun_name: &str, ipv6_only: bool) -> Result<()> {
     // earlier `up`), so delete any stale entry first and ignore its result.
     //
     // In IPv6-only mode the `/10` is left to the other VPN; only `200::/7` is
-    // ours. The magic-DNS `/32` is installed separately by `route_magic_dns`
-    // and still wins for that one address by longest-prefix match.
+    // ours, and it already covers `dns::MAGIC_DNS_V6`, so that mode installs no
+    // magic-DNS host route at all.
     let ranges: &[(&str, &str)] = if ipv6_only {
         &[("-inet6", "200::/7")]
     } else {
