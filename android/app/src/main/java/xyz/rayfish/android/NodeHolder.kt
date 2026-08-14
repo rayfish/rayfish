@@ -2,11 +2,15 @@ package xyz.rayfish.android
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.Node
@@ -203,10 +207,21 @@ object NodeHolder {
         withContext(Dispatchers.IO) {
             synchronized(this@NodeHolder) {
                 if (!started) {
-                    // Register Android's trust store before start(): building the
-                    // iroh endpoint sets up TLS, which fails without it.
-                    RustlsInit.ensureInitialized(context)
-                    get(context).start()
+                    try {
+                        // Register Android's trust store before start(): building
+                        // the iroh endpoint sets up TLS, which fails without it.
+                        RustlsInit.ensureInitialized(context)
+                        get(context).start()
+                    } catch (t: Throwable) {
+                        // A node that will not start leaves the device offline in
+                        // the mesh with nothing in the UI to say why, and every
+                        // caller here only logs and moves on. Report it (throttled,
+                        // and only if crash reporting is on) so it is visible
+                        // without the user having to send diagnostics by hand.
+                        Log.e(TAG, "node start failed", t)
+                        runCatching { Telemetry.captureStartFailure(context, t) }
+                        throw t
+                    }
                     seedDeviceName(context)
                     registerNetworkCallback(context)
                     started = true
@@ -229,6 +244,13 @@ object NodeHolder {
      * Lives with the node's lifecycle, so it also covers standby, where the
      * control plane is the only thing running and nothing else would notice.
      * networkChanged() is idempotent and cheap, so the callback stays dumb.
+     *
+     * onAvailable/onLost alone are not enough, which is what made a phone that
+     * had moved stay disconnected: the default Network object survives a Wi-Fi
+     * roam between access points, a DHCP renew, an IPv6 prefix change and
+     * captive-portal validation, so none of those fire either callback. They
+     * fire onLinkPropertiesChanged / onCapabilitiesChanged instead, and the
+     * addresses under the endpoint have changed all the same.
      */
     private fun registerNetworkCallback(context: Context) {
         if (networkCallback != null) return
@@ -237,11 +259,13 @@ object NodeHolder {
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) = notifyCore("available", network)
             override fun onLost(network: Network) = notifyCore("lost", network)
+            override fun onLinkPropertiesChanged(network: Network, props: LinkProperties) =
+                notifyCore("link properties changed", network)
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
+                notifyCore("capabilities changed", network)
             private fun notifyCore(event: String, network: Network) {
                 Log.i(TAG, "default network $event ($network); notifying core")
-                // The FFI call blocks briefly on the core runtime; keep it off
-                // Android's connectivity thread.
-                netScope.launch { runCatching { node?.networkChanged() } }
+                scheduleNotify()
             }
         }
         runCatching { cm.registerDefaultNetworkCallback(cb) }
@@ -249,7 +273,45 @@ object NodeHolder {
             .onFailure { Log.w(TAG, "network callback registration failed", it) }
     }
 
+    /**
+     * Coalesce a burst of callbacks into one rebind. A single network switch
+     * fires several of them within a few hundred milliseconds (available, then
+     * capabilities, then link properties, often more than once as validation
+     * completes), and each networkChanged() is a full endpoint rebind and path
+     * re-probe. The last one in the burst is the one that sees the settled
+     * addresses, so waiting for the burst to stop is both cheaper and more
+     * accurate than acting on the first.
+     *
+     * The delay also keeps this off Android's connectivity thread, which the FFI
+     * call must never block.
+     */
+    private const val NETWORK_DEBOUNCE_MS = 400L
+
+    /**
+     * Guards [notifyJob] only. Deliberately not this object's own monitor: these
+     * callbacks arrive on Android's connectivity thread, and [ensureStarted] /
+     * [stopNode] hold that monitor across blocking FFI calls, so sharing it would
+     * park a system thread behind a node start.
+     */
+    private val notifyLock = Any()
+
+    private var notifyJob: Job? = null
+
+    private fun scheduleNotify() {
+        synchronized(notifyLock) {
+            notifyJob?.cancel()
+            notifyJob = netScope.launch {
+                delay(NETWORK_DEBOUNCE_MS)
+                runCatching { node?.networkChanged() }
+            }
+        }
+    }
+
     private fun unregisterNetworkCallback(context: Context) {
+        synchronized(notifyLock) {
+            notifyJob?.cancel()
+            notifyJob = null
+        }
         val cb = networkCallback ?: return
         networkCallback = null
         val cm = context.applicationContext.getSystemService(ConnectivityManager::class.java)

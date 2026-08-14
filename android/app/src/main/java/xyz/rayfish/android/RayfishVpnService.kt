@@ -399,6 +399,7 @@ class RayfishVpnService : VpnService() {
             NodeHolder.get(applicationContext).up(pfd.detachFd())
             Log.i(TAG, "Node.up succeeded")
             startAutoAcceptPoller()
+            rebindAfterBringUp()
         } catch (t: Throwable) {
             Log.e(TAG, "Node bring-up failed", t)
             // up() threw after detachFd() handed the fd to Rust, so this
@@ -409,6 +410,29 @@ class RayfishVpnService : VpnService() {
             // helper instead of a divergent one that leaves dnsProxy orphaned and
             // the notification claiming a tunnel that isn't there.
             handleBringUpFailure("Node.up() threw", startId)
+        }
+    }
+
+    /**
+     * Rebind the endpoint whenever Rayfish is turned on, tunnel or standby.
+     *
+     * Turning it off and on is what a user does when peers look disconnected,
+     * and until now that gesture could not possibly help: the toggle only
+     * detaches and reattaches the TUN (`Node.down` / `Node.up`), leaving the
+     * endpoint and every peer connection exactly as they were, dead sockets
+     * included. The network callback normally covers a move, but it only sees
+     * what the system reports, and a change it missed (or one that happened
+     * while the node was stopped) is precisely the case where the user reaches
+     * for the toggle. Idempotent and cheap, so an unnecessary one costs nothing.
+     *
+     * Called at the end of bring-up, not the start: the FFI call runs inline on
+     * nodeExecutor's thread, and nothing about coming up should wait on it.
+     */
+    private fun rebindAfterBringUp() {
+        try {
+            NodeHolder.get(applicationContext).networkChanged()
+        } catch (t: Throwable) {
+            Log.w(TAG, "rebind after bring-up failed", t)
         }
     }
 
@@ -531,6 +555,7 @@ class RayfishVpnService : VpnService() {
         try {
             runBlocking { NodeHolder.ensureStarted(applicationContext) }
             Log.i(TAG, "standby: control plane up, no tunnel")
+            rebindAfterBringUp()
         } catch (t: Throwable) {
             Log.e(TAG, "standby bring-up failed", t)
         }
