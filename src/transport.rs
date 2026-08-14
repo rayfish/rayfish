@@ -201,17 +201,41 @@ async fn bind_endpoint(
     builder.bind().await.context("failed to bind iroh endpoint")
 }
 
+/// Tailscale's IPv6 ULA range. Its IPv4 half is inside `100.64.0.0/10`, which
+/// [`crate::membership::is_overlay_ip`] already covers, but the v6 half looks
+/// like an ordinary private address to iroh. Named here rather than in
+/// `membership` because it is not *our* overlay: this is only about what we
+/// publish, not about what counts as a mesh address.
+const TAILSCALE_ULA: (u16, u16, u16) = (0xfd7a, 0x115c, 0xa1e0);
+
+/// True for an address belonging to another VPN's overlay, which we must not
+/// advertise as a way to reach this node.
+fn is_foreign_overlay_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            (s[0], s[1], s[2]) == TAILSCALE_ULA
+        }
+        std::net::IpAddr::V4(_) => false,
+    }
+}
+
 /// A [`DirectAddrFilter`] that drops rayfish overlay addresses (`100.64.0.0/10`,
 /// `200::/7`) from iroh's gathered direct-address candidates. The mesh IP is bound
 /// on the TUN device; without this iroh would discover it, advertise it (pkarr/DNS
 /// and in-band NAT-traversal), and peers would dial it, looping the underlay back
 /// through the tunnel we carry.
+///
+/// Another VPN's overlay is dropped too. A host running rayfish alongside
+/// Tailscale would otherwise publish its tailnet address in a public pkarr
+/// record: it names a network no rayfish peer can route to, and it leaks the
+/// fact (and address) of that tailnet to anyone who reads the record.
 #[derive(Debug)]
 struct OverlayAddrFilter;
 
 impl DirectAddrFilter for OverlayAddrFilter {
     fn keeps(&self, ip: std::net::IpAddr) -> bool {
-        !crate::membership::is_overlay_ip(ip)
+        !crate::membership::is_overlay_ip(ip) && !is_foreign_overlay_ip(ip)
     }
 }
 
@@ -336,9 +360,15 @@ mod tests {
         // Real underlay / LAN addresses are kept.
         assert!(keeps("51.15.139.151"));
         assert!(keeps("192.168.1.104"));
+        // An ordinary ULA is a real (if private) underlay path, so it stays.
+        assert!(keeps("fd00:1234:5678::1"));
         // Overlay v4 (100.64.0.0/10) and v6 (200::/7) are dropped.
         assert!(!keeps("100.124.253.88"));
         assert!(!keeps("200::1"));
+        // So is another VPN's overlay: a tailnet address names a network no
+        // rayfish peer can route to, and publishing it leaks the tailnet.
+        assert!(!keeps("fd7a:115c:a1e0::1"));
+        assert!(!keeps("fd7a:115c:a1e0:ab12:4843:cd96:1234:5678"));
     }
 
     #[test]
