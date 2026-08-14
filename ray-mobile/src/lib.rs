@@ -1090,7 +1090,7 @@ impl Node {
             state.attach_tun(reader, writer).await;
             // Mark the data plane active (and configure Magic DNS) the same way
             // `run_daemon` does after attaching the desktop TUN.
-            state.activate(None).await;
+            state.activate(None, None).await;
         });
         Ok(())
     }

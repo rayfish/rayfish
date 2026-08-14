@@ -479,6 +479,11 @@ pub struct Daemon {
     /// on` / `ray install --auto-update`). Read at startup; when set, `run_daemon`
     /// spawns the periodic update task. Echoed back in `ray status`.
     auto_update: bool,
+    /// IPv6-only data plane (`ray config set ipv6-only on`), for sharing a host
+    /// with another VPN that owns `100.64.0.0/10`. Read once at startup because
+    /// the TUN's addressing is decided there; `ray up --ipv6-only` persists the
+    /// setting and asks for a restart rather than pretending to apply it live.
+    pub(crate) ipv6_only: bool,
     /// Name of the OS TUN device (desktop) or a placeholder until a packet
     /// interface is attached. Interior-mutable because on embedders (mobile) the
     /// interface is attached after construction via [`Daemon::attach_tun`],
@@ -1036,7 +1041,10 @@ impl Daemon {
             IpcMessage::GetEphemeral { network } => self.registry.get_ephemeral(&network),
             IpcMessage::Status => self.status(),
             IpcMessage::Report => self.build_report(peer_cred),
-            IpcMessage::Up { hostname } => self.activate(hostname).await,
+            IpcMessage::Up {
+                hostname,
+                ipv6_only,
+            } => self.activate(hostname, ipv6_only).await,
             IpcMessage::Down => self.deactivate().await,
             IpcMessage::Shutdown => {
                 self.shutdown_token.cancel();
@@ -1112,6 +1120,16 @@ impl Daemon {
                 self.reconcile_exit_node(resp).await
             }
             IpcMessage::ExitNodeUse { network, peer } => {
+                // The client-side full tunnel is IPv4 policy routing through the
+                // exit peer's mesh IPv4, which this node does not have a working
+                // path to in IPv6-only mode. Clearing a selection stays allowed.
+                if peer.is_some() && self.ipv6_only {
+                    return ipc_err(
+                        "cannot use an exit node in IPv6-only mode: the full tunnel routes \
+                         over mesh IPv4. Turn the mode off (`ray config set ipv6-only off`) \
+                         and restart the daemon.",
+                    );
+                }
                 let resp = self.registry.exit_node_use(&network, peer).await;
                 self.reconcile_exit_node(resp).await
             }

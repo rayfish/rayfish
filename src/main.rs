@@ -155,6 +155,11 @@ pub(crate) enum Command {
         /// when create/join don't specify one; doesn't rename existing networks
         #[arg(long)]
         hostname: Option<String>,
+        /// Run the data plane over IPv6 only, so another VPN (e.g. Tailscale)
+        /// can keep 100.64.0.0/10. Takes effect on the next daemon restart;
+        /// turn it back off with `ray config set ipv6-only off`
+        #[arg(long)]
+        ipv6_only: bool,
     },
     /// Standby: take the data plane (TUN + Magic DNS) offline; stays connected to peers
     Down,
@@ -345,7 +350,7 @@ pub(crate) enum Command {
         state: String,
     },
     /// View or change global daemon settings (relay, discovery-dns, dns-upstreams,
-    /// auto-update, on-demand)
+    /// auto-update, on-demand, ipv6-only)
     Config {
         #[command(subcommand)]
         action: Option<ConfigAction>,
@@ -541,14 +546,14 @@ pub(crate) enum ConfigAction {
     /// Show settings (all, or one key)
     #[command(visible_alias = "ls")]
     Get {
-        /// relay, discovery-dns, dns-upstreams, auto-update, or on-demand (omit for all)
+        /// relay, discovery-dns, dns-upstreams, auto-update, on-demand, or ipv6-only (omit for all)
         #[arg(add = complete::settings_keys())]
         key: Option<String>,
     },
-    /// Set a key. List keys take a comma list of presets/URLs/IPs; auto-update and
-    /// on-demand take on/off.
+    /// Set a key. List keys take a comma list of presets/URLs/IPs; auto-update,
+    /// on-demand and ipv6-only take on/off.
     Set {
-        /// relay, discovery-dns, dns-upstreams, auto-update, or on-demand
+        /// relay, discovery-dns, dns-upstreams, auto-update, on-demand, or ipv6-only
         #[arg(add = complete::settings_keys())]
         key: String,
         /// A comma list of presets / URLs / IPv4s ("n0" or empty resets), or on/off
@@ -560,7 +565,7 @@ pub(crate) enum ConfigAction {
     /// Reset a key to its default
     #[command(visible_alias = "rm")]
     Unset {
-        /// relay, discovery-dns, dns-upstreams, auto-update, or on-demand
+        /// relay, discovery-dns, dns-upstreams, auto-update, on-demand, or ipv6-only
         #[arg(add = complete::settings_keys())]
         key: String,
     },
@@ -1170,7 +1175,10 @@ async fn run() -> Result<()> {
             stats.spawn_logger(token.clone());
             daemon::run_daemon(token, stats).await
         }
-        Command::Up { hostname } => cmd_up(hostname).await,
+        Command::Up {
+            hostname,
+            ipv6_only,
+        } => cmd_up(hostname, ipv6_only.then_some(true)).await,
         Command::Down => ipc_down().await,
         Command::Stop => cmd_stop().await,
         Command::Start => cmd_start().await,

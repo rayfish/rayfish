@@ -24,8 +24,14 @@ const BLOB_GC_INTERVAL: Duration = Duration::from_secs(600);
 
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
     // Bail early on a CGNAT clash (e.g. Tailscale) before touching anything.
+    // IPv6-only mode is the supported way to share a host with such a VPN, so
+    // it skips the check. Read straight from disk: the config this comes from is
+    // loaded again inside `build_daemon` below, and moving the check after that
+    // would give up the early bail.
     #[cfg(not(target_os = "android"))]
-    check_cgnat_conflict()?;
+    if !crate::config::load().map(|c| c.ipv6_only).unwrap_or(false) {
+        check_cgnat_conflict().await?;
+    }
 
     // Repair a leftover `/etc/resolv.conf` before anything reads it. A hard kill
     // or reboot leaves ours in place (nameserver = our own Magic DNS), and the
@@ -51,7 +57,11 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     {
         let my_ipv6 = derive_ipv6(&daemon.transport.identity.local_identity());
         let (tun_reader, tun_writer, tun_name) =
-            tun::create(daemon.transport.identity.local_ip(), my_ipv6)
+            tun::create(
+                daemon.transport.identity.local_ip(),
+                my_ipv6,
+                daemon.ipv6_only,
+            )
                 .await
                 .context("failed to create TUN device")?;
         daemon.tun_name.store(Arc::new(tun_name));
@@ -65,7 +75,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     daemon.registry.connect_all_networks().await;
     tokio::spawn(Arc::clone(&daemon.registry).run_restore_supervisor());
     daemon.spawn_exit_reapply_listener();
-    daemon.activate(None).await;
+    daemon.activate(None, None).await;
 
     // Opt-in automatic updates: a single daemon-wide task that periodically
     // checks for a newer stable release and swaps + restarts onto it. Desktop-only
@@ -197,6 +207,9 @@ async fn build_daemon_inner(
 
     // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
     let mut app_config = config::load()?;
+    // Tell the forwarding core whether mesh IPv4 carries traffic on this node.
+    // Before any packet moves: the data plane is attached further down.
+    forward::set_ipv6_only(app_config.ipv6_only);
     // On-demand mode: the platform (mobile embedder) may force it; otherwise honor
     // config (on by default). Computed here so it can thread into the registry.
     let on_demand = on_demand_override.unwrap_or(app_config.on_demand);
@@ -628,6 +641,7 @@ async fn build_daemon_inner(
     .await;
 
     let auto_update = app_config.auto_update;
+    let ipv6_only = app_config.ipv6_only;
     let daemon = Arc::new(Daemon {
         transport,
         registry,
@@ -639,6 +653,7 @@ async fn build_daemon_inner(
         dns,
         mdns_enabled,
         auto_update,
+        ipv6_only,
         tun_name,
         tun_tasks: Mutex::new(None),
         exit_reconcile: tokio::sync::Mutex::new(()),

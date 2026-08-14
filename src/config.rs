@@ -301,18 +301,20 @@ fn parse_entries(value: &str) -> Vec<String> {
 /// Every recognized `ray config` key, in the order `ray config get` prints
 /// them. Single source of truth: `config_get` iterates it, and the CLI offers it
 /// on tab, so a key added here needs no second edit to show up in either.
-pub const CONFIG_KEY_NAMES: [&str; 5] = [
+pub const CONFIG_KEY_NAMES: [&str; 6] = [
     "relay",
     "discovery-dns",
     "dns-upstreams",
     "auto-update",
     "on-demand",
+    "ipv6-only",
 ];
 
 /// The recognized `ray config` keys, for error messages. The list values
 /// (relay/discovery-dns/dns-upstreams) are set via `config set`; the on/off
 /// toggles (auto-update/on-demand) via their own `config` subcommands.
-const CONFIG_KEYS: &str = "expected relay, discovery-dns, dns-upstreams, auto-update, or on-demand";
+const CONFIG_KEYS: &str =
+    "expected relay, discovery-dns, dns-upstreams, auto-update, on-demand, or ipv6-only";
 
 /// Apply a `ray config set`/`unset` to the in-memory config. An empty value or
 /// the lone keyword `n0` resets the key to its default (iroh n0). Validates
@@ -365,6 +367,7 @@ pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) ->
         // return to the default. `--replace` is meaningless here and ignored.
         "auto-update" => cfg.auto_update = parse_bool_setting(value, false)?,
         "on-demand" => cfg.on_demand = parse_bool_setting(value, true)?,
+        "ipv6-only" => cfg.ipv6_only = parse_bool_setting(value, false)?,
         other => anyhow::bail!("unknown config key: {other} ({CONFIG_KEYS})"),
     }
     Ok(())
@@ -405,6 +408,7 @@ pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, Str
             "dns-upstreams" => render_override(&cfg.dns_upstreams),
             "auto-update" => on_off(cfg.auto_update),
             "on-demand" => on_off(cfg.on_demand),
+            "ipv6-only" => on_off(cfg.ipv6_only),
             other => anyhow::bail!("unknown config key: {other} ({CONFIG_KEYS})"),
         };
         Ok((k.to_string(), v))
@@ -469,6 +473,14 @@ pub struct AppConfig {
     /// it off (`ray config set on-demand off`) to stay eagerly connected.
     #[serde(default = "default_true")]
     pub on_demand: bool,
+    /// IPv6-only data plane, for hosts that share the box with another VPN
+    /// claiming `100.64.0.0/10` (Tailscale). The TUN keeps its own derived IPv4
+    /// as a `/32` so Magic DNS still works, but the `/10` connected route is not
+    /// installed, mesh IPv4 carries no traffic, and the responder answers AAAA
+    /// only. Read once at daemon start (the TUN is built there), so a change
+    /// needs a restart.
+    #[serde(default)]
+    pub ipv6_only: bool,
     /// Seconds of no traffic before an on-demand node closes a peer connection.
     /// `None` uses [`DEFAULT_IDLE_TIMEOUT_SECS`]. Only consulted when `on_demand`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -527,6 +539,7 @@ impl Default for AppConfig {
             dns_upstreams: ServerOverride::default(),
             ssh_enabled: false,
             on_demand: true,
+            ipv6_only: false,
             idle_timeout_secs: None,
             auto_update: false,
             auto_update_last_target: None,
@@ -627,6 +640,8 @@ struct Settings {
     ssh_enabled: bool,
     #[serde(default = "default_true")]
     on_demand: bool,
+    #[serde(default)]
+    ipv6_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     idle_timeout_secs: Option<u64>,
     #[serde(default)]
@@ -937,6 +952,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         dns_upstreams: settings.dns_upstreams,
         ssh_enabled: settings.ssh_enabled,
         on_demand: settings.on_demand,
+        ipv6_only: settings.ipv6_only,
         idle_timeout_secs: settings.idle_timeout_secs,
         auto_update: settings.auto_update,
         auto_update_last_target: settings.auto_update_last_target,
@@ -966,6 +982,7 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         dns_upstreams: config.dns_upstreams.clone(),
         ssh_enabled: config.ssh_enabled,
         on_demand: config.on_demand,
+        ipv6_only: config.ipv6_only,
         idle_timeout_secs: config.idle_timeout_secs,
         auto_update: config.auto_update,
         auto_update_last_target: config.auto_update_last_target.clone(),

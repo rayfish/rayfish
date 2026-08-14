@@ -86,9 +86,16 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
 /// to bring the TUN up, configure DNS, and reconnect networks. Only when no
 /// daemon is reachable do we fall back to installing/starting the system
 /// service, which requires root.
-pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
+pub(crate) async fn cmd_up(hostname: Option<String>, ipv6_only: Option<bool>) -> Result<()> {
     if let Ok(mut stream) = ipc::connect().await {
-        ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
+        ipc::send(
+            &mut stream,
+            ipc::IpcMessage::Up {
+                hostname,
+                ipv6_only,
+            },
+        )
+        .await?;
         match ipc::recv(&mut stream).await? {
             ipc::IpcMessage::Ok { message } => println!("{message}"),
             ipc::IpcMessage::Error { message } => print_error("error", &message, None),
@@ -105,7 +112,7 @@ pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
         );
         std::process::exit(1);
     }
-    install_and_start_service(hostname).await
+    install_and_start_service(hostname, ipv6_only).await
 }
 
 /// Install/refresh the system service and (re)start it. Requires root.
@@ -115,7 +122,10 @@ pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
 /// it never comes up (e.g. it crashed on a port/route conflict with another
 /// VPN), we surface the tail of its log so the user knows what went wrong
 /// instead of seeing a cheerful "started" followed by a dead `ray status`.
-pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Result<()> {
+pub(crate) async fn install_and_start_service(
+    hostname: Option<String>,
+    ipv6_only: Option<bool>,
+) -> Result<()> {
     ensure_service_installed()?;
     // We are root here, which is what it takes to write into the directories
     // the shells already search. Doing it from the service installer is what
@@ -157,7 +167,14 @@ pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Resul
     spinner.finish_and_clear();
     match daemon {
         Some(mut stream) => {
-            ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
+            ipc::send(
+                &mut stream,
+                ipc::IpcMessage::Up {
+                    hostname,
+                    ipv6_only,
+                },
+            )
+            .await?;
             match ipc::recv(&mut stream).await? {
                 ipc::IpcMessage::Ok { message } => println!("rayfish service started. {message}"),
                 ipc::IpcMessage::Error { message } => print_error("error", &message, None),
@@ -235,7 +252,7 @@ pub(crate) async fn cmd_install(auto_update: bool) -> Result<()> {
         }
         println!("automatic stable updates enabled for this node");
     }
-    install_and_start_service(None).await
+    install_and_start_service(None, None).await
 }
 
 /// Whether the system service unit/plist is installed on this host.
