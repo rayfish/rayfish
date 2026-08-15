@@ -417,9 +417,29 @@ mod macos {
     /// IPv6 traffic, and it stays out of the flag set configd merges into every
     /// other resolver. In practice the routing table is unchanged, byte for
     /// byte, before and after this key is written.
+    ///
+    /// The rank goes first, and the ordering is load-bearing: it is the only
+    /// thing keeping the `Router` below from being taken seriously. Publish the
+    /// address without it and configd is free to elect us the primary IPv6
+    /// service and put a real `::/0` on the utun, so a failure here has to stop
+    /// us before we publish anything routable, never after.
     fn write_service_config(tun_name: &str, mesh_v6: Ipv6Addr) -> Result<()> {
         let store = get_or_init_store()?;
         let store = store.lock().unwrap();
+
+        let rank = CFDictionary::from_CFType_pairs(&[(
+            CFString::new("PrimaryRank"),
+            CFString::new("Never").as_CFType(),
+        )]);
+        let rank = unsafe { CFDictionary::wrap_under_get_rule(rank.as_concrete_TypeRef()) };
+        // Our session's keys are reclaimed by configd when the session ends, but
+        // a copy left behind by anyone else is not, and a session store cannot
+        // overwrite one. Drop it first so a stray key cannot wedge us for good.
+        store.0.remove(SC_SERVICE_KEY);
+        anyhow::ensure!(
+            store.0.set(SC_SERVICE_KEY, rank),
+            "SCDynamicStoreSetValue failed for {SC_SERVICE_KEY}"
+        );
 
         let addr_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetIPv6Addresses) };
         let addr_val = CFArray::from_CFTypes(&[CFString::new(&mesh_v6.to_string())]);
@@ -440,16 +460,6 @@ mod macos {
         anyhow::ensure!(
             store.0.set(SC_IPV6_KEY, dict),
             "SCDynamicStoreSetValue failed for {SC_IPV6_KEY}"
-        );
-
-        let rank = CFDictionary::from_CFType_pairs(&[(
-            CFString::new("PrimaryRank"),
-            CFString::new("Never").as_CFType(),
-        )]);
-        let rank = unsafe { CFDictionary::wrap_under_get_rule(rank.as_concrete_TypeRef()) };
-        anyhow::ensure!(
-            store.0.set(SC_SERVICE_KEY, rank),
-            "SCDynamicStoreSetValue failed for {SC_SERVICE_KEY}"
         );
         Ok(())
     }
