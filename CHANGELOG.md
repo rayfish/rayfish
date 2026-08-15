@@ -231,6 +231,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`.ray` names now resolve on macOS in IPv6-only mode.** `ssh dev.box.ray`
+  failed with "nodename nor servname provided" on a Mac sharing the host with
+  another VPN, while `dig` against the same resolver answered instantly: macOS
+  was never asking us for AAAA records, and AAAA is the only answer that mode
+  has. It asks for both families now. The mesh range being `200::/7` had nothing
+  to do with it; macOS was declining to ask because our resolver's service
+  published no default route and so did not count as having IPv6 at all. The
+  service now says it has one, while ranking itself so it can never become the
+  primary route or take over the host's IPv6 traffic. Another VPN's DNS, routes
+  and search domains are untouched.
+
 - **Direct connections over IPv6.** The daemon bound a UDP socket for IPv4 only,
   so a peer on an IPv6-only network could be reached through a relay and never
   directly, and this node offered no IPv6 address for others to try. Both

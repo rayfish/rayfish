@@ -271,6 +271,7 @@ mod macos {
     use system_configuration::sys::schema_definitions::{
         kSCPropInterfaceName, kSCPropNetDNSSearchDomains, kSCPropNetDNSServerAddresses,
         kSCPropNetDNSSupplementalMatchDomains, kSCPropNetIPv6Addresses, kSCPropNetIPv6PrefixLength,
+        kSCPropNetIPv6Router,
     };
 
     use async_trait::async_trait;
@@ -281,6 +282,12 @@ mod macos {
     /// The IPv6 half of the same service. Written alongside the DNS key in
     /// IPv6-only mode; see [`write_service_config`].
     const SC_IPV6_KEY: &str = "State:/Network/Service/rayfish/IPv6";
+    /// The service itself, carrying only its rank. See [`write_service_config`].
+    const SC_SERVICE_KEY: &str = "State:/Network/Service/rayfish";
+    /// The service id, which is the last path component of the keys above.
+    /// `ConfirmedServiceID` has to repeat it to be believed; see
+    /// [`write_dns_config`].
+    const SC_SERVICE_ID: &str = "rayfish";
 
     struct SendSyncStore(SCDynamicStore);
 
@@ -338,22 +345,33 @@ mod macos {
             search_domains.iter().map(|s| CFString::new(s)).collect();
         let search_val = CFArray::from_CFTypes(&search_cfstrings);
 
-        // Scope the resolver to our utun in IPv6-only mode. mDNSResponder
-        // decides per resolver whether to ask it for A records, AAAA records or
-        // both, and it decides from the address families of the interface the
-        // resolver belongs to. An unscoped resolver is judged against the host's
-        // primary interface, which on a Mac with no native IPv6 means A records
-        // only: `scutil --dns` shows `flags: Supplemental, Request A records`,
-        // the system never asks us for AAAA, and `.ray` names resolve to nothing
-        // in the one mode where AAAA is the only answer we have. Scoped to the
-        // utun, which carries our mesh IPv6, it asks for both.
+        // In IPv6-only mode, ask configd to trust this resolver, which is the
+        // only way it is ever asked for AAAA. configd computes the per-resolver
+        // "Request A / Request AAAA" flags, and for a supplemental resolver
+        // there is exactly one branch that sets them from the resolver's own
+        // service: the one guarded by an internal `__SCOPED_QUERY__` marker
+        // (configd's dns-configuration.c). Fail it and configd strips the
+        // InterfaceName below, assigns no families of its own, and falls back to
+        // merging in the flags of the *default* resolver. On a Mac with no
+        // native IPv6 that fallback is A-only, so `.ray` names resolve to
+        // nothing in the one mode where AAAA is the only answer we have, while
+        // `dig` against the same resolver answers fine.
         //
-        // Only in that mode: with the v4 magic address an unscoped resolver
-        // already gets the one family it needs, and no build can tell us what
-        // mDNSResponder makes of the scoping, only a Mac in front of a person.
+        // We cannot write that marker: configd rebuilds this dictionary from a
+        // fixed list of keys and would drop it. It sets the marker itself for a
+        // `State:`-only service (we have no `Setup:` half, and no
+        // NetworkExtension) on one condition, that the dictionary names its own
+        // service id back. Hence `ConfirmedServiceID`, which is also how another
+        // VPN's supplemental resolver earns both families.
         //
-        // Values are type-erased to `CFType` because `InterfaceName` is a string
-        // where the rest are arrays, and `from_CFType_pairs` takes one value type.
+        // Trust alone only carries the flags across; [`write_service_config`] is
+        // what makes there be an AAAA flag to carry.
+        //
+        // Only in that mode: with the v4 magic address the fallback already
+        // gives us the one family we need.
+        //
+        // Values are type-erased to `CFType` because these are strings where the
+        // rest are arrays, and `from_CFType_pairs` takes one value type.
         let mut pairs: Vec<(CFString, CFType)> = vec![
             (server_key, server_val.as_CFType()),
             (match_key, match_val.as_CFType()),
@@ -362,6 +380,10 @@ mod macos {
         if super::ipv6_only() && !tun_name.is_empty() {
             let iface_key = unsafe { CFString::wrap_under_get_rule(kSCPropInterfaceName) };
             pairs.push((iface_key, CFString::new(tun_name).as_CFType()));
+            pairs.push((
+                CFString::new("ConfirmedServiceID"),
+                CFString::new(SC_SERVICE_ID).as_CFType(),
+            ));
         }
         let typed_dict = CFDictionary::from_CFType_pairs(&pairs);
         let dict = unsafe { CFDictionary::wrap_under_get_rule(typed_dict.as_concrete_TypeRef()) };
@@ -373,22 +395,28 @@ mod macos {
         Ok(())
     }
 
-    /// Publish the IPv6 half of our service: the utun, its mesh address, and a
-    /// `/128`. Only meaningful in IPv6-only mode, and only there is it written.
+    /// Publish the IPv6 half of our service, plus the service's rank. Only
+    /// meaningful in IPv6-only mode, and only there is it written.
     ///
-    /// Without it the resolver written above is never asked for AAAA records.
-    /// mDNSResponder decides which families to request per resolver from the
-    /// interface that resolver belongs to, and it learns a service's interface
-    /// from this key: naming the interface inside the DNS dictionary alone is
-    /// accepted into the store and then ignored (`scutil --dns` shows our
-    /// resolver with no `if_index` and `flags: Supplemental, Request A
-    /// records`). Judged against the host's primary interface instead, a Mac
-    /// with no native IPv6 concludes AAAA is pointless, and `.ray` names, whose
-    /// only answer in this mode is AAAA, resolve to nothing while `dig` against
-    /// the same resolver answers fine.
+    /// This is what puts the AAAA flag on the resolver written above. configd
+    /// asks one question of a service before it will request a family for it:
+    /// does the service have a *default route* of that family (`ip_plugin.c`,
+    /// `service_is_routable` over `kRouteListFlagsHasDefault`). Address,
+    /// prefix and interface are not enough, and the answer turns on the
+    /// presence of `Router` and nothing else. Note what is *not* asked: no part
+    /// of that path inspects the address range, so our `200::/7`, which is
+    /// IETF-reserved rather than global unicast or ULA, counts exactly as much
+    /// as another VPN's ULA. The same flag is what admits an interface to
+    /// `scutil --nwi`, which is why ours was missing from it.
     ///
-    /// This is what makes another VPN's supplemental resolver sit on
-    /// `if_index : NN (utunN)` with both families requested.
+    /// `Router` pointing back at our own address is the "all routes local"
+    /// case: configd wants a default route to exist in its own model of the
+    /// service, and gets one with no gateway. `PrimaryRank = Never` is what
+    /// keeps that model from reaching the kernel: the service can never win the
+    /// primary election, so it claims no `::/0` and cannot capture the host's
+    /// IPv6 traffic, and it stays out of the flag set configd merges into every
+    /// other resolver. In practice the routing table is unchanged, byte for
+    /// byte, before and after this key is written.
     fn write_service_config(tun_name: &str, mesh_v6: Ipv6Addr) -> Result<()> {
         let store = get_or_init_store()?;
         let store = store.lock().unwrap();
@@ -398,11 +426,13 @@ mod macos {
         let prefix_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetIPv6PrefixLength) };
         let prefix_val = CFArray::from_CFTypes(&[CFNumber::from(128i32)]);
         let iface_key = unsafe { CFString::wrap_under_get_rule(kSCPropInterfaceName) };
+        let router_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetIPv6Router) };
 
         let pairs: Vec<(CFString, CFType)> = vec![
             (addr_key, addr_val.as_CFType()),
             (prefix_key, prefix_val.as_CFType()),
             (iface_key, CFString::new(tun_name).as_CFType()),
+            (router_key, CFString::new(&mesh_v6.to_string()).as_CFType()),
         ];
         let typed_dict = CFDictionary::from_CFType_pairs(&pairs);
         let dict = unsafe { CFDictionary::wrap_under_get_rule(typed_dict.as_concrete_TypeRef()) };
@@ -410,6 +440,16 @@ mod macos {
         anyhow::ensure!(
             store.0.set(SC_IPV6_KEY, dict),
             "SCDynamicStoreSetValue failed for {SC_IPV6_KEY}"
+        );
+
+        let rank = CFDictionary::from_CFType_pairs(&[(
+            CFString::new("PrimaryRank"),
+            CFString::new("Never").as_CFType(),
+        )]);
+        let rank = unsafe { CFDictionary::wrap_under_get_rule(rank.as_concrete_TypeRef()) };
+        anyhow::ensure!(
+            store.0.set(SC_SERVICE_KEY, rank),
+            "SCDynamicStoreSetValue failed for {SC_SERVICE_KEY}"
         );
         Ok(())
     }
@@ -500,6 +540,7 @@ mod macos {
                 // Unconditional: the mode can have changed since the write, and
                 // removing a key that was never set is a no-op.
                 store.0.remove(SC_IPV6_KEY);
+                store.0.remove(SC_SERVICE_KEY);
             }
             tracing::info!("removed SCDynamicStore DNS configuration");
             Ok(())
