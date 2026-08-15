@@ -170,6 +170,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Direct connections over IPv6.** The daemon bound a UDP socket for IPv4 only,
+  so a peer on an IPv6-only network could be reached through a relay and never
+  directly, and this node offered no IPv6 address for others to try. Both
+  families are bound now, on any interface. A host with IPv6 disabled is
+  unaffected: that bind is allowed to fail.
+
 - **A tailnet address is no longer published in your public record.** A host
   running Rayfish next to Tailscale advertised its `fd7a:115c:a1e0::/48` address
   as a way to reach it. No peer could route to it, and it told anyone reading
