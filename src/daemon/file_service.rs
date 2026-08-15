@@ -1009,6 +1009,8 @@ impl FileService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh_blobs::Hash;
+    use std::time::Instant;
 
     /// Pins the outbox persistence format: `EndpointId` and `blake3::Hash`
     /// must survive a JSON round trip (the file is reloaded across daemon
@@ -1068,9 +1070,32 @@ mod tests {
             .unwrap()
     }
 
-    /// Long enough for several sweeps at the interval above.
-    async fn let_gc_run() {
-        tokio::time::sleep(Duration::from_millis(600)).await;
+    /// An untagged blob, there to be collected. Its disappearance is the only
+    /// sound signal that a sweep ran to completion, so every assertion below
+    /// waits on one instead of on the clock.
+    async fn canary(store: &FsStore, dir: &std::path::Path, name: &str) -> Hash {
+        let path = dir.join(name);
+        // Past the 16 KiB inline threshold, so this is a real on-disk blob.
+        std::fs::write(&path, vec![3u8; 64 * 1024]).unwrap();
+        let temp = store.blobs().add_path(&path).temp_tag().await.unwrap();
+        temp.hash()
+    }
+
+    /// Wait for a sweep to collect `hash`. A fixed sleep here is a deadline the
+    /// test loses whenever the runner is slow enough: the sweep is a background
+    /// task on a 100ms timer, and on a loaded two-core CI box it does not always
+    /// land inside the budget a fast laptop never misses. Poll for the effect,
+    /// and keep the timeout far above any real sweep so a failure means gc is
+    /// broken rather than busy.
+    async fn collected(store: &FsStore, hash: Hash, what: &str) {
+        let start = Instant::now();
+        while store.blobs().has(hash).await.unwrap() {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "gc never collected {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// The invariant the whole reclaim design rests on: a tagged blob survives
@@ -1097,18 +1122,17 @@ mod tests {
             .unwrap();
         drop(temp);
 
-        let_gc_run().await;
+        // Added after the tag, so the sweep that takes it is one that already
+        // saw the tag: surviving that sweep is the thing being asserted.
+        let canary = canary(&store, tmp.path(), "canary.bin").await;
+        collected(&store, canary, "the untagged canary").await;
         assert!(
             store.blobs().has(hash).await.unwrap(),
             "a tagged blob must survive gc"
         );
 
         store.tags().delete(&tag).await.unwrap();
-        let_gc_run().await;
-        assert!(
-            !store.blobs().has(hash).await.unwrap(),
-            "an untagged blob must be collected"
-        );
+        collected(&store, hash, "the blob whose tag was deleted").await;
     }
 
     /// `accept_file` tags the blob *before* fetching it, so for a moment the tag
@@ -1143,18 +1167,9 @@ mod tests {
         // An untagged blob, purely so the assertions below can tell "gc ran and
         // behaved" apart from "gc never ran". Without it every assertion here
         // would also hold if the sweep had silently aborted.
-        let junk = tmp.path().join("junk.bin");
-        std::fs::write(&junk, vec![3u8; 64 * 1024]).unwrap();
-        let junk_hash = {
-            let t = store.blobs().add_path(&junk).temp_tag().await.unwrap();
-            t.hash()
-        };
+        let junk_hash = canary(&store, tmp.path(), "junk.bin").await;
 
-        let_gc_run().await;
-        assert!(
-            !store.blobs().has(junk_hash).await.unwrap(),
-            "gc did not run, so this test proves nothing"
-        );
+        collected(&store, junk_hash, "the untagged canary").await;
         assert!(
             store.blobs().has(present).await.unwrap(),
             "gc must still protect tagged blobs despite a dangling tag"
