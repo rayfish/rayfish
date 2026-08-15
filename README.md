@@ -498,6 +498,46 @@ added alongside the defaults; `--replace` swaps them out (a bad custom server
 with no fallback can isolate the node). Settings are saved to `settings.toml` and
 take effect on `sudo ray restart`.
 
+## Running alongside another VPN
+
+Tailscale (and anything else built on CGNAT space) routes all of
+`100.64.0.0/10`, the same range rayfish derives its IPv4 from, so on a host
+running both, one of the two loses its IPv4 half. The IPv6 ranges don't overlap,
+so rayfish steps aside and uses only its own.
+
+This needs no setup: the daemon looks for another VPN on that range at startup
+and switches itself, logging why and showing `ipv6-only on (auto)` in
+`ray status`. Nothing is written to your config, so the mode ends when the other
+VPN does. To decide it yourself:
+
+```bash
+ray config set ipv6-only on    # always, even with no other VPN present
+ray config set ipv6-only off   # never; refuse to start on such a host instead
+ray config set ipv6-only auto  # the default: let the daemon decide at startup
+sudo ray restart               # the mode is fixed when the tunnel is built
+```
+
+Peers, mesh SSH, file transfer, and `.ray` names all keep working over IPv6;
+`.ray` answers AAAA only, and peers are told not to use your mesh IPv4 either.
+Magic DNS moves to `200::53` in this mode, because the usual `100.100.100.53`
+sits in the range the other VPN is filtering (Tailscale drops anything sourced
+from `100.64.0.0/10` that doesn't arrive on `tailscale0`, which includes our own
+DNS replies).
+
+The one thing that doesn't work is `ray exit-node use`: the full tunnel is IPv4
+policy routing, so it's refused in this mode. Serving as an exit node for others
+is unaffected. NetworkManager's DNS backend is skipped too (it can only carry an
+IPv4 nameserver); the next backend down takes over.
+
+If both VPNs manage `/etc/resolv.conf` directly (no systemd-resolved), rayfish
+leaves the file to whoever holds it rather than fighting over it, and `.ray`
+names won't resolve until you add rayfish's resolver to that file yourself or
+put a DNS manager both can register with in the path.
+
+On Android the same mode is a switch under **You > IPv6-only mode**. Two VPNs
+can't run at once there, so the reason to reach for it is a carrier that gives
+the phone a `100.64.x.x` address of its own. Flipping it reconnects.
+
 ## Troubleshooting
 
 ```bash

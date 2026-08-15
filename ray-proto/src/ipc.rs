@@ -74,6 +74,11 @@ pub enum IpcMessage {
     Up {
         #[serde(default)]
         hostname: Option<String>,
+        /// `Some(true)` asks to switch the data plane to IPv6-only (see
+        /// `AppConfig::ipv6_only`). `None` leaves the setting untouched, which
+        /// is what a plain `ray up` sends.
+        #[serde(default)]
+        ipv6_only: Option<bool>,
     },
     /// Put the daemon on standby: tear down active network connections, revert
     /// system DNS, and bring the TUN interface down. The daemon process keeps
@@ -386,6 +391,16 @@ pub enum IpcMessage {
         /// restart). Defaulted so an older CLI/daemon pair still deserializes.
         #[serde(default)]
         auto_update: bool,
+        /// Whether the running daemon's data plane is IPv6-only. Mesh IPv4 is
+        /// not routable in that mode, so `ray status` shows the IPv6 address in
+        /// place of the IPv4 one.
+        #[serde(default)]
+        ipv6_only: bool,
+        /// Whether that mode was chosen by the daemon at startup (another VPN
+        /// holds `100.64.0.0/10`) rather than configured. Shown so the mode is
+        /// not mistaken for a setting. Defaulted for older daemons.
+        #[serde(default)]
+        ipv6_only_auto: bool,
         /// Whether the VPN is active (TUN up, networks connected) or on standby.
         active: bool,
         /// This node's contact id (`ray connect`), shown at the top of status.

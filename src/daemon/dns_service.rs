@@ -61,7 +61,7 @@ impl DnsService {
     pub(crate) async fn sync_network(
         &self,
         network: &str,
-        entries: &[(String, Ipv4Addr, Ipv6Addr)],
+        entries: &[(String, Option<Ipv4Addr>, Ipv6Addr)],
     ) {
         dns::sync_network_hostnames(&self.hostname_table, &self.reverse_table, network, entries)
             .await;
@@ -114,7 +114,7 @@ impl DnsService {
         let search = c.search_domains();
         #[cfg(target_os = "linux")]
         let fallback = c.fallback_upstream();
-        tracing::info!(backend = c.name(), resolver_ip = %crate::dns::MAGIC_DNS_V4, upstreams = ?upstreams, "Magic DNS active");
+        tracing::info!(backend = c.name(), resolver_ip = %dns_config::resolver_addr(), upstreams = ?upstreams, "Magic DNS active");
         self.resolver.set_upstreams(upstreams);
         *self.configurator.lock().unwrap() = Some(Arc::from(c));
         // In direct mode, re-assert /etc/resolv.conf the instant another

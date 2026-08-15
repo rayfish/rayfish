@@ -492,6 +492,7 @@ impl Daemon {
             && let Some(warning) = crate::hostfw::check_inbound_tcp(
                 self.tun_name.load().as_str(),
                 crate::forward::SSH_LISTEN_PORT,
+                self.ipv6_only,
             )
             .warning(crate::forward::SSH_LISTEN_PORT)
         {

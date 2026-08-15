@@ -4,6 +4,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -14,6 +15,10 @@ pub struct Resolver {
     table: HostnameTable,
     reverse: ReverseLookupTable,
     upstreams: Arc<ArcSwap<Vec<SocketAddr>>>,
+    /// Whether this node's data plane is IPv6-only. When set, the roster
+    /// responder withholds A records (see [`crate::dns::handle_query`]): mesh
+    /// IPv4 is not routed here, so handing an app one is a black hole.
+    ipv6_only: AtomicBool,
 }
 
 impl Resolver {
@@ -22,7 +27,15 @@ impl Resolver {
             table,
             reverse,
             upstreams: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            ipv6_only: AtomicBool::new(false),
         }
+    }
+
+    /// Record whether mesh IPv4 is usable on this node. Called once at daemon
+    /// start; a setter rather than a `new` parameter so the mode stays out of
+    /// every construction site.
+    pub fn set_ipv6_only(&self, on: bool) {
+        self.ipv6_only.store(on, Ordering::Relaxed);
     }
 
     /// Replace the upstream set (bare IPv4 on port 53), dropping the magic IP to
@@ -38,7 +51,9 @@ impl Resolver {
     pub fn set_upstream_addrs(&self, addrs: impl IntoIterator<Item = SocketAddr>) {
         let v: Vec<SocketAddr> = addrs
             .into_iter()
-            .filter(|a| a.ip() != IpAddr::V4(MAGIC_DNS_V4))
+            .filter(|a| {
+                a.ip() != IpAddr::V4(MAGIC_DNS_V4) && a.ip() != IpAddr::V6(crate::dns::MAGIC_DNS_V6)
+            })
             .collect();
         self.upstreams.store(Arc::new(v));
     }
@@ -55,7 +70,10 @@ impl Resolver {
     /// goes upstream to the real internet instead of failing. It does not apply
     /// inside `.ray`, where [`crate::dns::handle_query`] answers a miss itself.
     pub async fn resolve(&self, query: &[u8]) -> Option<Vec<u8>> {
-        if let Some(local) = crate::dns::handle_query(query, &self.table, &self.reverse).await {
+        let ipv6_only = self.ipv6_only.load(Ordering::Relaxed);
+        if let Some(local) =
+            crate::dns::handle_query(query, &self.table, &self.reverse, ipv6_only).await
+        {
             return Some(local);
         }
         if let Some(forwarded) = self.forward(query).await {
@@ -76,9 +94,15 @@ impl Resolver {
         if info.protocol != 17 {
             return; // TCP/other: drop cleanly.
         }
-        // UDP payload begins after the IPv4 header (IHL*4) + 8-byte UDP header.
-        let ihl = ((pkt.first().copied().unwrap_or(0) & 0x0f) as usize) * 4;
-        let payload_start = ihl + 8;
+        // UDP payload begins after the IP header + the 8-byte UDP header. IPv4's
+        // header is IHL words long; IPv6's is a fixed 40 bytes (`parse_packet_info`
+        // read the next-header field directly, so there are no extension headers
+        // to walk past here).
+        let ip_header_len = match info.dst_ip {
+            IpAddr::V6(_) => 40,
+            IpAddr::V4(_) => ((pkt.first().copied().unwrap_or(0) & 0x0f) as usize) * 4,
+        };
+        let payload_start = ip_header_len + 8;
         let Some(dns_query) = pkt.get(payload_start..) else {
             return;
         };
@@ -227,7 +251,7 @@ mod tests {
             &reverse,
             "homelab",
             "dario",
-            Ipv4Addr::new(100, 64, 0, 7),
+            Some(Ipv4Addr::new(100, 64, 0, 7)),
             "200::7".parse().unwrap(),
         )
         .await;
@@ -300,7 +324,7 @@ mod tests {
             &reverse,
             "homelab",
             "dario",
-            Ipv4Addr::new(100, 64, 0, 7),
+            Some(Ipv4Addr::new(100, 64, 0, 7)),
             "200::7".parse().unwrap(),
         )
         .await;
@@ -324,7 +348,7 @@ mod tests {
             &reverse,
             "dev",
             "box",
-            peer_ip,
+            Some(peer_ip),
             "200::7".parse().unwrap(),
         )
         .await;

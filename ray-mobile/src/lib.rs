@@ -69,7 +69,7 @@ use android_tun::{AndroidTunReader, AndroidTunWriter};
 use rayfish::config;
 use rayfish::control;
 use rayfish::daemon::transfers;
-use rayfish::daemon::{DaemonState, build_headless};
+use rayfish::daemon::{DaemonState, build_headless_with_setting};
 use rayfish::deeplink::{self, RayfishLink};
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::hostname;
@@ -180,9 +180,41 @@ pub struct Status {
     pub node_id: String,
     pub ipv4: String,
     pub ipv6: String,
+    /// Whether the running node's data plane is IPv6-only.
+    pub ipv6_only: bool,
+    /// Whether that was decided for the user (something else on this device
+    /// already holds `100.64.0.0/10`) rather than chosen in the app. Lets the
+    /// screen say what `Auto` resolved to instead of leaving it a mystery.
+    pub ipv6_only_auto: bool,
     pub peers: Vec<PeerInfo>,
     pub networks: Vec<NetworkDetail>,
     pub pending_networks: Vec<String>,
+}
+
+/// The app's IPv6-only setting, mirroring the desktop `ipv6-only` config key.
+///
+/// Tri-state for the same reason: `Off` has to be sayable, or a phone could not
+/// opt out of being moved onto the mode by the scan.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ipv6OnlyMode {
+    /// Decide at start: IPv6-only when something else on the device already
+    /// holds a `100.64.x.x` address (a carrier, typically), dual-stack when not.
+    Auto,
+    /// Always IPv6-only.
+    On,
+    /// Never. Fails to start rather than run beside such an address.
+    Off,
+}
+
+impl Ipv6OnlyMode {
+    /// As the core's tri-state setting: `None` is auto.
+    fn setting(self) -> Option<bool> {
+        match self {
+            Ipv6OnlyMode::Auto => None,
+            Ipv6OnlyMode::On => Some(true),
+            Ipv6OnlyMode::Off => Some(false),
+        }
+    }
 }
 
 /// One network's liveness, for the health snapshot.
@@ -337,6 +369,9 @@ fn saved_networks_status() -> Status {
         node_id: String::new(),
         ipv4: String::new(),
         ipv6: String::new(),
+        // A stopped node has no data plane, so it is in no mode at all.
+        ipv6_only: false,
+        ipv6_only_auto: false,
         peers: Vec::new(),
         networks: Vec::new(),
         pending_networks: Vec::new(),
@@ -430,8 +465,27 @@ impl Node {
     /// Build the headless daemon (identity, endpoint, blob store, resolver) and
     /// bring the saved networks' control plane up. Idempotent: a second call is a
     /// no-op success. Must run before `join`/`create`/`pair`/`up`.
-    pub fn start(&self) -> Result<(), RayError> {
+    ///
+    /// `ipv6_only` runs the data plane over mesh IPv6 alone, for a network where
+    /// something else already owns `100.64.0.0/10` (a carrier handing the phone a
+    /// CGNAT address, say). It is start-time: the caller decides it here because
+    /// the tunnel's addressing is fixed when the interface is built, so changing
+    /// it means stopping the node and starting a new one. The app's own settings
+    /// store is the authority, not the core's `settings.toml`, which on Android
+    /// lives in an app-private directory the user cannot reach.
+    ///
+    /// [`Ipv6OnlyMode::Auto`] hands the decision to the core, which looks at the
+    /// device's own addresses; the result is reported back through
+    /// [`Status::ipv6_only`] and [`Status::ipv6_only_auto`].
+    /// [`Ipv6OnlyMode::Off`] on a device that already has a `100.64.x.x` address
+    /// is an error rather than an override: it is an explicit instruction not to
+    /// run in the only mode that would work there.
+    pub fn start(&self, ipv6_only: Ipv6OnlyMode) -> Result<(), RayError> {
         // Fast path: already started. Check briefly, then release the lock.
+        //
+        // Note this ignores `ipv6_only` on an already-built daemon: a running
+        // node keeps the mode it was built with. The caller flips the mode by
+        // stopping the node first.
         if self.state.lock().unwrap().is_some() {
             return Ok(());
         }
@@ -445,7 +499,13 @@ impl Node {
         // phone never came back online"). Failing is recoverable; wedging is not.
         let state = self
             .runtime
-            .block_on(async { timeout(START_TIMEOUT, build_headless(true)).await })
+            .block_on(async {
+                timeout(
+                    START_TIMEOUT,
+                    build_headless_with_setting(true, ipv6_only.setting()),
+                )
+                .await
+            })
             .map_err(|_| {
                 tracing::error!(
                     timeout_secs = START_TIMEOUT.as_secs(),
@@ -1090,7 +1150,7 @@ impl Node {
             state.attach_tun(reader, writer).await;
             // Mark the data plane active (and configure Magic DNS) the same way
             // `run_daemon` does after attaching the desktop TUN.
-            state.activate(None).await;
+            state.activate(None, None).await;
         });
         Ok(())
     }
@@ -1158,6 +1218,8 @@ impl Node {
             node_id: String::new(),
             ipv4: String::new(),
             ipv6: String::new(),
+            ipv6_only: false,
+            ipv6_only_auto: false,
             peers: Vec::new(),
             networks: Vec::new(),
             pending_networks: Vec::new(),
@@ -1173,6 +1235,8 @@ impl Node {
         let IpcMessage::StatusResponse {
             endpoint_id,
             active,
+            ipv6_only,
+            ipv6_only_auto,
             networks,
             pending_networks,
             ..
@@ -1217,26 +1281,32 @@ impl Node {
         // networks yet, derive the IPv4 from our identity so the tunnel still
         // gets our real mesh address (the same value every network would use)
         // instead of a placeholder.
+        //
+        // The IPv6 falls back to the derived value even when a network *is*
+        // joined, because a roster entry can carry no IPv6 (an old record, a
+        // peer that predates the v6 field). The derivation is the same blake3 of
+        // our identity that put the address on the roster in the first place, so
+        // this is the address either way. An IPv6-only tunnel has nothing to
+        // bind without it.
         let (ipv4, ipv6) = networks
             .first()
-            .map(|n| {
-                (
-                    n.my_ip.to_string(),
-                    n.my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
-                )
-            })
+            .map(|n| (n.my_ip.to_string(), n.my_ipv6.map(|v| v.to_string())))
             .unwrap_or_else(|| {
                 (
                     rayfish::membership::derive_ip(&endpoint_id).to_string(),
-                    rayfish::membership::derive_ipv6(&endpoint_id).to_string(),
+                    None,
                 )
             });
+        let ipv6 =
+            ipv6.unwrap_or_else(|| rayfish::membership::derive_ipv6(&endpoint_id).to_string());
 
         Status {
             running: active,
             node_id: endpoint_id.to_string(),
             ipv4,
             ipv6,
+            ipv6_only,
+            ipv6_only_auto,
             peers: flat_peers,
             networks: detail,
             pending_networks,

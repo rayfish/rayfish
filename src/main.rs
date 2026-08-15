@@ -192,6 +192,13 @@ pub(crate) enum Command {
         /// when create/join don't specify one; doesn't rename existing networks
         #[arg(long)]
         hostname: Option<String>,
+        /// Always run the data plane over IPv6 only, so another VPN (e.g.
+        /// Tailscale) can keep 100.64.0.0/10. Only needed to make the mode
+        /// permanent: by default the daemon switches to it on its own when it
+        /// finds such a VPN. Takes effect on the next daemon restart; undo with
+        /// `ray config set ipv6-only auto` (or `off` to refuse to start instead)
+        #[arg(long)]
+        ipv6_only: bool,
     },
     /// Standby: take the data plane offline, staying connected to peers
     ///
@@ -1311,7 +1318,10 @@ async fn run() -> Result<()> {
             stats.spawn_logger(token.clone());
             daemon::run_daemon(token, stats).await
         }
-        Command::Up { hostname } => cmd_up(hostname).await,
+        Command::Up {
+            hostname,
+            ipv6_only,
+        } => cmd_up(hostname, ipv6_only.then_some(true)).await,
         Command::Down => ipc_down().await,
         Command::Stop => cmd_stop().await,
         Command::Start => cmd_start().await,

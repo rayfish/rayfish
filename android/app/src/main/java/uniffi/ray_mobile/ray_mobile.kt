@@ -1012,7 +1012,7 @@ fun uniffi_ray_mobile_fn_method_node_set_dns_upstreams(`ptr`: Pointer,`servers`:
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_set_hostname(`ptr`: Pointer,`network`: RustBuffer.ByValue,`hostname`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-fun uniffi_ray_mobile_fn_method_node_start(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+fun uniffi_ray_mobile_fn_method_node_start(`ptr`: Pointer,`ipv6Only`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_start_pairing(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1250,7 +1250,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_set_hostname() != 56819.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_start() != 25989.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_start() != 3926.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_start_pairing() != 51955.toShort()) {
@@ -1879,8 +1879,23 @@ public interface NodeInterface {
      * Build the headless daemon (identity, endpoint, blob store, resolver) and
      * bring the saved networks' control plane up. Idempotent: a second call is a
      * no-op success. Must run before `join`/`create`/`pair`/`up`.
+     *
+     * `ipv6_only` runs the data plane over mesh IPv6 alone, for a network where
+     * something else already owns `100.64.0.0/10` (a carrier handing the phone a
+     * CGNAT address, say). It is start-time: the caller decides it here because
+     * the tunnel's addressing is fixed when the interface is built, so changing
+     * it means stopping the node and starting a new one. The app's own settings
+     * store is the authority, not the core's `settings.toml`, which on Android
+     * lives in an app-private directory the user cannot reach.
+     *
+     * [`Ipv6OnlyMode::Auto`] hands the decision to the core, which looks at the
+     * device's own addresses; the result is reported back through
+     * [`Status::ipv6_only`] and [`Status::ipv6_only_auto`].
+     * [`Ipv6OnlyMode::Off`] on a device that already has a `100.64.x.x` address
+     * is an error rather than an override: it is an explicit instruction not to
+     * run in the only mode that would work there.
      */
-    fun `start`()
+    fun `start`(`ipv6Only`: Ipv6OnlyMode)
     
     /**
      * Begin pairing: returns a ticket to show (as QR) to a device that will
@@ -2579,13 +2594,28 @@ open class Node: Disposable, AutoCloseable, NodeInterface
      * Build the headless daemon (identity, endpoint, blob store, resolver) and
      * bring the saved networks' control plane up. Idempotent: a second call is a
      * no-op success. Must run before `join`/`create`/`pair`/`up`.
+     *
+     * `ipv6_only` runs the data plane over mesh IPv6 alone, for a network where
+     * something else already owns `100.64.0.0/10` (a carrier handing the phone a
+     * CGNAT address, say). It is start-time: the caller decides it here because
+     * the tunnel's addressing is fixed when the interface is built, so changing
+     * it means stopping the node and starting a new one. The app's own settings
+     * store is the authority, not the core's `settings.toml`, which on Android
+     * lives in an app-private directory the user cannot reach.
+     *
+     * [`Ipv6OnlyMode::Auto`] hands the decision to the core, which looks at the
+     * device's own addresses; the result is reported back through
+     * [`Status::ipv6_only`] and [`Status::ipv6_only_auto`].
+     * [`Ipv6OnlyMode::Off`] on a device that already has a `100.64.x.x` address
+     * is an error rather than an override: it is an explicit instruction not to
+     * run in the only mode that would work there.
      */
-    @Throws(RayException::class)override fun `start`()
+    @Throws(RayException::class)override fun `start`(`ipv6Only`: Ipv6OnlyMode)
         = 
     callWithPointer {
     uniffiRustCallWithError(RayException) { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_start(
-        it, _status)
+        it, FfiConverterTypeIpv6OnlyMode.lower(`ipv6Only`),_status)
 }
     }
     
@@ -3253,6 +3283,16 @@ data class Status (
     var `nodeId`: kotlin.String, 
     var `ipv4`: kotlin.String, 
     var `ipv6`: kotlin.String, 
+    /**
+     * Whether the running node's data plane is IPv6-only.
+     */
+    var `ipv6Only`: kotlin.Boolean, 
+    /**
+     * Whether that was decided for the user (something else on this device
+     * already holds `100.64.0.0/10`) rather than chosen in the app. Lets the
+     * screen say what `Auto` resolved to instead of leaving it a mystery.
+     */
+    var `ipv6OnlyAuto`: kotlin.Boolean, 
     var `peers`: List<PeerInfo>, 
     var `networks`: List<NetworkDetail>, 
     var `pendingNetworks`: List<kotlin.String>
@@ -3271,6 +3311,8 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterSequenceTypePeerInfo.read(buf),
             FfiConverterSequenceTypeNetworkDetail.read(buf),
             FfiConverterSequenceString.read(buf),
@@ -3282,6 +3324,8 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterString.allocationSize(value.`nodeId`) +
             FfiConverterString.allocationSize(value.`ipv4`) +
             FfiConverterString.allocationSize(value.`ipv6`) +
+            FfiConverterBoolean.allocationSize(value.`ipv6Only`) +
+            FfiConverterBoolean.allocationSize(value.`ipv6OnlyAuto`) +
             FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`) +
             FfiConverterSequenceTypeNetworkDetail.allocationSize(value.`networks`) +
             FfiConverterSequenceString.allocationSize(value.`pendingNetworks`)
@@ -3292,6 +3336,8 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterString.write(value.`nodeId`, buf)
             FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`ipv6`, buf)
+            FfiConverterBoolean.write(value.`ipv6Only`, buf)
+            FfiConverterBoolean.write(value.`ipv6OnlyAuto`, buf)
             FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
             FfiConverterSequenceTypeNetworkDetail.write(value.`networks`, buf)
             FfiConverterSequenceString.write(value.`pendingNetworks`, buf)
@@ -3352,6 +3398,53 @@ public object FfiConverterTypeTransfer: FfiConverterRustBuffer<Transfer> {
             FfiConverterTypeTransferState.write(value.`state`, buf)
     }
 }
+
+
+
+/**
+ * The app's IPv6-only setting, mirroring the desktop `ipv6-only` config key.
+ *
+ * Tri-state for the same reason: `Off` has to be sayable, or a phone could not
+ * opt out of being moved onto the mode by the scan.
+ */
+
+enum class Ipv6OnlyMode {
+    
+    /**
+     * Decide at start: IPv6-only when something else on the device already
+     * holds a `100.64.x.x` address (a carrier, typically), dual-stack when not.
+     */
+    AUTO,
+    /**
+     * Always IPv6-only.
+     */
+    ON,
+    /**
+     * Never. Fails to start rather than run beside such an address.
+     */
+    OFF;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeIpv6OnlyMode: FfiConverterRustBuffer<Ipv6OnlyMode> {
+    override fun read(buf: ByteBuffer) = try {
+        Ipv6OnlyMode.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: Ipv6OnlyMode) = 4UL
+
+    override fun write(value: Ipv6OnlyMode, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
 
 
 

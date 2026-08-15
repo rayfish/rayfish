@@ -54,18 +54,22 @@ impl Manager {
         }
     }
 
-    /// The command that opens `port` for inbound TCP on `tun` only.
+    /// The command that opens `port` for inbound TCP on `tun` only. `v6` picks
+    /// the address family the mesh SSH listener actually binds, which is the
+    /// only one whose ruleset can drop the connection. ufw and firewalld apply
+    /// to both families from one command, so only the raw `iptables` fix splits.
     /// Only the Linux detector builds a fix; elsewhere nothing constructs a
     /// `WouldBlock`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fn fix_command(self, tun: &str, port: u16) -> String {
+    fn fix_command(self, tun: &str, port: u16, v6: bool) -> String {
         match self {
             Manager::Ufw => format!("ufw allow in on {tun} to any port {port} proto tcp"),
             Manager::Firewalld => format!(
                 "firewall-cmd --permanent --zone=trusted --add-interface={tun} && firewall-cmd --reload"
             ),
             Manager::Iptables => {
-                format!("iptables -I INPUT -i {tun} -p tcp --dport {port} -j ACCEPT")
+                let cmd = if v6 { "ip6tables" } else { "iptables" };
+                format!("{cmd} -I INPUT -i {tun} -p tcp --dport {port} -j ACCEPT")
             }
             Manager::Nftables => {
                 format!("nft add rule inet filter input iifname \"{tun}\" tcp dport {port} accept")
@@ -91,11 +95,17 @@ impl Verdict {
 
 /// Whether the host firewall would drop inbound TCP to `port` arriving on `tun`.
 ///
+/// `v6` selects the family the mesh SSH server listens on. The two rulesets are
+/// independent, and reading the wrong one is worse than reading none: an
+/// IPv6-only data plane behind a permissive `iptables` and a default-DROP
+/// `ip6tables` is exactly the silent hang this module exists to catch, and it
+/// would report [`Verdict::Clear`].
+///
 /// Runs the firewall CLIs read-only. Linux-only in substance: macOS ships pf
 /// disabled by default and BSD hosts do not run the mesh SSH NAT, so elsewhere
 /// this reports [`Verdict::Unknown`] rather than guessing.
 #[cfg(target_os = "linux")]
-pub fn check_inbound_tcp(tun: &str, port: u16) -> Verdict {
+pub fn check_inbound_tcp(tun: &str, port: u16, v6: bool) -> Verdict {
     // ufw and firewalld both render into iptables/nft, so the ruleset below is
     // the ground truth either way. Identify the front-end first purely so the
     // fix we print is the one the operator's own tooling will accept: telling a
@@ -103,32 +113,35 @@ pub fn check_inbound_tcp(tun: &str, port: u16) -> Verdict {
     // silently discards.
     let manager = detect_manager();
 
-    if let Some(rules) = run(&["iptables", "-S"])
+    if let Some(rules) = run(&[if v6 { "ip6tables" } else { "iptables" }, "-S"])
         && let Some(blocked) = iptables_blocks_port(&rules, tun, port)
     {
-        return verdict(blocked, manager.unwrap_or(Manager::Iptables), tun, port);
+        return verdict(blocked, manager.unwrap_or(Manager::Iptables), tun, port, v6);
     }
 
+    // `nft list ruleset` prints every family at once, and the `inet` tables both
+    // distros and we generate cover v4 and v6 together, so this rung needs no
+    // family split.
     if let Some(ruleset) = run(&["nft", "list", "ruleset"])
         && let Some(blocked) = nft_blocks_port(&ruleset, tun, port)
     {
-        return verdict(blocked, manager.unwrap_or(Manager::Nftables), tun, port);
+        return verdict(blocked, manager.unwrap_or(Manager::Nftables), tun, port, v6);
     }
 
     Verdict::Unknown
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn check_inbound_tcp(_tun: &str, _port: u16) -> Verdict {
+pub fn check_inbound_tcp(_tun: &str, _port: u16, _v6: bool) -> Verdict {
     Verdict::Unknown
 }
 
 #[cfg(target_os = "linux")]
-fn verdict(blocked: bool, manager: Manager, tun: &str, port: u16) -> Verdict {
+fn verdict(blocked: bool, manager: Manager, tun: &str, port: u16, v6: bool) -> Verdict {
     if blocked {
         Verdict::WouldBlock {
             manager,
-            fix: manager.fix_command(tun, port),
+            fix: manager.fix_command(tun, port, v6),
         }
     } else {
         Verdict::Clear
@@ -350,11 +363,32 @@ table inet filter {
 
     #[test]
     fn warning_names_the_port_mapping_and_the_fix() {
-        let v = verdict(true, Manager::Ufw, "tun0", 30022);
+        let v = verdict(true, Manager::Ufw, "tun0", 30022, false);
         let msg = v.warning(30022).expect("blocked verdict warns");
         assert!(msg.contains("ufw allow in on tun0 to any port 30022 proto tcp"));
         assert!(msg.contains("30022"));
         assert_eq!(Verdict::Clear.warning(30022), None);
         assert_eq!(Verdict::Unknown.warning(30022), None);
+    }
+
+    #[test]
+    fn the_iptables_fix_matches_the_family_ssh_listens_on() {
+        // IPv6-only mode binds mesh SSH on the v6 address only, so the v4
+        // ruleset is not the one that can drop the connection.
+        assert!(
+            Manager::Iptables
+                .fix_command("tun0", 30022, true)
+                .starts_with("ip6tables -I INPUT -i tun0")
+        );
+        assert!(
+            Manager::Iptables
+                .fix_command("tun0", 30022, false)
+                .starts_with("iptables -I INPUT -i tun0")
+        );
+        // ufw covers both families from one command, so it does not split.
+        assert_eq!(
+            Manager::Ufw.fix_command("tun0", 30022, true),
+            Manager::Ufw.fix_command("tun0", 30022, false)
+        );
     }
 }

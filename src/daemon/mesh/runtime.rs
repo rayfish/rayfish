@@ -98,6 +98,7 @@ impl NetworkRegistry {
                             collision_index: 0,
                             last_seen: None,
                             exit_node: false,
+                            ipv6_only: false,
                         });
                     }
                     for entry in &nc.approved {
@@ -126,6 +127,7 @@ impl NetworkRegistry {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    ipv6_only: self.ipv6_only,
                 })
                 .expect("self-add cannot collide");
         }
@@ -267,9 +269,13 @@ impl NetworkRegistry {
                     .all()
                     .into_iter()
                     .filter_map(|m| {
-                        m.hostname
-                            .as_ref()
-                            .map(|h| (h.clone(), m.ip, derive_ipv6(&m.identity)))
+                        m.hostname.as_ref().map(|h| {
+                            (
+                                h.clone(),
+                                (!m.ipv6_only).then_some(m.ip),
+                                derive_ipv6(&m.identity),
+                            )
+                        })
                     })
                     .collect()
             };
@@ -875,7 +881,14 @@ impl Daemon {
             self.registry.device_user_map.clone(),
             self.ssh_authz.clone(),
         );
-        server.spawn(vec![IpAddr::V4(my_v4), IpAddr::V6(my_v6)], token);
+        // IPv6-only mode carries no mesh IPv4, so binding our v4 would create a
+        // listener nothing can reach.
+        let binds = if self.ipv6_only {
+            vec![IpAddr::V6(my_v6)]
+        } else {
+            vec![IpAddr::V4(my_v4), IpAddr::V6(my_v6)]
+        };
+        server.spawn(binds, token);
         // Turn on the userspace port NAT so mesh `:22` reaches the listener.
         crate::forward::set_ssh_nat_active(true);
     }
@@ -896,7 +909,11 @@ impl Daemon {
     /// bring the data plane up (mark active, configure Magic DNS). On Android the
     /// packet interface + routes are the `VpnService`'s job, so those desktop
     /// route calls are skipped.
-    pub async fn activate(self: &Arc<Self>, hostname: Option<String>) -> IpcMessage {
+    pub async fn activate(
+        self: &Arc<Self>,
+        hostname: Option<String>,
+        ipv6_only: Option<bool>,
+    ) -> IpcMessage {
         // Persist the personal default hostname first (before the already-active
         // short-circuit) so `ray up --hostname X` records the new default even
         // when the VPN is already up. Used as the fallback for future
@@ -920,9 +937,44 @@ impl Daemon {
             }
         }
 
+        // Same deal for `ray up --ipv6-only`: persist before the short-circuit.
+        // The TUN's addressing is fixed when the device is created at daemon
+        // start, so this can only take effect on the next restart; say so
+        // instead of reporting a mode the data plane is not actually in.
+        // Compared against the *stored setting*, not the running mode: on `auto`
+        // the daemon may already be IPv6-only because it found another VPN, and
+        // an explicit `--ipv6-only` still has to be written down or the mode
+        // would vanish along with that VPN.
+        let restart_note = match ipv6_only {
+            Some(want) => match config::load() {
+                Ok(mut app_config) if app_config.ipv6_only != Some(want) => {
+                    app_config.ipv6_only = Some(want);
+                    match config::save_settings(&app_config) {
+                        // Only a data plane that is not already in the requested
+                        // mode needs the restart.
+                        Ok(()) if want != self.ipv6_only => Some(
+                            ". IPv6-only mode set; restart the daemon for changes to take effect.",
+                        ),
+                        Ok(()) => None,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to persist ipv6-only setting");
+                            Some(". Failed to persist the IPv6-only setting, see the log.")
+                        }
+                    }
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load config to set ipv6-only");
+                    Some(". Failed to persist the IPv6-only setting, see the log.")
+                }
+            },
+            None => None,
+        };
+        let restart_note = restart_note.unwrap_or("");
+
         if self.active.swap(true, Ordering::SeqCst) {
             return IpcMessage::Ok {
-                message: "already up".into(),
+                message: format!("already up{restart_note}"),
             };
         }
 
@@ -957,12 +1009,18 @@ impl Daemon {
             // link-up: on Linux the kernel won't install an IPv6 connected route
             // while the link is down, so without this peer traffic leaks out the
             // default route.
-            if let Err(e) = tun::route_peer_range(&tun_name).await {
+            if let Err(e) = tun::route_peer_range(&tun_name, self.ipv6_only).await {
                 tracing::warn!(error = %e, "failed to route 200::/7 into TUN");
                 warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
             }
 
-            if let Err(e) = tun::route_magic_dns(&tun_name).await {
+            // IPv6-only mode answers on `dns::MAGIC_DNS_V6`, which the `200::/7`
+            // route above already delivers. Installing the v4 `/32` there would
+            // plant a dead route inside the `100.64.0.0/10` range this mode
+            // exists to hand over to another VPN.
+            if !self.ipv6_only
+                && let Err(e) = tun::route_magic_dns(&tun_name).await
+            {
                 tracing::warn!(error = %e, "failed to route magic DNS IP into TUN");
             }
 
@@ -971,7 +1029,7 @@ impl Daemon {
             // the TUN, where the forwarding loop would drop it as "no peer for
             // dst". No-op on Linux (kernel installs the `local` route
             // automatically).
-            if let Err(e) = tun::route_self_loopback(my_v4, my_v6).await {
+            if let Err(e) = tun::route_self_loopback(my_v4, my_v6, self.ipv6_only).await {
                 tracing::warn!(error = %e, "failed to install loopback self-route");
                 warnings.push(format!("failed to install loopback self-route: {e}"));
             }
@@ -992,9 +1050,12 @@ impl Daemon {
             // "22/tcp" still drops it and the failure looks like a dead network
             // rather than a firewall rule. Surface it with the other `ray up`
             // warnings; we only read the ruleset, never edit it.
-            if let Some(w) =
-                crate::hostfw::check_inbound_tcp(&dns_tun_name, crate::ssh::SSH_LISTEN_PORT)
-                    .warning(crate::ssh::SSH_LISTEN_PORT)
+            if let Some(w) = crate::hostfw::check_inbound_tcp(
+                &dns_tun_name,
+                crate::ssh::SSH_LISTEN_PORT,
+                self.ipv6_only,
+            )
+            .warning(crate::ssh::SSH_LISTEN_PORT)
             {
                 tracing::warn!("{w}");
                 warnings.push(w);
@@ -1011,10 +1072,10 @@ impl Daemon {
         tracing::info!("data plane activated");
         if warnings.is_empty() {
             IpcMessage::Ok {
-                message: "VPN up".into(),
+                message: format!("VPN up{restart_note}"),
             }
         } else {
-            let mut message = String::from("VPN up, but some things need attention:");
+            let mut message = format!("VPN up{restart_note} Some things need attention:");
             for w in &warnings {
                 message.push_str("\n  - ");
                 message.push_str(w);
@@ -1048,6 +1109,7 @@ impl Daemon {
         // the offers, so this also withdraws a stale advertisement rather than
         // keeping clients routed into a gateway that forwards nothing.
         self.registry.sync_exit_offers().await;
+        self.registry.sync_ipv6_only().await;
         // This runs inside the IPC request, so anything slow here is time the user
         // spends staring at `ray exit-node use`. Timed per phase because a stall in
         // any of them is indistinguishable from the outside.
@@ -1391,6 +1453,7 @@ impl Daemon {
         // otherwise. `activate()` re-advertises. Then disable syncing, so a
         // reconverge during standby leaves the (withdrawn) flag alone.
         self.registry.sync_exit_offers().await;
+        self.registry.sync_ipv6_only().await;
         self.registry
             .exit_sync_enabled
             .store(false, Ordering::SeqCst);

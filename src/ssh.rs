@@ -334,7 +334,15 @@ async fn handle_conn(
         .local_addr()
         .map(|a| SocketAddr::new(a.ip(), SSH_PORT))
         .unwrap_or_else(|_| SocketAddr::new(src, SSH_PORT));
-    let handler = SshHandler::new(policy, user_identity, banner, Origin { client: peer, server });
+    let handler = SshHandler::new(
+        policy,
+        user_identity,
+        banner,
+        Origin {
+            client: peer,
+            server,
+        },
+    );
     match russh::server::run_stream(config, stream, handler).await {
         Ok(session) => {
             let _ = session.await;
@@ -506,12 +514,7 @@ impl Drop for SshHandler {
 }
 
 impl SshHandler {
-    fn new(
-        policy: UserPolicy,
-        user: EndpointId,
-        banner: Option<String>,
-        origin: Origin,
-    ) -> Self {
+    fn new(policy: UserPolicy, user: EndpointId, banner: Option<String>, origin: Origin) -> Self {
         Self {
             policy,
             user,
@@ -1052,10 +1055,9 @@ impl Handler for SshHandler {
             session.channel_failure(channel)?;
             return Ok(());
         };
-        state.env.push((
-            variable_name.to_string(),
-            variable_value.to_string(),
-        ));
+        state
+            .env
+            .push((variable_name.to_string(), variable_value.to_string()));
         session.channel_success(channel)?;
         Ok(())
     }
@@ -1329,7 +1331,8 @@ where
 /// an existing path), so nothing can be waiting at the path to be handed the
 /// socket when the daemon chowns it away from root.
 fn open_agent_socket(info: &LoginInfo) -> Result<(PathBuf, UnixListener, PathBuf)> {
-    let dir = std::env::temp_dir().join(format!("rayfish-ssh-agent.{:016x}", rand::random::<u64>()));
+    let dir =
+        std::env::temp_dir().join(format!("rayfish-ssh-agent.{:016x}", rand::random::<u64>()));
     std::fs::create_dir(&dir).context("creating the agent socket directory")?;
     hand_over(&dir, info, 0o700)?;
     let path = dir.join("agent.sock");
@@ -1404,11 +1407,7 @@ fn account_can(path: &Path, info: &LoginInfo, want: u32) -> bool {
 /// Whether the account is a member of `gid` through its supplementary groups.
 fn in_group(info: &LoginInfo, gid: u32) -> bool {
     uzers::get_user_groups(&info.name, info.gid)
-        .map(|groups| {
-            groups
-                .iter()
-                .any(|g| g.gid() == gid)
-        })
+        .map(|groups| groups.iter().any(|g| g.gid() == gid))
         .unwrap_or(false)
 }
 
@@ -1627,7 +1626,9 @@ async fn run_pty_session(
     let mut child = cmd.spawn(pts).context("spawning login shell")?;
     // Publish the pid so `signal` requests reach it, and clear it again below
     // once it is reaped: a stale pid gets reused by an unrelated process.
-    child_proc.pid.store(child.id().unwrap_or(0), Ordering::Relaxed);
+    child_proc
+        .pid
+        .store(child.id().unwrap_or(0), Ordering::Relaxed);
 
     let stream = channel.into_stream();
     let (mut chan_read, mut chan_write) = tokio::io::split(stream);
@@ -1709,7 +1710,9 @@ async fn run_pipe_session(
         cmd.pre_exec(drop);
     }
     let mut child = cmd.spawn().context("spawning command")?;
-    child_proc.pid.store(child.id().unwrap_or(0), Ordering::Relaxed);
+    child_proc
+        .pid
+        .store(child.id().unwrap_or(0), Ordering::Relaxed);
     let mut stdin = child.stdin.take().context("child stdin")?;
     let mut stdout = child.stdout.take().context("child stdout")?;
     let mut stderr = child.stderr.take().context("child stderr")?;
@@ -2144,7 +2147,10 @@ mod tests {
         mpsc::UnboundedReceiver<Channel<ClientMsg>>,
     ) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (connect_watching_openings(Some(tx), test_account()).await, rx)
+        (
+            connect_watching_openings(Some(tx), test_account()).await,
+            rx,
+        )
     }
 
     async fn connect_watching_openings(
@@ -2630,7 +2636,10 @@ mod tests {
             .find(|w| w.starts_with("conn:"))
             .map(|w| w.trim_start_matches("conn:").to_string())
             .expect("SSH_CONNECTION is set");
-        assert_eq!(conn, "127.0.0.1", "SSH_CONNECTION starts at the client: {out}");
+        assert_eq!(
+            conn, "127.0.0.1",
+            "SSH_CONNECTION starts at the client: {out}"
+        );
         assert!(
             out.contains(&format!(" {SSH_PORT} ")) || out.ends_with(&format!(" {SSH_PORT}")),
             "the server port is the one the client dialled: {out}"
@@ -2644,10 +2653,7 @@ mod tests {
         // anything that talks to a terminal by path need it.
         let (_pty, pts) = pty_process::open().expect("open a pty");
         let name = tty_name(&pts).expect("the child end of a pty has a name");
-        assert!(
-            name.starts_with("/dev/"),
-            "a terminal path, got {name:?}"
-        );
+        assert!(name.starts_with("/dev/"), "a terminal path, got {name:?}");
     }
 
     #[test]
@@ -2661,7 +2667,10 @@ mod tests {
         assert_eq!(reverse_bind_addr(""), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(reverse_bind_addr("::1"), IpAddr::V6(Ipv6Addr::LOCALHOST));
         assert_eq!(reverse_bind_addr("*"), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(reverse_bind_addr("0.0.0.0"), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            reverse_bind_addr("0.0.0.0"),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
         assert_eq!(
             reverse_bind_addr("10.0.0.1"),
             IpAddr::V4(Ipv4Addr::LOCALHOST)

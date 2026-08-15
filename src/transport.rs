@@ -4,13 +4,15 @@
 //! and mesh-protocol version gating (see `MESH_PROTOCOL_VERSION`).
 //! A single shared iroh [`Endpoint`] handles all networks, filtering by ALPN on accept.
 
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
 use anyhow::{Context, Result};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey,
     address_lookup::{PkarrPublisher, PkarrResolver},
     endpoint::Connection,
     endpoint::presets,
-    endpoint::{Builder, DirectAddrFilter, QuicTransportConfig},
+    endpoint::{BindOpts, Builder, DirectAddrFilter, QuicTransportConfig},
 };
 
 use crate::config::ServerOverride;
@@ -102,10 +104,18 @@ pub async fn create_endpoint_with_alpns(
 ) -> Result<Endpoint> {
     // Bind the fixed port so the daemon is reachable on a known, forwardable UDP
     // port across restarts. The builder is consumed by `.bind()`, so we rebuild
-    // it for the ephemeral fallback. Falling back keeps the `0.0.0.0:0` guarantee
+    // it for the ephemeral fallback. Falling back to port 0 keeps the guarantee
     // that the daemon always starts even if the fixed port is already in use.
-    let fixed = format!("0.0.0.0:{RAYFISH_LISTEN_PORT}");
-    let ep = match bind_endpoint(&secret_key, &alpns, tor, &fixed, relay, discovery).await {
+    let ep = match bind_endpoint(
+        &secret_key,
+        &alpns,
+        tor,
+        RAYFISH_LISTEN_PORT,
+        relay,
+        discovery,
+    )
+    .await
+    {
         Ok(ep) => ep,
         Err(e) => {
             tracing::warn!(
@@ -113,7 +123,7 @@ pub async fn create_endpoint_with_alpns(
                 error = %e,
                 "fixed UDP port unavailable; falling back to an ephemeral port"
             );
-            bind_endpoint(&secret_key, &alpns, tor, "0.0.0.0:0", relay, discovery)
+            bind_endpoint(&secret_key, &alpns, tor, 0, relay, discovery)
                 .await
                 .context("failed to bind iroh endpoint")?
         }
@@ -124,14 +134,22 @@ pub async fn create_endpoint_with_alpns(
     Ok(ep)
 }
 
-/// Builds and binds an iroh endpoint at `bind` with the N0 preset and (when
+/// Builds and binds an iroh endpoint on `port` with the N0 preset and (when
 /// requested + compiled in) the Tor custom transport. Factored out so the caller
-/// can retry with a different bind address after a port collision.
+/// can retry with a different port after a collision. Port `0` means ephemeral.
+///
+/// Both families are bound, on the unspecified address of each: `0.0.0.0:port`
+/// and `[::]:port`. Clearing the preset's IP transports to pin the port drops
+/// *both* of the sockets it pre-configures, so re-adding only the v4 one would
+/// leave the node without a v6 underlay: no direct v6 path, no v6 candidate
+/// published, and a peer on an IPv6-only network reachable through a relay only.
+/// The v6 bind is best-effort (`set_is_required(false)`), matching the preset,
+/// since a host with IPv6 disabled must still start.
 async fn bind_endpoint(
     secret_key: &SecretKey,
     alpns: &[Vec<u8>],
     tor: bool,
-    bind: &str,
+    port: u16,
     relay: &ServerOverride,
     discovery: &ServerOverride,
 ) -> Result<Endpoint> {
@@ -140,8 +158,13 @@ async fn bind_endpoint(
         .secret_key(secret_key.clone())
         .alpns(alpns.to_vec())
         .clear_ip_transports()
-        .bind_addr(bind)
-        .context("invalid bind address")?
+        .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+        .context("invalid IPv4 bind address")?
+        .bind_addr_with_opts(
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+            BindOpts::default().set_is_required(false),
+        )
+        .context("invalid IPv6 bind address")?
         // Rayfish's data plane is a single stream of QUIC datagrams per peer
         // (TUN packets → `send_datagram`), with a few reliable control streams per
         // connection. Tune the transport config for that shape:
@@ -201,17 +224,41 @@ async fn bind_endpoint(
     builder.bind().await.context("failed to bind iroh endpoint")
 }
 
+/// Tailscale's IPv6 ULA range. Its IPv4 half is inside `100.64.0.0/10`, which
+/// [`crate::membership::is_overlay_ip`] already covers, but the v6 half looks
+/// like an ordinary private address to iroh. Named here rather than in
+/// `membership` because it is not *our* overlay: this is only about what we
+/// publish, not about what counts as a mesh address.
+const TAILSCALE_ULA: (u16, u16, u16) = (0xfd7a, 0x115c, 0xa1e0);
+
+/// True for an address belonging to another VPN's overlay, which we must not
+/// advertise as a way to reach this node.
+fn is_foreign_overlay_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            (s[0], s[1], s[2]) == TAILSCALE_ULA
+        }
+        std::net::IpAddr::V4(_) => false,
+    }
+}
+
 /// A [`DirectAddrFilter`] that drops rayfish overlay addresses (`100.64.0.0/10`,
 /// `200::/7`) from iroh's gathered direct-address candidates. The mesh IP is bound
 /// on the TUN device; without this iroh would discover it, advertise it (pkarr/DNS
 /// and in-band NAT-traversal), and peers would dial it, looping the underlay back
 /// through the tunnel we carry.
+///
+/// Another VPN's overlay is dropped too. A host running rayfish alongside
+/// Tailscale would otherwise publish its tailnet address in a public pkarr
+/// record: it names a network no rayfish peer can route to, and it leaks the
+/// fact (and address) of that tailnet to anyone who reads the record.
 #[derive(Debug)]
 struct OverlayAddrFilter;
 
 impl DirectAddrFilter for OverlayAddrFilter {
     fn keeps(&self, ip: std::net::IpAddr) -> bool {
-        !crate::membership::is_overlay_ip(ip)
+        !crate::membership::is_overlay_ip(ip) && !is_foreign_overlay_ip(ip)
     }
 }
 
@@ -336,9 +383,15 @@ mod tests {
         // Real underlay / LAN addresses are kept.
         assert!(keeps("51.15.139.151"));
         assert!(keeps("192.168.1.104"));
+        // An ordinary ULA is a real (if private) underlay path, so it stays.
+        assert!(keeps("fd00:1234:5678::1"));
         // Overlay v4 (100.64.0.0/10) and v6 (200::/7) are dropped.
         assert!(!keeps("100.124.253.88"));
         assert!(!keeps("200::1"));
+        // So is another VPN's overlay: a tailnet address names a network no
+        // rayfish peer can route to, and publishing it leaks the tailnet.
+        assert!(!keeps("fd7a:115c:a1e0::1"));
+        assert!(!keeps("fd7a:115c:a1e0:ab12:4843:cd96:1234:5678"));
     }
 
     #[test]

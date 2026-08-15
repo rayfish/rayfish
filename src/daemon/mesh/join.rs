@@ -637,6 +637,7 @@ mod persist_config_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         }
     }
 

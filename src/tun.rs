@@ -11,15 +11,16 @@
 use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
 #[cfg(not(target_os = "android"))]
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv6Addr;
 #[cfg(not(target_os = "android"))]
 use std::process::Command;
 #[cfg(not(target_os = "android"))]
 use std::sync::Arc;
 
 #[cfg(not(target_os = "android"))]
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 // The desktop TUN device (the `tun-rs` crate) only exists off Android, where the
 // packet interface is a `VpnService` fd instead.
 #[cfg(not(target_os = "android"))]
@@ -96,14 +97,79 @@ pub struct TunWriter {
     dev: Arc<AsyncDevice>,
 }
 
-#[cfg(not(target_os = "android"))]
 fn is_cgnat(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     octets[0] == 100 && (octets[1] & 0xC0) == 64
 }
 
-#[cfg(not(target_os = "android"))]
-pub fn check_cgnat_conflict() -> Result<()> {
+/// Error for a host that already has another VPN sitting on the CGNAT range.
+///
+/// States the finding and nothing else: the caller decides what it means (start
+/// IPv6-only, or refuse) and appends the advice that goes with that outcome.
+fn cgnat_conflict(iface: &str, ip: Ipv4Addr) -> anyhow::Error {
+    anyhow::anyhow!(
+        "interface {iface} already has CGNAT address {ip}: another VPN \
+         (e.g. Tailscale) is using the 100.64.0.0/10 range."
+    )
+}
+
+/// Refuses to start when another VPN already holds an address in
+/// `100.64.0.0/10`, since both overlays would fight over the same range.
+///
+/// Skipped in IPv6-only mode, which exists precisely to share a host with such
+/// a VPN (see `AppConfig::ipv6_only`).
+///
+/// Linux reads the address list over netlink. It used to parse `ifconfig` here
+/// too and treat a missing binary as "no conflict", so on a server without
+/// net-tools (most of them) the clash went undetected and the overlay silently
+/// lost its IPv4 half instead of refusing to start.
+#[cfg(target_os = "linux")]
+pub async fn check_cgnat_conflict() -> Result<()> {
+    use futures::TryStreamExt;
+    use rtnetlink::packet_route::address::AddressAttribute;
+
+    let (connection, handle, _) = rtnetlink::new_connection().context("open netlink socket")?;
+    let conn = tokio::spawn(connection);
+
+    let result = async {
+        let mut addrs = handle.address().get().execute();
+        while let Some(msg) = addrs
+            .try_next()
+            .await
+            .context("dump interface addresses via netlink")?
+        {
+            // IFA_LOCAL is the interface's own address and IFA_ADDRESS the peer's
+            // on a point-to-point link (they are equal elsewhere); either one in
+            // the range means someone else is already routing it.
+            let mut label = None;
+            let mut found = None;
+            for attr in &msg.attributes {
+                match attr {
+                    AddressAttribute::Label(l) => label = Some(l.clone()),
+                    AddressAttribute::Address(IpAddr::V4(ip))
+                    | AddressAttribute::Local(IpAddr::V4(ip))
+                        if is_cgnat(*ip) =>
+                    {
+                        found = Some(*ip)
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(ip) = found {
+                let iface = label.unwrap_or_else(|| format!("index {}", msg.header.index));
+                return Err(cgnat_conflict(&iface, ip));
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    conn.abort();
+    result
+}
+
+#[cfg(all(not(target_os = "android"), not(target_os = "linux")))]
+pub async fn check_cgnat_conflict() -> Result<()> {
     let output = Command::new("ifconfig").output();
 
     let output = match output {
@@ -128,13 +194,7 @@ pub fn check_cgnat_conflict() -> Result<()> {
                 && let Ok(ip) = ip_str.parse::<Ipv4Addr>()
                 && is_cgnat(ip)
             {
-                bail!(
-                    "interface {} already has CGNAT address {} — another VPN \
-                     (e.g. Tailscale) is using the 100.64.0.0/10 range. \
-                     Disable it before starting rayfish.",
-                    current_iface,
-                    ip
-                );
+                return Err(cgnat_conflict(&current_iface, ip));
             }
         }
     }
@@ -142,13 +202,112 @@ pub fn check_cgnat_conflict() -> Result<()> {
     Ok(())
 }
 
+/// Android counterpart of the desktop scan, over `getifaddrs` (bionic, API 24+):
+/// netlink dumps and `/proc/net` are not something an app can rely on there,
+/// and there is no `ifconfig` to shell out to.
+///
+/// `own` is this node's own mesh IPv4, skipped if present. The desktop scan runs
+/// before the TUN exists so it cannot meet its own address; here the packet
+/// interface is a `VpnService` fd that may well be up already when the node is
+/// rebuilt, and mistaking our own address for another VPN's would latch the mode
+/// on permanently.
+///
+/// The case this catches is not a peer VPN (Android runs one at a time) but a
+/// carrier handing the phone a `100.64.x.x` address of its own, which the tunnel
+/// would otherwise swallow whole.
+#[cfg(target_os = "android")]
+pub async fn check_cgnat_conflict(own: Option<Ipv4Addr>) -> Result<()> {
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` writes a list head into `ifap` and returns 0 on
+    // success; the list is freed below on every path out.
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        // No list means nothing to compare against. Treating this as "no
+        // conflict" keeps a restricted device starting in the normal mode
+        // rather than failing, which is the same call the desktop scan makes
+        // when it cannot read the addresses.
+        tracing::debug!("getifaddrs failed; assuming no CGNAT conflict");
+        return Ok(());
+    }
+    let addrs = collect_ipv4_addrs(ifap);
+    // SAFETY: `ifap` came from a successful `getifaddrs` and is freed once.
+    unsafe { libc::freeifaddrs(ifap) };
+
+    match find_cgnat_conflict(&addrs, own) {
+        Some((iface, ip)) => Err(cgnat_conflict(&iface, ip)),
+        None => Ok(()),
+    }
+}
+
+/// Walk the `getifaddrs` list into owned `(interface, address)` pairs, so the
+/// filtering below is ordinary safe code that can be tested on a made-up list.
+#[cfg(target_os = "android")]
+fn collect_ipv4_addrs(ifap: *mut libc::ifaddrs) -> Vec<(String, Ipv4Addr)> {
+    let mut out = Vec::new();
+    let mut cur = ifap;
+    // SAFETY: walking a `getifaddrs` list; every pointer is checked for null
+    // before it is read, and the list outlives this walk (freed by the caller).
+    unsafe {
+        while !cur.is_null() {
+            let entry = &*cur;
+            cur = entry.ifa_next;
+            if entry.ifa_addr.is_null() {
+                continue;
+            }
+            let sa = &*entry.ifa_addr;
+            if i32::from(sa.sa_family) != libc::AF_INET {
+                continue;
+            }
+            let sin = &*(entry.ifa_addr as *const libc::sockaddr_in);
+            let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+            let name = if entry.ifa_name.is_null() {
+                String::from("unknown")
+            } else {
+                std::ffi::CStr::from_ptr(entry.ifa_name)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            out.push((name, ip));
+        }
+    }
+    out
+}
+
+/// The first address in `100.64.0.0/10` that is not ours, if any. Split from
+/// the `getifaddrs` walk (and compiled everywhere) so the rule that decides a
+/// conflict is testable off Android.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn find_cgnat_conflict(
+    addrs: &[(String, Ipv4Addr)],
+    own: Option<Ipv4Addr>,
+) -> Option<(String, Ipv4Addr)> {
+    addrs
+        .iter()
+        .find(|(_, ip)| is_cgnat(*ip) && Some(*ip) != own)
+        .cloned()
+}
+
 /// Creates a TUN device with the given virtual IPs and shares it between
 /// independent read/write halves. IPv4 gets a /10 (100.64.0.0/10); IPv6 gets our
 /// own /128 address. The `200::/7` peer range is routed in separately by
 /// [`route_peer_range`] after link-up (the kernel does not reliably install an
 /// IPv6 connected route while the link is down), mirroring how the IPv4 /10 works.
+///
+/// In `ipv6_only` mode the IPv4 address is assigned as a `/32` instead, so no
+/// connected route for the `/10` is installed and another VPN keeps the range.
+/// The `/10` is the part that collides; a single address does not.
+///
+/// The address itself stays because it is still this node's identity-derived
+/// handle: the peer table is keyed on it (`conn_for_ip`), `ray status` reports
+/// it, and the roster carries it for every member. Dropping it would mean
+/// reworking all of that to buy nothing, since an unrouted `/32` carries no
+/// traffic either way. Magic DNS does not depend on it in this mode: it is
+/// reached at [`crate::dns::MAGIC_DNS_V6`] instead.
 #[cfg(not(target_os = "android"))]
-pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
+pub async fn create(
+    v4: Ipv4Addr,
+    v6: Ipv6Addr,
+    ipv6_only: bool,
+) -> Result<(TunReader, TunWriter, String)> {
     let gateway = Ipv4Addr::new(100, 64, 0, 1);
     // `10` is the /10 prefix (was the (255,192,0,0) netmask); `Some(gateway)` is
     // the point-to-point destination. `ipv6(v6, 128)` assigns just our own
@@ -156,8 +315,13 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
     // netlink/`ifconfig` `configure_ipv6` shell-out. `enable(true)` brings the
     // link up at creation (as the old `.up()` did); `set_link_up` and the
     // peer-range route helpers still run later on activate.
+    let (prefix, gateway) = if ipv6_only {
+        (32, None)
+    } else {
+        (10, Some(gateway))
+    };
     let device = DeviceBuilder::new()
-        .ipv4(v4, 10, Some(gateway))
+        .ipv4(v4, prefix, gateway)
         .ipv6(v6, 128)
         .mtu(TUN_MTU)
         .enable(true)
@@ -165,7 +329,7 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
         .context("create tun-rs device")?;
 
     let tun_name = device.name().unwrap_or_else(|_| "unknown".to_string());
-    tracing::info!(addr = %v4, ipv6 = %v6, tun = %tun_name, "TUN device created");
+    tracing::info!(addr = %v4, ipv6 = %v6, tun = %tun_name, ipv6_only, "TUN device created");
 
     // `recv`/`send` take `&self`, so both halves share one device via `Arc`
     // instead of splitting into independent read/write objects.
@@ -247,7 +411,7 @@ pub async fn ensure_ipv6_addr(tun_name: &str, v6: Ipv6Addr) -> Result<()> {
 /// neither range reliably, so *both* `100.64.0.0/10` and `200::/7` are added
 /// explicitly. Idempotent, safe to call on every `up` cycle.
 #[cfg(target_os = "linux")]
-pub async fn route_peer_range(tun_name: &str) -> Result<()> {
+pub async fn route_peer_range(tun_name: &str, _ipv6_only: bool) -> Result<()> {
     use rtnetlink::RouteMessageBuilder;
 
     with_tun_link(tun_name, async |handle, index| {
@@ -267,7 +431,7 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub async fn route_peer_range(tun_name: &str) -> Result<()> {
+pub async fn route_peer_range(tun_name: &str, ipv6_only: bool) -> Result<()> {
     // utun is point-to-point, so the address prefix alone does not reliably
     // create the range route, we add both families explicitly. The IPv4 `/10`
     // is only installed implicitly by the `tun` crate at device creation and
@@ -275,7 +439,16 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     // re-add it on every activate or peers become unreachable over IPv4 while
     // IPv6 still works. `route add` fails if the route already exists (e.g. an
     // earlier `up`), so delete any stale entry first and ignore its result.
-    for (family, net) in [("-inet", "100.64.0.0/10"), ("-inet6", "200::/7")] {
+    //
+    // In IPv6-only mode the `/10` is left to the other VPN; only `200::/7` is
+    // ours, and it already covers `dns::MAGIC_DNS_V6`, so that mode installs no
+    // magic-DNS host route at all.
+    let ranges: &[(&str, &str)] = if ipv6_only {
+        &[("-inet6", "200::/7")]
+    } else {
+        &[("-inet", "100.64.0.0/10"), ("-inet6", "200::/7")]
+    };
+    for (family, net) in ranges.iter().copied() {
         let _ = Command::new("route")
             .args(["-n", "delete", family, "-net", net, "-interface", tun_name])
             .status();
@@ -409,8 +582,15 @@ pub async fn route_magic_dns(_tun_name: &str) -> Result<()> {
 /// `local` route in the `local` table that already delivers self-traffic via
 /// loopback, so pinging your own TUN address works out of the box.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub async fn route_self_loopback(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<()> {
-    for (family, addr) in [("-inet", v4.to_string()), ("-inet6", v6.to_string())] {
+pub async fn route_self_loopback(v4: Ipv4Addr, v6: Ipv6Addr, ipv6_only: bool) -> Result<()> {
+    // IPv6-only mode carries no IPv4 mesh traffic, so only the v6 self-route is
+    // wanted; a `/32` for our own IPv4 sitting on lo0 would just shadow that one
+    // address for the VPN that owns the range.
+    let mut families = vec![("-inet6", v6.to_string())];
+    if !ipv6_only {
+        families.insert(0, ("-inet", v4.to_string()));
+    }
+    for (family, addr) in families {
         let _ = Command::new("route")
             .args(["-n", "delete", family, "-host", &addr, "-interface", "lo0"])
             .status();
@@ -431,7 +611,7 @@ pub async fn route_self_loopback(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<()> {
     not(target_os = "android"),
     not(target_os = "freebsd")
 ))]
-pub async fn route_self_loopback(_v4: Ipv4Addr, _v6: Ipv6Addr) -> Result<()> {
+pub async fn route_self_loopback(_v4: Ipv4Addr, _v6: Ipv6Addr, _ipv6_only: bool) -> Result<()> {
     // Linux installs the loopback `local` route automatically on address
     // assignment; self-traffic already works without an explicit route.
     Ok(())
@@ -498,5 +678,57 @@ impl TunWrite for TunWriter {
     async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
         self.dev.send(packet).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_cgnat_conflict, is_cgnat};
+    use std::net::Ipv4Addr;
+
+    fn addrs() -> Vec<(String, Ipv4Addr)> {
+        vec![
+            ("lo".into(), Ipv4Addr::new(127, 0, 0, 1)),
+            ("wlan0".into(), Ipv4Addr::new(192, 168, 1, 20)),
+            // What a carrier hands a phone on mobile data.
+            ("rmnet_data0".into(), Ipv4Addr::new(100, 79, 3, 4)),
+        ]
+    }
+
+    #[test]
+    fn cgnat_range_is_the_whole_slash_ten() {
+        assert!(is_cgnat(Ipv4Addr::new(100, 64, 0, 0)));
+        assert!(is_cgnat(Ipv4Addr::new(100, 127, 255, 255)));
+        // Either side of it: 100.63.x and 100.128.x are ordinary public space.
+        assert!(!is_cgnat(Ipv4Addr::new(100, 63, 255, 255)));
+        assert!(!is_cgnat(Ipv4Addr::new(100, 128, 0, 0)));
+    }
+
+    #[test]
+    fn a_carrier_cgnat_address_is_a_conflict() {
+        let found = find_cgnat_conflict(&addrs(), None).expect("carrier address should be found");
+        assert_eq!(found.0, "rmnet_data0");
+        assert_eq!(found.1, Ipv4Addr::new(100, 79, 3, 4));
+    }
+
+    /// The Android-only case: our own `VpnService` interface is up when the node
+    /// is rebuilt, and finding our own mesh IPv4 must not read as another VPN,
+    /// or the mode would latch on and never come back off.
+    #[test]
+    fn our_own_mesh_address_is_not_a_conflict() {
+        let mut list = addrs();
+        list.pop();
+        let own = Ipv4Addr::new(100, 119, 146, 219);
+        list.push(("tun0".into(), own));
+
+        assert_eq!(find_cgnat_conflict(&list, Some(own)), None);
+        // Someone else's, on the same interface list, still is.
+        assert!(find_cgnat_conflict(&list, Some(Ipv4Addr::new(100, 64, 9, 9))).is_some());
+    }
+
+    #[test]
+    fn a_host_with_no_cgnat_address_is_clean() {
+        let list = vec![("wlan0".to_string(), Ipv4Addr::new(192, 168, 1, 20))];
+        assert_eq!(find_cgnat_conflict(&list, None), None);
     }
 }

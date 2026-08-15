@@ -678,8 +678,16 @@ mod names {
 use names::*;
 
 /// Turn this host into an exit node: enable IPv4/IPv6 forwarding and install an
-/// nftables table that masquerades overlay-sourced traffic leaving any non-TUN
-/// interface, so replies come back to us and we can un-NAT them to the client.
+/// nftables table that masquerades overlay-sourced traffic that arrived on the
+/// TUN and is leaving by another interface, so replies come back to us and we
+/// can un-NAT them to the client.
+///
+/// The `iifname` half of that match is what keeps the rule to our own traffic.
+/// `100.64.0.0/10` is not exclusively ours (Tailscale allocates from it too), so
+/// matching on the source range alone would also masquerade another VPN's
+/// forwarded packets on a host that routes for both. Locally-generated traffic
+/// has no input interface and so never matches, which is correct: nothing this
+/// host originates is a peer's transit traffic.
 ///
 /// Nothing here opens the forward path: with no other ruleset the kernel forwards
 /// once the sysctls are on, and a host firewall that drops forwarding (ufw,
@@ -712,8 +720,8 @@ fn enable(tun_name: &str) -> Result<()> {
          table inet {t} {{\n\
          \tchain postrouting {{\n\
          \t\ttype nat hook postrouting priority srcnat; policy accept;\n\
-         \t\tip saddr {v4} oifname != \"{tun}\" masquerade\n\
-         \t\tip6 saddr {v6} oifname != \"{tun}\" masquerade\n\
+         \t\tiifname \"{tun}\" ip saddr {v4} oifname != \"{tun}\" masquerade\n\
+         \t\tiifname \"{tun}\" ip6 saddr {v6} oifname != \"{tun}\" masquerade\n\
          \t}}\n\
          }}\n",
         reset = drop_table(SERVER_TABLE),

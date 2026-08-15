@@ -54,6 +54,14 @@ pub struct Member {
     /// makes clients dial a node that drops them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exit_node: bool,
+    /// This member's data plane is IPv6-only, so its `ip` is assigned but not
+    /// routed: another VPN owns `100.64.0.0/10` on that host. A self-claim, same
+    /// shape as `exit_node` and carried the same way
+    /// (`ControlMsg::Ipv6Only` -> coordinator -> signed blob). Peers use it to
+    /// withhold the member's A record, since packets sent to that address arrive
+    /// but the replies leave through the other VPN.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ipv6_only: bool,
 }
 
 impl Member {
@@ -833,6 +841,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         list.add(member.clone()).unwrap();
         assert!(list.is_member(&id));
@@ -854,6 +863,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         list.add(member).unwrap();
         let found = list.get_by_ip(Ipv4Addr::new(100, 64, 10, 5)).unwrap();
@@ -874,6 +884,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         })
         .unwrap();
         let result = list.add(Member {
@@ -886,6 +897,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         });
         assert!(result.is_err());
     }
@@ -904,6 +916,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         })
         .unwrap();
         list.add(Member {
@@ -916,6 +929,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         })
         .unwrap();
         assert!(list.get(&id).unwrap().is_coordinator);
@@ -935,6 +949,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         })
         .unwrap();
         let removed = list.remove(&id);
@@ -956,6 +971,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         })
         .unwrap();
         list.add(Member {
@@ -968,6 +984,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         })
         .unwrap();
         assert_eq!(list.all().len(), 2);
@@ -1006,6 +1023,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                ipv6_only: false,
             })
             .unwrap();
         let entry = ApprovedEntry {
@@ -1149,6 +1167,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                ipv6_only: false,
             });
         }
         list
@@ -1170,6 +1189,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         })
         .unwrap();
 
@@ -1368,6 +1388,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: Some(12345),
                 exit_node: false,
+                ipv6_only: false,
             })
             .unwrap();
         let approved = ApprovedList::new();
@@ -1410,6 +1431,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                ipv6_only: false,
             })
             .unwrap();
         let approved = ApprovedList::new();
@@ -1507,6 +1529,37 @@ mod tests {
         assert!(blob.suggested_firewall.is_empty());
         // A pre-reusable-keys blob decodes with an empty reusable_keys map.
         assert!(blob.reusable_keys.is_empty());
+    }
+
+    /// `Member.ipv6_only` is additive and map-encoded, so a peer on an older
+    /// build (whose members carry no such key) still decodes, and a member that
+    /// does not claim it serializes exactly as before. That is what lets the
+    /// flag ship without bumping `MESH_PROTOCOL_VERSION`.
+    #[test]
+    fn member_ipv6_only_is_additive() {
+        #[derive(Serialize)]
+        struct OldMember {
+            identity: EndpointId,
+            ip: Ipv4Addr,
+            is_coordinator: bool,
+        }
+        let id = test_id(7);
+        let bytes = rmp_serde::to_vec_named(&OldMember {
+            identity: id,
+            ip: derive_ip(&id),
+            is_coordinator: false,
+        })
+        .unwrap();
+        let decoded: Member = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(!decoded.ipv6_only);
+
+        // Not claiming it emits no key at all, so an old peer sees the same bytes.
+        let plain = rmp_serde::to_vec_named(&decoded).unwrap();
+        let mut claiming = decoded.clone();
+        claiming.ipv6_only = true;
+        let claimed = rmp_serde::to_vec_named(&claiming).unwrap();
+        assert!(claimed.len() > plain.len());
+        assert!(rmp_serde::from_slice::<Member>(&claimed).unwrap().ipv6_only);
     }
 
     // -- reusable keys --------------------------------------------------------
@@ -1709,6 +1762,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         assert!(validate_member(&member).is_ok());
     }
@@ -1728,6 +1782,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         let err = validate_member(&member).unwrap_err().to_string();
         assert!(err.contains("does not match"), "{err}");
@@ -1746,6 +1801,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         assert!(validate_member(&member).is_err());
     }
@@ -1764,6 +1820,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         let gw = Member {
             identity: id,
@@ -1775,6 +1832,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         assert!(validate_member(&net).is_err());
         assert!(validate_member(&gw).is_err());
@@ -1809,6 +1867,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                ipv6_only: false,
             };
             assert!(
                 validate_member(&member).is_ok(),
@@ -1834,6 +1893,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         let blob = GroupBlob {
             members: vec![bad_member],
@@ -1861,6 +1921,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         let blob = GroupBlob {
             members: vec![bad_member],
@@ -1888,6 +1949,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         })
         .unwrap();
         mark_coordinator(&mut list, &id);
@@ -1933,6 +1995,7 @@ mod tests {
             collision_index: 2,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         assert!(validate_member(&good).is_ok());
         let bad = Member {
@@ -1957,6 +2020,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         let dup = derive_ip(&a);
         assert!(validate_no_duplicate_ips(&[m(a, dup), m(test_id(2), dup)]).is_err());
@@ -1985,6 +2049,7 @@ mod tests {
             collision_index: idx_a,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         })
         .unwrap();
 
@@ -2023,6 +2088,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         let resolved = resolve_ip_tiebreak(vec![mk(hi), mk(lo)]);
         // lower identity keeps `ip`; higher re-rolls to a free index.
@@ -2057,6 +2123,7 @@ mod tests {
             device_cert: None,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         };
         assert!(validate_member(&m).is_err());
     }

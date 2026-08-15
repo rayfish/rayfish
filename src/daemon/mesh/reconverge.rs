@@ -206,6 +206,7 @@ pub(crate) async fn reconverge_and_apply(
         // so the apply path below would never run and the offer would stay
         // invisible forever. Quiet no-op when the flag already matches.
         registry.sync_exit_offers().await;
+        registry.sync_ipv6_only().await;
         return;
     }
     let Some(data) =
@@ -295,6 +296,7 @@ pub(crate) async fn reconverge_and_apply(
     // the activation-time one, which can fire before any network is connected
     // and go to zero peers. Quiet no-op when the flag already matches.
     registry.sync_exit_offers().await;
+    registry.sync_ipv6_only().await;
     if registry
         .exit_selection_pending
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -436,12 +438,20 @@ pub(crate) async fn apply_roster_to_dns(
         })
         .collect();
     route_map.sync_network(network_name, &routes);
-    let mut entries: Vec<(String, Ipv4Addr, Ipv6Addr)> = members
+    // The roster is the source of truth for DNS, including which members have a
+    // usable mesh IPv4: a member running an IPv6-only data plane gets `None`, so
+    // the responder withholds its A record instead of pointing apps at an
+    // address another VPN owns on that host.
+    let mut entries: Vec<(String, Option<Ipv4Addr>, Ipv6Addr)> = members
         .iter()
         .filter_map(|m| {
-            m.hostname
-                .as_ref()
-                .map(|h| (h.clone(), m.ip, derive_ipv6(&m.identity)))
+            m.hostname.as_ref().map(|h| {
+                (
+                    h.clone(),
+                    (!m.ipv6_only).then_some(m.ip),
+                    derive_ipv6(&m.identity),
+                )
+            })
         })
         .collect();
 
@@ -467,8 +477,8 @@ pub(crate) async fn apply_roster_to_dns(
                     // Override our own DNS entry so `.ray` resolution and
                     // `ray status` reflect the pending name immediately.
                     let v6 = derive_ipv6(&my_identity);
-                    entries.retain(|(_, v4, _)| *v4 != me.ip);
-                    entries.push((pending.clone(), me.ip, v6));
+                    entries.retain(|(_, v4, _)| *v4 != Some(me.ip));
+                    entries.push((pending.clone(), (!me.ipv6_only).then_some(me.ip), v6));
                 }
                 if net.my_hostname.as_deref() != Some(pending.as_str()) {
                     net.my_hostname = Some(pending);
@@ -540,6 +550,7 @@ pub(crate) fn spawn_group_poller(
             // blob, so no reconverge trigger would ever heal it. Quiet local
             // no-op when the flag already matches.
             registry.sync_exit_offers().await;
+            registry.sync_ipv6_only().await;
 
             let current_hash = {
                 let s = state.read().unwrap();
@@ -690,6 +701,7 @@ pub(crate) async fn fetch_and_apply_blob(
     // nudge the daemon to re-run the exit reconcile rather than leaking traffic
     // until the next `ray up`. Both are cheap no-ops otherwise.
     registry.sync_exit_offers().await;
+    registry.sync_ipv6_only().await;
     if registry
         .exit_selection_pending
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -724,6 +736,7 @@ mod self_nullified_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            ipv6_only: false,
         }
     }
 

@@ -32,6 +32,20 @@ pub fn parse_bool(value: &str, default: bool) -> Result<bool> {
     }
 }
 
+/// Parse an on/off/auto value. `auto` and an empty value (what `ConfigUnset`
+/// sends) both mean "no stored preference": the daemon decides at startup.
+pub fn parse_auto_bool(value: &str) -> Result<Option<bool>> {
+    let v = value.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    match v.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(Some(true)),
+        "off" | "false" | "no" | "0" => Ok(Some(false)),
+        other => bail!("'{other}' is not a valid on/off/auto value (use 'on', 'off' or 'auto')"),
+    }
+}
+
 pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: bool) -> Result<()> {
     let entries = super::parse_entries(value);
     let reset = entries.is_empty() || entries == ["n0"];
@@ -39,6 +53,9 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
         GlobalKey::Mdns => cfg.mdns_enabled = parse_bool(value, true)?,
         GlobalKey::AutoUpdate => cfg.auto_update = parse_bool(value, false)?,
         GlobalKey::OnDemand => cfg.on_demand = parse_bool(value, true)?,
+        // The one tri-state: `auto` (and `unset`, which means the same) stores
+        // nothing and leaves the decision to the startup scan.
+        GlobalKey::Ipv6Only => cfg.ipv6_only = parse_auto_bool(value)?,
 
         // Writing `ssh_enabled` is only half of `ray firewall ssh on|off`: the
         // caller must also seed/remove the `allow in tcp:22` passthrough and
@@ -123,6 +140,10 @@ pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
         GlobalKey::Mdns => on_off(cfg.mdns_enabled),
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
         GlobalKey::OnDemand => on_off(cfg.on_demand),
+        GlobalKey::Ipv6Only => match cfg.ipv6_only {
+            Some(v) => on_off(v),
+            None => "auto".to_string(),
+        },
         GlobalKey::Ssh => on_off(cfg.ssh_enabled),
         // Empty renders as unset, matching the `net.ephemeral-ttl` convention.
         GlobalKey::DownloadDir => cfg.download_dir.clone().unwrap_or_default(),
@@ -228,6 +249,30 @@ fn parse_action(value: &str, default: Action) -> Result<Action> {
 mod tests {
     use super::super::empty_network_config as empty_network;
     use super::*;
+
+    /// The one tri-state key: `on`/`off` are stored choices, `auto` (and
+    /// `unset`, which sends an empty value) stores nothing, so the daemon
+    /// decides at startup from what else is on the host.
+    #[test]
+    fn ipv6_only_is_on_off_or_auto() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.ipv6_only, None, "auto is the default");
+        assert_eq!(render_global(&cfg, GlobalKey::Ipv6Only), "auto");
+
+        for (input, want, rendered) in [
+            ("on", Some(true), "on"),
+            ("off", Some(false), "off"),
+            ("auto", None, "auto"),
+            ("on", Some(true), "on"),
+            ("", None, "auto"),
+        ] {
+            apply_global(&mut cfg, GlobalKey::Ipv6Only, input, false).unwrap();
+            assert_eq!(cfg.ipv6_only, want, "set ipv6-only {input:?}");
+            assert_eq!(render_global(&cfg, GlobalKey::Ipv6Only), rendered);
+        }
+
+        assert!(apply_global(&mut cfg, GlobalKey::Ipv6Only, "maybe", false).is_err());
+    }
 
     #[test]
     fn network_auto_accept_toggles_round_trip() {

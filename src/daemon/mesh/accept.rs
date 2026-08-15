@@ -333,7 +333,7 @@ impl CoordinatorAcceptState {
             &self.ctx.reverse_table,
             &self.network_name,
             &final_hostname,
-            peer_ip,
+            Some(peer_ip),
             derive_ipv6(&remote_id),
         )
         .await;
@@ -549,6 +549,7 @@ impl CoordinatorAcceptState {
                 collision_index,
                 last_seen: Some(crate::membership::now_secs()),
                 exit_node: false,
+                ipv6_only: false,
             });
             s.refresh_snapshot();
             s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
@@ -563,7 +564,7 @@ impl CoordinatorAcceptState {
                 &self.ctx.reverse_table,
                 &self.network_name,
                 h,
-                peer_ip,
+                Some(peer_ip),
                 derive_ipv6(&remote_id),
             )
             .await;
@@ -950,7 +951,7 @@ impl MemberAcceptState {
                     &self.ctx.reverse_table,
                     &self.network_name,
                     h,
-                    member_ip,
+                    Some(member_ip),
                     derive_ipv6(&peer_identity),
                 )
                 .await;
@@ -995,6 +996,7 @@ impl MemberAcceptState {
                 collision_index: member_idx,
                 last_seen: Some(crate::membership::now_secs()),
                 exit_node: false,
+                ipv6_only: false,
             });
             s.refresh_snapshot();
             (
@@ -1011,7 +1013,7 @@ impl MemberAcceptState {
                 &self.ctx.reverse_table,
                 &self.network_name,
                 h,
-                member_ip,
+                Some(member_ip),
                 derive_ipv6(&peer_identity),
             )
             .await;
@@ -1142,6 +1144,18 @@ impl AcceptHandler {
                 };
                 tokio::spawn(async move {
                     registry.record_exit_offer(&network, peer_id, enabled).await;
+                });
+                true
+            }
+            // Same shape for a member telling us its data plane is IPv6-only, so
+            // its mesh IPv4 must not be handed out in DNS answers.
+            ControlMsg::Ipv6Only { enabled } => {
+                let registry = self.registry().clone();
+                let Some(network) = self.network_name() else {
+                    return true;
+                };
+                tokio::spawn(async move {
+                    registry.record_ipv6_only(&network, peer_id, enabled).await;
                 });
                 true
             }

@@ -37,7 +37,7 @@ impl NetworkRegistry {
     }
 
     /// The roster member `id` names (see [`Member::matches_identity`]).
-    fn roster_member(&self, network: &str, id: EndpointId) -> Option<Member> {
+    pub(crate) fn roster_member(&self, network: &str, id: EndpointId) -> Option<Member> {
         self.roster(network)
             .into_iter()
             .find(|m| m.matches_identity(id))
@@ -310,6 +310,40 @@ impl NetworkRegistry {
     /// cadence, and the reconnect loop re-establishes the link, so a later pass
     /// delivers.
     async fn publish_exit_offer(&self, network: &str, enabled: bool) {
+        if self
+            .deliver_self_flag(
+                network,
+                &ControlMsg::ExitNodeOffer { enabled },
+                "exit offer",
+            )
+            .await
+        {
+            self.record_exit_offer(network, self.transport.endpoint.id(), enabled)
+                .await;
+        }
+    }
+
+    /// Deliver a self-claimed roster flag to the network's coordinator set, over
+    /// each coordinator's **retained** mesh connection. Returns `true` when this
+    /// node holds the network key, meaning the caller should record the flag on
+    /// its own roster entry and republish instead of sending anything.
+    ///
+    /// The connection has to be one the [`ConnectionManager`] owns, not a
+    /// locally-held dial: a control frame is written on a fresh bidirectional
+    /// stream and only flushes while its connection stays open, so sending over a
+    /// connection this function owns and then drops cuts the stream off before
+    /// the bytes reach the coordinator (the sender sees a clean `Ok` while the
+    /// coordinator never receives the frame, the bug this replaced). A coordinator
+    /// with no live connection right now (an idle-closed on-demand link) is
+    /// skipped; the caller's sync pass retries on the backstop / group-poll
+    /// cadence, and the reconnect loop re-establishes the link, so a later pass
+    /// delivers.
+    pub(crate) async fn deliver_self_flag(
+        &self,
+        network: &str,
+        msg: &ControlMsg,
+        what: &str,
+    ) -> bool {
         let self_id = self.transport.endpoint.id();
         let user_id = self.device_user_map.resolve(&self_id);
         let (net_pubkey, is_coordinator) = match self.networks.get(network) {
@@ -317,12 +351,11 @@ impl NetworkRegistry {
                 let s = h.state.read().unwrap();
                 (s.network_public_key, s.network_secret_key.is_some())
             }
-            None => return,
+            None => return false,
         };
-        tracing::debug!(network = %network, enabled, is_coordinator, "advertising exit offer");
+        tracing::debug!(network = %network, is_coordinator, "advertising {what}");
         if is_coordinator {
-            self.record_exit_offer(network, self_id, enabled).await;
-            return;
+            return true;
         }
         let coordinators: Vec<Member> = self
             .roster(network)
@@ -330,8 +363,8 @@ impl NetworkRegistry {
             .filter(|m| m.is_coordinator && m.identity != self_id && m.identity != user_id)
             .collect();
         if coordinators.is_empty() {
-            tracing::debug!(network = %network, "no coordinator in roster to deliver exit offer to; will retry");
-            return;
+            tracing::debug!(network = %network, "no coordinator in roster to deliver {what} to; will retry");
+            return false;
         }
         for m in coordinators {
             // Reuse the live, ConnectionManager-owned link. Never a connection we
@@ -340,32 +373,26 @@ impl NetworkRegistry {
                 tracing::debug!(
                     network = %network,
                     coordinator = %m.identity.fmt_short(),
-                    "no live connection to coordinator to deliver exit offer; will retry"
+                    "no live connection to coordinator to deliver {what}; will retry"
                 );
                 continue;
             };
-            if let Err(e) = open_and_send(
-                &conn,
-                Some(net_pubkey),
-                &ControlMsg::ExitNodeOffer { enabled },
-            )
-            .await
-            {
+            if let Err(e) = open_and_send(&conn, Some(net_pubkey), msg).await {
                 tracing::warn!(
                     network = %network,
                     coordinator = %m.identity.fmt_short(),
                     error = %e,
-                    "failed to deliver exit offer to coordinator; will retry"
+                    "failed to deliver {what} to coordinator; will retry"
                 );
             } else {
                 tracing::debug!(
                     network = %network,
                     coordinator = %m.identity.fmt_short(),
-                    enabled,
-                    "delivered exit offer to coordinator"
+                    "delivered {what} to coordinator"
                 );
             }
         }
+        false
     }
 
     /// Coordinator side: record a member's exit-node offer on its signed roster
@@ -373,12 +400,32 @@ impl NetworkRegistry {
     /// normalized to the roster identity (device or paired user) before matching.
     /// No-op if we do not hold the network key or the sender is not a member.
     pub(crate) async fn record_exit_offer(&self, network: &str, sender: EndpointId, enabled: bool) {
+        self.record_self_flag(network, sender, "exit offer", |m| {
+            let changed = m.exit_node != enabled;
+            m.exit_node = enabled;
+            changed
+        })
+        .await;
+    }
+
+    /// Coordinator side: apply a member's self-claimed flag to its signed roster
+    /// entry and republish if `set` actually changed it. `sender` is the claiming
+    /// peer's transport id; it is normalized to the roster identity (device or
+    /// paired user) before matching. No-op if we do not hold the network key or
+    /// the sender is not a member.
+    pub(crate) async fn record_self_flag(
+        &self,
+        network: &str,
+        sender: EndpointId,
+        what: &str,
+        set: impl Fn(&mut Member) -> bool,
+    ) {
         let user_id = self.device_user_map.resolve(&sender);
         let changed = match self.networks.get(network) {
             Some(h) => {
                 let mut s = h.state.write().unwrap();
                 if s.network_secret_key.is_none() {
-                    tracing::debug!(network = %network, "exit offer received but we hold no network key; ignoring");
+                    tracing::debug!(network = %network, "{what} received but we hold no network key; ignoring");
                     return;
                 }
                 // The roster keys a member by its own identity, which for a paired
@@ -391,27 +438,26 @@ impl NetworkRegistry {
                     tracing::warn!(
                         network = %network,
                         sender = %sender.fmt_short(),
-                        "exit offer from a peer the roster does not list; ignoring"
+                        "{what} from a peer the roster does not list; ignoring"
                     );
                     return;
                 };
-                match s.members.get_mut(&id) {
-                    Some(member) if member.exit_node != enabled => {
-                        member.exit_node = enabled;
-                        s.refresh_snapshot();
-                        true
-                    }
-                    _ => false,
+                let changed = match s.members.get_mut(&id) {
+                    Some(member) => set(member),
+                    None => false,
+                };
+                if changed {
+                    s.refresh_snapshot();
                 }
+                changed
             }
             None => return,
         };
         tracing::debug!(
             network = %network,
             sender = %sender.fmt_short(),
-            enabled,
             changed,
-            "exit offer recorded"
+            "{what} recorded"
         );
         if changed {
             self.store_and_publish_group(network).await;

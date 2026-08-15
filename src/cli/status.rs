@@ -137,6 +137,8 @@ pub(crate) async fn ipc_status() -> Result<()> {
             endpoint_id,
             mdns_enabled,
             auto_update,
+            ipv6_only,
+            ipv6_only_auto,
             active,
             contact_id,
             daemon_version,
@@ -164,6 +166,8 @@ pub(crate) async fn ipc_status() -> Result<()> {
                         }))
                         .collect::<Vec<_>>(),
                     "auto_update": auto_update,
+                    "ipv6_only": ipv6_only,
+                    "ipv6_only_auto": ipv6_only_auto,
                     "active": active,
                     "contact_id": contact_id,
                     "daemon_version": daemon_version,
@@ -202,13 +206,28 @@ pub(crate) async fn ipc_status() -> Result<()> {
             } else {
                 String::new()
             };
+            // Same treatment for IPv6-only: off is the default, so only say
+            // something when the data plane is actually running without IPv4.
+            // `(auto)` marks a mode the daemon chose on finding another VPN on
+            // `100.64.0.0/10`, which nobody would otherwise know to expect.
+            let v6only = if ipv6_only {
+                let how = if ipv6_only_auto {
+                    format!("{} {}", style::green("on"), style::faint("(auto)"))
+                } else {
+                    style::green("on").to_string()
+                };
+                format!("      {} {how}", style::label("ipv6-only"))
+            } else {
+                String::new()
+            };
             println!();
             println!(
-                "  {}  {}      {}{}      {} {}",
+                "  {}  {}      {}{}{}      {} {}",
                 style::bold("rayfish"),
                 state,
                 mdns,
                 auto,
+                v6only,
                 style::label("endpoint"),
                 style::value(&endpoint_id.fmt_short().to_string()),
             );
@@ -224,7 +243,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 println!("  {}", style::faint("no active networks"));
             } else {
                 for net in &networks {
-                    print_network(net);
+                    print_network(net, ipv6_only);
                 }
             }
 
@@ -343,7 +362,7 @@ fn print_nearby(peers: &[ipc::LanPeerInfo]) {
 /// Render one network block: header (name · role · dns · ip · member count),
 /// the aligned peer table, and the shareable join code (suppressed for direct
 /// `ray connect` networks).
-fn print_network(net: &ipc::NetworkStatus) {
+fn print_network(net: &ipc::NetworkStatus, ipv6_only: bool) {
     let role = net.role.to_string();
     // Just the hostname: the network name is already the block header, so the
     // `.{network}.ray` suffix would only repeat it.
@@ -357,7 +376,13 @@ fn print_network(net: &ipc::NetworkStatus) {
     if let Some(ref dns) = dns_name {
         print!("   {}", style::value(dns));
     }
-    print!("   {}", style::faint(&net.my_ip.to_string()));
+    // In IPv6-only mode the mesh IPv4 carries no traffic, so showing it would
+    // hand out an address that goes nowhere. Show the address actually in use.
+    let my_addr = match (ipv6_only, net.my_ipv6) {
+        (true, Some(v6)) => v6.to_string(),
+        _ => net.my_ip.to_string(),
+    };
+    print!("   {}", style::faint(&my_addr));
     print!(
         "   {} {}",
         style::label("members"),

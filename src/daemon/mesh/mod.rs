@@ -20,6 +20,7 @@ mod exit_node;
 mod files;
 mod firewall;
 mod invite;
+mod ipv6_only;
 mod join;
 mod publish;
 mod reconverge;
@@ -44,4 +45,7 @@ pub(crate) use select::*;
 // `run_daemon` is the public process entry point (called by `ray daemon`).
 pub use bootstrap::run_daemon;
 // `build_headless` is the embedder (mobile) construction entry point.
-pub use bootstrap::build_headless;
+pub use bootstrap::{build_headless, build_headless_with_setting};
+// The IPv6-only mode decision, shared by `run_daemon` and the embedder: both
+// hold a tri-state setting from their own store and need the same answer.
+pub use ipv6_only::resolve_ipv6_only;

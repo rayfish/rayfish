@@ -418,6 +418,23 @@ pub struct AppConfig {
     /// it off (`ray config set on-demand off`) to stay eagerly connected.
     #[serde(default = "default_true")]
     pub on_demand: bool,
+    /// IPv6-only data plane, for hosts that share the box with another VPN
+    /// claiming `100.64.0.0/10` (Tailscale). The `/10` connected route is not
+    /// installed, mesh IPv4 carries no traffic, and the responder answers AAAA
+    /// only. The TUN keeps its own derived IPv4 as a `/32`, not for Magic DNS
+    /// (that moves to [`crate::dns::MAGIC_DNS_V6`]) but because the address is
+    /// still this node's internal handle: peer table, roster, and `ray status`
+    /// all key on it. Read once at daemon start (the TUN is built there), so a
+    /// change needs a restart.
+    ///
+    /// Three states, because "off" has to be sayable: `Some(true)` on,
+    /// `Some(false)` off, and `None` (the key absent, the default) auto, which
+    /// starts the daemon in this mode when the startup scan finds another VPN
+    /// already on `100.64.0.0/10`. An auto decision is never written back, so
+    /// the mode follows the host and stops when the other VPN does; `Some(false)`
+    /// is a standing instruction to refuse to start on such a host instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_only: Option<bool>,
     /// Seconds of no traffic before an on-demand node closes a peer connection.
     /// `None` uses [`DEFAULT_IDLE_TIMEOUT_SECS`]. Only consulted when `on_demand`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -476,6 +493,7 @@ impl Default for AppConfig {
             dns_upstreams: ServerOverride::default(),
             ssh_enabled: false,
             on_demand: true,
+            ipv6_only: None,
             idle_timeout_secs: None,
             auto_update: false,
             auto_update_last_target: None,
@@ -577,6 +595,8 @@ struct Settings {
     #[serde(default = "default_true")]
     on_demand: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    ipv6_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     idle_timeout_secs: Option<u64>,
     #[serde(default)]
     auto_update: bool,
@@ -656,7 +676,8 @@ fn config_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
 ///
 /// Platform defaults: Linux `/etc/rayfish` (system service location,
 /// root:rayfish), FreeBSD `/usr/local/etc/rayfish`, macOS the daemon's
-/// `~/.config/rayfish` (root-only under `/var/root`), Android the app's
+/// `~/Library/Application Support/rayfish` (root-only, and under launchd that
+/// home is `/var/root`, not the home of whoever ran `sudo`), Android the app's
 /// `Context.getFilesDir()` (passed by `ray-mobile`'s `Node::new` through this
 /// same var).
 pub fn config_dir() -> Result<PathBuf> {
@@ -886,6 +907,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         dns_upstreams: settings.dns_upstreams,
         ssh_enabled: settings.ssh_enabled,
         on_demand: settings.on_demand,
+        ipv6_only: settings.ipv6_only,
         idle_timeout_secs: settings.idle_timeout_secs,
         auto_update: settings.auto_update,
         auto_update_last_target: settings.auto_update_last_target,
@@ -915,6 +937,7 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         dns_upstreams: config.dns_upstreams.clone(),
         ssh_enabled: config.ssh_enabled,
         on_demand: config.on_demand,
+        ipv6_only: config.ipv6_only,
         idle_timeout_secs: config.idle_timeout_secs,
         auto_update: config.auto_update,
         auto_update_last_target: config.auto_update_last_target.clone(),
@@ -1658,6 +1681,44 @@ name = "test"
         assert!(!cfg.relay.is_unset());
         config_set(&mut cfg, settings::GlobalKey::Relay, "n0", false).unwrap();
         assert!(cfg.relay.is_unset());
+    }
+
+    /// `ipv6_only` has to survive the settings.toml round trip, or the daemon
+    /// would come back dual-stack after the restart the mode requires.
+    #[test]
+    fn ipv6_only_persists_through_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        config_set(&mut cfg, settings::GlobalKey::Ipv6Only, "on", false).unwrap();
+        save_settings_in(dir.path(), &cfg).unwrap();
+        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Some(true));
+    }
+
+    /// `auto` is the absence of the key, so it must not be written: an older
+    /// daemon reading the file would reject a non-boolean value, and a written
+    /// `false` would silently mean "refuse to start next to another VPN".
+    #[test]
+    fn auto_ipv6_only_is_not_written_to_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        config_set(&mut cfg, settings::GlobalKey::Ipv6Only, "auto", false).unwrap();
+        save_settings_in(dir.path(), &cfg).unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(!raw.contains("ipv6_only"), "auto wrote a value: {raw}");
+        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, None);
+    }
+
+    /// A settings.toml written before the tri-state names a bare boolean, and it
+    /// still has to mean what it meant then.
+    #[test]
+    fn a_stored_boolean_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SETTINGS_FILE), "ipv6_only = true\n").unwrap();
+        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Some(true));
+
+        std::fs::write(dir.path().join(SETTINGS_FILE), "ipv6_only = false\n").unwrap();
+        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Some(false));
     }
 
     #[test]
