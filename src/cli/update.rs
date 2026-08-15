@@ -6,6 +6,8 @@
 
 use std::path::Path;
 use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
@@ -429,6 +431,18 @@ pub(crate) fn run_cmd(program: &str, args: &[&str]) {
         Ok(status) => eprintln!("warning: `{program}` exited with {status}"),
         Err(e) => eprintln!("warning: failed to run `{program}`: {e}"),
     }
+}
+
+/// Run a command, ignoring its exit status and output. For the launchd teardown
+/// in `install_and_start_service`, where unloading a job that was never loaded
+/// is both expected and noisy. macOS-only, as its one caller is.
+#[cfg(target_os = "macos")]
+pub(crate) fn run_cmd_quiet(program: &str, args: &[&str]) {
+    let _ = Command::new(program)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 pub(crate) fn cmd_uninstall_service() -> Result<()> {

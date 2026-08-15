@@ -59,7 +59,8 @@ impl Manager {
     /// only one whose ruleset can drop the connection. ufw and firewalld apply
     /// to both families from one command, so only the raw `iptables` fix splits.
     /// Only the Linux detector builds a fix; elsewhere nothing constructs a
-    /// `WouldBlock`.
+    /// `WouldBlock`, so off Linux this exists for its own tests.
+    #[cfg(any(target_os = "linux", test))]
     fn fix_command(self, tun: &str, port: u16, v6: bool) -> String {
         match self {
             Manager::Ufw => format!("ufw allow in on {tun} to any port {port} proto tcp"),

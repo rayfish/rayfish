@@ -37,6 +37,31 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  # Same gap the Android job closes, for the other platform whose code no Linux
+  # build compiles: the TUN/route/DNS backends are per-OS `cfg` branches, and
+  # macOS was only ever built on release, where a break costs a failed tag.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "macos-ci"
+          cache-on-failure: true
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
   # The APK is built on release, which is too late: the Android half of the tree
   # is `#[cfg(target_os = "android")]` Rust plus generated Kotlin bindings, and
   # neither is compiled by the job above, so a PR could go green and break the

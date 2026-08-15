@@ -43,6 +43,13 @@ pub fn set_ipv6_only(on: bool) {
 /// IPv6-only hosts must not be given the v4 one: it lives in `100.64.0.0/10`,
 /// and the VPN that owns that range on such a host drops our reply before it
 /// reaches the stub resolver. See [`crate::dns::MAGIC_DNS_V6`].
+/// Read by the macOS configurator, which scopes its resolver to the utun in
+/// this mode; the other backends only ever need [`resolver_addr`].
+#[cfg(target_os = "macos")]
+pub(crate) fn ipv6_only() -> bool {
+    IPV6_ONLY.load(Ordering::Relaxed)
+}
+
 pub fn resolver_addr() -> IpAddr {
     if IPV6_ONLY.load(Ordering::Relaxed) {
         IpAddr::V6(crate::dns::MAGIC_DNS_V6)
@@ -91,8 +98,7 @@ pub async fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigura
 
     #[cfg(target_os = "macos")]
     {
-        let _ = tun_name;
-        let configurator = MacosDynamicStoreDns::new();
+        let configurator = MacosDynamicStoreDns::new(tun_name.to_string());
         configurator.apply().await?;
         return Ok(Box::new(configurator));
     }
@@ -222,8 +228,7 @@ pub async fn clear_search_domains(tun_name: &str) {
 async fn set_search_domains(rayfish_domains: &[String], tun_name: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let _ = tun_name;
-        write_dns_config_macos(rayfish_domains)
+        write_dns_config_macos(rayfish_domains, tun_name)
     }
     #[cfg(target_os = "linux")]
     {
@@ -246,11 +251,14 @@ mod macos {
 
     use anyhow::{Context, Result};
     use core_foundation::{
-        array::CFArray, base::TCFType, dictionary::CFDictionary, string::CFString,
+        array::CFArray,
+        base::{CFType, TCFType},
+        dictionary::CFDictionary,
+        string::CFString,
     };
     use system_configuration::dynamic_store::{SCDynamicStore, SCDynamicStoreBuilder};
     use system_configuration::sys::schema_definitions::{
-        kSCPropNetDNSSearchDomains, kSCPropNetDNSServerAddresses,
+        kSCPropInterfaceName, kSCPropNetDNSSearchDomains, kSCPropNetDNSServerAddresses,
         kSCPropNetDNSSupplementalMatchDomains,
     };
 
@@ -287,7 +295,7 @@ mod macos {
         Ok(STORE.get().unwrap())
     }
 
-    pub fn write_dns_config(search_domains: &[String]) -> Result<()> {
+    pub fn write_dns_config(search_domains: &[String], tun_name: &str) -> Result<()> {
         let store = get_or_init_store()?;
         let store = store.lock().unwrap();
 
@@ -316,11 +324,32 @@ mod macos {
             search_domains.iter().map(|s| CFString::new(s)).collect();
         let search_val = CFArray::from_CFTypes(&search_cfstrings);
 
-        let typed_dict = CFDictionary::from_CFType_pairs(&[
-            (server_key, server_val),
-            (match_key, match_val),
-            (search_key, search_val),
-        ]);
+        // Scope the resolver to our utun in IPv6-only mode. mDNSResponder
+        // decides per resolver whether to ask it for A records, AAAA records or
+        // both, and it decides from the address families of the interface the
+        // resolver belongs to. An unscoped resolver is judged against the host's
+        // primary interface, which on a Mac with no native IPv6 means A records
+        // only: `scutil --dns` shows `flags: Supplemental, Request A records`,
+        // the system never asks us for AAAA, and `.ray` names resolve to nothing
+        // in the one mode where AAAA is the only answer we have. Scoped to the
+        // utun, which carries our mesh IPv6, it asks for both.
+        //
+        // Only in that mode: with the v4 magic address an unscoped resolver
+        // already gets the one family it needs, and no build can tell us what
+        // mDNSResponder makes of the scoping, only a Mac in front of a person.
+        //
+        // Values are type-erased to `CFType` because `InterfaceName` is a string
+        // where the rest are arrays, and `from_CFType_pairs` takes one value type.
+        let mut pairs: Vec<(CFString, CFType)> = vec![
+            (server_key, server_val.as_CFType()),
+            (match_key, match_val.as_CFType()),
+            (search_key, search_val.as_CFType()),
+        ];
+        if super::ipv6_only() && !tun_name.is_empty() {
+            let iface_key = unsafe { CFString::wrap_under_get_rule(kSCPropInterfaceName) };
+            pairs.push((iface_key, CFString::new(tun_name).as_CFType()));
+        }
+        let typed_dict = CFDictionary::from_CFType_pairs(&pairs);
         let dict = unsafe { CFDictionary::wrap_under_get_rule(typed_dict.as_concrete_TypeRef()) };
 
         anyhow::ensure!(
@@ -369,12 +398,15 @@ mod macos {
 
     pub struct MacosDynamicStoreDns {
         captured: Vec<std::net::Ipv4Addr>,
+        /// The utun the resolver is scoped to (see [`write_dns_config`]).
+        tun_name: String,
     }
 
     impl MacosDynamicStoreDns {
-        pub fn new() -> Self {
+        pub fn new(tun_name: String) -> Self {
             Self {
                 captured: capture_system_upstreams(),
+                tun_name,
             }
         }
     }
@@ -383,9 +415,10 @@ mod macos {
     impl DnsConfigurator for MacosDynamicStoreDns {
         async fn apply(&self) -> Result<()> {
             init_store()?;
-            write_dns_config(&[DNS_DOMAIN.to_string()])?;
+            write_dns_config(&[DNS_DOMAIN.to_string()], &self.tun_name)?;
             tracing::info!(
                 key = SC_DNS_KEY,
+                interface = %self.tun_name,
                 full_tunnel = crate::exit_node::full_tunnel_active(),
                 "configured macOS DNS via SCDynamicStore"
             );
@@ -415,8 +448,8 @@ mod macos {
 use macos::MacosDynamicStoreDns;
 
 #[cfg(target_os = "macos")]
-fn write_dns_config_macos(search_domains: &[String]) -> Result<()> {
-    macos::write_dns_config(search_domains)
+fn write_dns_config_macos(search_domains: &[String], tun_name: &str) -> Result<()> {
+    macos::write_dns_config(search_domains, tun_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -983,6 +1016,9 @@ impl DnsConfigurator for Resolvconf {
 /// than matching `"nameserver "` matters more than it looks: missing an entry
 /// here doesn't degrade anything, it silently leaves the forwarder with nothing
 /// to forward to.
+// This and the resolv.conf helpers below serve the Linux direct-write fallback
+// and their own tests, and nothing else: no other platform writes resolv.conf.
+#[cfg(any(target_os = "linux", test))]
 fn parse_resolv_nameservers(contents: &str) -> Vec<Ipv4Addr> {
     contents
         .lines()
@@ -1003,12 +1039,14 @@ fn parse_resolv_nameservers(contents: &str) -> Vec<Ipv4Addr> {
 /// answer `.ray` authoritatively so it never reaches the second entry, but if
 /// our resolver is dead, wedged, or the daemon is gone, the libc resolver moves
 /// on to a real server instead of the machine having no DNS at all.
+#[cfg(any(target_os = "linux", test))]
 fn render_direct_resolv_conf(search: &[String], fallback: Option<Ipv4Addr>) -> String {
     render_direct_resolv_conf_with(resolver_addr(), search, fallback)
 }
 
 /// The body of [`render_direct_resolv_conf`], with the resolver address passed
 /// in so the rendering is testable without the process-wide mode.
+#[cfg(any(target_os = "linux", test))]
 fn render_direct_resolv_conf_with(
     resolver: IpAddr,
     search: &[String],
@@ -1027,9 +1065,11 @@ fn render_direct_resolv_conf_with(
 
 #[cfg(target_os = "linux")]
 const BACKUP_SUFFIX: &str = ".before-rayfish";
+#[cfg(any(target_os = "linux", test))]
 const HEADER_COMMENT: &str = "# Added by rayfish - do not edit\n";
 
 /// True iff `/etc/resolv.conf` contents are ours (carry the rayfish marker).
+#[cfg(any(target_os = "linux", test))]
 fn resolv_conf_is_ours(contents: &str) -> bool {
     contents.contains(HEADER_COMMENT.trim_end())
 }
@@ -1142,6 +1182,7 @@ const NM_CONF_DIR: &str = "/etc/NetworkManager/conf.d";
 const NM_DROPIN: &str = "/etc/NetworkManager/conf.d/rayfish-dns.conf";
 
 /// The `dns=none` drop-in that tells NetworkManager to stop managing resolv.conf.
+#[cfg(any(target_os = "linux", test))]
 fn nm_dns_none_dropin() -> String {
     format!("{HEADER_COMMENT}[main]\ndns=none\n")
 }
@@ -1358,6 +1399,7 @@ struct DirectResolvConf {
 /// A nameserver inside `100.64.0.0/10` that is not ours is the signal: nothing
 /// in that range is a real resolver, so it can only be another overlay's magic
 /// DNS. Deliberately not a check for any particular vendor's marker line.
+#[cfg(any(target_os = "linux", test))]
 fn foreign_mesh_resolver(contents: &str) -> Option<Ipv4Addr> {
     if resolv_conf_is_ours(contents) {
         return None;

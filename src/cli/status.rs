@@ -428,7 +428,7 @@ fn print_network(net: &ipc::NetworkStatus, ipv6_only: bool) {
     };
     let up_w = counter_width(|c| c.bytes_tx);
     let down_w = counter_width(|c| c.bytes_rx);
-    let rows = grouped_peer_rows(net, &alias_by_identity, up_w, down_w);
+    let rows = grouped_peer_rows(net, &alias_by_identity, up_w, down_w, ipv6_only);
     if rows.is_empty() {
         println!("    {}", style::faint("(no other members)"));
     } else {
@@ -468,6 +468,7 @@ fn grouped_peer_rows(
     alias_by_identity: &HashMap<&str, &str>,
     up_w: usize,
     down_w: usize,
+    ipv6_only: bool,
 ) -> Vec<Vec<layout::Cell>> {
     let mut rows = Vec::new();
     let mut emitted: std::collections::HashSet<EndpointId> = std::collections::HashSet::new();
@@ -491,6 +492,7 @@ fn grouped_peer_rows(
                 "",
                 up_w,
                 down_w,
+                ipv6_only,
             ));
             continue;
         }
@@ -522,6 +524,7 @@ fn grouped_peer_rows(
                     "",
                     up_w,
                     down_w,
+                    ipv6_only,
                 ));
                 for (i, d) in secondaries.iter().enumerate() {
                     let branch = if i + 1 == secondaries.len() {
@@ -529,7 +532,7 @@ fn grouped_peer_rows(
                     } else {
                         "   ├─ "
                     };
-                    rows.push(device_row(d, None, branch, up_w, down_w));
+                    rows.push(device_row(d, None, branch, up_w, down_w, ipv6_only));
                 }
             }
             // The primary is not visible here (e.g. it is us, filtered out of our
@@ -543,7 +546,7 @@ fn grouped_peer_rows(
                     } else {
                         "   ├─ "
                     };
-                    rows.push(device_row(d, None, branch, up_w, down_w));
+                    rows.push(device_row(d, None, branch, up_w, down_w, ipv6_only));
                 }
             }
         }
@@ -636,8 +639,17 @@ fn device_row(
     prefix: &str,
     up_w: usize,
     down_w: usize,
+    ipv6_only: bool,
 ) -> Vec<layout::Cell> {
-    let base = peer.hostname.clone().unwrap_or_else(|| peer.ip.to_string());
+    // The address column carries whatever this node can actually reach the peer
+    // on, matching the network header: in IPv6-only mode the peer's mesh IPv4 is
+    // an address nothing here can send to, and it is the column people copy into
+    // `ssh` and `ping`. Wider rows are the price; a wrong address is not.
+    let addr = match (ipv6_only, peer.ipv6) {
+        (true, Some(v6)) => v6.to_string(),
+        _ => peer.ip.to_string(),
+    };
+    let base = peer.hostname.clone().unwrap_or_else(|| addr.clone());
     let host = match alias {
         Some(a) => format!("{base} [{a}]"),
         None => base,
@@ -660,7 +672,7 @@ fn device_row(
         format!("{prefix}{glyph_plain} {host}"),
         format!("{prefix}{glyph_styled} {}", host_style(&host)),
     );
-    let ip = layout::Cell::new(peer.ip.to_string(), style::faint(&peer.ip.to_string()));
+    let ip = layout::Cell::new(addr.clone(), style::faint(&addr));
     let mut cells = match &peer.connection {
         Some(ci) => {
             let via = match ci.conn_type {
@@ -946,7 +958,11 @@ mod grouping_tests {
     }
 
     fn render(net: &ipc::NetworkStatus) -> String {
-        layout::columns(&grouped_peer_rows(net, &HashMap::new(), 0, 0), 3)
+        render_in(net, false)
+    }
+
+    fn render_in(net: &ipc::NetworkStatus, ipv6_only: bool) -> String {
+        layout::columns(&grouped_peer_rows(net, &HashMap::new(), 0, 0, ipv6_only), 3)
     }
 
     #[test]
@@ -972,6 +988,33 @@ mod grouping_tests {
         assert!(at("phone") < at("tablet"));
         // Standalone member still renders flat.
         assert!(out.contains("server"));
+    }
+
+    /// The address column has to be one this node can send to. In IPv6-only mode
+    /// the peer's mesh IPv4 is not routed here (another VPN owns the range), so
+    /// printing it would hand out an address that goes nowhere, and this column
+    /// is what people copy into `ssh`.
+    #[test]
+    fn peer_rows_carry_the_reachable_address() {
+        let mut p = peer("dev", None, false, true, false);
+        p.ipv6 = Some("200::9".parse().unwrap());
+        let net = net("dario", vec![p]);
+
+        let dual = render_in(&net, false);
+        assert!(dual.contains("100.64.0.2"), "{dual}");
+        assert!(!dual.contains("200::9"), "{dual}");
+
+        let v6_only = render_in(&net, true);
+        assert!(v6_only.contains("200::9"), "{v6_only}");
+        assert!(!v6_only.contains("100.64.0.2"), "{v6_only}");
+    }
+
+    /// A peer whose roster entry predates the v6 address still has to render:
+    /// falling back to its mesh IPv4 beats an empty column.
+    #[test]
+    fn peer_without_ipv6_falls_back_to_its_ipv4() {
+        let net = net("dario", vec![peer("dev", None, false, true, false)]);
+        assert!(render_in(&net, true).contains("100.64.0.2"));
     }
 
     #[test]
