@@ -48,6 +48,10 @@ pub(crate) fn cmd_gui(port: u16, no_open: bool) -> Result<()> {
         let exe = exe.clone();
         match stream {
             Ok(stream) => {
+                // Loopback, so Nagle costs far less here than it does on the
+                // mesh, but this serves small request/response HTTP the same
+                // way and there is no reason to wait on a coalescing timer.
+                let _ = stream.set_nodelay(true);
                 std::thread::spawn(move || {
                     if let Err(err) = handle_client(stream, &token, &exe) {
                         eprintln!("gui request failed: {err:#}");

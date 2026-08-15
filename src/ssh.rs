@@ -270,6 +270,7 @@ impl SshServer {
                                     Ok(p) => p,
                                     Err(e) => { debug!(error = %e, "mesh SSH accept failed"); continue; }
                                 };
+                                disable_nagle(&stream);
                                 let config = config.clone();
                                 let peers = peers.clone();
                                 let dum = dum.clone();
@@ -307,6 +308,26 @@ fn bind_listener(ip: IpAddr, port: u16) -> Result<TcpListener> {
     sock.listen(128)?;
     let std_listener: std::net::TcpListener = sock.into();
     Ok(TcpListener::from_std(std_listener)?)
+}
+
+/// Turn off Nagle on an SSH-carrying socket.
+///
+/// SSH is a request/response protocol made of small writes. Nagle holds a small
+/// write back waiting for more data to coalesce, while the peer's delayed ACK
+/// holds the acknowledgement back waiting for a reply to piggyback on, and the
+/// two wait for each other until a timer breaks the tie. That costs a stall per
+/// exchange: opening a session channel over a 34 ms mesh link measured 117 ms
+/// with Nagle on against 84 ms for OpenSSH over a slower transport, and ansible,
+/// which opens one channel per task, paid it once per task.
+///
+/// russh has a `nodelay` config flag, but it only applies it inside its own
+/// accept loop (`run_on_socket`), and we do our own accept and hand the stream
+/// to `run_stream`. So it has to be set here, on every socket carrying SSH:
+/// the session itself and both directions of port forwarding.
+fn disable_nagle(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        debug!(error = %e, "mesh SSH: could not set TCP_NODELAY");
+    }
 }
 
 /// Resolve the connecting peer, decide authorization, and run the SSH session.
@@ -731,6 +752,7 @@ impl Handler for SshHandler {
                     return;
                 }
             };
+            disable_nagle(&upstream);
             debug!(peer = %peer.fmt_short(), %target, "mesh SSH: forwarding to");
             splice(channel, handle, upstream).await;
         });
@@ -833,6 +855,7 @@ impl Handler for SshHandler {
                         }
                     },
                 };
+                disable_nagle(&sock);
                 let handle = handle.clone();
                 let advertised = advertised.clone();
                 tokio::spawn(async move {
