@@ -11,8 +11,9 @@
 use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
 #[cfg(not(target_os = "android"))]
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv6Addr;
 #[cfg(not(target_os = "android"))]
 use std::process::Command;
 #[cfg(not(target_os = "android"))]
@@ -96,20 +97,19 @@ pub struct TunWriter {
     dev: Arc<AsyncDevice>,
 }
 
-#[cfg(not(target_os = "android"))]
 fn is_cgnat(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     octets[0] == 100 && (octets[1] & 0xC0) == 64
 }
 
 /// Error for a host that already has another VPN sitting on the CGNAT range.
-#[cfg(not(target_os = "android"))]
+///
+/// States the finding and nothing else: the caller decides what it means (start
+/// IPv6-only, or refuse) and appends the advice that goes with that outcome.
 fn cgnat_conflict(iface: &str, ip: Ipv4Addr) -> anyhow::Error {
     anyhow::anyhow!(
         "interface {iface} already has CGNAT address {ip}: another VPN \
-         (e.g. Tailscale) is using the 100.64.0.0/10 range. Disable it before \
-         starting rayfish, or run the IPv6-only data plane alongside it with \
-         `ray config set ipv6-only on`."
+         (e.g. Tailscale) is using the 100.64.0.0/10 range."
     )
 }
 
@@ -200,6 +200,90 @@ pub async fn check_cgnat_conflict() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Android counterpart of the desktop scan, over `getifaddrs` (bionic, API 24+):
+/// netlink dumps and `/proc/net` are not something an app can rely on there,
+/// and there is no `ifconfig` to shell out to.
+///
+/// `own` is this node's own mesh IPv4, skipped if present. The desktop scan runs
+/// before the TUN exists so it cannot meet its own address; here the packet
+/// interface is a `VpnService` fd that may well be up already when the node is
+/// rebuilt, and mistaking our own address for another VPN's would latch the mode
+/// on permanently.
+///
+/// The case this catches is not a peer VPN (Android runs one at a time) but a
+/// carrier handing the phone a `100.64.x.x` address of its own, which the tunnel
+/// would otherwise swallow whole.
+#[cfg(target_os = "android")]
+pub async fn check_cgnat_conflict(own: Option<Ipv4Addr>) -> Result<()> {
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` writes a list head into `ifap` and returns 0 on
+    // success; the list is freed below on every path out.
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        // No list means nothing to compare against. Treating this as "no
+        // conflict" keeps a restricted device starting in the normal mode
+        // rather than failing, which is the same call the desktop scan makes
+        // when it cannot read the addresses.
+        tracing::debug!("getifaddrs failed; assuming no CGNAT conflict");
+        return Ok(());
+    }
+    let addrs = collect_ipv4_addrs(ifap);
+    // SAFETY: `ifap` came from a successful `getifaddrs` and is freed once.
+    unsafe { libc::freeifaddrs(ifap) };
+
+    match find_cgnat_conflict(&addrs, own) {
+        Some((iface, ip)) => Err(cgnat_conflict(&iface, ip)),
+        None => Ok(()),
+    }
+}
+
+/// Walk the `getifaddrs` list into owned `(interface, address)` pairs, so the
+/// filtering below is ordinary safe code that can be tested on a made-up list.
+#[cfg(target_os = "android")]
+fn collect_ipv4_addrs(ifap: *mut libc::ifaddrs) -> Vec<(String, Ipv4Addr)> {
+    let mut out = Vec::new();
+    let mut cur = ifap;
+    // SAFETY: walking a `getifaddrs` list; every pointer is checked for null
+    // before it is read, and the list outlives this walk (freed by the caller).
+    unsafe {
+        while !cur.is_null() {
+            let entry = &*cur;
+            cur = entry.ifa_next;
+            if entry.ifa_addr.is_null() {
+                continue;
+            }
+            let sa = &*entry.ifa_addr;
+            if i32::from(sa.sa_family) != libc::AF_INET {
+                continue;
+            }
+            let sin = &*(entry.ifa_addr as *const libc::sockaddr_in);
+            let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+            let name = if entry.ifa_name.is_null() {
+                String::from("unknown")
+            } else {
+                std::ffi::CStr::from_ptr(entry.ifa_name)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            out.push((name, ip));
+        }
+    }
+    out
+}
+
+/// The first address in `100.64.0.0/10` that is not ours, if any. Split from
+/// the `getifaddrs` walk (and compiled everywhere) so the rule that decides a
+/// conflict is testable off Android.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn find_cgnat_conflict(
+    addrs: &[(String, Ipv4Addr)],
+    own: Option<Ipv4Addr>,
+) -> Option<(String, Ipv4Addr)> {
+    addrs
+        .iter()
+        .find(|(_, ip)| is_cgnat(*ip) && Some(*ip) != own)
+        .cloned()
 }
 
 /// Creates a TUN device with the given virtual IPs and shares it between
@@ -594,5 +678,57 @@ impl TunWrite for TunWriter {
     async fn write_packet(&mut self, packet: &[u8]) -> anyhow::Result<()> {
         self.dev.send(packet).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_cgnat_conflict, is_cgnat};
+    use std::net::Ipv4Addr;
+
+    fn addrs() -> Vec<(String, Ipv4Addr)> {
+        vec![
+            ("lo".into(), Ipv4Addr::new(127, 0, 0, 1)),
+            ("wlan0".into(), Ipv4Addr::new(192, 168, 1, 20)),
+            // What a carrier hands a phone on mobile data.
+            ("rmnet_data0".into(), Ipv4Addr::new(100, 79, 3, 4)),
+        ]
+    }
+
+    #[test]
+    fn cgnat_range_is_the_whole_slash_ten() {
+        assert!(is_cgnat(Ipv4Addr::new(100, 64, 0, 0)));
+        assert!(is_cgnat(Ipv4Addr::new(100, 127, 255, 255)));
+        // Either side of it: 100.63.x and 100.128.x are ordinary public space.
+        assert!(!is_cgnat(Ipv4Addr::new(100, 63, 255, 255)));
+        assert!(!is_cgnat(Ipv4Addr::new(100, 128, 0, 0)));
+    }
+
+    #[test]
+    fn a_carrier_cgnat_address_is_a_conflict() {
+        let found = find_cgnat_conflict(&addrs(), None).expect("carrier address should be found");
+        assert_eq!(found.0, "rmnet_data0");
+        assert_eq!(found.1, Ipv4Addr::new(100, 79, 3, 4));
+    }
+
+    /// The Android-only case: our own `VpnService` interface is up when the node
+    /// is rebuilt, and finding our own mesh IPv4 must not read as another VPN,
+    /// or the mode would latch on and never come back off.
+    #[test]
+    fn our_own_mesh_address_is_not_a_conflict() {
+        let mut list = addrs();
+        list.pop();
+        let own = Ipv4Addr::new(100, 119, 146, 219);
+        list.push(("tun0".into(), own));
+
+        assert_eq!(find_cgnat_conflict(&list, Some(own)), None);
+        // Someone else's, on the same interface list, still is.
+        assert!(find_cgnat_conflict(&list, Some(Ipv4Addr::new(100, 64, 9, 9))).is_some());
+    }
+
+    #[test]
+    fn a_host_with_no_cgnat_address_is_clean() {
+        let list = vec![("wlan0".to_string(), Ipv4Addr::new(192, 168, 1, 20))];
+        assert_eq!(find_cgnat_conflict(&list, None), None);
     }
 }

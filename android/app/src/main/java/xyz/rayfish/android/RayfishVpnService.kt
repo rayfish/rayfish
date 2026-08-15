@@ -346,10 +346,17 @@ class RayfishVpnService : VpnService() {
         // still establishes.
         val tunnelAddr = meshIp.ifBlank { "100.64.0.2" }
 
-        // The node was built in this mode (NodeHolder.ensureStarted passed it to
-        // Node.start), so the tunnel has to be built to match: mesh IPv6 only,
-        // with the 100.64.0.0/10 range left to whoever else is using it.
-        val ipv6Only = NodeHolder.isIpv6Only(applicationContext)
+        // The tunnel has to be built to match the mode the node was built in:
+        // mesh IPv6 only, with the 100.64.0.0/10 range left to whoever else is
+        // using it. Asked of the node rather than read back out of the pref,
+        // because on Auto the pref does not know the answer: the core decided it
+        // at start from the addresses on this device.
+        val ipv6Only = try {
+            NodeHolder.get(applicationContext).status().ipv6Only
+        } catch (t: Throwable) {
+            Log.e(TAG, "could not read the node's IPv6-only mode; assuming dual-stack", t)
+            false
+        }
         if (ipv6Only && meshV6.isBlank()) {
             // Nothing to carry traffic: the v4 address is a handle only in this
             // mode, and it is the v6 address the route and the resolver hang off.

@@ -85,7 +85,7 @@ use crate::transport;
 // The desktop TUN device and its CGNAT pre-flight check don't exist on Android,
 // where the packet interface is a `VpnService` fd supplied from Kotlin.
 #[cfg(not(target_os = "android"))]
-use crate::tun::{self, check_cgnat_conflict};
+use crate::tun;
 use ray_proto::SuggestedFirewall;
 use smol_str::SmolStr;
 
@@ -102,7 +102,10 @@ pub(crate) use mesh::*;
 // `run_daemon` (the `ray daemon` entry point) stays public for the binary.
 pub use mesh::run_daemon;
 // `build_headless` is the embedder (mobile) construction entry point.
-pub use mesh::build_headless;
+pub use mesh::{build_headless, build_headless_with_setting};
+// The IPv6-only decision, resolved from a tri-state setting plus a scan of this
+// host. Public because the embedder (mobile) holds its own copy of the setting.
+pub use mesh::resolve_ipv6_only;
 
 /// Legacy name for [`Daemon`], kept so embedders (`ray-mobile`) that were
 /// written against `DaemonState` compile unchanged after the daemon refactor.
@@ -484,6 +487,10 @@ pub struct Daemon {
     /// the TUN's addressing is decided there; `ray up --ipv6-only` persists the
     /// setting and asks for a restart rather than pretending to apply it live.
     pub(crate) ipv6_only: bool,
+    /// Whether [`Self::ipv6_only`] was decided by the startup scan finding
+    /// another VPN on `100.64.0.0/10`, rather than configured. Reported by
+    /// `ray status` so a mode nobody asked for still explains itself.
+    pub(crate) ipv6_only_auto: bool,
     /// Name of the OS TUN device (desktop) or a placeholder until a packet
     /// interface is attached. Interior-mutable because on embedders (mobile) the
     /// interface is attached after construction via [`Daemon::attach_tun`],

@@ -138,6 +138,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
             mdns_enabled,
             auto_update,
             ipv6_only,
+            ipv6_only_auto,
             active,
             contact_id,
             daemon_version,
@@ -166,6 +167,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                         .collect::<Vec<_>>(),
                     "auto_update": auto_update,
                     "ipv6_only": ipv6_only,
+                    "ipv6_only_auto": ipv6_only_auto,
                     "active": active,
                     "contact_id": contact_id,
                     "daemon_version": daemon_version,
@@ -206,8 +208,15 @@ pub(crate) async fn ipc_status() -> Result<()> {
             };
             // Same treatment for IPv6-only: off is the default, so only say
             // something when the data plane is actually running without IPv4.
+            // `(auto)` marks a mode the daemon chose on finding another VPN on
+            // `100.64.0.0/10`, which nobody would otherwise know to expect.
             let v6only = if ipv6_only {
-                format!("      {} {}", style::label("ipv6-only"), style::green("on"))
+                let how = if ipv6_only_auto {
+                    format!("{} {}", style::green("on"), style::faint("(auto)"))
+                } else {
+                    style::green("on").to_string()
+                };
+                format!("      {} {how}", style::label("ipv6-only"))
             } else {
                 String::new()
             };

@@ -367,7 +367,9 @@ pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) ->
         // return to the default. `--replace` is meaningless here and ignored.
         "auto-update" => cfg.auto_update = parse_bool_setting(value, false)?,
         "on-demand" => cfg.on_demand = parse_bool_setting(value, true)?,
-        "ipv6-only" => cfg.ipv6_only = parse_bool_setting(value, false)?,
+        // The one tri-state: `auto` (and `unset`, which means the same) leaves
+        // the decision to the startup scan.
+        "ipv6-only" => cfg.ipv6_only = parse_auto_bool_setting(value)?,
         other => anyhow::bail!("unknown config key: {other} ({CONFIG_KEYS})"),
     }
     Ok(())
@@ -385,6 +387,22 @@ fn parse_bool_setting(value: &str, default: bool) -> Result<bool> {
         "on" | "true" | "yes" | "1" => Ok(true),
         "off" | "false" | "no" | "0" => Ok(false),
         other => anyhow::bail!("'{other}' is not a valid on/off value (use 'on' or 'off')"),
+    }
+}
+
+/// Parse an on/off/auto config value. `auto` and an empty value (from `config
+/// unset`) both mean "no stored preference": the daemon decides at startup.
+fn parse_auto_bool_setting(value: &str) -> Result<Option<bool>> {
+    let v = value.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    match v.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(Some(true)),
+        "off" | "false" | "no" | "0" => Ok(Some(false)),
+        other => {
+            anyhow::bail!("'{other}' is not a valid on/off/auto value (use 'on', 'off' or 'auto')")
+        }
     }
 }
 
@@ -408,7 +426,10 @@ pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, Str
             "dns-upstreams" => render_override(&cfg.dns_upstreams),
             "auto-update" => on_off(cfg.auto_update),
             "on-demand" => on_off(cfg.on_demand),
-            "ipv6-only" => on_off(cfg.ipv6_only),
+            "ipv6-only" => match cfg.ipv6_only {
+                Some(v) => on_off(v),
+                None => "auto".to_string(),
+            },
             other => anyhow::bail!("unknown config key: {other} ({CONFIG_KEYS})"),
         };
         Ok((k.to_string(), v))
@@ -481,8 +502,15 @@ pub struct AppConfig {
     /// still this node's internal handle: peer table, roster, and `ray status`
     /// all key on it. Read once at daemon start (the TUN is built there), so a
     /// change needs a restart.
-    #[serde(default)]
-    pub ipv6_only: bool,
+    ///
+    /// Three states, because "off" has to be sayable: `Some(true)` on,
+    /// `Some(false)` off, and `None` (the key absent, the default) auto, which
+    /// starts the daemon in this mode when the startup scan finds another VPN
+    /// already on `100.64.0.0/10`. An auto decision is never written back, so
+    /// the mode follows the host and stops when the other VPN does; `Some(false)`
+    /// is a standing instruction to refuse to start on such a host instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_only: Option<bool>,
     /// Seconds of no traffic before an on-demand node closes a peer connection.
     /// `None` uses [`DEFAULT_IDLE_TIMEOUT_SECS`]. Only consulted when `on_demand`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -541,7 +569,7 @@ impl Default for AppConfig {
             dns_upstreams: ServerOverride::default(),
             ssh_enabled: false,
             on_demand: true,
-            ipv6_only: false,
+            ipv6_only: None,
             idle_timeout_secs: None,
             auto_update: false,
             auto_update_last_target: None,
@@ -642,8 +670,8 @@ struct Settings {
     ssh_enabled: bool,
     #[serde(default = "default_true")]
     on_demand: bool,
-    #[serde(default)]
-    ipv6_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ipv6_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     idle_timeout_secs: Option<u64>,
     #[serde(default)]
@@ -724,7 +752,8 @@ fn config_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
 ///
 /// Platform defaults: Linux `/etc/rayfish` (system service location,
 /// root:rayfish), FreeBSD `/usr/local/etc/rayfish`, macOS the daemon's
-/// `~/.config/rayfish` (root-only under `/var/root`), Android the app's
+/// `~/Library/Application Support/rayfish` (root-only, and under launchd that
+/// home is `/var/root`, not the home of whoever ran `sudo`), Android the app's
 /// `Context.getFilesDir()` (passed by `ray-mobile`'s `Node::new` through this
 /// same var).
 pub fn config_dir() -> Result<PathBuf> {
@@ -1732,11 +1761,9 @@ name = "test"
     #[test]
     fn config_set_toggles_round_trip() {
         let mut cfg = AppConfig::default();
-        for (key, default) in [
-            ("ipv6-only", false),
-            ("auto-update", false),
-            ("on-demand", true),
-        ] {
+        // `ipv6-only` is the tri-state and has its own test below: `unset` puts
+        // it back to `auto`, not to an on/off default.
+        for (key, default) in [("auto-update", false), ("on-demand", true)] {
             assert!(
                 CONFIG_KEY_NAMES.contains(&key),
                 "{key} missing from the list"
@@ -1751,7 +1778,6 @@ name = "test"
             assert_eq!(config_get(&cfg, Some(key)).unwrap()[0].1, want);
             assert!(config_set(&mut cfg, key, "maybe", false).is_err());
         }
-        assert!(!cfg.ipv6_only);
         // Every listed key renders, so `config get` with no key cannot panic or
         // silently drop one.
         assert_eq!(
@@ -1768,7 +1794,58 @@ name = "test"
         let mut cfg = AppConfig::default();
         config_set(&mut cfg, "ipv6-only", "on", false).unwrap();
         save_settings_in(dir.path(), &cfg).unwrap();
-        assert!(load_in(dir.path()).unwrap().ipv6_only);
+        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Some(true));
+    }
+
+    /// The tri-state: `on`/`off` are stored choices, `auto` (and `unset`, which
+    /// means the same) stores nothing, so the daemon decides at startup.
+    #[test]
+    fn ipv6_only_is_on_off_or_auto() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.ipv6_only, None, "auto is the default");
+        assert_eq!(config_get(&cfg, Some("ipv6-only")).unwrap()[0].1, "auto");
+
+        for (input, want, rendered) in [
+            ("on", Some(true), "on"),
+            ("off", Some(false), "off"),
+            ("auto", None, "auto"),
+            ("on", Some(true), "on"),
+            // `config unset` sends an empty value, which is also auto.
+            ("", None, "auto"),
+        ] {
+            config_set(&mut cfg, "ipv6-only", input, false).unwrap();
+            assert_eq!(cfg.ipv6_only, want, "set ipv6-only {input:?}");
+            assert_eq!(config_get(&cfg, Some("ipv6-only")).unwrap()[0].1, rendered);
+        }
+
+        assert!(config_set(&mut cfg, "ipv6-only", "maybe", false).is_err());
+    }
+
+    /// `auto` is the absence of the key, so it must not be written: an older
+    /// daemon reading the file would reject a non-boolean value, and a written
+    /// `false` would silently mean "refuse to start next to another VPN".
+    #[test]
+    fn auto_ipv6_only_is_not_written_to_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        config_set(&mut cfg, "ipv6-only", "auto", false).unwrap();
+        save_settings_in(dir.path(), &cfg).unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(!raw.contains("ipv6_only"), "auto wrote a value: {raw}");
+        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, None);
+    }
+
+    /// A settings.toml written before the tri-state names a bare boolean, and it
+    /// still has to mean what it meant then.
+    #[test]
+    fn a_stored_boolean_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SETTINGS_FILE), "ipv6_only = true\n").unwrap();
+        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Some(true));
+
+        std::fs::write(dir.path().join(SETTINGS_FILE), "ipv6_only = false\n").unwrap();
+        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Some(false));
     }
 
     #[test]

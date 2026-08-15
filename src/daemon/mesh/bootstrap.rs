@@ -23,15 +23,23 @@ use super::super::*;
 const BLOB_GC_INTERVAL: Duration = Duration::from_secs(600);
 
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
-    // Bail early on a CGNAT clash (e.g. Tailscale) before touching anything.
-    // IPv6-only mode is the supported way to share a host with such a VPN, so
-    // it skips the check. Read straight from disk: the config this comes from is
-    // loaded again inside `build_daemon` below, and moving the check after that
-    // would give up the early bail.
+    // Settle the data plane's address families before touching anything else: on
+    // a host that shares `100.64.0.0/10` with another VPN this either switches us
+    // to IPv6-only or refuses to start, and both have to happen before the TUN
+    // exists. Read straight from disk; `build_daemon` loads the config again, but
+    // moving the scan after it would give up the early bail.
     #[cfg(not(target_os = "android"))]
-    if !crate::config::load().map(|c| c.ipv6_only).unwrap_or(false) {
-        check_cgnat_conflict().await?;
-    }
+    let overrides = {
+        let setting = crate::config::load().map(|c| c.ipv6_only).unwrap_or(None);
+        let (ipv6_only, auto) = super::resolve_ipv6_only(setting).await?;
+        Overrides {
+            ipv6_only: Some(ipv6_only),
+            ipv6_only_auto: auto,
+            ..Overrides::default()
+        }
+    };
+    #[cfg(target_os = "android")]
+    let overrides = Overrides::default();
 
     // Repair a leftover `/etc/resolv.conf` before anything reads it. A hard kill
     // or reboot leaves ours in place (nameserver = our own Magic DNS), and the
@@ -47,7 +55,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // identical construction.
     // Desktop honors the persisted `on_demand` config (default off); the mobile
     // embedder forces it on via `build_headless`.
-    let daemon = build_daemon(token.clone(), stats, Overrides::default()).await?;
+    let daemon = build_daemon(token.clone(), stats, overrides).await?;
 
     // Attach the real OS TUN device: create it, record its name, and spawn the
     // writer + `run_mesh` forwarding loop. On Android the packet interface is a
@@ -140,6 +148,10 @@ struct Overrides {
     /// setting it replaces: the TUN's addressing is fixed when the interface is
     /// created, so a change only lands on the next build.
     ipv6_only: Option<bool>,
+    /// Whether that value was decided by the startup scan rather than
+    /// configured. Reported by `ray status` so the mode is never mistaken for
+    /// something the operator set.
+    ipv6_only_auto: bool,
 }
 
 /// Construct a headless [`Daemon`] for an embedder (used by `ray-mobile`
@@ -147,12 +159,41 @@ struct Overrides {
 /// the OS TUN device and the Unix-socket IPC server: the caller supplies a
 /// packet interface via [`Daemon::attach_tun`]. The returned daemon is on
 /// standby (no data plane), with its saved networks' control plane connected.
+///
+/// `ipv6_only` is a decided value: this entry point never scans the host, so a
+/// caller that has already made the choice (and every test that builds a daemon)
+/// gets exactly the mode it asked for. Embedders holding a tri-state setting
+/// want [`build_headless_with_setting`] instead.
 pub async fn build_headless(on_demand: bool, ipv6_only: bool) -> Result<Arc<Daemon>> {
+    build_headless_inner(on_demand, ipv6_only, false).await
+}
+
+/// [`build_headless`] from a tri-state setting, matching the desktop config key:
+/// `Some(on/off)` is a choice the user made in the app's own settings store,
+/// `None` is "auto" and is resolved here against the addresses on the device,
+/// the same way `run_daemon` resolves the config's.
+///
+/// Errors when the caller said `Some(false)` on a device where mesh IPv4 cannot
+/// work, which is what that setting asks for.
+pub async fn build_headless_with_setting(
+    on_demand: bool,
+    ipv6_only: Option<bool>,
+) -> Result<Arc<Daemon>> {
+    let (ipv6_only, auto) = super::resolve_ipv6_only(ipv6_only).await?;
+    build_headless_inner(on_demand, ipv6_only, auto).await
+}
+
+async fn build_headless_inner(
+    on_demand: bool,
+    ipv6_only: bool,
+    ipv6_only_auto: bool,
+) -> Result<Arc<Daemon>> {
     let token = CancellationToken::new();
     let stats = Arc::new(ForwardMetrics::default());
     let overrides = Overrides {
         on_demand: Some(on_demand),
         ipv6_only: Some(ipv6_only),
+        ipv6_only_auto,
     };
     let daemon = build_daemon(token, stats, overrides).await?;
     // Bring the saved networks' control plane up, matching `run_daemon`.
@@ -232,7 +273,12 @@ async fn build_daemon_inner(
     // authority there); otherwise honor config. Resolved once, here, and used
     // everywhere below in place of the config field, so every consumer of the
     // mode agrees with the one the data plane actually runs in.
-    let ipv6_only = overrides.ipv6_only.unwrap_or(app_config.ipv6_only);
+    // An absent config value means "auto", which only `run_daemon` can resolve
+    // (it needs the interface scan), so it always passes an override; anything
+    // reaching here without one falls back to dual-stack.
+    let ipv6_only = overrides
+        .ipv6_only
+        .unwrap_or(app_config.ipv6_only.unwrap_or(false));
     // Tell the forwarding core whether mesh IPv4 carries traffic on this node.
     // Before any packet moves: the data plane is attached further down.
     forward::set_ipv6_only(ipv6_only);
@@ -686,6 +732,7 @@ async fn build_daemon_inner(
         mdns_enabled,
         auto_update,
         ipv6_only,
+        ipv6_only_auto: overrides.ipv6_only_auto,
         tun_name,
         tun_tasks: Mutex::new(None),
         exit_reconcile: tokio::sync::Mutex::new(()),

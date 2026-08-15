@@ -23,9 +23,9 @@ async fn ipv6_only_argument_overrides_config() {
     // Isolate identity/config/blobs from the system config dir.
     unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", tmp.path()) };
 
-    // A fresh config dir, so the on-disk setting is at its default: off. The
-    // argument below is the only thing asking for IPv6-only.
-    assert!(!rayfish::config::load().unwrap().ipv6_only);
+    // A fresh config dir, so the on-disk setting is at its default: auto, which
+    // stores nothing. The argument below is the only thing asking for IPv6-only.
+    assert_eq!(rayfish::config::load().unwrap().ipv6_only, None);
 
     // Bounded like the other headless-build tests: a startup regression should
     // fail fast rather than hang the suite.

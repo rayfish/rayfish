@@ -155,9 +155,11 @@ pub(crate) enum Command {
         /// when create/join don't specify one; doesn't rename existing networks
         #[arg(long)]
         hostname: Option<String>,
-        /// Run the data plane over IPv6 only, so another VPN (e.g. Tailscale)
-        /// can keep 100.64.0.0/10. Takes effect on the next daemon restart;
-        /// turn it back off with `ray config set ipv6-only off`
+        /// Always run the data plane over IPv6 only, so another VPN (e.g.
+        /// Tailscale) can keep 100.64.0.0/10. Only needed to make the mode
+        /// permanent: by default the daemon switches to it on its own when it
+        /// finds such a VPN. Takes effect on the next daemon restart; undo with
+        /// `ray config set ipv6-only auto` (or `off` to refuse to start instead)
         #[arg(long)]
         ipv6_only: bool,
     },
@@ -550,13 +552,14 @@ pub(crate) enum ConfigAction {
         #[arg(add = complete::settings_keys())]
         key: Option<String>,
     },
-    /// Set a key. List keys take a comma list of presets/URLs/IPs; auto-update,
-    /// on-demand and ipv6-only take on/off.
+    /// Set a key. List keys take a comma list of presets/URLs/IPs; auto-update
+    /// and on-demand take on/off; ipv6-only takes on/off/auto.
     Set {
         /// relay, discovery-dns, dns-upstreams, auto-update, on-demand, or ipv6-only
         #[arg(add = complete::settings_keys())]
         key: String,
-        /// A comma list of presets / URLs / IPv4s ("n0" or empty resets), or on/off
+        /// A comma list of presets / URLs / IPv4s ("n0" or empty resets), or
+        /// on/off (ipv6-only also takes auto)
         value: String,
         /// Replace the defaults instead of augmenting them (list keys only)
         #[arg(long)]

@@ -8,20 +8,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Run alongside Tailscale (or any VPN on `100.64.0.0/10`).** Both claim that
-  range, so until now one of the two lost its IPv4 half and the daemon refused
-  to start. `ray config set ipv6-only on` (or `ray up --ipv6-only`, then a
-  restart) runs the data plane over `200::/7` only, leaving the CGNAT range to
-  the other VPN. Everything keeps working over IPv6: peers, mesh SSH, file
-  transfer, and `.ray` names, which now answer AAAA only so nothing hands an app
-  an address that goes nowhere. Peers are told, too, so they stop handing out
+- **Run alongside Tailscale (or any VPN on `100.64.0.0/10`), without setting
+  anything up.** Both claim that range, so until now one of the two lost its
+  IPv4 half and the daemon refused to start. It now notices the other VPN at
+  startup and runs the data plane over `200::/7` only, leaving the CGNAT range
+  to it, saying so in the log and marking it `ipv6-only on (auto)` in
+  `ray status`. Everything keeps working over IPv6: peers, mesh SSH, file
+  transfer, and `.ray` names, which answer AAAA only so nothing hands an app an
+  address that goes nowhere. Peers are told, too, so they stop handing out
   yours. Exit nodes are the exception; `ray exit-node use` says so.
 
-- **IPv6-only mode on Android**, as a switch under **You**. The case there is
-  not another VPN (Android runs one at a time) but a carrier that hands the
-  phone a `100.64.x.x` address of its own, which the tunnel would otherwise
-  swallow whole. Turning it on reconnects: the tunnel's addressing is fixed when
-  it is built, so the node is rebuilt, and the VPN comes back if it was on.
+  The mode ends when the other VPN does, since nothing is written to your
+  config. To pin it either way: `ray config set ipv6-only on` keeps it on
+  regardless, and `off` restores the old behaviour of refusing to start on such
+  a host. `auto` (the default) hands the decision back to the daemon.
+
+- **IPv6-only mode on Android**, under **You**, as Auto / On / Off with Auto the
+  default. The case there is not another VPN (Android runs one at a time) but a
+  carrier that hands the phone a `100.64.x.x` address of its own, which the
+  tunnel would otherwise swallow whole. On Auto the app checks the device's own
+  addresses each time the node starts and switches only when it finds one, so
+  the mode follows the network you are on: the card says which way it went.
+  Changing it reconnects, because the tunnel's addressing is fixed when it is
+  built, so the node is rebuilt and the VPN comes back if it was on.
 
 - **Tab completion, already installed.** The installer and `sudo ray up` write
   completion scripts for bash, zsh and fish into the directories those shells

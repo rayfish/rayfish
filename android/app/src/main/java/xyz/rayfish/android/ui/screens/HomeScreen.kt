@@ -320,7 +320,11 @@ private fun formatSize(bytes: ULong): String {
 private fun HomePreview() {
     xyz.rayfish.android.ui.theme.RayfishTheme {
         HomeScreen(
-            status = Status(true, "7f3ac2e1", "100.88.0.3", "fd00::7f3a", emptyList(), emptyList(), emptyList()),
+            status = Status(
+                true, "7f3ac2e1", "100.88.0.3", "fd00::7f3a",
+                ipv6Only = false, ipv6OnlyAuto = false,
+                peers = emptyList(), networks = emptyList(), pendingNetworks = emptyList(),
+            ),
             starting = false, onToast = {},
         )
     }

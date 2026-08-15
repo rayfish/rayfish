@@ -441,6 +441,11 @@ pub enum IpcMessage {
         /// place of the IPv4 one.
         #[serde(default)]
         ipv6_only: bool,
+        /// Whether that mode was chosen by the daemon at startup (another VPN
+        /// holds `100.64.0.0/10`) rather than configured. Shown so the mode is
+        /// not mistaken for a setting. Defaulted for older daemons.
+        #[serde(default)]
+        ipv6_only_auto: bool,
         /// Whether the VPN is active (TUN up, networks connected) or on standby.
         active: bool,
         /// This node's contact id (`ray connect`), shown at the top of status.

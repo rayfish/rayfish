@@ -69,7 +69,7 @@ use android_tun::{AndroidTunReader, AndroidTunWriter};
 use rayfish::config;
 use rayfish::control;
 use rayfish::daemon::transfers;
-use rayfish::daemon::{DaemonState, build_headless};
+use rayfish::daemon::{DaemonState, build_headless_with_setting};
 use rayfish::deeplink::{self, RayfishLink};
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::hostname;
@@ -180,9 +180,41 @@ pub struct Status {
     pub node_id: String,
     pub ipv4: String,
     pub ipv6: String,
+    /// Whether the running node's data plane is IPv6-only.
+    pub ipv6_only: bool,
+    /// Whether that was decided for the user (something else on this device
+    /// already holds `100.64.0.0/10`) rather than chosen in the app. Lets the
+    /// screen say what `Auto` resolved to instead of leaving it a mystery.
+    pub ipv6_only_auto: bool,
     pub peers: Vec<PeerInfo>,
     pub networks: Vec<NetworkDetail>,
     pub pending_networks: Vec<String>,
+}
+
+/// The app's IPv6-only setting, mirroring the desktop `ipv6-only` config key.
+///
+/// Tri-state for the same reason: `Off` has to be sayable, or a phone could not
+/// opt out of being moved onto the mode by the scan.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ipv6OnlyMode {
+    /// Decide at start: IPv6-only when something else on the device already
+    /// holds a `100.64.x.x` address (a carrier, typically), dual-stack when not.
+    Auto,
+    /// Always IPv6-only.
+    On,
+    /// Never. Fails to start rather than run beside such an address.
+    Off,
+}
+
+impl Ipv6OnlyMode {
+    /// As the core's tri-state setting: `None` is auto.
+    fn setting(self) -> Option<bool> {
+        match self {
+            Ipv6OnlyMode::Auto => None,
+            Ipv6OnlyMode::On => Some(true),
+            Ipv6OnlyMode::Off => Some(false),
+        }
+    }
 }
 
 /// One network's liveness, for the health snapshot.
@@ -337,6 +369,9 @@ fn saved_networks_status() -> Status {
         node_id: String::new(),
         ipv4: String::new(),
         ipv6: String::new(),
+        // A stopped node has no data plane, so it is in no mode at all.
+        ipv6_only: false,
+        ipv6_only_auto: false,
         peers: Vec::new(),
         networks: Vec::new(),
         pending_networks: Vec::new(),
@@ -438,7 +473,14 @@ impl Node {
     /// it means stopping the node and starting a new one. The app's own settings
     /// store is the authority, not the core's `settings.toml`, which on Android
     /// lives in an app-private directory the user cannot reach.
-    pub fn start(&self, ipv6_only: bool) -> Result<(), RayError> {
+    ///
+    /// [`Ipv6OnlyMode::Auto`] hands the decision to the core, which looks at the
+    /// device's own addresses; the result is reported back through
+    /// [`Status::ipv6_only`] and [`Status::ipv6_only_auto`].
+    /// [`Ipv6OnlyMode::Off`] on a device that already has a `100.64.x.x` address
+    /// is an error rather than an override: it is an explicit instruction not to
+    /// run in the only mode that would work there.
+    pub fn start(&self, ipv6_only: Ipv6OnlyMode) -> Result<(), RayError> {
         // Fast path: already started. Check briefly, then release the lock.
         //
         // Note this ignores `ipv6_only` on an already-built daemon: a running
@@ -457,7 +499,13 @@ impl Node {
         // phone never came back online"). Failing is recoverable; wedging is not.
         let state = self
             .runtime
-            .block_on(async { timeout(START_TIMEOUT, build_headless(true, ipv6_only)).await })
+            .block_on(async {
+                timeout(
+                    START_TIMEOUT,
+                    build_headless_with_setting(true, ipv6_only.setting()),
+                )
+                .await
+            })
             .map_err(|_| {
                 tracing::error!(
                     timeout_secs = START_TIMEOUT.as_secs(),
@@ -1170,6 +1218,8 @@ impl Node {
             node_id: String::new(),
             ipv4: String::new(),
             ipv6: String::new(),
+            ipv6_only: false,
+            ipv6_only_auto: false,
             peers: Vec::new(),
             networks: Vec::new(),
             pending_networks: Vec::new(),
@@ -1185,6 +1235,8 @@ impl Node {
         let IpcMessage::StatusResponse {
             endpoint_id,
             active,
+            ipv6_only,
+            ipv6_only_auto,
             networks,
             pending_networks,
             ..
@@ -1253,6 +1305,8 @@ impl Node {
             node_id: endpoint_id.to_string(),
             ipv4,
             ipv6,
+            ipv6_only,
+            ipv6_only_auto,
             peers: flat_peers,
             networks: detail,
             pending_networks,

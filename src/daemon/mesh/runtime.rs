@@ -980,26 +980,34 @@ impl Daemon {
         // The TUN's addressing is fixed when the device is created at daemon
         // start, so this can only take effect on the next restart; say so
         // instead of reporting a mode the data plane is not actually in.
+        // Compared against the *stored setting*, not the running mode: on `auto`
+        // the daemon may already be IPv6-only because it found another VPN, and
+        // an explicit `--ipv6-only` still has to be written down or the mode
+        // would vanish along with that VPN.
         let restart_note = match ipv6_only {
-            Some(want) if want != self.ipv6_only => match config::load() {
-                Ok(mut app_config) => {
-                    app_config.ipv6_only = want;
+            Some(want) => match config::load() {
+                Ok(mut app_config) if app_config.ipv6_only != Some(want) => {
+                    app_config.ipv6_only = Some(want);
                     match config::save_settings(&app_config) {
-                        Ok(()) => Some(
+                        // Only a data plane that is not already in the requested
+                        // mode needs the restart.
+                        Ok(()) if want != self.ipv6_only => Some(
                             ". IPv6-only mode set; restart the daemon for changes to take effect.",
                         ),
+                        Ok(()) => None,
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to persist ipv6-only setting");
                             Some(". Failed to persist the IPv6-only setting, see the log.")
                         }
                     }
                 }
+                Ok(_) => None,
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to load config to set ipv6-only");
                     Some(". Failed to persist the IPv6-only setting, see the log.")
                 }
             },
-            _ => None,
+            None => None,
         };
         let restart_note = restart_note.unwrap_or("");
 

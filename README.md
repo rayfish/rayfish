@@ -503,10 +503,18 @@ take effect on `sudo ray restart`.
 Tailscale (and anything else built on CGNAT space) routes all of
 `100.64.0.0/10`, the same range rayfish derives its IPv4 from, so on a host
 running both, one of the two loses its IPv4 half. The IPv6 ranges don't overlap,
-so rayfish can step aside and use only its own:
+so rayfish steps aside and uses only its own.
+
+This needs no setup: the daemon looks for another VPN on that range at startup
+and switches itself, logging why and showing `ipv6-only on (auto)` in
+`ray status`. Nothing is written to your config, so the mode ends when the other
+VPN does. To decide it yourself:
 
 ```bash
-ray config set ipv6-only on && sudo ray restart   # or: sudo ray up --ipv6-only
+ray config set ipv6-only on    # always, even with no other VPN present
+ray config set ipv6-only off   # never; refuse to start on such a host instead
+ray config set ipv6-only auto  # the default: let the daemon decide at startup
+sudo ray restart               # the mode is fixed when the tunnel is built
 ```
 
 Peers, mesh SSH, file transfer, and `.ray` names all keep working over IPv6;
