@@ -299,6 +299,7 @@ async fn build_daemon_inner(
         use_tor,
         &app_config.relay,
         &app_config.discovery_dns,
+        &app_config.dns_upstreams,
     )
     .await?;
     *endpoint_out = Some(ep.clone());

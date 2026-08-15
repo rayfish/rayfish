@@ -468,7 +468,7 @@ mod macos {
     /// so a full-tunnel catch-all can forward non-`.ray` queries to them. Captured
     /// once, before we install our own config, so we never capture ourselves.
     /// `resolver #1` is macOS's primary (default) resolver; skip our magic IP.
-    fn capture_system_upstreams() -> Vec<std::net::Ipv4Addr> {
+    pub(super) fn capture_system_upstreams() -> Vec<std::net::Ipv4Addr> {
         let out = std::process::Command::new("scutil")
             .arg("--dns")
             .output()
@@ -1148,6 +1148,41 @@ fn parse_resolv_nameservers(contents: &str) -> Vec<Ipv4Addr> {
         .filter_map(|s| s.parse::<Ipv4Addr>().ok())
         .filter(|ip| *ip != crate::dns::MAGIC_DNS_V4)
         .collect()
+}
+
+/// The host's own DNS servers, read the way this platform stores them.
+///
+/// This is not the Magic DNS forwarder's upstream set (that one is captured by
+/// whichever backend takes DNS over, and only when one does). It answers a
+/// different question: which resolvers does the *daemon* use for its own names,
+/// the relay and the pkarr server. Called once, before the endpoint binds, so
+/// what it reads is the host's configuration rather than ours.
+///
+/// `None` on a platform where we have no way to read them (Android keeps its
+/// resolvers behind JNI, Windows behind the registry); the caller leaves such a
+/// host on iroh's own system-defaults reader. `Some(vec![])` is the different
+/// answer "we read the host's configuration and it holds nothing we can use",
+/// which is a host the daemon must still work on.
+pub(crate) fn system_nameservers() -> Option<Vec<Ipv4Addr>> {
+    #[cfg(target_os = "linux")]
+    let found = Some(parse_resolv_nameservers(
+        &std::fs::read_to_string("/etc/resolv.conf").ok()?,
+    ));
+    #[cfg(target_os = "macos")]
+    let found = Some(macos::capture_system_upstreams());
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let found: Option<Vec<Ipv4Addr>> = None;
+
+    // Nothing inside an overlay range is a resolver we can lean on: ours would
+    // ask itself, and another VPN's answers only for as long as that VPN is up.
+    // Both magic addresses live in those ranges, so this is also what keeps the
+    // daemon's own lookups off its own data plane.
+    Some(
+        found?
+            .into_iter()
+            .filter(|ip| !crate::membership::is_overlay_ip(IpAddr::V4(*ip)))
+            .collect(),
+    )
 }
 
 /// Render a direct-mode resolv.conf pointing at the magic resolver IP, with a

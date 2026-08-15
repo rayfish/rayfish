@@ -239,6 +239,21 @@ this build cannot be redeemed by a peer still on 0.2.x.
 
 ### Fixed
 
+- **A host whose own DNS is broken no longer takes Rayfish down with it.** The
+  daemon looked up the relay and the discovery server through whatever
+  `/etc/resolv.conf` named, so a machine whose nameserver had stopped answering
+  got no relay connection, no record publishing, and a `ray join` that failed
+  with a DNS error there was nothing to do about. It now keeps its own short
+  list of resolvers for those two names: your configured `dns_upstreams` first,
+  then the host's, then a public resolver as a last resort, so the node still
+  reaches the network while the host's DNS is down. Only Rayfish's own
+  infrastructure names go there, never anything from the mesh or from your
+  traffic, and `ray config set dns-upstreams <ip> --replace` pins it to servers
+  you name. This also settles a chicken-and-egg case: a daemon that started
+  while its own Magic DNS address was still listed in `resolv.conf` (after a
+  crash, or a restart before the file was restored) used to wait for the tunnel
+  it was trying to bring up.
+
 - **`.ray` names now resolve on macOS in IPv6-only mode.** `ssh dev.box.ray`
   failed with "nodename nor servname provided" on a Mac sharing the host with
   another VPN, while `dig` against the same resolver answered instantly: macOS
