@@ -100,7 +100,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **Magic DNS falls back to your normal DNS for any name the mesh doesn't
+- **`ray -h` groups its commands instead of listing all 44 in one run.** The
+  list is now broken into Networks, Members & access, Devices & links, Files,
+  Policy, Service, Diagnostics and Setup, so you can find the command you want
+  by looking in the obvious place rather than reading the whole page. Each
+  command is described in one line that fits an 80-column terminal, where
+  several used to be full paragraphs that wrapped; the detail they carried moved
+  to `ray help <command>`, which the foot of the page now points at.
+
+- **`--json` is only accepted by the commands that produce JSON.** It used to be
+  accepted everywhere and honoured by 16 commands, so `ray version --json` and
+  `ray up --json` printed their usual text and gave no hint that the flag did
+  nothing. Those now report an unknown argument, and `--json` is listed only in
+  the help of commands that support it. **This is a breaking change** if you
+  wrote the flag before the command: `ray --json status` no longer parses, and
+  becomes `ray status --json` (the form the docs already used, and the one the
+  error message suggests). Writing it after a subcommand's action, as in
+  `ray firewall show --json`, is unaffected.
   hold.** A network named `dev` used to be registered with the OS as its own
   domain, so every lookup under it, `zed.dev` included, was captured by rayfish
   and answered NXDOMAIN instead of going to the real internet. Rayfish now
