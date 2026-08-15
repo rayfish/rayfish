@@ -23,6 +23,7 @@ mod exit_node;
 mod files;
 mod firewall;
 mod gui;
+pub(crate) mod help;
 mod invite;
 mod network;
 mod open;
