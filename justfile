@@ -20,6 +20,18 @@ apk:
     cd android && ./gradlew :app:assembleDebug
     @echo "APK: android/app/build/outputs/apk/debug/app-debug.apk"
 
+# Compile the Android core for both APK ABIs without an NDK on this machine:
+# cross builds it in a container (see cross/Dockerfile.android). Catches the
+# `#[cfg(target_os = "android")]` code that no desktop build ever sees. `just
+# apk` is still what produces an installable APK.
+#
+# The target dir is separate on purpose: cross's Android images are old enough
+# (Ubuntu 16.04) that they cannot execute build scripts a modern host compiled,
+# and sharing `target/` would have each run rebuild what the other just cached.
+android-check:
+    CARGO_TARGET_DIR=target/android cross -q build -p ray-mobile --target aarch64-linux-android
+    CARGO_TARGET_DIR=target/android cross -q build -p ray-mobile --target x86_64-linux-android
+
 release:
     cargo -q build --release
 
