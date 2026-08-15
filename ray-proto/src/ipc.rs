@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
@@ -67,6 +68,20 @@ pub enum IpcMessage {
     /// return its path plus a pre-filled GitHub issue title/body. Open to any
     /// local user, like `Status`.
     Report,
+    /// Read the daemon's rolling log files. `since` keeps only lines newer than
+    /// that long ago (`None` = everything since the last daily rotation);
+    /// `follow` keeps the stream open and forwards new lines as they land.
+    ///
+    /// The only multi-frame reply in the protocol: the daemon answers with a
+    /// run of [`IpcMessage::LogChunk`]s, terminated by [`IpcMessage::Ok`] when
+    /// `follow` is false and never terminated when it is true (the client hangs
+    /// up instead). Open to any local user, like `Status`.
+    Logs {
+        #[serde(default)]
+        since: Option<Duration>,
+        #[serde(default)]
+        follow: bool,
+    },
     Shutdown,
     /// Activate the VPN: bring the TUN interface up, configure system DNS, and
     /// reconnect all saved networks. Handled by the already-running daemon, so
@@ -532,6 +547,13 @@ pub enum IpcMessage {
         /// reporting an empty LAN.
         mdns_enabled: bool,
     },
+    /// One piece of a streamed log response (reply to [`IpcMessage::Logs`]).
+    /// Raw bytes, not lines: the daemon splits on whatever boundary keeps a
+    /// frame under [`MAX_FRAME_LEN`], so a chunk is only meaningful when the
+    /// run is concatenated in order.
+    LogChunk {
+        data: Vec<u8>,
+    },
     /// A diagnostic bundle was written to `path` (a `.tgz`, owned by the caller).
     /// `issue_title`/`issue_body` pre-fill a GitHub issue; the user attaches the
     /// bundle file manually.
@@ -827,7 +849,18 @@ pub enum ConnType {
 /// Maximum IPC frame size (body). Matches the previous hand-rolled guard;
 /// `LengthDelimitedCodec` rejects anything larger so a malformed/hostile peer
 /// can't make us allocate an unbounded buffer.
-const MAX_FRAME_LEN: usize = 1_048_576;
+///
+/// Public because a multi-frame reply has to size its own frames against it:
+/// [`IpcMessage::LogChunk`] carries as much as fits and no more.
+pub const MAX_FRAME_LEN: usize = 1_048_576;
+
+/// How many log bytes one [`IpcMessage::LogChunk`] carries.
+///
+/// A quarter of [`MAX_FRAME_LEN`], not all of it: msgpack writes a `Vec<u8>`
+/// as an array of integers, and every byte over `0x7f` costs two, so the frame
+/// can be twice the payload plus the envelope. `test_log_chunk_fits_a_frame`
+/// pins the worst case.
+pub const LOG_CHUNK_BYTES: usize = MAX_FRAME_LEN / 4;
 
 /// A codec that frames msgpack-serialized `T`s using tokio's
 /// [`LengthDelimitedCodec`] (a 4-byte big-endian length prefix — the wire format
@@ -1249,6 +1282,43 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_logs_request_roundtrip() {
+        let req = IpcMessage::Logs {
+            since: Some(Duration::from_secs(9000)),
+            follow: true,
+        };
+        let bytes = rmp_serde::to_vec_named(&req).unwrap();
+        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded {
+            IpcMessage::Logs { since, follow } => {
+                assert_eq!(since, Some(Duration::from_secs(9000)));
+                assert!(follow);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// A `LogChunk` is a `Vec<u8>`, which msgpack writes as an array of ints:
+    /// a byte over 0x7f costs two. The daemon sizes chunks against
+    /// `MAX_FRAME_LEN` and so has to allow for that expansion, so pin the
+    /// worst case here — all-high bytes, a full chunk's worth — rather than
+    /// discovering it as a runtime "frame too large" on a log line with
+    /// non-ASCII in it.
+    #[test]
+    fn test_log_chunk_fits_a_frame() {
+        let chunk = IpcMessage::LogChunk {
+            data: vec![0xffu8; LOG_CHUNK_BYTES],
+        };
+        let mut buf = BytesMut::new();
+        MsgpackCodec::new().encode(chunk, &mut buf).unwrap();
+        assert!(
+            buf.len() <= MAX_FRAME_LEN,
+            "a full log chunk framed to {} bytes, over the {MAX_FRAME_LEN} cap",
+            buf.len()
+        );
     }
 
     #[test]

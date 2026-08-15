@@ -939,6 +939,28 @@ async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<Daemon>) -> Result<(
             return Ok(());
         }
     };
+    // `Logs` is the one request whose answer is a run of frames rather than a
+    // single message (a day of debug logs does not fit the frame cap, and
+    // `--follow` never ends), so it takes the stream instead of going through
+    // `handle_request`. Authorization is still the same check: it sits in the
+    // open read tier, alongside `Status` and `Report`.
+    if let IpcMessage::Logs { since, follow } = &req {
+        let (since, follow) = (*since, *follow);
+        let mut framed = ipc::framed(stream);
+        if let Some(denied) = Daemon::check_authorized(&req, peer_cred) {
+            let _ = ipc::send(&mut framed, denied).await;
+            return Ok(());
+        }
+        return super::diagnostics::stream_logs(
+            &crate::logdir::log_dir(),
+            &mut framed,
+            since,
+            follow,
+            &daemon.shutdown_token,
+        )
+        .await;
+    }
+
     let resp = daemon.handle_request(req, peer_cred, fds).await;
     let mut framed = ipc::framed(stream);
     ipc::send(&mut framed, resp).await?;

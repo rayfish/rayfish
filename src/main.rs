@@ -184,6 +184,19 @@ pub(crate) enum Command {
     ///
     /// Bundles the rolling log files and the forward metrics.
     Report,
+    /// Show the daemon's log output
+    ///
+    /// Reads the daemon's rolling log files over IPC, so no root is needed.
+    /// With no arguments, shows everything since the last daily rotation,
+    /// through `$PAGER` (`less`) when the output is a terminal.
+    Logs {
+        /// Only lines from the last <DUR> (e.g. 10m, 1h, 2h30m)
+        #[arg(long, value_name = "DUR")]
+        since: Option<String>,
+        /// Keep streaming new lines until Ctrl-C, like `tail -f`
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Run the daemon in the foreground (invoked by the system service)
     #[command(hide = true)]
     Daemon,
@@ -1311,6 +1324,7 @@ async fn run() -> Result<()> {
         Command::Ephemeral { network, arg } => ipc_ephemeral(&network, &arg).await,
         Command::Status { json: _ } => ipc_status().await,
         Command::Report => ipc_report().await,
+        Command::Logs { since, follow } => ipc_logs(since, follow).await,
         Command::Daemon => {
             check_root();
             install_panic_hook();

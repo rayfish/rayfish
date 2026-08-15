@@ -1,9 +1,12 @@
 //! Read-only diagnostics for `Daemon`: `status`, `build_report`, `ping`,
 //! `netcheck`, and connection-info helpers. Split out of `daemon/mod.rs`.
 
+use std::io::SeekFrom;
 use std::net::IpAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::super::*;
+use crate::ipc::{IpcFramed, LOG_CHUNK_BYTES};
 
 /// How recent a failed reach must be to render a peer `Offline` in `ray status`.
 /// Older failures decay back to `Idle` (the optimistic default) so a peer that was
@@ -603,5 +606,532 @@ impl Daemon {
             public_ipv6,
             udp,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `ray logs`: the streamed read of the daemon's own rolling log files
+// ---------------------------------------------------------------------------
+
+/// The appender's per-day filename prefix (`rayfish.log.2026-08-15`).
+const LOG_PREFIX: &str = "rayfish.log.";
+
+/// Width of the `YYYY-MM-DD` day a rolling file is named for, and of the day
+/// half of a timestamp.
+const DAY_LEN: usize = 10;
+
+/// Width of the fixed-layout RFC3339 UTC timestamp the appender writes at the
+/// head of every line: `2026-08-15T22:36:00.123456Z`.
+const TS_LEN: usize = 27;
+
+/// How often `--follow` looks for appended bytes. Polling the file the daemon
+/// writes itself needs no new plumbing, shows exactly what `ray report` would
+/// bundle, and picks the daily rotation up for free by re-resolving "today"
+/// each tick.
+const FOLLOW_POLL: Duration = Duration::from_millis(500);
+
+/// Answer an [`IpcMessage::Logs`] request on `framed`, reading the rolling
+/// files under `dir`.
+///
+/// The one multi-frame reply in the protocol, and it writes its own frames
+/// rather than returning a message: a day of `rayfish=debug` output is well
+/// over the 1 MiB frame cap, and `--follow` has no end at all. A one-shot read
+/// closes with an [`IpcMessage::Ok`] sentinel; a followed one runs until the
+/// client hangs up or the daemon shuts down.
+pub(crate) async fn stream_logs(
+    dir: &Path,
+    framed: &mut IpcFramed,
+    since: Option<Duration>,
+    follow: bool,
+    token: &CancellationToken,
+) -> Result<()> {
+    if !dir.is_dir() {
+        let _ = ipc::send(
+            framed,
+            ipc_err(format!("no log directory at {}", dir.display())),
+        )
+        .await;
+        return Ok(());
+    }
+
+    let now = SystemTime::now();
+    // The cutoff is rendered in the appender's own format so a line can be
+    // compared against it as a string; `now - since` saturates at the epoch.
+    let cutoff = since.map(|d| rfc3339_micros(now.checked_sub(d).unwrap_or(UNIX_EPOCH)));
+    let today = day_of(now);
+
+    // Oldest file first, so what the client concatenates reads chronologically.
+    let mut offset = 0u64;
+    let mut current = dir.join(format!("{LOG_PREFIX}{today}"));
+    for path in select_log_files(dir, cutoff.as_deref(), &today) {
+        let end = stream_file(framed, &path, cutoff.as_deref(), 0).await?;
+        // Where `--follow` picks up, if the pass ended on the live file.
+        if path == current {
+            offset = end;
+        }
+    }
+
+    if !follow {
+        return ipc::send(
+            framed,
+            IpcMessage::Ok {
+                message: "end of logs".to_string(),
+            },
+        )
+        .await;
+    }
+
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            // `--follow` can sit idle for minutes between lines, so a hangup has
+            // to be noticed on the read side: waiting for a write to fail would
+            // leak the task until something happened to be logged.
+            _ = client_gone(framed.get_ref()) => return Ok(()),
+            _ = tokio::time::sleep(FOLLOW_POLL) => {}
+        }
+
+        // Re-resolve the day each tick: at midnight the appender opens a new
+        // file and the old one stops growing.
+        let today = day_of(SystemTime::now());
+        let path = dir.join(format!("{LOG_PREFIX}{today}"));
+        if path != current {
+            current = path;
+            offset = 0;
+        }
+        if !current.is_file() {
+            continue;
+        }
+        // A file shorter than where we left off was replaced under us; restart
+        // from its head rather than waiting forever on bytes past the end.
+        if let Ok(meta) = tokio::fs::metadata(&current).await
+            && meta.len() < offset
+        {
+            offset = 0;
+        }
+        // No cutoff on the tail: anything appended after the one-shot pass is
+        // inside the `--since` window by construction.
+        offset = stream_file(framed, &current, None, offset).await?;
+    }
+}
+
+/// The rolling files that can hold lines at or after `cutoff`, oldest first.
+///
+/// `None` selects just `today`'s file, which is everything since the last
+/// daily rotation and what a bare `ray logs` shows. `panic.log` is not in
+/// either set: it carries no timestamps to filter on, and `ray report` is what
+/// collects it.
+fn select_log_files(dir: &Path, cutoff: Option<&str>, today: &str) -> Vec<PathBuf> {
+    let Some(cutoff) = cutoff else {
+        let path = dir.join(format!("{LOG_PREFIX}{today}"));
+        return if path.is_file() {
+            vec![path]
+        } else {
+            Vec::new()
+        };
+    };
+    let Some(day) = cutoff.get(..DAY_LEN) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix(LOG_PREFIX))
+                .is_some_and(|d| d >= day)
+        })
+        .collect();
+    // Rotation appends the date, so lexical order is chronological.
+    files.sort();
+    files
+}
+
+/// Forward one log file's complete lines from byte `from`, dropping anything
+/// older than `cutoff`. Returns the offset just past the last whole line,
+/// which is where a `--follow` poll resumes.
+///
+/// A trailing partial line is left where it is: the daemon writes into this
+/// same file, so a read can land mid-line, and forwarding half of one would
+/// both garble it and make the next poll repeat it.
+async fn stream_file(
+    framed: &mut IpcFramed,
+    path: &Path,
+    cutoff: Option<&str>,
+    from: u64,
+) -> Result<u64> {
+    use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
+
+    let Ok(file) = tokio::fs::File::open(path).await else {
+        return Ok(from);
+    };
+    let mut reader = BufReader::new(file);
+    if from > 0 {
+        reader.seek(SeekFrom::Start(from)).await?;
+    }
+
+    let mut offset = from;
+    let mut out: Vec<u8> = Vec::with_capacity(LOG_CHUNK_BYTES);
+    let mut line: Vec<u8> = Vec::new();
+    let mut keep = true;
+    loop {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line).await?;
+        if n == 0 || !line.ends_with(b"\n") {
+            break;
+        }
+        offset += n as u64;
+        if let Some(cutoff) = cutoff {
+            keep = keep_line(&line, cutoff, keep);
+            if !keep {
+                continue;
+            }
+        }
+        out.extend_from_slice(&line);
+        if out.len() >= LOG_CHUNK_BYTES {
+            send_chunks(framed, &mut out).await?;
+        }
+    }
+    send_chunks(framed, &mut out).await?;
+    Ok(offset)
+}
+
+/// Drain `buf` into `LogChunk` frames, none bigger than the frame cap allows.
+async fn send_chunks(framed: &mut IpcFramed, buf: &mut Vec<u8>) -> Result<()> {
+    for piece in buf.chunks(LOG_CHUNK_BYTES) {
+        ipc::send(
+            framed,
+            IpcMessage::LogChunk {
+                data: piece.to_vec(),
+            },
+        )
+        .await?;
+    }
+    buf.clear();
+    Ok(())
+}
+
+/// Whether a log line is at or after `cutoff`. `prev` is the verdict for the
+/// line before it: a line with no leading timestamp is a continuation (a panic
+/// backtrace, a multi-line message) and inherits it, so a kept event keeps its
+/// whole body.
+fn keep_line(line: &[u8], cutoff: &str, prev: bool) -> bool {
+    match line_timestamp(line) {
+        Some(ts) => ts >= cutoff,
+        None => prev,
+    }
+}
+
+/// The leading RFC3339 UTC timestamp of a log line, if it has one.
+///
+/// Recognized by shape and compared as a string: the appender writes a
+/// fixed-width, zero-padded `YYYY-MM-DDTHH:MM:SS.ffffffZ`, so lexical order is
+/// chronological and no calendar arithmetic is needed to answer the only
+/// question `--since` asks.
+fn line_timestamp(line: &[u8]) -> Option<&str> {
+    let head = std::str::from_utf8(line.get(..TS_LEN)?).ok()?;
+    let b = head.as_bytes();
+    let shaped = b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[19] == b'.'
+        && b[26] == b'Z';
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    let filled = digits(0..4)
+        && digits(5..7)
+        && digits(8..10)
+        && digits(11..13)
+        && digits(14..16)
+        && digits(17..19)
+        && digits(20..26);
+    (shaped && filled).then_some(head)
+}
+
+/// `t` in the appender's timestamp format.
+fn rfc3339_micros(t: SystemTime) -> String {
+    humantime::format_rfc3339_micros(t).to_string()
+}
+
+/// The `YYYY-MM-DD` a rolling file is named for.
+fn day_of(t: SystemTime) -> String {
+    rfc3339_micros(t)[..DAY_LEN].to_string()
+}
+
+/// Resolves once the client's end of the socket is gone.
+///
+/// The client sends nothing after its request, so any readability is either
+/// EOF (it hung up) or noise to discard.
+async fn client_gone(stream: &UnixStream) -> std::io::Result<()> {
+    let mut scratch = [0u8; 64];
+    loop {
+        stream.readable().await?;
+        match stream.try_read(&mut scratch) {
+            Ok(0) => return Ok(()),
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    const CUTOFF: &str = "2026-08-15T12:00:00.000000Z";
+
+    fn touch(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), b"").unwrap();
+    }
+
+    #[test]
+    fn no_cutoff_selects_only_todays_file() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "rayfish.log.2026-08-13");
+        touch(dir.path(), "rayfish.log.2026-08-15");
+
+        let files = select_log_files(dir.path(), None, "2026-08-15");
+        assert_eq!(files, vec![dir.path().join("rayfish.log.2026-08-15")]);
+    }
+
+    #[test]
+    fn no_cutoff_and_no_file_today_selects_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "rayfish.log.2026-08-13");
+
+        assert!(select_log_files(dir.path(), None, "2026-08-15").is_empty());
+    }
+
+    #[test]
+    fn a_cutoff_selects_its_day_and_newer_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        for day in ["2026-08-12", "2026-08-14", "2026-08-15", "2026-08-16"] {
+            touch(dir.path(), &format!("rayfish.log.{day}"));
+        }
+        // The daemon may have crashed mid-write, and a report bundle may sit
+        // alongside; neither is a rolling log file.
+        touch(dir.path(), "panic.log");
+        touch(dir.path(), "rayfish-report-1.tgz");
+
+        let files = select_log_files(
+            dir.path(),
+            Some("2026-08-14T09:30:00.000000Z"),
+            "2026-08-16",
+        );
+        let names: Vec<&str> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "rayfish.log.2026-08-14",
+                "rayfish.log.2026-08-15",
+                "rayfish.log.2026-08-16"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_directory_selects_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("nope");
+        assert!(select_log_files(&gone, Some(CUTOFF), "2026-08-15").is_empty());
+        assert!(select_log_files(&gone, None, "2026-08-15").is_empty());
+    }
+
+    #[test]
+    fn a_leading_timestamp_is_recognized_by_shape() {
+        assert_eq!(
+            line_timestamp(b"2026-08-15T12:00:00.000000Z  INFO rayfish: hi\n"),
+            Some(CUTOFF)
+        );
+        // Local time, a missing `Z`, a short fraction, a bare backtrace frame:
+        // none of these is the appender's format, so none is a timestamp.
+        assert_eq!(line_timestamp(b"2026-08-15 12:00:00.000000Z INFO\n"), None);
+        assert_eq!(line_timestamp(b"2026-08-15T12:00:00.000000+ INFO\n"), None);
+        assert_eq!(line_timestamp(b"2026-08-15T12:00:00.00Z INFO\n"), None);
+        assert_eq!(line_timestamp(b"   1: rayfish::forward::run\n"), None);
+        assert_eq!(line_timestamp(b"short\n"), None);
+    }
+
+    #[test]
+    fn the_cutoff_line_itself_is_kept() {
+        let at = b"2026-08-15T12:00:00.000000Z  INFO rayfish: at the cutoff\n";
+        let just_before = b"2026-08-15T11:59:59.999999Z  INFO rayfish: before\n";
+        let just_after = b"2026-08-15T12:00:00.000001Z  INFO rayfish: after\n";
+
+        assert!(keep_line(at, CUTOFF, false));
+        assert!(!keep_line(just_before, CUTOFF, true));
+        assert!(keep_line(just_after, CUTOFF, false));
+    }
+
+    #[test]
+    fn a_continuation_line_inherits_the_line_above_it() {
+        let frame = b"   1: rayfish::forward::run\n";
+        assert!(keep_line(frame, CUTOFF, true));
+        assert!(!keep_line(frame, CUTOFF, false));
+    }
+}
+
+/// The streaming half of `ray logs`, driven over a real socket pair: the
+/// filtering and file-selection units above say what *should* go out, these
+/// say what actually comes back on the wire.
+#[cfg(test)]
+mod log_stream_tests {
+    use super::*;
+
+    /// Ample for a 500ms poll, short enough that a hang fails the run instead
+    /// of stalling it.
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// A log line stamped `ago` before now, in the appender's format.
+    fn line(ago: Duration, msg: &str) -> String {
+        let at = SystemTime::now().checked_sub(ago).unwrap();
+        format!("{}  INFO rayfish: {msg}\n", rfc3339_micros(at))
+    }
+
+    fn today_log(dir: &Path) -> PathBuf {
+        dir.join(format!("{LOG_PREFIX}{}", day_of(SystemTime::now())))
+    }
+
+    /// The text of one `LogChunk` frame.
+    fn chunk(msg: IpcMessage) -> String {
+        match msg {
+            IpcMessage::LogChunk { data } => String::from_utf8(data).unwrap(),
+            other => panic!("expected a LogChunk, got {other:?}"),
+        }
+    }
+
+    /// Read the next frame off the client end, failing rather than hanging.
+    async fn next_chunk(framed: &mut IpcFramed) -> String {
+        let msg = tokio::time::timeout(PATIENCE, ipc::recv(framed))
+            .await
+            .expect("no frame arrived")
+            .unwrap();
+        chunk(msg)
+    }
+
+    /// Drain the client end until the `Ok` sentinel and return what the chunks
+    /// concatenate to. `None` for `Error`, which is a different answer.
+    async fn drain(framed: &mut IpcFramed) -> Option<String> {
+        let mut out = Vec::new();
+        loop {
+            match ipc::recv(framed).await.unwrap() {
+                IpcMessage::LogChunk { data } => out.extend_from_slice(&data),
+                IpcMessage::Ok { .. } => return Some(String::from_utf8(out).unwrap()),
+                IpcMessage::Error { .. } => return None,
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+    }
+
+    async fn serve(
+        dir: &Path,
+        since: Option<Duration>,
+        follow: bool,
+    ) -> (IpcFramed, tokio::task::JoinHandle<Result<()>>) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let dir = dir.to_path_buf();
+        let task = tokio::spawn(async move {
+            let mut framed = ipc::framed(server);
+            stream_logs(&dir, &mut framed, since, follow, &CancellationToken::new()).await
+        });
+        (ipc::framed(client), task)
+    }
+
+    #[tokio::test]
+    async fn a_bare_read_returns_todays_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "{}{}",
+            line(Duration::from_secs(7200), "early"),
+            line(Duration::from_secs(60), "late")
+        );
+        std::fs::write(today_log(dir.path()), &body).unwrap();
+
+        let (mut client, task) = serve(dir.path(), None, false).await;
+        let got = tokio::time::timeout(PATIENCE, drain(&mut client))
+            .await
+            .unwrap();
+        assert_eq!(got.unwrap(), body);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn since_drops_older_lines_and_keeps_their_continuations_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = line(Duration::from_secs(7200), "early");
+        let recent = line(Duration::from_secs(60), "late");
+        std::fs::write(
+            today_log(dir.path()),
+            format!("{old}   1: an old backtrace frame\n{recent}   1: a recent one\n"),
+        )
+        .unwrap();
+
+        let (mut client, task) = serve(dir.path(), Some(Duration::from_secs(3600)), false).await;
+        let got = tokio::time::timeout(PATIENCE, drain(&mut client))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, format!("{recent}   1: a recent one\n"));
+        task.await.unwrap().unwrap();
+    }
+
+    /// A read lands mid-write often enough that it has to be handled: the
+    /// partial line stays put and arrives whole once its newline does.
+    #[tokio::test]
+    async fn follow_sends_appended_lines_and_holds_a_partial_one_back() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = line(Duration::from_secs(1), "already there");
+        std::fs::write(today_log(dir.path()), &first).unwrap();
+
+        let (mut client, task) = serve(dir.path(), None, true).await;
+        assert_eq!(next_chunk(&mut client).await, first);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(today_log(dir.path()))
+            .unwrap();
+        let second = line(Duration::ZERO, "appended");
+        write!(file, "{}", &second[..10]).unwrap();
+        file.flush().unwrap();
+        // Past a poll, so the half-written line really is what the follow loop
+        // finds rather than something the timing happened to skip over.
+        tokio::time::sleep(FOLLOW_POLL * 2).await;
+        write!(file, "{}", &second[10..]).unwrap();
+        file.flush().unwrap();
+
+        assert_eq!(next_chunk(&mut client).await, second);
+
+        // Hanging up is how a follow ends; the daemon must not be left polling
+        // a file for a client that is gone.
+        drop(client);
+        tokio::time::timeout(PATIENCE, task)
+            .await
+            .expect("follow outlived its client")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_missing_log_directory_is_an_error_not_an_empty_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, task) = serve(&dir.path().join("nope"), None, false).await;
+        assert!(
+            tokio::time::timeout(PATIENCE, drain(&mut client))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        task.await.unwrap().unwrap();
     }
 }

@@ -785,6 +785,7 @@ impl Daemon {
             req,
             IpcMessage::Status
                 | IpcMessage::Report
+                | IpcMessage::Logs { .. }
                 | IpcMessage::FirewallShow
                 | IpcMessage::FirewallSuggestions { .. }
                 | IpcMessage::FirewallPending { .. }

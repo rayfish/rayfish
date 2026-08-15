@@ -541,10 +541,15 @@ the phone a `100.64.x.x` address of its own. Flipping it reconnects.
 ## Troubleshooting
 
 ```bash
+ray logs                 # today's daemon log, in your pager
+ray logs --since 2h30m   # just the last two and a half hours
+ray logs -f              # keep streaming new lines, like tail -f
 ray report               # bundle logs + metrics, open a pre-filled GitHub issue
 ```
 
-The daemon writes rolling logs to `/var/log/rayfish/` (Linux) or `/Library/Logs/rayfish/` (macOS). `ray report` collects those logs, current metrics, and a **sanitized** status snapshot (no private keys) into a `.tgz`, then opens a pre-filled GitHub issue for you to attach. The bundle is written locally first, so you can review it before sharing.
+The daemon writes rolling logs to `/var/log/rayfish/` (Linux) or `/Library/Logs/rayfish/` (macOS). They're root-owned, so `ray logs` reads them through the daemon rather than off disk: no `sudo`, and it pages through `$PAGER` on a terminal but writes straight through when piped or following (`ray logs | grep peer`).
+
+`ray report` collects those logs, current metrics, and a **sanitized** status snapshot (no private keys) into a `.tgz`, then opens a pre-filled GitHub issue for you to attach. The bundle is written locally first, so you can review it before sharing.
 
 ## How it compares
 

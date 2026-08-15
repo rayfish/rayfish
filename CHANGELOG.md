@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`ray logs`: read the daemon's log without hunting for the files.** The logs
+  are root-owned under `/var/log/rayfish` (`/Library/Logs/rayfish` on macOS),
+  so until now looking at them meant `sudo cat` and knowing which file, or
+  `ray report`, which bundles a week of them into a tarball meant for sharing.
+  `ray logs` prints today's, from the daemon over IPC, so it needs no root:
+
+  ```bash
+  ray logs                 # everything since the last daily rotation
+  ray logs --since 2h30m   # only the last two and a half hours
+  ray logs -f              # keep streaming new lines, like tail -f
+  ray logs --since 5m -f   # the last five minutes, then keep streaming
+  ```
+
+  Output goes through `$PAGER` (`less`) on a terminal and straight through
+  when piped or following, so `ray logs | grep peer` and `ray logs -f` both
+  behave the way you would expect.
+
 ## [0.3.0] - 2026-08-15
 
 Peers on 0.2.x still connect: the mesh protocol is unchanged (`rayfish/mesh/2`),

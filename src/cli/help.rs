@@ -66,7 +66,10 @@ const GROUPS: &[(&str, &[&str])] = &[
             "set-operator",
         ],
     ),
-    ("Diagnostics", &["ping", "netcheck", "report", "mdns"]),
+    (
+        "Diagnostics",
+        &["ping", "netcheck", "logs", "report", "mdns"],
+    ),
     (
         "Setup",
         &[

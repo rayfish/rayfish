@@ -86,6 +86,10 @@ iroh-dns = "1"
 iroh-blobs = { version = "0.103", default-features = false, features = ["fs-store"] }
 iroh-mdns-address-lookup = "0.4"
 humansize = "2"
+# `ray logs`: parses `--since 2h30m`, and renders the cutoff in the exact
+# fixed-width RFC3339 the log appender writes, so a line can be compared
+# against it as a string.
+humantime = "2"
 unicode-width = "0.2"
 indicatif = "0.18"
 crossterm = "0.29"

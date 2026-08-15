@@ -35,7 +35,7 @@ ray invite | requests | accept | deny | admin        # admission + coordinators
 ray connect | connections | contact | pair | unpair  # direct links + multi-device identity
 ray firewall … | apply | alias | identityof          # policy
 ray exit-node allow | disallow | use | none | status  # internet gateway (offer: Linux/macOS/BSD, use: Linux/macOS)
-ray send | files | config | gui | mdns | auto-update | update | ping | netcheck | report
+ray send | files | config | gui | mdns | auto-update | update | ping | netcheck | logs | report
 ray completions [shell] [--install]                  # tab completion (installed by `ray up`)
 ```
 
@@ -106,6 +106,14 @@ The rules the code upholds. Read the code for the mechanics.
 - **Rust:** import type names (`use std::net::Ipv6Addr;` then `Ipv6Addr`), don't inline fully-qualified paths. **Never** share an I/O resource (TUN, socket, stream) behind a `Mutex`: split read/write halves. Avoid `Mutex` generally: prefer channels, atomics, or `RwLock`/`ArcSwap` for fast non-async state.
 - **Wire protocols are ALPN-versioned** (`rayfish/{mesh,files,pair,connect}/<v>`). ALPN negotiation is the *only* compatibility gate (no in-band version handshake), so when you change a wire protocol incompatibly, bump its version in the same change. Wire format = 4-byte BE length + msgpack; TUN MTU 1280.
 - **Config** lives under `config::config_dir()` (`/etc/rayfish` on Linux, `~/Library/Application Support/rayfish` on macOS, i.e. the *daemon's* home, `/var/root` under launchd; `RAYFISH_CONFIG_DIR` overrides it on every platform, and daemon + CLI must both see the same value): sharded + atomic: globals in `settings.toml`, one network per `networks/<name>.toml`. Secret-bearing files are `0600 root:root`; writes go through `config::write_file` (temp file + rename). Single-value settings are not bespoke IPC: every one is a typed key, one enum per store (`GlobalKey` / `FirewallKey` / `NetworkKey` in `ray-proto/src/settings.rs`, named on the wire, `NodeKey` = global + firewall), meaning it writes over `ConfigSet`/`ConfigGet` or `NetConfigSet`/`NetConfigGet` and its behavior lives in `config::settings` (`src/config/settings.rs`). The per-store split is load-bearing: every `apply_*`/`render_*` matches its key enum exhaustively, so a new key cannot compile until each handler serving it grows an arm. Adding a setting means adding an enum variant, its `apply`/`render` arms, and a CLI arm, never a new message type.
+- **IPC is one request, one response, with one exception.** `ray logs` answers
+  with a run of `LogChunk` frames, ended by an `Ok` sentinel or (under
+  `--follow`) not ended at all, because a day of `rayfish=debug` output is many
+  times the 1 MiB frame cap and a follow has no last frame by definition. It is
+  the only handler that writes to the stream instead of returning an
+  `IpcMessage`, which is why it is dispatched in `handle_ipc_client` ahead of
+  `handle_request`. Keep it that way: a second streaming reply is a reason to
+  factor the pattern out, not to widen every handler's signature.
 - **CLI help is grouped in `src/cli/help.rs`.** clap has no subcommand grouping (`help_heading`/`hide_short_help` are argument-only), so the `-h` command list is rendered there from the clap model and the help template drops `{subcommands}`. A new command must join a `GROUPS` entry or it appears nowhere (tests enforce both directions). Subcommands stay *visible* in the clap model on purpose: `hide = true` would suppress clap's list but `clap_complete` skips hidden subcommands, silently gutting tab completion. Keep each `about` to one line inside 80 columns and put the rest after a blank line, where it becomes `ray help <command>`.
 - **`--json` is per-command, never on the root.** It is declared on each command that renders JSON, `global = true` so it also parses after that command's action (`ray firewall show --json`). Declaring it on `Cli` would put it back on all 44 commands, most of which would ignore it in silence.
 - **Logging** is `tracing`: console at `info`, rolling daily files at `rayfish=debug` (bundled by `ray report`). The daemon panic hook restores DNS then `abort()`s so the service manager restarts it (fail-fast, never limp).
