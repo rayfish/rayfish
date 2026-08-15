@@ -504,7 +504,9 @@ pub struct Daemon {
     /// The iroh protocol [`Router`](iroh::protocol::Router): owns the endpoint
     /// accept loop and dispatches each inbound connection by ALPN to its handler.
     /// Owned for the daemon's whole lifetime (it aborts on drop); `run_daemon`
-    /// `shutdown()`s it on exit (which also closes the endpoint).
+    /// (desktop) and [`Daemon::shutdown_and_close`] (embedders) `shutdown()` it
+    /// on exit, which drains the protocol handlers (releasing the blob store's
+    /// redb lock) and closes the endpoint.
     router: iroh::protocol::Router,
     /// File-transfer + pairing state and ALPN accept arms (see [`FileService`]).
     /// Shared with [`ProtocolRouter`], which runs the accept arms.
@@ -602,15 +604,27 @@ impl Daemon {
     /// embedders (mobile) that rebuild a fresh daemon on re-enable: without it
     /// the old endpoint's connections outlive `stop`, so a coordinator keeps the
     /// stale session while the rebuilt endpoint (same node key) comes up and the
-    /// device shows offline until the race clears. Mirrors the shutdown tail of
-    /// `run_daemon`. After this the `Daemon` is spent; build a new one to
-    /// come back online.
+    /// device shows offline until the race clears.
+    ///
+    /// Shutting the protocol router down first is what releases the blob store,
+    /// and it is not optional for an embedder either: `Router::shutdown` is the
+    /// only thing that drives `BlobsProtocol::shutdown` -> `Store::shutdown`,
+    /// which is what drops the store's redb `Database` and with it the exclusive
+    /// file lock on `blobs/blobs.db`. Without it the lock outlives this call, and
+    /// a second open does not fail, it waits: the next `build_headless` in the
+    /// same process then blocks until whatever eventually drops the old store
+    /// does, if anything does, which on mobile is how a disabled node never comes
+    /// back. The explicit `endpoint.close()` after it is the same idempotent
+    /// backstop the desktop tail keeps.
+    ///
+    /// After this the `Daemon` is spent; build a new one to come back online.
     pub async fn shutdown_and_close(&self) {
         let tun_attached = self.tun_tasks.lock().unwrap().is_some();
         tracing::info!(tun_attached, "shutdown: cancelling token, closing endpoint");
         self.shutdown_token.cancel();
+        let _ = self.router.shutdown().await;
         self.transport.endpoint.close().await;
-        tracing::info!("shutdown: endpoint closed");
+        tracing::info!("shutdown: router stopped, blob store released, endpoint closed");
     }
 
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
@@ -2689,6 +2703,68 @@ mod headless_tests {
             .net_config_apply("gaming", NetworkKey::AutoAcceptFiles, "off")
             .await;
         assert!(matches!(msg, IpcMessage::Ok { .. }), "{msg:?}");
+    }
+
+    /// A stopped node must be rebuildable in the same process, which is the
+    /// mobile disable/enable cycle (`Node::stop` then `Node::start`, both in one
+    /// app process).
+    ///
+    /// What makes this sharp: two `FsStore`s over the same directory do not
+    /// error, they *block*. redb waits for the lock on `blobs/blobs.db` rather
+    /// than returning `DatabaseAlreadyOpen`, so a rebuild that overlaps a store
+    /// the previous daemon has not released yet never returns at all, and on
+    /// Android that wedges the thread `Node::start` was called on for the life of
+    /// the process. Before `shutdown_and_close` shut the protocol router down,
+    /// nothing in it released the store: the release happened later, if at all,
+    /// when the router's accept task noticed the closed endpoint and dropped its
+    /// handlers. This asserts the router is shut down before the call returns
+    /// (which is what drives `BlobsProtocol::shutdown` -> `Store::shutdown`) and
+    /// then reopens the store immediately, with the daemon `Arc` still held.
+    ///
+    /// See `build_headless_returns_usable_state_without_ipc_socket`: `ENV_LOCK`
+    /// only serializes tests and guards no data across the awaits.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_and_close_releases_the_blob_store_for_a_rebuild() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // One config dir throughout: sharing `blobs/blobs.db` is the whole point,
+        // so a per-build tempdir would pass even with the bug.
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+
+        let first = tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+            .await
+            .expect("first build_headless should not hang")
+            .expect("first build_headless should succeed");
+        tokio::time::timeout(Duration::from_secs(30), first.shutdown_and_close())
+            .await
+            .expect("shutdown_and_close should not hang");
+        assert!(
+            first.router.is_shutdown(),
+            "shutdown_and_close must shut the protocol router down, which is what \
+             releases the blob store, rather than leaving it to the accept task"
+        );
+
+        // Still holding `first`, and reopening on the very next line. Waiting for
+        // the last `Arc` to drop is not something a caller can arrange
+        // (background tasks hold their own clones and wind down on their own
+        // schedule), so releasing the store has to be something the call itself
+        // guarantees before it returns.
+        let blobs_dir = config::config_dir().unwrap().join("blobs");
+        let reopened = tokio::time::timeout(
+            Duration::from_secs(10),
+            iroh_blobs::store::fs::FsStore::load(&blobs_dir),
+        )
+        .await
+        .expect("the blob store is still locked after shutdown_and_close")
+        .expect("reopening the blob store should succeed");
+        let _ = reopened.shutdown().await;
+
+        // And the whole rebuild works, which is what the app actually does.
+        tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+            .await
+            .expect("rebuild should not hang")
+            .expect("rebuilding after shutdown_and_close should succeed");
     }
 
     // See `build_headless_returns_usable_state_without_ipc_socket`: `ENV_LOCK`

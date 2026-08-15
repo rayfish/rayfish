@@ -141,10 +141,37 @@ pub async fn build_headless(on_demand: bool) -> Result<Arc<Daemon>> {
 /// receiver and metrics-server guard are stashed on the state for the caller.
 ///
 /// Shared by [`run_daemon`] (desktop) and [`build_headless`] (embedders).
+///
+/// The endpoint is built long before the rest of the infrastructure, so every
+/// `?` after that point would drop a live endpoint (iroh logs "Endpoint dropped
+/// without calling `Endpoint::close`. Aborting ungracefully."). That is only
+/// noise for the desktop binary, which exits anyway, but an embedder retries:
+/// `Node::start` is called again on every enable, so a failing build would stack
+/// one abandoned endpoint per attempt for the life of the process. Close it here
+/// instead, on the way out.
 async fn build_daemon(
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
     on_demand_override: Option<bool>,
+) -> Result<Arc<Daemon>> {
+    let mut endpoint = None;
+    let result = build_daemon_inner(token, stats, on_demand_override, &mut endpoint).await;
+    if result.is_err()
+        && let Some(ep) = endpoint
+    {
+        tracing::warn!("daemon build failed; closing the endpoint it had already created");
+        ep.close().await;
+    }
+    result
+}
+
+/// The body of [`build_daemon`]. `endpoint_out` is filled the moment the iroh
+/// endpoint exists, so the caller can close it if any later step fails.
+async fn build_daemon_inner(
+    token: CancellationToken,
+    stats: Arc<ForwardMetrics>,
+    on_demand_override: Option<bool>,
+    endpoint_out: &mut Option<Endpoint>,
 ) -> Result<Arc<Daemon>> {
     // Relocate a pre-/etc config tree into /etc/rayfish (Linux upgrade path)
     // before anything reads identity or config. No-op on macOS / once migrated.
@@ -195,6 +222,7 @@ async fn build_daemon(
         &app_config.discovery_dns,
     )
     .await?;
+    *endpoint_out = Some(ep.clone());
 
     // Built before the blob store below, because the provider event pump that
     // feeds it (a bit further down, once `blobs_proto` exists) needs the

@@ -178,6 +178,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **On Android, Rayfish comes back after being turned off with "go fully
+  offline when disabled" set.** Turning it back on could leave the phone
+  offline for good: the previous node released its blob store only after the
+  fact, if at all, and a start that overlapped it waited for a database lock
+  that was never coming, with nothing in the app to say so. Stopping now
+  releases the store before it returns, starting gives up rather than waiting
+  forever, and a start that does fail is reported instead of passing in
+  silence.
+
+- **On Android, moving between networks no longer leaves the phone on dead
+  sockets.** Only a full network switch was forwarded to the core, so a Wi-Fi
+  roam between access points, a DHCP renew or an address change on the same
+  network went unnoticed and the phone stayed invisible to its peers. Those
+  changes now rebind, and turning Rayfish off and on does too, so the obvious
+  thing to try when peers look disconnected actually recovers it.
+
 - **A mesh SSH terminal session can no longer go silent while its shell keeps
   running.** If the program on the far end closed and reopened its terminal
   while starting up, the daemon's read of the pseudo-terminal ended there and

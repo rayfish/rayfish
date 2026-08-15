@@ -63,6 +63,7 @@ mod android_jni {
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use android_tun::{AndroidTunReader, AndroidTunWriter};
 use rayfish::config;
@@ -77,8 +78,21 @@ use rayfish::invite;
 use rayfish::ipc::{self, IpcMessage};
 use rayfish::membership::{self, GroupMode};
 use tokio::runtime::Runtime;
+use tokio::time::timeout;
 
 uniffi::setup_scaffolding!();
+
+/// How long [`Node::stop`] waits for the daemon to close before giving up. Long
+/// enough for QUIC connections to terminate cleanly and the blob store to flush,
+/// short enough that a caller on an Android main/binder thread is never held for
+/// what the system would count as an ANR.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`Node::start`] waits for the daemon to build. Generous, because a
+/// cold start does disk and network work (identity, endpoint bind, relay probe)
+/// on a phone that may be on a bad link; this is a backstop against a build that
+/// never returns at all, not a latency budget.
+const START_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Structured error surfaced across the FFI boundary.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -422,16 +436,43 @@ impl Node {
             return Ok(());
         }
 
+        // Bounded, because the one way this call can fail to return is fatal to
+        // the app: opening the blob store takes redb's exclusive lock on
+        // `blobs.db`, and a second open does not fail, it waits. So a rebuild
+        // that overlaps a store the previous daemon has not released yet would
+        // block here forever, on a thread that holds NodeHolder's monitor, and
+        // every later start/stop/up would queue behind it (the reported "the
+        // phone never came back online"). Failing is recoverable; wedging is not.
         let state = self
             .runtime
-            .block_on(build_headless(true))
+            .block_on(async { timeout(START_TIMEOUT, build_headless(true)).await })
+            .map_err(|_| {
+                tracing::error!(
+                    timeout_secs = START_TIMEOUT.as_secs(),
+                    "Node.start: building the daemon timed out"
+                );
+                RayError::Network("node start timed out".to_string())
+            })?
             .map_err(RayError::network)?;
 
         // Commit under the lock, re-checking for a racing `start` that won while
-        // we were building. If one did, keep the winner and drop ours.
-        let mut guard = self.state.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(state);
+        // we were building. If one did, keep the winner and shut ours down: a
+        // plain drop would leave a second endpoint live and, worse, a second
+        // blob store holding the exclusive redb lock on `blobs.db`, which no
+        // later `start` in this process could then reopen.
+        let loser = {
+            let mut guard = self.state.lock().unwrap();
+            match guard.is_none() {
+                true => {
+                    *guard = Some(state);
+                    None
+                }
+                false => Some(state),
+            }
+        };
+        if let Some(loser) = loser {
+            tracing::warn!("Node.start: a concurrent start won; shutting the extra daemon down");
+            self.runtime.block_on(loser.shutdown_and_close());
         }
         Ok(())
     }
@@ -1080,12 +1121,30 @@ impl Node {
         if let Some(state) = state {
             // Tear the data plane down first: abort the TUN writer + mesh tasks so
             // both dups of the Android VPN fd close and the interface comes down.
-            // `shutdown_and_close` only cancels the token + closes the endpoint;
-            // the writer never observes the token, so without this the fd would
+            // `shutdown_and_close` cancels the token, shuts the router down and
+            // closes the endpoint, but never touches the TUN tasks; the writer
+            // does not observe the token either, so without this the fd would
             // leak and the tunnel would linger after disable.
             state.detach_tun();
-            self.runtime.block_on(state.shutdown_and_close());
-            tracing::info!("Node.stop: data plane detached and endpoint closed");
+            // Bounded: this runs on an Android main/binder thread by way of
+            // NodeHolder.stopNode, so a wedged protocol handler or store actor
+            // must not hang the app. Giving up here can leave the blob store's
+            // redb lock held, in which case the next start() waits out its own
+            // timeout and reports a failure. A recoverable failure beats a frozen
+            // UI.
+            let closed = self.runtime.block_on(async {
+                timeout(SHUTDOWN_TIMEOUT, state.shutdown_and_close())
+                    .await
+                    .is_ok()
+            });
+            if closed {
+                tracing::info!("Node.stop: data plane detached and endpoint closed");
+            } else {
+                tracing::error!(
+                    timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
+                    "Node.stop: shutdown timed out; the node may not restart until the app is restarted"
+                );
+            }
         } else {
             tracing::info!("Node.stop: no live state (already stopped)");
         }

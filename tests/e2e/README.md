@@ -1,9 +1,13 @@
 # Rayfish end-to-end tests
 
-Each scenario provisions real Scaleway instances, deploys `ray` over SSH, drives a
-flow end to end, and prints a `PASS`/`FAIL` line per check (exit non-zero on any
-failure). The shared SSH/deploy/reset/assert plumbing lives in
-[`../lib/`](../lib) and is sourced by every scenario.
+Each scenario provisions a fleet of hosts, deploys `ray` over SSH, drives a flow end
+to end, and prints a `PASS`/`FAIL` line per check (exit non-zero on any failure). The
+shared SSH/deploy/reset/assert plumbing lives in [`../lib/`](../lib) and is sourced by
+every scenario.
+
+A host is anything that answers `ssh root@<ip>`, so there are two backends: real
+Scaleway instances (the default) and local Docker containers (`E2E_BACKEND=docker`).
+See [Backends](#backends).
 
 ## Scenarios
 
@@ -33,20 +37,70 @@ provision/teardown/assert bodies are shared in [`../lib/`](../lib).
 The throughput/latency benchmark (`tests/e2e.sh bench`) is a sibling suite
 under [`../bench/`](../bench) (same shared `tests/lib/`).
 
-## Prerequisites (all scenarios)
+## Prerequisites (both backends)
 
-- `scw` authenticated (`scw account project list` should work) and `jq` installed.
-- Docker running (used by `cross` for the x86_64-linux build behind `just deploy`),
-  plus `just`.
-- Your `~/.ssh/id_ed25519` public key registered in the Scaleway account so the
-  instances accept `root@<ip>`. Override the key with `SSH_KEY=…`.
+- `jq` (the assertions parse `ray status --json` on the runner), plus `just` and
+  `cross` with Docker running (the x86_64-linux build behind `just deploy`).
+- An SSH keypair at one of `~/.ssh/id_*`. Leave `SSH_KEY` at its default: `just scp`
+  runs bare `rsync`/`ssh` with no `-i`, so the hosts have to accept ssh's default
+  identity.
+
+## Backends
+
+`E2E_BACKEND` selects one; the `.servers` zone column records which backend wrote a
+fleet, and each backend refuses to touch the other's.
+
+### `scaleway` (default)
+
+Real instances, one fleet per scenario. Also needs `scw` authenticated
+(`scw account project list` should work) and your public key registered in the
+Scaleway account.
+
+### `docker`
+
+```bash
+E2E_BACKEND=docker tests/e2e.sh <scenario>
+```
+
+Each host is a container from [`../docker/`](../docker): Ubuntu 22.04 (the glibc floor
+`just cross` builds against) running systemd as PID 1, with sshd on `0.0.0.0:22`. They
+share one bridge and reach the internet through the host's NAT, which the daemon needs
+for pkarr and the relays. Also needs `/dev/net/tun` on the host; the containers run
+`--privileged`, because systemd manages its own cgroups.
+
+The fleet is recreated on every `run`. `device-cert` and `unpair` never call `ray up`
+after deploying, so a redeployed-but-not-reactivated daemon comes back in standby and
+every data-plane check fails; containers are cheap enough to just rebuild.
+`E2E_DOCKER_REUSE=1` keeps a live fleet if you want to poke at it.
+
+**Scaleway-only scenarios.** `exit-node`, `reliability` and `bench` exit early under
+this backend. All the containers share the host's public IP, and `exit-node` asserts
+the opposite by design ("srv-a and srv-b already share a public IP: the egress
+assertion would be meaningless"); `reliability` and `bench` measure the rayfish path
+against a direct-public-IP baseline that on one host is the same bridge.
+
+**What a green docker run does not cover:**
+
+- No NAT between peers, so no hole punching and no relay fallback anywhere.
+- The nodes take the direct `/etc/resolv.conf` DNS path; Scaleway's `ubuntu_jammy`
+  runs systemd-resolved and takes the D-Bus path. The conditional takeover block in
+  `dns/run.sh` is skipped on Scaleway and exercised here — complementary, not equal.
+- `dns/run.sh`'s "no host `:53` bind" check has no positive control in a container
+  with no `:53` listener at all, so it passes for free.
+- mDNS is off on the nodes (one bridge means every node hears every other one, which
+  no real fleet does). `E2E_DOCKER_MDNS=1` turns it back on.
 
 ## Common environment overrides
 
 | Var | Default | Meaning |
 |-----|---------|---------|
+| `E2E_BACKEND` | `scaleway` | `scaleway` or `docker` |
 | `ZONE` | `fr-par-1` | Scaleway zone (provision) |
 | `TYPE` | `DEV1-S` | instance type (provision) |
 | `IMAGE` | `ubuntu_jammy` | instance image label (provision) |
 | `SSH_KEY` | `~/.ssh/id_ed25519` | private key for `root@<ip>` |
 | `KEEP_STATE` | `0` | `1` skips the per-run rayfish state wipe |
+| `E2E_DOCKER_REUSE` | `0` | `1` keeps a live container fleet instead of recreating it |
+| `E2E_DOCKER_REBUILD` | `0` | `1` rebuilds the node image |
+| `E2E_DOCKER_MDNS` | `0` | `1` leaves mDNS enabled on the nodes |
+| `E2E_DOCKER_IMAGE` / `_NET` / `_SUBNET` / `_SUBNET6` | see `lib/docker.sh` | names the backend uses |

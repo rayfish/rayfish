@@ -3,6 +3,7 @@ package xyz.rayfish.android
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.os.SystemClock
 import io.sentry.Attachment
 import io.sentry.Sentry
 import io.sentry.SentryLevel
@@ -63,6 +64,43 @@ object Telemetry {
             else -> "other"
         }
     }
+
+    /**
+     * A node bring-up failure, reported without the user having to notice and
+     * send diagnostics by hand. This is the one failure worth reporting on its
+     * own: the node not starting means the device is offline in the mesh, with
+     * no tunnel and no file transfer, and nothing in the UI says why.
+     *
+     * Throttled to one report per [FAILURE_REPORT_INTERVAL_MS] per process. Every
+     * caller of NodeHolder.ensureStarted retries (the VPN service on each start
+     * command, the UI poller, ShareActivity), so an un-throttled capture would
+     * send the same failure on a loop.
+     */
+    fun captureStartFailure(context: Context, t: Throwable) {
+        if (!Sentry.isEnabled()) return
+        val now = SystemClock.elapsedRealtime()
+        synchronized(this) {
+            val last = lastFailureReportMs
+            if (last != 0L && now - last < FAILURE_REPORT_INTERVAL_MS) return
+            lastFailureReportMs = now
+        }
+        Sentry.withScope { scope ->
+            scope.setTag("install_id", NodeHolder.installId(context))
+            scope.setTag("transport", transportType(context))
+            // The core's own log ring is the only place the reason lives: the
+            // Kotlin exception says "start failed", the Rust log says what failed.
+            runCatching {
+                val logs = NodeHolder.get(context).logSnapshot()
+                scope.addAttachment(Attachment(logs.toByteArray(), "rayfish-logs.txt", "text/plain"))
+            }
+            Sentry.captureException(t)
+        }
+    }
+
+    private const val FAILURE_REPORT_INTERVAL_MS = 30 * 60 * 1000L
+
+    @Volatile
+    private var lastFailureReportMs = 0L
 
     /** Full log snapshot as a Sentry attachment. Returns the event id, or null
      * when Sentry is off / the send failed. Best-effort. */
