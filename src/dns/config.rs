@@ -90,15 +90,24 @@ pub async fn revert(configurator: &dyn DnsConfigurator) -> Result<()> {
     configurator.revert().await
 }
 
-pub async fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigurator>> {
+/// `mesh_v6` is this node's mesh IPv6: macOS publishes it as the address of the
+/// service its resolver belongs to, which is what gets that resolver asked for
+/// AAAA records at all (see `macos::write_service_config`). The other backends
+/// have no use for it.
+pub async fn detect_and_configure(
+    tun_name: &str,
+    mesh_v6: std::net::Ipv6Addr,
+) -> Result<Box<dyn DnsConfigurator>> {
     // Only the macOS/Linux branches consume `tun_name`; on any other target
     // (e.g. Android) the function falls through to the unsupported-platform bail.
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let _ = tun_name;
+    #[cfg(not(target_os = "macos"))]
+    let _ = mesh_v6;
 
     #[cfg(target_os = "macos")]
     {
-        let configurator = MacosDynamicStoreDns::new(tun_name.to_string());
+        let configurator = MacosDynamicStoreDns::new(tun_name.to_string(), mesh_v6);
         configurator.apply().await?;
         return Ok(Box::new(configurator));
     }
@@ -247,6 +256,7 @@ async fn set_search_domains(rayfish_domains: &[String], tun_name: &str) -> Resul
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::net::Ipv6Addr;
     use std::sync::{Mutex, OnceLock};
 
     use anyhow::{Context, Result};
@@ -254,12 +264,13 @@ mod macos {
         array::CFArray,
         base::{CFType, TCFType},
         dictionary::CFDictionary,
+        number::CFNumber,
         string::CFString,
     };
     use system_configuration::dynamic_store::{SCDynamicStore, SCDynamicStoreBuilder};
     use system_configuration::sys::schema_definitions::{
         kSCPropInterfaceName, kSCPropNetDNSSearchDomains, kSCPropNetDNSServerAddresses,
-        kSCPropNetDNSSupplementalMatchDomains,
+        kSCPropNetDNSSupplementalMatchDomains, kSCPropNetIPv6Addresses, kSCPropNetIPv6PrefixLength,
     };
 
     use async_trait::async_trait;
@@ -267,6 +278,9 @@ mod macos {
     use super::{DNS_DOMAIN, DnsConfigurator};
 
     const SC_DNS_KEY: &str = "State:/Network/Service/rayfish/DNS";
+    /// The IPv6 half of the same service. Written alongside the DNS key in
+    /// IPv6-only mode; see [`write_service_config`].
+    const SC_IPV6_KEY: &str = "State:/Network/Service/rayfish/IPv6";
 
     struct SendSyncStore(SCDynamicStore);
 
@@ -359,6 +373,47 @@ mod macos {
         Ok(())
     }
 
+    /// Publish the IPv6 half of our service: the utun, its mesh address, and a
+    /// `/128`. Only meaningful in IPv6-only mode, and only there is it written.
+    ///
+    /// Without it the resolver written above is never asked for AAAA records.
+    /// mDNSResponder decides which families to request per resolver from the
+    /// interface that resolver belongs to, and it learns a service's interface
+    /// from this key: naming the interface inside the DNS dictionary alone is
+    /// accepted into the store and then ignored (`scutil --dns` shows our
+    /// resolver with no `if_index` and `flags: Supplemental, Request A
+    /// records`). Judged against the host's primary interface instead, a Mac
+    /// with no native IPv6 concludes AAAA is pointless, and `.ray` names, whose
+    /// only answer in this mode is AAAA, resolve to nothing while `dig` against
+    /// the same resolver answers fine.
+    ///
+    /// This is what makes another VPN's supplemental resolver sit on
+    /// `if_index : NN (utunN)` with both families requested.
+    fn write_service_config(tun_name: &str, mesh_v6: Ipv6Addr) -> Result<()> {
+        let store = get_or_init_store()?;
+        let store = store.lock().unwrap();
+
+        let addr_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetIPv6Addresses) };
+        let addr_val = CFArray::from_CFTypes(&[CFString::new(&mesh_v6.to_string())]);
+        let prefix_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetIPv6PrefixLength) };
+        let prefix_val = CFArray::from_CFTypes(&[CFNumber::from(128i32)]);
+        let iface_key = unsafe { CFString::wrap_under_get_rule(kSCPropInterfaceName) };
+
+        let pairs: Vec<(CFString, CFType)> = vec![
+            (addr_key, addr_val.as_CFType()),
+            (prefix_key, prefix_val.as_CFType()),
+            (iface_key, CFString::new(tun_name).as_CFType()),
+        ];
+        let typed_dict = CFDictionary::from_CFType_pairs(&pairs);
+        let dict = unsafe { CFDictionary::wrap_under_get_rule(typed_dict.as_concrete_TypeRef()) };
+
+        anyhow::ensure!(
+            store.0.set(SC_IPV6_KEY, dict),
+            "SCDynamicStoreSetValue failed for {SC_IPV6_KEY}"
+        );
+        Ok(())
+    }
+
     /// Read the system's current default-resolver upstreams from `scutil --dns`,
     /// so a full-tunnel catch-all can forward non-`.ray` queries to them. Captured
     /// once, before we install our own config, so we never capture ourselves.
@@ -400,13 +455,17 @@ mod macos {
         captured: Vec<std::net::Ipv4Addr>,
         /// The utun the resolver is scoped to (see [`write_dns_config`]).
         tun_name: String,
+        /// This node's mesh IPv6, published as the service's address in
+        /// IPv6-only mode (see [`write_service_config`]).
+        mesh_v6: Ipv6Addr,
     }
 
     impl MacosDynamicStoreDns {
-        pub fn new(tun_name: String) -> Self {
+        pub fn new(tun_name: String, mesh_v6: Ipv6Addr) -> Self {
             Self {
                 captured: capture_system_upstreams(),
                 tun_name,
+                mesh_v6,
             }
         }
     }
@@ -415,6 +474,11 @@ mod macos {
     impl DnsConfigurator for MacosDynamicStoreDns {
         async fn apply(&self) -> Result<()> {
             init_store()?;
+            // The service first: the DNS key is only scoped to the interface if
+            // configd already knows the service has one.
+            if super::ipv6_only() && !self.tun_name.is_empty() {
+                write_service_config(&self.tun_name, self.mesh_v6)?;
+            }
             write_dns_config(&[DNS_DOMAIN.to_string()], &self.tun_name)?;
             tracing::info!(
                 key = SC_DNS_KEY,
@@ -433,6 +497,9 @@ mod macos {
             if let Some(store) = STORE.get() {
                 let store = store.lock().unwrap();
                 store.0.remove(SC_DNS_KEY);
+                // Unconditional: the mode can have changed since the write, and
+                // removing a key that was never set is a no-op.
+                store.0.remove(SC_IPV6_KEY);
             }
             tracing::info!("removed SCDynamicStore DNS configuration");
             Ok(())

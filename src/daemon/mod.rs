@@ -1909,7 +1909,14 @@ mod accept_handler_tests {
             hostname_table.clone(),
             reverse_table.clone(),
         ));
-        let dns = Arc::new(DnsService::new(hostname_table, reverse_table, dns_resolver));
+        let dns = Arc::new(DnsService::new(
+            hostname_table,
+            reverse_table,
+            dns_resolver,
+            // No OS-DNS configuration runs in these tests, so the address the
+            // macOS backend would publish is never read.
+            std::net::Ipv6Addr::UNSPECIFIED,
+        ));
         let (disconnect_tx, _disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(1);
         let (placeholder_tx, _placeholder_rx) = mpsc::channel::<Bytes>(1);
         Arc::new(NetworkRegistry::new(

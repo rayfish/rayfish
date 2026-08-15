@@ -14,6 +14,7 @@
 //! `resolve` (reader side), on top of `configure` / `revert` (lifecycle).
 
 use super::*;
+use std::net::Ipv6Addr;
 
 /// First and last backoff step for the OS-DNS configuration retry loop.
 const DNS_CONFIG_RETRY_MIN: Duration = Duration::from_secs(5);
@@ -36,6 +37,10 @@ pub(crate) struct DnsService {
     /// Cancellation token for the retry loop spawned when the initial OS-DNS
     /// configuration fails (see [`DnsService::configure`]).
     configure_retry: std::sync::Mutex<Option<CancellationToken>>,
+    /// This node's identity-derived mesh IPv6. Handed to the OS-DNS backend,
+    /// which on macOS publishes it as the address of the service our resolver
+    /// belongs to; never rotates, so it is captured once at construction.
+    mesh_v6: Ipv6Addr,
 }
 
 impl DnsService {
@@ -43,6 +48,7 @@ impl DnsService {
         hostname_table: dns::HostnameTable,
         reverse_table: dns::ReverseLookupTable,
         resolver: std::sync::Arc<crate::dns::resolver::Resolver>,
+        mesh_v6: Ipv6Addr,
     ) -> Self {
         Self {
             hostname_table,
@@ -51,6 +57,7 @@ impl DnsService {
             configurator: Arc::new(std::sync::Mutex::new(None)),
             reassert_token: std::sync::Mutex::new(None),
             configure_retry: std::sync::Mutex::new(None),
+            mesh_v6,
         }
     }
 
@@ -75,7 +82,7 @@ impl DnsService {
         if let Some(retry) = self.configure_retry.lock().unwrap().take() {
             retry.cancel();
         }
-        match dns_config::detect_and_configure(tun_name).await {
+        match dns_config::detect_and_configure(tun_name, self.mesh_v6).await {
             Ok(c) => self.adopt_configurator(c),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to configure system DNS, retrying in the background");
@@ -134,7 +141,7 @@ impl DnsService {
                     _ = token.cancelled() => return,
                     _ = tokio::time::sleep(delay) => {}
                 }
-                match dns_config::detect_and_configure(&tun_name).await {
+                match dns_config::detect_and_configure(&tun_name, me.mesh_v6).await {
                     Ok(c) => {
                         // `revert` may have run while detection was in flight; it
                         // cancelled us, so drop the configuration on the floor

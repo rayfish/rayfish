@@ -538,6 +538,7 @@ async fn build_daemon_inner(
         hostname_table,
         reverse_table,
         dns_resolver.clone(),
+        derive_ipv6(&identity.local_identity()),
     ));
     let mdns_enabled = app_config.mdns_enabled;
     // Stays empty when mDNS is off, so `ray mdns scan` reports nothing rather
