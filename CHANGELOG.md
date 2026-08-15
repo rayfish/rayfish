@@ -123,6 +123,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "rayfish daemon is not running". A request the daemon cannot decode at all now
   comes back as an error rather than a closed connection, which the client could
   only report as "connection closed".
+
 - **Magic DNS falls back to your normal DNS for any name the mesh doesn't
   hold.** A network named `dev` used to be registered with the OS as its own
   domain, so every lookup under it, `zed.dev` included, was captured by rayfish
