@@ -1,6 +1,5 @@
 //! Three-word network name generation (adjective-noun-noun).
 
-
 use rand::RngExt;
 
 pub const ADJECTIVES: &[&str] = &[

@@ -1250,7 +1250,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_set_hostname() != 56819.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_start() != 3926.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_start() != 31235.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_start_pairing() != 51955.toShort()) {
@@ -1890,7 +1890,8 @@ public interface NodeInterface {
      *
      * [`Ipv6OnlyMode::Auto`] hands the decision to the core, which looks at the
      * device's own addresses; the result is reported back through
-     * [`Status::ipv6_only`] and [`Status::ipv6_only_auto`].
+     * [`Status::ipv6_only`], which says `Auto` when the core turned the mode on
+     * by itself.
      * [`Ipv6OnlyMode::Off`] on a device that already has a `100.64.x.x` address
      * is an error rather than an override: it is an explicit instruction not to
      * run in the only mode that would work there.
@@ -2605,7 +2606,8 @@ open class Node: Disposable, AutoCloseable, NodeInterface
      *
      * [`Ipv6OnlyMode::Auto`] hands the decision to the core, which looks at the
      * device's own addresses; the result is reported back through
-     * [`Status::ipv6_only`] and [`Status::ipv6_only_auto`].
+     * [`Status::ipv6_only`], which says `Auto` when the core turned the mode on
+     * by itself.
      * [`Ipv6OnlyMode::Off`] on a device that already has a `100.64.x.x` address
      * is an error rather than an override: it is an explicit instruction not to
      * run in the only mode that would work there.
@@ -3284,15 +3286,13 @@ data class Status (
     var `ipv4`: kotlin.String, 
     var `ipv6`: kotlin.String, 
     /**
-     * Whether the running node's data plane is IPv6-only.
+     * The running node's data-plane mode. `On` and `Auto` both mean IPv6-only;
+     * `Auto` says it was decided for the user (something else on this device
+     * already holds `100.64.0.0/10`) rather than chosen in the app, so the
+     * screen can report what `Auto` resolved to instead of leaving it a
+     * mystery.
      */
-    var `ipv6Only`: kotlin.Boolean, 
-    /**
-     * Whether that was decided for the user (something else on this device
-     * already holds `100.64.0.0/10`) rather than chosen in the app. Lets the
-     * screen say what `Auto` resolved to instead of leaving it a mystery.
-     */
-    var `ipv6OnlyAuto`: kotlin.Boolean, 
+    var `ipv6Only`: Ipv6OnlyMode, 
     var `peers`: List<PeerInfo>, 
     var `networks`: List<NetworkDetail>, 
     var `pendingNetworks`: List<kotlin.String>
@@ -3311,8 +3311,7 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
-            FfiConverterBoolean.read(buf),
-            FfiConverterBoolean.read(buf),
+            FfiConverterTypeIpv6OnlyMode.read(buf),
             FfiConverterSequenceTypePeerInfo.read(buf),
             FfiConverterSequenceTypeNetworkDetail.read(buf),
             FfiConverterSequenceString.read(buf),
@@ -3324,8 +3323,7 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterString.allocationSize(value.`nodeId`) +
             FfiConverterString.allocationSize(value.`ipv4`) +
             FfiConverterString.allocationSize(value.`ipv6`) +
-            FfiConverterBoolean.allocationSize(value.`ipv6Only`) +
-            FfiConverterBoolean.allocationSize(value.`ipv6OnlyAuto`) +
+            FfiConverterTypeIpv6OnlyMode.allocationSize(value.`ipv6Only`) +
             FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`) +
             FfiConverterSequenceTypeNetworkDetail.allocationSize(value.`networks`) +
             FfiConverterSequenceString.allocationSize(value.`pendingNetworks`)
@@ -3336,8 +3334,7 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterString.write(value.`nodeId`, buf)
             FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`ipv6`, buf)
-            FfiConverterBoolean.write(value.`ipv6Only`, buf)
-            FfiConverterBoolean.write(value.`ipv6OnlyAuto`, buf)
+            FfiConverterTypeIpv6OnlyMode.write(value.`ipv6Only`, buf)
             FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
             FfiConverterSequenceTypeNetworkDetail.write(value.`networks`, buf)
             FfiConverterSequenceString.write(value.`pendingNetworks`, buf)

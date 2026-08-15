@@ -175,7 +175,7 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             // so the subtitle reports what it resolved to rather than repeating
             // the setting back at the user.
             subtitle = when (ipv6Mode) {
-                Ipv6OnlyMode.AUTO -> if (status?.ipv6Only == true) {
+                Ipv6OnlyMode.AUTO -> if (status?.ipv6Only != Ipv6OnlyMode.OFF) {
                     "auto · on, something here already uses 100.64.x.x · reconnects"
                 } else {
                     "auto · off, nothing else is using 100.64.x.x · reconnects"

@@ -12,6 +12,7 @@
 
 use std::net::IpAddr;
 
+use rayfish::config::Ipv6Only;
 use rayfish::daemon::build_headless;
 use rayfish::dns::MAGIC_DNS_V6;
 use rayfish::dns::config::resolver_addr;
@@ -25,13 +26,13 @@ async fn ipv6_only_argument_overrides_config() {
 
     // A fresh config dir, so the on-disk setting is at its default: auto, which
     // stores nothing. The argument below is the only thing asking for IPv6-only.
-    assert_eq!(rayfish::config::load().unwrap().ipv6_only, None);
+    assert_eq!(rayfish::config::load().unwrap().ipv6_only, Ipv6Only::Auto);
 
     // Bounded like the other headless-build tests: a startup regression should
     // fail fast rather than hang the suite.
     let daemon = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        build_headless(false, true),
+        build_headless(false, Ipv6Only::On),
     )
     .await
     .expect("build_headless should not hang")
@@ -39,7 +40,11 @@ async fn ipv6_only_argument_overrides_config() {
 
     match daemon.status() {
         IpcMessage::StatusResponse { ipv6_only, .. } => {
-            assert!(ipv6_only, "the daemon runs in the mode it was asked for")
+            assert_eq!(
+                ipv6_only,
+                Ipv6Only::On,
+                "the daemon runs in the mode it was asked for, and says it was asked"
+            )
         }
         other => panic!("expected a status response, got {other:?}"),
     }

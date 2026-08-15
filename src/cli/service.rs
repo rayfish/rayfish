@@ -1,6 +1,7 @@
 //! CLI service-management handlers: up, install, start/stop/restart, operator.
 
 use crate::*;
+use rayfish::config::Ipv6Only;
 #[cfg(target_os = "linux")]
 use rayfish::init_system::InitSystem;
 #[cfg(target_os = "macos")]
@@ -86,7 +87,7 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
 /// to bring the TUN up, configure DNS, and reconnect networks. Only when no
 /// daemon is reachable do we fall back to installing/starting the system
 /// service, which requires root.
-pub(crate) async fn cmd_up(hostname: Option<String>, ipv6_only: Option<bool>) -> Result<()> {
+pub(crate) async fn cmd_up(hostname: Option<String>, ipv6_only: Option<Ipv6Only>) -> Result<()> {
     if let Ok(mut stream) = ipc::connect().await {
         ipc::send(
             &mut stream,
@@ -124,7 +125,7 @@ pub(crate) async fn cmd_up(hostname: Option<String>, ipv6_only: Option<bool>) ->
 /// instead of seeing a cheerful "started" followed by a dead `ray status`.
 pub(crate) async fn install_and_start_service(
     hostname: Option<String>,
-    ipv6_only: Option<bool>,
+    ipv6_only: Option<Ipv6Only>,
 ) -> Result<()> {
     ensure_service_installed()?;
     // We are root here, which is what it takes to write into the directories

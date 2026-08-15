@@ -24,6 +24,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
+import uniffi.ray_mobile.Ipv6OnlyMode
 
 /**
  * Foreground [VpnService] that captures the phone's packets and hands the tunnel
@@ -352,7 +353,7 @@ class RayfishVpnService : VpnService() {
         // because on Auto the pref does not know the answer: the core decided it
         // at start from the addresses on this device.
         val ipv6Only = try {
-            NodeHolder.get(applicationContext).status().ipv6Only
+            NodeHolder.get(applicationContext).status().ipv6Only != Ipv6OnlyMode.OFF
         } catch (t: Throwable) {
             Log.e(TAG, "could not read the node's IPv6-only mode; assuming dual-stack", t)
             false

@@ -414,14 +414,7 @@ impl NetworkRegistry {
             };
 
             match self
-                .run_join_handshake(
-                    ctx,
-                    data,
-                    conn,
-                    true,
-                    &cancel,
-                    ctx.invite.clone(),
-                )
+                .run_join_handshake(ctx, data, conn, true, &cancel, ctx.invite.clone())
                 .await
             {
                 Ok(JoinResult::Joined(state)) => {
@@ -516,14 +509,7 @@ impl NetworkRegistry {
         .await
         {
             Ok(conn) => match self
-                .run_join_handshake(
-                    ctx,
-                    data,
-                    conn,
-                    false,
-                    &cancel,
-                    ctx.invite.clone(),
-                )
+                .run_join_handshake(ctx, data, conn, false, &cancel, ctx.invite.clone())
                 .await
             {
                 Ok(JoinResult::Joined(state)) => state,

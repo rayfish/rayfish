@@ -15,15 +15,16 @@
 //! settings store is the authority instead of `settings.toml`.
 
 use super::super::*;
+use crate::config::Ipv6Only;
 
 /// What to do about the data plane's address families, given the `ipv6-only`
 /// setting and whether another VPN was found on `100.64.0.0/10`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Ipv6OnlyDecision {
-    /// Both families, the normal case.
-    DualStack,
-    /// IPv6-only. `auto` when the scan decided it rather than the operator.
-    Ipv6Only { auto: bool },
+    /// The mode to run in, as `ray status` reports it: [`Ipv6Only::Off`] is the
+    /// normal dual-stack data plane, [`Ipv6Only::Auto`] is the mode with the
+    /// scan having chosen it.
+    Mode(Ipv6Only),
     /// Refuse to start: the operator asked for both families on a host where
     /// mesh IPv4 cannot work.
     Refuse,
@@ -32,21 +33,21 @@ pub enum Ipv6OnlyDecision {
 /// The `ipv6-only` decision table. Pure, so the six cases are testable without
 /// a network interface in sight.
 ///
-/// `Some(true)` needs no scan at all (the caller skips it and passes
+/// [`Ipv6Only::On`] needs no scan at all (the caller skips it and passes
 /// `conflict = false`), because the mode it asks for is exactly the one a
 /// conflict would force.
-pub fn decide_ipv6_only(setting: Option<bool>, conflict: bool) -> Ipv6OnlyDecision {
+pub fn decide_ipv6_only(setting: Ipv6Only, conflict: bool) -> Ipv6OnlyDecision {
     match (setting, conflict) {
-        (Some(true), _) => Ipv6OnlyDecision::Ipv6Only { auto: false },
-        (Some(false), false) | (None, false) => Ipv6OnlyDecision::DualStack,
-        (Some(false), true) => Ipv6OnlyDecision::Refuse,
-        (None, true) => Ipv6OnlyDecision::Ipv6Only { auto: true },
+        (Ipv6Only::On, _) => Ipv6OnlyDecision::Mode(Ipv6Only::On),
+        (Ipv6Only::Off, false) | (Ipv6Only::Auto, false) => Ipv6OnlyDecision::Mode(Ipv6Only::Off),
+        (Ipv6Only::Off, true) => Ipv6OnlyDecision::Refuse,
+        (Ipv6Only::Auto, true) => Ipv6OnlyDecision::Mode(Ipv6Only::Auto),
     }
 }
 
 /// Resolve the `ipv6-only` setting against what is actually on this host,
-/// returning `(ipv6_only, auto)`. `None` is "auto": scan, and take the mode if
-/// something else already holds the CGNAT range.
+/// returning the mode to run in: [`Ipv6Only::Auto`] is the answer when the scan
+/// (not the operator) turned the mode on.
 ///
 /// Errors only in the [`Ipv6OnlyDecision::Refuse`] case, carrying the scan's own
 /// description of the conflicting interface and address.
@@ -54,7 +55,7 @@ pub fn decide_ipv6_only(setting: Option<bool>, conflict: bool) -> Ipv6OnlyDecisi
 /// Part of the embedding API: Android calls this with the app's tri-state
 /// setting, exactly as `run_daemon` calls it with the config's.
 #[cfg(not(target_os = "android"))]
-pub async fn resolve_ipv6_only(setting: Option<bool>) -> Result<(bool, bool)> {
+pub async fn resolve_ipv6_only(setting: Ipv6Only) -> Result<Ipv6Only> {
     resolve_with(setting, crate::tun::check_cgnat_conflict().await.err())
 }
 
@@ -63,7 +64,7 @@ pub async fn resolve_ipv6_only(setting: Option<bool>) -> Result<(bool, bool)> {
 /// `VpnService` interface already up, and seeing our own mesh IPv4 there would
 /// latch the mode on for good.
 #[cfg(target_os = "android")]
-pub async fn resolve_ipv6_only(setting: Option<bool>) -> Result<(bool, bool)> {
+pub async fn resolve_ipv6_only(setting: Ipv6Only) -> Result<Ipv6Only> {
     let own = own_mesh_ipv4();
     resolve_with(setting, crate::tun::check_cgnat_conflict(own).await.err())
 }
@@ -82,15 +83,14 @@ fn own_mesh_ipv4() -> Option<std::net::Ipv4Addr> {
 }
 
 /// Shared tail of both `resolve_ipv6_only`s: apply the table to a scan result.
-fn resolve_with(setting: Option<bool>, conflict: Option<anyhow::Error>) -> Result<(bool, bool)> {
+fn resolve_with(setting: Ipv6Only, conflict: Option<anyhow::Error>) -> Result<Ipv6Only> {
     // Asking for the mode outright means the scan cannot change the answer.
-    if setting == Some(true) {
-        return Ok((true, false));
+    if setting == Ipv6Only::On {
+        return Ok(Ipv6Only::On);
     }
     match decide_ipv6_only(setting, conflict.is_some()) {
-        Ipv6OnlyDecision::DualStack => Ok((false, false)),
-        Ipv6OnlyDecision::Ipv6Only { auto } => {
-            if let Some(e) = conflict {
+        Ipv6OnlyDecision::Mode(mode) => {
+            if let Some(e) = conflict.filter(|_| mode.enabled()) {
                 tracing::warn!(
                     "{e} Starting the IPv6-only data plane instead, so the two can share this \
                      host; mesh IPv4 carries no traffic and `.ray` names answer AAAA only. \
@@ -98,7 +98,7 @@ fn resolve_with(setting: Option<bool>, conflict: Option<anyhow::Error>) -> Resul
                      to on to make the mode permanent."
                 );
             }
-            Ok((true, auto))
+            Ok(mode)
         }
         // Only reachable with a conflict in hand (see the table above).
         Ipv6OnlyDecision::Refuse => Err(conflict
@@ -171,29 +171,26 @@ impl NetworkRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ipv6OnlyDecision, decide_ipv6_only};
+    use super::{Ipv6Only, Ipv6OnlyDecision, decide_ipv6_only};
 
-    /// The whole point of the tri-state: `off` is a standing refusal, absent is
+    /// The whole point of the tri-state: `off` is a standing refusal, `auto` is
     /// consent to be moved, and `on` never depends on what is on the host.
     #[test]
     fn ipv6_only_decision_table() {
         use Ipv6OnlyDecision::*;
 
         // Configured on: the mode is the mode, scan or no scan.
-        assert_eq!(
-            decide_ipv6_only(Some(true), false),
-            Ipv6Only { auto: false }
-        );
-        assert_eq!(decide_ipv6_only(Some(true), true), Ipv6Only { auto: false });
+        assert_eq!(decide_ipv6_only(Ipv6Only::On, false), Mode(Ipv6Only::On));
+        assert_eq!(decide_ipv6_only(Ipv6Only::On, true), Mode(Ipv6Only::On));
 
         // Configured off: dual-stack, and a conflict is fatal rather than
         // quietly overridden.
-        assert_eq!(decide_ipv6_only(Some(false), false), DualStack);
-        assert_eq!(decide_ipv6_only(Some(false), true), Refuse);
+        assert_eq!(decide_ipv6_only(Ipv6Only::Off, false), Mode(Ipv6Only::Off));
+        assert_eq!(decide_ipv6_only(Ipv6Only::Off, true), Refuse);
 
         // Auto: dual-stack on a clean host, IPv6-only on a shared one, and the
-        // switch is marked so the UI can say the daemon chose it.
-        assert_eq!(decide_ipv6_only(None, false), DualStack);
-        assert_eq!(decide_ipv6_only(None, true), Ipv6Only { auto: true });
+        // answer says which, so the UI can report a mode nobody asked for.
+        assert_eq!(decide_ipv6_only(Ipv6Only::Auto, false), Mode(Ipv6Only::Off));
+        assert_eq!(decide_ipv6_only(Ipv6Only::Auto, true), Mode(Ipv6Only::Auto));
     }
 }

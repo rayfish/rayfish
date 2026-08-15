@@ -14,7 +14,8 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
 
 use crate::{
-    Action, Direction, GroupMode, NetworkKey, NodeKey, Protocol, SuggestedFirewall, TransportMode,
+    Action, Direction, GroupMode, Ipv6Only, NetworkKey, NodeKey, Protocol, SuggestedFirewall,
+    TransportMode,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,11 +75,10 @@ pub enum IpcMessage {
     Up {
         #[serde(default)]
         hostname: Option<String>,
-        /// `Some(true)` asks to switch the data plane to IPv6-only (see
-        /// `AppConfig::ipv6_only`). `None` leaves the setting untouched, which
-        /// is what a plain `ray up` sends.
+        /// Asks to pin the `ipv6-only` setting (see `AppConfig::ipv6_only`).
+        /// `None` leaves it untouched, which is what a plain `ray up` sends.
         #[serde(default)]
-        ipv6_only: Option<bool>,
+        ipv6_only: Option<Ipv6Only>,
     },
     /// Put the daemon on standby: tear down active network connections, revert
     /// system DNS, and bring the TUN interface down. The daemon process keeps
@@ -391,16 +391,14 @@ pub enum IpcMessage {
         /// restart). Defaulted so an older CLI/daemon pair still deserializes.
         #[serde(default)]
         auto_update: bool,
-        /// Whether the running daemon's data plane is IPv6-only. Mesh IPv4 is
-        /// not routable in that mode, so `ray status` shows the IPv6 address in
-        /// place of the IPv4 one.
-        #[serde(default)]
-        ipv6_only: bool,
-        /// Whether that mode was chosen by the daemon at startup (another VPN
-        /// holds `100.64.0.0/10`) rather than configured. Shown so the mode is
-        /// not mistaken for a setting. Defaulted for older daemons.
-        #[serde(default)]
-        ipv6_only_auto: bool,
+        /// The running daemon's data-plane mode. `On` and `Auto` both mean
+        /// IPv6-only (mesh IPv4 is not routable, so `ray status` shows the IPv6
+        /// address in place of the IPv4 one); `Auto` additionally says the
+        /// daemon chose it at startup, another VPN holding `100.64.0.0/10`, so
+        /// a mode nobody asked for still explains itself. An older daemon does
+        /// not send the field at all, and is not in the mode.
+        #[serde(default = "Ipv6Only::off")]
+        ipv6_only: Ipv6Only,
         /// Whether the VPN is active (TUN up, networks connected) or on standby.
         active: bool,
         /// This node's contact id (`ray connect`), shown at the top of status.
@@ -1457,8 +1455,7 @@ mod tests {
             pending_files: 0,
             pending_connects: 0,
             pending_networks: vec![],
-            ipv6_only: false,
-            ipv6_only_auto: false,
+            ipv6_only: Ipv6Only::Off,
             lan_peers: vec![LanPeerInfo {
                 endpoint_id: peer_id,
                 short_id: peer_id.fmt_short().to_string(),

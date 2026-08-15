@@ -107,6 +107,7 @@ pub use mesh::run_daemon;
 pub use mesh::{build_headless, build_headless_with_setting};
 // The IPv6-only decision, resolved from a tri-state setting plus a scan of this
 // host. Public because the embedder (mobile) holds its own copy of the setting.
+use crate::config::Ipv6Only;
 pub use mesh::resolve_ipv6_only;
 
 /// Legacy name for [`Daemon`], kept so embedders (`ray-mobile`) that were
@@ -479,15 +480,17 @@ pub struct Daemon {
     /// on` / `ray install --auto-update`). Read at startup; when set, `run_daemon`
     /// spawns the periodic update task. Echoed back in `ray status`.
     auto_update: bool,
-    /// IPv6-only data plane (`ray config set ipv6-only on`), for sharing a host
-    /// with another VPN that owns `100.64.0.0/10`. Read once at startup because
-    /// the TUN's addressing is decided there; `ray up --ipv6-only` persists the
-    /// setting and asks for a restart rather than pretending to apply it live.
-    pub(crate) ipv6_only: bool,
-    /// Whether [`Self::ipv6_only`] was decided by the startup scan finding
-    /// another VPN on `100.64.0.0/10`, rather than configured. Reported by
-    /// `ray status` so a mode nobody asked for still explains itself.
-    pub(crate) ipv6_only_auto: bool,
+    /// The resolved data-plane mode (`ray config set ipv6-only on`), for
+    /// sharing a host with another VPN that owns `100.64.0.0/10`. Resolved once
+    /// at startup because the TUN's addressing is decided there; `ray up
+    /// --ipv6-only` persists the setting and asks for a restart rather than
+    /// pretending to apply it live.
+    ///
+    /// [`Ipv6Only::Auto`] here is not "undecided": it is the mode, on, with the
+    /// startup scan having chosen it rather than the operator, which `ray
+    /// status` reports so a mode nobody asked for still explains itself. Ask
+    /// [`Ipv6Only::enabled`] whether mesh IPv4 carries traffic.
+    pub(crate) ipv6_only: Ipv6Only,
     /// Name of the OS TUN device (desktop) or a placeholder until a packet
     /// interface is attached. Interior-mutable because on embedders (mobile) the
     /// interface is attached after construction via [`Daemon::attach_tun`],
@@ -540,10 +543,10 @@ pub struct Daemon {
     #[cfg(feature = "desktop")]
     ssh_authz: crate::ssh::SshAuthz,
     /// Cancellation token for the running SSH listeners (`None` when off / on
-    /// standby). Set by [`Daemon::start_ssh`], cleared by `stop_ssh`.
-    // The only readers/writers (`start_ssh`/`stop_ssh`) are desktop-only, so on a
-    // `--no-default-features` (Android) build the field is inert; silence the
-    // resulting dead-code warning there rather than dropping the field.
+    /// standby). Set by [`Daemon::start_ssh`], cleared by `stop_ssh`, which are
+    /// the only readers and are desktop-only, so the field does not exist on an
+    /// Android build at all.
+    #[cfg(feature = "desktop")]
     ssh_token: Mutex<Option<CancellationToken>>,
 }
 
@@ -1123,7 +1126,7 @@ impl Daemon {
                 // The client-side full tunnel is IPv4 policy routing through the
                 // exit peer's mesh IPv4, which this node does not have a working
                 // path to in IPv6-only mode. Clearing a selection stays allowed.
-                if peer.is_some() && self.ipv6_only {
+                if peer.is_some() && self.ipv6_only.enabled() {
                     return ipc_err(
                         "cannot use an exit node in IPv6-only mode: the full tunnel routes \
                          over mesh IPv4. Turn the mode off (`ray config set ipv6-only off`) \
@@ -1278,7 +1281,7 @@ impl Daemon {
             &self.dns.reverse_table,
             network,
             &new_hostname,
-            (!self.ipv6_only).then_some(my_ip),
+            (!self.ipv6_only.enabled()).then_some(my_ip),
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
@@ -1409,9 +1412,9 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
         // Worth saying what it resolved to rather than echoing the key: `auto`
         // is not a mode, it is a decision the next start makes.
         GlobalKey::Ipv6Only => match cfg.ipv6_only {
-            Some(true) => format!("IPv6-only mode on. {restart}"),
-            Some(false) => format!("IPv6-only mode off. {restart}"),
-            None => format!(
+            Ipv6Only::On => format!("IPv6-only mode on. {restart}"),
+            Ipv6Only::Off => format!("IPv6-only mode off. {restart}"),
+            Ipv6Only::Auto => format!(
                 "IPv6-only mode automatic: on when another VPN holds 100.64.0.0/10. {restart}"
             ),
         },
@@ -2676,7 +2679,7 @@ mod headless_tests {
 
         let daemon = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            build_headless(false, false),
+            build_headless(false, Ipv6Only::Off),
         )
         .await
         .expect("build_headless should not hang")
@@ -2705,7 +2708,7 @@ mod headless_tests {
 
         let daemon = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            build_headless(false, false),
+            build_headless(false, Ipv6Only::Off),
         )
         .await
         .expect("build_headless should not hang")
@@ -2758,10 +2761,13 @@ mod headless_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let first = tokio::time::timeout(Duration::from_secs(30), build_headless(false, false))
-            .await
-            .expect("first build_headless should not hang")
-            .expect("first build_headless should succeed");
+        let first = tokio::time::timeout(
+            Duration::from_secs(30),
+            build_headless(false, Ipv6Only::Off),
+        )
+        .await
+        .expect("first build_headless should not hang")
+        .expect("first build_headless should succeed");
         tokio::time::timeout(Duration::from_secs(30), first.shutdown_and_close())
             .await
             .expect("shutdown_and_close should not hang");
@@ -2787,10 +2793,13 @@ mod headless_tests {
         let _ = reopened.shutdown().await;
 
         // And the whole rebuild works, which is what the app actually does.
-        tokio::time::timeout(Duration::from_secs(30), build_headless(false, false))
-            .await
-            .expect("rebuild should not hang")
-            .expect("rebuilding after shutdown_and_close should succeed");
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            build_headless(false, Ipv6Only::Off),
+        )
+        .await
+        .expect("rebuild should not hang")
+        .expect("rebuilding after shutdown_and_close should succeed");
     }
 
     // See `build_headless_returns_usable_state_without_ipc_socket`: `ENV_LOCK`
@@ -2804,7 +2813,7 @@ mod headless_tests {
 
         let daemon = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            build_headless(false, false),
+            build_headless(false, Ipv6Only::Off),
         )
         .await
         .expect("build_headless should not hang")
@@ -2913,7 +2922,7 @@ mod headless_tests {
 
         let daemon = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            build_headless(false, false),
+            build_headless(false, Ipv6Only::Off),
         )
         .await
         .expect("build_headless should not hang")

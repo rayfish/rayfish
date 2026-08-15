@@ -882,7 +882,7 @@ impl Daemon {
         );
         // IPv6-only mode carries no mesh IPv4, so binding our v4 would create a
         // listener nothing can reach.
-        let binds = if self.ipv6_only {
+        let binds = if self.ipv6_only.enabled() {
             vec![IpAddr::V6(my_v6)]
         } else {
             vec![IpAddr::V4(my_v4), IpAddr::V6(my_v6)]
@@ -911,7 +911,7 @@ impl Daemon {
     pub async fn activate(
         self: &Arc<Self>,
         hostname: Option<String>,
-        ipv6_only: Option<bool>,
+        ipv6_only: Option<Ipv6Only>,
     ) -> IpcMessage {
         // Persist the personal default hostname first (before the already-active
         // short-circuit) so `ray up --hostname X` records the new default even
@@ -946,12 +946,12 @@ impl Daemon {
         // would vanish along with that VPN.
         let restart_note = match ipv6_only {
             Some(want) => match config::load() {
-                Ok(mut app_config) if app_config.ipv6_only != Some(want) => {
-                    app_config.ipv6_only = Some(want);
+                Ok(mut app_config) if app_config.ipv6_only != want => {
+                    app_config.ipv6_only = want;
                     match config::save_settings(&app_config) {
                         // Only a data plane that is not already in the requested
                         // mode needs the restart.
-                        Ok(()) if want != self.ipv6_only => Some(
+                        Ok(()) if want.enabled() != self.ipv6_only.enabled() => Some(
                             ". IPv6-only mode set; restart the daemon for changes to take effect.",
                         ),
                         Ok(()) => None,
@@ -1008,7 +1008,7 @@ impl Daemon {
             // link-up: on Linux the kernel won't install an IPv6 connected route
             // while the link is down, so without this peer traffic leaks out the
             // default route.
-            if let Err(e) = tun::route_peer_range(&tun_name, self.ipv6_only).await {
+            if let Err(e) = tun::route_peer_range(&tun_name, self.ipv6_only.enabled()).await {
                 tracing::warn!(error = %e, "failed to route 200::/7 into TUN");
                 warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
             }
@@ -1017,7 +1017,7 @@ impl Daemon {
             // route above already delivers. Installing the v4 `/32` there would
             // plant a dead route inside the `100.64.0.0/10` range this mode
             // exists to hand over to another VPN.
-            if !self.ipv6_only
+            if !self.ipv6_only.enabled()
                 && let Err(e) = tun::route_magic_dns(&tun_name).await
             {
                 tracing::warn!(error = %e, "failed to route magic DNS IP into TUN");
@@ -1028,7 +1028,7 @@ impl Daemon {
             // the TUN, where the forwarding loop would drop it as "no peer for
             // dst". No-op on Linux (kernel installs the `local` route
             // automatically).
-            if let Err(e) = tun::route_self_loopback(my_v4, my_v6, self.ipv6_only).await {
+            if let Err(e) = tun::route_self_loopback(my_v4, my_v6, self.ipv6_only.enabled()).await {
                 tracing::warn!(error = %e, "failed to install loopback self-route");
                 warnings.push(format!("failed to install loopback self-route: {e}"));
             }
@@ -1052,7 +1052,7 @@ impl Daemon {
             if let Some(w) = crate::hostfw::check_inbound_tcp(
                 &dns_tun_name,
                 crate::ssh::SSH_LISTEN_PORT,
-                self.ipv6_only,
+                self.ipv6_only.enabled(),
             )
             .warning(crate::ssh::SSH_LISTEN_PORT)
             {

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use iroh::EndpointId;
 
+use crate::config::Ipv6Only;
 use crate::*;
 
 /// Human-readable byte size (GiB/MiB/KiB/B) for traffic and transfer counters.
@@ -138,7 +139,6 @@ pub(crate) async fn ipc_status() -> Result<()> {
             mdns_enabled,
             auto_update,
             ipv6_only,
-            ipv6_only_auto,
             active,
             contact_id,
             daemon_version,
@@ -166,8 +166,8 @@ pub(crate) async fn ipc_status() -> Result<()> {
                         }))
                         .collect::<Vec<_>>(),
                     "auto_update": auto_update,
+                    // "on", "off", or "auto" (on, chosen by the daemon).
                     "ipv6_only": ipv6_only,
-                    "ipv6_only_auto": ipv6_only_auto,
                     "active": active,
                     "contact_id": contact_id,
                     "daemon_version": daemon_version,
@@ -210,15 +210,17 @@ pub(crate) async fn ipc_status() -> Result<()> {
             // something when the data plane is actually running without IPv4.
             // `(auto)` marks a mode the daemon chose on finding another VPN on
             // `100.64.0.0/10`, which nobody would otherwise know to expect.
-            let v6only = if ipv6_only {
-                let how = if ipv6_only_auto {
-                    format!("{} {}", style::green("on"), style::faint("(auto)"))
-                } else {
-                    style::green("on").to_string()
-                };
-                format!("      {} {how}", style::label("ipv6-only"))
-            } else {
-                String::new()
+            let v6only = match ipv6_only {
+                Ipv6Only::Off => String::new(),
+                mode => {
+                    let how = match mode {
+                        Ipv6Only::Auto => {
+                            format!("{} {}", style::green("on"), style::faint("(auto)"))
+                        }
+                        _ => style::green("on").to_string(),
+                    };
+                    format!("      {} {how}", style::label("ipv6-only"))
+                }
             };
             println!();
             println!(
@@ -243,7 +245,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 println!("  {}", style::faint("no active networks"));
             } else {
                 for net in &networks {
-                    print_network(net, ipv6_only);
+                    print_network(net, ipv6_only.enabled());
                 }
             }
 

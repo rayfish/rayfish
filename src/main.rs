@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use clap::{FromArgMatches, Parser, Subcommand};
 use ray_proto::settings::node_key_help;
 
+use config::Ipv6Only;
 use membership::GroupMode;
 
 // The CLI command handlers are split into the `cli` module (`src/cli/`) to keep
@@ -1321,7 +1322,7 @@ async fn run() -> Result<()> {
         Command::Up {
             hostname,
             ipv6_only,
-        } => cmd_up(hostname, ipv6_only.then_some(true)).await,
+        } => cmd_up(hostname, ipv6_only.then_some(Ipv6Only::On)).await,
         Command::Down => ipc_down().await,
         Command::Stop => cmd_stop().await,
         Command::Start => cmd_start().await,

@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::membership::GroupMode;
 
+/// The `ipv6-only` tri-state, also the shape `ray status` reports it in.
+pub use ray_proto::Ipv6Only;
 /// Per-network transport preference. Defined in `ray-proto` (shared with GUI
 /// frontends); re-exported here so existing `crate::config::TransportMode` paths work.
 pub use ray_proto::TransportMode;
@@ -413,14 +415,13 @@ pub struct AppConfig {
     /// all key on it. Read once at daemon start (the TUN is built there), so a
     /// change needs a restart.
     ///
-    /// Three states, because "off" has to be sayable: `Some(true)` on,
-    /// `Some(false)` off, and `None` (the key absent, the default) auto, which
-    /// starts the daemon in this mode when the startup scan finds another VPN
-    /// already on `100.64.0.0/10`. An auto decision is never written back, so
-    /// the mode follows the host and stops when the other VPN does; `Some(false)`
-    /// is a standing instruction to refuse to start on such a host instead.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ipv6_only: Option<bool>,
+    /// [`Ipv6Only::Auto`] (the key absent, the default) starts the daemon in
+    /// this mode when the startup scan finds another VPN already on
+    /// `100.64.0.0/10`. An auto decision is never written back, so the mode
+    /// follows the host and stops when the other VPN does; [`Ipv6Only::Off`] is
+    /// a standing instruction to refuse to start on such a host instead.
+    #[serde(default, skip_serializing_if = "Ipv6Only::is_auto")]
+    pub ipv6_only: Ipv6Only,
     /// Seconds of no traffic before an on-demand node closes a peer connection.
     /// `None` uses [`DEFAULT_IDLE_TIMEOUT_SECS`]. Only consulted when `on_demand`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -479,7 +480,7 @@ impl Default for AppConfig {
             dns_upstreams: ServerOverride::default(),
             ssh_enabled: false,
             on_demand: true,
-            ipv6_only: None,
+            ipv6_only: Ipv6Only::default(),
             idle_timeout_secs: None,
             auto_update: false,
             auto_update_last_target: None,
@@ -580,8 +581,8 @@ struct Settings {
     ssh_enabled: bool,
     #[serde(default = "default_true")]
     on_demand: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ipv6_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Ipv6Only::is_auto")]
+    ipv6_only: Ipv6Only,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     idle_timeout_secs: Option<u64>,
     #[serde(default)]
@@ -1677,7 +1678,7 @@ name = "test"
         let mut cfg = AppConfig::default();
         config_set(&mut cfg, settings::GlobalKey::Ipv6Only, "on", false).unwrap();
         save_settings_in(dir.path(), &cfg).unwrap();
-        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Some(true));
+        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Ipv6Only::On);
     }
 
     /// `auto` is the absence of the key, so it must not be written: an older
@@ -1692,7 +1693,7 @@ name = "test"
 
         let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
         assert!(!raw.contains("ipv6_only"), "auto wrote a value: {raw}");
-        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, None);
+        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Ipv6Only::Auto);
     }
 
     /// A settings.toml written before the tri-state names a bare boolean, and it
@@ -1701,10 +1702,14 @@ name = "test"
     fn a_stored_boolean_still_parses() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(SETTINGS_FILE), "ipv6_only = true\n").unwrap();
-        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Some(true));
+        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Ipv6Only::On);
 
         std::fs::write(dir.path().join(SETTINGS_FILE), "ipv6_only = false\n").unwrap();
-        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Some(false));
+        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Ipv6Only::Off);
+
+        // And the string form every write since produces.
+        std::fs::write(dir.path().join(SETTINGS_FILE), "ipv6_only = \"on\"\n").unwrap();
+        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Ipv6Only::On);
     }
 
     #[test]
