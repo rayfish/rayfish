@@ -5,7 +5,7 @@
 //! adds spinners, changelog printing, root checks, and the service restart.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
@@ -423,23 +423,12 @@ pub(crate) fn print_daemon_log_tail() {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn run_cmd(program: &str, args: &[&str]) {
     match Command::new(program).args(args).status() {
         Ok(status) if status.success() => {}
         Ok(status) => eprintln!("warning: `{program}` exited with {status}"),
         Err(e) => eprintln!("warning: failed to run `{program}`: {e}"),
     }
-}
-
-/// Run a command, ignoring its exit status (used for best-effort teardown).
-#[allow(dead_code)]
-pub(crate) fn run_cmd_quiet(program: &str, args: &[&str]) {
-    let _ = Command::new(program)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 pub(crate) fn cmd_uninstall_service() -> Result<()> {

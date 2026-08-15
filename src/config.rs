@@ -15,29 +15,15 @@ use crate::membership::GroupMode;
 /// frontends); re-exported here so existing `crate::config::TransportMode` paths work.
 pub use ray_proto::TransportMode;
 
-#[allow(dead_code)]
 mod secret_key_hex {
     use iroh::SecretKey;
-    use serde::de::Error;
-    use serde::{self, Deserialize, Deserializer, Serializer};
+    use serde::{self, Serializer};
 
     pub fn serialize<S>(key: &SecretKey, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         serializer.serialize_str(&hex::encode(key.to_bytes()))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<SecretKey, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes: [u8; 32] = hex::decode(&s)
-            .map_err(Error::custom)?
-            .try_into()
-            .map_err(|_| Error::custom("secret key must be 32 bytes"))?;
-        Ok(SecretKey::from(bytes))
     }
 }
 

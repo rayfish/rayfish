@@ -5,8 +5,12 @@
 //! replies to them. Both need the packets to be structurally honest (correct
 //! length fields, a real TCP data offset), which is easy to get subtly wrong
 //! twice.
-
-#![allow(dead_code)] // each test binary uses a different subset
+//!
+//! Each test binary compiles this module and uses a different subset of it, so
+//! "never used" here means "not used by *this* binary" and says nothing about
+//! whether the helper is dead. That is what the blanket allow below is for; it
+//! is not a stand-in for deleting code no one calls.
+#![allow(dead_code)]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

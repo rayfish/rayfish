@@ -14,7 +14,6 @@
 //! `resolve` (reader side), on top of `configure` / `revert` (lifecycle).
 
 use super::*;
-use std::net::Ipv6Addr;
 
 /// First and last backoff step for the OS-DNS configuration retry loop.
 const DNS_CONFIG_RETRY_MIN: Duration = Duration::from_secs(5);
@@ -53,18 +52,6 @@ impl DnsService {
             reassert_token: std::sync::Mutex::new(None),
             configure_retry: std::sync::Mutex::new(None),
         }
-    }
-
-    /// Rebuild one network's forward + reverse `.ray` entries from its roster
-    /// (the roster is the single source of truth for `*.ray`). Writer side.
-    #[allow(dead_code)] // adopted by NetworkRegistry in M5
-    pub(crate) async fn sync_network(
-        &self,
-        network: &str,
-        entries: &[(String, Option<Ipv4Addr>, Ipv6Addr)],
-    ) {
-        dns::sync_network_hostnames(&self.hostname_table, &self.reverse_table, network, entries)
-            .await;
     }
 
     /// Drop a network's `.ray` names entirely (on leave / nuke / kick).

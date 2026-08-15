@@ -503,7 +503,6 @@ pub fn validate_reusable_key<'a>(
 
 impl GroupBlob {
     /// Convenience wrapper over [`validate_reusable_key`] for a decoded blob.
-    #[allow(dead_code)] // used in tests; the daemon calls the free function on NetworkState
     pub fn validate_reusable(&self, secret: &[u8], now: u64) -> Option<&ReusableKey> {
         validate_reusable_key(&self.reusable_keys, secret, now)
     }

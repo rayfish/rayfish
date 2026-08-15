@@ -243,7 +243,7 @@ impl NetworkRegistry {
         let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
         let dht_notify = Arc::new(tokio::sync::Notify::new());
         let ctx = self.mesh_ctx();
-        let (tasks, disconnect_tx) = self.spawn_coordinator_background_tasks(
+        let tasks = self.spawn_coordinator_background_tasks(
             &ctx,
             name,
             &net_secret_key,
@@ -333,7 +333,6 @@ impl NetworkRegistry {
             cancel: cancel.clone(),
             tasks,
             invite_lock,
-            disconnect_tx: disconnect_tx.clone(),
         };
         self.networks.insert(name.to_string(), handle);
         self.refresh_search_domains().await;

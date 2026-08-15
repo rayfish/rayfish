@@ -321,7 +321,6 @@ fn apply_discovery(mut builder: Builder, o: &ServerOverride) -> Result<Builder> 
     Ok(builder)
 }
 
-#[allow(dead_code)]
 pub async fn accept_connection_with_alpn(ep: &Endpoint) -> Result<(Connection, Vec<u8>)> {
     let incoming = ep.accept().await.context("no incoming connection")?;
     let conn = incoming.await.context("failed to accept connection")?;

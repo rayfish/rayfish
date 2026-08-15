@@ -1457,6 +1457,8 @@ mod tests {
             pending_files: 0,
             pending_connects: 0,
             pending_networks: vec![],
+            ipv6_only: false,
+            ipv6_only_auto: false,
             lan_peers: vec![LanPeerInfo {
                 endpoint_id: peer_id,
                 short_id: peer_id.fmt_short().to_string(),

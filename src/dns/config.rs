@@ -983,7 +983,6 @@ impl DnsConfigurator for Resolvconf {
 /// than matching `"nameserver "` matters more than it looks: missing an entry
 /// here doesn't degrade anything, it silently leaves the forwarder with nothing
 /// to forward to.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_resolv_nameservers(contents: &str) -> Vec<Ipv4Addr> {
     contents
         .lines()
@@ -1004,14 +1003,12 @@ fn parse_resolv_nameservers(contents: &str) -> Vec<Ipv4Addr> {
 /// answer `.ray` authoritatively so it never reaches the second entry, but if
 /// our resolver is dead, wedged, or the daemon is gone, the libc resolver moves
 /// on to a real server instead of the machine having no DNS at all.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn render_direct_resolv_conf(search: &[String], fallback: Option<Ipv4Addr>) -> String {
     render_direct_resolv_conf_with(resolver_addr(), search, fallback)
 }
 
 /// The body of [`render_direct_resolv_conf`], with the resolver address passed
 /// in so the rendering is testable without the process-wide mode.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn render_direct_resolv_conf_with(
     resolver: IpAddr,
     search: &[String],
@@ -1030,11 +1027,9 @@ fn render_direct_resolv_conf_with(
 
 #[cfg(target_os = "linux")]
 const BACKUP_SUFFIX: &str = ".before-rayfish";
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const HEADER_COMMENT: &str = "# Added by rayfish - do not edit\n";
 
 /// True iff `/etc/resolv.conf` contents are ours (carry the rayfish marker).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn resolv_conf_is_ours(contents: &str) -> bool {
     contents.contains(HEADER_COMMENT.trim_end())
 }
@@ -1147,7 +1142,6 @@ const NM_CONF_DIR: &str = "/etc/NetworkManager/conf.d";
 const NM_DROPIN: &str = "/etc/NetworkManager/conf.d/rayfish-dns.conf";
 
 /// The `dns=none` drop-in that tells NetworkManager to stop managing resolv.conf.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn nm_dns_none_dropin() -> String {
     format!("{HEADER_COMMENT}[main]\ndns=none\n")
 }
@@ -1364,7 +1358,6 @@ struct DirectResolvConf {
 /// A nameserver inside `100.64.0.0/10` that is not ours is the signal: nothing
 /// in that range is a real resolver, so it can only be another overlay's magic
 /// DNS. Deliberately not a check for any particular vendor's marker line.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn foreign_mesh_resolver(contents: &str) -> Option<Ipv4Addr> {
     if resolv_conf_is_ours(contents) {
         return None;

@@ -26,14 +26,16 @@ jobs:
           shared-key: "ci"
           cache-on-failure: true
 
+      # `--workspace`: ray-proto and ray-mobile are members, and a root-package
+      # build never compiles their tests, so one of them had already gone stale.
       - name: Check
-        run: cargo check --all-targets --locked
+        run: cargo check --workspace --all-targets --locked
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
   # The APK is built on release, which is too late: the Android half of the tree
   # is `#[cfg(target_os = "android")]` Rust plus generated Kotlin bindings, and

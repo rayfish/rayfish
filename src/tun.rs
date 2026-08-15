@@ -276,9 +276,9 @@ fn collect_ipv4_addrs(ifap: *mut libc::ifaddrs) -> Vec<(String, Ipv4Addr)> {
 }
 
 /// The first address in `100.64.0.0/10` that is not ours, if any. Split from
-/// the `getifaddrs` walk (and compiled everywhere) so the rule that decides a
-/// conflict is testable off Android.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+/// the `getifaddrs` walk so the rule that decides a conflict is testable off
+/// Android, which is the only place it runs.
+#[cfg(any(target_os = "android", test))]
 fn find_cgnat_conflict(
     addrs: &[(String, Ipv4Addr)],
     own: Option<Ipv4Addr>,

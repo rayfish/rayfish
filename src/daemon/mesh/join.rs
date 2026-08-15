@@ -75,7 +75,6 @@ pub(crate) async fn join_mesh_shared(
     alpn: &[u8],
     ctx: MeshCtx,
     params: JoinParams,
-    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
     // The network-owning service: the per-peer control reader calls
     // `registry.promote_to_coordinator` on itself after persisting an
@@ -150,7 +149,6 @@ pub(crate) async fn join_mesh_shared(
         direct_key.as_ref(),
     )?;
 
-    let _ = disconnect_tx; // readers use the daemon-wide sender via `ctx`.
     let remote_id = initial_conn.remote_id();
     let remote_ip = identity.derive_ip(&remote_id);
 

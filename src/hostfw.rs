@@ -60,7 +60,6 @@ impl Manager {
     /// to both families from one command, so only the raw `iptables` fix splits.
     /// Only the Linux detector builds a fix; elsewhere nothing constructs a
     /// `WouldBlock`.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn fix_command(self, tun: &str, port: u16, v6: bool) -> String {
         match self {
             Manager::Ufw => format!("ufw allow in on {tun} to any port {port} proto tcp"),

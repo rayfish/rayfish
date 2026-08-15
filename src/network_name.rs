@@ -1,6 +1,5 @@
 //! Three-word network name generation (adjective-noun-noun).
 
-#![allow(dead_code)]
 
 use rand::RngExt;
 

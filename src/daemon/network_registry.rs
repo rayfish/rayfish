@@ -599,7 +599,7 @@ impl NetworkRegistry {
         let state = Arc::new(std::sync::RwLock::new(net_state));
         let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
         let dht_notify = Arc::new(tokio::sync::Notify::new());
-        let (tasks, disconnect_tx) = self.spawn_coordinator_background_tasks(
+        let tasks = self.spawn_coordinator_background_tasks(
             &ctx,
             &name,
             &net_secret_key,
@@ -619,7 +619,6 @@ impl NetworkRegistry {
             cancel: cancel.clone(),
             tasks,
             invite_lock: invite_lock.clone(),
-            disconnect_tx: disconnect_tx.clone(),
         };
         self.networks.insert(name.clone(), handle);
 
@@ -763,10 +762,7 @@ impl NetworkRegistry {
         state: &SharedNetworkState,
         dht_notify: &Arc<tokio::sync::Notify>,
         cancel: &CancellationToken,
-    ) -> (
-        Vec<tokio::task::JoinHandle<()>>,
-        mpsc::Sender<forward::DisconnectEvent>,
-    ) {
+    ) -> Vec<tokio::task::JoinHandle<()>> {
         let mut tasks = Vec::new();
 
         if let Ok(pkarr_client) = dht::create_pkarr_client(&self.transport.endpoint) {
@@ -790,7 +786,7 @@ impl NetworkRegistry {
             cancel.clone(),
         ));
 
-        (tasks, ctx.disconnect_tx.clone())
+        tasks
     }
 
     /// Store a network's current blob snapshot in the blob store and publish the

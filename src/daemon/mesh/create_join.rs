@@ -394,7 +394,6 @@ impl NetworkRegistry {
             let cancel = self.shutdown_token.child_token();
             // Reconnect + cleanup are daemon-wide now (the connection supervisor),
             // so no per-network reconnect task; readers report to the shared sender.
-            let disconnect_tx = self.disconnect_tx.clone();
             let tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
 
             tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
@@ -420,7 +419,6 @@ impl NetworkRegistry {
                     data,
                     conn,
                     true,
-                    &disconnect_tx,
                     &cancel,
                     ctx.invite.clone(),
                 )
@@ -480,7 +478,6 @@ impl NetworkRegistry {
         // state until a lucky restart.
         let cancel = self.shutdown_token.child_token();
         // Reconnect + cleanup are daemon-wide now (the connection supervisor).
-        let disconnect_tx = self.disconnect_tx.clone();
         let tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
 
         // Fallback state built straight from the verified blob so registration
@@ -524,7 +521,6 @@ impl NetworkRegistry {
                     data,
                     conn,
                     false,
-                    &disconnect_tx,
                     &cancel,
                     ctx.invite.clone(),
                 )
@@ -593,7 +589,6 @@ impl NetworkRegistry {
         data: &crate::membership::GroupBlob,
         conn: iroh::endpoint::Connection,
         initial: bool,
-        disconnect_tx: &mpsc::Sender<forward::DisconnectEvent>,
         cancel: &CancellationToken,
         invite_secret: Option<Vec<u8>>,
     ) -> Result<JoinResult> {
@@ -614,7 +609,6 @@ impl NetworkRegistry {
                 auto_accept_files: ctx.auto_accept_files,
                 initial,
             },
-            disconnect_tx.clone(),
             cancel.clone(),
             self.clone(),
             ctx.invite_lock.clone(),
@@ -736,7 +730,6 @@ impl NetworkRegistry {
             cancel,
             tasks,
             invite_lock,
-            disconnect_tx: self.disconnect_tx.clone(),
         };
         self.networks.insert(display_name.to_string(), handle);
         self.refresh_search_domains().await;

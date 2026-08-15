@@ -351,7 +351,6 @@ impl SharedFirewall {
     /// Stateless rule + default evaluation (no connection tracking).
     /// Retained for compatibility and direct rule testing; the data plane uses
     /// [`Self::evaluate_packet`] which is stateful.
-    #[allow(dead_code)]
     pub fn evaluate(
         &self,
         direction: Direction,

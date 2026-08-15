@@ -405,7 +405,6 @@ impl NetworkState {
 /// when the network is left or the VPN is put on standby. The persisted config
 /// (in `networks.toml`) outlives this handle: standby tears down the handle
 /// but keeps the config so `activate` can rebuild it.
-#[allow(dead_code)]
 pub struct NetworkHandle {
     name: String,
     network_key: EndpointId,
@@ -425,10 +424,6 @@ pub struct NetworkHandle {
     /// joins can't double-burn a single-use invite (TOCTOU on the toml file).
     /// Shared with this network's [`CoordinatorAcceptState`].
     invite_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Disconnect channel for this network's accept handlers, kept so a member
-    /// promoted to coordinator (via `AdminGrant`) can re-register a
-    /// [`CoordinatorAcceptState`] on the live channel without rebuilding it.
-    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
 }
 
 /// Shared, always-on daemon state. Cloned (via `Arc`) into every IPC handler
@@ -549,7 +544,6 @@ pub struct Daemon {
     // The only readers/writers (`start_ssh`/`stop_ssh`) are desktop-only, so on a
     // `--no-default-features` (Android) build the field is inert; silence the
     // resulting dead-code warning there rather than dropping the field.
-    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
     ssh_token: Mutex<Option<CancellationToken>>,
 }
 
@@ -641,14 +635,6 @@ impl Daemon {
 
     /// Bundle the daemon-wide shared handles into a [`MeshCtx`] for the accept
     /// handlers and background tasks. Every field is a cheap `Clone`.
-    /// The process-lifetime foundation (endpoint, identity, blob store, metrics,
-    /// contact id). Extracted services depend on this `Arc<Transport>` rather
-    /// than the whole daemon. First consumed in M2.
-    #[allow(dead_code)]
-    pub(crate) fn transport(&self) -> Arc<Transport> {
-        self.transport.clone()
-    }
-
     /// Part of the embedding API (used by `ray-mobile`): the host OS observed a
     /// network change (Wi-Fi/cellular switch, roam, airplane mode). On desktop,
     /// netwatch sees route changes itself; on Android its route monitor is a
@@ -2021,7 +2007,6 @@ mod accept_handler_tests {
                     })
                     .unwrap();
             }
-            let (disconnect_tx, _disconnect_rx) = mpsc::channel(1);
             registry.networks.insert(
                 "test-net".to_string(),
                 NetworkHandle {
@@ -2034,7 +2019,6 @@ mod accept_handler_tests {
                     cancel: CancellationToken::new(),
                     tasks: Vec::new(),
                     invite_lock: Arc::new(tokio::sync::Mutex::new(())),
-                    disconnect_tx,
                 },
             );
             assert!(
@@ -2128,7 +2112,6 @@ mod accept_handler_tests {
                 })
                 .unwrap();
         }
-        let (disconnect_tx, _drx) = mpsc::channel(1);
         registry.networks.insert(
             "test-net".to_string(),
             NetworkHandle {
@@ -2141,7 +2124,6 @@ mod accept_handler_tests {
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
                 invite_lock: Arc::new(tokio::sync::Mutex::new(())),
-                disconnect_tx,
             },
         );
 
@@ -2307,7 +2289,6 @@ mod accept_handler_tests {
             s.network_secret_key = Some(net_secret.clone());
             s.members = MemberList::from_members(roster());
         }
-        let (ctx_tx, _ctx_rx) = mpsc::channel(1);
         coord_reg.networks.insert(
             "test-net".to_string(),
             NetworkHandle {
@@ -2320,7 +2301,6 @@ mod accept_handler_tests {
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
                 invite_lock: Arc::new(tokio::sync::Mutex::new(())),
-                disconnect_tx: ctx_tx,
             },
         );
         let connmgr = Arc::new(ConnectionManager::new());
@@ -2376,7 +2356,6 @@ mod accept_handler_tests {
             s.network_secret_key = None; // plain member
             s.members = MemberList::from_members(roster());
         }
-        let (mtx, _mrx) = mpsc::channel(1);
         member_reg.networks.insert(
             "test-net".to_string(),
             NetworkHandle {
@@ -2389,7 +2368,6 @@ mod accept_handler_tests {
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
                 invite_lock: Arc::new(tokio::sync::Mutex::new(())),
-                disconnect_tx: mtx,
             },
         );
         // Offering an exit, and the data plane is up so sync is enabled.
