@@ -526,6 +526,10 @@ leaves the file to whoever holds it rather than fighting over it, and `.ray`
 names won't resolve until you add rayfish's resolver to that file yourself or
 put a DNS manager both can register with in the path.
 
+On Android the same mode is a switch under **You > IPv6-only mode**. Two VPNs
+can't run at once there, so the reason to reach for it is a carrier that gives
+the phone a `100.64.x.x` address of its own. Flipping it reconnects.
+
 ## Troubleshooting
 
 ```bash

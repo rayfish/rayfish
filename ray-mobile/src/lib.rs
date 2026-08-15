@@ -430,8 +430,20 @@ impl Node {
     /// Build the headless daemon (identity, endpoint, blob store, resolver) and
     /// bring the saved networks' control plane up. Idempotent: a second call is a
     /// no-op success. Must run before `join`/`create`/`pair`/`up`.
-    pub fn start(&self) -> Result<(), RayError> {
+    ///
+    /// `ipv6_only` runs the data plane over mesh IPv6 alone, for a network where
+    /// something else already owns `100.64.0.0/10` (a carrier handing the phone a
+    /// CGNAT address, say). It is start-time: the caller decides it here because
+    /// the tunnel's addressing is fixed when the interface is built, so changing
+    /// it means stopping the node and starting a new one. The app's own settings
+    /// store is the authority, not the core's `settings.toml`, which on Android
+    /// lives in an app-private directory the user cannot reach.
+    pub fn start(&self, ipv6_only: bool) -> Result<(), RayError> {
         // Fast path: already started. Check briefly, then release the lock.
+        //
+        // Note this ignores `ipv6_only` on an already-built daemon: a running
+        // node keeps the mode it was built with. The caller flips the mode by
+        // stopping the node first.
         if self.state.lock().unwrap().is_some() {
             return Ok(());
         }
@@ -445,7 +457,7 @@ impl Node {
         // phone never came back online"). Failing is recoverable; wedging is not.
         let state = self
             .runtime
-            .block_on(async { timeout(START_TIMEOUT, build_headless(true)).await })
+            .block_on(async { timeout(START_TIMEOUT, build_headless(true, ipv6_only)).await })
             .map_err(|_| {
                 tracing::error!(
                     timeout_secs = START_TIMEOUT.as_secs(),
@@ -1217,20 +1229,24 @@ impl Node {
         // networks yet, derive the IPv4 from our identity so the tunnel still
         // gets our real mesh address (the same value every network would use)
         // instead of a placeholder.
+        //
+        // The IPv6 falls back to the derived value even when a network *is*
+        // joined, because a roster entry can carry no IPv6 (an old record, a
+        // peer that predates the v6 field). The derivation is the same blake3 of
+        // our identity that put the address on the roster in the first place, so
+        // this is the address either way. An IPv6-only tunnel has nothing to
+        // bind without it.
         let (ipv4, ipv6) = networks
             .first()
-            .map(|n| {
-                (
-                    n.my_ip.to_string(),
-                    n.my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
-                )
-            })
+            .map(|n| (n.my_ip.to_string(), n.my_ipv6.map(|v| v.to_string())))
             .unwrap_or_else(|| {
                 (
                     rayfish::membership::derive_ip(&endpoint_id).to_string(),
-                    rayfish::membership::derive_ipv6(&endpoint_id).to_string(),
+                    None,
                 )
             });
+        let ipv6 =
+            ipv6.unwrap_or_else(|| rayfish::membership::derive_ipv6(&endpoint_id).to_string());
 
         Status {
             running: active,

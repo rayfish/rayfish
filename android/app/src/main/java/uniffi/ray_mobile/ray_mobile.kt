@@ -1012,7 +1012,7 @@ fun uniffi_ray_mobile_fn_method_node_set_dns_upstreams(`ptr`: Pointer,`servers`:
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_set_hostname(`ptr`: Pointer,`network`: RustBuffer.ByValue,`hostname`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-fun uniffi_ray_mobile_fn_method_node_start(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+fun uniffi_ray_mobile_fn_method_node_start(`ptr`: Pointer,`ipv6Only`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_start_pairing(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1250,7 +1250,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_set_hostname() != 56819.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_start() != 25989.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_start() != 17640.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_start_pairing() != 51955.toShort()) {
@@ -1879,8 +1879,16 @@ public interface NodeInterface {
      * Build the headless daemon (identity, endpoint, blob store, resolver) and
      * bring the saved networks' control plane up. Idempotent: a second call is a
      * no-op success. Must run before `join`/`create`/`pair`/`up`.
+     *
+     * `ipv6_only` runs the data plane over mesh IPv6 alone, for a network where
+     * something else already owns `100.64.0.0/10` (a carrier handing the phone a
+     * CGNAT address, say). It is start-time: the caller decides it here because
+     * the tunnel's addressing is fixed when the interface is built, so changing
+     * it means stopping the node and starting a new one. The app's own settings
+     * store is the authority, not the core's `settings.toml`, which on Android
+     * lives in an app-private directory the user cannot reach.
      */
-    fun `start`()
+    fun `start`(`ipv6Only`: kotlin.Boolean)
     
     /**
      * Begin pairing: returns a ticket to show (as QR) to a device that will
@@ -2579,13 +2587,21 @@ open class Node: Disposable, AutoCloseable, NodeInterface
      * Build the headless daemon (identity, endpoint, blob store, resolver) and
      * bring the saved networks' control plane up. Idempotent: a second call is a
      * no-op success. Must run before `join`/`create`/`pair`/`up`.
+     *
+     * `ipv6_only` runs the data plane over mesh IPv6 alone, for a network where
+     * something else already owns `100.64.0.0/10` (a carrier handing the phone a
+     * CGNAT address, say). It is start-time: the caller decides it here because
+     * the tunnel's addressing is fixed when the interface is built, so changing
+     * it means stopping the node and starting a new one. The app's own settings
+     * store is the authority, not the core's `settings.toml`, which on Android
+     * lives in an app-private directory the user cannot reach.
      */
-    @Throws(RayException::class)override fun `start`()
+    @Throws(RayException::class)override fun `start`(`ipv6Only`: kotlin.Boolean)
         = 
     callWithPointer {
     uniffiRustCallWithError(RayException) { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_start(
-        it, _status)
+        it, FfiConverterBoolean.lower(`ipv6Only`),_status)
 }
     }
     

@@ -142,6 +142,25 @@ object NodeHolder {
         prefs(context).edit().putBoolean(KEY_GO_OFFLINE_WHEN_DISABLED, value).apply()
     }
 
+    // IPv6-only mode: the data plane runs over mesh IPv6 alone, so the tunnel
+    // never claims 100.64.0.0/10. For a network where something else already
+    // owns that range, which on a phone is usually the carrier handing it out as
+    // a CGNAT address. Off by default.
+    //
+    // This pref, not the core's settings.toml, is the authority: the config
+    // directory is app-private, so the file is not something the user can edit,
+    // and [Node.start] takes the mode as an argument. It is start-time (the
+    // tunnel's addressing is fixed when the interface is built), so flipping it
+    // means rebuilding the node: see [RayfishVpnService.ACTION_RESTART_NODE].
+    private const val KEY_IPV6_ONLY = "ipv6_only"
+
+    fun isIpv6Only(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_IPV6_ONLY, false)
+
+    fun setIpv6Only(context: Context, value: Boolean) {
+        prefs(context).edit().putBoolean(KEY_IPV6_ONLY, value).apply()
+    }
+
     fun isCrashReportingEnabled(context: Context): Boolean =
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -211,7 +230,9 @@ object NodeHolder {
                         // Register Android's trust store before start(): building
                         // the iroh endpoint sets up TLS, which fails without it.
                         RustlsInit.ensureInitialized(context)
-                        get(context).start()
+                        // The mode is fixed for this daemon's lifetime, so it is
+                        // read here, at the one place a daemon is built.
+                        get(context).start(isIpv6Only(context))
                     } catch (t: Throwable) {
                         // A node that will not start leaves the device offline in
                         // the mesh with nothing in the UI to say why, and every

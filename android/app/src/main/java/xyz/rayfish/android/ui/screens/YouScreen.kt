@@ -164,6 +164,34 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 }
             },
         )
+        // Start-time setting: the daemon and the tunnel both fix their addressing
+        // when they are built, so this cannot be applied to the running node. The
+        // service rebuilds it, restoring the VPN afterwards if it was on.
+        var ipv6Only by remember { mutableStateOf(NodeHolder.isIpv6Only(context)) }
+        ToggleCard(
+            title = "IPv6-only mode",
+            subtitle = if (ipv6Only) {
+                "on · mesh IPv6 only, leaving 100.64.x.x alone · reconnects"
+            } else {
+                "off · turn on if this network already uses 100.64.x.x · reconnects"
+            },
+            checked = ipv6Only,
+            onCheckedChange = { on ->
+                ipv6Only = on
+                NodeHolder.setIpv6Only(context, on)
+                // startForegroundService, not startService: the rebuild can land
+                // with no tunnel established (the user had the VPN off), and a
+                // background start of a service that then calls startForeground is
+                // only allowed with the exemption a visible Activity carries.
+                ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, RayfishVpnService::class.java).apply {
+                        action = RayfishVpnService.ACTION_RESTART_NODE
+                    },
+                )
+                onToast(if (on) "IPv6-only mode on, reconnecting" else "IPv6-only mode off, reconnecting")
+            },
+        )
         var autoAcceptOwn by remember { mutableStateOf(NodeHolder.isAutoAcceptOwnDevices(context)) }
         ToggleCard(
             title = "Auto-accept from my devices",

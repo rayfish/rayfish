@@ -2415,11 +2415,13 @@ mod headless_tests {
         // on panic, so this can't poison later tests.
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon =
-            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
-                .await
-                .expect("build_headless should not hang")
-                .expect("build_headless should succeed");
+        let daemon = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            build_headless(false, false),
+        )
+        .await
+        .expect("build_headless should not hang")
+        .expect("build_headless should succeed");
 
         // It returns a shared `Arc<DaemonState>`.
         assert!(Arc::strong_count(&daemon) >= 1);
@@ -2455,7 +2457,7 @@ mod headless_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let first = tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+        let first = tokio::time::timeout(Duration::from_secs(30), build_headless(false, false))
             .await
             .expect("first build_headless should not hang")
             .expect("first build_headless should succeed");
@@ -2484,7 +2486,7 @@ mod headless_tests {
         let _ = reopened.shutdown().await;
 
         // And the whole rebuild works, which is what the app actually does.
-        tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+        tokio::time::timeout(Duration::from_secs(30), build_headless(false, false))
             .await
             .expect("rebuild should not hang")
             .expect("rebuilding after shutdown_and_close should succeed");
@@ -2499,11 +2501,13 @@ mod headless_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon =
-            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
-                .await
-                .expect("build_headless should not hang")
-                .expect("build_headless should succeed");
+        let daemon = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            build_headless(false, false),
+        )
+        .await
+        .expect("build_headless should not hang")
+        .expect("build_headless should succeed");
 
         // Nothing seen yet: the scan reply is empty and status counts nothing.
         match daemon.list_lan_peers() {
@@ -2606,11 +2610,13 @@ mod headless_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon =
-            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
-                .await
-                .expect("build_headless should not hang")
-                .expect("build_headless should succeed");
+        let daemon = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            build_headless(false, false),
+        )
+        .await
+        .expect("build_headless should not hang")
+        .expect("build_headless should succeed");
 
         use std::sync::atomic::Ordering;
 

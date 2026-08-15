@@ -47,7 +47,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // identical construction.
     // Desktop honors the persisted `on_demand` config (default off); the mobile
     // embedder forces it on via `build_headless`.
-    let daemon = build_daemon(token.clone(), stats, None).await?;
+    let daemon = build_daemon(token.clone(), stats, Overrides::default()).await?;
 
     // Attach the real OS TUN device: create it, record its name, and spawn the
     // writer + `run_mesh` forwarding loop. On Android the packet interface is a
@@ -124,15 +124,37 @@ fn initial_alpns(_app_config: &config::AppConfig) -> Vec<Vec<u8>> {
     ]
 }
 
+/// Settings an embedder decides for itself instead of reading from
+/// `settings.toml`. `None` means "take the config value" (the desktop daemon
+/// passes [`Overrides::default`], so its behavior is entirely config-driven).
+///
+/// These exist because the config file is not the embedder's source of truth:
+/// on Android the user's choice lives in the app's own preferences and the
+/// config directory is app-private, so the value has to arrive as an argument
+/// at construction time.
+#[derive(Default)]
+struct Overrides {
+    /// Force on-demand mode (mobile always forces it on; desktop honors config).
+    on_demand: Option<bool>,
+    /// Force the IPv6-only data plane on or off. Start-time like the config
+    /// setting it replaces: the TUN's addressing is fixed when the interface is
+    /// created, so a change only lands on the next build.
+    ipv6_only: Option<bool>,
+}
+
 /// Construct a headless [`Daemon`] for an embedder (used by `ray-mobile`
 /// and future embedders). Builds the same infrastructure as `run_daemon` minus
 /// the OS TUN device and the Unix-socket IPC server: the caller supplies a
 /// packet interface via [`Daemon::attach_tun`]. The returned daemon is on
 /// standby (no data plane), with its saved networks' control plane connected.
-pub async fn build_headless(on_demand: bool) -> Result<Arc<Daemon>> {
+pub async fn build_headless(on_demand: bool, ipv6_only: bool) -> Result<Arc<Daemon>> {
     let token = CancellationToken::new();
     let stats = Arc::new(ForwardMetrics::default());
-    let daemon = build_daemon(token, stats, Some(on_demand)).await?;
+    let overrides = Overrides {
+        on_demand: Some(on_demand),
+        ipv6_only: Some(ipv6_only),
+    };
+    let daemon = build_daemon(token, stats, overrides).await?;
     // Bring the saved networks' control plane up, matching `run_daemon`.
     daemon.registry.connect_all_networks().await;
     tokio::spawn(Arc::clone(&daemon.registry).run_restore_supervisor());
@@ -161,10 +183,10 @@ pub async fn build_headless(on_demand: bool) -> Result<Arc<Daemon>> {
 async fn build_daemon(
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
-    on_demand_override: Option<bool>,
+    overrides: Overrides,
 ) -> Result<Arc<Daemon>> {
     let mut endpoint = None;
-    let result = build_daemon_inner(token, stats, on_demand_override, &mut endpoint).await;
+    let result = build_daemon_inner(token, stats, overrides, &mut endpoint).await;
     if result.is_err()
         && let Some(ep) = endpoint
     {
@@ -179,7 +201,7 @@ async fn build_daemon(
 async fn build_daemon_inner(
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
-    on_demand_override: Option<bool>,
+    overrides: Overrides,
     endpoint_out: &mut Option<Endpoint>,
 ) -> Result<Arc<Daemon>> {
     // Relocate a pre-/etc config tree into /etc/rayfish (Linux upgrade path)
@@ -206,15 +228,20 @@ async fn build_daemon_inner(
 
     // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
     let mut app_config = config::load()?;
+    // IPv6-only mode: the embedder may decide it (its own settings store is the
+    // authority there); otherwise honor config. Resolved once, here, and used
+    // everywhere below in place of the config field, so every consumer of the
+    // mode agrees with the one the data plane actually runs in.
+    let ipv6_only = overrides.ipv6_only.unwrap_or(app_config.ipv6_only);
     // Tell the forwarding core whether mesh IPv4 carries traffic on this node.
     // Before any packet moves: the data plane is attached further down.
-    forward::set_ipv6_only(app_config.ipv6_only);
+    forward::set_ipv6_only(ipv6_only);
     // Same for the DNS backends, which pick the magic resolver address from it.
     // Before `activate` runs detection.
-    crate::dns::config::set_ipv6_only(app_config.ipv6_only);
+    crate::dns::config::set_ipv6_only(ipv6_only);
     // On-demand mode: the platform (mobile embedder) may force it; otherwise honor
     // config (on by default). Computed here so it can thread into the registry.
-    let on_demand = on_demand_override.unwrap_or(app_config.on_demand);
+    let on_demand = overrides.on_demand.unwrap_or(app_config.on_demand);
     // Point the pkarr client at the configured discovery-DNS server (if any)
     // before any record publish/resolve happens.
     dht::set_discovery_override(&app_config.discovery_dns);
@@ -467,7 +494,7 @@ async fn build_daemon_inner(
     ));
     // Withhold A records when mesh IPv4 is not routed on this node; without
     // this, apps here would resolve peers to addresses owned by another VPN.
-    dns_resolver.set_ipv6_only(app_config.ipv6_only);
+    dns_resolver.set_ipv6_only(ipv6_only);
     // Built here (not in the struct literal) so NetworkRegistry can share it for
     // the leave/teardown DNS cleanup.
     let dns = Arc::new(DnsService::new(
@@ -527,7 +554,7 @@ async fn build_daemon_inner(
         disconnect_tx.clone(),
         on_demand,
         app_config.idle_timeout(),
-        app_config.ipv6_only,
+        ipv6_only,
     ));
     // FileService owns file transfer + pairing. It evaluates own-device auto-accept
     // directly (no worker channel) and clears a re-paired device's nullifier by
@@ -647,7 +674,6 @@ async fn build_daemon_inner(
     .await;
 
     let auto_update = app_config.auto_update;
-    let ipv6_only = app_config.ipv6_only;
     let daemon = Arc::new(Daemon {
         transport,
         registry,

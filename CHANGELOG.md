@@ -17,6 +17,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   an address that goes nowhere. Peers are told, too, so they stop handing out
   yours. Exit nodes are the exception; `ray exit-node use` says so.
 
+- **IPv6-only mode on Android**, as a switch under **You**. The case there is
+  not another VPN (Android runs one at a time) but a carrier that hands the
+  phone a `100.64.x.x` address of its own, which the tunnel would otherwise
+  swallow whole. Turning it on reconnects: the tunnel's addressing is fixed when
+  it is built, so the node is rebuilt, and the VPN comes back if it was on.
+
 - **Tab completion, already installed.** The installer and `sudo ray up` write
   completion scripts for bash, zsh and fish into the directories those shells
   already search, so there is nothing to source and no rc file to edit: open a
