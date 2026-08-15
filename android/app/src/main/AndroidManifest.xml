@@ -74,6 +74,24 @@
             </intent-filter>
         </activity>
 
+        <!-- Invisible shim the quick settings tile launches when it needs the
+             system VPN consent dialog, which no service can raise. Its own task
+             (taskAffinity="") and kept out of recents, so tapping the tile never
+             leaves anything behind next to the real app.
+
+             Deliberately NOT noHistory: that finishes an activity as soon as it
+             stops, and this one is waiting on the result of the consent dialog it
+             launched. The dialog is dialog-themed and should only pause us, but
+             if it ever did stop us the activity would be finished before the
+             result arrived and consent would silently never start the tunnel. It
+             finishes itself on every branch anyway, so the flag buys nothing. -->
+        <activity
+            android:name=".VpnConsentActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Rayfish.Invisible" />
+
         <!-- QR scanner pinned to portrait. zxing's default CaptureActivity
              follows the rotation sensor and comes up sideways on foldables;
              forcing the orientation here is the reliable fix. -->
@@ -99,6 +117,22 @@
                 android:value="Rayfish mesh VPN tunnel" />
             <intent-filter>
                 <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+
+        <!-- Quick settings tile for toggling the tunnel from the shade. The
+             BIND_QUICK_SETTINGS_TILE permission plus the QS_TILE filter are what
+             put it in the system's tile picker; exported="true" is required for
+             SystemUI to bind it, and the permission is what keeps everyone else
+             out. No ACTIVE_TILE meta-data on purpose: see TunnelTileService. -->
+        <service
+            android:name=".TunnelTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_vpn"
+            android:label="${appName}"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
             </intent-filter>
         </service>
     </application>

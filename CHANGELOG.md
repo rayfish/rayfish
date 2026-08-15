@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Android: toggle the tunnel from quick settings.** Rayfish now offers a
+  quick settings tile, so the tunnel goes on and off from the shade without
+  opening the app. Turning it off there does exactly what the app's toggle and
+  the notification's "Disable" button do, so files keep working with the VPN
+  off unless you asked to go fully offline when disabled. The tile shows
+  whether the tunnel is actually up, not just whether it was asked for. On a
+  device that has not granted the VPN yet, the first tap raises the system
+  consent dialog and then brings the tunnel up; after that the tile does its
+  work without opening anything.
+
 - **Tab completion, already installed.** The installer and `sudo ray up` write
   completion scripts for bash, zsh and fish into the directories those shells
   already search, so there is nothing to source and no rc file to edit: open a
