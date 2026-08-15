@@ -474,11 +474,13 @@ pub struct AppConfig {
     #[serde(default = "default_true")]
     pub on_demand: bool,
     /// IPv6-only data plane, for hosts that share the box with another VPN
-    /// claiming `100.64.0.0/10` (Tailscale). The TUN keeps its own derived IPv4
-    /// as a `/32` so Magic DNS still works, but the `/10` connected route is not
+    /// claiming `100.64.0.0/10` (Tailscale). The `/10` connected route is not
     /// installed, mesh IPv4 carries no traffic, and the responder answers AAAA
-    /// only. Read once at daemon start (the TUN is built there), so a change
-    /// needs a restart.
+    /// only. The TUN keeps its own derived IPv4 as a `/32`, not for Magic DNS
+    /// (that moves to [`crate::dns::MAGIC_DNS_V6`]) but because the address is
+    /// still this node's internal handle: peer table, roster, and `ray status`
+    /// all key on it. Read once at daemon start (the TUN is built there), so a
+    /// change needs a restart.
     #[serde(default)]
     pub ipv6_only: bool,
     /// Seconds of no traffic before an on-demand node closes a peer connection.
