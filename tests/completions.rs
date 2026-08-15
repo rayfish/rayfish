@@ -10,6 +10,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use ray_proto::settings::NodeKey;
+
 const RAY: &str = env!("CARGO_BIN_EXE_ray");
 
 /// Run one completion request, as the stub would, and return the candidates.
@@ -113,11 +115,41 @@ fn fixed_domain_arguments_offer_their_words() {
     assert!(found.contains(&"deny".to_string()), "{found:?}");
 }
 
+/// Every key the settings registry defines is offered, both stores' worth.
+///
+/// The point of driving completion off `NodeKey::all()` is that adding a key to
+/// the registry is the whole job; this fails if someone reintroduces a
+/// hand-kept list here.
 #[test]
-fn the_settings_keys_come_from_the_one_list_that_defines_them() {
+fn the_settings_keys_come_from_the_registry_that_defines_them() {
     let found: HashSet<String> = complete(&["config", "set", ""]).into_iter().collect();
-    for key in rayfish::config::CONFIG_KEY_NAMES {
-        assert!(found.contains(key), "missing {key}: {found:?}");
+    for key in NodeKey::all() {
+        assert!(found.contains(key.name()), "missing {key}: {found:?}");
+    }
+    // Both scopes, not just the globals: firewall keys are node-scoped too.
+    assert!(found.contains("firewall.default-in"), "{found:?}");
+}
+
+/// A key whose domain is a fixed set completes its values; one whose domain is
+/// free-form offers nothing rather than something wrong.
+#[test]
+fn a_settings_value_completes_when_the_key_has_a_fixed_domain() {
+    assert_eq!(
+        complete(&["config", "set", "mdns", ""])[..2],
+        ["on".to_string(), "off".to_string()]
+    );
+    assert_eq!(
+        complete(&["config", "set", "firewall.default-in", ""])[..2],
+        ["allow".to_string(), "deny".to_string()]
+    );
+
+    // A path, a URL list and a uid are nobody's fixed set.
+    for key in ["relay", "dns-upstreams", "download-dir", "download-user"] {
+        let found = complete(&["config", "set", key, ""]);
+        assert!(
+            found.iter().all(|c| c.starts_with('-')),
+            "{key} offered values: {found:?}"
+        );
     }
 }
 

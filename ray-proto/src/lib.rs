@@ -7,8 +7,10 @@
 pub mod firewall;
 pub mod ipc;
 pub mod policy;
+pub mod settings;
 mod types;
 
 pub use firewall::{Action, Direction, Protocol};
 pub use policy::{HostSuggestions, SuggestedFirewall};
+pub use settings::{FirewallKey, GlobalKey, NetworkKey, NodeKey};
 pub use types::{GroupMode, TransportMode};

@@ -38,7 +38,7 @@ use clap_complete::{CompleteEnv, Shell};
 use crate::Cli;
 use crate::*;
 
-use ipc::{IpcMessage, NetworkStatus, PeerState};
+use ipc::{IpcMessage, NetworkStatus, NodeKey, PeerState};
 
 /// The environment variable the installed stub sets to ask for completions.
 const VAR: &str = "COMPLETE";
@@ -157,28 +157,60 @@ pub(crate) fn words(values: &'static [&'static str]) -> ArgValueCandidates {
     })
 }
 
-/// The global settings keys, with what each is currently set to as help text.
+/// Every node-scoped settings key, described by the registry that defines it.
 ///
-/// The names come from `config::CONFIG_KEY_NAMES`, so a key added there shows up
-/// here without anyone remembering to. The values come from the daemon when it
-/// is up, which turns `ray config set <TAB>` into a listing of what is set.
-pub(crate) fn settings_keys() -> ArgValueCandidates {
+/// `NodeKey::all()` is the same iterator `ray config get` lists and
+/// `settings::node_key_help` documents, so a key added to the registry appears
+/// on tab with its description and needs no edit here. No IPC either: the key
+/// namespace is compiled in, so this answers with the daemon stopped.
+pub(crate) fn node_settings_keys() -> ArgValueCandidates {
     ArgValueCandidates::new(|| {
-        let current = config::load()
-            .ok()
-            .and_then(|cfg| config::config_get(&cfg, None).ok())
-            .unwrap_or_default();
-        config::CONFIG_KEY_NAMES
-            .iter()
-            .map(|key| {
-                let candidate = CompletionCandidate::new(*key);
-                match current.iter().find(|(name, _)| name == key) {
-                    Some((_, value)) => candidate.help(Some(value.clone().into())),
-                    None => candidate,
-                }
-            })
+        NodeKey::all()
+            .map(|key| CompletionCandidate::new(key.name()).help(Some(key.help().into())))
             .collect()
     })
+}
+
+/// The values a settings key accepts, for `ray config set <key> <TAB>`.
+///
+/// Read off the key's own help text, whose convention is to end with the domain
+/// in parentheses: `(on|off)`, `(allow|deny)`. Anything that isn't a list of
+/// bare words is a free-form value (a path, a URL list, a uid) and gets no
+/// suggestions rather than a wrong one. Deriving it this way means the registry
+/// stays the only place a key is described.
+pub(crate) fn settings_values() -> ArgValueCandidates {
+    ArgValueCandidates::new(|| {
+        let words = line_words();
+        let Some(key) = NodeKey::all().find(|k| words.iter().any(|w| w == k.name())) else {
+            return Vec::new();
+        };
+        domain_of(key.help())
+            .into_iter()
+            .map(CompletionCandidate::new)
+            .collect()
+    })
+}
+
+/// The `(a|b)` domain at the end of a settings key's help, if it is one.
+///
+/// Kept free of I/O so the convention it relies on can be tested against every
+/// key the registry actually defines.
+fn domain_of(help: &str) -> Vec<String> {
+    let Some(inner) = help
+        .rsplit_once('(')
+        .map(|(_, tail)| tail)
+        .and_then(|tail| tail.strip_suffix(')'))
+    else {
+        return Vec::new();
+    };
+    let words: Vec<String> = inner.split('|').map(str::to_string).collect();
+    let bare = |word: &String| {
+        !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    match words.len() > 1 && words.iter().all(bare) {
+        true => words,
+        false => Vec::new(),
+    }
 }
 
 enum PeerFilter {
@@ -634,6 +666,30 @@ mod tests {
         let script = String::from_utf8(written).unwrap();
         let exe = std::env::current_exe().unwrap();
         assert!(!script.contains(&*exe.to_string_lossy()));
+    }
+
+    /// The convention `settings_values` reads, checked against the keys the
+    /// registry actually defines rather than against invented strings.
+    #[test]
+    fn a_keys_domain_is_read_off_its_help_only_when_it_is_a_fixed_set() {
+        let domain = |name: &str| {
+            let key = NodeKey::all()
+                .find(|k| k.name() == name)
+                .unwrap_or_else(|| panic!("no such key: {name}"));
+            domain_of(key.help())
+        };
+        assert_eq!(domain("mdns"), ["on", "off"]);
+        assert_eq!(domain("firewall.default-in"), ["allow", "deny"]);
+
+        // Free-form values: a trailing parenthesis that is prose, not a domain.
+        assert!(domain("relay").is_empty());
+        assert!(domain("dns-upstreams").is_empty());
+        assert!(domain("download-dir").is_empty());
+        assert!(domain("download-user").is_empty());
+
+        // Nothing to read at all.
+        assert!(domain_of("no parenthesis here").is_empty());
+        assert!(domain_of("a single word (on)").is_empty());
     }
 
     #[test]

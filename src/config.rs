@@ -165,8 +165,10 @@ pub struct NetworkConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub aliases: BTreeMap<String, String>,
     /// Coordinator-local ephemeral policy: auto-remove a member offline
-    /// longer than this many seconds. `None` = off (default). A 1-hour floor
-    /// is enforced at the CLI. Local only (only the coordinator enforces);
+    /// longer than this many seconds. `None` = off (default). The 1-hour floor
+    /// is enforced by the settings registry (`settings::apply_network`), so it
+    /// binds every writer; the CLI's duration parser rejects it earlier only to
+    /// give a nicer message. Local only (only the coordinator enforces);
     /// never rides the signed blob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ephemeral_ttl_secs: Option<u64>,
@@ -247,7 +249,7 @@ fn validate_http_url(s: &str) -> Result<()> {
 
 /// Resolve one relay/discovery entry: the `rayfish` keyword maps to `preset`,
 /// anything else must be a valid http(s) URL (returned as-is).
-fn resolve_url_entry(entry: &str, preset: &str) -> Result<String> {
+pub(crate) fn resolve_url_entry(entry: &str, preset: &str) -> Result<String> {
     match entry {
         "rayfish" => Ok(preset.to_string()),
         other => {
@@ -290,7 +292,7 @@ pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<Ipv
 }
 
 /// Parse a comma list of entries (trimmed, empties dropped).
-fn parse_entries(value: &str) -> Vec<String> {
+pub(crate) fn parse_entries(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(|s| s.trim().to_string())
@@ -298,94 +300,49 @@ fn parse_entries(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Every recognized `ray config` key, in the order `ray config get` prints
-/// them. Single source of truth: `config_get` iterates it, and the CLI offers it
-/// on tab, so a key added here needs no second edit to show up in either.
-pub const CONFIG_KEY_NAMES: [&str; 5] = [
-    "relay",
-    "discovery-dns",
-    "dns-upstreams",
-    "auto-update",
-    "on-demand",
-];
+pub mod settings;
 
-/// The recognized `ray config` keys, for error messages. The list values
-/// (relay/discovery-dns/dns-upstreams) are set via `config set`; the on/off
-/// toggles (auto-update/on-demand) via their own `config` subcommands.
-const CONFIG_KEYS: &str = "expected relay, discovery-dns, dns-upstreams, auto-update, or on-demand";
-
-/// Apply a `ray config set`/`unset` to the in-memory config. An empty value or
-/// the lone keyword `n0` resets the key to its default (iroh n0). Validates
-/// every entry, so a bad URL/IP or unknown preset is rejected before persist.
-pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) -> Result<()> {
-    let entries = parse_entries(value);
-    let reset = entries.is_empty() || entries == ["n0"];
-    match key {
-        "relay" => {
-            if reset {
-                cfg.relay = ServerOverride::default();
-            } else {
-                for e in &entries {
-                    resolve_url_entry(e, RELAY_PRESET_RAYFISH)?;
-                }
-                cfg.relay = ServerOverride {
-                    servers: entries,
-                    replace,
-                };
-            }
-        }
-        "discovery-dns" => {
-            if reset {
-                cfg.discovery_dns = ServerOverride::default();
-            } else {
-                for e in &entries {
-                    resolve_url_entry(e, DISCOVERY_PRESET_RAYFISH)?;
-                }
-                cfg.discovery_dns = ServerOverride {
-                    servers: entries,
-                    replace,
-                };
-            }
-        }
-        "dns-upstreams" => {
-            if entries.is_empty() {
-                cfg.dns_upstreams = ServerOverride::default();
-            } else {
-                for e in &entries {
-                    e.parse::<Ipv4Addr>()
-                        .with_context(|| format!("invalid IPv4 address: {e}"))?;
-                }
-                cfg.dns_upstreams = ServerOverride {
-                    servers: entries,
-                    replace,
-                };
-            }
-        }
-        // On/off toggles: `set <key> on|off`, or `unset <key>` (empty value) to
-        // return to the default. `--replace` is meaningless here and ignored.
-        "auto-update" => cfg.auto_update = parse_bool_setting(value, false)?,
-        "on-demand" => cfg.on_demand = parse_bool_setting(value, true)?,
-        other => anyhow::bail!("unknown config key: {other} ({CONFIG_KEYS})"),
-    }
-    Ok(())
-}
-
-/// Parse an on/off config value. An empty value (from `config unset`) resets to
-/// `default`.
-fn parse_bool_setting(value: &str, default: bool) -> Result<bool> {
-    let v = value.trim();
-    if v.is_empty() {
-        return Ok(default);
-    }
-
-    match v.to_ascii_lowercase().as_str() {
-        "on" | "true" | "yes" | "1" => Ok(true),
-        "off" | "false" | "no" | "0" => Ok(false),
-        other => anyhow::bail!("'{other}' is not a valid on/off value (use 'on' or 'off')"),
+/// A minimal saved network, for tests that need a `NetworkConfig` to apply
+/// settings to or render messages from. Every field is at its default; only the
+/// name is meaningful.
+#[cfg(test)]
+pub(crate) fn empty_network_config(name: &str) -> NetworkConfig {
+    NetworkConfig {
+        name: name.to_string(),
+        group_mode: GroupMode::Open,
+        my_ip: None,
+        my_hostname: None,
+        pending_hostname: None,
+        members: vec![],
+        approved: vec![],
+        network_secret_key: None,
+        network_public_key: None,
+        transport: None,
+        auto_accept_firewall: false,
+        auto_accept_files: true,
+        admins: vec![],
+        direct: false,
+        ssh_allow: vec![],
+        aliases: BTreeMap::new(),
+        ephemeral_ttl_secs: None,
+        exit_allow: vec![],
+        exit_node_use: None,
     }
 }
 
-fn render_override(o: &ServerOverride) -> String {
+/// Apply a `ray config set`/`unset` to the in-memory config. Delegates to the
+/// settings registry; kept as a thin wrapper so existing callers don't need to
+/// know about `settings::apply_global`.
+pub fn config_set(
+    cfg: &mut AppConfig,
+    key: settings::GlobalKey,
+    value: &str,
+    replace: bool,
+) -> Result<()> {
+    settings::apply_global(cfg, key, value, replace)
+}
+
+pub(crate) fn render_override(o: &ServerOverride) -> String {
     if o.is_unset() {
         "<default>".to_string()
     } else {
@@ -394,24 +351,16 @@ fn render_override(o: &ServerOverride) -> String {
     }
 }
 
-/// Render config settings as `(key, value)` rows for `ray config get`. With a
-/// key, returns just that one (error on unknown key); without, all three.
-pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, String)>> {
-    let on_off = |v: bool| if v { "on" } else { "off" }.to_string();
-    let row = |k: &str| -> Result<(String, String)> {
-        let v = match k {
-            "relay" => render_override(&cfg.relay),
-            "discovery-dns" => render_override(&cfg.discovery_dns),
-            "dns-upstreams" => render_override(&cfg.dns_upstreams),
-            "auto-update" => on_off(cfg.auto_update),
-            "on-demand" => on_off(cfg.on_demand),
-            other => anyhow::bail!("unknown config key: {other} ({CONFIG_KEYS})"),
-        };
-        Ok((k.to_string(), v))
-    };
+/// Render global settings as `(key, value)` rows for `ray config get`. With a
+/// key, returns just that one; without, every global key. Driven off
+/// `GlobalKey::ALL` rather than a hand-kept list, so a new key shows up here
+/// the moment it exists instead of being silently unlistable.
+pub fn config_get(cfg: &AppConfig, key: Option<settings::GlobalKey>) -> Vec<(String, String)> {
+    use settings::GlobalKey;
+    let row = |k: GlobalKey| (k.name().to_string(), settings::render_global(cfg, k));
     match key {
-        Some(k) => Ok(vec![row(k)?]),
-        None => CONFIG_KEY_NAMES.iter().map(|k| row(k)).collect(),
+        Some(k) => vec![row(k)],
+        None => GlobalKey::ALL.iter().copied().map(row).collect(),
     }
 }
 
@@ -1101,6 +1050,18 @@ mod tests {
         SecretKey::from(key_bytes).public()
     }
 
+    /// A bare `ray config get` used to print a hand-kept list of five keys, so a
+    /// new setting was reachable but invisible. It now lists the whole enum.
+    #[test]
+    fn the_bare_listing_covers_every_global_key() {
+        let rows = config_get(&AppConfig::default(), None);
+        let names: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+        for k in settings::GlobalKey::ALL {
+            assert!(names.contains(&k.name()), "{} not listed", k.name());
+        }
+        assert_eq!(rows.len(), settings::GlobalKey::ALL.len());
+    }
+
     #[test]
     fn config_dir_override_ignores_unset_and_empty() {
         use std::ffi::OsString;
@@ -1691,28 +1652,45 @@ name = "test"
     }
 
     #[test]
-    fn config_set_unknown_key_errors() {
-        let mut cfg = AppConfig::default();
-        assert!(config_set(&mut cfg, "bogus", "rayfish", false).is_err());
-        assert!(config_get(&cfg, Some("bogus")).is_err());
-    }
-
-    #[test]
     fn config_set_n0_resets() {
         let mut cfg = AppConfig::default();
-        config_set(&mut cfg, "relay", "rayfish", true).unwrap();
+        config_set(&mut cfg, settings::GlobalKey::Relay, "rayfish", true).unwrap();
         assert!(!cfg.relay.is_unset());
-        config_set(&mut cfg, "relay", "n0", false).unwrap();
+        config_set(&mut cfg, settings::GlobalKey::Relay, "n0", false).unwrap();
         assert!(cfg.relay.is_unset());
     }
 
     #[test]
     fn config_set_dns_upstreams_rejects_non_ip() {
         let mut cfg = AppConfig::default();
-        assert!(config_set(&mut cfg, "dns-upstreams", "1.1.1.1", false).is_ok());
-        assert!(config_set(&mut cfg, "dns-upstreams", "not-an-ip", false).is_err());
+        assert!(
+            config_set(
+                &mut cfg,
+                settings::GlobalKey::DnsUpstreams,
+                "1.1.1.1",
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            config_set(
+                &mut cfg,
+                settings::GlobalKey::DnsUpstreams,
+                "not-an-ip",
+                false
+            )
+            .is_err()
+        );
         // rayfish is not a valid upstream keyword.
-        assert!(config_set(&mut cfg, "dns-upstreams", "rayfish", false).is_err());
+        assert!(
+            config_set(
+                &mut cfg,
+                settings::GlobalKey::DnsUpstreams,
+                "rayfish",
+                false
+            )
+            .is_err()
+        );
     }
 
     // Regression for the bug that prompted this change: concurrent saves of

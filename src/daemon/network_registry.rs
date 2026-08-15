@@ -425,11 +425,6 @@ impl NetworkRegistry {
         }
     }
 
-    /// Whether a network by this name is currently active (in the live map).
-    pub(crate) fn contains(&self, name: &str) -> bool {
-        self.networks.contains_key(name)
-    }
-
     /// Look up an active network we coordinate, returning its public key and
     /// invite lock, or an error response if it's absent or we're only a member.
     #[allow(clippy::result_large_err)]
