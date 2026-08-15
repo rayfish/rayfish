@@ -158,11 +158,38 @@ fn next_free_handle(used: &HashMap<SmolStr, u16>) -> u16 {
 }
 
 impl PeerEntry {
-    /// Picks the network a packet to this peer is attributed to (lexically
-    /// smallest shared network) so routing/firewall context is stable across
-    /// lookups, and returns the connection + that network's outbound handle.
+    /// Picks the network a packet to this peer is attributed to (the lexically
+    /// smallest one both ends still share) so routing/firewall context is stable
+    /// across lookups, and returns the connection + that network's outbound
+    /// handle.
+    ///
+    /// The pick is taken from the networks the peer *itself* announced a handle
+    /// for, not from our shared set alone. The two can disagree: a peer that
+    /// left a network while we were the coordinator, or without being able to
+    /// tell us, stays in our set for good, since our own roster is the record
+    /// nothing else corrects. The peer drops any datagram tagged with a network
+    /// it does not share ([`PeerTable::resolve_inbound_by_id`]), so tagging one
+    /// black-holes the peer entirely while its `.ray` names keep resolving from
+    /// that same stale roster. `in_handles` is the peer's own statement of what
+    /// this connection carries and is already on the wire, so preferring it
+    /// costs nothing and routes over a network that actually works.
+    ///
+    /// Falls back to the plain pick when the peer has announced nothing yet (its
+    /// `NetworkHandles` is still in flight), which is where every peer starts.
     fn route(&self) -> Option<PeerRoute> {
-        let network = self.networks.iter().min()?.clone();
+        // With one shared network there is nothing to choose between: the filter
+        // below could only keep it or fall back to it, so the common case pays
+        // nothing per packet for a guard that exists for multi-network peers.
+        let network = if self.networks.len() < 2 {
+            self.networks.iter().next()?.clone()
+        } else {
+            self.networks
+                .iter()
+                .filter(|n| self.in_handles.values().any(|announced| announced == *n))
+                .min()
+                .or_else(|| self.networks.iter().min())?
+                .clone()
+        };
         let handle = self.out_handles.get(&network).copied().unwrap_or(0);
         Some(PeerRoute {
             conn: self.conn.clone(),
@@ -434,9 +461,28 @@ impl PeerTable {
 
     /// Replace a peer's inbound decode table from its announced `NetworkHandles`.
     /// `entries` is `(handle, network)` pairs. Applied to both address maps.
+    ///
+    /// Also the one place the two views of "what we share" can be compared, so a
+    /// network we still hold the peer in and the peer no longer claims is
+    /// reported here, once per announcement, rather than per dropped packet. See
+    /// [`PeerEntry::route`] for what the disagreement does.
     pub fn set_inbound_handles(&self, ip: &Ipv4Addr, ipv6: &Ipv6Addr, entries: &[(u16, SmolStr)]) {
         let table: HashMap<u16, SmolStr> = entries.iter().cloned().collect();
         if let Some(mut e) = self.v4.get_mut(ip) {
+            let stale: Vec<&str> = e
+                .networks
+                .iter()
+                .filter(|n| !table.values().any(|announced| announced == *n))
+                .map(|n| n.as_str())
+                .collect();
+            if !stale.is_empty() {
+                tracing::info!(
+                    peer = %e.endpoint_id.fmt_short(),
+                    networks = ?stale,
+                    "peer no longer shares these networks with us; routing over the ones \
+                     it still holds"
+                );
+            }
             e.in_handles = table.clone();
         }
         if let Some(mut e) = self.v6.get_mut(ipv6) {
@@ -1328,6 +1374,56 @@ mod tests {
             Some((ip, SmolStr::new("n2"))),
             "after the repair the same datagram must be accepted on n2"
         );
+    }
+
+    /// A network the peer has left but we still hold it in must not be the one
+    /// we tag datagrams with: the peer drops anything tagged with a network it
+    /// does not share, so the stale name black-holes a peer we have a working
+    /// network with. Lexical order is what makes this reachable in practice —
+    /// the stale name only has to sort first.
+    #[tokio::test]
+    async fn route_skips_a_network_the_peer_no_longer_announces() {
+        let (_srv, _cli, conn, _client_side) = connected_pair().await;
+        let peer = conn.remote_id();
+        let ip = crate::membership::derive_ip(&peer);
+        let ipv6 = crate::membership::derive_ipv6(&peer);
+        let table = PeerTable::new();
+        table.add(ip, ipv6, conn.clone(), peer, "aaa");
+        table.add(ip, ipv6, conn.clone(), peer, "zzz");
+
+        // The peer's announcement carries only zzz: it left aaa without us
+        // hearing about it (offline, or we are aaa's coordinator so nothing else
+        // ever corrects our roster).
+        table.set_inbound_handles(&ip, &ipv6, &[(1, SmolStr::new("zzz"))]);
+
+        let route = table.lookup_v4(&ip).expect("peer is reachable");
+        assert_eq!(route.network, "zzz");
+        assert_eq!(route.handle, table.out_handle(&ip, "zzz").unwrap());
+        // The v6 address of the same peer routes the same way.
+        assert_eq!(table.lookup_v6(&ipv6).unwrap().network, "zzz");
+    }
+
+    #[tokio::test]
+    async fn route_keeps_the_lexical_pick_when_the_peer_agrees_or_is_silent() {
+        let (_srv, _cli, conn, _client_side) = connected_pair().await;
+        let peer = conn.remote_id();
+        let ip = crate::membership::derive_ip(&peer);
+        let ipv6 = crate::membership::derive_ipv6(&peer);
+        let table = PeerTable::new();
+        table.add(ip, ipv6, conn.clone(), peer, "aaa");
+        table.add(ip, ipv6, conn.clone(), peer, "zzz");
+
+        // Nothing announced yet (the handshake is still in flight): the plain
+        // pick stands, so a fresh connection routes from its first packet.
+        assert_eq!(table.lookup_v4(&ip).unwrap().network, "aaa");
+
+        // Peer agrees on both: unchanged, and stable across lookups.
+        table.set_inbound_handles(
+            &ip,
+            &ipv6,
+            &[(1, SmolStr::new("aaa")), (2, SmolStr::new("zzz"))],
+        );
+        assert_eq!(table.lookup_v4(&ip).unwrap().network, "aaa");
     }
 
     #[tokio::test]

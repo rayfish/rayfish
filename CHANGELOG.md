@@ -254,6 +254,15 @@ this build cannot be redeemed by a peer still on 0.2.x.
   crash, or a restart before the file was restored) used to wait for the tunnel
   it was trying to bring up.
 
+- **A network a peer has left no longer blocks traffic to that peer.** Where you
+  shared two networks with someone and they left one without you hearing about
+  it — they were offline, or you hold the network so nothing corrects your
+  roster — every packet to them was stamped with the network they had left, and
+  they dropped all of it. Their `.ray` names still resolved, so it looked like
+  the mesh was up and the connection simply timed out both ways, and deleting
+  the leftover network fixed it instantly. Traffic is now attributed to a
+  network the peer agrees you share, and the log names the one that fell away.
+
 - **`.ray` names now resolve on macOS in IPv6-only mode.** `ssh dev.box.ray`
   failed with "nodename nor servname provided" on a Mac sharing the host with
   another VPN, while `dig` against the same resolver answered instantly: macOS
