@@ -437,6 +437,9 @@ fn host_addresses() -> HashSet<IpAddr> {
 /// Pull the addresses out of `ip -o addr show` or `ifconfig -a` output: any token
 /// following an `inet`/`inet6` keyword, with the Linux `/prefix` and BSD `%zone`
 /// suffixes stripped.
+// Same platforms as its only caller: Android has neither `ip` nor `ifconfig`,
+// so nothing there produces output for it to parse.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn parse_host_addresses(out: &str) -> HashSet<IpAddr> {
     let mut addrs = HashSet::new();
     let mut tokens = out.split_whitespace().peekable();

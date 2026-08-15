@@ -19,8 +19,11 @@ use std::process::Command;
 #[cfg(not(target_os = "android"))]
 use std::sync::Arc;
 
+// `Result` is the CGNAT preflight's too, which Android has its own version of;
+// `Context` is only used by the desktop setup below.
+use anyhow::Result;
 #[cfg(not(target_os = "android"))]
-use anyhow::{Context, Result};
+use anyhow::Context;
 // The desktop TUN device (the `tun-rs` crate) only exists off Android, where the
 // packet interface is a `VpnService` fd instead.
 #[cfg(not(target_os = "android"))]
