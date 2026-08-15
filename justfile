@@ -56,6 +56,19 @@ cross-musl:
 # Build both the glibc and static-musl release binaries.
 cross-all: cross cross-musl
 
+# The restart is not redundant: with the service already running, `ray up` is
+# only an IPC call, so it neither re-execs the new binary nor applies a
+# start-time setting like ipv6-only. `up` first (it installs the unit when it
+# is missing, and persists the flags), then restart onto the new binary.
+
+# Install this checkout as the local daemon (args go to `ray up`, e.g. --ipv6-only).
+local-dev *args:
+    cargo -q build --release
+    sudo install -m 755 target/release/{{binary}} /usr/local/bin/{{binary}}
+    sudo {{binary}} up {{args}}
+    sudo {{binary}} restart
+    @echo "Installed /usr/local/bin/{{binary}} and restarted the local daemon"
+
 deploy ip:
     cross -q build --release --target {{target}}
     just scp {{ip}}
