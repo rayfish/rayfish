@@ -1,6 +1,7 @@
 //! CLI handlers for network lifecycle: create / join / nuke / leave.
 
 use crate::*;
+use ipc::NetworkKey;
 
 pub(crate) async fn ipc_create(
     mode: GroupMode,
@@ -220,16 +221,23 @@ pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
     if arg == "show" {
         ipc::send(
             &mut stream,
-            ipc::IpcMessage::GetEphemeral {
+            ipc::IpcMessage::NetConfigGet {
                 network: network.to_string(),
+                key: Some(NetworkKey::EphemeralTtl),
             },
         )
         .await?;
         match ipc::recv(&mut stream).await? {
-            ipc::IpcMessage::EphemeralStatus { ttl_secs, .. } => match ttl_secs {
-                Some(s) => println!("ephemeral policy on '{network}': {}", format_ttl(s)),
-                None => println!("ephemeral policy on '{network}': off"),
-            },
+            // The key renders as the TTL in seconds, or empty when the policy is off.
+            ipc::IpcMessage::ConfigValues { rows } => {
+                match rows.first().map(|(_, v)| v.as_str()).unwrap_or("") {
+                    "" => println!("ephemeral policy on '{network}': off"),
+                    ttl => match ttl.parse::<u64>() {
+                        Ok(s) => println!("ephemeral policy on '{network}': {}", format_ttl(s)),
+                        Err(_) => eprintln!("Unexpected ephemeral ttl: {ttl}"),
+                    },
+                }
+            }
             ipc::IpcMessage::Error { message } => print_error("error", &message, None),
             other => eprintln!("Unexpected response: {:?}", other),
         }
@@ -248,9 +256,11 @@ pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
     };
     ipc::send(
         &mut stream,
-        ipc::IpcMessage::SetEphemeral {
+        ipc::IpcMessage::NetConfigSet {
             network: network.to_string(),
-            ttl_secs,
+            key: NetworkKey::EphemeralTtl,
+            // Empty disables the policy, matching `ConfigUnset` semantics.
+            value: ttl_secs.map(|s| s.to_string()).unwrap_or_default(),
         },
     )
     .await?;

@@ -499,6 +499,7 @@ class RayfishVpnService : VpnService() {
         try {
             NodeHolder.get(applicationContext).up(pfd.detachFd())
             Log.i(TAG, "Node.up succeeded")
+            tunnelUp = true
             startAutoAcceptPoller()
             rebindAfterBringUp()
         } catch (t: Throwable) {
@@ -571,6 +572,7 @@ class RayfishVpnService : VpnService() {
      */
     private fun handleBringUpFailure(reason: String, startId: Int) {
         tunnel = null
+        tunnelUp = false
         try {
             dnsProxy?.stop()
         } catch (t: Throwable) {
@@ -800,6 +802,7 @@ class RayfishVpnService : VpnService() {
             Log.w(TAG, "closing tunnel fd failed", t)
         }
         tunnel = null
+        tunnelUp = false
 
         // The DNS proxy exists to serve the tunnel's resolver; with no tunnel there
         // is nothing pointed at it. Torn down in both cases. Wrapped: this runs on
@@ -843,6 +846,10 @@ class RayfishVpnService : VpnService() {
         // poller is still alive, and once onDestroy has been called nothing here
         // is going to observe a transfer completing any more.
         isRunning = false
+        // Same reasoning for the tile's state: the service is going away, so the
+        // tunnel is going with it. Set here rather than left to the queued
+        // teardown below, which can sit behind a whole bring-up before it runs.
+        tunnelUp = false
         nodeExecutor.execute {
             // See the ACTION_STOP execute() block for why this must never let a
             // throwable escape.
@@ -981,6 +988,18 @@ class RayfishVpnService : VpnService() {
         // poller is running, not what it is doing.
         @Volatile
         var isRunning: Boolean = false
+            private set
+
+        // Whether a tunnel is actually established right now. Written only where
+        // the tunnel field itself is (bring-up success, every teardown and
+        // bring-up failure, onDestroy), so it says what [isRunning] cannot: the
+        // service is equally alive in standby, and NodeHolder.isEnabled is the
+        // user's intent, which stays true when a bring-up fails because another
+        // VPN app holds the slot. [TunnelTileService] reads this to decide what
+        // the quick settings tile shows and what a tap should do, on the main
+        // thread, so it must stay a plain volatile read and never an FFI call.
+        @Volatile
+        var tunnelUp: Boolean = false
             private set
 
         const val ACTION_STOP = "xyz.rayfish.android.STOP"

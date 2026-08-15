@@ -5,6 +5,9 @@
 //! so the daemon/CLI continue to use their original paths unchanged.
 
 pub use ray_proto::ipc::*;
+// The key types the config messages carry. Re-exported here so `ipc::NodeKey`
+// reads alongside `ipc::IpcMessage` at every call site that builds one.
+pub use ray_proto::settings::{FirewallKey, GlobalKey, NetworkKey, NodeKey};
 
 /// Shorthand for the ubiquitous `IpcMessage::Error { message }` reply. Lets a
 /// handler write `return ipc_err(format!("..."))` (or `... ?` via the

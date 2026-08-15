@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Android: toggle the tunnel from quick settings.** Rayfish now offers a
+  quick settings tile, so the tunnel goes on and off from the shade without
+  opening the app. Turning it off there does exactly what the app's toggle and
+  the notification's "Disable" button do, so files keep working with the VPN
+  off unless you asked to go fully offline when disabled. The tile shows
+  whether the tunnel is actually up, not just whether it was asked for. On a
+  device that has not granted the VPN yet, the first tap raises the system
+  consent dialog and then brings the tunnel up; after that the tile does its
+  work without opening anything.
+
 - **Run alongside Tailscale (or any VPN on `100.64.0.0/10`), without setting
   anything up.** Both claim that range, so until now one of the two lost its
   IPv4 half and the daemon refused to start. It now notices the other VPN at
@@ -39,11 +49,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   offers the networks and peers you actually have (`ray leave <TAB>`,
   `ray ping <TAB>`, `ray exit-node use <net> <TAB>`), scoped to the network you
   already named on the line, with each peer's mesh IP and state alongside it.
-  Fixed-choice arguments (`in`/`out`, `allow`/`deny`, `on`/`off`, protocols,
-  settings keys) complete too, and `ray config set <TAB>` shows what each key is
-  currently set to. A tab never starts the daemon and gives up rather than
-  blocking your shell if it is wedged. `ray uninstall` removes the scripts;
-  `ray completions --install` sets them up on a binary-only install.
+  Fixed-choice arguments (`in`/`out`, `allow`/`deny`, `on`/`off`, protocols)
+  complete too. `ray config set <TAB>` lists every settings key with its
+  one-line description, and `ray config set <key> <TAB>` offers that key's
+  values where it has a fixed set (`on`/`off`, `allow`/`deny`) and stays out of
+  the way where it doesn't. A tab never starts the daemon and gives up rather
+  than blocking your shell if it is wedged. `ray uninstall` removes the
+  scripts; `ray completions --install` sets them up on a binary-only install.
 
 - **Mesh SSH supports port forwarding.** `ssh -L`, `ssh -D` and `ProxyJump`
   through a mesh host work now. Before, the embedded SSH server had no handler
@@ -123,6 +135,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   manage from `ray firewall`.
 
 ### Changed
+
+- **`ray config get`/`set` now reaches every single-value setting**, not just
+  the relay/DNS ones: `firewall.enabled`, `firewall.reject`,
+  `firewall.default-in`, `ssh`, `mdns`, `download-dir` and `download-user` are
+  all settable by name. The dedicated commands (`ray firewall off`,
+  `ray firewall ssh on`, `ray files download-dir`, `ray mdns off`, …) are
+  unchanged and still the recommended spelling; they now share one code path
+  with `ray config`, so a setting behaves the same whichever way you write it.
+  A bare `ray config get` prints all twelve, and `ray config set --help` lists
+  each key with a one-line description, so nothing is reachable only by
+  guessing its name.
+
+- **`ray firewall default ALLOW` is accepted**, matching
+  `ray config set firewall.default-in ALLOW`. The two spellings of the same
+  setting disagreed on capitalisation.
+
+- **A mistyped config key is reported by name, even with the daemon stopped.**
+  `ray config get|set|unset <key>` checks the key before it connects, so a typo
+  reads as "unknown config key: …" with the list of valid ones instead of
+  "rayfish daemon is not running". A request the daemon cannot decode at all now
+  comes back as an error rather than a closed connection, which the client could
+  only report as "connection closed".
+
+- **`ray -h` groups its commands instead of listing all 44 in one run.** The
+  list is now broken into Networks, Members & access, Devices & links, Files,
+  Policy, Service, Diagnostics and Setup, so you can find the command you want
+  by looking in the obvious place rather than reading the whole page. Each
+  command is described in one line that fits an 80-column terminal, where
+  several used to be full paragraphs that wrapped; the detail they carried moved
+  to `ray help <command>`, which the foot of the page now points at.
+
+- **`--json` is only accepted by the commands that produce JSON.** It used to be
+  accepted everywhere and honoured by 16 commands, so `ray version --json` and
+  `ray up --json` printed their usual text and gave no hint that the flag did
+  nothing. Those now report an unknown argument, and `--json` is listed only in
+  the help of commands that support it. **This is a breaking change** if you
+  wrote the flag before the command: `ray --json status` no longer parses, and
+  becomes `ray status --json` (the form the docs already used, and the one the
+  error message suggests). Writing it after a subcommand's action, as in
+  `ray firewall show --json`, is unaffected.
 
 - **Magic DNS falls back to your normal DNS for any name the mesh doesn't
   hold.** A network named `dev` used to be registered with the OS as its own

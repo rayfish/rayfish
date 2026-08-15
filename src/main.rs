@@ -10,7 +10,8 @@ use rayfish::{
 use std::sync::{Arc, atomic};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{FromArgMatches, Parser, Subcommand};
+use ray_proto::settings::node_key_help;
 
 use membership::GroupMode;
 
@@ -42,11 +43,6 @@ const ALLOW_DENY: [&str; 2] = ["allow", "deny"];
     version = FULL_VERSION
 )]
 struct Cli {
-    /// Emit machine-readable JSON instead of styled text (disables color and
-    /// spinners). Supported by `status`, `firewall show`, `files`, and other
-    /// list commands.
-    #[arg(long, global = true)]
-    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -56,6 +52,37 @@ static JSON_FLAG: atomic::AtomicBool = atomic::AtomicBool::new(false);
 /// Whether `--json` output mode is active (set once in `main`).
 fn json_enabled() -> bool {
     JSON_FLAG.load(atomic::Ordering::Relaxed)
+}
+
+/// Whether the parsed command carried `--json`.
+///
+/// `--json` used to be a `global = true` flag on `Cli`, which meant every one of
+/// the 44 commands accepted it and the 30-odd that render no JSON ignored it in
+/// silence (`ray version --json` printed the same plain text). It is now declared
+/// only on the commands that honour it, so the parser rejects it elsewhere. This
+/// funnels those per-command flags back into the one `JSON_FLAG` the renderers
+/// already read, keeping the change to the enum and this function rather than
+/// the seven `cli` modules that call `json_enabled`.
+fn json_requested(command: &Command) -> bool {
+    match command {
+        Command::Status { json }
+        | Command::Invite { json, .. }
+        | Command::Requests { json, .. }
+        | Command::Connections { json, .. }
+        | Command::Contact { json, .. }
+        | Command::Ping { json, .. }
+        | Command::Netcheck { json }
+        | Command::Admin { json, .. }
+        | Command::Firewall { json, .. }
+        | Command::ExitNode { json, .. }
+        | Command::Mdns { json, .. }
+        | Command::Files { json, .. }
+        | Command::Pair { json, .. }
+        | Command::Identityof { json, .. }
+        | Command::Alias { json, .. }
+        | Command::Config { json, .. } => *json,
+        _ => false,
+    }
 }
 
 #[derive(Subcommand)]
@@ -121,7 +148,9 @@ pub(crate) enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Remove a member from a closed network (coordinator only)
+    /// Remove a member from a network (coordinator only)
+    ///
+    /// Closed networks only.
     #[command(visible_alias = "boot")]
     Kick {
         /// Network name
@@ -131,8 +160,10 @@ pub(crate) enum Command {
         #[arg(add = complete::peers())]
         peer: String,
     },
-    /// Set or show a per-network ephemeral policy: auto-remove members offline
-    /// longer than the given duration (coordinator only)
+    /// Set or show a per-network ephemeral policy (coordinator only)
+    ///
+    /// Auto-removes members that have been offline longer than the given
+    /// duration.
     Ephemeral {
         /// Network name
         #[arg(add = complete::networks())]
@@ -143,8 +174,14 @@ pub(crate) enum Command {
     },
     /// Show status of all networks (active + saved)
     #[command(visible_aliases = ["st", "ls"])]
-    Status,
-    /// Collect diagnostics (logs + metrics) and open a pre-filled GitHub issue
+    Status {
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Collect diagnostics and open a pre-filled GitHub issue
+    ///
+    /// Bundles the rolling log files and the forward metrics.
     Report,
     /// Run the daemon in the foreground (invoked by the system service)
     #[command(hide = true)]
@@ -163,7 +200,10 @@ pub(crate) enum Command {
         #[arg(long)]
         ipv6_only: bool,
     },
-    /// Standby: take the data plane (TUN + Magic DNS) offline; stays connected to peers
+    /// Standby: take the data plane offline, staying connected to peers
+    ///
+    /// Drops the TUN link and Magic DNS. Peer connections stay up, so coming
+    /// back with `ray up` does not have to redial anyone.
     Down,
     /// Stop the system service (go fully offline). Requires root
     Stop,
@@ -171,7 +211,9 @@ pub(crate) enum Command {
     Start,
     /// Uninstall system service
     Uninstall,
-    /// Install or refresh the system service and start it (requires root)
+    /// Install or refresh the system service (requires root)
+    ///
+    /// Starts it once installed.
     Install {
         /// Opt this node into automatic stable updates: the daemon periodically
         /// checks for a newer stable release and swaps + restarts onto it
@@ -180,7 +222,9 @@ pub(crate) enum Command {
     },
     /// Restart the system service (requires root)
     Restart,
-    /// Set up tab completion for your shell (installed for you by `ray up`)
+    /// Set up tab completion for your shell
+    ///
+    /// `ray up` installs this for you; this command is for a binary-only install.
     Completions {
         /// Shell to generate for. Guessed from $SHELL when left out; as root,
         /// left out means every shell
@@ -190,7 +234,9 @@ pub(crate) enum Command {
         #[arg(long)]
         install: bool,
     },
-    /// Start a local browser GUI for common workflows and every CLI command
+    /// Start a local browser GUI
+    ///
+    /// Covers the common workflows and every CLI command.
     Gui {
         /// Localhost port to listen on (0 chooses a free port)
         #[arg(long, default_value_t = 0)]
@@ -199,19 +245,29 @@ pub(crate) enum Command {
         #[arg(long)]
         no_open: bool,
     },
-    /// Mint and manage one-time invite codes for a network (coordinator only)
+    /// Mint and manage invite codes (coordinator only)
+    ///
+    /// Codes are one-time by default; `--reusable` mints a multi-use key.
     Invite {
         /// Network name to issue/manage invites for
         #[arg(add = complete::networks())]
         network: String,
         #[command(subcommand)]
         action: Option<InviteAction>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
-    /// List peers awaiting approval on a closed network (coordinator only)
+    /// List peers awaiting approval (coordinator only)
+    ///
+    /// Closed networks only. Admit one with `ray accept`, reject with `ray deny`.
     Requests {
         /// Network name
         #[arg(add = complete::networks())]
         network: String,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Admit a peer waiting for approval (coordinator only)
     Accept {
@@ -229,8 +285,9 @@ pub(crate) enum Command {
         /// Short id of the pending peer (from `ray requests`)
         id: String,
     },
-    /// Request a direct 2-peer connection to someone by their contact id. They
-    /// approve it with `ray connections approve`, forming a private 2-peer
+    /// Request a direct 2-peer connection by contact id
+    ///
+    /// They approve it with `ray connections approve`, forming a private 2-peer
     /// network, no room id or invite code needed.
     Connect {
         /// The peer's contact id (from their `ray contact id` / `ray status`)
@@ -239,19 +296,31 @@ pub(crate) enum Command {
         #[arg(long)]
         hostname: Option<String>,
     },
-    /// Review and approve incoming direct-connection requests (`ray connect`)
+    /// Review and approve incoming connection requests
+    ///
+    /// The other side of `ray connect`.
     Connections {
         #[command(subcommand)]
         action: Option<ConnectionsAction>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
-    /// Show or rotate your contact id (shared so others can `ray connect` you)
+    /// Show or rotate your contact id
+    ///
+    /// Share it so others can `ray connect` you.
     Contact {
         #[command(subcommand)]
         action: Option<ContactAction>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
-    /// Probe a peer over the mesh: report round-trip latency, packet loss, and
-    /// whether the path is direct or relayed. Unlike `status`, this sends live
-    /// echo probes that verify the round-trip end to end.
+    /// Probe a peer over the mesh for latency and packet loss
+    ///
+    /// Reports round-trip latency, packet loss, and whether the path is direct
+    /// or relayed. Unlike `status`, this sends live echo probes that verify the
+    /// round-trip end to end.
     Ping {
         /// Peer to probe: hostname, mesh IP, or short id.
         #[arg(add = complete::peers())]
@@ -262,44 +331,72 @@ pub(crate) enum Command {
         /// Delay between probes, in milliseconds.
         #[arg(short, long, default_value_t = 1000)]
         interval: u64,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
-    /// Report this node's network conditions: bound UDP port, home relay and its
-    /// latency, public addresses, and IPv4/IPv6/UDP reachability.
-    Netcheck,
-    /// Grant the network key to a member (coordinator only). The grantee becomes
-    /// a co-coordinator: it can publish the signed blob and suggest firewall
-    /// rules. Trusted-network multi-admin.
+    /// Report this node's network conditions
+    ///
+    /// Bound UDP port, home relay and its latency, public addresses, and
+    /// IPv4/IPv6/UDP reachability.
+    Netcheck {
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Grant the network key to a member (coordinator only)
+    ///
+    /// The grantee becomes a co-coordinator: it can publish the signed blob and
+    /// suggest firewall rules. Trusted-network multi-admin.
     Admin {
         /// Network name
         #[arg(add = complete::networks())]
         network: String,
         #[command(subcommand)]
         action: AdminAction,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
-    /// Manage local, per-network aliases (a friendly name for a user identity).
-    /// Node-local and display-only: shown inline in `ray status` and used to seed
-    /// a `ray apply` spec's `aliases:` map. Never published to the network.
+    /// Manage local, per-network aliases for peer identities
+    ///
+    /// A friendly name for a user identity. Node-local and display-only: shown
+    /// inline in `ray status` and used to seed a `ray apply` spec's `aliases:`
+    /// map. Never published to the network.
     Alias {
         /// Network name
         #[arg(add = complete::networks())]
         network: String,
         #[command(subcommand)]
         action: AliasAction,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Manage local device firewall rules
     Firewall {
         #[command(subcommand)]
         action: FirewallAction,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
-    /// Offer this node as an internet gateway, or route traffic through one
+    /// Offer or use an internet gateway
+    ///
+    /// Offer this node as a gateway, or route this node's traffic through one.
     #[command(name = "exit-node")]
     ExitNode {
         #[command(subcommand)]
         action: ExitNodeAction,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
-    /// Reconcile trusted networks against a deploy spec file (Phase B). Creates
-    /// missing trusted networks, publishes idempotent firewall suggestions, and
-    /// reports the membership gap (expected vs joined hosts). Never joins.
+    /// Reconcile trusted networks against a deploy spec file
+    ///
+    /// Creates missing trusted networks, publishes idempotent firewall
+    /// suggestions, and reports the membership gap (expected vs joined hosts).
+    /// Never joins.
     Apply {
         /// Path to a TOML spec file (see `ray apply --example`).
         #[arg(value_hint = clap::ValueHint::FilePath)]
@@ -327,9 +424,11 @@ pub(crate) enum Command {
         /// New hostname (e.g. "alice" → alice.network.ray)
         name: String,
     },
-    /// Print a host's identity string (the value to paste into a `ray apply`
-    /// spec's `aliases:` map). Resolves to the user identity if the device is
-    /// paired, else the device's transport identity.
+    /// Print a host's identity string
+    ///
+    /// The value to paste into a `ray apply` spec's `aliases:` map. Resolves to
+    /// the user identity if the device is paired, else the device's transport
+    /// identity.
     #[command(visible_alias = "whois")]
     Identityof {
         /// Network name
@@ -338,24 +437,38 @@ pub(crate) enum Command {
         /// Hostname to look up
         #[arg(add = complete::peers())]
         hostname: String,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
-    /// Local (LAN) peer discovery over mDNS: toggle it, or list what it found
+    /// Toggle LAN peer discovery, or list what it found
+    ///
+    /// Discovery is over mDNS, and finds peers on the same local network.
     Mdns {
         #[command(subcommand)]
         action: MdnsAction,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
-    /// Enable or disable automatic stable updates (applied by the daemon)
+    /// Enable or disable automatic stable updates
+    ///
+    /// Applied by the daemon, which swaps and restarts onto the new release.
     #[command(name = "auto-update")]
     AutoUpdate {
         /// "on" or "off"
         #[arg(add = complete::words(&ON_OFF))]
         state: String,
     },
-    /// View or change global daemon settings (relay, discovery-dns, dns-upstreams,
-    /// auto-update, on-demand, ipv6-only)
+    /// View or change daemon settings
+    ///
+    /// `ray config get` lists every key, `ray config set --help` describes them.
     Config {
         #[command(subcommand)]
         action: Option<ConfigAction>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Authorize a user to run ray without sudo (requires root)
     SetOperator {
@@ -376,6 +489,9 @@ pub(crate) enum Command {
     Files {
         #[command(subcommand)]
         action: Option<FilesAction>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Pair this device with another device (share user identity)
     Pair {
@@ -383,8 +499,13 @@ pub(crate) enum Command {
         action: Option<PairAction>,
         /// Pairing ticket from the primary device (shorthand for `rayfish pair accept <ticket>`)
         ticket: Option<String>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
-    /// Revoke a paired device: invalidate its certificate mesh-wide (primary only)
+    /// Revoke a paired device (primary only)
+    ///
+    /// Invalidates the device's certificate mesh-wide.
     Unpair {
         /// Device to revoke: hostname, mesh IP, short id, or full endpoint id
         /// (see `ray pair list`)
@@ -543,23 +664,35 @@ pub(crate) enum ConnectionsAction {
     },
 }
 
+/// `--help` text for a `ray config` key argument: the lead line plus the
+/// generated key list, so `-h` stays one line and `--help` names every key.
+fn key_long_help(lead: &str) -> String {
+    format!("{lead}\n\n{}", node_key_help())
+}
+
 #[derive(Subcommand)]
 pub(crate) enum ConfigAction {
     /// Show settings (all, or one key)
     #[command(visible_alias = "ls")]
     Get {
-        /// relay, discovery-dns, dns-upstreams, auto-update, on-demand, or ipv6-only (omit for all)
-        #[arg(add = complete::settings_keys())]
+        /// A settings key (omit for all)
+        #[arg(
+            long_help = key_long_help("A settings key (omit for all)."),
+            add = complete::node_settings_keys()
+        )]
         key: Option<String>,
     },
-    /// Set a key. List keys take a comma list of presets/URLs/IPs; auto-update
-    /// and on-demand take on/off; ipv6-only takes on/off/auto.
+    /// Set a key. List keys take a comma list of presets/URLs/IPs; on/off keys
+    /// take on or off.
     Set {
-        /// relay, discovery-dns, dns-upstreams, auto-update, on-demand, or ipv6-only
-        #[arg(add = complete::settings_keys())]
+        /// A settings key
+        #[arg(
+            long_help = key_long_help("A settings key."),
+            add = complete::node_settings_keys()
+        )]
         key: String,
-        /// A comma list of presets / URLs / IPv4s ("n0" or empty resets), or
-        /// on/off (ipv6-only also takes auto)
+        /// A comma list of presets / URLs / IPv4s ("n0" or empty resets), or on/off
+        #[arg(add = complete::settings_values())]
         value: String,
         /// Replace the defaults instead of augmenting them (list keys only)
         #[arg(long)]
@@ -568,8 +701,11 @@ pub(crate) enum ConfigAction {
     /// Reset a key to its default
     #[command(visible_alias = "rm")]
     Unset {
-        /// relay, discovery-dns, dns-upstreams, auto-update, on-demand, or ipv6-only
-        #[arg(add = complete::settings_keys())]
+        /// A settings key
+        #[arg(
+            long_help = key_long_help("A settings key."),
+            add = complete::node_settings_keys()
+        )]
         key: String,
     },
 }
@@ -1122,8 +1258,12 @@ fn main() -> Result<()> {
 
 #[tokio::main]
 async fn run() -> Result<()> {
-    let cli = Cli::parse();
-    if cli.json {
+    // Not `Cli::parse()`: the command list in `-h` is grouped, which clap cannot
+    // express on subcommands, so the parser comes from `cli::help` with a
+    // template that renders the grouping in place of clap's flat list.
+    let cli =
+        Cli::from_arg_matches(&cli::help::command().get_matches()).unwrap_or_else(|e| e.exit());
+    if json_requested(&cli.command) {
         JSON_FLAG.store(true, atomic::Ordering::Relaxed);
         // JSON output must never be colorized or interrupted by spinners.
         style::set_plain(true);
@@ -1168,7 +1308,7 @@ async fn run() -> Result<()> {
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Kick { network, peer } => ipc_kick(&network, &peer).await,
         Command::Ephemeral { network, arg } => ipc_ephemeral(&network, &arg).await,
-        Command::Status => ipc_status().await,
+        Command::Status { json: _ } => ipc_status().await,
         Command::Report => ipc_report().await,
         Command::Daemon => {
             check_root();
@@ -1190,25 +1330,34 @@ async fn run() -> Result<()> {
         Command::Restart => cmd_restart().await,
         Command::Completions { shell, install } => complete::cmd_completions(shell, install),
         Command::Gui { port, no_open } => cmd_gui(port, no_open),
-        Command::Invite { network, action } => ipc_invite(&network, action).await,
-        Command::Requests { network } => ipc_requests(&network).await,
+        Command::Invite {
+            network,
+            action,
+            json: _,
+        } => ipc_invite(&network, action).await,
+        Command::Requests { network, json: _ } => ipc_requests(&network).await,
         Command::Accept { network, id } => ipc_accept_request(&network, &id).await,
         Command::Deny { network, id } => ipc_deny_request(&network, &id).await,
         Command::Connect {
             contact_id,
             hostname,
         } => ipc_connect(&contact_id, hostname).await,
-        Command::Connections { action } => ipc_connections(action).await,
-        Command::Contact { action } => ipc_contact(action).await,
+        Command::Connections { action, json: _ } => ipc_connections(action).await,
+        Command::Contact { action, json: _ } => ipc_contact(action).await,
         Command::Ping {
             peer,
             count,
             interval,
+            json: _,
         } => ipc_ping(&peer, count, interval).await,
-        Command::Netcheck => ipc_netcheck().await,
-        Command::Admin { network, action } => ipc_admin(&network, action).await,
-        Command::Firewall { action } => ipc_firewall(action).await,
-        Command::ExitNode { action } => ipc_exit_node(action).await,
+        Command::Netcheck { json: _ } => ipc_netcheck().await,
+        Command::Admin {
+            network,
+            action,
+            json: _,
+        } => ipc_admin(&network, action).await,
+        Command::Firewall { action, json: _ } => ipc_firewall(action).await,
+        Command::ExitNode { action, json: _ } => ipc_exit_node(action).await,
         Command::Apply {
             spec,
             prune,
@@ -1217,17 +1366,27 @@ async fn run() -> Result<()> {
             example,
         } => ipc_apply(spec, prune, dry_run, invite_missing, example).await,
         Command::Hostname { network, name } => ipc_set_hostname(&network, &name).await,
-        Command::Identityof { network, hostname } => {
-            cmd_identityof(&network, &hostname, cli.json).await
-        }
-        Command::Alias { network, action } => cmd_alias(&network, action, cli.json).await,
-        Command::Mdns { action } => cmd_mdns(action).await,
+        Command::Identityof {
+            network,
+            hostname,
+            json,
+        } => cmd_identityof(&network, &hostname, json).await,
+        Command::Alias {
+            network,
+            action,
+            json,
+        } => cmd_alias(&network, action, json).await,
+        Command::Mdns { action, json: _ } => cmd_mdns(action).await,
         Command::AutoUpdate { state } => cmd_auto_update(&state).await,
-        Command::Config { action } => cmd_config(action, cli.json).await,
+        Command::Config { action, json } => cmd_config(action, json).await,
         Command::SetOperator { user } => cmd_set_operator(&user).await,
         Command::Send { peer, files } => ipc_send_files(&files, &peer).await,
-        Command::Files { action } => ipc_files(action).await,
-        Command::Pair { action, ticket } => cmd_pair(action, ticket).await,
+        Command::Files { action, json: _ } => ipc_files(action).await,
+        Command::Pair {
+            action,
+            ticket,
+            json: _,
+        } => cmd_pair(action, ticket).await,
         Command::Unpair { device } => ipc_unpair(&device).await,
         Command::Open { uri } => cmd_open(&uri).await,
         Command::Version => {
@@ -1272,12 +1431,20 @@ pub(crate) async fn ipc_mutate(msg: ipc::IpcMessage) -> Result<()> {
     Ok(())
 }
 
+/// `ray mdns on|off|scan`. The two toggles are the `mdns` settings key under
+/// another name; `scan` is a read and goes its own way.
 async fn cmd_mdns(action: MdnsAction) -> Result<()> {
-    match action {
-        MdnsAction::On => ipc_mutate(ipc::IpcMessage::SetMdns { enabled: true }).await,
-        MdnsAction::Off => ipc_mutate(ipc::IpcMessage::SetMdns { enabled: false }).await,
-        MdnsAction::Scan => ipc_lan_peers().await,
-    }
+    let state = match action {
+        MdnsAction::On => "on",
+        MdnsAction::Off => "off",
+        MdnsAction::Scan => return ipc_lan_peers().await,
+    };
+    ipc_mutate(ipc::IpcMessage::ConfigSet {
+        key: ipc::NodeKey::Global(ipc::GlobalKey::Mdns),
+        value: state.to_string(),
+        replace: false,
+    })
+    .await
 }
 
 /// `ray auto-update on|off`: back-compat alias for `ray config set auto-update
@@ -1285,7 +1452,7 @@ async fn cmd_mdns(action: MdnsAction) -> Result<()> {
 /// takes effect on the next daemon restart.
 async fn cmd_auto_update(state: &str) -> Result<()> {
     ipc_mutate(ipc::IpcMessage::ConfigSet {
-        key: "auto-update".to_string(),
+        key: ipc::NodeKey::Global(ipc::GlobalKey::AutoUpdate),
         value: state.to_string(),
         replace: false,
     })
@@ -1298,6 +1465,9 @@ async fn cmd_auto_update(state: &str) -> Result<()> {
 async fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
     match action.unwrap_or(ConfigAction::Get { key: None }) {
         ConfigAction::Get { key } => {
+            // Before the connect, so a bad key reads the same whether or not the
+            // daemon happens to be running (and the same as `set`/`unset`).
+            let key = key.as_deref().map(parse_node_key);
             let mut stream = ipc::connect()
                 .await
                 .context("rayfish daemon is not running; start it with: sudo ray up")?;
@@ -1330,13 +1500,35 @@ async fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
             replace,
         } => {
             ipc_mutate(ipc::IpcMessage::ConfigSet {
-                key,
+                key: parse_node_key(&key),
                 value,
                 replace,
             })
             .await
         }
-        ConfigAction::Unset { key } => ipc_mutate(ipc::IpcMessage::ConfigUnset { key }).await,
+        ConfigAction::Unset { key } => {
+            ipc_mutate(ipc::IpcMessage::ConfigUnset {
+                key: parse_node_key(&key),
+            })
+            .await
+        }
+    }
+}
+
+/// Resolve a user-typed key to the one the wire carries. `ray config` is the
+/// only command that takes a key as free text; every other caller names its key
+/// as a constant, so this is the single place a typo can enter.
+///
+/// Reported here rather than by the daemon, with the registry's own wording:
+/// the key type makes an unknown key unrepresentable on the wire, so without
+/// this the request would fail to encode instead of explaining itself.
+fn parse_node_key(key: &str) -> ipc::NodeKey {
+    match key.parse() {
+        Ok(k) => k,
+        Err(e) => {
+            print_error("error", &e, None);
+            std::process::exit(1);
+        }
     }
 }
 

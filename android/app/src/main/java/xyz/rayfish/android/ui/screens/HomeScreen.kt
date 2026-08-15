@@ -2,7 +2,6 @@ package xyz.rayfish.android.ui.screens
 
 import android.app.Activity
 import android.content.Context
-import android.content.Intent
 import android.net.VpnService
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -16,7 +15,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -27,9 +25,9 @@ import uniffi.ray_mobile.Status
 import xyz.rayfish.android.DownloadsOutcome
 import xyz.rayfish.android.FileAutoAccept
 import xyz.rayfish.android.NodeHolder
-import xyz.rayfish.android.RayfishVpnService
 import xyz.rayfish.android.TransferKey
 import xyz.rayfish.android.TransferNotifier
+import xyz.rayfish.android.TunnelControl
 import xyz.rayfish.android.isActive
 import xyz.rayfish.android.moveToDownloads
 import xyz.rayfish.android.ui.components.*
@@ -66,9 +64,14 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     }
 
     fun startService() {
-        // Record the intent before starting so an app relaunch restores online.
-        NodeHolder.setEnabled(context, true)
-        ContextCompat.startForegroundService(context, Intent(context, RayfishVpnService::class.java))
+        // Shared with the quick settings tile, so both entry points record the
+        // same enable intent and start the service the same way. A false return
+        // means the system refused the service start outright, so there is no
+        // bring-up to be optimistic about and the toggle must stay where it is.
+        if (!TunnelControl.start(context)) {
+            onToast("Could not start the VPN service")
+            return
+        }
         vpnOn = true
         pendingVpn = true
     }
@@ -80,10 +83,9 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
             val prep = VpnService.prepare(context)
             if (prep != null) consent.launch(prep) else startService()
         } else {
-            // Record disable intent so the launch-time restore and the status
-            // poll both keep the device offline until the user re-enables.
-            NodeHolder.setEnabled(context, false)
-            context.startService(Intent(context, RayfishVpnService::class.java).apply { action = RayfishVpnService.ACTION_STOP })
+            // Records the disable intent so the launch-time restore and the
+            // status poll both keep the device offline until the user re-enables.
+            TunnelControl.stop(context)
             vpnOn = false
             pendingVpn = false
         }

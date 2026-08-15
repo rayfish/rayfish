@@ -1,6 +1,7 @@
 //! CLI firewall + declarative-apply handlers and their parsers/renderers.
 
 use crate::*;
+use ipc::{FirewallKey, GlobalKey, NetworkKey, NodeKey};
 
 pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
     if let FirewallAction::Suggest {
@@ -18,53 +19,8 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
     if let FirewallAction::Ssh { action } = action {
         return ipc_firewall_ssh(action).await;
     }
+    let req = to_ipc(action)?;
     let mut stream = ipc::connect().await?;
-    let req = match action {
-        FirewallAction::Add {
-            direction,
-            action,
-            proto,
-            port,
-            peer,
-            network,
-        } => ipc::IpcMessage::FirewallAdd {
-            direction: direction.parse().map_err(anyhow::Error::msg)?,
-            action: action.parse().map_err(anyhow::Error::msg)?,
-            protocol: proto.parse().map_err(anyhow::Error::msg)?,
-            port,
-            peer,
-            network,
-        },
-        FirewallAction::Remove { index } => ipc::IpcMessage::FirewallRemove { index },
-        FirewallAction::Show => ipc::IpcMessage::FirewallShow,
-        FirewallAction::Default { action } => ipc::IpcMessage::FirewallDefault {
-            action: action.parse().map_err(anyhow::Error::msg)?,
-        },
-        FirewallAction::Reject { state } => {
-            let enabled = match state.to_ascii_lowercase().as_str() {
-                "on" | "true" | "yes" => true,
-                "off" | "false" | "no" => false,
-                other => anyhow::bail!("expected `on` or `off`, got '{other}'"),
-            };
-            ipc::IpcMessage::FirewallReject { enabled }
-        }
-        FirewallAction::On => ipc::IpcMessage::FirewallSetEnabled { enabled: true },
-        FirewallAction::Off => ipc::IpcMessage::FirewallSetEnabled { enabled: false },
-        FirewallAction::Accept { network } => ipc::IpcMessage::FirewallAccept { network },
-        FirewallAction::Deny { network } => ipc::IpcMessage::FirewallDeny { network },
-        FirewallAction::AutoAccept { network, state } => {
-            let enabled = match state.to_ascii_lowercase().as_str() {
-                "on" | "true" | "yes" => true,
-                "off" | "false" | "no" => false,
-                other => anyhow::bail!("expected `on` or `off`, got '{other}'"),
-            };
-            ipc::IpcMessage::FirewallAutoAccept { network, enabled }
-        }
-        // Handled above by early return (need extra round trips / interaction).
-        FirewallAction::Suggest { .. }
-        | FirewallAction::Pending { .. }
-        | FirewallAction::Ssh { .. } => unreachable!(),
-    };
     ipc::send(&mut stream, req).await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
@@ -102,13 +58,98 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
     Ok(())
 }
 
-/// `ray firewall ssh ...`: toggle the embedded mesh SSH server and manage
-/// per-network allow lists.
-async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
-    let mut filter: Option<String> = None;
-    let req = match action {
-        SshAction::On => ipc::IpcMessage::FirewallSshSet { enabled: true },
-        SshAction::Off => ipc::IpcMessage::FirewallSshSet { enabled: false },
+/// Map a `ray firewall` subcommand onto the IPC request that serves it. The
+/// single-value toggles carry no variant of their own: they name a settings key
+/// and hand the raw `on|off` / `allow|deny` word to the daemon, which parses it
+/// through the registry (`config::settings`). Kept as its own function so the
+/// mapping is unit-testable without a daemon.
+///
+/// A bad word is still rejected here, by [`parse_on_off`]: `ray firewall` prints
+/// a daemon error without failing the command, so a typo caught only
+/// server-side would exit 0 instead of 1.
+fn to_ipc(action: FirewallAction) -> Result<ipc::IpcMessage> {
+    Ok(match action {
+        FirewallAction::Add {
+            direction,
+            action,
+            proto,
+            port,
+            peer,
+            network,
+        } => ipc::IpcMessage::FirewallAdd {
+            direction: direction.parse().map_err(anyhow::Error::msg)?,
+            action: action.parse().map_err(anyhow::Error::msg)?,
+            protocol: proto.parse().map_err(anyhow::Error::msg)?,
+            port,
+            peer,
+            network,
+        },
+        FirewallAction::Remove { index } => ipc::IpcMessage::FirewallRemove { index },
+        FirewallAction::Show => ipc::IpcMessage::FirewallShow,
+        FirewallAction::Default { action } => {
+            // Lowercased to match the daemon's own parse (`settings::apply_firewall`):
+            // otherwise `ray firewall default ALLOW` fails here while
+            // `ray config set firewall.default-in ALLOW`, the same setting, works.
+            let action = action.to_lowercase();
+            action
+                .parse::<firewall::Action>()
+                .map_err(anyhow::Error::msg)?;
+            ipc::IpcMessage::ConfigSet {
+                key: NodeKey::Firewall(FirewallKey::DefaultIn),
+                value: action,
+                replace: false,
+            }
+        }
+        FirewallAction::Reject { state } => {
+            parse_on_off(&state)?;
+            ipc::IpcMessage::ConfigSet {
+                key: NodeKey::Firewall(FirewallKey::Reject),
+                value: state,
+                replace: false,
+            }
+        }
+        FirewallAction::On => ipc::IpcMessage::ConfigSet {
+            key: NodeKey::Firewall(FirewallKey::Enabled),
+            value: "on".to_string(),
+            replace: false,
+        },
+        FirewallAction::Off => ipc::IpcMessage::ConfigSet {
+            key: NodeKey::Firewall(FirewallKey::Enabled),
+            value: "off".to_string(),
+            replace: false,
+        },
+        FirewallAction::Accept { network } => ipc::IpcMessage::FirewallAccept { network },
+        FirewallAction::Deny { network } => ipc::IpcMessage::FirewallDeny { network },
+        FirewallAction::AutoAccept { network, state } => {
+            parse_on_off(&state)?;
+            ipc::IpcMessage::NetConfigSet {
+                network,
+                key: NetworkKey::AutoAcceptFirewall,
+                value: state,
+            }
+        }
+        // Handled above by early return (need extra round trips / interaction).
+        FirewallAction::Suggest { .. }
+        | FirewallAction::Pending { .. }
+        | FirewallAction::Ssh { .. } => unreachable!(),
+    })
+}
+
+/// Map a `ray firewall ssh` subcommand onto its IPC request. `on|off` is the
+/// `ssh` settings key: the daemon serves it through the handler that also seeds
+/// the tcp:22 passthrough and starts/stops the listener.
+fn ssh_to_ipc(action: SshAction) -> ipc::IpcMessage {
+    match action {
+        SshAction::On => ipc::IpcMessage::ConfigSet {
+            key: NodeKey::Global(GlobalKey::Ssh),
+            value: "on".to_string(),
+            replace: false,
+        },
+        SshAction::Off => ipc::IpcMessage::ConfigSet {
+            key: NodeKey::Global(GlobalKey::Ssh),
+            value: "off".to_string(),
+            replace: false,
+        },
         SshAction::Allow {
             network,
             peer,
@@ -125,11 +166,19 @@ async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
             users: vec![],
             allow: false,
         },
-        SshAction::Show { network } => {
-            filter = network;
-            ipc::IpcMessage::FirewallSshShow
-        }
+        SshAction::Show { .. } => ipc::IpcMessage::FirewallSshShow,
+    }
+}
+
+/// `ray firewall ssh ...`: toggle the embedded mesh SSH server and manage
+/// per-network allow lists.
+async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
+    // `show` filters the reply client-side, so keep its network before the move.
+    let filter = match &action {
+        SshAction::Show { network } => network.clone(),
+        _ => None,
     };
+    let req = ssh_to_ipc(action);
     let mut stream = ipc::connect().await?;
     ipc::send(&mut stream, req).await?;
     let resp = ipc::recv(&mut stream).await?;
@@ -857,6 +906,113 @@ pub(crate) async fn ipc_invite_mint(network: &str, hostname: Option<String>) -> 
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    /// `IpcMessage` has no `PartialEq` (it carries wire types that don't want
+    /// one), so compare the settings-key mapping as a tuple.
+    fn config_set_of(action: FirewallAction) -> (NodeKey, String) {
+        match to_ipc(action).unwrap() {
+            ipc::IpcMessage::ConfigSet {
+                key,
+                value,
+                replace,
+            } => {
+                assert!(!replace, "a toggle never replaces a list");
+                (key, value)
+            }
+            other => panic!("expected ConfigSet, got {other:?}"),
+        }
+    }
+
+    /// The single-value toggles must land on settings keys, not on bespoke IPC
+    /// variants, and must pass the user's word through unparsed so the daemon's
+    /// registry is the only place that decides what `on` means.
+    #[test]
+    fn firewall_subcommands_map_onto_the_settings_keys() {
+        assert_eq!(
+            config_set_of(FirewallAction::Off),
+            (NodeKey::Firewall(FirewallKey::Enabled), "off".to_string())
+        );
+        assert_eq!(
+            config_set_of(FirewallAction::On),
+            (NodeKey::Firewall(FirewallKey::Enabled), "on".to_string())
+        );
+        assert_eq!(
+            config_set_of(FirewallAction::Default {
+                action: "deny".into()
+            }),
+            (
+                NodeKey::Firewall(FirewallKey::DefaultIn),
+                "deny".to_string()
+            )
+        );
+        assert_eq!(
+            config_set_of(FirewallAction::Reject { state: "on".into() }),
+            (NodeKey::Firewall(FirewallKey::Reject), "on".to_string())
+        );
+
+        // Auto-accept is per-network, so it takes the network-scoped variant.
+        match to_ipc(FirewallAction::AutoAccept {
+            network: "gaming".into(),
+            state: "off".into(),
+        })
+        .unwrap()
+        {
+            ipc::IpcMessage::NetConfigSet {
+                network,
+                key,
+                value,
+            } => {
+                assert_eq!(network, "gaming");
+                assert_eq!(key, NetworkKey::AutoAcceptFirewall);
+                assert_eq!(value, "off");
+            }
+            other => panic!("expected NetConfigSet, got {other:?}"),
+        }
+    }
+
+    /// A bad toggle word must still fail the command (exit 1, not a printed
+    /// daemon error and exit 0) and must fail with the wording these commands
+    /// have always used, which is not the settings registry's wording.
+    #[test]
+    fn a_bad_toggle_word_fails_with_the_original_message() {
+        let err = to_ipc(FirewallAction::Reject {
+            state: "maybe".into(),
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "expected `on` or `off`, got 'maybe'");
+
+        let err = to_ipc(FirewallAction::AutoAccept {
+            network: "gaming".into(),
+            state: "maybe".into(),
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "expected `on` or `off`, got 'maybe'");
+
+        // `firewall default` parses an allow/deny word, with its own message.
+        let err = to_ipc(FirewallAction::Default {
+            action: "maybe".into(),
+        })
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid action 'maybe' (expected 'allow' or 'deny')"
+        );
+    }
+
+    /// `ray firewall ssh on|off` must go through the `ssh` key, which is the
+    /// only path that also seeds the tcp:22 passthrough and starts the listener.
+    #[test]
+    fn ssh_toggle_maps_onto_the_ssh_key() {
+        for (action, want) in [(SshAction::On, "on"), (SshAction::Off, "off")] {
+            match ssh_to_ipc(action) {
+                ipc::IpcMessage::ConfigSet { key, value, .. } => {
+                    assert_eq!(key, NodeKey::Global(GlobalKey::Ssh));
+                    assert_eq!(value, want);
+                }
+                other => panic!("expected ConfigSet, got {other:?}"),
+            }
+        }
+    }
 
     fn peer(hostname: &str, user: Option<iroh::EndpointId>) -> ipc::PeerStatus {
         ipc::PeerStatus {

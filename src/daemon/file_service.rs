@@ -870,50 +870,20 @@ impl FileService {
         }
     }
 
-    /// Toggle this node's per-network auto-accept of file offers from our own
-    /// paired devices (persisted in config). Turning it on also drains any
-    /// already-queued offers that now qualify.
-    pub(crate) async fn files_auto_accept(
-        self: &Arc<Self>,
-        network: &str,
-        enabled: bool,
-    ) -> IpcMessage {
-        if !self.registry.contains(network) {
-            return ipc_err(format!("network '{network}' not found"));
-        }
-        match config::load_network(network) {
-            Ok(Some(mut nc)) => {
-                nc.auto_accept_files = enabled;
-                if let Err(e) = config::save_network(&nc) {
-                    return ipc_err(format!("failed to persist auto-accept setting: {e}"));
-                }
-            }
-            Ok(None) => {
-                return ipc_err(format!("network '{network}' not found in config"));
-            }
-            Err(e) => {
-                return ipc_err(format!("failed to load config: {e}"));
-            }
-        }
-        // On enable, sweep any already-queued offers so a file that arrived
-        // before the toggle still lands.
-        if enabled {
-            let ids: Vec<u64> = self
-                .pending_files
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|f| f.id)
-                .collect();
-            for id in ids {
-                self.try_auto_accept_file(id).await;
-            }
-        }
-        IpcMessage::Ok {
-            message: format!(
-                "auto-accept files from your own devices {} for '{network}'",
-                if enabled { "enabled" } else { "disabled" }
-            ),
+    /// Sweep the queued file offers, accepting any that now qualify. Called
+    /// after `net.auto-accept-files` is turned on so a file that arrived before
+    /// the toggle still lands, instead of sitting in the queue until the sender
+    /// retries.
+    pub(crate) async fn drain_auto_acceptable(self: &Arc<Self>) {
+        let ids: Vec<u64> = self
+            .pending_files
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| f.id)
+            .collect();
+        for id in ids {
+            self.try_auto_accept_file(id).await;
         }
     }
 

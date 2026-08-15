@@ -543,45 +543,6 @@ impl NetworkRegistry {
         }
     }
 
-    /// Set or clear the per-network ephemeral policy (coordinator-local). A
-    /// `None` TTL disables it. Persisted to the network's config; the pruner
-    /// re-reads it each tick, so no restart is needed.
-    pub(crate) async fn set_ephemeral(&self, network: &str, ttl_secs: Option<u64>) -> IpcMessage {
-        let mut cfg = match config::load_network(network) {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                return ipc_err(format!("network '{network}' not found"));
-            }
-            Err(e) => {
-                return ipc_err(format!("failed to load network '{network}': {e}"));
-            }
-        };
-        cfg.ephemeral_ttl_secs = ttl_secs;
-        if let Err(e) = config::save_network(&cfg) {
-            return ipc_err(format!("failed to save network '{network}': {e}"));
-        }
-        match ttl_secs {
-            Some(s) => IpcMessage::Ok {
-                message: format!("ephemeral policy on '{network}' set to {s}s"),
-            },
-            None => IpcMessage::Ok {
-                message: format!("ephemeral policy on '{network}' disabled"),
-            },
-        }
-    }
-
-    /// Read the per-network ephemeral TTL (open read).
-    pub(crate) fn get_ephemeral(&self, network: &str) -> IpcMessage {
-        match config::load_network(network) {
-            Ok(Some(c)) => IpcMessage::EphemeralStatus {
-                network: network.to_string(),
-                ttl_secs: c.ephemeral_ttl_secs,
-            },
-            Ok(None) => ipc_err(format!("network '{network}' not found")),
-            Err(e) => ipc_err(format!("failed to load network '{network}': {e}")),
-        }
-    }
-
     /// Restore one saved member network, retrying until it lands.
     ///
     /// Restoring a membership needs the network's signed pkarr record, so it
