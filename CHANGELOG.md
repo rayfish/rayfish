@@ -6,17 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
+## [0.3.0] - 2026-08-15
 
-- **Android: toggle the tunnel from quick settings.** Rayfish now offers a
-  quick settings tile, so the tunnel goes on and off from the shade without
-  opening the app. Turning it off there does exactly what the app's toggle and
-  the notification's "Disable" button do, so files keep working with the VPN
-  off unless you asked to go fully offline when disabled. The tile shows
-  whether the tunnel is actually up, not just whether it was asked for. On a
-  device that has not granted the VPN yet, the first tap raises the system
-  consent dialog and then brings the tunnel up; after that the tile does its
-  work without opening anything.
+Peers on 0.2.x still connect: the mesh protocol is unchanged (`rayfish/mesh/2`),
+and the signed roster only gained an optional field older builds ignore. Two
+things do break across versions. `--json` goes after the command now
+(`ray status --json`, not `ray --json status`), and an invite code minted by
+this build cannot be redeemed by a peer still on 0.2.x.
+
+### Added
 
 - **Run alongside Tailscale (or any VPN on `100.64.0.0/10`), without setting
   anything up.** Both claim that range, so until now one of the two lost its
@@ -121,6 +119,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   recognised, the error now tells you to run `sudo ray daemon` directly instead
   of leaving you to guess. Under SysV init nothing supervises the daemon, so
   `ray up` says so: a crash stays down until the next `ray start`.
+
+- **Android: toggle the tunnel from quick settings.** Rayfish now offers a
+  quick settings tile, so the tunnel goes on and off from the shade without
+  opening the app. Turning it off there does exactly what the app's toggle and
+  the notification's "Disable" button do, so files keep working with the VPN
+  off unless you asked to go fully offline when disabled. The tile shows
+  whether the tunnel is actually up, not just whether it was asked for. On a
+  device that has not granted the VPN yet, the first tap raises the system
+  consent dialog and then brings the tunnel up; after that the tile does its
+  work without opening anything.
 
 - **The Android app can cancel a queued send.** A send waiting on a peer that
   hasn't picked it up now shows under Notifications with a Cancel button, the
@@ -479,6 +487,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   version.
 
 ### Performance
+
+- **Mesh SSH commands start faster.** The sockets carrying SSH left Nagle on, so
+  every small request/response exchange waited on the Nagle/delayed-ACK standoff
+  instead of going out at once. Over a 34 ms link, opening a session channel on
+  an established connection cost 117 ms, roughly 3.4 round trips where 1-2 is
+  the floor. Ansible, which opens a channel per task, paid that on every one.
+  Forwarded connections in both directions and the local `ray gui` server got
+  the same treatment.
 
 - **Cheaper per-packet receive.** Every datagram arriving from a peer re-resolved
   the TUN writer through two atomic reference-count operations. Readers now keep
@@ -1254,7 +1270,8 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rayfish/rayfish/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/rayfish/rayfish/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/rayfish/rayfish/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/rayfish/rayfish/compare/v0.1.3...v0.1.4
