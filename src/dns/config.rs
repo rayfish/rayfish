@@ -1131,6 +1131,11 @@ impl Resolvconf {
             .await?;
         let status = child.wait().await?;
         anyhow::ensure!(status.success(), "resolvconf -a failed");
+        // Check the merge here rather than once at `apply`: the case that
+        // matters is the other VPN registering its stanza after we did, which
+        // is exactly the one a startup-only check cannot see. This runs on
+        // every join and leave too.
+        self.warn_if_outranked().await;
         Ok(())
     }
 
@@ -1147,7 +1152,10 @@ impl Resolvconf {
         let Some(first) = first_nameserver(&merged) else {
             return;
         };
-        if first == resolver_addr() {
+        // A loopback stub (resolved's 127.0.0.53, an NM/dnsmasq 127.0.0.1) is
+        // not a competitor: it is a forwarder we registered *with*, so it is
+        // reached first by design and hands `.ray` back to us.
+        if first == resolver_addr() || first.is_loopback() {
             return;
         }
         tracing::warn!(
@@ -1173,7 +1181,6 @@ impl DnsConfigurator for Resolvconf {
             variant = variant_name,
             "configured resolvconf for .{DNS_DOMAIN}"
         );
-        self.warn_if_outranked().await;
         Ok(())
     }
 
@@ -1531,7 +1538,7 @@ async fn nm_quiet_install() {
 /// Only removes a file carrying our marker, so we never delete an operator's
 /// own NM config. Best-effort.
 #[cfg(target_os = "linux")]
-async fn nm_quiet_remove() {
+pub(crate) async fn nm_quiet_remove() {
     let path = Path::new(NM_DROPIN);
     match tokio::fs::read_to_string(path).await {
         Ok(c) if resolv_conf_is_ours(&c) => {}
@@ -1554,15 +1561,36 @@ fn backup_path(original: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Capture the host's `/etc/resolv.conf` before we overwrite it, once.
+///
+/// Never captures a file that is already ours. It can be: after standing down
+/// we drop our backup, and the VPN that took the file backed it up *while we
+/// owned it*, so when that VPN leaves it restores our old rayfish file and the
+/// retry loop finds that as "the host's". Storing it as the baseline would mean
+/// a later `ray down` restores a resolv.conf whose first nameserver is the
+/// magic IP with no daemon behind it, and every lookup on the host eats a
+/// resolver timeout before falling through to the second line. With no backup,
+/// `restore_file` takes its marker-based in-place strip instead, which is the
+/// right answer for a file we wrote.
 #[cfg(target_os = "linux")]
 async fn backup_file(path: &Path) -> Result<()> {
     let backup = backup_path(path);
-    if path.exists() && !backup.exists() {
-        tokio::fs::copy(path, &backup)
-            .await
-            .with_context(|| format!("backing up {}", path.display()))?;
+    if backup.exists() {
+        return Ok(());
     }
-    Ok(())
+    let Ok(current) = tokio::fs::read_to_string(path).await else {
+        return Ok(()); // absent or unreadable: nothing to capture
+    };
+    if resolv_conf_is_ours(&current) {
+        tracing::info!("not backing up /etc/resolv.conf: it is one we wrote");
+        return Ok(());
+    }
+    // `copy`, not a write of `current`: it carries the original's mode across,
+    // and the restore copies it straight back.
+    tokio::fs::copy(path, &backup)
+        .await
+        .map(|_| ())
+        .with_context(|| format!("backing up {}", path.display()))
 }
 
 /// Drop the `/etc/resolv.conf` backup without restoring it.
@@ -1575,10 +1603,12 @@ async fn backup_file(path: &Path) -> Result<()> {
 #[cfg(target_os = "linux")]
 pub async fn discard_resolv_backup() {
     let backup = backup_path(Path::new("/etc/resolv.conf"));
-    if backup.exists()
-        && let Err(e) = tokio::fs::remove_file(&backup).await
-    {
-        tracing::warn!(error = %e, path = %backup.display(), "failed to drop the stale DNS backup");
+    match tokio::fs::remove_file(&backup).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(error = %e, path = %backup.display(), "failed to drop the stale DNS backup");
+        }
     }
 }
 
@@ -1812,11 +1842,24 @@ fn is_our_search_domain(domain: &str) -> bool {
     domain == DNS_DOMAIN || domain.ends_with(&format!(".{DNS_DOMAIN}"))
 }
 
-/// The host's own search domains followed by ours, without duplicates.
+/// What the resolver actually reads: glibc's `MAXDNSRCH`. Entries past it are
+/// ignored in silence, which is why the merge below truncates deliberately
+/// instead of rendering a list the host will quietly cut short.
+#[cfg(any(target_os = "linux", test))]
+const MAX_SEARCH_DOMAINS: usize = 6;
+
+/// The host's own search domains followed by ours, without duplicates, capped
+/// at what the resolver reads.
 ///
 /// Host first: on a box that already searched `lan`, a bare name that resolves
 /// there keeps resolving there. Ours only add candidates, they never take one
 /// away, and the cost of losing the race is one extra NXDOMAIN.
+///
+/// The cap inverts that priority for exactly one entry. `search_domains_for`
+/// puts the catch-all `ray` last, so a host with its own domains and several
+/// networks would overflow the list and lose precisely the entry that makes any
+/// bare mesh name resolve. `ray` is kept at the cost of the last thing that
+/// fits, and what got dropped is logged rather than silently cut.
 #[cfg(any(target_os = "linux", test))]
 fn merge_search_domains(captured: &[String], rayfish: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(captured.len() + rayfish.len());
@@ -1825,6 +1868,21 @@ fn merge_search_domains(captured: &[String], rayfish: &[String]) -> Vec<String> 
             out.push(d.clone());
         }
     }
+    if out.len() <= MAX_SEARCH_DOMAINS {
+        return out;
+    }
+    let mut dropped = out.split_off(MAX_SEARCH_DOMAINS);
+    if !out.iter().any(|d| d == DNS_DOMAIN) {
+        dropped.retain(|d| d != DNS_DOMAIN);
+        dropped.push(out.pop().expect("cap is non-zero"));
+        out.push(DNS_DOMAIN.to_string());
+    }
+    tracing::warn!(
+        ?dropped,
+        kept = ?out,
+        "more search domains than the resolver reads ({MAX_SEARCH_DOMAINS}); \
+         bare names under the dropped ones need their full `.{DNS_DOMAIN}` name"
+    );
     out
 }
 
@@ -2035,6 +2093,46 @@ mod tests {
         assert!(is_our_search_domain("homelab.ray"));
         assert!(!is_our_search_domain("lan"));
         assert!(!is_our_search_domain("notray"));
+    }
+
+    #[test]
+    fn search_domains_overflow_keeps_the_catch_all() {
+        // Three host domains plus four networks is eight entries, and the
+        // resolver reads six. `ray` is last in our list, so a plain truncation
+        // drops the one entry that makes any bare mesh name resolve.
+        let host = ["corp.example.com", "example.com", "lan"].map(String::from);
+        let rayfish = search_domains_for(
+            &["a", "b", "c", "d"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>(),
+        );
+        let merged = merge_search_domains(&host, &rayfish);
+        assert_eq!(merged.len(), 6);
+        assert_eq!(merged.last().unwrap(), "ray");
+        // The host's own domains outrank ours: they resolved here before.
+        assert_eq!(&merged[..3], &host[..]);
+        assert_eq!(&merged[3..], ["a.ray", "b.ray", "ray"]);
+        // Already inside the cap: nothing is rearranged.
+        let small = merge_search_domains(&["lan".to_string()], &search_domains_for(&[]));
+        assert_eq!(small, ["lan", "ray"]);
+    }
+
+    /// The re-assert loop reads the domains through a shared handle rather than
+    /// the snapshot it started with, so a join or leave lands in the file the
+    /// next repair writes. This is the staleness `SearchDomains` exists to fix.
+    #[test]
+    fn reassert_renders_the_live_search_list() {
+        let handle: std::sync::Arc<arc_swap::ArcSwap<Vec<String>>> =
+            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(vec!["ray".to_string()]));
+        assert!(render_direct_resolv_conf(&handle.load(), None).contains("search ray\n"));
+        handle.store(std::sync::Arc::new(vec![
+            "homelab.ray".to_string(),
+            "ray".to_string(),
+        ]));
+        assert!(
+            render_direct_resolv_conf(&handle.load(), None).contains("search homelab.ray ray\n")
+        );
     }
 
     #[test]

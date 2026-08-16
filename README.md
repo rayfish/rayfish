@@ -534,8 +534,11 @@ leaves the file to whoever holds it rather than fighting over it, whichever of
 the two started first, and takes DNS back on its own once the other VPN is
 gone. Until then `.ray` names won't resolve through the system resolver: add
 rayfish's resolver to that file yourself, or put a DNS manager both can
-register with in the path. Everything else is unaffected, and `dig
-@100.100.100.53 <host>.ray` (`@200::53` in IPv6-only mode) answers regardless.
+register with in the path. Everything else is unaffected, and `dig @200::53
+<host>.ray` still answers, since Magic DNS is reached through the tunnel and
+not through `resolv.conf`. (Use `@200::53`, not the v4 `100.100.100.53`: a host
+sharing the CGNAT range with another VPN is in IPv6-only mode, where the v4
+magic address is exactly what the mode gives up.)
 
 With `resolvconf` in the path both VPNs do get to register, but the system
 tries the resolvers in order and stops at the first that answers, so whichever

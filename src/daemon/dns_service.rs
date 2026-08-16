@@ -146,11 +146,17 @@ impl DnsService {
             // `revert` should not be held open by a task waiting on a 30s tick.
             let me = Arc::downgrade(self);
             let tun_name = tun_name.to_string();
+            let watcher = rt.clone();
             tokio::spawn(async move {
+                // The watcher can return a verdict it decided just before
+                // `revert` cancelled it: the select arm is already committed by
+                // then, so the cancel is only visible here. Acting on a stale
+                // verdict would re-arm DNS for a data plane that is down.
                 if let Some(ip) = dns_config::run_resolv_reassert(search, fallback, rt).await
+                    && !watcher.is_cancelled()
                     && let Some(me) = me.upgrade()
                 {
-                    me.stand_down(ip, tun_name).await;
+                    me.stand_down(ip, tun_name, &watcher).await;
                 }
             });
         }
@@ -165,11 +171,23 @@ impl DnsService {
     /// `restore_stale_backups` can do it later, and go back to retrying
     /// detection so we reclaim DNS if that VPN leaves.
     ///
-    /// The `dns=none` NetworkManager drop-in stays: un-quieting NM here would
-    /// only have NM regenerate the file and start a different fight over it.
-    /// It is marker-guarded and still removed on the real revert path.
+    /// The `dns=none` NetworkManager drop-in stays *while* we are stood down:
+    /// un-quieting NM here would only have NM regenerate the file and start a
+    /// different fight over it. Dropping the configurator would otherwise
+    /// orphan it, since `DirectResolvConf::revert` is the only thing that
+    /// removes it, so [`revert`](Self::revert) clears it directly.
+    ///
+    /// `watcher` is the token of the watcher that reported this, and it is what
+    /// says the verdict is still current: `revert` cancels it on the way down,
+    /// and a stand-down that re-armed the retry loop after that would point a
+    /// downed data plane's DNS back at us.
     #[cfg(target_os = "linux")]
-    async fn stand_down(self: &Arc<Self>, foreign: std::net::Ipv4Addr, tun_name: String) {
+    async fn stand_down(
+        self: &Arc<Self>,
+        foreign: std::net::Ipv4Addr,
+        tun_name: String,
+        watcher: &CancellationToken,
+    ) {
         tracing::warn!(
             %foreign,
             "/etc/resolv.conf is owned by another VPN now; leaving it to them rather than \
@@ -179,6 +197,9 @@ impl DnsService {
         self.reassert_token.lock().unwrap().take();
         self.configurator.lock().unwrap().take();
         dns_config::discard_resolv_backup().await;
+        if watcher.is_cancelled() {
+            return;
+        }
         self.spawn_configure_retry(tun_name);
     }
 
@@ -282,6 +303,15 @@ impl DnsService {
         {
             tracing::warn!(error = %e, "failed to revert DNS configuration");
         }
+        // Un-quiet NetworkManager even with no configurator to do it for us.
+        // `stand_down` drops the configurator while the `dns=none` drop-in is
+        // still installed, and `DirectResolvConf::revert` is the only other
+        // thing that removes it, so without this a stood-down node leaves NM
+        // muted for good: the other VPN owns resolv.conf, and if it leaves too,
+        // nothing regenerates the file. Marker-guarded and idempotent, so this
+        // is a no-op on every backend that never installed one.
+        #[cfg(target_os = "linux")]
+        dns_config::nm_quiet_remove().await;
         dns_config::clear_search_domains(tun_name).await;
     }
 }
