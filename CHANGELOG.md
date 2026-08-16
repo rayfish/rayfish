@@ -38,6 +38,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The mesh protocol version is now 3, and every peer must be on it.** Control
+  frames, pairing, `ray connect`, file transfer and the signed roster are now
+  encoded more compactly, which takes about a third off the largest thing on the
+  wire (a 50-member roster drops from 6041 to 4061 bytes). The encoding is not
+  backward compatible, and peers on different protocol versions cannot connect
+  at all, so a mesh has to upgrade together: a node left on 0.3.x will stop
+  seeing the rest of the network rather than degrading. Nothing on disk changes,
+  so upgrading in place keeps your networks, identity and pairings.
+
+
 - **`ray firewall --help` is grouped, and every help page reads in one pass.**
   The firewall's 13 actions are now listed under Rules, Mode, Coordinator
   suggestions and Mesh SSH, the way `ray --help` has been grouped for a while.

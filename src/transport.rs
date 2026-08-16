@@ -25,14 +25,14 @@ use std::sync::Arc;
 /// protocol** (`FileOffer`/blob handshake). iroh negotiates the ALPN at the QUIC
 /// handshake, so a peer on a different version shares no common ALPN and the
 /// transfer simply can't connect: the version gate needs no in-band check.
-pub const FILES_ALPN: &[u8] = b"rayfish/files/1";
+pub const FILES_ALPN: &[u8] = b"rayfish/files/2";
 
 /// Identity-level ALPN for the `ray connect` friend-request handshake. Unlike
 /// `network_alpn`, this is not per-network: it accepts connection requests
 /// addressed to this node's contact key. The trailing `/1` is its protocol
 /// version, **bump it on any breaking change to the `ConnectMsg` handshake**;
 /// peers on different versions can't negotiate a connection (transport-enforced).
-pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/1";
+pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/2";
 
 /// Fixed UDP port the endpoint binds so users can port-forward a stable, known
 /// port for guaranteed direct reachability (Tailscale-style). Unlike an ephemeral
@@ -66,14 +66,16 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// frame it cannot decode (so an unknown `ControlMsg` variant is dropped, not
 /// fatal) and nacks it with `ControlMsg::NotSupported` so the mismatch shows in
 /// the sender's log (builds before the nack existed skip silently), and every
-/// frame and blob is msgpack map-encoded (`to_vec_named`) with
-/// `serde(default)` on new fields, so unknown fields are ignored and missing ones
-/// defaulted in both directions. Exit nodes ride that: a v2 peer that predates
-/// `ControlMsg::ExitNodeOffer` and `Member.exit_node` stays connected and simply
+/// frame and blob is msgpack array-encoded (`to_vec`) with `serde(default)` on
+/// new fields, so a shorter array from an older build defaults its trailing
+/// fields. That tolerance runs one way only, which is why fields are
+/// append-only and a version bump is the tool for anything else. Exit nodes rode
+/// the older map encoding: a v2 peer that predates
+/// `ControlMsg::ExitNodeOffer` and `Member.exit_node` stayed connected and simply
 /// cannot offer or discover exit nodes until updated. Bump only for changes an
 /// old peer would *misinterpret* (removed/repurposed fields or variants, changed
 /// semantics of existing ones), not for ones it safely ignores.
-pub const MESH_PROTOCOL_VERSION: u32 = 2;
+pub const MESH_PROTOCOL_VERSION: u32 = 3;
 
 /// Capability bits a peer advertises in its `MeshHello.features`. These are
 /// negotiated *inside* the single mesh ALPN, so adding one needs no version bump:

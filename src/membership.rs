@@ -76,11 +76,11 @@ pub struct Member {
     pub identity: EndpointId,
     pub ip: Ipv4Addr,
     pub is_coordinator: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub hostname: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub user_identity: Option<EndpointId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub device_cert: Option<DeviceCert>,
     /// Index used to resolve IPv4 collisions in the 22-bit CGNAT space.
     /// 0 for most peers; incremented only when `derive_ip_with_index(identity, 0)`
@@ -91,7 +91,7 @@ pub struct Member {
     /// observed offline, so the ephemeral pruner never evicts it. Stamped on
     /// disconnect and seeded at admit; part of the hashed blob so it replicates
     /// to co-coordinators and survives a coordinator restart.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub last_seen: Option<u64>,
     /// This member offers itself as an exit node on the network (advertised so
     /// peers can discover it via `ray status` and `ray exit-node use`). Set by a
@@ -99,7 +99,7 @@ pub struct Member {
     /// self-claim that only advertises availability. The exit node still gates
     /// actual forwarding with its local `exit_allow` list, so a false claim just
     /// makes clients dial a node that drops them.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     pub exit_node: bool,
     /// Which families the exit node this member offers can egress, i.e. whether
     /// that host has an IPv6 default route to masquerade onto. Meaningless
@@ -111,7 +111,7 @@ pub struct Member {
     /// nowhere to send it. Without this that failure is a silent black hole,
     /// since nothing else on the roster says which families a gateway can
     /// egress. See [`ExitFamilies`] for why it is three-valued.
-    #[serde(default, skip_serializing_if = "ExitFamilies::is_unknown")]
+    #[serde(default)]
     pub exit_families: ExitFamilies,
     /// This member's data plane is IPv6-only, so its `ip` is assigned but not
     /// routed: another VPN owns `100.64.0.0/10` on that host. A self-claim, same
@@ -119,7 +119,7 @@ pub struct Member {
     /// (`ControlMsg::Ipv6Only` -> coordinator -> signed blob). Peers use it to
     /// withhold the member's A record, since packets sent to that address arrive
     /// but the replies leave through the other VPN.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     pub ipv6_only: bool,
 }
 
@@ -254,11 +254,11 @@ impl MemberList {
 pub struct ApprovedEntry {
     pub identity: EndpointId,
     pub ip: Ipv4Addr,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub hostname: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub user_identity: Option<EndpointId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub device_cert: Option<DeviceCert>,
     /// Index used to resolve IPv4 collisions. Mirrors `Member.collision_index`
     /// for the same identity; defaults to 0 for backward-compatible decoding.
@@ -485,14 +485,14 @@ pub struct GroupBlob {
     /// subject targets every node). Advisory: each node queues them for
     /// `ray firewall accept`, or auto-installs them if it opted into
     /// `--auto-accept-firewall`. `BTreeMap` keys keep the encoding canonical.
-    #[serde(default, skip_serializing_if = "SuggestedFirewall::is_empty")]
+    #[serde(default)]
     pub suggested_firewall: SuggestedFirewall,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub name: Option<String>,
     /// Reusable join keys, keyed by hex `blake3(secret)`. `BTreeMap` keeps the
     /// encoding canonical; the secret hash commits to the signed hash, so adding
     /// or revoking a key changes the blob hash and triggers reconvergence.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub reusable_keys: BTreeMap<String, ReusableKey>,
     /// Device keys nullified on this network (`ray unpair`). A cert whose
     /// `device_key` is listed is no longer honored: admission rejects it, the
@@ -500,7 +500,7 @@ pub struct GroupBlob {
     /// it on reconverge. `BTreeSet` keeps the encoding canonical, so adding or
     /// clearing a nullifier changes the blob hash and triggers reconvergence.
     /// Serde-default empty for back-compat with pre-nullifier blobs.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     pub nullifiers: BTreeSet<EndpointId>,
 }
 
@@ -593,7 +593,7 @@ pub fn canonical_group_bytes(
         reusable_keys: reusable_keys.clone(),
         nullifiers: nullifiers.clone(),
     };
-    rmp_serde::to_vec_named(&data).expect("msgpack serialize")
+    rmp_serde::to_vec(&data).expect("msgpack serialize")
 }
 
 pub fn group_blob_hash(
@@ -1486,9 +1486,9 @@ mod tests {
 
     #[test]
     fn last_seen_absent_decodes_to_none() {
-        // A member with no last_seen serializes WITHOUT the field
-        // (skip_serializing_if), exactly like a blob published before the field
-        // existed; it must decode to None with no mass eviction on upgrade.
+        // A member with no last_seen serializes it as nil, and a blob from a
+        // build that predates the field is simply shorter; either way it must
+        // decode to None with no mass eviction on upgrade.
         let id = test_id(8);
         let mut members = MemberList::new();
         members
@@ -1603,89 +1603,115 @@ mod tests {
         assert!(blob.reusable_keys.is_empty());
     }
 
-    /// `Member.ipv6_only` is additive and map-encoded, so a peer on an older
-    /// build (whose members carry no such key) still decodes, and a member that
-    /// does not claim it serializes exactly as before. That is what lets the
-    /// flag ship without bumping `MESH_PROTOCOL_VERSION`.
+    /// What "additive" means now that the wire is compact (positional arrays):
+    /// a field may only ever be **appended**, and a shorter array from an older
+    /// build fills the trailing fields with their defaults.
+    ///
+    /// This is the whole compatibility story for the control wire, and it is
+    /// narrower than the map-encoded one it replaced. Under named encoding field
+    /// order was irrelevant; here the declaration order *is* the wire format, so
+    /// inserting a field anywhere but the end shifts every field after it into
+    /// the wrong slot. The bytes below are what a build that predates the last
+    /// two fields would send.
     #[test]
-    fn member_ipv6_only_is_additive() {
+    fn member_fields_are_append_only_and_default_when_absent() {
         #[derive(Serialize)]
-        struct OldMember {
+        struct ShorterMember {
             identity: EndpointId,
             ip: Ipv4Addr,
             is_coordinator: bool,
+            hostname: Option<String>,
+            user_identity: Option<EndpointId>,
+            device_cert: Option<DeviceCert>,
+            collision_index: u32,
+            last_seen: Option<u64>,
+            exit_node: bool,
+            // `exit_families` and `ipv6_only` not yet declared.
         }
         let id = test_id(7);
-        let bytes = rmp_serde::to_vec_named(&OldMember {
+        let bytes = rmp_serde::to_vec(&ShorterMember {
             identity: id,
             ip: derive_ip(&id),
             is_coordinator: false,
-        })
-        .unwrap();
-        let decoded: Member = rmp_serde::from_slice(&bytes).unwrap();
-        assert!(!decoded.ipv6_only);
-
-        // Not claiming it emits no key at all, so an old peer sees the same bytes.
-        let plain = rmp_serde::to_vec_named(&decoded).unwrap();
-        let mut claiming = decoded.clone();
-        claiming.ipv6_only = true;
-        let claimed = rmp_serde::to_vec_named(&claiming).unwrap();
-        assert!(claimed.len() > plain.len());
-        assert!(rmp_serde::from_slice::<Member>(&claimed).unwrap().ipv6_only);
-    }
-
-    /// `Member.exit_families` is additive on the same terms, so an IPv6-capable
-    /// gateway can advertise itself without bumping `MESH_PROTOCOL_VERSION`.
-    ///
-    /// Three-valued rather than a bool because the absent key has to stay
-    /// distinguishable from a denial. A coordinator that predates the field
-    /// republishes the roster without it, and reading that silence as "cannot
-    /// carry IPv6" is what made an offer that could never converge look like a
-    /// settled fact: see `NetworkRegistry::exit_offer_out_of_sync`.
-    #[test]
-    fn member_exit_families_is_additive() {
-        #[derive(Serialize)]
-        struct OldMember {
-            identity: EndpointId,
-            ip: Ipv4Addr,
-            is_coordinator: bool,
-            exit_node: bool,
-        }
-        let id = test_id(8);
-        let bytes = rmp_serde::to_vec_named(&OldMember {
-            identity: id,
-            ip: derive_ip(&id),
-            is_coordinator: false,
+            hostname: Some("box".into()),
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+            last_seen: None,
             exit_node: true,
         })
         .unwrap();
+
         let decoded: Member = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.identity, id);
+        assert_eq!(decoded.hostname.as_deref(), Some("box"));
         assert!(decoded.exit_node);
-        // Absent, so unknown: not a claim that IPv6 is unavailable.
+        // The two appended fields take their defaults rather than failing.
         assert_eq!(decoded.exit_families, ExitFamilies::Unknown);
-        assert!(decoded.exit_families.is_unknown());
-        assert!(!decoded.exit_families.carries_v6());
+        assert!(!decoded.ipv6_only);
 
-        // Not claiming it emits no key at all, so the encoding is what it was
-        // before the field existed and the group blob hash is unchanged.
-        let plain = rmp_serde::to_vec_named(&decoded).unwrap();
-        assert!(
-            !plain.windows(13).any(|w| w == b"exit_families"),
-            "an unknown claim must not appear in the encoding"
-        );
-
-        for families in [ExitFamilies::V4, ExitFamilies::Dual] {
-            let mut claiming = decoded.clone();
-            claiming.exit_families = families;
-            let claimed = rmp_serde::to_vec_named(&claiming).unwrap();
-            assert!(claimed.len() > plain.len(), "{families:?} must emit a key");
-            assert_eq!(
-                rmp_serde::from_slice::<Member>(&claimed)
-                    .unwrap()
-                    .exit_families,
-                families
-            );
+        // Every field is now written, claimed or not: there is no key to omit.
+        // A round-trip is the property that survives, not a byte comparison.
+        for (families, ipv6_only) in [
+            (ExitFamilies::Unknown, false),
+            (ExitFamilies::V4, true),
+            (ExitFamilies::Dual, false),
+        ] {
+            let mut m = decoded.clone();
+            m.exit_families = families;
+            m.ipv6_only = ipv6_only;
+            let round: Member = rmp_serde::from_slice(&rmp_serde::to_vec(&m).unwrap()).unwrap();
+            assert_eq!(round.exit_families, families);
+            assert_eq!(round.ipv6_only, ipv6_only);
         }
+    }
+
+    /// Reordering two same-typed fields silently swaps their values, and this is
+    /// the one way the compact wire fails without saying so.
+    ///
+    /// A shift between differently-typed fields errors loudly ("invalid type"),
+    /// which is survivable. Between two `bool`s there is nothing to detect: the
+    /// bytes are valid, the struct decodes, and `exit_node` now holds what
+    /// `ipv6_only` meant. Declaration order *is* the wire format here, and a diff
+    /// that merely moves a line does not look like a protocol change, so this is
+    /// recorded as a test rather than left to review.
+    #[test]
+    fn reordering_same_typed_fields_silently_swaps_them() {
+        #[derive(Serialize)]
+        struct Reordered {
+            identity: EndpointId,
+            ip: Ipv4Addr,
+            is_coordinator: bool,
+            hostname: Option<String>,
+            user_identity: Option<EndpointId>,
+            device_cert: Option<DeviceCert>,
+            collision_index: u32,
+            last_seen: Option<u64>,
+            // `ipv6_only` and `exit_node` swapped relative to `Member`.
+            ipv6_only: bool,
+            exit_families: ExitFamilies,
+            exit_node: bool,
+        }
+        let id = test_id(9);
+        let bytes = rmp_serde::to_vec(&Reordered {
+            identity: id,
+            ip: derive_ip(&id),
+            is_coordinator: false,
+            hostname: Some("box".into()),
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+            last_seen: None,
+            ipv6_only: true,
+            exit_families: ExitFamilies::Dual,
+            exit_node: false,
+        })
+        .unwrap();
+
+        let decoded: Member = rmp_serde::from_slice(&bytes).expect("decodes without complaint");
+        // No error, and both booleans now say the opposite of what was sent.
+        assert!(decoded.exit_node, "ipv6_only was read as exit_node");
+        assert!(!decoded.ipv6_only, "exit_node was read as ipv6_only");
     }
 
     // -- reusable keys --------------------------------------------------------

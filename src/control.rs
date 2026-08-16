@@ -76,7 +76,7 @@ pub struct PairNetwork {
     pub network_key: String,
 }
 
-/// Messages for the device pairing protocol (ALPN `rayfish/pair/1`).
+/// Messages for the device pairing protocol (ALPN `rayfish/pair/2`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PairMsg {
     Request {
@@ -91,7 +91,7 @@ pub enum PairMsg {
 }
 
 /// Messages for the `ray connect` friend-request handshake (ALPN
-/// `rayfish/connect/1`). The initiator (A) dials the recipient's (B) contact
+/// `rayfish/connect/2`). The initiator (A) dials the recipient's (B) contact
 /// key, sends `Request`, and polls until `Approved`. Approval is recipient-only:
 /// only B acts, A just waits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,7 +102,7 @@ pub enum ConnectMsg {
     Request {
         from_contact_id: EndpointId,
         from_endpoint: EndpointId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         hostname: Option<String>,
     },
     /// B → A: queued, not yet approved. A retries with backoff.
@@ -125,11 +125,11 @@ pub enum ControlMsg {
     /// the joiner's desired hostname/device cert. The coordinator branches on the
     /// secret and the network's access mode to admit, gate, or deny.
     JoinRequest {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         invite_secret: Option<Vec<u8>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         hostname: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         device_cert: Option<DeviceCert>,
     },
     /// Coordinator response telling the joiner it has been queued for live
@@ -160,17 +160,17 @@ pub enum ControlMsg {
     MeshHello {
         identity: EndpointId,
         ip: Ipv4Addr,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         hostname: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         device_cert: Option<DeviceCert>,
     },
     MemberApproved {
         identity: EndpointId,
         ip: Ipv4Addr,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         hostname: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         device_cert: Option<DeviceCert>,
     },
     Welcome {
@@ -184,7 +184,7 @@ pub enum ControlMsg {
         /// no separate best-effort `AdminGrant` stream that could be dropped or race
         /// the joiner's handler setup. The joiner verifies it against the network
         /// pubkey before adopting (see `admin_grant_key_valid`).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         direct_key: Option<[u8; 32]>,
     },
     /// Notify connected members that the signed group blob changed. Payload-free:
@@ -212,7 +212,7 @@ pub enum ControlMsg {
         /// as unusable for as long as it stays on that build. `enabled` above is
         /// deliberately left a plain `bool`: it shipped in 0.3.0, and changing
         /// how an existing field encodes breaks every peer already running it.
-        #[serde(default, skip_serializing_if = "ExitFamilies::is_unknown")]
+        #[serde(default)]
         exit_families: ExitFamilies,
     },
     /// Member -> coordinators: announce whether this sender's data plane is
@@ -327,8 +327,8 @@ pub enum ControlMsg {
     KickedFromNetwork,
     /// Receiver to sender: the receiver read a control frame it could not decode,
     /// i.e. a variant from a newer build. `msg_kind` is the unknown variant's name
-    /// as it appeared on the wire (`to_vec_named` puts the name in the msgpack
-    /// map, so it survives even when the variant itself is unknown; see
+    /// as it appeared on the wire (both msgpack encodings key a payload variant
+    /// by its name, so it survives even when the variant itself is unknown; see
     /// [`FrameRead`]). Advisory and connection-level (`net: None`): nothing acts
     /// on it beyond logging, it exists so the sender can tell its user "peer X
     /// doesn't support Y" instead of features failing silently. Never sent in
@@ -358,7 +358,7 @@ pub struct NetworkHandle {
 /// ping); it is `None` for connection-level messages ([`ControlMsg::NetworkHandles`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlFrame {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub net: Option<EndpointId>,
     pub msg: ControlMsg,
 }
@@ -371,7 +371,7 @@ pub fn encode_msg(net: Option<EndpointId>, msg: &ControlMsg) -> Vec<u8> {
         net,
         msg: msg.clone(),
     };
-    let body = rmp_serde::to_vec_named(&frame).expect("serialize control frame");
+    let body = rmp_serde::to_vec(&frame).expect("serialize control frame");
     let len = (body.len() as u32).to_be_bytes();
     [len.as_slice(), &body].concat()
 }
@@ -407,9 +407,11 @@ struct FrameProbe {
     msg: KindProbe,
 }
 
-/// `to_vec_named` encodes a unit variant as a bare string and a payload variant
-/// as a single-key map keyed by the variant name; either way the name survives
-/// even when the variant itself is unknown to this build.
+/// msgpack encodes a unit variant as a bare string and a payload variant as a
+/// single-key map keyed by the variant name; either way the name survives even
+/// when the variant itself is unknown to this build. True of `to_vec` as well as
+/// `to_vec_named`: only the *fields* of a struct become positional, not the
+/// variant tag, so the probe is unaffected by the move to compact.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum KindProbe {
@@ -489,7 +491,7 @@ pub async fn recv_frame(stream: &mut RecvStream) -> Result<FrameRead> {
 /// the stream (same one-message-per-stream contract as [`send_msg`]). Used by
 /// the `ray connect` handshake (`ConnectMsg`).
 pub async fn send_framed<T: Serialize>(stream: &mut SendStream, msg: &T) -> Result<()> {
-    let body = rmp_serde::to_vec_named(msg).context("serialize framed message")?;
+    let body = rmp_serde::to_vec(msg).context("serialize framed message")?;
     let len = (body.len() as u32).to_be_bytes();
     stream
         .write_all(&[len.as_slice(), &body].concat())

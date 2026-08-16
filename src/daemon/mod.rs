@@ -155,7 +155,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// ALPN for the device-pairing protocol. The trailing `/1` is its protocol
 /// version - **bump it on any breaking change to the `PairMsg` handshake**;
 /// peers on different versions can't negotiate a connection (transport-enforced).
-const PAIR_ALPN: &[u8] = b"rayfish/pair/1";
+const PAIR_ALPN: &[u8] = b"rayfish/pair/2";
 
 /// Node-wide shared handles, cloned into every per-network accept handler and
 /// background task. Every field is a cheap `Clone` (an `Arc`-backed handle, a
