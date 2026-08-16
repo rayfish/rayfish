@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 #[cfg(target_os = "linux")]
+use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
@@ -169,23 +171,22 @@ pub trait DnsConfigurator: Send + Sync {
     fn search_handle(&self) -> Option<SearchDomains> {
         None
     }
-    /// The real resolver listed after ours in resolv.conf (direct mode only), so
-    /// the host still resolves names if our resolver stops answering. Threaded
-    /// into the re-assert loop so a trample-repair rewrites the same file we
-    /// installed. Default: none (split-DNS backends don't write the file).
-    fn fallback_upstream(&self) -> Option<Ipv4Addr> {
-        None
+    /// The resolvers listed after ours in resolv.conf (direct mode only), so the
+    /// host still resolves names if our resolver stops answering, and so the
+    /// stub has somewhere to go when we decline. Threaded into the re-assert
+    /// loop so a trample-repair rewrites the same file we installed.
+    /// Default: empty (split-DNS backends don't write the file).
+    fn fallback_upstreams(&self) -> Vec<Ipv4Addr> {
+        Vec::new()
     }
-    /// The other mesh's resolver and the domains it answers for, when this
-    /// backend is sharing `/etc/resolv.conf` with one.
+    /// The other mesh's resolver, when this backend is sharing
+    /// `/etc/resolv.conf` with one.
     ///
-    /// Sharing the file puts us first for *every* name on the host, theirs
-    /// included, so without this the only way their names resolve is to forward
-    /// everything to them. Naming their domains instead lets general traffic go
-    /// to real servers: shorter for names neither mesh owns, and it is what
-    /// stops a resolver pointed back at us from looping.
+    /// Its presence is what lets the in-daemon resolver decline names outside
+    /// `.ray` instead of forwarding them: the file lists it after ours, so the
+    /// stub asks it directly the moment we refuse.
     /// Default: none (no other backend shares a file with anybody).
-    fn delegated_domains(&self) -> Option<(Vec<SearchDomain>, Ipv4Addr)> {
+    fn shared_resolver(&self) -> Option<Ipv4Addr> {
         None
     }
 }
@@ -1370,23 +1371,27 @@ pub(crate) fn system_nameservers() -> Option<Vec<Ipv4Addr>> {
     )
 }
 
-/// Render a direct-mode resolv.conf pointing at the magic resolver IP, with a
-/// verified upstream listed after it as a fallback.
-///
-/// The fallback is what keeps a box that trusts us from losing DNS outright. We
-/// answer `.ray` authoritatively so it never reaches the second entry, but if
-/// our resolver is dead, wedged, or the daemon is gone, the libc resolver moves
-/// on to a real server instead of the machine having no DNS at all.
-///
-/// On a host we share with another mesh VPN, that second entry is *their*
-/// resolver (it is the nameserver their file named, so it is the first thing we
-/// captured), which is what makes this render a merge rather than a takeover:
-/// their names keep resolving behind ours, and keep resolving even if we stop.
-/// Only the first captured server is written, so a file naming several loses
-/// the rest as a *fallback*; all of them are still forwarding upstreams.
+/// What glibc reads: entries past `MAXNS` are ignored in silence, so the render
+/// truncates deliberately rather than write a list the resolver will cut short.
 #[cfg(any(target_os = "linux", test))]
-fn render_direct_resolv_conf(search: &[SearchDomain], fallback: Option<Ipv4Addr>) -> String {
-    render_direct_resolv_conf_with(resolver_addr(), search, fallback)
+const MAX_NAMESERVERS: usize = 3;
+
+/// Render a direct-mode resolv.conf pointing at the magic resolver IP, with the
+/// servers we captured listed after it.
+///
+/// Those servers are what keeps a box that trusts us from losing DNS outright:
+/// if our resolver is dead, wedged, or the daemon is gone, the libc resolver
+/// moves on to a real one instead of the machine having no DNS at all.
+///
+/// On a host we share with another mesh VPN they are load-bearing rather than a
+/// safety net. Their resolver is among them (it is what their file named, so it
+/// is what we captured), and the in-daemon resolver *declines* names outside
+/// `.ray` on such a host, which means these lines are the path every other name
+/// on the box takes. All of them are written, not just the first, because the
+/// second and third are what the stub tries next.
+#[cfg(any(target_os = "linux", test))]
+fn render_direct_resolv_conf(search: &[SearchDomain], fallbacks: &[Ipv4Addr]) -> String {
+    render_direct_resolv_conf_with(resolver_addr(), search, fallbacks)
 }
 
 /// The body of [`render_direct_resolv_conf`], with the resolver address passed
@@ -1395,11 +1400,11 @@ fn render_direct_resolv_conf(search: &[SearchDomain], fallback: Option<Ipv4Addr>
 fn render_direct_resolv_conf_with(
     resolver: IpAddr,
     search: &[SearchDomain],
-    fallback: Option<Ipv4Addr>,
+    fallbacks: &[Ipv4Addr],
 ) -> String {
     let mut s = String::from(HEADER_COMMENT);
     s.push_str(&format!("nameserver {resolver}\n"));
-    if let Some(ip) = fallback {
+    for ip in fallbacks.iter().take(MAX_NAMESERVERS - 1) {
         s.push_str(&format!("nameserver {ip}\n"));
     }
     if !search.is_empty() {
@@ -1470,7 +1475,7 @@ fn reassert_decision(current: &str, merged_with: Option<Ipv4Addr>) -> Reassert {
 #[cfg(target_os = "linux")]
 async fn reassert_resolv_conf(
     search: &ArcSwap<Vec<SearchDomain>>,
-    fallback: Option<Ipv4Addr>,
+    fallbacks: &[Ipv4Addr],
     merged_with: Option<Ipv4Addr>,
 ) -> Result<Reassert> {
     let path = Path::new("/etc/resolv.conf");
@@ -1478,7 +1483,7 @@ async fn reassert_resolv_conf(
     let decision = reassert_decision(&current, merged_with);
     if decision == Reassert::Rewrite {
         tracing::warn!("/etc/resolv.conf was overwritten; re-asserting rayfish DNS");
-        tokio::fs::write(path, render_direct_resolv_conf(&search.load(), fallback))
+        tokio::fs::write(path, render_direct_resolv_conf(&search.load(), fallbacks))
             .await
             .context("re-asserting /etc/resolv.conf")?;
     }
@@ -1501,17 +1506,22 @@ async fn reassert_resolv_conf(
 #[cfg(target_os = "linux")]
 pub async fn run_resolv_reassert(
     search: SearchDomains,
-    fallback: Option<Ipv4Addr>,
+    fallbacks: Vec<Ipv4Addr>,
     token: tokio_util::sync::CancellationToken,
 ) -> Option<Recapture> {
     use futures::StreamExt;
     use std::time::Instant;
 
-    // The fallback we render is also the first server our forwarder was pointed
-    // at, so an overlay address there is exactly "we are merged with that VPN".
-    // Derived rather than stored: what makes a departure dangerous is forwarding
-    // to an address that can vanish, not which VPN wrote the file we read.
-    let merged_with = fallback.filter(|ip| crate::membership::is_overlay_ip(IpAddr::V4(*ip)));
+    // An overlay address among the servers we render is exactly "we are sharing
+    // the file with that VPN". Derived rather than stored: what matters is which
+    // address the host's DNS now depends on, not which VPN wrote the file.
+    let merged_with = fallbacks
+        .iter()
+        .copied()
+        .find(|ip| crate::membership::is_overlay_ip(IpAddr::V4(*ip)));
+    // Consecutive liveness failures for `merged_with`. Two, so one lost packet
+    // or a restart does not hand the file back.
+    let mut shared_misses = 0u32;
 
     // This task is spawned immediately after the apply it belongs to, so its own
     // uptime is the time since we last wrote the file. That is what the merge
@@ -1545,7 +1555,7 @@ pub async fn run_resolv_reassert(
     let mut check = true;
     loop {
         if check {
-            match pass(&search, fallback, merged_with).await {
+            match pass(&search, &fallbacks, merged_with).await {
                 // Hold off rather than answer their write with ours. Sleeping
                 // and re-reading (instead of exiting late) means what we finally
                 // merge with is their newest file, not the one that woke us.
@@ -1586,7 +1596,31 @@ pub async fn run_resolv_reassert(
                     None => { stream = None; false } // stream ended; rely on the tick
                 };
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => check = true,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                check = true;
+                // A VPN that leaves while we hold the file changes nothing about
+                // the file: it will not restore a backup over one it does not
+                // own (nor will we over theirs), so its address just sits there
+                // and stops answering. Nothing the watcher reads can see that,
+                // which is why liveness is asked rather than inferred: on a host
+                // where we decline off-mesh names, that dead address *is* the
+                // host's DNS.
+                if let Some(ip) = merged_with {
+                    let up = SocketAddr::from((ip, 53u16));
+                    if crate::dns::resolver::probe_upstream(up).await {
+                        shared_misses = 0;
+                    } else {
+                        shared_misses += 1;
+                        tracing::warn!(
+                            resolver = %ip, misses = shared_misses,
+                            "the resolver we share /etc/resolv.conf with is not answering"
+                        );
+                        if shared_misses >= 2 {
+                            return Some(Recapture::SharedResolverGone(ip));
+                        }
+                    }
+                }
+            }
         }
     }
     None
@@ -1603,6 +1637,11 @@ pub enum Recapture {
     Merge(Ipv4Addr),
     /// The VPN we were merged with is gone from it. Take the file back.
     Reclaim,
+    /// The resolver we share the file with stopped answering, and the file
+    /// still names it because neither of us will overwrite the other's. Nothing
+    /// here can fix that: on this host we decline off-mesh names, so its
+    /// address is where the rest of the machine's DNS was going.
+    SharedResolverGone(Ipv4Addr),
 }
 
 /// How long after our own last write we refuse to write again over another
@@ -1623,10 +1662,10 @@ const MERGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 #[cfg(target_os = "linux")]
 async fn pass(
     search: &ArcSwap<Vec<SearchDomain>>,
-    fallback: Option<Ipv4Addr>,
+    fallbacks: &[Ipv4Addr],
     merged_with: Option<Ipv4Addr>,
 ) -> Option<Recapture> {
-    match reassert_resolv_conf(search, fallback, merged_with).await {
+    match reassert_resolv_conf(search, fallbacks, merged_with).await {
         Ok(Reassert::Merge(ip)) => Some(Recapture::Merge(ip)),
         Ok(Reassert::Reclaim) => Some(Recapture::Reclaim),
         Ok(Reassert::Held | Reassert::Rewrite) => None,
@@ -2056,8 +2095,8 @@ impl DirectResolvConf {
 
     /// The upstream written into resolv.conf as the second nameserver, so the
     /// host keeps resolving if our resolver stops answering.
-    fn fallback(&self) -> Option<Ipv4Addr> {
-        self.captured_upstreams.first().copied()
+    fn fallbacks(&self) -> &[Ipv4Addr] {
+        &self.captured_upstreams
     }
 }
 
@@ -2142,7 +2181,7 @@ impl DnsConfigurator for DirectResolvConf {
         // Quiet NM first so it doesn't regenerate the file out from under the
         // write we're about to make (the inotify re-assert covers any residual).
         nm_quiet_install().await;
-        let new_content = render_direct_resolv_conf(&self.search.load(), self.fallback());
+        let new_content = render_direct_resolv_conf(&self.search.load(), self.fallbacks());
         tokio::fs::write(path, new_content)
             .await
             .context("writing /etc/resolv.conf")?;
@@ -2190,7 +2229,7 @@ impl DnsConfigurator for DirectResolvConf {
         }
         tokio::fs::write(
             path,
-            render_direct_resolv_conf(&self.search.load(), self.fallback()),
+            render_direct_resolv_conf(&self.search.load(), self.fallbacks()),
         )
         .await
         .context("writing search domains to /etc/resolv.conf")
@@ -2200,22 +2239,12 @@ impl DnsConfigurator for DirectResolvConf {
         Some(Arc::clone(&self.search))
     }
 
-    fn fallback_upstream(&self) -> Option<Ipv4Addr> {
-        self.fallback()
+    fn fallback_upstreams(&self) -> Vec<Ipv4Addr> {
+        self.captured_upstreams.clone()
     }
 
-    /// The domains their file carried, which are theirs by construction: we
-    /// only captured them because their resolver was in the file we read.
-    fn delegated_domains(&self) -> Option<(Vec<SearchDomain>, Ipv4Addr)> {
-        let foreign = self.foreign_resolver?;
-        if self.captured_search.is_empty() {
-            // Nothing to delegate, so everything keeps going to them (their
-            // resolver is captured as an upstream). A merge with a file that
-            // named no search domains is the one case suffix routing cannot
-            // narrow, since we have no idea which names are theirs.
-            return None;
-        }
-        Some((self.captured_search.clone(), foreign))
+    fn shared_resolver(&self) -> Option<Ipv4Addr> {
+        self.foreign_resolver
     }
 }
 
@@ -2224,10 +2253,11 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::{
-        Reassert, SearchDomain, first_nameserver, foreign_mesh_resolver, join_domains,
-        merge_search_domains, nm_dns_none_dropin, other_overlay_resolver, parse_resolv_nameservers,
-        reassert_decision, render_direct_resolv_conf, render_direct_resolv_conf_with,
-        resolv_conf_is_ours, search_domains_for, strip_our_resolv_entries,
+        MAX_NAMESERVERS, Reassert, SearchDomain, first_nameserver, foreign_mesh_resolver,
+        join_domains, merge_search_domains, nm_dns_none_dropin, other_overlay_resolver,
+        parse_resolv_nameservers, reassert_decision, render_direct_resolv_conf,
+        render_direct_resolv_conf_with, resolv_conf_is_ours, search_domains_for,
+        strip_our_resolv_entries,
     };
 
     /// Domains as the host had them, i.e. read back from its own config.
@@ -2430,12 +2460,12 @@ mod tests {
     #[test]
     fn reassert_renders_the_live_search_list() {
         let handle = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(search_domains_for(&[])));
-        assert!(render_direct_resolv_conf(&handle.load(), None).contains("search ray\n"));
+        assert!(render_direct_resolv_conf(&handle.load(), &[]).contains("search ray\n"));
         handle.store(std::sync::Arc::new(search_domains_for(&networks(&[
             "homelab",
         ]))));
         assert!(
-            render_direct_resolv_conf(&handle.load(), None).contains("search homelab.ray ray\n")
+            render_direct_resolv_conf(&handle.load(), &[]).contains("search homelab.ray ray\n")
         );
     }
 
@@ -2453,7 +2483,7 @@ mod tests {
 
     #[test]
     fn render_direct_resolv_conf_points_at_magic_ip() {
-        let out = render_direct_resolv_conf(&search_domains_for(&networks(&["homelab"])), None);
+        let out = render_direct_resolv_conf(&search_domains_for(&networks(&["homelab"])), &[]);
         assert!(out.starts_with("# Added by rayfish"));
         assert!(out.contains("nameserver 100.100.100.53"));
         assert!(out.contains("search homelab.ray ray"));
@@ -2467,7 +2497,7 @@ mod tests {
         let out = render_direct_resolv_conf_with(
             std::net::IpAddr::V6(crate::dns::MAGIC_DNS_V6),
             &search_domains_for(&[]),
-            Some("1.1.1.1".parse().unwrap()),
+            &["1.1.1.1".parse().unwrap()],
         );
         assert!(out.contains("nameserver 200::53"));
         assert!(!out.contains("100.100.100.53"));
@@ -2552,19 +2582,37 @@ mod tests {
 
     #[test]
     fn render_direct_resolv_conf_no_search_line_when_empty() {
-        let out = render_direct_resolv_conf(&[], None);
+        let out = render_direct_resolv_conf(&[], &[]);
         assert!(out.contains("nameserver 100.100.100.53"));
         assert!(!out.contains("search "));
     }
 
     #[test]
     fn render_direct_resolv_conf_lists_fallback_after_magic_ip() {
-        let out = render_direct_resolv_conf(&[], Some("192.168.1.1".parse().unwrap()));
+        let out = render_direct_resolv_conf(&[], &["192.168.1.1".parse().unwrap()]);
         // Order is load-bearing: the resolver library tries entries top-down, so
         // ours must come first or `.ray` names go to the upstream and NXDOMAIN.
         let magic = out.find("nameserver 100.100.100.53").unwrap();
         let fallback = out.find("nameserver 192.168.1.1").unwrap();
         assert!(magic < fallback, "magic IP must be listed first:\n{out}");
+    }
+
+    /// Every captured server is written, not just the first: on a host where we
+    /// decline names outside `.ray`, these lines *are* the resolution path for
+    /// everything else, so dropping one drops what the stub tries next.
+    #[test]
+    fn render_direct_resolv_conf_carries_every_server_up_to_maxns() {
+        let servers: Vec<Ipv4Addr> = ["100.100.100.100", "192.168.1.1", "9.9.9.9"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let out = render_direct_resolv_conf(&[], &servers);
+        assert!(out.contains("nameserver 100.100.100.100\n"));
+        assert!(out.contains("nameserver 192.168.1.1\n"));
+        // Ours plus two is glibc's MAXNS; a fourth line is read by nobody, and
+        // writing it would only misrepresent what the host will actually try.
+        assert!(!out.contains("9.9.9.9"));
+        assert_eq!(out.matches("nameserver ").count(), MAX_NAMESERVERS);
     }
 
     #[test]

@@ -24,48 +24,10 @@ pub struct Resolver {
     /// Per-name forwarding counters for [`LOOP_WINDOW`], kept only for names
     /// sent to another mesh's resolver. See [`Resolver::loop_guard_allows`].
     overlay_forwards: DashMap<SmolStr, (Instant, u32)>,
-    /// Suffixes that belong to somebody else's resolver, asked before
-    /// [`Self::upstreams`]. Empty on a host we do not share DNS with.
-    delegations: Arc<ArcSwap<Vec<Delegation>>>,
-}
-
-/// A DNS suffix that belongs to another resolver, and where to send it.
-///
-/// The point of naming the suffix is that the *general* upstream then does not
-/// have to be the other mesh's resolver. Sharing `/etc/resolv.conf` means we
-/// are asked first for every name on the host, including theirs; without a
-/// delegation the only way to answer theirs is to forward everything to them,
-/// which is both a detour for names neither mesh owns and the setup that loops
-/// when their resolver is pointed back at us.
-#[derive(Clone, Debug)]
-pub struct Delegation {
-    /// Lowercase, no trailing dot. Matched on label boundaries.
-    suffix: SmolStr,
-    upstream: SocketAddr,
-}
-
-impl Delegation {
-    pub fn new(suffix: &str, upstream: SocketAddr) -> Self {
-        Self {
-            suffix: SmolStr::new(suffix.trim_matches('.').to_ascii_lowercase()),
-            upstream,
-        }
-    }
-
-    /// Whether `name` (lowercase, no trailing dot) is the suffix or sits under
-    /// it. The boundary check is what keeps `nottailnet.ts.net` out of a
-    /// delegation for `tailnet.ts.net`: a bare `ends_with` would hand another
-    /// tailnet's name, or a lookalike domain, to a resolver that is not ours to
-    /// send it to.
-    fn covers(&self, name: &str) -> bool {
-        if self.suffix.is_empty() {
-            return false;
-        }
-        let Some(rest) = name.strip_suffix(self.suffix.as_str()) else {
-            return false;
-        };
-        rest.is_empty() || rest.ends_with('.')
-    }
+    /// Whether the stub has another nameserver listed after ours, so a name
+    /// outside `.ray` can be declined instead of forwarded. See
+    /// [`Resolver::set_defer_off_mesh`].
+    defer_off_mesh: AtomicBool,
 }
 
 /// How many times one name may go to another mesh's resolver inside
@@ -100,14 +62,21 @@ impl Resolver {
             upstreams: Arc::new(ArcSwap::from_pointee(Vec::new())),
             ipv6_only: AtomicBool::new(false),
             overlay_forwards: DashMap::new(),
-            delegations: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            defer_off_mesh: AtomicBool::new(false),
         }
     }
 
-    /// Replace the set of suffixes handed to another resolver. Empty clears it,
-    /// which is what a host that stops sharing DNS does.
-    pub fn set_delegations(&self, delegations: Vec<Delegation>) {
-        self.delegations.store(Arc::new(delegations));
+    /// Whether to decline names outside `.ray` instead of forwarding them.
+    ///
+    /// Only true while `/etc/resolv.conf` lists a live resolver after ours,
+    /// which is what sharing the file with another mesh leaves behind. The stub
+    /// then does the work the forwarder would have: glibc treats REFUSED as a
+    /// failed server and asks the next `nameserver` line, so the query reaches
+    /// the other resolver directly instead of being relayed by us. Off by
+    /// default, because on an ordinary host ours is the only line in the file
+    /// and declining would take the machine's DNS down.
+    pub fn set_defer_off_mesh(&self, on: bool) {
+        self.defer_off_mesh.store(on, Ordering::Relaxed);
     }
 
     /// Record whether mesh IPv4 is usable on this node. Called once at daemon
@@ -154,6 +123,18 @@ impl Resolver {
             crate::dns::handle_query(query, &self.table, &self.reverse, ipv6_only).await
         {
             return Some(local);
+        }
+        // Sharing resolv.conf means the stub has another nameserver listed
+        // after ours, and it will ask that one the moment we decline. Doing
+        // that instead of forwarding is not a shortcut: relaying the host's
+        // general DNS through us puts a userspace hop in front of every name,
+        // flattens whatever the other resolver does natively (its own split
+        // DNS, its own encrypted upstreams) into one plain UDP query, and is
+        // the only reason two resolvers pointed at each other can loop.
+        if self.defer_off_mesh.load(Ordering::Relaxed) {
+            // `.ray` is ours to answer, misses included: passing those on would
+            // hand a mesh name to the other resolver for the same failure.
+            return crate::dns::nxdomain_if_in_zone(query).or_else(|| refused(query));
         }
         if let Some(forwarded) = self.forward(query).await {
             return Some(forwarded);
@@ -203,31 +184,18 @@ impl Resolver {
 
     async fn forward(&self, query: &[u8]) -> Option<Vec<u8>> {
         let upstreams = self.upstreams.load();
-        let delegations = self.delegations.load();
-
-        // The name is only needed to route and to count loops, so it is parsed
-        // only when one of those is in play. A host with ordinary resolvers and
-        // no shared file pays nothing for either.
-        let name = (!delegations.is_empty()
-            || upstreams
-                .iter()
-                .any(|a| crate::membership::is_overlay_ip(a.ip())))
-        .then(|| query_name(query))
-        .flatten();
-        let delegated = name
-            .as_deref()
-            .and_then(|n| delegations.iter().find(|d| d.covers(n)))
-            .map(|d| d.upstream);
-
-        if delegated.is_none() && upstreams.is_empty() {
+        if upstreams.is_empty() {
             tracing::warn!("no DNS upstream configured; cannot forward off-mesh queries");
             return None;
         }
-        // The delegated resolver first, then the general ones: a name under its
-        // suffix is its to answer, and falling through to the defaults after
-        // means a resolver that has gone away costs a timeout rather than the
-        // whole zone.
-        for up in delegated.iter().chain(upstreams.iter()) {
+        // The name is only needed to count loops, so it is parsed only when an
+        // upstream could loop. A host with ordinary resolvers pays nothing.
+        let name = upstreams
+            .iter()
+            .any(|a| crate::membership::is_overlay_ip(a.ip()))
+            .then(|| query_name(query))
+            .flatten();
+        for up in upstreams.iter() {
             // Skip an overlay resolver that this name has already been bounced
             // off, and fall through to the next upstream (a real server, if the
             // capture found one) rather than feeding the loop another hop.
@@ -374,6 +342,23 @@ fn servfail(query: &[u8]) -> Option<Vec<u8>> {
     Some(resp)
 }
 
+/// "Not mine, ask somebody else."
+///
+/// REFUSED rather than SERVFAIL because it is the true statement (we are
+/// declining, not failing) and rather than silence because silence costs the
+/// stub its whole timeout: glibc waits `timeout:5` twice before moving on,
+/// while any of REFUSED/SERVFAIL/NOTIMP makes it try the next nameserver at
+/// once. musl asks every server at once and discards the refusal.
+fn refused(query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
+    let mut resp = query.to_vec();
+    resp[2] |= 0x80; // QR: this is a response
+    resp[3] = 0x80 | 5; // RA=1, Z=0, RCODE=5 (refused)
+    Some(resp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,53 +376,41 @@ mod tests {
         pkt.build_bytes_vec().expect("build query")
     }
 
-    /// A delegated suffix covers itself and anything under it, and stops at a
-    /// label boundary. Without the boundary check `nottailnet.ts.net` would be
-    /// handed to a resolver that has no business seeing it.
-    #[test]
-    fn delegation_covers_its_zone_and_stops_at_a_label() {
-        let up = SocketAddr::from(([100, 100, 100, 100], 53));
-        let d = Delegation::new("tailnet.ts.net", up);
-        assert!(d.covers("tailnet.ts.net"));
-        assert!(d.covers("box.tailnet.ts.net"));
-        assert!(d.covers("a.b.tailnet.ts.net"));
-        assert!(!d.covers("nottailnet.ts.net"));
-        assert!(!d.covers("ts.net"));
-        assert!(!d.covers("tailnet.ts.net.evil.com"));
-        // Written with the dots a resolv.conf or a config might carry.
-        assert!(Delegation::new(".Tailnet.TS.net.", up).covers("box.tailnet.ts.net"));
-    }
-
-    /// The whole point of the delegation: their names reach their resolver
-    /// while everything else goes to a real server, so general traffic never
-    /// touches a resolver that might be pointed back at us.
+    /// Off-mesh names are declined, not forwarded, so the stub asks the next
+    /// nameserver itself. `.ray` stays ours to answer either way, including the
+    /// misses: sending those on would leak a mesh name to the other resolver
+    /// and get the same failure back a round trip later.
     #[tokio::test]
-    async fn delegated_names_go_to_their_resolver_and_the_rest_upstream() {
-        let theirs = Ipv4Addr::new(10, 0, 0, 1);
-        let general = Ipv4Addr::new(10, 0, 0, 2);
-        let their_server = fake_upstream(theirs).await;
-        let general_server = fake_upstream(general).await;
+    async fn declining_leaves_off_mesh_names_to_the_next_nameserver() {
+        let upstream_answer = Ipv4Addr::new(93, 184, 216, 34);
+        let up = fake_upstream(upstream_answer).await;
 
         let r = Resolver::new(HostnameTable::default(), ReverseLookupTable::default());
-        r.set_upstream_addrs([general_server]);
-        r.set_delegations(vec![Delegation::new("tailnet.ts.net", their_server)]);
-
-        let resp = r
-            .resolve(&build_a_query("box.tailnet.ts.net"))
-            .await
-            .expect("delegated answer");
-        assert!(
-            response_has_a(&resp, theirs),
-            "a name under their suffix must go to their resolver"
-        );
+        r.set_upstream_addrs([up]);
+        r.set_defer_off_mesh(true);
 
         let resp = r
             .resolve(&build_a_query("example.com"))
             .await
-            .expect("general answer");
+            .expect("a reply, not silence: a dropped query costs the stub its timeout");
+        assert_eq!(
+            Packet::parse(&resp).expect("parse").rcode(),
+            simple_dns::RCODE::Refused,
+            "declined, so glibc moves to the next nameserver at once"
+        );
         assert!(
-            response_has_a(&resp, general),
-            "everything else must go to the general upstream, not to them"
+            !response_has_a(&resp, upstream_answer),
+            "the upstream must not have been asked at all"
+        );
+
+        // A `.ray` name nobody holds is still ours to fail authoritatively.
+        let resp = r
+            .resolve(&build_a_query("nobody.homelab.ray"))
+            .await
+            .expect("local NXDOMAIN");
+        assert_eq!(
+            Packet::parse(&resp).expect("parse").rcode(),
+            simple_dns::RCODE::NameError
         );
     }
 

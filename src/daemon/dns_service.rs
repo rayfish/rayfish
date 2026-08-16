@@ -14,9 +14,7 @@
 //! `resolve` (reader side), on top of `configure` / `revert` (lifecycle).
 
 use super::*;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-
-use crate::membership::is_overlay_ip;
+use std::net::Ipv6Addr;
 
 /// First and last backoff step for the OS-DNS configuration retry loop.
 const DNS_CONFIG_RETRY_MIN: Duration = Duration::from_secs(5);
@@ -103,43 +101,6 @@ impl DnsService {
         }
     }
 
-    /// The upstreams for everything the delegations do not claim.
-    ///
-    /// Without a delegation this is just what detection captured. With one, the
-    /// file we captured from is the other mesh's, so what it named is their
-    /// resolver, and pointing the host's general traffic there is both a detour
-    /// for names neither mesh owns and the leg that loops if they are pointed
-    /// back at us. Real servers we already knew are the host's own and nothing
-    /// in the shared file will name them again, so they are kept when the merge
-    /// would otherwise leave us with nothing but the other mesh's resolver.
-    fn general_upstreams(&self, captured: Vec<Ipv4Addr>, delegating: bool) -> Vec<Ipv4Addr> {
-        if !delegating || captured.iter().any(|ip| !is_overlay_ip(IpAddr::V4(*ip))) {
-            return captured;
-        }
-        let retained: Vec<Ipv4Addr> = self
-            .resolver
-            .upstreams()
-            .into_iter()
-            .filter_map(|a| match a.ip() {
-                IpAddr::V4(ip) if !is_overlay_ip(IpAddr::V4(ip)) => Some(ip),
-                _ => None,
-            })
-            .collect();
-        if retained.is_empty() {
-            // Nothing but theirs, which is the ordinary case when they had the
-            // file first: they hold the host's real servers, so forwarding the
-            // rest to them is right and cannot loop back through us.
-            captured
-        } else {
-            tracing::info!(
-                upstreams = ?retained,
-                "keeping the host's own resolvers for general traffic; the shared file names \
-                 only the other mesh's"
-            );
-            retained
-        }
-    }
-
     /// Take ownership of a detected OS-DNS backend: seed the resolver's
     /// upstreams, keep the configurator for `revert`, install the current search
     /// domains, and (Linux direct mode) start the inotify re-assert watcher.
@@ -155,23 +116,15 @@ impl DnsService {
         let upstreams = config::resolve_upstreams(&dns_override, captured);
         #[cfg(target_os = "linux")]
         let search_handle = c.search_handle();
-        #[cfg(target_os = "linux")]
-        let fallback = c.fallback_upstream();
-        let delegation = c.delegated_domains();
-        let upstreams = self.general_upstreams(upstreams, delegation.is_some());
-        tracing::info!(backend = c.name(), resolver_ip = %dns_config::resolver_addr(), upstreams = ?upstreams, "Magic DNS active");
+        let fallbacks = c.fallback_upstreams();
+        // Sharing the file with another mesh means the stub has its resolver
+        // listed after ours, so a name outside `.ray` can be declined and the
+        // stub will ask it directly. Both halves are required: somebody to
+        // share with, and a live server behind us to decline *to*.
+        let defer_off_mesh = c.shared_resolver().is_some() && !fallbacks.is_empty();
+        tracing::info!(backend = c.name(), resolver_ip = %dns_config::resolver_addr(), upstreams = ?upstreams, defer_off_mesh, "Magic DNS active");
         self.resolver.set_upstreams(upstreams);
-        self.resolver.set_delegations(
-            delegation
-                .into_iter()
-                .flat_map(|(domains, resolver)| {
-                    let addr = SocketAddr::from((resolver, 53u16));
-                    domains
-                        .into_iter()
-                        .map(move |d| dns::resolver::Delegation::new(d.as_str(), addr))
-                })
-                .collect(),
-        );
+        self.resolver.set_defer_off_mesh(defer_off_mesh);
         let c: Arc<dyn dns_config::DnsConfigurator> = Arc::from(c);
         *self.configurator.lock().unwrap() = Some(Arc::clone(&c));
 
@@ -204,11 +157,11 @@ impl DnsService {
                 // `revert` cancelled it: the select arm is already committed by
                 // then, so the cancel is only visible here. Acting on a stale
                 // verdict would re-arm DNS for a data plane that is down.
-                if let Some(why) = dns_config::run_resolv_reassert(search, fallback, rt).await
+                if let Some(why) = dns_config::run_resolv_reassert(search, fallbacks, rt).await
                     && !watcher.is_cancelled()
                     && let Some(me) = me.upgrade()
                 {
-                    me.recapture(why, tun_name, &watcher);
+                    me.recapture(why, tun_name, &watcher).await;
                 }
             });
         }
@@ -241,12 +194,32 @@ impl DnsService {
     /// says the verdict is still current: `revert` cancels it on the way down,
     /// and re-arming DNS after that would point a downed data plane back at us.
     #[cfg(target_os = "linux")]
-    fn recapture(
+    async fn recapture(
         self: &Arc<Self>,
         why: dns_config::Recapture,
         tun_name: String,
         watcher: &CancellationToken,
     ) {
+        // The one verdict that is not a rebuild. Nothing on this host knows a
+        // working resolver any more: the file names theirs, theirs is gone, and
+        // the servers it replaced are unrecoverable (they dropped their backup
+        // on the way out, and ours is a copy of *their* file). Standing all the
+        // way down is what gets DNS back, because it un-quiets NetworkManager
+        // and hands the file to whatever regenerates it from DHCP. The retry
+        // loop then takes it over again once that has happened.
+        if let dns_config::Recapture::SharedResolverGone(ip) = why {
+            tracing::warn!(
+                resolver = %ip,
+                "the resolver we shared /etc/resolv.conf with has gone and left the host \
+                 without one; releasing DNS so it can be regenerated"
+            );
+            self.revert(&tun_name).await;
+            if watcher.is_cancelled() {
+                return;
+            }
+            self.spawn_configure_retry(tun_name, DNS_CONFIG_RETRY_MIN);
+            return;
+        }
         match why {
             dns_config::Recapture::Merge(ip) => tracing::info!(
                 resolver = %ip,
@@ -255,6 +228,7 @@ impl DnsService {
             dns_config::Recapture::Reclaim => tracing::info!(
                 "the VPN sharing /etc/resolv.conf is gone; recapturing the host's own resolvers"
             ),
+            dns_config::Recapture::SharedResolverGone(_) => unreachable!("handled above"),
         }
         self.reassert_token.lock().unwrap().take();
         self.configurator.lock().unwrap().take();
@@ -365,6 +339,9 @@ impl DnsService {
 
         // Revert system DNS (extract the configurator before reverting so the
         // mutex guard isn't held across the call).
+        // No backend held means no guarantee another nameserver sits behind
+        // ours, so the resolver goes back to forwarding rather than declining.
+        self.resolver.set_defer_off_mesh(false);
         let configurator = self.configurator.lock().unwrap().take();
         if let Some(configurator) = configurator
             && let Err(e) = dns_config::revert(configurator.as_ref()).await
@@ -388,57 +365,48 @@ impl DnsService {
 mod tests {
     use super::*;
 
-    fn service() -> Arc<DnsService> {
-        Arc::new(DnsService::new(
-            dns::HostnameTable::default(),
-            dns::ReverseLookupTable::default(),
-            std::sync::Arc::new(crate::dns::resolver::Resolver::new(
-                dns::HostnameTable::default(),
-                dns::ReverseLookupTable::default(),
-            )),
-            Ipv6Addr::LOCALHOST,
-        ))
-    }
-
-    const THEIRS: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 100);
-    const REAL: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
-
-    /// With nothing delegated the captured set is used as-is, whatever is in
-    /// it: this must not start second-guessing an ordinary host's resolvers.
+    /// Declining is only safe with somebody to decline *to*. Both halves of
+    /// that come from the backend: another mesh sharing the file, and at least
+    /// one live server rendered after ours in it.
     #[test]
-    fn general_upstreams_are_the_captured_ones_without_a_delegation() {
-        let s = service();
-        assert_eq!(s.general_upstreams(vec![THEIRS], false), vec![THEIRS]);
-        assert_eq!(s.general_upstreams(vec![REAL], false), vec![REAL]);
-    }
+    fn deferring_needs_both_a_sharer_and_a_server_behind_us() {
+        use std::net::Ipv4Addr;
 
-    /// The shared file named a real server too, so there is nothing to repair.
-    #[test]
-    fn a_real_server_in_the_shared_file_is_kept() {
-        let s = service();
-        assert_eq!(
-            s.general_upstreams(vec![THEIRS, REAL], true),
-            vec![THEIRS, REAL]
-        );
-    }
+        struct Backend {
+            shared: Option<Ipv4Addr>,
+            fallbacks: Vec<Ipv4Addr>,
+        }
+        #[async_trait::async_trait]
+        impl dns_config::DnsConfigurator for Backend {
+            async fn apply(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn revert(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn name(&self) -> &'static str {
+                "test"
+            }
+            fn shared_resolver(&self) -> Option<Ipv4Addr> {
+                self.shared
+            }
+            fn fallback_upstreams(&self) -> Vec<Ipv4Addr> {
+                self.fallbacks.clone()
+            }
+        }
+        let theirs = Ipv4Addr::new(100, 100, 100, 100);
+        let real = Ipv4Addr::new(192, 168, 1, 1);
+        use dns_config::DnsConfigurator;
+        let defers = |shared, fallbacks: Vec<Ipv4Addr>| {
+            let b = Backend { shared, fallbacks };
+            b.shared_resolver().is_some() && !b.fallback_upstreams().is_empty()
+        };
 
-    /// They took the file while we held it, so it names only their resolver.
-    /// The host's own servers, which we captured before they arrived, are what
-    /// general traffic should keep using: their names are delegated, and
-    /// sending the rest to them is the leg that can loop back through us.
-    #[test]
-    fn the_hosts_own_resolvers_survive_a_merge_that_hides_them() {
-        let s = service();
-        s.resolver.set_upstreams(vec![REAL]);
-        assert_eq!(s.general_upstreams(vec![THEIRS], true), vec![REAL]);
-    }
-
-    /// They had the file first, so we never saw the host's own servers. Theirs
-    /// is all there is, and forwarding to them is right: they hold the real
-    /// upstreams, so nothing comes back to us.
-    #[test]
-    fn with_nothing_else_known_their_resolver_is_the_general_one() {
-        let s = service();
-        assert_eq!(s.general_upstreams(vec![THEIRS], true), vec![THEIRS]);
+        assert!(defers(Some(theirs), vec![theirs]));
+        // No one to share with: ours is the only nameserver in the file, so
+        // declining would take the host's DNS down.
+        assert!(!defers(None, vec![real]));
+        // Sharing, but nothing rendered behind us to fall through to.
+        assert!(!defers(Some(theirs), vec![]));
     }
 }

@@ -532,10 +532,10 @@ IPv4 nameserver); the next backend down takes over.
 If both VPNs manage `/etc/resolv.conf` directly (no systemd-resolved), rayfish
 shares the file rather than fighting over it or giving it up. It writes its own
 resolver in first, keeps the other VPN's behind it, and keeps both sets of
-search domains. Names under the domains the other VPN claimed go to its
-resolver; everything else goes to the host's real DNS servers. Both meshes
-resolve, in either start order, and it holds whichever way the two write the
-file. Rayfish rewrites at most once a minute, so the two daemons can't spin
+search domains. It answers `.ray` and declines everything else, so your system
+resolver moves straight on to the other VPN's server, whose own DNS setup then
+applies as usual. Both meshes resolve, in either start order, and it holds
+whichever way the two write the file. Rayfish rewrites at most once a minute, so the two daemons can't spin
 against each other, and once the other VPN is gone it goes back to managing the
 file alone.
 

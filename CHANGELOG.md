@@ -50,11 +50,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   once the other VPN leaves.
 - **The other VPN's names keep resolving too.** Sharing `/etc/resolv.conf`
   means Rayfish is asked first for every name on the host, including the other
-  VPN's. Names under the domains its own config claimed go to its resolver;
-  everything else goes to the host's real DNS servers, which is both shorter
-  and the reason the two cannot end up forwarding to each other in a circle.
-  If they somehow still do, Rayfish stops sending a name onward once it has
-  bounced.
+  VPN's. Rather than relay those, Rayfish declines anything outside `.ray`, and
+  the system resolver asks the next server in the file, which is the other
+  VPN's. Its own DNS behaviour applies unchanged, nothing is proxied through
+  Rayfish, and the two cannot end up forwarding to each other in a circle.
+- **DNS comes back when the other VPN leaves.** Neither VPN overwrites a
+  `/etc/resolv.conf` the other is holding, so one that shuts down leaves its
+  resolver named in a file nobody will correct. Rayfish now notices that
+  resolver has stopped answering and releases DNS, so the host regenerates the
+  file and Rayfish takes it over again, instead of the machine being left
+  pointed at a server that is gone.
 - **Shutting down no longer takes the other VPN's DNS with it.** When Rayfish
   shares `/etc/resolv.conf`, `ray down` (and a crash, and a restart) removes
   only the lines Rayfish added, leaving the other VPN's resolver and search
