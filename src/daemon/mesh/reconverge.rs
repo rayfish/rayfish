@@ -106,14 +106,25 @@ pub(crate) fn apply_suggested_firewall(
     }
 }
 
-/// Resolve the network's *signed* group-blob hash (and seed peers) from the
-/// pkarr record. This is the sole authority for the roster/firewall.
+/// Resolve the network's *signed* group-blob hash, seed peers, and author
+/// timestamp from the pkarr record. This is the sole authority for the
+/// roster/firewall.
+///
+/// The timestamp comes back with the rest because the DHT can serve a stale
+/// record (that is the whole reason the `SignedRecord` mesh fast path exists),
+/// and a stale one must not undo a fresher record we already applied. Same floor,
+/// same reason, as the mesh path.
 pub(crate) async fn resolve_signed(
     endpoint: &Endpoint,
     net_pubkey: EndpointId,
-) -> Option<(blake3::Hash, Vec<EndpointId>)> {
+) -> Option<(blake3::Hash, Vec<EndpointId>, u64)> {
     let client = dht::create_pkarr_client(endpoint).ok()?;
-    dht::resolve_network(&client, net_pubkey).await.ok()
+    let packet = dht::resolve_network_packet(&client, net_pubkey)
+        .await
+        .ok()?;
+    let ts = packet.timestamp().as_micros();
+    let (hash, seeds) = dht::decode_network_record(&packet).ok()?;
+    Some((hash, seeds, ts))
 }
 
 /// Fetch the group blob for `signed` from any connected peer or seed, and verify
@@ -182,8 +193,11 @@ pub(crate) async fn reconverge_and_apply(
         registry,
         ..
     } = ctx;
-    let current = state.read().unwrap().snapshot.as_ref().map(|s| s.hash);
-    let Some((signed, seeds)) = resolve_signed(endpoint, net_pubkey).await else {
+    let (current, floor) = {
+        let s = state.read().unwrap();
+        (s.snapshot.as_ref().map(|s| s.hash), s.last_record_timestamp)
+    };
+    let Some((signed, seeds, record_ts)) = resolve_signed(endpoint, net_pubkey).await else {
         tracing::debug!(network = %network_name, "reconverge: signed record unavailable");
         return;
     };
@@ -226,12 +240,26 @@ pub(crate) async fn reconverge_and_apply(
         registry.sync_ipv6_only().await;
         return;
     }
+    // The record names a different blob than we hold. Take it only if it was
+    // authored after the last one we applied: the DHT can serve a copy older than
+    // the record a coordinator already handed us over the mesh, and applying that
+    // would undo the roster rather than update it.
+    if !record_is_newer(record_ts, floor) {
+        tracing::debug!(
+            network = %network_name,
+            record_ts,
+            floor,
+            "reconverge: DHT served a record older than the last applied; keeping ours"
+        );
+        return;
+    }
     let Some(data) =
         fetch_verified_blob(endpoint, blob_store, peers, signed, network_name, &seeds).await
     else {
         tracing::warn!(network = %network_name, "reconverge: could not fetch verified blob");
         return;
     };
+    state.write().unwrap().last_record_timestamp = Some(record_ts);
     // Self-unpair: if our own device cert is nullified in this (verified, signed)
     // blob and the blob is coordinated by our *own* primary, the primary has
     // revoked this device. Tear ourselves out (delete the cert + leave every

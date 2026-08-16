@@ -61,6 +61,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::AsyncMutex;
 use crate::audit;
 use crate::config;
 use crate::config::settings::{self, FirewallKey, GlobalKey, NetworkKey, NodeKey};
@@ -345,6 +346,24 @@ pub(crate) struct NetworkState {
     /// on every reconverge. Enforcement (admission, MeshHello, prune) rejects a
     /// cert whose device key is listed.
     nullifiers: BTreeSet<EndpointId>,
+    /// Author timestamp (microseconds since the epoch) of the most recent signed
+    /// pkarr record applied to this state, and the floor every later one has to
+    /// clear.
+    ///
+    /// A signature proves who wrote a record, never when: an old record for this
+    /// network stays valid forever and its hash differs from the current one, so
+    /// hash inequality alone reads a rollback as a change and applies it. That
+    /// re-seats kicked members, restores devices the blob nullified, and reverts
+    /// the suggested firewall, and the record it takes is one the DHT served
+    /// publicly to anyone holding the room id. The timestamp lives inside the
+    /// signed bytes (`SignedPacket::timestamp`), so it cannot be edited to clear
+    /// the floor, and ordering on it is what pkarr relays themselves do.
+    ///
+    /// In memory only, so a restart starts from `None` and takes the first record
+    /// it sees. That is the DHT's copy, which relays keep at the highest
+    /// timestamp, and any later legitimate republish outranks a replay anyway, so
+    /// the gap is a race at startup rather than a standing hole.
+    last_record_timestamp: Option<u64>,
     /// Materialized suggested rules awaiting manual `ray firewall accept` on a
     /// node that did not opt into `--auto-accept-firewall`. Empty when
     /// auto-accepting.
@@ -424,7 +443,7 @@ pub struct NetworkHandle {
     /// Serializes invite-ledger reads/writes (mint, redeem, revoke) so concurrent
     /// joins can't double-burn a single-use invite (TOCTOU on the toml file).
     /// Shared with this network's [`CoordinatorAcceptState`].
-    invite_lock: Arc<tokio::sync::Mutex<()>>,
+    invite_lock: Arc<AsyncMutex<()>>,
 }
 
 /// Shared, always-on daemon state. Cloned (via `Arc`) into every IPC handler
@@ -476,9 +495,10 @@ pub struct Daemon {
     /// (see [`DnsService`]). Shared as `Arc` so extracted consumers can hold it.
     dns: Arc<DnsService>,
     mdns_enabled: bool,
-    /// Whether this node opted into automatic stable updates (`ray auto-update
-    /// on` / `ray install --auto-update`). Read at startup; when set, `run_daemon`
-    /// spawns the periodic update task. Echoed back in `ray status`.
+    /// Whether this node opted into automatic stable updates
+    /// (`ray config set auto-update on` / `ray install --auto-update`). Read at
+    /// startup; when set, `run_daemon` spawns the periodic update task. Echoed
+    /// back in `ray status`.
     auto_update: bool,
     /// The resolved data-plane mode (`ray config set ipv6-only on`), for
     /// sharing a host with another VPN that owns `100.64.0.0/10`. Resolved once
@@ -507,7 +527,7 @@ pub struct Daemon {
     /// other's intermediate state, after which teardown "restores" forwarding to
     /// on. One reconcile at a time. Tokio's mutex because the critical section
     /// awaits (blocking-pool `ip`/`nft`/`pfctl` children, offer broadcasts).
-    pub(crate) exit_reconcile: tokio::sync::Mutex<()>,
+    pub(crate) exit_reconcile: AsyncMutex<()>,
     /// Prometheus metrics-server guard. Owned so it lives for the daemon's whole
     /// lifetime (dropping it stops the export); `None` if the server failed to bind.
     _metrics_server: Option<MetricsServer>,
@@ -892,8 +912,9 @@ impl Daemon {
 
     /// Apply one settings key and persist it. Serves `ray config set|unset` and
     /// every single-value command that used to carry its own IPC variant
-    /// (`ray mdns`, `ray auto-update`, `ray firewall on|off|reject|default`,
-    /// `ray firewall ssh on|off`, `ray files download-dir|download-user`).
+    /// (`ray mdns`, `ray firewall on|off|reject|default`, `ray firewall ssh
+    /// on|off`, `ray files download-dir|download-user`, and the hidden
+    /// `ray auto-update`, whose only spelling is now the key itself).
     ///
     /// Dispatch is on the key's store, because the two a [`NodeKey`] can name
     /// are not interchangeable: a firewall key writes the live `ArcSwap` the
@@ -1991,7 +2012,107 @@ mod accept_handler_tests {
             nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
+            last_record_timestamp: None,
         }))
+    }
+
+    /// The live state and context behind a handler, whichever role it is. Lets a
+    /// test seat members and device bindings on a handler it just built.
+    fn handler_parts(h: &AcceptHandler) -> (&SharedNetworkState, &MeshCtx) {
+        match h {
+            AcceptHandler::Coordinator(s) => (&s.state, &s.ctx),
+            AcceptHandler::Member(s) => (&s.state, &s.ctx),
+        }
+    }
+
+    fn seated(id: EndpointId, ip: u8) -> Member {
+        Member {
+            identity: id,
+            ip: Ipv4Addr::new(100, 64, 0, ip),
+            is_coordinator: false,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+            last_seen: None,
+            exit_node: false,
+            exit_node_v6: false,
+            ipv6_only: false,
+        }
+    }
+
+    /// The demux wall: a peer on the roster may speak for this network.
+    #[tokio::test]
+    async fn knows_sender_accepts_a_seated_member() {
+        let h = sample_coordinator_handler().await;
+        let (state, _) = handler_parts(&h);
+        let member = SecretKey::from_bytes(&[9u8; 32]).public();
+        state
+            .write()
+            .unwrap()
+            .members
+            .add(seated(member, 2))
+            .unwrap();
+        assert!(h.knows_sender(member));
+    }
+
+    /// A peer approved but not yet seated is still accounted for: it is mid-join
+    /// and its `MeshHello` is what completes the admission.
+    #[tokio::test]
+    async fn knows_sender_accepts_an_approved_peer() {
+        let h = sample_coordinator_handler().await;
+        let (state, _) = handler_parts(&h);
+        let peer = SecretKey::from_bytes(&[10u8; 32]).public();
+        {
+            let mut s = state.write().unwrap();
+            let members = s.members.clone();
+            s.approved
+                .approve(
+                    ApprovedEntry {
+                        identity: peer,
+                        ip: Ipv4Addr::new(100, 64, 0, 3),
+                        hostname: None,
+                        user_identity: None,
+                        device_cert: None,
+                        collision_index: 0,
+                    },
+                    &members,
+                )
+                .unwrap();
+        }
+        assert!(h.knows_sender(peer));
+    }
+
+    /// The branch the doc comment calls out: a paired peer can be on the roster
+    /// under its *user* identity while its frames arrive under a device key, so
+    /// the lookup has to try the resolved identity too.
+    #[tokio::test]
+    async fn knows_sender_resolves_a_device_to_its_roster_user() {
+        let h = sample_coordinator_handler().await;
+        let (state, ctx) = handler_parts(&h);
+        let user = SecretKey::from_bytes(&[11u8; 32]).public();
+        let device = SecretKey::from_bytes(&[12u8; 32]).public();
+        state.write().unwrap().members.add(seated(user, 4)).unwrap();
+        // Unmapped, the device key is a stranger.
+        assert!(!h.knows_sender(device));
+        ctx.device_user_map.insert(device, user);
+        assert!(h.knows_sender(device));
+    }
+
+    /// The case the wall exists for: knowing the room id is not being in the room.
+    #[tokio::test]
+    async fn knows_sender_refuses_a_stranger() {
+        let h = sample_coordinator_handler().await;
+        let (state, _) = handler_parts(&h);
+        let member = SecretKey::from_bytes(&[13u8; 32]).public();
+        state
+            .write()
+            .unwrap()
+            .members
+            .add(seated(member, 5))
+            .unwrap();
+        let stranger = SecretKey::from_bytes(&[14u8; 32]).public();
+        assert!(!h.knows_sender(stranger));
     }
 
     /// Throwaway [`MeshCtx`] for accept-handler tests: a fresh blob store and
@@ -2036,7 +2157,7 @@ mod accept_handler_tests {
             network_name: "test-net".to_string(),
             state: make_network_state(),
             dht_notify: None,
-            invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+            invite_lock: Arc::new(AsyncMutex::new(())),
         }))
     }
 
@@ -2117,7 +2238,7 @@ mod accept_handler_tests {
             my_identity: my_id,
             endpoint,
             registry,
-            invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+            invite_lock: Arc::new(AsyncMutex::new(())),
             reconverge_notify: Arc::new(tokio::sync::Notify::new()),
         }))
     }
@@ -2182,7 +2303,7 @@ mod accept_handler_tests {
                     dht_notify: None,
                     cancel: CancellationToken::new(),
                     tasks: Vec::new(),
-                    invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    invite_lock: Arc::new(AsyncMutex::new(())),
                 },
             );
             assert!(
@@ -2297,7 +2418,7 @@ mod accept_handler_tests {
                 dht_notify: None,
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                invite_lock: Arc::new(AsyncMutex::new(())),
             },
         );
 
@@ -2324,7 +2445,7 @@ mod accept_handler_tests {
                 network_name: "test-net".to_string(),
                 state: state.clone(),
                 dht_notify: None,
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                invite_lock: Arc::new(AsyncMutex::new(())),
             })),
         );
 
@@ -2479,7 +2600,7 @@ mod accept_handler_tests {
                 dht_notify: None,
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                invite_lock: Arc::new(AsyncMutex::new(())),
             },
         );
         let connmgr = Arc::new(ConnectionManager::new());
@@ -2503,7 +2624,7 @@ mod accept_handler_tests {
                 network_name: "test-net".to_string(),
                 state: coord_state.clone(),
                 dht_notify: None,
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                invite_lock: Arc::new(AsyncMutex::new(())),
             })),
         );
         let accept = {
@@ -2546,7 +2667,7 @@ mod accept_handler_tests {
                 dht_notify: None,
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                invite_lock: Arc::new(AsyncMutex::new(())),
             },
         );
         // Offering an exit, and the data plane is up so sync is enabled.
@@ -3046,7 +3167,7 @@ mod headless_tests {
     /// buffer, so a test can observe which writer the data plane routed to.
     #[derive(Clone, Default)]
     struct FakeTunWriter {
-        written: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        written: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     impl crate::tun::TunWrite for FakeTunWriter {
@@ -3077,7 +3198,7 @@ mod headless_tests {
     /// failure fails fast instead of hanging; the short poll interval leaves room
     /// for the cross-thread wakeup of the writer task without a fixed sleep that
     /// would either flake (too short) or slow the suite (too long).
-    async fn wait_for_len(sink: &Arc<std::sync::Mutex<Vec<Vec<u8>>>>, want: usize) -> bool {
+    async fn wait_for_len(sink: &Arc<Mutex<Vec<Vec<u8>>>>, want: usize) -> bool {
         for _ in 0..400 {
             if sink.lock().unwrap().len() >= want {
                 return true;

@@ -733,7 +733,7 @@ async fn build_daemon_inner(
         ipv6_only,
         tun_name,
         tun_tasks: Mutex::new(None),
-        exit_reconcile: tokio::sync::Mutex::new(()),
+        exit_reconcile: AsyncMutex::new(()),
         _metrics_server: metrics_server,
         router,
         files,

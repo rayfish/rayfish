@@ -915,6 +915,7 @@ pub fn spawn_tun_writer<W: crate::tun::TunWrite>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AsyncMutex;
     use crate::firewall::Action;
     use smol_str::SmolStr;
 
@@ -932,7 +933,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeTunWriter {
-        written: std::sync::Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+        written: Arc<AsyncMutex<Vec<Vec<u8>>>>,
     }
 
     impl crate::tun::TunWrite for FakeTunWriter {

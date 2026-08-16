@@ -5,9 +5,11 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
+use dashmap::DashMap;
+use smol_str::SmolStr;
 
 use crate::dns::{HostnameTable, MAGIC_DNS_V4, MAGIC_DNS_V6, ReverseLookupTable};
 
@@ -29,7 +31,38 @@ pub struct Resolver {
     /// responder withholds A records (see [`crate::dns::handle_query`]): mesh
     /// IPv4 is not routed here, so handing an app one is a black hole.
     ipv6_only: AtomicBool,
+    /// Per-name forwarding counters for [`LOOP_WINDOW`], kept only for names
+    /// sent to another mesh's resolver. See [`Resolver::loop_guard_allows`].
+    overlay_forwards: DashMap<SmolStr, (Instant, u32)>,
+    /// Whether the stub has another nameserver listed after ours, so a name
+    /// outside `.ray` can be declined instead of forwarded. See
+    /// [`Resolver::set_defer_off_mesh`].
+    defer_off_mesh: AtomicBool,
 }
+
+/// How many times one name may go to another mesh's resolver inside
+/// [`LOOP_WINDOW`] before we stop sending it there.
+///
+/// A resolver we share `/etc/resolv.conf` with can be pointed straight back at
+/// us, and then a name neither mesh owns bounces between the two until
+/// something gives. Tailscale reads the live file for its own upstreams and
+/// drops only its *own* service IPs from what it finds (`GetBaseConfig` in
+/// `net/dns/direct.go`, added for tailscale/tailscale#7816, which is this same
+/// loop with systemd-resolved on the other end), so a daemon that starts while
+/// our file is in place adopts our magic IP as its upstream and neither side's
+/// filter catches it.
+///
+/// The threshold is a circuit breaker, not a rate limit: it has to sit above
+/// what a busy host legitimately asks for (glibc does not cache, so every
+/// `getaddrinfo` is a query and parallel connections to one host are normal),
+/// and a loop blows past it inside a millisecond because each hop multiplies.
+const LOOP_LIMIT: u32 = 10;
+const LOOP_WINDOW: Duration = Duration::from_secs(5);
+
+/// Cap on distinct names tracked at once, so a host resolving endlessly many
+/// names cannot grow the map without bound. Well above the working set a loop
+/// produces (a loop hammers *one* name), so eviction never hides one.
+const LOOP_GUARD_MAX_NAMES: usize = 1024;
 
 impl Resolver {
     pub fn new(table: HostnameTable, reverse: ReverseLookupTable) -> Self {
@@ -39,6 +72,8 @@ impl Resolver {
             upstreams: Arc::new(ArcSwap::from_pointee(Vec::new())),
             tunnel_upstreams: Arc::new(ArcSwapOption::empty()),
             ipv6_only: AtomicBool::new(false),
+            overlay_forwards: DashMap::new(),
+            defer_off_mesh: AtomicBool::new(false),
         }
     }
 
@@ -59,6 +94,13 @@ impl Resolver {
     /// does: `dns_upstreams` now accepts any `IpAddr`, so `ray config set
     /// dns-upstreams 200::53` would otherwise hand the forwarder its own address
     /// and every miss would recurse through `handle_tun_query`.
+    ///
+    /// It governs only what *we* forward, so it does nothing on a host that
+    /// declines off-mesh names ([`Self::set_defer_off_mesh`]): there the stub
+    /// asks the next `nameserver` itself and never reaches the forwarder. That
+    /// combination is not hypothetical, it is the same host this mode exists
+    /// for, so `apply_exit_dns` warns about it rather than leaving the override
+    /// looking effective.
     pub fn set_tunnel_upstreams(&self, addrs: Option<Vec<SocketAddr>>) {
         // An override that filters down to nothing becomes no override: `forward`
         // reads an empty list as "no upstream configured" and refuses, where
@@ -71,6 +113,25 @@ impl Resolver {
             })
             .filter(|v: &Vec<SocketAddr>| !v.is_empty());
         self.tunnel_upstreams.store(addrs.map(Arc::new));
+    }
+
+    /// Whether to decline names outside `.ray` instead of forwarding them.
+    ///
+    /// Only true while `/etc/resolv.conf` lists a live resolver after ours,
+    /// which is what sharing the file with another mesh leaves behind. The stub
+    /// then does the work the forwarder would have: glibc treats REFUSED as a
+    /// failed server and asks the next `nameserver` line, so the query reaches
+    /// the other resolver directly instead of being relayed by us. Off by
+    /// default, because on an ordinary host ours is the only line in the file
+    /// and declining would take the machine's DNS down.
+    pub fn set_defer_off_mesh(&self, on: bool) {
+        self.defer_off_mesh.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether off-mesh names are being declined, for the callers that need to
+    /// know the forwarder is out of the path.
+    pub fn defers_off_mesh(&self) -> bool {
+        self.defer_off_mesh.load(Ordering::Relaxed)
     }
 
     /// Record whether mesh IPv4 is usable on this node. Called once at daemon
@@ -123,6 +184,18 @@ impl Resolver {
             crate::dns::handle_query(query, &self.table, &self.reverse, ipv6_only).await
         {
             return Some(local);
+        }
+        // Sharing resolv.conf means the stub has another nameserver listed
+        // after ours, and it will ask that one the moment we decline. Doing
+        // that instead of forwarding is not a shortcut: relaying the host's
+        // general DNS through us puts a userspace hop in front of every name,
+        // flattens whatever the other resolver does natively (its own split
+        // DNS, its own encrypted upstreams) into one plain UDP query, and is
+        // the only reason two resolvers pointed at each other can loop.
+        if self.defer_off_mesh.load(Ordering::Relaxed) {
+            // `.ray` is ours to answer, misses included: passing those on would
+            // hand a mesh name to the other resolver for the same failure.
+            return crate::dns::nxdomain_if_in_zone(query).or_else(|| refused(query));
         }
         if let Some(forwarded) = self.forward(query).await {
             return Some(forwarded);
@@ -180,7 +253,20 @@ impl Resolver {
             tracing::warn!("no DNS upstream configured; cannot forward off-mesh queries");
             return None;
         }
+        // The name is only needed to count loops, so it is parsed only when an
+        // upstream could loop. A host with ordinary resolvers pays nothing.
+        let name = upstreams
+            .iter()
+            .any(|a| crate::membership::is_overlay_ip(a.ip()))
+            .then(|| query_name(query))
+            .flatten();
         for up in upstreams.iter() {
+            // Skip an overlay resolver that this name has already been bounced
+            // off, and fall through to the next upstream (a real server, if the
+            // capture found one) rather than feeding the loop another hop.
+            if crate::membership::is_overlay_ip(up.ip()) && !self.loop_guard_allows(name.as_ref()) {
+                continue;
+            }
             match forward_once(query, *up, FORWARD_TIMEOUT).await {
                 Ok(resp) => return Some(resp),
                 Err(e) => tracing::debug!(upstream = %up, error = %e, "upstream DNS query failed"),
@@ -189,6 +275,62 @@ impl Resolver {
         tracing::warn!(upstreams = ?upstreams.as_ref(), "no DNS upstream answered");
         None
     }
+
+    /// Count one forward of this query's name to another mesh's resolver, and
+    /// say whether it is still under [`LOOP_LIMIT`] for the current window.
+    ///
+    /// Only asked about overlay upstreams, so the map hit stays off the path a
+    /// host with ordinary resolvers takes. A query we could not parse a name
+    /// out of is allowed: it is not the shape a loop has, and guessing would
+    /// drop real traffic.
+    fn loop_guard_allows(&self, name: Option<&SmolStr>) -> bool {
+        let Some(name) = name else {
+            return true;
+        };
+        let now = Instant::now();
+        // Evict before inserting a new name, never on a hit, so a loop's own
+        // entry cannot be swept out from under the count that is tripping.
+        if self.overlay_forwards.len() >= LOOP_GUARD_MAX_NAMES
+            && !self.overlay_forwards.contains_key(name.as_str())
+        {
+            self.overlay_forwards
+                .retain(|_, (started, _)| now.duration_since(*started) < LOOP_WINDOW);
+        }
+        let mut entry = self
+            .overlay_forwards
+            .entry(name.clone())
+            .or_insert((now, 0));
+        let (started, count) = &mut *entry;
+        if now.duration_since(*started) >= LOOP_WINDOW {
+            // Window expired: start a fresh one. A loop that is still running
+            // gets to send exactly one more burst before tripping again, which
+            // is also what lets a genuinely transient trip heal.
+            *started = now;
+            *count = 1;
+            return true;
+        }
+        *count += 1;
+        if *count > LOOP_LIMIT {
+            // Once per window, not once per query: a loop trips this thousands
+            // of times a second.
+            if *count == LOOP_LIMIT + 1 {
+                tracing::warn!(
+                    %name,
+                    "another mesh's resolver has been sent this name {LOOP_LIMIT} times in \
+                     {LOOP_WINDOW:?}; it is forwarding back to us, so no longer sending it there"
+                );
+            }
+            return false;
+        }
+        true
+    }
+}
+
+/// The first question's name in a DNS query, lowercased for comparison.
+fn query_name(query: &[u8]) -> Option<SmolStr> {
+    let packet = simple_dns::Packet::parse(query).ok()?;
+    let name = packet.questions.first()?.qname.to_string();
+    Some(SmolStr::new(name.to_ascii_lowercase()))
 }
 
 /// How long to wait for an upstream to answer a forwarded query.
@@ -271,6 +413,23 @@ fn servfail(query: &[u8]) -> Option<Vec<u8>> {
     Some(resp)
 }
 
+/// "Not mine, ask somebody else."
+///
+/// REFUSED rather than SERVFAIL because it is the true statement (we are
+/// declining, not failing) and rather than silence because silence costs the
+/// stub its whole timeout: glibc waits `timeout:5` twice before moving on,
+/// while any of REFUSED/SERVFAIL/NOTIMP makes it try the next nameserver at
+/// once. musl asks every server at once and discards the refusal.
+fn refused(query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
+    let mut resp = query.to_vec();
+    resp[2] |= 0x80; // QR: this is a response
+    resp[3] = 0x80 | 5; // RA=1, Z=0, RCODE=5 (refused)
+    Some(resp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +445,88 @@ mod tests {
             false,
         ));
         pkt.build_bytes_vec().expect("build query")
+    }
+
+    /// Off-mesh names are declined, not forwarded, so the stub asks the next
+    /// nameserver itself. `.ray` stays ours to answer either way, including the
+    /// misses: sending those on would leak a mesh name to the other resolver
+    /// and get the same failure back a round trip later.
+    #[tokio::test]
+    async fn declining_leaves_off_mesh_names_to_the_next_nameserver() {
+        let upstream_answer = Ipv4Addr::new(93, 184, 216, 34);
+        let up = fake_upstream(upstream_answer).await;
+
+        let r = Resolver::new(HostnameTable::default(), ReverseLookupTable::default());
+        r.set_upstream_addrs([up]);
+        r.set_defer_off_mesh(true);
+
+        let resp = r
+            .resolve(&build_a_query("example.com"))
+            .await
+            .expect("a reply, not silence: a dropped query costs the stub its timeout");
+        assert_eq!(
+            Packet::parse(&resp).expect("parse").rcode(),
+            simple_dns::RCODE::Refused,
+            "declined, so glibc moves to the next nameserver at once"
+        );
+        assert!(
+            !response_has_a(&resp, upstream_answer),
+            "the upstream must not have been asked at all"
+        );
+
+        // A `.ray` name nobody holds is still ours to fail authoritatively.
+        let resp = r
+            .resolve(&build_a_query("nobody.homelab.ray"))
+            .await
+            .expect("local NXDOMAIN");
+        assert_eq!(
+            Packet::parse(&resp).expect("parse").rcode(),
+            simple_dns::RCODE::NameError
+        );
+    }
+
+    /// The circuit breaker opens for one name and only that name, and a query
+    /// with no question in it is never what trips it.
+    #[test]
+    fn loop_guard_trips_on_the_looping_name_alone() {
+        let r = Resolver::new(HostnameTable::default(), ReverseLookupTable::default());
+        let looping = build_a_query("bounced.example.com");
+
+        // Everything up to the limit goes through: a busy host asking for one
+        // name repeatedly is normal, and this must not be a rate limit on it.
+        for i in 1..=LOOP_LIMIT {
+            assert!(
+                r.loop_guard_allows(query_name(&looping).as_ref()),
+                "forward {i} of {LOOP_LIMIT} should be allowed"
+            );
+        }
+        assert!(
+            !r.loop_guard_allows(query_name(&looping).as_ref()),
+            "the forward past the limit is the one that stops"
+        );
+        // Still shut on the next query, or a loop would get a hop per query.
+        assert!(!r.loop_guard_allows(query_name(&looping).as_ref()));
+
+        // A different name is unaffected: the breaker is per-name, so one
+        // looping lookup cannot take the host's other DNS down with it.
+        assert!(r.loop_guard_allows(query_name(&build_a_query("fine.example.com")).as_ref()));
+
+        // A malformed query has no name to count. Allowed, since dropping what
+        // we cannot parse would fail real traffic to protect against a shape a
+        // loop does not have.
+        assert!(r.loop_guard_allows(query_name(&[0u8; 4]).as_ref()));
+    }
+
+    /// Names differing only in case are one name to DNS, so they have to be one
+    /// counter here: a loop that varies the case would otherwise never trip.
+    #[test]
+    fn loop_guard_counts_a_name_case_insensitively() {
+        let r = Resolver::new(HostnameTable::default(), ReverseLookupTable::default());
+        for _ in 1..=5 {
+            assert!(r.loop_guard_allows(query_name(&build_a_query("Mixed.Example.Com")).as_ref()));
+            assert!(r.loop_guard_allows(query_name(&build_a_query("mixed.example.com")).as_ref()));
+        }
+        assert!(!r.loop_guard_allows(query_name(&build_a_query("MIXED.EXAMPLE.COM")).as_ref()));
     }
 
     fn response_has_a(bytes: &[u8], ip: Ipv4Addr) -> bool {

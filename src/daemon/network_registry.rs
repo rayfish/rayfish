@@ -410,7 +410,7 @@ impl NetworkRegistry {
     pub(crate) async fn refresh_search_domains(&self) {
         let network_names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
         let tun_name = self.tun_name.load().as_str().to_owned();
-        dns_config::update_search_domains(&network_names, &tun_name).await;
+        self.dns.set_search_domains(&network_names, &tun_name).await;
     }
 
     /// Leave a network: announce our departure to its peers, tear down the runtime,
@@ -451,7 +451,7 @@ impl NetworkRegistry {
     pub(crate) fn coordinator_handle(
         &self,
         network: &str,
-    ) -> std::result::Result<(EndpointId, Arc<tokio::sync::Mutex<()>>), IpcMessage> {
+    ) -> std::result::Result<(EndpointId, Arc<AsyncMutex<()>>), IpcMessage> {
         let Some(handle) = self.networks.get(network) else {
             return Err(ipc_err(format!("network '{network}' not active")));
         };
@@ -562,6 +562,10 @@ impl NetworkRegistry {
                 .unwrap_or_else(crate::hostname::generate_hostname),
         };
 
+        // Captured before `pre_approve` is consumed below: on a direct network
+        // this is the one peer the co-coordinator key grant is pinned to.
+        let pre_approved_peer = pre_approve.as_ref().map(|(id, _)| *id);
+
         let mut net_state = self.build_initial_roster(
             &name,
             my_ip,
@@ -601,6 +605,10 @@ impl NetworkRegistry {
             auto_accept_files: true,
             admins: vec![],
             direct,
+            // The peer this direct link was minted for. Pins the co-coordinator
+            // key grant in `admit_peer` to that one peer instead of to whoever
+            // happens to be approved on the network later.
+            direct_peer: direct.then_some(pre_approved_peer).flatten(),
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
@@ -610,7 +618,7 @@ impl NetworkRegistry {
 
         let cancel = self.shutdown_token.child_token();
         let state = Arc::new(std::sync::RwLock::new(net_state));
-        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let invite_lock = Arc::new(AsyncMutex::new(()));
         let dht_notify = Arc::new(tokio::sync::Notify::new());
         let tasks = self.spawn_coordinator_background_tasks(
             &ctx,
@@ -718,6 +726,8 @@ impl NetworkRegistry {
             nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
+            // We author this network's records; there is nothing to replay to us.
+            last_record_timestamp: None,
         })
     }
 
@@ -986,7 +996,7 @@ impl NetworkRegistry {
         ctx: &MeshCtx,
         network: &str,
         state: SharedNetworkState,
-        invite_lock: Arc<tokio::sync::Mutex<()>>,
+        invite_lock: Arc<AsyncMutex<()>>,
         dht_notify: Option<Arc<Notify>>,
         network_key: EndpointId,
     ) {

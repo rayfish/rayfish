@@ -198,6 +198,9 @@ impl NetworkRegistry {
             nullifiers,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
+            // A key holder authors records rather than applying them, so it keeps
+            // no replay floor.
+            last_record_timestamp: None,
         };
 
         self.seal_and_publish(&mut net_state, &net_secret_key).await;
@@ -227,6 +230,7 @@ impl NetworkRegistry {
             auto_accept_files: net_config.map(|nc| nc.auto_accept_files).unwrap_or(false),
             admins: net_config.map(|nc| nc.admins.clone()).unwrap_or_default(),
             direct: net_config.map(|nc| nc.direct).unwrap_or(false),
+            direct_peer: net_config.and_then(|nc| nc.direct_peer),
             ssh_allow: net_config
                 .map(|nc| nc.ssh_allow.clone())
                 .unwrap_or_default(),
@@ -242,7 +246,7 @@ impl NetworkRegistry {
 
         let cancel = self.shutdown_token.child_token();
         let state = Arc::new(RwLock::new(net_state));
-        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let invite_lock = Arc::new(AsyncMutex::new(()));
         let dht_notify = Arc::new(tokio::sync::Notify::new());
         let ctx = self.mesh_ctx();
         let tasks = self.spawn_coordinator_background_tasks(
@@ -1213,15 +1217,22 @@ impl Daemon {
         // mode deliberately does not tunnel. macOS has no such gap, because
         // `apply_exit_client` re-asserts a catch-all match domain while the tunnel
         // is up. Giving Linux the same flip is the real fix and is not done here.
+        //
+        // Sharing `/etc/resolv.conf` with another mesh is the same gap by a
+        // different route: we are the first nameserver and get every name, but a
+        // name outside `.ray` is answered REFUSED so the stub asks the next line,
+        // which is that mesh's resolver. The forwarder is out of the path either
+        // way, and this is the host the mode is for, so it is worth saying.
         #[cfg(target_os = "linux")]
         if over.is_some()
             && let Some(backend) = self.dns.backend_name()
-            && backend != "direct-resolv.conf"
+            && (backend != "direct-resolv.conf" || self.dns.resolver.defers_off_mesh())
         {
             tracing::warn!(
                 backend,
-                "IPv6-only full tunnel is up, but this DNS backend routes only \
-                 `.ray` to rayfish, so other lookups still leave over IPv4, \
+                shared_resolv_conf = self.dns.resolver.defers_off_mesh(),
+                "IPv6-only full tunnel is up, but non-`.ray` lookups do not reach \
+                 rayfish's forwarder on this host, so they still leave over IPv4, \
                  outside the exit node"
             );
         }

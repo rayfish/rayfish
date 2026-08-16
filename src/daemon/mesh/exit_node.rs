@@ -87,6 +87,22 @@ impl NetworkRegistry {
             .find(|m| m.matches_identity(id))
     }
 
+    /// Whether `device_key` is nullified on *any* network this node runs
+    /// (`ray unpair`).
+    ///
+    /// Nullifier sets are per-network, but the thing they gate here is not: a
+    /// verified cert writes into `device_user_map`, which is one map for the whole
+    /// daemon and is what the inbound firewall, mesh SSH and own-device
+    /// auto-accept resolve through. Checking only the network a `MeshHello`
+    /// happened to arrive on let a device revoked on network A re-establish that
+    /// daemon-wide binding by saying hello on network B. The check has to be as
+    /// wide as the map it protects.
+    pub(crate) fn is_nullified_anywhere(&self, device_key: &EndpointId) -> bool {
+        self.networks
+            .iter()
+            .any(|h| h.state.read().unwrap().nullifiers.contains(device_key))
+    }
+
     /// Add or remove a peer from a network's exit-node allow list, then advertise
     /// the resulting offer state (offering iff the list is non-empty). `peer` is
     /// `*` (any member) or a name/ip/id resolved to the peer's user identity.

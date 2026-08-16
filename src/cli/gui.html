@@ -305,7 +305,7 @@
           <button data-run="firewall show">firewall</button>
           <button data-run="files">files</button>
           <button data-run="pair list">devices</button>
-          <button data-run="connections">connections</button>
+          <button data-run="connect">connections</button>
           <button data-run="config">config</button>
           <button data-run="update --check">update check</button>
           <button data-run="report">report issue</button>
@@ -371,12 +371,12 @@
       "firewall suggest <network> --subject '*' --allow tcp:22", "firewall auto-accept <network> on",
       "firewall ssh on", "firewall ssh allow <network> <peer>",
       "send <file> <peer>", "files accept <id>", "files auto-accept <network> on", "files download-dir <dir>",
-      "connect <contact-id>", "connections approve <id>", "contact id", "contact rotate",
+      "connect <contact-id>", "connect approve <id>", "contact id", "contact rotate",
       "pair", "pair accept <ticket>", "pair list", "pair backup", "unpair <device>",
       "alias <network> set <host> <alias>", "identityof <network> <host>",
       "exit-node allow", "exit-node use <peer>", "exit-node none",
       "apply <spec.yaml> --dry-run", "config set relay rayfish", "mdns off",
-      "update --check", "update --list", "auto-update on", "report", "version"
+      "update --check", "update --list", "config set auto-update on", "report", "version"
     ];
 
     function esc(s) {
@@ -614,8 +614,8 @@
               rows.push(`<div class="attn-row">
                 <span class="what"><b>${esc(r.hostname || r.id)}</b> asks to join <b>${esc(n.name)}</b>
                   <span class="sub">waiting ${esc(String(r.waiting_secs))}s · id ${esc(r.id)}</span></span>
-                <button class="small primary" data-act='${esc(JSON.stringify(["accept", n.name, r.id]))}' data-ok="let ${esc(r.hostname || r.id)} in">Let in</button>
-                <button class="small danger" data-act='${esc(JSON.stringify(["deny", n.name, r.id]))}' data-ok="denied">Deny</button>
+                <button class="small primary" data-act='${esc(JSON.stringify(["requests", n.name, "accept", r.id]))}' data-ok="let ${esc(r.hostname || r.id)} in">Let in</button>
+                <button class="small danger" data-act='${esc(JSON.stringify(["requests", n.name, "deny", r.id]))}' data-ok="denied">Deny</button>
               </div>`);
             }
           }
@@ -631,13 +631,13 @@
         }
       }
       if (pd.connects > 0) {
-        const res = await call(["connections"], true);
+        const res = await call(["connect"], true);
         if (res && res.success) {
           for (const r of JSON.parse(res.stdout)) {
             rows.push(`<div class="attn-row">
               <span class="what"><b>${esc(r.hostname || r.id)}</b> wants a direct connection
                 <span class="sub">waiting ${esc(String(r.waiting_secs))}s · id ${esc(r.id)}</span></span>
-              <button class="small primary" data-act='${esc(JSON.stringify(["connections", "approve", r.id]))}' data-ok="connected">Approve</button>
+              <button class="small primary" data-act='${esc(JSON.stringify(["connect", "approve", r.id]))}' data-ok="connected">Approve</button>
             </div>`);
           }
         }

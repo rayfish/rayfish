@@ -137,7 +137,10 @@ impl NetworkRegistry {
         // confirmation that it no longer lists us; on any failure (can't
         // resolve/fetch) we stay, never leaving on uncertainty.
         let removed = match resolve_signed(&self.transport.endpoint, net_pubkey).await {
-            Some((signed, seeds)) => fetch_verified_blob(
+            // The timestamp is not consulted here: this only ever *confirms* a
+            // kick before leaving, and an older record listing us is a reason to
+            // stay, which is already the safe answer.
+            Some((signed, seeds, _ts)) => fetch_verified_blob(
                 &self.transport.endpoint,
                 &self.transport.blob_store,
                 &self.peers,
@@ -212,7 +215,17 @@ impl NetworkRegistry {
             (h.state.clone(), h.network_key, h.dht_notify.clone())
         };
         let member_id = self.device_user_map.resolve(&peer_id);
-        state.write().unwrap().members.remove(&member_id);
+        // Nothing to prune means nothing to announce. The tail of this function
+        // is a signature, a DHT publish, and a `MemberSync` to every roster
+        // member (each of which answers with a reconverge: a pkarr resolve plus a
+        // blob fetch). Running it for a peer that was never on the roster turned
+        // one unauthenticated frame into mesh-wide work, since a control frame
+        // reaches this handler on the strength of the network id alone and the
+        // network id is public.
+        if state.write().unwrap().members.remove(&member_id).is_none() {
+            tracing::debug!(peer = %member_id.fmt_short(), network, "leave from a peer the roster does not list; ignoring");
+            return;
+        }
         if let Some(ip) = leaver_ip {
             dns::remove_hostname_by_ip(
                 &self.dns.hostname_table,
@@ -798,6 +811,7 @@ mod sender_authority_tests {
             nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
+            last_record_timestamp: None,
         }))
     }
 

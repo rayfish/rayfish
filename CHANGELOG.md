@@ -29,6 +29,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`ray firewall --help` is grouped, and every help page reads in one pass.**
+  The firewall's 13 actions are now listed under Rules, Mode, Coordinator
+  suggestions and Mesh SSH, the way `ray --help` has been grouped for a while.
+  Everywhere else, a command's one-line summary is now actually one line:
+  descriptions that ran to a full paragraph on a single unwrapped line have
+  been cut back to a summary, with the detail moved into
+  `ray help <command> <action>`, which now wraps to your terminal instead of
+  printing one very long line.
+- **Four commands moved next to the thing they act on.** `ray connections` is
+  now `ray connect` (bare, it lists incoming requests) and `ray connections
+  approve <id>` is `ray connect approve <id>`. `ray accept <net> <id>` and
+  `ray deny <net> <id>` are now `ray requests <net> accept <id>` and
+  `ray requests <net> deny <id>`. `ray auto-update on|off` is now
+  `ray config set auto-update on|off`. The old spellings all still work, so
+  existing scripts are unaffected; they no longer appear in `ray --help` or in
+  tab completion. `ray open` (the `rayfish://` link handler, which nobody types)
+  is hidden for the same reason.
 - **The mobile app stops waking the radio every minute.** Every node used to
   re-resolve each network's signed record once a minute, whether or not
   anything had changed, which on a phone is a wakeup per network per minute for
@@ -46,7 +63,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rather than the main one, so turning our tunnel on black-holed them entirely.
   Their routes are now copied into the tunnel's own table first, so the more
   specific ones still win and that VPN keeps working.
-
+- **`.ray` names now resolve alongside another VPN that manages
+  `/etc/resolv.conf`.** On a host with no DNS manager (no systemd-resolved in
+  the resolution path), Rayfish and a VPN like Tailscale both want that file.
+  Rayfish used to refuse it and `.ray` names stopped resolving for anything
+  that goes through the system resolver, and in the other start order the two
+  overwrote each other every few milliseconds. Rayfish now shares the file
+  instead: its resolver goes in ahead of the other VPN's, the other VPN's stays
+  behind it as the next nameserver, both sets of search domains are kept, and
+  everything outside `.ray` is forwarded to it. Both meshes resolve, whichever
+  VPN wrote the file last. Rayfish writes at most once a minute, so the two
+  cannot spin against each other, and it goes back to managing the file alone
+  once the other VPN leaves.
+- **The other VPN's names keep resolving too.** Sharing `/etc/resolv.conf`
+  means Rayfish is asked first for every name on the host, including the other
+  VPN's. Rather than relay those, Rayfish declines anything outside `.ray`, and
+  the system resolver asks the next server in the file, which is the other
+  VPN's. Its own DNS behaviour applies unchanged, nothing is proxied through
+  Rayfish, and the two cannot end up forwarding to each other in a circle.
+- **DNS comes back when the other VPN leaves.** Neither VPN overwrites a
+  `/etc/resolv.conf` the other is holding, so one that shuts down leaves its
+  resolver named in a file nobody will correct. Rayfish now notices that
+  resolver has stopped answering and releases DNS, so the host regenerates the
+  file and Rayfish takes it over again, instead of the machine being left
+  pointed at a server that is gone.
+- **Shutting down no longer takes the other VPN's DNS with it.** When Rayfish
+  shares `/etc/resolv.conf`, `ray down` (and a crash, and a restart) removes
+  only the lines Rayfish added, leaving the other VPN's resolver and search
+  domains in place, rather than restoring a snapshot of the file from before
+  either VPN was on the host.
+- **Bare hostnames now resolve on hosts without a DNS manager.** `ping box`
+  and `ssh box` worked through systemd-resolved but not on a machine where
+  Rayfish manages `/etc/resolv.conf` or registers with `resolvconf`: the
+  `<network>.ray` and `ray` search domains were only ever handed to
+  systemd-resolved, so on those hosts only the full `box.homelab.ray` resolved.
+  They are now written wherever DNS actually lives, and follow every join and
+  leave.
+- **Rayfish says so when another VPN's resolver outranks it.** With
+  `resolvconf` in the path, both VPNs register a resolver and the system tries
+  them in order, stopping at the first that answers. Second place never sees a
+  `.ray` query, and Rayfish reported success anyway. It now logs which resolver
+  is ahead of it and what to do about it.
 - **The metrics endpoint no longer answers the local network.** The Prometheus
   exporter bound `0.0.0.0:9090`, so any device on the same Wi-Fi could read
   it. Its counters name every peer by mesh IP with per-peer round-trip times
@@ -65,6 +122,61 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   roster until their next poll. Coordinators now dial those members to deliver
   it. Devices that are genuinely offline are left alone for five minutes
   between attempts rather than being re-dialed on every change.
+
+### Security
+
+- **Knowing a network's room id no longer lets a stranger talk to it.** A mesh
+  control message is addressed to a network by its public key, and that key is
+  a discovery key by design: it is in every invite code and it is the address
+  the network publishes under. Nothing checked that the sender of such a
+  message was actually in the network it named, so anyone who had ever seen an
+  invite could reach the handlers meant for members. They are now refused
+  unless the sender is on that network's roster, apart from the three messages
+  by which a peer that is not on it yet legitimately makes contact (a join
+  request, a hello, and a network-signed record, which is verified against the
+  network key regardless of who carried it).
+- **A device certificate is verified before it can speak for its user.**
+  Certificates bind a device key to a user identity, and that binding is what
+  the inbound firewall, mesh SSH authorization, and own-device file
+  auto-accept match on. A peer that presented a certificate under its own key
+  had that certificate recorded without its signature being checked, so an
+  unsigned one naming somebody else handed the sender that person's firewall
+  rules and SSH access on the receiving node. Certificates are now verified on
+  every path, and one revoked with `ray unpair` grants nothing even though its
+  signature stays valid forever.
+- **Only a coordinator can say who was admitted.** The message announcing a new
+  member was accepted from any sender. Acting on it seats the named peer at an
+  address the message chose, publishes its `.ray` name, and routes to it, so an
+  entry in a node's `.ray` DNS was something a stranger could place there until
+  the next roster sync. It is now honored only from a coordinator.
+- **A signed membership record cannot be rolled back to an older one.** A
+  signature says who wrote a record, never when, and an old record for a network
+  stays valid forever. Nodes compared only whether a record differed from the
+  one they held, so replaying a copy the network had published earlier (which
+  anyone holding the room id could have fetched) re-seated removed members,
+  restored revoked devices, and reverted the suggested firewall. Records are now
+  accepted only if they were authored after the last one applied, on both the
+  mesh and the lookup path.
+- **A pairing ticket now expires.** Opening a pairing session and never
+  completing it left the daemon willing to certify a new device for whoever
+  presented the ticket, indefinitely. Tickets are good for five minutes.
+- **A `ray connect` link hands its key to the one peer it was made for.**
+  Approving a direct connection makes the other peer a co-coordinator, since
+  the link is symmetric. That rule keyed on the network rather than the peer,
+  so anyone approved onto that network afterwards silently received the network
+  key as well. The grant now follows the peer the link was created for.
+- **A wrong guess no longer closes an open pairing window.** The pairing secret
+  was consumed before it was compared, so any dial carrying the wrong bytes
+  ended the pairing session and the real device had to start over. The secret
+  now survives a mismatch, and the comparison is constant-time.
+- **Queues a stranger could grow without limit are now bounded.** Incoming
+  `ray connect` requests and incoming file offers are both capped the way
+  pending join requests already were, dropping the oldest unanswered entry
+  rather than growing forever on a dial anyone can make.
+- **A leave from a peer that was never a member costs nothing.** Such a message
+  still made a coordinator re-sign and republish its membership record and
+  notify every member, each of whom answered with a lookup of their own. It is
+  now ignored.
 
 ### Added
 

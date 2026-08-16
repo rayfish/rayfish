@@ -48,6 +48,15 @@ pub(crate) fn spawn_path_logger(conn: IrohConnection, label: String) {
     });
 }
 
+/// The async mutex, under a name that cannot be mistaken for the std one.
+///
+/// `Mutex` is always `std::sync::Mutex` in this crate; when a lock genuinely
+/// has to be held across an await, it is an `AsyncMutex` and says so at the
+/// field. Two types called `Mutex` distinguished only by their import is the
+/// one place that distinction is easy to get wrong, and holding the std one
+/// across an await does not fail until it deadlocks.
+pub type AsyncMutex<T> = tokio::sync::Mutex<T>;
+
 pub mod apply;
 pub mod audit;
 pub mod config;

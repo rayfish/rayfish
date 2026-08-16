@@ -47,7 +47,7 @@ pub(crate) async fn ipc_pair_start() -> Result<()> {
             println!("On the other device, run:");
             println!("  rayfish pair {}", ticket);
             println!();
-            println!("Waiting for device to connect...");
+            println!("Waiting for device to connect (this ticket expires in 5 minutes)...");
             // The daemon handles the pairing asynchronously via the accept loop.
             // We could poll for completion, but the daemon logs when it happens.
             // For now, just tell the user it's ready.

@@ -25,6 +25,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(target_os = "macos")]
 use std::num::NonZeroU32;
 use std::sync::Arc;
+// Only the macOS statics below hold one.
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::{
@@ -118,8 +121,7 @@ impl SocketConfigurator for LoopPrevention {
 /// The physical default-route interface per family, snapshotted by
 /// [`capture_physical_defaults`] before the tunnel routes go in.
 #[cfg(target_os = "macos")]
-static PHYSICAL_DEFAULTS: std::sync::Mutex<Option<(Option<String>, Option<String>)>> =
-    std::sync::Mutex::new(None);
+static PHYSICAL_DEFAULTS: Mutex<Option<(Option<String>, Option<String>)>> = Mutex::new(None);
 
 /// Record which interface each family's default route leaves by, to pin iroh's
 /// sockets to for as long as the full tunnel is up.
@@ -223,7 +225,7 @@ fn default_gateway(family: &str) -> Option<String> {
 /// Host routes installed to keep iroh's own underlay traffic off the full tunnel,
 /// tracked so teardown can remove exactly what it added.
 #[cfg(target_os = "macos")]
-static EXCLUDED_IPS: std::sync::Mutex<Vec<IpAddr>> = std::sync::Mutex::new(Vec::new());
+static EXCLUDED_IPS: Mutex<Vec<IpAddr>> = Mutex::new(Vec::new());
 
 /// Route each underlay IP straight out the physical gateway so iroh's own traffic
 /// is not swallowed by the full tunnel it is carrying. A `/32` or `/128` host route

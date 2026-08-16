@@ -3,6 +3,9 @@ use std::fs::Permissions;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+// Only the test-only `CONFIG_ENV_LOCK` holds one.
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -141,6 +144,21 @@ pub struct NetworkConfig {
     /// and suppress its (non-shareable) room id.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub direct: bool,
+    /// The one peer this direct network was minted for, recorded at
+    /// `ray connect approve` time.
+    ///
+    /// Admission hands the network *secret key* to a pre-approved peer on a
+    /// direct network, because a direct link is symmetric and both ends
+    /// coordinate it. `direct` alone is a property of the network, so that rule
+    /// read as "any peer ever approved here becomes a co-coordinator", and a
+    /// later `ray requests accept` on the same network would silently give away
+    /// the key.
+    /// Naming the peer keeps the grant to the link it was meant for.
+    ///
+    /// `None` on networks minted before this field existed. See the fallback in
+    /// `admit_peer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_peer: Option<EndpointId>,
     /// Peers authorized to SSH into this node over this network's mesh link
     /// (`ray firewall ssh allow <net> <peer>`). Only consulted when the global
     /// `ssh_enabled` toggle is on. Empty = no peer may SSH in.
@@ -327,6 +345,7 @@ pub(crate) fn empty_network_config(name: &str) -> NetworkConfig {
         auto_accept_files: true,
         admins: vec![],
         direct: false,
+        direct_peer: None,
         ssh_allow: vec![],
         aliases: BTreeMap::new(),
         ephemeral_ttl_secs: None,
@@ -445,7 +464,7 @@ pub struct AppConfig {
     pub idle_timeout_secs: Option<u64>,
     /// Opt-in automatic updates: when on, the daemon periodically checks for a
     /// newer stable release, swaps the binary, and restarts itself onto it. Off
-    /// by default; enable via `ray install --auto-update` or `ray auto-update on`.
+    /// by default; enable via `ray install --auto-update` or `ray config set auto-update on`.
     #[serde(default)]
     pub auto_update: bool,
     /// Last release tag the auto-updater attempted (e.g. `v0.2.0`). Persisted so a
@@ -1064,7 +1083,7 @@ pub fn remove_network(config: &mut AppConfig, name: &str) -> bool {
 /// run on parallel threads. Shared across test modules (`identity`, `daemon`)
 /// so none of them observe a `RAYFISH_CONFIG_DIR` value set by a concurrent test.
 #[cfg(test)]
-pub(crate) static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -1135,6 +1154,7 @@ mod tests {
                     auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    direct_peer: None,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
@@ -1156,6 +1176,7 @@ mod tests {
                     auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    direct_peer: None,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
@@ -1198,6 +1219,7 @@ mod tests {
             auto_accept_files: false,
             admins: vec![],
             direct: false,
+            direct_peer: None,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
@@ -1228,6 +1250,7 @@ mod tests {
                 auto_accept_files: false,
                 admins: vec![],
                 direct: false,
+                direct_peer: None,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
                 ephemeral_ttl_secs: None,
@@ -1251,6 +1274,7 @@ mod tests {
             auto_accept_files: false,
             admins: vec![],
             direct: false,
+            direct_peer: None,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
@@ -1285,6 +1309,7 @@ mod tests {
                     auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    direct_peer: None,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
@@ -1306,6 +1331,7 @@ mod tests {
                     auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    direct_peer: None,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
@@ -1355,6 +1381,7 @@ mod tests {
                 auto_accept_files: false,
                 admins: vec![],
                 direct: false,
+                direct_peer: None,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
                 ephemeral_ttl_secs: None,
@@ -1389,6 +1416,7 @@ mod tests {
                 auto_accept_files: false,
                 admins: vec![],
                 direct: false,
+                direct_peer: None,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
                 ephemeral_ttl_secs: None,
@@ -1477,6 +1505,7 @@ name = "test"
             auto_accept_files: false,
             admins: vec![],
             direct: false,
+            direct_peer: None,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
