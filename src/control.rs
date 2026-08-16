@@ -201,6 +201,13 @@ pub enum ControlMsg {
     /// [`ControlFrame`]'s `net`.
     ExitNodeOffer {
         enabled: bool,
+        /// Whether that exit node can carry IPv6 (the offering host has an IPv6
+        /// default route). Recorded as `Member.exit_node_v6`, and what lets an
+        /// IPv6-only client tell a usable gateway from one that would take its
+        /// traffic and have nowhere to send it. Additive: an older peer omits it
+        /// and reads as v4-only, which is the safe way to be wrong.
+        #[serde(default)]
+        exit_v6: bool,
     },
     /// Member -> coordinators: announce whether this sender's data plane is
     /// IPv6-only (`ray config set ipv6-only on`), meaning its mesh IPv4 is
@@ -558,6 +565,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                exit_node_v6: false,
                 ipv6_only: false,
             }],
         };
@@ -786,6 +794,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                exit_node_v6: false,
                 ipv6_only: false,
             }],
             approved: vec![ApprovedEntry {
@@ -993,5 +1002,29 @@ mod tests {
             PairMsg::Response { networks, .. } => assert!(networks.is_empty()),
             _ => panic!("expected Response"),
         }
+    }
+
+    /// An `ExitNodeOffer` from a peer that predates `exit_v6` still decodes, and
+    /// reads as "cannot carry IPv6". That default is what lets the field ship
+    /// without bumping `MESH_PROTOCOL_VERSION`: an IPv6-only client declines such
+    /// a gateway, which costs it a usable exit at worst, where guessing the other
+    /// way would route its traffic into a host with nowhere to send it.
+    #[test]
+    fn exit_node_offer_v6_defaults_when_absent() {
+        #[derive(serde::Serialize)]
+        enum OldControlMsg {
+            ExitNodeOffer { enabled: bool },
+        }
+        let bytes = rmp_serde::to_vec_named(&OldControlMsg::ExitNodeOffer { enabled: true })
+            .expect("serialize");
+
+        let decoded: ControlMsg = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(
+            decoded,
+            ControlMsg::ExitNodeOffer {
+                enabled: true,
+                exit_v6: false,
+            }
+        );
     }
 }

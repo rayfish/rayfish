@@ -54,6 +54,16 @@ pub struct Member {
     /// makes clients dial a node that drops them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exit_node: bool,
+    /// The exit node this member offers can carry IPv6, i.e. that host has an
+    /// IPv6 default route to masquerade onto. Meaningless unless `exit_node`.
+    ///
+    /// Separate from `exit_node` because an IPv6-only client can only use a
+    /// gateway with this set: its tunnel is IPv6-only too, so a gateway that can
+    /// reach the internet over IPv4 alone would take the traffic and have nowhere
+    /// to send it. Without the flag that failure is a silent black hole, since
+    /// nothing else on the roster says which families a gateway can egress.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exit_node_v6: bool,
     /// This member's data plane is IPv6-only, so its `ip` is assigned but not
     /// routed: another VPN owns `100.64.0.0/10` on that host. A self-claim, same
     /// shape as `exit_node` and carried the same way
@@ -840,6 +850,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         list.add(member.clone()).unwrap();
@@ -862,6 +873,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         list.add(member).unwrap();
@@ -883,6 +895,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         })
         .unwrap();
@@ -896,6 +909,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         });
         assert!(result.is_err());
@@ -915,6 +929,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         })
         .unwrap();
@@ -928,6 +943,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         })
         .unwrap();
@@ -948,6 +964,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         })
         .unwrap();
@@ -970,6 +987,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         })
         .unwrap();
@@ -983,6 +1001,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         })
         .unwrap();
@@ -1022,6 +1041,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                exit_node_v6: false,
                 ipv6_only: false,
             })
             .unwrap();
@@ -1166,6 +1186,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                exit_node_v6: false,
                 ipv6_only: false,
             });
         }
@@ -1188,6 +1209,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         })
         .unwrap();
@@ -1387,6 +1409,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: Some(12345),
                 exit_node: false,
+                exit_node_v6: false,
                 ipv6_only: false,
             })
             .unwrap();
@@ -1430,6 +1453,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                exit_node_v6: false,
                 ipv6_only: false,
             })
             .unwrap();
@@ -1559,6 +1583,47 @@ mod tests {
         let claimed = rmp_serde::to_vec_named(&claiming).unwrap();
         assert!(claimed.len() > plain.len());
         assert!(rmp_serde::from_slice::<Member>(&claimed).unwrap().ipv6_only);
+    }
+
+    /// `Member.exit_node_v6` is additive on the same terms, so an IPv6-capable
+    /// gateway can advertise itself without bumping `MESH_PROTOCOL_VERSION`.
+    ///
+    /// The direction of the default is what makes that safe: a gateway on an
+    /// older build sends no key, decodes as `false`, and an IPv6-only client
+    /// declines to select it. Erring toward "cannot carry IPv6" costs a usable
+    /// gateway; the other way round would be a silent black hole.
+    #[test]
+    fn member_exit_node_v6_is_additive() {
+        #[derive(Serialize)]
+        struct OldMember {
+            identity: EndpointId,
+            ip: Ipv4Addr,
+            is_coordinator: bool,
+            exit_node: bool,
+        }
+        let id = test_id(8);
+        let bytes = rmp_serde::to_vec_named(&OldMember {
+            identity: id,
+            ip: derive_ip(&id),
+            is_coordinator: false,
+            exit_node: true,
+        })
+        .unwrap();
+        let decoded: Member = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(decoded.exit_node);
+        assert!(!decoded.exit_node_v6);
+
+        // Not claiming it emits no key, so an old peer sees the same bytes.
+        let plain = rmp_serde::to_vec_named(&decoded).unwrap();
+        let mut claiming = decoded.clone();
+        claiming.exit_node_v6 = true;
+        let claimed = rmp_serde::to_vec_named(&claiming).unwrap();
+        assert!(claimed.len() > plain.len());
+        assert!(
+            rmp_serde::from_slice::<Member>(&claimed)
+                .unwrap()
+                .exit_node_v6
+        );
     }
 
     // -- reusable keys --------------------------------------------------------
@@ -1761,6 +1826,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         assert!(validate_member(&member).is_ok());
@@ -1781,6 +1847,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         let err = validate_member(&member).unwrap_err().to_string();
@@ -1800,6 +1867,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         assert!(validate_member(&member).is_err());
@@ -1819,6 +1887,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         let gw = Member {
@@ -1831,6 +1900,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         assert!(validate_member(&net).is_err());
@@ -1866,6 +1936,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                exit_node_v6: false,
                 ipv6_only: false,
             };
             assert!(
@@ -1892,6 +1963,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         let blob = GroupBlob {
@@ -1920,6 +1992,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         let blob = GroupBlob {
@@ -1948,6 +2021,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         })
         .unwrap();
@@ -1994,6 +2068,7 @@ mod tests {
             collision_index: 2,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         assert!(validate_member(&good).is_ok());
@@ -2001,6 +2076,7 @@ mod tests {
             collision_index: 1,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ..good.clone()
         }; // ip is for index 2, claims 1
         assert!(validate_member(&bad).is_err());
@@ -2019,6 +2095,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         let dup = derive_ip(&a);
@@ -2048,6 +2125,7 @@ mod tests {
             collision_index: idx_a,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         })
         .unwrap();
@@ -2087,6 +2165,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         let resolved = resolve_ip_tiebreak(vec![mk(hi), mk(lo)]);
@@ -2122,6 +2201,7 @@ mod tests {
             device_cert: None,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         assert!(validate_member(&m).is_err());

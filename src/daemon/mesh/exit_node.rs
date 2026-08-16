@@ -24,6 +24,39 @@ fn display_name(m: &Member) -> String {
         .unwrap_or_else(|| m.identity.fmt_short().to_string())
 }
 
+/// Why this node cannot route through `member`, or `None` when it can. `member`
+/// is `None` when the roster does not list the peer at all.
+///
+/// Two refusals, both about a gateway that would take our traffic and drop it.
+/// The first is the long-standing one: a peer that does not advertise an exit
+/// node has no allow-list entry for us and would refuse every packet. The second
+/// belongs to IPv6-only mode, whose tunnel carries IPv6 alone: a gateway with no
+/// IPv6 uplink has nothing to masquerade onto, so it would black-hole us in
+/// silence. Both are cheaper to say here than to diagnose from a dead tunnel.
+fn gateway_refusal(
+    member: Option<&Member>,
+    name: &str,
+    network: &str,
+    ipv6_only: bool,
+) -> Option<String> {
+    match member {
+        None
+        | Some(Member {
+            exit_node: false, ..
+        }) => Some(format!(
+            "{name} does not advertise an exit node on '{network}' \
+             (see `ray exit-node status`)"
+        )),
+        Some(m) if ipv6_only && !m.exit_node_v6 => Some(format!(
+            "{name} offers an exit node but cannot carry IPv6, and this node's data \
+             plane is IPv6-only, so nothing would reach the internet through it. \
+             Pick a gateway shown as (IPv6) in `ray exit-node status`, or give that \
+             host an IPv6 uplink."
+        )),
+        Some(_) => None,
+    }
+}
+
 impl NetworkRegistry {
     /// A network's roster, or empty if we don't have that network. Keeps the
     /// lookup-then-lock-then-clone dance (and the lock guard) out of the callers.
@@ -98,8 +131,19 @@ impl NetworkRegistry {
     }
 
     /// Select or clear the exit peer this node routes non-mesh traffic through.
-    /// On select, the peer must be in the roster and advertise `exit_node`.
-    pub(crate) async fn exit_node_use(&self, network: &str, peer: Option<String>) -> IpcMessage {
+    /// On select, the peer must be in the roster and advertise `exit_node`, and on
+    /// an IPv6-only node it must advertise `exit_node_v6` as well.
+    ///
+    /// That extra condition is the whole reason the flag exists. An IPv6-only data
+    /// plane tunnels IPv6 and nothing else, so a gateway that reaches the internet
+    /// over IPv4 alone would receive this node's traffic and have no uplink to
+    /// masquerade it onto. Refusing here turns a silent black hole into a sentence.
+    pub(crate) async fn exit_node_use(
+        &self,
+        network: &str,
+        peer: Option<String>,
+        ipv6_only: bool,
+    ) -> IpcMessage {
         let mut app_config = match config::load() {
             Ok(c) => c,
             Err(e) => return ipc_err(format!("failed to load config: {e}")),
@@ -110,12 +154,9 @@ impl NetworkRegistry {
                 let Some(id) = self.resolve_peer_flexible(name).await else {
                     return ipc_err(format!("could not resolve peer: {name}"));
                 };
-                let advertises = self.roster_member(network, id).is_some_and(|m| m.exit_node);
-                if !advertises {
-                    return ipc_err(format!(
-                        "{name} does not advertise an exit node on '{network}' \
-                         (see `ray exit-node status`)"
-                    ));
+                let member = self.roster_member(network, id);
+                if let Some(why) = gateway_refusal(member.as_ref(), name, network, ipv6_only) {
+                    return ipc_err(why);
                 }
                 Some(id.to_string())
             }
@@ -129,9 +170,17 @@ impl NetworkRegistry {
         if let Err(e) = config::save_network(&net) {
             return ipc_err(format!("failed to persist network config: {e}"));
         }
-        let message = match &peer {
-            Some(name) => format!("routing all traffic through {name} on {network}"),
-            None => format!("direct egress restored on {network}"),
+        // "All traffic" is the dual-stack promise, and it would be a lie in
+        // IPv6-only mode: mesh IPv4 carries nothing there, so the tunnel takes
+        // IPv6 and leaves the host's IPv4 egress where it already was. Say which
+        // one this is rather than let the user find out from a leak test.
+        let message = match (&peer, ipv6_only) {
+            (Some(name), false) => format!("routing all traffic through {name} on {network}"),
+            (Some(name), true) => format!(
+                "routing IPv6 traffic through {name} on {network}. IPv4 is not tunnelled \
+                 in IPv6-only mode and still leaves this host directly"
+            ),
+            (None, _) => format!("direct egress restored on {network}"),
         };
         IpcMessage::Ok { message }
     }
@@ -241,8 +290,9 @@ impl NetworkRegistry {
         for name in names {
             if self.exit_offer_out_of_sync(&name) {
                 let offering = self.exit_server.is_offering(&name);
-                tracing::debug!(network = %name, offering, "exit offer out of sync; publishing");
-                self.publish_exit_offer(&name, offering).await;
+                let exit_v6 = offering && self.exit_server.offers_v6();
+                tracing::debug!(network = %name, offering, exit_v6, "exit offer out of sync; publishing");
+                self.publish_exit_offer(&name, offering, exit_v6).await;
             }
         }
     }
@@ -252,6 +302,10 @@ impl NetworkRegistry {
     /// Cheap (two map reads), so it also gates the reconverge worker's backstop
     /// tick, which is the retry that heals a delivery that missed every
     /// coordinator. Always false while the data plane is down.
+    ///
+    /// The IPv6 claim counts as part of the offer: a gateway that gains or loses
+    /// its IPv6 uplink has to republish, or an IPv6-only client keeps selecting it
+    /// (or keeps refusing to) on a fact that stopped being true.
     pub(crate) fn exit_offer_out_of_sync(&self, network: &str) -> bool {
         if !self.exit_sync_enabled.load(Ordering::Relaxed) {
             return false;
@@ -261,8 +315,10 @@ impl NetworkRegistry {
         let advertised = [self_id, user_id]
             .into_iter()
             .find_map(|id| self.roster_member(network, id))
-            .is_some_and(|m| m.exit_node);
-        advertised != self.exit_server.is_offering(network)
+            .map(|m| (m.exit_node, m.exit_node_v6))
+            .unwrap_or((false, false));
+        let offering = self.exit_server.is_offering(network);
+        advertised != (offering, offering && self.exit_server.offers_v6())
     }
 
     /// Report exit-node state per network: this node's own allow list + selection,
@@ -277,17 +333,23 @@ impl NetworkRegistry {
             if network.as_ref().is_some_and(|want| want != &n.name) {
                 continue;
             }
-            let available = self
+            let offers: Vec<Member> = self
                 .roster(&n.name)
-                .iter()
+                .into_iter()
                 .filter(|m| m.exit_node)
+                .collect();
+            let available_v6 = offers
+                .iter()
+                .filter(|m| m.exit_node_v6)
                 .map(display_name)
                 .collect();
             networks.push(ipc::ExitNodeStatusView {
                 network: n.name,
                 allow: n.exit_allow,
                 using: n.exit_node_use,
-                available,
+                available: offers.iter().map(display_name).collect(),
+                available_v6,
+                ipv6_only: self.ipv6_only,
             });
         }
         IpcMessage::ExitNodeState { networks }
@@ -309,16 +371,16 @@ impl NetworkRegistry {
     /// skipped; [`Self::sync_exit_offers`] retries on the backstop / group-poll
     /// cadence, and the reconnect loop re-establishes the link, so a later pass
     /// delivers.
-    async fn publish_exit_offer(&self, network: &str, enabled: bool) {
+    async fn publish_exit_offer(&self, network: &str, enabled: bool, exit_v6: bool) {
         if self
             .deliver_self_flag(
                 network,
-                &ControlMsg::ExitNodeOffer { enabled },
+                &ControlMsg::ExitNodeOffer { enabled, exit_v6 },
                 "exit offer",
             )
             .await
         {
-            self.record_exit_offer(network, self.transport.endpoint.id(), enabled)
+            self.record_exit_offer(network, self.transport.endpoint.id(), enabled, exit_v6)
                 .await;
         }
     }
@@ -399,10 +461,17 @@ impl NetworkRegistry {
     /// entry and republish. `sender` is the offering peer's transport id; it is
     /// normalized to the roster identity (device or paired user) before matching.
     /// No-op if we do not hold the network key or the sender is not a member.
-    pub(crate) async fn record_exit_offer(&self, network: &str, sender: EndpointId, enabled: bool) {
+    pub(crate) async fn record_exit_offer(
+        &self,
+        network: &str,
+        sender: EndpointId,
+        enabled: bool,
+        exit_v6: bool,
+    ) {
         self.record_self_flag(network, sender, "exit offer", |m| {
-            let changed = m.exit_node != enabled;
+            let changed = m.exit_node != enabled || m.exit_node_v6 != exit_v6;
             m.exit_node = enabled;
+            m.exit_node_v6 = exit_v6;
             changed
         })
         .await;
@@ -461,6 +530,59 @@ impl NetworkRegistry {
         );
         if changed {
             self.store_and_publish_group(network).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Member, gateway_refusal};
+    use crate::membership::derive_ip;
+
+    fn gateway(exit_node: bool, exit_node_v6: bool) -> Member {
+        let identity = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        Member {
+            identity,
+            ip: derive_ip(&identity),
+            is_coordinator: false,
+            hostname: Some("gw".to_string()),
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+            last_seen: None,
+            exit_node,
+            exit_node_v6,
+            ipv6_only: false,
+        }
+    }
+
+    /// Which gateways `ray exit-node use` will accept, and why it turns the two
+    /// unusable cases into a sentence instead of a dead tunnel.
+    #[test]
+    fn ipv6_only_needs_a_gateway_that_carries_ipv6() {
+        // Dual-stack: any advertised gateway will do, IPv6 uplink or not. Its
+        // tunnel carries IPv4, which is what a v4-only gateway can egress.
+        assert!(gateway_refusal(Some(&gateway(true, false)), "gw", "net", false).is_none());
+        assert!(gateway_refusal(Some(&gateway(true, true)), "gw", "net", false).is_none());
+
+        // IPv6-only: the tunnel carries IPv6 alone, so a gateway without an IPv6
+        // uplink would receive the traffic and have nowhere to send it.
+        let refusal = gateway_refusal(Some(&gateway(true, false)), "gw", "net", true)
+            .expect("a v4-only gateway is unusable from an IPv6-only node");
+        assert!(refusal.contains("cannot carry IPv6"), "{refusal}");
+        assert!(gateway_refusal(Some(&gateway(true, true)), "gw", "net", true).is_none());
+
+        // No offer at all, and not on the roster, are the same answer in both
+        // modes: there is nothing there to route through.
+        for ipv6_only in [false, true] {
+            for member in [Some(gateway(false, true)), None] {
+                let refusal = gateway_refusal(member.as_ref(), "gw", "net", ipv6_only)
+                    .expect("a peer with no offer is unusable");
+                assert!(
+                    refusal.contains("does not advertise an exit node"),
+                    "{refusal}"
+                );
+            }
         }
     }
 }

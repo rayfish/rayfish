@@ -1131,17 +1131,10 @@ impl Daemon {
                 self.reconcile_exit_node(resp).await
             }
             IpcMessage::ExitNodeUse { network, peer } => {
-                // The client-side full tunnel is IPv4 policy routing through the
-                // exit peer's mesh IPv4, which this node does not have a working
-                // path to in IPv6-only mode. Clearing a selection stays allowed.
-                if peer.is_some() && self.ipv6_only.enabled() {
-                    return ipc_err(
-                        "cannot use an exit node in IPv6-only mode: the full tunnel routes \
-                         over mesh IPv4. Turn the mode off (`ray config set ipv6-only off`) \
-                         and restart the daemon.",
-                    );
-                }
-                let resp = self.registry.exit_node_use(&network, peer).await;
+                let resp = self
+                    .registry
+                    .exit_node_use(&network, peer, self.ipv6_only.enabled())
+                    .await;
                 self.reconcile_exit_node(resp).await
             }
             IpcMessage::ExitNodeStatus { network } => self.registry.exit_node_status(network),
@@ -1930,6 +1923,7 @@ mod absent_member_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         }
     }
@@ -2172,6 +2166,7 @@ mod accept_handler_tests {
                         collision_index: 0,
                         last_seen: None,
                         exit_node: false,
+                        exit_node_v6: false,
                         ipv6_only: false,
                     })
                     .unwrap();
@@ -2191,19 +2186,28 @@ mod accept_handler_tests {
                 },
             );
             assert!(
-                handler.handle_common(sender, &ControlMsg::ExitNodeOffer { enabled: true }),
+                handler.handle_common(
+                    sender,
+                    &ControlMsg::ExitNodeOffer {
+                        enabled: true,
+                        exit_v6: true,
+                    },
+                ),
                 "ExitNodeOffer must be consumed by the role-independent dispatch"
             );
             // The recording runs off the demux loop; wait for it to land.
             let mut recorded = false;
             for _ in 0..100 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
+                // Both halves of the offer: the IPv6 claim rides the same message
+                // and has to reach the signed roster with it, or an IPv6-only
+                // client sees a gateway it will refuse to select.
                 let done = state
                     .read()
                     .unwrap()
                     .members
                     .get(&sender)
-                    .is_some_and(|m| m.exit_node);
+                    .is_some_and(|m| m.exit_node && m.exit_node_v6);
                 if done {
                     recorded = true;
                     break;
@@ -2277,6 +2281,7 @@ mod accept_handler_tests {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    exit_node_v6: false,
                     ipv6_only: false,
                 })
                 .unwrap();
@@ -2348,7 +2353,10 @@ mod accept_handler_tests {
         control::send_msg(
             &mut send,
             Some(net_pubkey),
-            &ControlMsg::ExitNodeOffer { enabled: true },
+            &ControlMsg::ExitNodeOffer {
+                enabled: true,
+                exit_v6: false,
+            },
         )
         .await
         .unwrap();
@@ -2426,6 +2434,7 @@ mod accept_handler_tests {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    exit_node_v6: false,
                     ipv6_only: false,
                 },
                 Member {
@@ -2438,6 +2447,7 @@ mod accept_handler_tests {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    exit_node_v6: false,
                     ipv6_only: false,
                 },
             ]
@@ -2666,6 +2676,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
@@ -2686,6 +2697,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
 
@@ -2748,6 +2760,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         let members = vec![mk(a, true), mk(b, false), mk(c, true)];
@@ -2769,6 +2782,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         };
         // Only members are us (coordinator) and a plain member: nobody to gossip to.

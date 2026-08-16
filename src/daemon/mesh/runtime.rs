@@ -98,6 +98,7 @@ impl NetworkRegistry {
                             collision_index: 0,
                             last_seen: None,
                             exit_node: false,
+                            exit_node_v6: false,
                             ipv6_only: false,
                         });
                     }
@@ -127,6 +128,7 @@ impl NetworkRegistry {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    exit_node_v6: false,
                     ipv6_only: self.ipv6_only,
                 })
                 .expect("self-add cannot collide");
@@ -1109,6 +1111,7 @@ impl Daemon {
         let server = apply_exit_server_os(&self.registry.exit_server, &tun_name).await;
         let served = started.elapsed();
         let client = self.apply_exit_client(&tun_name).await;
+        self.apply_exit_dns();
         let clients = started.elapsed();
         // Advertise what actually survived the reconcile: a failed enable cleared
         // the offers, so this also withdraws a stale advertisement rather than
@@ -1178,6 +1181,23 @@ impl Daemon {
         }
     }
 
+    /// Point the Magic DNS forwarder at upstreams the tunnel can actually reach,
+    /// or put the captured ones back when no tunnel is up.
+    ///
+    /// Only IPv6-only mode needs this: its tunnel carries IPv6 alone, and every
+    /// upstream the desktop capture produces is IPv4, so without an override the
+    /// exit node would carry the traffic while each lookup that steered it went
+    /// out the physical link. See [`exit_node::tunnel_upstreams`].
+    fn apply_exit_dns(&self) {
+        let over = self.registry.exit_client.is_active().then(|| {
+            let configured = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
+            crate::exit_node::tunnel_upstreams(self.ipv6_only.enabled(), &configured)
+        });
+        // `None` from either level means "no override": no tunnel, or a tunnel
+        // whose own family already carries the captured upstreams.
+        self.dns.resolver.set_tunnel_upstreams(over.flatten());
+    }
+
     /// Install or remove the client full-tunnel routing to match the selection.
     /// The kernel plumbing spawns a series of `ip`/`nft` children and waits on
     /// them, so it runs on the blocking pool rather than stalling a runtime
@@ -1185,13 +1205,14 @@ impl Daemon {
     #[cfg(target_os = "linux")]
     async fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
         let install = self.registry.exit_client.is_active();
+        let ipv6_only = self.ipv6_only.enabled();
         let tun_name = tun_name.to_owned();
         let result = tokio::task::spawn_blocking(move || {
             if !install {
                 crate::exit_node::teardown_client_routing();
                 return Ok(());
             }
-            crate::exit_node::install_client_routing(&tun_name).inspect_err(|_| {
+            crate::exit_node::install_client_routing(&tun_name, ipv6_only).inspect_err(|_| {
                 // A partial install must not stay live: rules that went in before
                 // the failure (say v4's, with `ipv6.disable=1` failing the v6 half)
                 // would keep routing traffic into a tunnel that was never fully set
@@ -1357,7 +1378,7 @@ impl Daemon {
     /// around the full tunnel. Resolved via the system resolver, so call this
     /// while DNS is still split (before the tunnel's DNS catch-all goes in).
     #[cfg(target_os = "macos")]
-    async fn relay_underlay_ips(&self) -> Vec<std::net::Ipv4Addr> {
+    async fn relay_underlay_ips(&self) -> Vec<IpAddr> {
         // The configured relay set (custom override + n0 default fallback), the
         // same the endpoint dials. Excluding the whole set (a handful of host
         // routes) covers whichever relay it is actually homed on.
@@ -1372,10 +1393,8 @@ impl Daemon {
             let port = url.port_or_known_default().unwrap_or(443);
             if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
                 for a in addrs {
-                    if let IpAddr::V4(v4) = a.ip()
-                        && !ips.contains(&v4)
-                    {
-                        ips.push(v4);
+                    if !ips.contains(&a.ip()) {
+                        ips.push(a.ip());
                     }
                 }
             }
@@ -1388,7 +1407,7 @@ impl Daemon {
     /// not blackhole traffic.
     #[cfg(target_os = "macos")]
     async fn route_default_or_rollback(&self, tun_name: &str) -> Option<String> {
-        match tun::route_default_via_tun(tun_name).await {
+        match tun::route_default_via_tun(tun_name, self.ipv6_only.enabled()).await {
             Ok(()) => None,
             Err(e) => {
                 tun::unroute_default_via_tun(tun_name).await;
@@ -1519,21 +1538,24 @@ async fn nudge_holepunch(router: &ProtocolRouter, conn: &Connection) -> bool {
     answered
 }
 
-/// The exit peer's own underlay IPv4 addresses, as iroh currently knows them.
+/// The exit peer's own underlay addresses, as iroh currently knows them.
 ///
 /// These are the addresses our QUIC packets to the exit peer are actually sent to,
 /// so they are exactly what must be routed around the full tunnel. Relay paths are
 /// skipped: the relay servers are excluded separately, by name, before DNS moves
 /// into the tunnel.
+///
+/// Both families. Which one a peer is reachable over is not ours to pick, and in
+/// IPv6-only mode the tunnel is IPv6, so an IPv6 path is precisely the one that
+/// would otherwise be swallowed by the tunnel it is carrying.
 #[cfg(target_os = "macos")]
-fn peer_underlay_ips(conn: &Connection) -> Vec<std::net::Ipv4Addr> {
+fn peer_underlay_ips(conn: &Connection) -> Vec<IpAddr> {
     let mut ips = Vec::new();
     for path in conn.paths().iter() {
         if let iroh::TransportAddr::Ip(addr) = path.remote_addr()
-            && let IpAddr::V4(v4) = addr.ip()
-            && !ips.contains(&v4)
+            && !ips.contains(&addr.ip())
         {
-            ips.push(v4);
+            ips.push(addr.ip());
         }
     }
     ips

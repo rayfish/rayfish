@@ -21,7 +21,7 @@
 //! bundled for the data path as [`ExitContext`].
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(target_os = "macos")]
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -201,12 +201,13 @@ fn if_index(name: &str) -> Option<NonZeroU32> {
     NonZeroU32::new(unsafe { libc::if_nametoindex(cname.as_ptr()) })
 }
 
-/// The physical default-route gateway, for host routes that must bypass the full
-/// tunnel.
+/// The physical default-route gateway for one family, for host routes that must
+/// bypass the full tunnel. `None` when that family has no default route, which is
+/// the ordinary state of a Mac with no native IPv6.
 #[cfg(target_os = "macos")]
-fn default_gateway() -> Option<String> {
+fn default_gateway(family: &str) -> Option<String> {
     let out = Command::new("route")
-        .args(["-n", "get", "-inet", "default"])
+        .args(["-n", "get", family, "default"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -222,11 +223,12 @@ fn default_gateway() -> Option<String> {
 /// Host routes installed to keep iroh's own underlay traffic off the full tunnel,
 /// tracked so teardown can remove exactly what it added.
 #[cfg(target_os = "macos")]
-static EXCLUDED_IPS: std::sync::Mutex<Vec<Ipv4Addr>> = std::sync::Mutex::new(Vec::new());
+static EXCLUDED_IPS: std::sync::Mutex<Vec<IpAddr>> = std::sync::Mutex::new(Vec::new());
 
 /// Route each underlay IP straight out the physical gateway so iroh's own traffic
-/// is not swallowed by the full tunnel it is carrying. A `/32` host route beats the
-/// `0/1`+`128/1` split default, so it bypasses the TUN. Idempotent.
+/// is not swallowed by the full tunnel it is carrying. A `/32` or `/128` host route
+/// beats the `0/1`+`128/1` (or `::/1`+`8000::/1`) split default, so it bypasses the
+/// TUN. Idempotent.
 ///
 /// This, not the socket pin, is what actually keeps the transport alive. The pin
 /// only takes effect when iroh rebinds its sockets, and `Endpoint::network_change`
@@ -236,26 +238,33 @@ static EXCLUDED_IPS: std::sync::Mutex<Vec<Ipv4Addr>> = std::sync::Mutex::new(Vec
 /// goes into the tunnel and disappears.
 ///
 /// Applies to the relay servers (resolved while DNS is still split) and to the exit
-/// peer's own direct addresses. IPv6 underlay addresses are not excluded yet, so a
-/// peer reachable only over IPv6 still falls back to the relay.
+/// peer's own direct addresses. Both families: an IPv6-only node's tunnel is IPv6,
+/// so IPv6 underlay paths are exactly the ones it would otherwise swallow, and the
+/// address a peer is reachable at is not something we get to choose.
+///
+/// Per family, and best-effort per address: a host with no default route in one
+/// family simply has nothing to route around, and the addresses in the other
+/// family still get their exclusion.
 #[cfg(target_os = "macos")]
-pub fn exclude_from_tunnel(ips: &[Ipv4Addr]) {
-    let Some(gw) = default_gateway() else {
-        tracing::warn!("no default gateway; cannot keep iroh's traffic off the exit tunnel");
-        return;
-    };
+pub fn exclude_from_tunnel(ips: &[IpAddr]) {
     let mut excluded = EXCLUDED_IPS.lock().unwrap();
     let mut added = 0;
+    let mut gateways: HashMap<&str, Option<String>> = HashMap::new();
     for ip in ips {
         if excluded.contains(ip) {
             continue;
         }
+        let family = if ip.is_ipv6() { "-inet6" } else { "-inet" };
+        let gw = gateways
+            .entry(family)
+            .or_insert_with(|| default_gateway(family));
+        let Some(gw) = gw.as_deref() else { continue };
         let s = ip.to_string();
         let _ = Command::new("route")
-            .args(["-n", "delete", "-host", &s])
+            .args(["-n", "delete", family, "-host", &s])
             .status();
         let ok = Command::new("route")
-            .args(["-n", "add", "-host", &s, &gw])
+            .args(["-n", "add", family, "-host", &s, gw])
             .status()
             .map(|st| st.success())
             .unwrap_or(false);
@@ -265,7 +274,11 @@ pub fn exclude_from_tunnel(ips: &[Ipv4Addr]) {
         }
     }
     if added > 0 {
-        tracing::debug!(added, total = excluded.len(), %gw, "excluded IPs from the exit tunnel");
+        tracing::debug!(
+            added,
+            total = excluded.len(),
+            "excluded IPs from the exit tunnel"
+        );
     }
 }
 
@@ -274,8 +287,9 @@ pub fn exclude_from_tunnel(ips: &[Ipv4Addr]) {
 pub fn remove_tunnel_exclusions() {
     let mut excluded = EXCLUDED_IPS.lock().unwrap();
     for ip in excluded.drain(..) {
+        let family = if ip.is_ipv6() { "-inet6" } else { "-inet" };
         let _ = Command::new("route")
-            .args(["-n", "delete", "-host", &ip.to_string()])
+            .args(["-n", "delete", family, "-host", &ip.to_string()])
             .status();
     }
 }
@@ -292,6 +306,11 @@ pub struct ExitServer {
     /// one of them would be local-delivered by the kernel, reaching this host's
     /// services without ever passing its rayfish inbound firewall.
     self_addrs: Arc<ArcSwap<HashSet<IpAddr>>>,
+    /// Whether this host can actually egress IPv6, refreshed on every reconcile
+    /// alongside `self_addrs`. Advertised as `Member.exit_node_v6` so an
+    /// IPv6-only client can tell a gateway it can use from one that would take
+    /// its traffic and have nowhere to send it.
+    v6_uplink: Arc<AtomicBool>,
 }
 
 /// Who may route out through us on one network.
@@ -342,6 +361,13 @@ impl ExitServer {
         self.nets.load().contains_key(network)
     }
 
+    /// Whether an exit node we offer can carry IPv6. Read at the same moment as
+    /// [`is_offering`](Self::is_offering) when publishing the roster claim, so the
+    /// two never disagree about what this host does.
+    pub fn offers_v6(&self) -> bool {
+        self.v6_uplink.load(Ordering::Relaxed)
+    }
+
     /// Rebuild the policy from `(network name, allow-list)` pairs. An allow entry
     /// is `"*"` (any member) or a user-identity hex; unparseable entries are
     /// skipped. Networks with an empty list are omitted, so `is_active` reflects
@@ -385,6 +411,9 @@ impl ExitServer {
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         if self.is_active() {
             self.set_self_addrs(host_addresses());
+            // Re-read rather than cache: an uplink gains or loses IPv6 with a
+            // lease or a link change, and the claim we publish has to follow.
+            self.v6_uplink.store(has_v6_uplink(), Ordering::Relaxed);
             if let Err(e) = enable(tun_name) {
                 disable();
                 self.clear();
@@ -393,6 +422,7 @@ impl ExitServer {
             }
         } else {
             disable();
+            self.v6_uplink.store(false, Ordering::Relaxed);
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
         let _ = tun_name;
@@ -454,6 +484,21 @@ fn parse_host_addresses(out: &str) -> HashSet<IpAddr> {
         }
     }
     addrs
+}
+
+/// Whether this host has an IPv6 default route, i.e. an exit node it offers can
+/// masquerade IPv6 onto something. A gateway without one is still a perfectly good
+/// IPv4 exit node, which is why this is advertised rather than refused.
+#[cfg(target_os = "linux")]
+fn has_v6_uplink() -> bool {
+    ip_output(&["-6", "route", "show", "default"]).is_some_and(|out| !out.trim().is_empty())
+}
+
+/// The BSD counterpart, over the same `route -n get` the NAT rules already use to
+/// find the interface to masquerade onto.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn has_v6_uplink() -> bool {
+    default_interface("-inet6").is_some()
 }
 
 pub fn is_transitable(dst: IpAddr) -> bool {
@@ -550,6 +595,50 @@ impl ExitClient {
     pub fn set(&self, selection: Option<ExitSelection>) {
         self.inner.store(selection.map(Arc::new));
     }
+}
+
+/// The IPv6 resolvers a full tunnel forwards DNS to when the operator has named
+/// none of their own: the v6 addresses of the same pair the control plane falls
+/// back to (`transport::PUBLIC_FALLBACK_DNS`).
+const PUBLIC_FALLBACK_DNS_V6: [Ipv6Addr; 2] = [
+    Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
+    Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+];
+
+/// The upstreams a client full tunnel should forward DNS to, or `None` when it
+/// needs no override.
+///
+/// Only IPv6-only mode needs one. Its tunnel carries IPv6 alone, while every
+/// upstream the desktop capture can produce is IPv4
+/// (`DnsConfigurator::captured_upstreams`), so left alone the daemon would forward
+/// each lookup out the physical link: the exit node would carry the traffic and
+/// see none of the names that chose it. A dual-stack tunnel has no such gap, since
+/// it carries the captured upstreams' own family.
+///
+/// The operator's `dns_upstreams` come first when any of them are IPv6 (the same
+/// list [`crate::config::resolve_upstreams`] reads for IPv4, from the other end),
+/// and `replace` suppresses the public fallback exactly as it does there.
+pub fn tunnel_upstreams(
+    ipv6_only: bool,
+    configured: &crate::config::ServerOverride,
+) -> Option<Vec<SocketAddr>> {
+    if !ipv6_only {
+        return None;
+    }
+    let mut servers: Vec<Ipv6Addr> = configured
+        .servers
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    if !configured.replace || servers.is_empty() {
+        servers.extend(PUBLIC_FALLBACK_DNS_V6);
+    }
+    Some(
+        servers
+            .into_iter()
+            .map(|ip| SocketAddr::from((ip, 53u16)))
+            .collect(),
+    )
 }
 
 /// This node's exit-node state as the inbound data path needs it: the gateway allow
@@ -868,8 +957,22 @@ fn client_nft_script(tun_name: &str) -> String {
     )
 }
 
+/// The `ip` family flags a client full tunnel is installed for.
+///
+/// An IPv6-only data plane carries no mesh IPv4 at all, so its tunnel does not
+/// claim IPv4 either: the host's IPv4 egress stays exactly where it was, with the
+/// VPN that owns `100.64.0.0/10` or with the physical uplink. Taking it would mean
+/// sourcing transit from a `/32` this mode deliberately leaves unrouted, and
+/// pulling IPv4 out from under the very VPN the mode exists to share a host with.
+/// Teardown is not symmetric with this: it always sweeps both families, so a
+/// daemon restarted into the other mode still cleans up what the last one left.
 #[cfg(target_os = "linux")]
-pub fn install_client_routing(tun_name: &str) -> Result<()> {
+fn tunnel_families(ipv6_only: bool) -> &'static [&'static str] {
+    if ipv6_only { &["-6"] } else { &["-4", "-6"] }
+}
+
+#[cfg(target_os = "linux")]
+pub fn install_client_routing(tun_name: &str, ipv6_only: bool) -> Result<()> {
     // The conntrack-mark table loads first: nothing routes into the tunnel until
     // the `ip rule`s below go in, but the moment they do, an inbound connection's
     // replies depend on this table already restoring the mark. Loading it after
@@ -878,7 +981,10 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
     // cut.
     nft_load(&client_nft_script(tun_name))?;
     let mark = format!("{SOCKET_MARK:#x}");
-    for family in ["-4", "-6"] {
+    for family in tunnel_families(ipv6_only).iter().copied() {
+        // Give the tunnel table the prefixes another VPN serves out of a table of
+        // its own, or our catch-all rule swallows them (see the fn docs).
+        mirror_foreign_routes(family, tun_name);
         run_ip(&[
             family, "route", "replace", "default", "dev", tun_name, "table", EXIT_TABLE,
         ])?;
@@ -1041,6 +1147,174 @@ fn remove_client_rules(family: &str) {
         "pref",
         PREF_TUNNEL,
     ]);
+}
+
+/// One route, as [`parse_foreign_routes`] reads it back off `ip route show`.
+/// `spec` is the route minus its destination and its `table` clause, in the order
+/// `ip` printed it, so re-emitting it is a matter of appending our own table.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct MirroredRoute {
+    dest: String,
+    spec: Vec<String>,
+}
+
+/// Copy into the tunnel table every prefix another VPN serves out of a routing
+/// table of its own, so that VPN keeps working while our full tunnel is up.
+///
+/// [`PREF_TUNNEL`] is a catch-all, and it sits far above the preferences a peer
+/// VPN uses (Tailscale's are 5210-5270), so once it is in, that VPN's own rules are
+/// never reached. [`PREF_MAIN`] does not save them: `suppress_prefixlength 0` only
+/// rescues routes in `main`, and a policy-routing VPN keeps its prefixes in a
+/// private table (Tailscale's `100.64.0.0/10` and `fd7a:115c:a1e0::/48` live in
+/// table 52). The result would be the co-resident VPN black-holed the moment we
+/// route anything, which is precisely what IPv6-only mode exists to avoid.
+///
+/// Mirroring is one-directional: we only ever write our own table, never a foreign
+/// rule or a foreign table, and the teardown flush drops the copies with the
+/// default. Inside the table longest-prefix decides, so a mirrored `/48` beats our
+/// own `default` without either needing to know about the other, and insertion
+/// order is irrelevant.
+///
+/// Reconciled rather than merely added to: a prefix the other VPN has since
+/// dropped is deleted here, so a re-apply cannot leave traffic pointed at a tunnel
+/// that no longer claims it. Our own default is never touched, so there is no
+/// moment where the table is empty and traffic leaks past the tunnel.
+///
+/// Best-effort throughout: this is an accommodation for someone else's routing, and
+/// failing to read or write one route must not fail the install.
+#[cfg(target_os = "linux")]
+fn mirror_foreign_routes(family: &str, tun_name: &str) {
+    let wanted = match ip_output(&[family, "route", "show", "table", "all"]) {
+        Some(out) => parse_foreign_routes(&out, tun_name),
+        None => return,
+    };
+    // Drop copies whose source route is gone. Read from our own table, where the
+    // only other entry is the default we install below and never mirror.
+    if let Some(out) = ip_output(&[family, "route", "show", "table", EXIT_TABLE]) {
+        for stale in parse_table_routes(&out)
+            .into_iter()
+            .filter(|r| r.dest != "default" && !wanted.iter().any(|w| w.dest == r.dest))
+        {
+            let _ = run_ip(&[family, "route", "del", &stale.dest, "table", EXIT_TABLE]);
+        }
+    }
+    let mut mirrored = 0;
+    for route in &wanted {
+        let mut args = vec![family, "route", "replace", &route.dest];
+        args.extend(route.spec.iter().map(String::as_str));
+        args.extend(["table", EXIT_TABLE]);
+        match run_ip(&args) {
+            Ok(()) => mirrored += 1,
+            Err(e) => tracing::debug!(
+                dest = %route.dest,
+                error = %e,
+                "could not mirror a foreign route into the tunnel table"
+            ),
+        }
+    }
+    if mirrored > 0 {
+        tracing::debug!(
+            family,
+            mirrored,
+            "mirrored another VPN's routes into the tunnel table"
+        );
+    }
+}
+
+/// The routes in `ip <family> route show table all` that belong to somebody else's
+/// policy-routing table, so [`mirror_foreign_routes`] can copy them.
+///
+/// Kept only when all of these hold, which between them is the definition of "a
+/// route our catch-all rule would otherwise steal":
+///
+/// - it names a `table` that is not `main`, `local`, `default`, or our own. `main`
+///   is already rescued by [`PREF_MAIN`], and the kernel's `local` table is
+///   reached ahead of every rule we install.
+/// - its destination is a real prefix. A foreign `default` is another full tunnel,
+///   and mirroring it would hand our egress straight back rather than tunnel it.
+/// - it does not leave by our own TUN, which would be a copy of the route we are
+///   installing anyway.
+///
+/// Only `via`, `dev` and `metric` are carried over. `ip route show` prints plenty
+/// besides (`proto`, `scope`, `src`, `pref`, `expires`, and bare flags like
+/// `onlink`), some of which take a value and some of which do not; rather than
+/// guess each one's arity we re-emit the three clauses that decide where a packet
+/// goes and let the kernel derive the rest. A copy in our own table has no need to
+/// resemble the original in anything else.
+#[cfg(target_os = "linux")]
+fn parse_foreign_routes(show: &str, tun_name: &str) -> Vec<MirroredRoute> {
+    show.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let dest = *fields.first()?;
+            // A default is another full tunnel: mirroring it would hand our egress
+            // straight back. A non-unicast type (`local`, `broadcast`,
+            // `unreachable`, `blackhole`, ...) leads with the type instead of a
+            // destination, so anything that is not an address is not ours to copy.
+            if dest == "default"
+                || dest
+                    .split('/')
+                    .next()
+                    .is_none_or(|a| a.parse::<IpAddr>().is_err())
+            {
+                return None;
+            }
+            let value_after = |key: &str| {
+                fields
+                    .iter()
+                    .position(|f| *f == key)
+                    .and_then(|i| fields.get(i + 1))
+                    .copied()
+            };
+            let table = value_after("table")?;
+            if matches!(table, "main" | "local" | "default") || table == EXIT_TABLE {
+                return None;
+            }
+            let dev = value_after("dev")?;
+            if dev == tun_name {
+                return None;
+            }
+            let mut spec: Vec<String> = Vec::new();
+            if let Some(via) = value_after("via") {
+                spec.extend(["via".to_string(), via.to_string()]);
+            }
+            spec.extend(["dev".to_string(), dev.to_string()]);
+            if let Some(metric) = value_after("metric") {
+                spec.extend(["metric".to_string(), metric.to_string()]);
+            }
+            Some(MirroredRoute {
+                dest: dest.to_string(),
+                spec,
+            })
+        })
+        .collect()
+}
+
+/// The destinations currently in one table, for the stale-copy sweep in
+/// [`mirror_foreign_routes`]. Only `dest` is used; `spec` comes along because the
+/// two parses share a shape.
+#[cfg(target_os = "linux")]
+fn parse_table_routes(show: &str) -> Vec<MirroredRoute> {
+    show.lines()
+        .filter_map(|line| {
+            let dest = line.split_whitespace().next()?;
+            Some(MirroredRoute {
+                dest: dest.to_string(),
+                spec: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+/// `ip <args>` stdout, or `None` when it could not be run or failed. The read-only
+/// counterpart to [`run_ip`], which reports the failure instead.
+#[cfg(target_os = "linux")]
+fn ip_output(args: &[&str]) -> Option<String> {
+    let out = Command::new("ip").args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// nft script fragment that removes `table`, whether or not it exists: `delete
@@ -1608,5 +1882,131 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         s.reload([("n", strs(&["*"]).as_slice())]);
         s.clear();
         assert!(!s.is_active());
+    }
+
+    /// An IPv6-only node tunnels IPv6 and leaves the host's IPv4 egress alone,
+    /// because mesh IPv4 carries nothing there and the `100.64.0.0/10` range is
+    /// another VPN's. A dual-stack node still takes both.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipv6_only_tunnels_one_family() {
+        assert_eq!(tunnel_families(true), ["-6"]);
+        assert_eq!(tunnel_families(false), ["-4", "-6"]);
+    }
+
+    /// What gets copied into the tunnel table so a co-resident VPN survives our
+    /// catch-all rule, and what deliberately does not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreign_routes_are_mirrored_but_defaults_and_our_own_are_not() {
+        let show = "\
+fd7a:115c:a1e0::/48 dev tailscale0 table 52 metric 1024 pref medium
+2001:db8:1::/64 via fe80::1 dev eth0 table 52 metric 100 pref medium
+default via fe80::ff dev tailscale0 table 52 metric 1024 pref medium
+200::/7 dev ray0 table 52 metric 1024 pref medium
+2001:db8:9::/64 dev eth0 proto kernel metric 256 pref medium
+::1 dev lo table local proto kernel metric 0 pref medium
+local 2001:db8:9::5 dev eth0 table local proto kernel metric 0 pref medium
+unreachable fd00::/8 dev lo table 52 metric 1024 pref medium
+";
+        let got = parse_foreign_routes(show, "ray0");
+
+        // A foreign table's real prefixes, carried over with just what decides
+        // where a packet goes.
+        assert_eq!(
+            got,
+            vec![
+                MirroredRoute {
+                    dest: "fd7a:115c:a1e0::/48".into(),
+                    spec: strs(&["dev", "tailscale0", "metric", "1024"]),
+                },
+                MirroredRoute {
+                    dest: "2001:db8:1::/64".into(),
+                    spec: strs(&["via", "fe80::1", "dev", "eth0", "metric", "100"]),
+                },
+            ]
+        );
+        // And what is left out: a foreign `default` (mirroring another full
+        // tunnel would hand our egress straight back), our own TUN's route, a
+        // route with no `table` of its own (that is `main`, already rescued by
+        // PREF_MAIN), the kernel's `local` table, and non-unicast route types
+        // that lead with a type instead of a destination.
+        for absent in [
+            "default",
+            "200::/7",
+            "2001:db8:9::/64",
+            "::1",
+            "fd00::/8",
+            "2001:db8:9::5",
+        ] {
+            assert!(
+                !got.iter().any(|r| r.dest == absent),
+                "{absent} should not be mirrored"
+            );
+        }
+    }
+
+    /// The IPv4 side, where the range that matters is the one IPv6-only mode
+    /// hands over in the first place.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreign_cgnat_route_is_mirrored() {
+        let show = "100.64.0.0/10 dev tailscale0 table 52 \n";
+        assert_eq!(
+            parse_foreign_routes(show, "ray0"),
+            vec![MirroredRoute {
+                dest: "100.64.0.0/10".into(),
+                spec: strs(&["dev", "tailscale0"]),
+            }]
+        );
+    }
+
+    /// Only an IPv6-only tunnel needs its own DNS upstreams: a dual-stack one
+    /// already carries the family the captured IPv4 upstreams live in.
+    #[test]
+    fn only_an_ipv6_only_tunnel_overrides_dns_upstreams() {
+        use crate::config::ServerOverride;
+
+        assert!(tunnel_upstreams(false, &ServerOverride::default()).is_none());
+
+        // Nothing configured: the public fallback pair, on port 53.
+        let got = tunnel_upstreams(true, &ServerOverride::default()).unwrap();
+        assert_eq!(
+            got,
+            PUBLIC_FALLBACK_DNS_V6
+                .map(|ip| SocketAddr::from((ip, 53)))
+                .to_vec()
+        );
+
+        // The operator's own IPv6 entries come first; their IPv4 ones are not
+        // reachable through this tunnel and are left to `resolve_upstreams`.
+        let augment = ServerOverride {
+            servers: strs(&["2001:4860:4860::8844", "192.168.1.1"]),
+            replace: false,
+        };
+        let got = tunnel_upstreams(true, &augment).unwrap();
+        assert_eq!(got[0], "[2001:4860:4860::8844]:53".parse().unwrap());
+        assert_eq!(got.len(), 1 + PUBLIC_FALLBACK_DNS_V6.len());
+
+        // `replace` suppresses the fallback, exactly as it does for IPv4.
+        let replace = ServerOverride {
+            servers: strs(&["2001:4860:4860::8844"]),
+            replace: true,
+        };
+        assert_eq!(
+            tunnel_upstreams(true, &replace).unwrap(),
+            vec!["[2001:4860:4860::8844]:53".parse::<SocketAddr>().unwrap()]
+        );
+
+        // `replace` with no IPv6 entry at all would leave the forwarder with
+        // nowhere to send anything, so the fallback goes back in.
+        let v4_only = ServerOverride {
+            servers: strs(&["192.168.1.1"]),
+            replace: true,
+        };
+        assert_eq!(
+            tunnel_upstreams(true, &v4_only).unwrap().len(),
+            PUBLIC_FALLBACK_DNS_V6.len()
+        );
     }
 }

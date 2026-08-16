@@ -761,6 +761,7 @@ mod self_nullified_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_node_v6: false,
             ipv6_only: false,
         }
     }

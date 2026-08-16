@@ -486,9 +486,18 @@ const SPLIT_DEFAULT: [(&str, &str); 4] = [
 /// across re-applies. The caller is responsible for loop prevention *before*
 /// this goes in: from here on, everything the routing table decides, including
 /// the daemon's own transport unless it is pinned elsewhere, goes to the TUN.
+///
+/// In IPv6-only mode only the `::/1` + `8000::/1` half goes in: mesh IPv4 carries
+/// no traffic on such a host, so the tunnel does not claim the host's IPv4 egress
+/// either, leaving it with whoever owns `100.64.0.0/10` there. Unlike Linux, no
+/// hole has to be punched for that VPN's own prefixes: the split default lives in
+/// the one routing table, where its more specific routes already win.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub async fn route_default_via_tun(tun_name: &str) -> Result<()> {
-    for (family, net) in SPLIT_DEFAULT {
+pub async fn route_default_via_tun(tun_name: &str, ipv6_only: bool) -> Result<()> {
+    for (family, net) in SPLIT_DEFAULT
+        .into_iter()
+        .filter(|(family, _)| !ipv6_only || *family == "-inet6")
+    {
         let _ = Command::new("route")
             .args(["-n", "delete", family, "-net", net, "-interface", tun_name])
             .status();
@@ -506,6 +515,9 @@ pub async fn route_default_via_tun(tun_name: &str) -> Result<()> {
 
 /// Removes the full-tunnel half-space routes. Best-effort and idempotent: routes
 /// that are already gone (never installed, or dropped with the utun) are fine.
+///
+/// Always both families, whatever mode installed them, so a daemon restarted into
+/// the other one still clears what the last left behind.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub async fn unroute_default_via_tun(tun_name: &str) {
     for (family, net) in SPLIT_DEFAULT {

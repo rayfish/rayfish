@@ -267,6 +267,13 @@ pub fn discovery_urls(o: &ServerOverride) -> Result<Vec<String>> {
 /// Merge configured DNS upstreams with the system-captured ones. `replace`
 /// drops the captured set; otherwise custom upstreams are tried first, then the
 /// captured ones. Unset returns the captured set unchanged.
+///
+/// IPv4 only, and deliberately so: the captured set this merges with comes from
+/// the OS DNS backends, every one of which reads an IPv4 nameserver. A configured
+/// IPv6 entry is not dropped so much as handled elsewhere, by
+/// [`crate::exit_node::tunnel_upstreams`], which is the one caller that has a
+/// path to reach it (an IPv6-only full tunnel, where the IPv4 ones are the
+/// unreachable half).
 pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<Ipv4Addr> {
     if o.servers.is_empty() {
         return captured;

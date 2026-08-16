@@ -59,6 +59,7 @@ pub(crate) fn persisted_roster(network_name: &str) -> Vec<Member> {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    exit_node_v6: false,
                     ipv6_only: false,
                 })
                 .collect()

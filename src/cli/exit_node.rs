@@ -100,6 +100,8 @@ fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>) {
                 "allow": n.allow,
                 "using": n.using,
                 "available": n.available,
+                "available_v6": n.available_v6,
+                "ipv6_only": n.ipv6_only,
             })).collect::<Vec<_>>(),
         }));
         return;
@@ -124,14 +126,27 @@ fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>) {
                 .collect();
             println!("  offering: yes (allow: {})", peers.join(", "));
         }
-        match &n.using {
-            Some(peer) => println!("  using: {peer}"),
-            None => println!("  using: direct egress"),
+        match (&n.using, n.ipv6_only) {
+            // In IPv6-only mode the tunnel carries IPv6 and nothing else, so say
+            // so: a bare "using: <peer>" reads as a full tunnel over both.
+            (Some(peer), true) => println!("  using: {peer} (IPv6 only; IPv4 leaves directly)"),
+            (Some(peer), false) => println!("  using: {peer}"),
+            (None, _) => println!("  using: direct egress"),
         }
         if n.available.is_empty() {
             println!("  available: (none advertised)");
         } else {
-            println!("  available: {}", n.available.join(", "));
+            // Mark which gateways can carry IPv6, since on an IPv6-only node they
+            // are the only ones `ray exit-node use` will accept.
+            let listed: Vec<String> = n
+                .available
+                .iter()
+                .map(|peer| match n.available_v6.contains(peer) {
+                    true => format!("{peer} (IPv6)"),
+                    false => peer.clone(),
+                })
+                .collect();
+            println!("  available: {}", listed.join(", "));
         }
     }
 }

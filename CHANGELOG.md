@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Exit nodes work in IPv6-only mode.** `ray exit-node use` was refused on a
+  host sharing the box with another VPN, which is where the feature is most
+  useful. It now works, tunnelling IPv6: mesh IPv4 carries no traffic in that
+  mode, so your IPv4 internet traffic keeps leaving directly, and both
+  `ray exit-node use` and `ray exit-node status` say so rather than leaving you
+  to find out. The gateway needs an IPv6 uplink of its own; ones that have it
+  are marked `(IPv6)` in `ray exit-node status`, and picking one that doesn't is
+  refused with the reason instead of timing out. While the tunnel is up,
+  non-`.ray` DNS is forwarded to an IPv6 resolver so lookups go through the exit
+  rather than around it. Offering an exit node was never affected by the mode.
+- **`ray config set dns-upstreams` takes IPv6 addresses.** Used by an exit-node
+  tunnel in IPv6-only mode, which has no IPv4 to reach a v4 resolver over.
+
 ### Changed
 
 - **The mobile app stops waking the radio every minute.** Every node used to
@@ -18,6 +33,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and server nodes keep the 60-second poll.
 
 ### Fixed
+
+- **Using an exit node no longer cuts off another VPN on the same host.** The
+  full tunnel's routing rule sits above the ones Tailscale (and anything else
+  doing policy routing) installs, and their routes live in a table of their own
+  rather than the main one, so turning our tunnel on black-holed them entirely.
+  Their routes are now copied into the tunnel's own table first, so the more
+  specific ones still win and that VPN keeps working.
 
 - **The metrics endpoint no longer answers the local network.** The Prometheus
   exporter bound `0.0.0.0:9090`, so any device on the same Wi-Fi could read
