@@ -27,7 +27,7 @@ fn display_name(m: &Member) -> String {
 impl NetworkRegistry {
     /// A network's roster, or empty if we don't have that network. Keeps the
     /// lookup-then-lock-then-clone dance (and the lock guard) out of the callers.
-    fn roster(&self, network: &str) -> Vec<Member> {
+    pub(crate) fn roster(&self, network: &str) -> Vec<Member> {
         match self.networks.get(network) {
             // Cloned out (`NetworkState::roster`): callers must be free to work
             // (and to await) without holding the state lock.

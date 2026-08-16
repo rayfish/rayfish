@@ -250,7 +250,7 @@ impl CoordinatorAcceptState {
 
         // Hand this (re)connecting member our current signed record over the mesh
         // so it converges to the live roster in ~1s instead of waiting out a stale
-        // DHT lookup plus the 60s group poll. Only a coordinator holds the network
+        // DHT lookup plus the group poll. Only a coordinator holds the network
         // key, so only we can originate it; the member verifies the record against
         // the network key before applying (see `MemberAcceptState::handle_frame`).
         if let Some(record) = self.ctx.registry.current_signed_record(&self.network_name) {
@@ -341,8 +341,13 @@ impl CoordinatorAcceptState {
         if changed {
             tracing::info!(peer = %remote_id.fmt_short(), network = %self.network_name, hostname = %final_hostname, "peer hostname changed; republishing blob + broadcasting MemberSync");
             update_snapshot_and_publish(&self.state, &self.ctx.blob_store, &self.dht_notify).await;
-            broadcast_member_sync(&self.ctx.peers, self.net_pubkey(), &self.network_name, None)
-                .await;
+            broadcast_member_sync(
+                &self.ctx.registry,
+                self.net_pubkey(),
+                &self.network_name,
+                None,
+            )
+            .await;
         }
         Some(peer_ip)
     }
@@ -619,7 +624,7 @@ impl CoordinatorAcceptState {
             .register_peer_conn(conn, remote_id, peer_ip, &self.network_name);
 
         broadcast_member_sync(
-            &self.ctx.peers,
+            &self.ctx.registry,
             net_pubkey,
             &self.network_name,
             Some(peer_ip),
@@ -1037,7 +1042,7 @@ impl MemberAcceptState {
         self.ctx
             .register_peer_conn(conn, peer_identity, member_ip, &self.network_name);
         broadcast_member_sync(
-            &self.ctx.peers,
+            &self.ctx.registry,
             self.net_pubkey,
             &self.network_name,
             Some(member_ip),

@@ -435,7 +435,7 @@ impl NetworkRegistry {
     /// drops the target mesh-wide (`prune_departed_peers`); the coordinator also
     /// closes its own link to the target immediately. Refused on open networks
     /// (the target would auto-re-join) and against coordinators / self.
-    pub(crate) async fn kick_member(&self, network: &str, peer: &str) -> IpcMessage {
+    pub(crate) async fn kick_member(self: &Arc<Self>, network: &str, peer: &str) -> IpcMessage {
         let (state, dht_notify, has_key, mode) = match self.networks.get(network) {
             Some(h) => {
                 let (has_key, mode) = {
@@ -517,7 +517,7 @@ impl NetworkRegistry {
         .await;
         update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
         let net_pubkey = state.read().unwrap().network_public_key;
-        broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
+        broadcast_member_sync(self, net_pubkey, network, None).await;
 
         // Sever our own link(s) to the target now, rather than waiting for it to
         // time out. Other members drop it when they reconverge from the freshly
@@ -976,6 +976,12 @@ impl Daemon {
                 message: format!("already up{restart_note}"),
             };
         }
+
+        // Re-resolve every network's signed record now. A battery-powered node
+        // polls on a long interval, so a device coming up after a spell on
+        // standby would otherwise route from whatever the roster looked like
+        // when it went down.
+        self.registry.poll_nudge.notify_waiters();
 
         // Non-fatal problems hit while activating. The daemon stays up, but we
         // return these to the client so `ray up` can tell the user something is

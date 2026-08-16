@@ -195,7 +195,7 @@ impl MeshConnection {
             // chatter (pings, roster-sync/blob-update triggers) hold a connection open
             // forever, defeating on-demand teardown. A control exchange racing the idle
             // close is safe: frames are atomic and control is only ever a trigger, so a
-            // dropped push re-forms on the next lazy dial or the 60s poll reconverge.
+            // dropped push re-forms on the next lazy dial or the group poll reconverge.
             match self.gate.check() {
                 crate::ratelimit::Verdict::Allow => {}
                 crate::ratelimit::Verdict::Drop => continue,

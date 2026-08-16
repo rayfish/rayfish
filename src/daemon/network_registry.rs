@@ -126,6 +126,18 @@ pub(crate) struct NetworkRegistry {
     /// saved but not live: their traffic is proof the network is reachable
     /// again, so recovery shouldn't wait out the tick.
     pub(crate) restore_nudge: Arc<Notify>,
+    /// Nudges every network's group poller to resolve now instead of at its next
+    /// tick. Fired when the data plane comes up and when the host reports a
+    /// network change: a battery-powered node polls on a long interval, so
+    /// without this a phone whose VPN was just switched on could work from a
+    /// roster up to that interval stale.
+    ///
+    /// `notify_waiters` (not `notify_one`): there is a poller per network and
+    /// they all want it. That also makes it a hint rather than a guarantee, since
+    /// a poller already mid-resolve is not parked on it and misses the wakeup.
+    /// The cost of a missed nudge is one tick of staleness, which is what the
+    /// poll was for anyway.
+    pub(crate) poll_nudge: Arc<Notify>,
 }
 
 /// One saved network the restore supervisor found missing from the live map,
@@ -209,6 +221,7 @@ impl NetworkRegistry {
             ipv6_only,
             restoring: Arc::new(DashSet::new()),
             restore_nudge: Arc::new(Notify::new()),
+            poll_nudge: Arc::new(Notify::new()),
         }
     }
 
@@ -1025,7 +1038,7 @@ impl NetworkRegistry {
     /// honored mesh wide again. Non-coordinated networks clear on their own
     /// coordinator's next reseal. Best-effort; a persist/publish failure is
     /// logged, not surfaced.
-    pub(crate) async fn reauth_device(&self, device: EndpointId) {
+    pub(crate) async fn reauth_device(self: &Arc<Self>, device: EndpointId) {
         // Drop from the durable nullifier seed so a later reseal won't re-add it.
         let mut cfg = config::load().unwrap_or_default();
         let hex = device.to_string();
@@ -1063,7 +1076,7 @@ impl NetworkRegistry {
                 changed = true;
                 update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
                 let net_pubkey = state.read().unwrap().network_public_key;
-                broadcast_member_sync(&self.peers, net_pubkey, &net, None).await;
+                broadcast_member_sync(self, net_pubkey, &net, None).await;
             }
         }
         if changed {

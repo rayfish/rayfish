@@ -140,7 +140,7 @@ impl NetworkRegistry {
     /// secret key (so any admin granted the key can suggest). Suggestions are
     /// advisory on every network; each node queues or auto-accepts them.
     pub(crate) async fn firewall_suggest(
-        &self,
+        self: &Arc<Self>,
         network: &str,
         suggestions: SuggestedFirewall,
     ) -> IpcMessage {
@@ -165,11 +165,11 @@ impl NetworkRegistry {
         }
         update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
         // Nudge connected members to reconverge from the freshly-published signed
-        // record now, instead of waiting up to 60s for the group poller. Like the
+        // record now, instead of waiting for the group poller. Like the
         // rename flow, this is a payload-free trigger, the suggestions still come
         // exclusively from the network-key-signed blob, never from this message.
         let net_pubkey = state.read().unwrap().network_public_key;
-        broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
+        broadcast_member_sync(self, net_pubkey, network, None).await;
         // The coordinator is the blob's source, so the group poller's hash
         // check (local == published) short-circuits and it never re-applies its
         // own authored suggestions. Materialize them here so the coordinator is

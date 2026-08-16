@@ -40,7 +40,7 @@ use bytes::Bytes;
 use iroh_metrics::service::MetricsServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -647,6 +647,13 @@ impl Daemon {
     pub async fn network_changed(&self) {
         tracing::info!("host reported a network change; rebinding endpoint");
         self.transport.endpoint.network_change().await;
+        // Re-resolve every network's signed record too. Anything a coordinator
+        // tried to push while we were between networks was delivered to an
+        // address that had stopped working, and a battery-powered node would
+        // otherwise carry that gap until its next long-interval tick. This is
+        // also the cheapest moment to ask: the radio is already up for the
+        // rebind.
+        self.registry.poll_nudge.notify_waiters();
     }
 
     /// Attach a packet interface to a headless [`DaemonState`] and start the data
@@ -1320,7 +1327,7 @@ impl Daemon {
             );
             update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
             let net_pubkey = state.read().unwrap().network_public_key;
-            broadcast_member_sync(&self.registry.peers, net_pubkey, network, None).await;
+            broadcast_member_sync(&self.registry, net_pubkey, network, None).await;
         }
 
         let dns_name = format!("{}.{}.{}", new_hostname, network, crate::DNS_DOMAIN);
@@ -1735,24 +1742,109 @@ async fn respond_pong(conn: &Connection, nonce: u64) {
     let _ = open_and_send(conn, None, &ControlMsg::Pong { nonce }).await;
 }
 
+/// How long to leave a roster member alone after a failed dial before trying it
+/// again, so a network carrying genuinely offline devices doesn't pay a dial
+/// timeout for each of them on every roster edit.
+const ABSENT_DIAL_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
 /// Broadcast a `MemberSync` trigger for one network to every peer that shares it,
 /// tagged with the network's public key so each receiver routes it correctly.
 /// A single mesh connection carries several networks now, so this filters to the
 /// network's own peers rather than blasting every connection.
+///
+/// Members holding no live connection are dialed in the background. "Not
+/// connected" stopped meaning "unreachable" once on-demand peers began
+/// idle-closing their links: a phone keeps its home relay open and stays dialable
+/// the whole time it looks absent here. Without the dial it would learn about a
+/// kick or a firewall change only at its next group poll, which is precisely the
+/// poll we slow down on battery-powered nodes.
 async fn broadcast_member_sync(
-    peers: &PeerTable,
+    registry: &Arc<NetworkRegistry>,
     net_pubkey: EndpointId,
     network_name: &str,
     exclude_ip: Option<Ipv4Addr>,
 ) {
-    for (_id, ip, conn) in peers.peers_for_network_with_conn(network_name) {
+    let mut reached: HashSet<EndpointId> = HashSet::new();
+    for (id, ip, conn) in registry.peers.peers_for_network_with_conn(network_name) {
         if Some(ip) == exclude_ip {
             continue;
         }
+        reached.insert(id);
         if let Err(e) = open_and_send(&conn, Some(net_pubkey), &ControlMsg::MemberSync).await {
             tracing::warn!(peer_ip = %ip, error = %e, "failed to sync members");
         }
     }
+    spawn_absent_member_sync(registry, net_pubkey, network_name, exclude_ip, reached);
+}
+
+/// The roster members a trigger did not reach over a live connection and that
+/// are worth dialing: not us, not the excluded peer, not already reached, and
+/// not known-offline. Split out from [`spawn_absent_member_sync`] so the choice
+/// of who gets dialed is testable without a live registry.
+fn absent_member_ips(
+    roster: &[Member],
+    my_id: EndpointId,
+    exclude_ip: Option<Ipv4Addr>,
+    reached: &HashSet<EndpointId>,
+    is_offline: impl Fn(&EndpointId) -> bool,
+) -> Vec<Ipv4Addr> {
+    roster
+        .iter()
+        .filter(|m| m.identity != my_id && !reached.contains(&m.identity))
+        .filter(|m| Some(m.ip) != exclude_ip)
+        .filter(|m| !is_offline(&m.identity))
+        .map(|m| m.ip)
+        .collect()
+}
+
+/// Dial the roster members [`broadcast_member_sync`] could not reach over an
+/// existing connection and deliver the trigger there. Spawned rather than
+/// awaited: a coordinator's `ray kick` must not block on dialing every device on
+/// the roster, and the trigger is a hint whose only cost when late is a slower
+/// reconverge.
+fn spawn_absent_member_sync(
+    registry: &Arc<NetworkRegistry>,
+    net_pubkey: EndpointId,
+    network_name: &str,
+    exclude_ip: Option<Ipv4Addr>,
+    reached: HashSet<EndpointId>,
+) {
+    let my_id = registry.transport.identity.local_identity();
+    let absent: Vec<peers::RouteTarget> = absent_member_ips(
+        &registry.roster(network_name),
+        my_id,
+        exclude_ip,
+        &reached,
+        // A member whose last dial failed recently is offline for real rather
+        // than idle-closed, so leave it to its own poll.
+        |id| registry.reachability.is_offline(id, ABSENT_DIAL_COOLDOWN),
+    )
+    .into_iter()
+    .filter_map(|ip| registry.resolve_route(IpAddr::V4(ip)))
+    .collect();
+    if absent.is_empty() {
+        return;
+    }
+    let registry = registry.clone();
+    let network_name = network_name.to_string();
+    tokio::spawn(async move {
+        tracing::debug!(
+            network = %network_name,
+            peers = absent.len(),
+            "dialing absent members to deliver MemberSync"
+        );
+        for target in absent {
+            if !registry.dial_target(&target).await {
+                continue;
+            }
+            let Some(conn) = registry.peers.conn_for_ip(&target.ipv4) else {
+                continue;
+            };
+            if let Err(e) = open_and_send(&conn, Some(net_pubkey), &ControlMsg::MemberSync).await {
+                tracing::debug!(peer_ip = %target.ipv4, error = %e, "failed to sync dialed member");
+            }
+        }
+    });
 }
 
 /// Broadcast a network-scoped control message to every peer that shares the
@@ -1813,6 +1905,72 @@ mod report_tests {
     fn test_collect_recent_logs_missing_dir_is_empty() {
         // The log dir may not exist in CI / non-root test runs; must not panic.
         let _ = collect_recent_logs();
+    }
+}
+
+#[cfg(test)]
+mod absent_member_tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn id(seed: u8) -> EndpointId {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        SecretKey::from(b).public()
+    }
+
+    fn member(seed: u8, last: u8) -> Member {
+        Member {
+            identity: id(seed),
+            ip: Ipv4Addr::new(100, 64, 0, last),
+            is_coordinator: false,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+            last_seen: None,
+            exit_node: false,
+            ipv6_only: false,
+        }
+    }
+
+    /// The whole point of the dial fallback: a member that holds no live
+    /// connection is a dial candidate, because on-demand peers idle-close their
+    /// links while staying reachable.
+    #[test]
+    fn unconnected_member_is_a_dial_candidate() {
+        let roster = vec![member(1, 1), member(2, 2)];
+        let reached: HashSet<EndpointId> = [id(1)].into_iter().collect();
+        let got = absent_member_ips(&roster, id(9), None, &reached, |_| false);
+        assert_eq!(got, vec![Ipv4Addr::new(100, 64, 0, 2)]);
+    }
+
+    /// Self, the excluded peer, and anyone already reached over a live
+    /// connection must never be dialed: the first is nonsense, the second is
+    /// the peer the caller deliberately skipped, the third already got it.
+    #[test]
+    fn self_excluded_and_reached_are_skipped() {
+        let roster = vec![member(1, 1), member(2, 2), member(3, 3), member(4, 4)];
+        let reached: HashSet<EndpointId> = [id(3)].into_iter().collect();
+        let got = absent_member_ips(
+            &roster,
+            id(1),
+            Some(Ipv4Addr::new(100, 64, 0, 2)),
+            &reached,
+            |_| false,
+        );
+        assert_eq!(got, vec![Ipv4Addr::new(100, 64, 0, 4)]);
+    }
+
+    /// A member whose last dial failed recently is offline for real, not
+    /// idle-closed. Re-dialing it on every roster edit would cost a timeout per
+    /// edit and teach us nothing.
+    #[test]
+    fn known_offline_member_is_not_redialed() {
+        let roster = vec![member(1, 1), member(2, 2)];
+        let offline = id(1);
+        let got = absent_member_ips(&roster, id(9), None, &HashSet::new(), |i| *i == offline);
+        assert_eq!(got, vec![Ipv4Addr::new(100, 64, 0, 2)]);
     }
 }
 

@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The mobile app stops waking the radio every minute.** Every node used to
+  re-resolve each network's signed record once a minute, whether or not
+  anything had changed, which on a phone is a wakeup per network per minute for
+  a day at a time. On Android that poll now runs every 15 minutes and is a
+  backstop rather than the mechanism: coordinators push membership changes to
+  members directly, and the poll runs immediately when the VPN comes up, so a
+  kick, a firewall suggestion or a new member still lands right away. Desktop
+  and server nodes keep the 60-second poll.
+
+### Fixed
+
+- **Membership changes reach devices that aren't currently connected.** A
+  coordinator's kick, firewall suggestion or roster edit was only delivered to
+  peers holding a live connection at that moment. Phones and other on-demand
+  nodes drop their links after a couple of idle minutes while remaining
+  reachable, so they routinely missed the notification and worked from a stale
+  roster until their next poll. Coordinators now dial those members to deliver
+  it. Devices that are genuinely offline are left alone for five minutes
+  between attempts rather than being re-dialed on every change.
+
 ### Added
 
 - **`ray logs`: read the daemon's log without hunting for the files.** The logs

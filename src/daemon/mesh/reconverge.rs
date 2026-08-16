@@ -1,11 +1,28 @@
 //! Verified-blob reconvergence: resolve the network-key-signed pkarr record,
 //! fetch + verify the `GroupBlob`, re-seat IP collisions, then apply the roster
-//! to DNS and re-materialize suggested firewall rules. The 60s group poller and
-//! the peer-cleanup-adjacent helpers that drive reconvergence live here.
+//! to DNS and re-materialize suggested firewall rules. The group poller and the
+//! peer-cleanup-adjacent helpers that drive reconvergence live here.
 
 use std::net::Ipv6Addr;
 
 use super::super::*;
+
+/// How often a node re-resolves the signed record when nothing triggers it.
+#[cfg(not(target_os = "android"))]
+const GROUP_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The same poll on a battery-powered node, where every tick is a radio wakeup
+/// that usually learns nothing. Coordinators push `MemberSync` to members they
+/// can dial, so here the poll is a backstop for a trigger that was missed
+/// entirely (every coordinator offline while the blob changed), not the
+/// mechanism. Reconvergence still happens promptly on wake: bringing the data
+/// plane up fires `NetworkRegistry::poll_nudge`, which resolves immediately.
+///
+/// Keyed on the platform, not on `on_demand`: that is a desktop config key
+/// (`GlobalKey::OnDemand`) a wired node can set for its own reasons, and a
+/// 15-minute-stale roster is not what it asked for by setting it.
+#[cfg(target_os = "android")]
+const GROUP_POLL_INTERVAL_BATTERY: Duration = Duration::from_secs(15 * 60);
 
 /// Materialize this node's suggested firewall rules for `network` from the
 /// verified blob state, then either install them (replacing the prior
@@ -534,13 +551,21 @@ pub(crate) fn spawn_group_poller(
     tokio::spawn(async move {
         // `interval` fires its first tick immediately, so the poller does an
         // at-start resolve (catching a blob that changed while we were offline or
-        // mid-restart) and then settles into the 60s cadence. Without this the
-        // first re-check was a full 60s after boot.
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        // mid-restart) and then settles into its cadence. Without this the first
+        // re-check was a full interval after boot.
+        #[cfg(target_os = "android")]
+        let period = GROUP_POLL_INTERVAL_BATTERY;
+        #[cfg(not(target_os = "android"))]
+        let period = GROUP_POLL_INTERVAL;
+        let mut tick = tokio::time::interval(period);
+        let nudge = registry.poll_nudge.clone();
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
                 _ = tick.tick() => {},
+                // The data plane came up. Resolve now rather than at the next
+                // tick, and re-arm so a nudge doesn't shorten the cadence.
+                _ = nudge.notified() => tick.reset(),
             }
 
             // Re-advertise the exit offer if the signed roster still disagrees
@@ -608,7 +633,7 @@ pub(crate) enum ReconvergeOutcome {
 /// record's seed peers) and apply it: honor a self-nullification, prune removed
 /// peers, detect our own removal, and refresh the roster + suggested firewall.
 ///
-/// Shared by the 60s group poller and the `SignedRecord` fast path (a coordinator
+/// Shared by the group poller and the `SignedRecord` fast path (a coordinator
 /// hands a reconnecting member the current signed record over the mesh), so both
 /// converge through identical, verified logic. The hash always arrives from a
 /// network-key-signed record; the blob itself is verified in `fetch_verified_blob`.

@@ -92,7 +92,7 @@ pub(crate) fn spawn_contact_publisher(
 /// is notify-driven and spawned at create/restore time), this is spawned at
 /// runtime when a member is promoted: it has no `dht_notify` handle, so it
 /// re-reads the snapshot hash every few seconds and republishes on change.
-/// Latency is bounded by `LAZY_PUBLISH_INTERVAL`; members' 60s group poller is
+/// Latency is bounded by `LAZY_PUBLISH_INTERVAL`; members' group poller is
 /// the downstream backstop regardless.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_lazy_publisher(

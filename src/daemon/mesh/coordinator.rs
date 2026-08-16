@@ -161,7 +161,7 @@ impl NetworkRegistry {
     /// Coordinator-authoritative prune of a member that left `network`: drop it
     /// from the roster + DNS, republish the signed blob, and broadcast a
     /// `MemberSync` trigger. A no-op on a network we don't coordinate.
-    async fn prune_member_on_leave(&self, network: &str, ev: &forward::DisconnectEvent) {
+    async fn prune_member_on_leave(self: &Arc<Self>, network: &str, ev: &forward::DisconnectEvent) {
         let (state, net_pubkey, dht_notify) = {
             let Some(h) = self.networks.get(network) else {
                 return;
@@ -181,7 +181,7 @@ impl NetworkRegistry {
         )
         .await;
         update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
-        broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
+        broadcast_member_sync(self, net_pubkey, network, None).await;
         tracing::info!(peer = %member_id.fmt_short(), network, "pruned member after leave");
     }
 
@@ -194,7 +194,7 @@ impl NetworkRegistry {
     /// no roster action and learns of the departure from the coordinator's republish
     /// on its next reconverge. Mirrors [`prune_member_on_leave`], keyed by the
     /// connection's remote id instead of a `DisconnectEvent`.
-    pub(crate) async fn handle_member_leave(&self, network: &str, peer_id: EndpointId) {
+    pub(crate) async fn handle_member_leave(self: &Arc<Self>, network: &str, peer_id: EndpointId) {
         // Capture the leaver's mesh IP before removal (needed for the DNS prune);
         // the by-id lookup is gone once this was its last shared network.
         let leaver_ip = self.peers.v4_for_id(&peer_id);
@@ -223,7 +223,7 @@ impl NetworkRegistry {
             .await;
         }
         update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
-        broadcast_member_sync(&self.peers, net_pubkey, network, None).await;
+        broadcast_member_sync(self, net_pubkey, network, None).await;
         tracing::info!(peer = %member_id.fmt_short(), network, "pruned member after in-band leave");
     }
 
@@ -236,7 +236,10 @@ impl NetworkRegistry {
     /// name, or an error string if `target` is not one of our paired devices, so a
     /// stranger's request is rejected. Only a network-key holder writes nullifiers,
     /// so on a network we don't coordinate this is a no-op for that network.
-    pub(crate) async fn nullify_device(&self, target: EndpointId) -> Result<String, String> {
+    pub(crate) async fn nullify_device(
+        self: &Arc<Self>,
+        target: EndpointId,
+    ) -> Result<String, String> {
         let own_user = self.transport.endpoint.id();
         // Confirm the target is one of our paired devices, grab a display name, and
         // snapshot each network's handles (cloning the Arc state) so the DashMap
@@ -310,7 +313,7 @@ impl NetworkRegistry {
                 }
                 update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
                 let net_pubkey = state.read().unwrap().network_public_key;
-                broadcast_member_sync(&self.peers, net_pubkey, &net, None).await;
+                broadcast_member_sync(self, net_pubkey, &net, None).await;
             }
             for (pid, ip, conn) in self.peers.peers_for_network_with_conn(&net) {
                 if pid == target {
@@ -580,7 +583,7 @@ pub(crate) async fn finalize_removal(
 ) {
     update_snapshot_and_publish(state, &ctx.blob_store, dht_notify).await;
     let net_pubkey = state.read().unwrap().network_public_key;
-    broadcast_member_sync(&ctx.peers, net_pubkey, network, None).await;
+    broadcast_member_sync(&ctx.registry, net_pubkey, network, None).await;
     for (pid, ip, conn) in ctx.peers.peers_for_network_with_conn(network) {
         let resolved = ctx.device_user_map.resolve(&pid);
         if victims.iter().any(|v| *v == pid || *v == resolved) {

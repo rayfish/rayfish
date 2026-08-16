@@ -649,7 +649,7 @@ impl NetworkRegistry {
             // live-join path already registered the member handler in
             // `join_mesh_shared`; register here only for the cold-restore path
             // (state built from the blob, no live handshake). Reconverge for that
-            // path is covered by the 60s group poller below.
+            // path is covered by the group poller below.
             NetworkRole::Member | NetworkRole::Direct => {
                 if !self.protocol_router().is_registered(&net_pubkey) {
                     self.protocol_router().register(
