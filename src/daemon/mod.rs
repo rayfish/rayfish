@@ -61,6 +61,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::AsyncMutex;
 use crate::audit;
 use crate::config;
 use crate::config::settings::{self, FirewallKey, GlobalKey, NetworkKey, NodeKey};
@@ -442,7 +443,7 @@ pub struct NetworkHandle {
     /// Serializes invite-ledger reads/writes (mint, redeem, revoke) so concurrent
     /// joins can't double-burn a single-use invite (TOCTOU on the toml file).
     /// Shared with this network's [`CoordinatorAcceptState`].
-    invite_lock: Arc<tokio::sync::Mutex<()>>,
+    invite_lock: Arc<AsyncMutex<()>>,
 }
 
 /// Shared, always-on daemon state. Cloned (via `Arc`) into every IPC handler
@@ -494,9 +495,10 @@ pub struct Daemon {
     /// (see [`DnsService`]). Shared as `Arc` so extracted consumers can hold it.
     dns: Arc<DnsService>,
     mdns_enabled: bool,
-    /// Whether this node opted into automatic stable updates (`ray auto-update
-    /// on` / `ray install --auto-update`). Read at startup; when set, `run_daemon`
-    /// spawns the periodic update task. Echoed back in `ray status`.
+    /// Whether this node opted into automatic stable updates
+    /// (`ray config set auto-update on` / `ray install --auto-update`). Read at
+    /// startup; when set, `run_daemon` spawns the periodic update task. Echoed
+    /// back in `ray status`.
     auto_update: bool,
     /// The resolved data-plane mode (`ray config set ipv6-only on`), for
     /// sharing a host with another VPN that owns `100.64.0.0/10`. Resolved once
@@ -525,7 +527,7 @@ pub struct Daemon {
     /// other's intermediate state, after which teardown "restores" forwarding to
     /// on. One reconcile at a time. Tokio's mutex because the critical section
     /// awaits (blocking-pool `ip`/`nft`/`pfctl` children, offer broadcasts).
-    pub(crate) exit_reconcile: tokio::sync::Mutex<()>,
+    pub(crate) exit_reconcile: AsyncMutex<()>,
     /// Prometheus metrics-server guard. Owned so it lives for the daemon's whole
     /// lifetime (dropping it stops the export); `None` if the server failed to bind.
     _metrics_server: Option<MetricsServer>,
@@ -910,8 +912,9 @@ impl Daemon {
 
     /// Apply one settings key and persist it. Serves `ray config set|unset` and
     /// every single-value command that used to carry its own IPC variant
-    /// (`ray mdns`, `ray auto-update`, `ray firewall on|off|reject|default`,
-    /// `ray firewall ssh on|off`, `ray files download-dir|download-user`).
+    /// (`ray mdns`, `ray firewall on|off|reject|default`, `ray firewall ssh
+    /// on|off`, `ray files download-dir|download-user`, and the hidden
+    /// `ray auto-update`, whose only spelling is now the key itself).
     ///
     /// Dispatch is on the key's store, because the two a [`NodeKey`] can name
     /// are not interchangeable: a firewall key writes the live `ArcSwap` the
@@ -2149,7 +2152,7 @@ mod accept_handler_tests {
             network_name: "test-net".to_string(),
             state: make_network_state(),
             dht_notify: None,
-            invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+            invite_lock: Arc::new(AsyncMutex::new(())),
         }))
     }
 
@@ -2230,7 +2233,7 @@ mod accept_handler_tests {
             my_identity: my_id,
             endpoint,
             registry,
-            invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+            invite_lock: Arc::new(AsyncMutex::new(())),
             reconverge_notify: Arc::new(tokio::sync::Notify::new()),
         }))
     }
@@ -2294,7 +2297,7 @@ mod accept_handler_tests {
                     dht_notify: None,
                     cancel: CancellationToken::new(),
                     tasks: Vec::new(),
-                    invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    invite_lock: Arc::new(AsyncMutex::new(())),
                 },
             );
             assert!(
@@ -2399,7 +2402,7 @@ mod accept_handler_tests {
                 dht_notify: None,
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                invite_lock: Arc::new(AsyncMutex::new(())),
             },
         );
 
@@ -2426,7 +2429,7 @@ mod accept_handler_tests {
                 network_name: "test-net".to_string(),
                 state: state.clone(),
                 dht_notify: None,
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                invite_lock: Arc::new(AsyncMutex::new(())),
             })),
         );
 
@@ -2576,7 +2579,7 @@ mod accept_handler_tests {
                 dht_notify: None,
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                invite_lock: Arc::new(AsyncMutex::new(())),
             },
         );
         let connmgr = Arc::new(ConnectionManager::new());
@@ -2600,7 +2603,7 @@ mod accept_handler_tests {
                 network_name: "test-net".to_string(),
                 state: coord_state.clone(),
                 dht_notify: None,
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                invite_lock: Arc::new(AsyncMutex::new(())),
             })),
         );
         let accept = {
@@ -2643,7 +2646,7 @@ mod accept_handler_tests {
                 dht_notify: None,
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
-                invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                invite_lock: Arc::new(AsyncMutex::new(())),
             },
         );
         // Offering an exit, and the data plane is up so sync is enabled.
@@ -3139,7 +3142,7 @@ mod headless_tests {
     /// buffer, so a test can observe which writer the data plane routed to.
     #[derive(Clone, Default)]
     struct FakeTunWriter {
-        written: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        written: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     impl crate::tun::TunWrite for FakeTunWriter {
@@ -3170,7 +3173,7 @@ mod headless_tests {
     /// failure fails fast instead of hanging; the short poll interval leaves room
     /// for the cross-thread wakeup of the writer task without a fixed sleep that
     /// would either flake (too short) or slow the suite (too long).
-    async fn wait_for_len(sink: &Arc<std::sync::Mutex<Vec<Vec<u8>>>>, want: usize) -> bool {
+    async fn wait_for_len(sink: &Arc<Mutex<Vec<Vec<u8>>>>, want: usize) -> bool {
         for _ in 0..400 {
             if sink.lock().unwrap().len() >= want {
                 return true;

@@ -128,7 +128,7 @@ pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
 ///
 /// A direct link is symmetric, so its one intended peer coordinates it too. The
 /// grant therefore follows the *peer* recorded when the link was minted, not the
-/// network's `direct` flag, which any later `ray accept` would otherwise ride
+/// network's `direct` flag, which any later `ray requests accept` would ride
 /// into a key it was never offered.
 ///
 /// `direct_peer` is `None` on links minted before it was recorded, so those fall
@@ -209,7 +209,7 @@ pub(crate) struct CoordinatorAcceptState {
     pub(crate) state: SharedNetworkState,
     pub(crate) dht_notify: Option<Arc<tokio::sync::Notify>>,
     /// Shared with this network's [`NetworkHandle`]; see its `invite_lock`.
-    pub(crate) invite_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) invite_lock: Arc<AsyncMutex<()>>,
 }
 
 impl CoordinatorAcceptState {
@@ -695,8 +695,8 @@ impl CoordinatorAcceptState {
         // Pinned to the peer the link was minted for (`direct_peer`), not to the
         // network's `direct` flag: the flag says the *network* is a direct link,
         // so on its own it handed the network key to anyone ever approved here,
-        // and a later `ray accept` on that network would give the key away
-        // without saying so.
+        // and a later `ray requests accept` on that network would give the key
+        // away without saying so.
         let grant_direct = was_approved
             && config::load_network(&self.network_name)
                 .ok()
@@ -884,7 +884,7 @@ pub(crate) struct MemberAcceptState {
     /// hand-off to the daemon loop).
     pub(crate) registry: Arc<NetworkRegistry>,
     /// Serializes single-use invite ledger access for the gossip arms.
-    pub(crate) invite_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) invite_lock: Arc<AsyncMutex<()>>,
     /// Kicks the debounced reconverge worker on a `MemberSync`/`BlobUpdated`
     /// trigger (the roster comes only from the signed pkarr record).
     pub(crate) reconverge_notify: Arc<tokio::sync::Notify>,
@@ -1738,7 +1738,7 @@ mod direct_grant_tests {
     }
 
     /// The regression. A direct network approving a *second* peer later (via
-    /// `ray accept`) used to hand it the network secret key too, because the
+    /// `ray requests accept`) used to hand it the network key too, because the
     /// grant keyed on the network being `direct` rather than on who the link was
     /// for. Nothing tells the user they just made a stranger a co-coordinator.
     #[test]

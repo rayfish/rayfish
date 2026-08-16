@@ -244,7 +244,7 @@ impl NetworkRegistry {
 
         let cancel = self.shutdown_token.child_token();
         let state = Arc::new(RwLock::new(net_state));
-        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let invite_lock = Arc::new(AsyncMutex::new(()));
         let dht_notify = Arc::new(tokio::sync::Notify::new());
         let ctx = self.mesh_ctx();
         let tasks = self.spawn_coordinator_background_tasks(

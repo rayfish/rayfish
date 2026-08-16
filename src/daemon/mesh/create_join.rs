@@ -28,7 +28,7 @@ struct JoinContext<'a> {
     /// Seed for per-network auto-accept of file offers from own devices
     /// (`--auto-accept-files`); persisted, config wins on reconnect/restore.
     auto_accept_files: bool,
-    invite_lock: Arc<tokio::sync::Mutex<()>>,
+    invite_lock: Arc<AsyncMutex<()>>,
     /// Pinned coordinator to dial first (the invite minter), if known.
     coordinator: Option<EndpointId>,
 }
@@ -281,7 +281,7 @@ impl NetworkRegistry {
         // control listener (which may handle InviteShare/InviteUsed once this
         // node is promoted to co-coordinator) and the coordinator handler we may
         // register below, so all ledger access stays serialized.
-        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let invite_lock = Arc::new(AsyncMutex::new(()));
 
         let ctx = JoinContext {
             display_name,

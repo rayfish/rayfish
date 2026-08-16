@@ -3,7 +3,7 @@
 #
 # Topology:
 #   srv-a  identity U   the initiator (`ray connect`)
-#   srv-b  identity V   the recipient (`ray connections approve`)
+#   srv-b  identity V   the recipient (`ray connect approve`)
 #
 # Proves the full friend-request flow over real hosts + the public pkarr DHT:
 #   B publishes a contact id  ->  A `ray connect <id>`  ->  B sees + approves
@@ -72,7 +72,7 @@ fi
 step "4. srv-b sees the pending request and approves it"
 REQ=""
 for _ in $(seq 1 8); do
-  REQ="$(on "$B" 'ray connections' 2>/dev/null | strip)"
+  REQ="$(on "$B" 'ray connect' 2>/dev/null | strip)"
   echo "$REQ" | grep -qiE "${A_CID:0:8}" && break
   sleep 3
 done
@@ -84,7 +84,7 @@ else
 fi
 # Approve by srv-a's full contact id (the daemon matches it as a prefix), so we
 # don't have to parse the short id out of the table.
-APPROVE="$(on "$B" "ray connections approve $A_CID" 2>&1 | strip)"
+APPROVE="$(on "$B" "ray connect approve $A_CID" 2>&1 | strip)"
 echo "$APPROVE" | sed 's/^/   b| /'
 echo "$APPROVE" | grep -qiE 'approved|already connected' && pass "srv-b approved the request" \
   || fail "srv-b approve failed"
