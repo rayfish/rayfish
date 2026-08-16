@@ -1487,6 +1487,10 @@ impl Daemon {
         // pinning). Teardown never reports a problem.
         self.registry.exit_client.set(None);
         let _ = self.apply_exit_client(&tun_name).await;
+        // With the selection gone this drops any tunnel DNS override, so standby
+        // does not leave the forwarder pointed at a resolver chosen for a tunnel
+        // that no longer exists.
+        self.apply_exit_dns();
 
         tracing::info!("VPN on standby");
         IpcMessage::Ok {

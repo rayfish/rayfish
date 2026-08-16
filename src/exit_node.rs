@@ -250,6 +250,7 @@ pub fn exclude_from_tunnel(ips: &[IpAddr]) {
     let mut excluded = EXCLUDED_IPS.lock().unwrap();
     let mut added = 0;
     let mut gateways: HashMap<&str, Option<String>> = HashMap::new();
+    let mut ungatewayed: HashSet<&str> = HashSet::new();
     for ip in ips {
         if excluded.contains(ip) {
             continue;
@@ -258,7 +259,12 @@ pub fn exclude_from_tunnel(ips: &[IpAddr]) {
         let gw = gateways
             .entry(family)
             .or_insert_with(|| default_gateway(family));
-        let Some(gw) = gw.as_deref() else { continue };
+        let Some(gw) = gw.as_deref() else {
+            // Worth saying: an address in a family with no default route is one
+            // this host cannot reach at all, so it is not merely un-excluded.
+            ungatewayed.insert(family);
+            continue;
+        };
         let s = ip.to_string();
         let _ = Command::new("route")
             .args(["-n", "delete", family, "-host", &s])
@@ -272,6 +278,13 @@ pub fn exclude_from_tunnel(ips: &[IpAddr]) {
             excluded.push(*ip);
             added += 1;
         }
+    }
+    for family in ungatewayed {
+        tracing::warn!(
+            family,
+            "no default gateway for this family; cannot keep iroh's traffic there \
+             off the exit tunnel"
+        );
     }
     if added > 0 {
         tracing::debug!(
