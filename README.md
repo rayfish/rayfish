@@ -530,9 +530,27 @@ is unaffected. NetworkManager's DNS backend is skipped too (it can only carry an
 IPv4 nameserver); the next backend down takes over.
 
 If both VPNs manage `/etc/resolv.conf` directly (no systemd-resolved), rayfish
-leaves the file to whoever holds it rather than fighting over it, and `.ray`
-names won't resolve until you add rayfish's resolver to that file yourself or
-put a DNS manager both can register with in the path.
+shares the file rather than fighting over it or giving it up. It writes its own
+resolver in first, keeps the other VPN's behind it, and keeps both sets of
+search domains. It answers `.ray` and declines everything else, so your system
+resolver moves straight on to the other VPN's server, whose own DNS setup then
+applies as usual. Both meshes resolve, in either start order, and it holds
+whichever way the two write the file. Rayfish rewrites at most once a minute, so the two daemons can't spin
+against each other, and once the other VPN is gone it goes back to managing the
+file alone.
+
+Shutting rayfish down removes only its own lines and leaves the other VPN's
+DNS as it found it. `dig @200::53 <host>.ray` answers throughout, since Magic
+DNS is reached through the tunnel and not through `resolv.conf`. (Use
+`@200::53`, not the v4 `100.100.100.53`: a host sharing the CGNAT range with
+another VPN is in IPv6-only mode, where the v4 magic address is exactly what
+the mode gives up.)
+
+With `resolvconf` in the path both VPNs do get to register, but the system
+tries the resolvers in order and stops at the first that answers, so whichever
+sorts second never sees its own names. rayfish says which resolver is ahead of
+it in the log if that happens; fix it by giving rayfish's stanza priority in
+resolvconf's interface order.
 
 On Android the same mode is a switch under **You > IPv6-only mode**. Two VPNs
 can't run at once there, so the reason to reach for it is a carrier that gives

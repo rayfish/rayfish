@@ -3,6 +3,9 @@ use std::fs::Permissions;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+// Only the test-only `CONFIG_ENV_LOCK` holds one.
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -1047,7 +1050,7 @@ pub fn remove_network(config: &mut AppConfig, name: &str) -> bool {
 /// run on parallel threads. Shared across test modules (`identity`, `daemon`)
 /// so none of them observe a `RAYFISH_CONFIG_DIR` value set by a concurrent test.
 #[cfg(test)]
-pub(crate) static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod tests {

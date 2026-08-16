@@ -49,7 +49,7 @@ pub(crate) struct CoordinatorAcceptState {
     pub(crate) state: SharedNetworkState,
     pub(crate) dht_notify: Option<Arc<tokio::sync::Notify>>,
     /// Shared with this network's [`NetworkHandle`]; see its `invite_lock`.
-    pub(crate) invite_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) invite_lock: Arc<AsyncMutex<()>>,
 }
 
 impl CoordinatorAcceptState {
@@ -718,7 +718,7 @@ pub(crate) struct MemberAcceptState {
     /// hand-off to the daemon loop).
     pub(crate) registry: Arc<NetworkRegistry>,
     /// Serializes single-use invite ledger access for the gossip arms.
-    pub(crate) invite_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) invite_lock: Arc<AsyncMutex<()>>,
     /// Kicks the debounced reconverge worker on a `MemberSync`/`BlobUpdated`
     /// trigger (the roster comes only from the signed pkarr record).
     pub(crate) reconverge_notify: Arc<tokio::sync::Notify>,
