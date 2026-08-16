@@ -37,6 +37,12 @@ pub(crate) struct DnsService {
     /// Cancellation token for the retry loop spawned when the initial OS-DNS
     /// configuration fails (see [`DnsService::configure`]).
     configure_retry: std::sync::Mutex<Option<CancellationToken>>,
+    /// The search domains last derived from the joined networks. Kept so a
+    /// backend adopted *after* the registry last announced them (the usual
+    /// order at startup, and every reconfigure after a retry or a stand-down)
+    /// still gets them; it is a cache of the argument, not a back-reference to
+    /// the registry that produced it.
+    search_domains: std::sync::Mutex<Vec<String>>,
     /// This node's identity-derived mesh IPv6. Handed to the OS-DNS backend,
     /// which on macOS publishes it as the address of the service our resolver
     /// belongs to; never rotates, so it is captured once at construction.
@@ -57,6 +63,7 @@ impl DnsService {
             configurator: Arc::new(std::sync::Mutex::new(None)),
             reassert_token: std::sync::Mutex::new(None),
             configure_retry: std::sync::Mutex::new(None),
+            search_domains: std::sync::Mutex::new(Vec::new()),
             mesh_v6,
         }
     }
@@ -83,7 +90,7 @@ impl DnsService {
             retry.cancel();
         }
         match dns_config::detect_and_configure(tun_name, self.mesh_v6).await {
-            Ok(c) => self.adopt_configurator(c),
+            Ok(c) => self.adopt_configurator(c, tun_name).await,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to configure system DNS, retrying in the background");
                 warnings.push(format!(
@@ -95,32 +102,106 @@ impl DnsService {
     }
 
     /// Take ownership of a detected OS-DNS backend: seed the resolver's
-    /// upstreams, keep the configurator for `revert`, and (Linux direct mode)
-    /// start the inotify re-assert watcher.
-    fn adopt_configurator(&self, c: Box<dyn dns_config::DnsConfigurator>) {
+    /// upstreams, keep the configurator for `revert`, install the current search
+    /// domains, and (Linux direct mode) start the inotify re-assert watcher.
+    async fn adopt_configurator(
+        self: &Arc<Self>,
+        c: Box<dyn dns_config::DnsConfigurator>,
+        tun_name: &str,
+    ) {
         let captured = c.captured_upstreams();
         // Merge any user-configured DNS upstreams over the system-captured
         // set (replace drops the captured ones; augment tries custom first).
         let dns_override = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
         let upstreams = config::resolve_upstreams(&dns_override, captured);
-        let is_direct = c.name() == "direct-resolv.conf";
         #[cfg(target_os = "linux")]
-        let search = c.search_domains();
+        let search_handle = c.search_handle();
         #[cfg(target_os = "linux")]
         let fallback = c.fallback_upstream();
         tracing::info!(backend = c.name(), resolver_ip = %dns_config::resolver_addr(), upstreams = ?upstreams, "Magic DNS active");
         self.resolver.set_upstreams(upstreams);
-        *self.configurator.lock().unwrap() = Some(Arc::from(c));
+        let c: Arc<dyn dns_config::DnsConfigurator> = Arc::from(c);
+        *self.configurator.lock().unwrap() = Some(Arc::clone(&c));
+
+        // The registry announces the search domains when networks are restored,
+        // which at startup is before any of this ran. Install what it said into
+        // the backend we just adopted, or a host on a file-owning backend gets
+        // `.ray` without the domains that make a bare `box` resolve.
+        let domains = self.search_domains.lock().unwrap().clone();
+        if !domains.is_empty()
+            && let Err(e) = c.set_search_domains(&domains, tun_name).await
+        {
+            tracing::warn!(error = %e, "failed to install search domains");
+        }
+
         // In direct mode, re-assert /etc/resolv.conf the instant another
         // program (NetworkManager, dhclient) overwrites it (inotify watch).
+        // Only that backend hands back a search handle, and only it writes the
+        // file the watcher guards.
         #[cfg(target_os = "linux")]
-        if is_direct {
+        if let Some(search) = search_handle {
             let rt = tokio_util::sync::CancellationToken::new();
             *self.reassert_token.lock().unwrap() = Some(rt.clone());
-            tokio::spawn(dns_config::run_resolv_reassert(search, fallback, rt));
+            // Weak: the watcher outlives nothing. A shutdown that never got to
+            // `revert` should not be held open by a task waiting on a 30s tick.
+            let me = Arc::downgrade(self);
+            let tun_name = tun_name.to_string();
+            tokio::spawn(async move {
+                if let Some(ip) = dns_config::run_resolv_reassert(search, fallback, rt).await
+                    && let Some(me) = me.upgrade()
+                {
+                    me.stand_down(ip, tun_name).await;
+                }
+            });
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = is_direct;
+    }
+
+    /// Another VPN took `/etc/resolv.conf` while we held it, and the re-assert
+    /// watcher stopped rather than rewrite it back at them.
+    ///
+    /// Let go of the file completely: no `revert`, because restoring our backup
+    /// would put a capture of the host from before either VPN over their
+    /// configuration. Drop that backup instead, so neither `revert` nor
+    /// `restore_stale_backups` can do it later, and go back to retrying
+    /// detection so we reclaim DNS if that VPN leaves.
+    ///
+    /// The `dns=none` NetworkManager drop-in stays: un-quieting NM here would
+    /// only have NM regenerate the file and start a different fight over it.
+    /// It is marker-guarded and still removed on the real revert path.
+    #[cfg(target_os = "linux")]
+    async fn stand_down(self: &Arc<Self>, foreign: std::net::Ipv4Addr, tun_name: String) {
+        tracing::warn!(
+            %foreign,
+            "/etc/resolv.conf is owned by another VPN now; leaving it to them rather than \
+             rewriting it against each other. `.ray` names stop resolving on this host until \
+             that VPN goes away or a DNS manager both can register with is in the path"
+        );
+        self.reassert_token.lock().unwrap().take();
+        self.configurator.lock().unwrap().take();
+        dns_config::discard_resolv_backup().await;
+        self.spawn_configure_retry(tun_name);
+    }
+
+    /// Install the OS search domains for the currently joined networks, through
+    /// whichever backend holds DNS.
+    ///
+    /// Dispatching matters: only the backends that own a file can carry these
+    /// on a host with no DNS manager, and they are exactly the backends a host
+    /// without one ends up on. With no backend adopted yet (standby, or before
+    /// the data plane comes up) it still tries the manager path, which is what
+    /// it always did, and the list is remembered for whatever gets adopted next.
+    pub(crate) async fn set_search_domains(&self, network_names: &[String], tun_name: &str) {
+        let domains = dns_config::search_domains_for(network_names);
+        *self.search_domains.lock().unwrap() = domains.clone();
+        let configurator = self.configurator.lock().unwrap().clone();
+        let result = match configurator.as_ref() {
+            Some(c) => c.set_search_domains(&domains, tun_name).await,
+            None => dns_config::set_manager_search_domains(&domains, tun_name).await,
+        };
+        match result {
+            Ok(()) => tracing::info!(search = ?domains, "updated search domains"),
+            Err(e) => tracing::warn!(error = %e, "failed to update search domains"),
+        }
     }
 
     /// Keep trying to configure OS DNS in the background after the first attempt
@@ -150,7 +231,7 @@ impl DnsService {
                             let _ = dns_config::revert(c.as_ref()).await;
                             return;
                         }
-                        me.adopt_configurator(c);
+                        me.adopt_configurator(c, &tun_name).await;
                         me.configure_retry.lock().unwrap().take();
                         return;
                     }

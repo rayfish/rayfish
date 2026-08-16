@@ -410,7 +410,7 @@ impl NetworkRegistry {
     pub(crate) async fn refresh_search_domains(&self) {
         let network_names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
         let tun_name = self.tun_name.load().as_str().to_owned();
-        dns_config::update_search_domains(&network_names, &tun_name).await;
+        self.dns.set_search_domains(&network_names, &tun_name).await;
     }
 
     /// Leave a network: announce our departure to its peers, tear down the runtime,

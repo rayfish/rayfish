@@ -19,6 +19,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Rayfish no longer takes `/etc/resolv.conf` back from a VPN that started
+  after it.** Where Rayfish manages that file directly, it refuses to take it
+  from another VPN that already holds it. That check ran once, when Rayfish
+  came up, so the same host in the other order got the fight it was meant to
+  prevent: the other VPN wrote the file and Rayfish put its own back within
+  milliseconds, every time, and the host's DNS was whichever write landed last.
+  Rayfish now stands down whenever the file goes to another VPN, leaves it
+  alone, and takes DNS back on its own once that VPN is gone.
+- **Bare hostnames now resolve on hosts without a DNS manager.** `ping box`
+  and `ssh box` worked through systemd-resolved but not on a machine where
+  Rayfish manages `/etc/resolv.conf` or registers with `resolvconf`: the
+  `<network>.ray` and `ray` search domains were only ever handed to
+  systemd-resolved, so on those hosts only the full `box.homelab.ray` resolved.
+  They are now written wherever DNS actually lives, and follow every join and
+  leave.
+- **Rayfish says so when another VPN's resolver outranks it.** With
+  `resolvconf` in the path, both VPNs register a resolver and the system tries
+  them in order, stopping at the first that answers. Second place never sees a
+  `.ray` query, and Rayfish reported success anyway. It now logs which resolver
+  is ahead of it and what to do about it.
 - **The metrics endpoint no longer answers the local network.** The Prometheus
   exporter bound `0.0.0.0:9090`, so any device on the same Wi-Fi could read
   it. Its counters name every peer by mesh IP with per-peer round-trip times

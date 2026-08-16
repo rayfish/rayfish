@@ -10,6 +10,8 @@ use std::net::IpAddr;
 use std::net::Ipv4Addr;
 #[cfg(target_os = "linux")]
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 // Only the macOS/Linux configurators build resolver/backup file paths; Android
 // does no OS-level DNS configuration.
@@ -19,6 +21,8 @@ use std::path::PathBuf;
 #[allow(unused_imports)]
 use anyhow::Context;
 use anyhow::Result;
+#[cfg(target_os = "linux")]
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 #[cfg(target_os = "linux")]
 use zbus::Connection;
@@ -58,6 +62,12 @@ pub fn resolver_addr() -> IpAddr {
     }
 }
 
+/// The search domains a file-owning backend currently renders, shared between
+/// the configurator and its re-assert task. Swapped whole on every join/leave,
+/// so the watcher reads the current list without being restarted.
+#[cfg(target_os = "linux")]
+pub type SearchDomains = Arc<ArcSwap<Vec<String>>>;
+
 #[async_trait]
 pub trait DnsConfigurator: Send + Sync {
     async fn apply(&self) -> Result<()>;
@@ -69,12 +79,26 @@ pub trait DnsConfigurator: Send + Sync {
     fn captured_upstreams(&self) -> Vec<Ipv4Addr> {
         Vec::new()
     }
-    /// Search domains this configurator wrote into resolv.conf (direct mode
-    /// only). Threaded into the re-assert loop so a trample-repair preserves
-    /// them instead of dropping back to a bare `nameserver` line.
-    /// Default: empty (split-DNS backends manage search domains out of band).
-    fn search_domains(&self) -> Vec<String> {
-        Vec::new()
+    /// Install the OS search domains for the currently joined networks.
+    ///
+    /// The default is the split-DNS path: hand them to the manager that already
+    /// holds `.ray`, out of band from the file. The two backends that own a
+    /// file of their own write the domains into it instead and override this,
+    /// because nothing else would: `set_manager_search_domains` only speaks
+    /// resolved, so on a host that fell past it the domains went nowhere and a
+    /// bare `box` did not resolve.
+    async fn set_search_domains(&self, domains: &[String], tun_name: &str) -> Result<()> {
+        set_manager_search_domains(domains, tun_name).await
+    }
+    /// The live search-domain list this configurator renders into
+    /// `/etc/resolv.conf` (direct mode only), shared with the re-assert loop so
+    /// a trample-repair writes the current domains rather than the ones that
+    /// were current when the watcher started.
+    /// Default: none (no other backend writes the file, and it is what tells
+    /// the caller which backend to start that watcher for).
+    #[cfg(target_os = "linux")]
+    fn search_handle(&self) -> Option<SearchDomains> {
+        None
     }
     /// The real resolver listed after ours in resolv.conf (direct mode only), so
     /// the host still resolves names if our resolver stops answering. Threaded
@@ -207,34 +231,40 @@ pub fn restore_stale_backups() {
     }
 }
 
-/// Update system DNS routing so bare hostnames resolve. Configures search
-/// domains (`<network>.ray`, then `ray`) so a bare `<host>` is tried as
-/// `<host>.<network>.ray` and `<host>.ray`; `.ray` itself is the only domain
+/// The search domains that make bare hostnames resolve: `<network>.ray` for
+/// each joined network, then `ray`, so a bare `<host>` is tried as
+/// `<host>.<network>.ray` and `<host>.ray`. `.ray` itself is the only domain
 /// routed to us. Bare network names are deliberately never registered: a
 /// network called `dev` would otherwise capture every `*.dev` lookup.
-/// Call whenever networks are joined or left.
-pub async fn update_search_domains(network_names: &[String], tun_name: &str) {
+///
+/// Where these end up is the active backend's business ([`DnsConfigurator::set_search_domains`]).
+pub fn search_domains_for(network_names: &[String]) -> Vec<String> {
     let mut search: Vec<String> = network_names
         .iter()
         .map(|n| format!("{n}.{DNS_DOMAIN}"))
         .collect();
     search.push(DNS_DOMAIN.to_string());
-
-    if let Err(e) = set_search_domains(&search, tun_name).await {
-        tracing::warn!(error = %e, "failed to update search domains");
-    } else {
-        tracing::info!(search = ?search, "updated search domains");
-    }
+    search
 }
 
 /// Remove all rayfish search domains (called on daemon shutdown).
+///
+/// Only the manager path needs this. The backends that own a file undo their
+/// domains by undoing the file: direct mode restores the backup, resolvconf
+/// withdraws the whole stanza.
 pub async fn clear_search_domains(tun_name: &str) {
-    if let Err(e) = set_search_domains(&[], tun_name).await {
+    if let Err(e) = set_manager_search_domains(&[], tun_name).await {
         tracing::warn!(error = %e, "failed to clear search domains");
     }
 }
 
-async fn set_search_domains(rayfish_domains: &[String], tun_name: &str) -> Result<()> {
+/// Hand the search domains to the OS DNS manager that already holds `.ray`
+/// (resolved on Linux, SCDynamicStore on macOS). The default for every
+/// split-DNS backend, and a no-op on a host with no manager at all.
+pub(crate) async fn set_manager_search_domains(
+    rayfish_domains: &[String],
+    tun_name: &str,
+) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         write_dns_config_macos(rayfish_domains, tun_name)
@@ -1036,6 +1066,8 @@ enum ResolvconfVariant {
 #[cfg(target_os = "linux")]
 struct Resolvconf {
     variant: ResolvconfVariant,
+    /// The domains our stanza carries, so a join/leave can re-register it.
+    search: SearchDomains,
 }
 
 #[cfg(target_os = "linux")]
@@ -1057,7 +1089,10 @@ fn try_resolvconf() -> Option<Resolvconf> {
         }
         Err(_) => ResolvconfVariant::Debian,
     };
-    Some(Resolvconf { variant })
+    Some(Resolvconf {
+        variant,
+        search: Arc::new(ArcSwap::from_pointee(vec![DNS_DOMAIN.to_string()])),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1068,17 +1103,20 @@ impl Resolvconf {
             ResolvconfVariant::Openresolv => "tun-rayfish",
         }
     }
-}
 
-#[cfg(target_os = "linux")]
-#[async_trait]
-impl DnsConfigurator for Resolvconf {
-    async fn apply(&self) -> Result<()> {
+    /// (Re-)register our stanza with the current search domains. resolvconf
+    /// replaces an interface's whole record on `-a`, so this is also how a
+    /// join or leave lands.
+    async fn register(&self) -> Result<()> {
         use std::process::Stdio;
 
         use tokio::io::AsyncWriteExt;
         use tokio::process::Command;
-        let config = format!("nameserver {}\nsearch {DNS_DOMAIN}\n", resolver_addr());
+        let search = self.search.load();
+        let mut config = format!("nameserver {}\n", resolver_addr());
+        if !search.is_empty() {
+            config.push_str(&format!("search {}\n", search.join(" ")));
+        }
         let iface = self.iface_name();
         let mut child = Command::new("resolvconf")
             .args(["-a", iface])
@@ -1093,6 +1131,40 @@ impl DnsConfigurator for Resolvconf {
             .await?;
         let status = child.wait().await?;
         anyhow::ensure!(status.success(), "resolvconf -a failed");
+        Ok(())
+    }
+
+    /// resolvconf merges every registered interface into one flat
+    /// `/etc/resolv.conf`, and glibc stops at the first nameserver that answers
+    /// (an NXDOMAIN included). Second place therefore never sees a `.ray`
+    /// query. Nothing to fix from here, since the file is resolvconf's and not
+    /// ours to rewrite, so say so instead of reporting a success the host will
+    /// not show.
+    async fn warn_if_outranked(&self) {
+        let Ok(merged) = tokio::fs::read_to_string("/etc/resolv.conf").await else {
+            return;
+        };
+        let Some(first) = first_nameserver(&merged) else {
+            return;
+        };
+        if first == resolver_addr() {
+            return;
+        }
+        tracing::warn!(
+            ahead_of_us = %first,
+            other_vpn = ?foreign_mesh_resolver(&merged),
+            "resolvconf put another resolver ahead of ours in /etc/resolv.conf, so `.ray` \
+             queries stop there and never reach us; give our stanza priority in resolvconf's \
+             interface order, or run systemd-resolved so each VPN registers its own domains"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait]
+impl DnsConfigurator for Resolvconf {
+    async fn apply(&self) -> Result<()> {
+        self.register().await?;
         let variant_name = match self.variant {
             ResolvconfVariant::Debian => "debian",
             ResolvconfVariant::Openresolv => "openresolv",
@@ -1101,6 +1173,7 @@ impl DnsConfigurator for Resolvconf {
             variant = variant_name,
             "configured resolvconf for .{DNS_DOMAIN}"
         );
+        self.warn_if_outranked().await;
         Ok(())
     }
 
@@ -1117,6 +1190,14 @@ impl DnsConfigurator for Resolvconf {
 
     fn name(&self) -> &'static str {
         "resolvconf"
+    }
+
+    /// Our stanza carries the domains, so a join or leave re-registers it.
+    /// `set_manager_search_domains` would be a no-op on a host that fell this
+    /// far down the ladder: there is no resolved here to hand them to.
+    async fn set_search_domains(&self, domains: &[String], _tun_name: &str) -> Result<()> {
+        self.search.store(Arc::new(domains.to_vec()));
+        self.register().await
     }
 }
 
@@ -1227,17 +1308,52 @@ fn resolv_conf_is_ours(contents: &str) -> bool {
     contents.contains(HEADER_COMMENT.trim_end())
 }
 
+/// What one re-assert pass makes of the current `/etc/resolv.conf`.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum Reassert {
+    /// The file is ours. Nothing to do.
+    Held,
+    /// Something overwrote it that will not fight back (NetworkManager,
+    /// dhclient). Put ours back.
+    Rewrite,
+    /// Another overlay owns the file now. Stop watching and let it.
+    StoodDown(Ipv4Addr),
+}
+
+/// Decide what to do about the current contents, without touching the file.
+/// Split out from [`reassert_resolv_conf`] so the decision is testable.
+#[cfg(any(target_os = "linux", test))]
+fn reassert_decision(current: &str) -> Reassert {
+    if resolv_conf_is_ours(current) {
+        return Reassert::Held;
+    }
+    // Another overlay took the file while we held it. Rewriting it back is the
+    // rewrite war `DirectResolvConf::apply` refuses to start, only with the
+    // roles swapped: we would win every round in milliseconds and the host's
+    // DNS would be whichever write landed last. Which of the two booted first
+    // is not a good reason to be the one that fights.
+    match foreign_mesh_resolver(current) {
+        Some(ip) => Reassert::StoodDown(ip),
+        None => Reassert::Rewrite,
+    }
+}
+
 #[cfg(target_os = "linux")]
-async fn reassert_resolv_conf(search: &[String], fallback: Option<Ipv4Addr>) -> Result<()> {
+async fn reassert_resolv_conf(
+    search: &ArcSwap<Vec<String>>,
+    fallback: Option<Ipv4Addr>,
+) -> Result<Reassert> {
     let path = Path::new("/etc/resolv.conf");
     let current = tokio::fs::read_to_string(path).await.unwrap_or_default();
-    if !resolv_conf_is_ours(&current) {
+    let decision = reassert_decision(&current);
+    if decision == Reassert::Rewrite {
         tracing::warn!("/etc/resolv.conf was overwritten; re-asserting rayfish DNS");
-        tokio::fs::write(path, render_direct_resolv_conf(search, fallback))
+        tokio::fs::write(path, render_direct_resolv_conf(&search.load(), fallback))
             .await
             .context("re-asserting /etc/resolv.conf")?;
     }
-    Ok(())
+    Ok(decision)
 }
 
 /// Re-assert our resolv.conf the instant another program (NetworkManager,
@@ -1249,17 +1365,23 @@ async fn reassert_resolv_conf(search: &[String], fallback: Option<Ipv4Addr>) -> 
 /// NM is told to stop owning resolv.conf (`dns=none`, see [`nm_quiet_install`])
 /// in direct mode, so on an NM host this watch mostly fires for dhclient or
 /// other writers; it remains the catch-all repair either way.
+///
+/// Returns the other VPN's resolver if it stood down (see [`reassert_decision`]),
+/// `None` if it was cancelled. The caller owns what standing down means for the
+/// rest of the DNS state.
 #[cfg(target_os = "linux")]
 pub async fn run_resolv_reassert(
-    search: Vec<String>,
+    search: SearchDomains,
     fallback: Option<Ipv4Addr>,
     token: tokio_util::sync::CancellationToken,
-) {
+) -> Option<Ipv4Addr> {
     use futures::StreamExt;
 
     // Re-assert immediately: covers any trample between apply() and our arrival.
-    if let Err(e) = reassert_resolv_conf(&search, fallback).await {
-        tracing::warn!(error = %e, "initial resolv.conf re-assert failed");
+    match reassert_resolv_conf(&search, fallback).await {
+        Ok(Reassert::StoodDown(ip)) => return Some(ip),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "initial resolv.conf re-assert failed"),
     }
 
     // Watch the parent directory, not the file: NetworkManager/resolvconf
@@ -1303,15 +1425,31 @@ pub async fn run_resolv_reassert(
                     None => { stream = None; false } // stream ended; rely on the tick
                 };
                 if relevant
-                    && let Err(e) = reassert_resolv_conf(&search, fallback).await {
-                    tracing::warn!(error = %e, "resolv.conf re-assert failed");
+                    && let Some(ip) = pass(&search, fallback).await {
+                    return Some(ip);
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                if let Err(e) = reassert_resolv_conf(&search, fallback).await {
-                    tracing::warn!(error = %e, "resolv.conf re-assert failed");
+                if let Some(ip) = pass(&search, fallback).await {
+                    return Some(ip);
                 }
             }
+        }
+    }
+    None
+}
+
+/// One re-assert pass, reporting only the outcome the loop acts on: the foreign
+/// resolver we are standing down for. Errors are logged and treated as "keep
+/// watching" (the next tick retries).
+#[cfg(target_os = "linux")]
+async fn pass(search: &ArcSwap<Vec<String>>, fallback: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    match reassert_resolv_conf(search, fallback).await {
+        Ok(Reassert::StoodDown(ip)) => Some(ip),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "resolv.conf re-assert failed");
+            None
         }
     }
 }
@@ -1427,6 +1565,23 @@ async fn backup_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Drop the `/etc/resolv.conf` backup without restoring it.
+///
+/// For the one case where restoring is the wrong move: another VPN owns the
+/// file now, and our backup is a capture of the host from before either of us
+/// touched it. Putting that back over their configuration would break their
+/// DNS, and leaving it on disk would let `revert` or [`restore_stale_backups`]
+/// do exactly that later.
+#[cfg(target_os = "linux")]
+pub async fn discard_resolv_backup() {
+    let backup = backup_path(Path::new("/etc/resolv.conf"));
+    if backup.exists()
+        && let Err(e) = tokio::fs::remove_file(&backup).await
+    {
+        tracing::warn!(error = %e, path = %backup.display(), "failed to drop the stale DNS backup");
+    }
+}
+
 #[cfg(target_os = "linux")]
 async fn restore_file(path: &Path) -> Result<()> {
     let backup = backup_path(path);
@@ -1531,7 +1686,14 @@ pub fn emergency_restore_resolv_conf() {}
 #[cfg(target_os = "linux")]
 struct DirectResolvConf {
     captured_upstreams: Vec<Ipv4Addr>,
-    search: Vec<String>,
+    /// The search domains the file already had. Kept separately from the live
+    /// list so a later join/leave re-merges against the host's own domains
+    /// instead of accumulating ours on top of the previous render.
+    captured_search: Vec<String>,
+    /// What actually goes in the file: [`Self::captured_search`] plus the
+    /// rayfish domains, swapped whole on every join/leave and shared with the
+    /// re-assert task so a trample-repair writes the current list.
+    search: SearchDomains,
     /// The operator named `dns_upstreams` in the config. Their explicit choice
     /// overrides our refusal to take over with no verified upstream of our own:
     /// [`DnsService::configure`] merges theirs in after detection, so the
@@ -1552,19 +1714,35 @@ struct DirectResolvConf {
 /// A nameserver inside `100.64.0.0/10` that is not ours is the signal: nothing
 /// in that range is a real resolver, so it can only be another overlay's magic
 /// DNS. Deliberately not a check for any particular vendor's marker line.
+///
+/// Parsing goes through [`parse_resolv_nameservers`] for the reason stated
+/// there: `resolv.conf(5)` allows any run of whitespace after the keyword, and
+/// a hand-rolled `"nameserver "` match misses the generators that emit a tab.
+/// Missing an entry costs nothing there; here it costs us the whole check.
 #[cfg(any(target_os = "linux", test))]
 fn foreign_mesh_resolver(contents: &str) -> Option<Ipv4Addr> {
     if resolv_conf_is_ours(contents) {
         return None;
     }
-    contents
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("nameserver "))
-        .filter_map(|s| s.split_whitespace().next()?.parse::<Ipv4Addr>().ok())
-        .find(|ip| {
-            *ip != crate::dns::MAGIC_DNS_V4
-                && crate::membership::is_overlay_ip(std::net::IpAddr::V4(*ip))
-        })
+    // `parse_resolv_nameservers` already drops our own magic IP.
+    parse_resolv_nameservers(contents)
+        .into_iter()
+        .find(|ip| crate::membership::is_overlay_ip(IpAddr::V4(*ip)))
+}
+
+/// The first `nameserver` in `contents`, whatever its family.
+///
+/// glibc queries resolvers in the order they are listed and stops at the first
+/// one that answers, and an authoritative NXDOMAIN is an answer. On a file that
+/// something else merged (resolvconf), first place is therefore the only place
+/// from which `.ray` queries ever reach us.
+#[cfg(any(target_os = "linux", test))]
+fn first_nameserver(contents: &str) -> Option<IpAddr> {
+    contents.lines().find_map(|l| {
+        let mut f = l.split_whitespace();
+        let value = (f.next()? == "nameserver").then(|| f.next())??;
+        value.parse().ok()
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1583,7 +1761,7 @@ impl DirectResolvConf {
         let contents = tokio::fs::read_to_string("/etc/resolv.conf")
             .await
             .unwrap_or_default();
-        let search = contents
+        let search: Vec<String> = contents
             .lines()
             .filter_map(|l| {
                 l.trim()
@@ -1591,6 +1769,9 @@ impl DirectResolvConf {
                     .or_else(|| l.trim().strip_prefix("domain "))
             })
             .flat_map(|s| s.split_whitespace().map(|x| x.to_string()))
+            // Ours are re-derived from the joined networks on every refresh;
+            // keeping the ones this file already names would outlive a leave.
+            .filter(|d| !is_our_search_domain(d))
             .collect();
 
         let captured = parse_resolv_nameservers(&contents);
@@ -1604,7 +1785,8 @@ impl DirectResolvConf {
         }
         Self {
             captured_upstreams: live,
-            search,
+            search: Arc::new(ArcSwap::from_pointee(search.clone())),
+            captured_search: search,
             operator_upstreams: crate::config::load()
                 .map(|c| !c.dns_upstreams.servers.is_empty())
                 .unwrap_or(false),
@@ -1617,6 +1799,33 @@ impl DirectResolvConf {
     fn fallback(&self) -> Option<Ipv4Addr> {
         self.captured_upstreams.first().copied()
     }
+}
+
+/// Whether a search domain is one of ours to manage rather than the host's.
+///
+/// It matters when reading back a file we wrote: a daemon restarted while our
+/// own resolv.conf is in place captures its `search` line as "the host's", and
+/// without this the networks that line named would stay in the list forever,
+/// surviving the `ray leave` that should have dropped them.
+#[cfg(any(target_os = "linux", test))]
+fn is_our_search_domain(domain: &str) -> bool {
+    domain == DNS_DOMAIN || domain.ends_with(&format!(".{DNS_DOMAIN}"))
+}
+
+/// The host's own search domains followed by ours, without duplicates.
+///
+/// Host first: on a box that already searched `lan`, a bare name that resolves
+/// there keeps resolving there. Ours only add candidates, they never take one
+/// away, and the cost of losing the race is one extra NXDOMAIN.
+#[cfg(any(target_os = "linux", test))]
+fn merge_search_domains(captured: &[String], rayfish: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(captured.len() + rayfish.len());
+    for d in captured.iter().chain(rayfish) {
+        if !out.iter().any(|k| k == d) {
+            out.push(d.clone());
+        }
+    }
+    out
 }
 
 #[cfg(target_os = "linux")]
@@ -1655,7 +1864,7 @@ impl DnsConfigurator for DirectResolvConf {
         // Quiet NM first so it doesn't regenerate the file out from under the
         // write we're about to make (the inotify re-assert covers any residual).
         nm_quiet_install().await;
-        let new_content = render_direct_resolv_conf(&self.search, self.fallback());
+        let new_content = render_direct_resolv_conf(&self.search.load(), self.fallback());
         tokio::fs::write(path, new_content)
             .await
             .context("writing /etc/resolv.conf")?;
@@ -1683,8 +1892,32 @@ impl DnsConfigurator for DirectResolvConf {
         self.captured_upstreams.clone()
     }
 
-    fn search_domains(&self) -> Vec<String> {
-        self.search.clone()
+    /// We own the file, so the domains go in it. Nothing else would put them
+    /// there: this backend is the one the host falls to when it has no DNS
+    /// manager to hand them to.
+    async fn set_search_domains(&self, domains: &[String], _tun_name: &str) -> Result<()> {
+        self.search.store(Arc::new(merge_search_domains(
+            &self.captured_search,
+            domains,
+        )));
+        let path = Path::new("/etc/resolv.conf");
+        // Only rewrite a file that is still ours. If something else holds it,
+        // the re-assert watcher is the one that decides whether to take it back
+        // or stand down, and it has the whole file to decide from.
+        let current = tokio::fs::read_to_string(path).await.unwrap_or_default();
+        if !resolv_conf_is_ours(&current) {
+            return Ok(());
+        }
+        tokio::fs::write(
+            path,
+            render_direct_resolv_conf(&self.search.load(), self.fallback()),
+        )
+        .await
+        .context("writing search domains to /etc/resolv.conf")
+    }
+
+    fn search_handle(&self) -> Option<SearchDomains> {
+        Some(Arc::clone(&self.search))
     }
 
     fn fallback_upstream(&self) -> Option<Ipv4Addr> {
@@ -1697,8 +1930,10 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::{
-        foreign_mesh_resolver, nm_dns_none_dropin, parse_resolv_nameservers,
+        Reassert, first_nameserver, foreign_mesh_resolver, is_our_search_domain,
+        merge_search_domains, nm_dns_none_dropin, parse_resolv_nameservers, reassert_decision,
         render_direct_resolv_conf, render_direct_resolv_conf_with, resolv_conf_is_ours,
+        search_domains_for,
     };
     #[cfg(target_os = "linux")]
     use super::{nsswitch_uses_resolve, resolv_conf_points_at_resolved, strip_our_resolv_entries};
@@ -1738,6 +1973,68 @@ mod tests {
             foreign_mesh_resolver("nameserver 100.100.100.53\nnameserver 1.1.1.1\n"),
             None
         );
+        // resolv.conf(5) separates the keyword from its value by any run of
+        // whitespace, and generators do emit a tab. Missing the entry here
+        // would mean taking the file over and starting the rewrite war.
+        assert_eq!(
+            foreign_mesh_resolver("nameserver\t100.100.100.100\n"),
+            Some("100.100.100.100".parse::<Ipv4Addr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn reassert_stands_down_only_for_another_overlay() {
+        // Ours: nothing to do.
+        assert_eq!(
+            reassert_decision("# Added by rayfish - do not edit\nnameserver 100.100.100.53\n"),
+            Reassert::Held
+        );
+        // A trample by something that will not fight back: put ours back.
+        assert_eq!(
+            reassert_decision("# Generated by NetworkManager\nnameserver 192.168.1.1\n"),
+            Reassert::Rewrite
+        );
+        // Another VPN took the file while we held it. Rewriting it back here is
+        // the same fight `apply` refuses to start, so let go instead.
+        assert_eq!(
+            reassert_decision("nameserver 100.100.100.100\nsearch ts.net\n"),
+            Reassert::StoodDown("100.100.100.100".parse::<Ipv4Addr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn first_nameserver_is_the_one_glibc_asks() {
+        // A file resolvconf merged from two stanzas: only the first is queried.
+        let merged = "# Dynamic resolv.conf\nnameserver 100.100.100.100\nnameserver 100.100.100.53\nsearch ts.net ray\n";
+        assert_eq!(
+            first_nameserver(merged),
+            Some("100.100.100.100".parse().unwrap())
+        );
+        assert_eq!(
+            first_nameserver("search ray\nnameserver\t200::53\n"),
+            Some("200::53".parse().unwrap())
+        );
+        assert_eq!(first_nameserver("search ray\n"), None);
+    }
+
+    #[test]
+    fn search_domains_keep_the_hosts_own_first() {
+        let rayfish = search_domains_for(&["homelab".to_string(), "work".to_string()]);
+        assert_eq!(rayfish, ["homelab.ray", "work.ray", "ray"]);
+        // The host's own domains still resolve, and a domain named twice is
+        // listed once (glibc caps the search list, so duplicates cost real
+        // candidates).
+        assert_eq!(
+            merge_search_domains(&["lan".to_string(), "ray".to_string()], &rayfish),
+            ["lan", "ray", "homelab.ray", "work.ray"]
+        );
+        assert_eq!(merge_search_domains(&[], &rayfish), rayfish);
+        // Reading back a file we wrote must not turn our own domains into the
+        // host's, or a `ray leave` would never drop them.
+        assert!(is_our_search_domain("ray"));
+        assert!(is_our_search_domain("homelab.ray"));
+        assert!(!is_our_search_domain("lan"));
+        assert!(!is_our_search_domain("notray"));
     }
 
     #[test]
