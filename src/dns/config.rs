@@ -91,6 +91,10 @@ impl SearchDomain {
 
     /// One the host already had, read back from its own resolver configuration.
     /// Unvalidated on purpose: it is the host's, and we only carry it along.
+    ///
+    /// Only the backends that read a file back capture these, and only Linux
+    /// has one.
+    #[cfg(any(target_os = "linux", test))]
     fn from_host(domain: &str) -> Self {
         Self(SmolStr::new(domain))
     }
@@ -105,6 +109,7 @@ impl SearchDomain {
     /// our own resolv.conf is in place captures its `search` line as "the
     /// host's", and without this the networks that line named would stay in the
     /// list forever, surviving the `ray leave` that should have dropped them.
+    #[cfg(any(target_os = "linux", test))]
     fn is_ours(&self) -> bool {
         self.0 == DNS_DOMAIN || self.0.ends_with(&format!(".{DNS_DOMAIN}"))
     }
@@ -625,7 +630,7 @@ mod macos {
             if super::ipv6_only() && !self.tun_name.is_empty() {
                 write_service_config(&self.tun_name, self.mesh_v6)?;
             }
-            write_dns_config(&[DNS_DOMAIN.to_string()], &self.tun_name)?;
+            write_dns_config(&[super::SearchDomain::root()], &self.tun_name)?;
             tracing::info!(
                 key = SC_DNS_KEY,
                 interface = %self.tun_name,
