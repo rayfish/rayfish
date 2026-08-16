@@ -61,7 +61,7 @@ if retry_until 60 "RID=\"\$(request_id '$A' '$NET' srv-b)\"; [[ -n \"\$RID\" ]]"
 else
   fail "srv-b never appeared in 'ray requests'"; summary
 fi
-on "$A" "ray accept $NET $RID" 2>&1 | strip | sed 's/^/   a| /'
+on "$A" "ray requests $NET accept $RID" 2>&1 | strip | sed 's/^/   a| /'
 wait_roster "$A" srv-b
 
 # ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ if retry_until 60 "CID=\"\$(request_id '$A' '$NET' srv-c)\"; [[ -n \"\$CID\" ]]"
 else
   fail "srv-c never queued"; CID=""
 fi
-[[ -n "$CID" ]] && on "$A" "ray deny $NET $CID" 2>&1 | strip | sed 's/^/   a| /'
+[[ -n "$CID" ]] && on "$A" "ray requests $NET deny $CID" 2>&1 | strip | sed 's/^/   a| /'
 # A denied peer must not become a member. Give it a window; expect still offline.
 sleep 15
 [[ "$(peer_online "$A" srv-c "$NET")" == "0" ]] && pass "denied peer is not admitted" \

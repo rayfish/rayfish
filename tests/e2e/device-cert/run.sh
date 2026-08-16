@@ -106,7 +106,7 @@ fi
 sleep 3
 REQ="$(on "$A" "ray requests $NET" 2>/dev/null | strip || true)"
 echo "$REQ" | grep -qiE '[0-9a-f]{6,}' && { echo "   pending requests found, accepting:"; echo "$REQ" | sed 's/^/   r| /'; \
-  echo "$REQ" | awk '/^ /{print $1}' | while read -r rid; do [[ -n "$rid" ]] && on "$A" "ray accept $NET $rid" | strip | sed 's/^/   a| /'; done; }
+  echo "$REQ" | awk '/^ /{print $1}' | while read -r rid; do [[ -n "$rid" ]] && on "$A" "ray requests $NET accept $rid" | strip | sed 's/^/   a| /'; done; }
 
 # ---------------------------------------------------------------------------
 step "5. wait for roster convergence (A, B, C all visible)"

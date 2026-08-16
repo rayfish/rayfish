@@ -476,9 +476,10 @@ pub struct Daemon {
     /// (see [`DnsService`]). Shared as `Arc` so extracted consumers can hold it.
     dns: Arc<DnsService>,
     mdns_enabled: bool,
-    /// Whether this node opted into automatic stable updates (`ray auto-update
-    /// on` / `ray install --auto-update`). Read at startup; when set, `run_daemon`
-    /// spawns the periodic update task. Echoed back in `ray status`.
+    /// Whether this node opted into automatic stable updates
+    /// (`ray config set auto-update on` / `ray install --auto-update`). Read at
+    /// startup; when set, `run_daemon` spawns the periodic update task. Echoed
+    /// back in `ray status`.
     auto_update: bool,
     /// The resolved data-plane mode (`ray config set ipv6-only on`), for
     /// sharing a host with another VPN that owns `100.64.0.0/10`. Resolved once
@@ -892,8 +893,9 @@ impl Daemon {
 
     /// Apply one settings key and persist it. Serves `ray config set|unset` and
     /// every single-value command that used to carry its own IPC variant
-    /// (`ray mdns`, `ray auto-update`, `ray firewall on|off|reject|default`,
-    /// `ray firewall ssh on|off`, `ray files download-dir|download-user`).
+    /// (`ray mdns`, `ray firewall on|off|reject|default`, `ray firewall ssh
+    /// on|off`, `ray files download-dir|download-user`, and the hidden
+    /// `ray auto-update`, whose only spelling is now the key itself).
     ///
     /// Dispatch is on the key's store, because the two a [`NodeKey`] can name
     /// are not interchangeable: a firewall key writes the live `ArcSwap` the

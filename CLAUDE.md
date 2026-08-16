@@ -31,11 +31,11 @@ Service management never calls `systemctl` directly: `init_system::InitSystem` d
 sudo ray up | down            # activate / standby (down keeps peer connections, drops only the data plane)
 sudo ray start | stop | restart | install | uninstall | set-operator
 ray create | join | leave | nuke | kick | ephemeral | hostname | status
-ray invite | requests | accept | deny | admin        # admission + coordinators
-ray connect | connections | contact | pair | unpair  # direct links + multi-device identity
+ray invite | requests [accept|deny] | admin          # admission + coordinators
+ray connect [list|approve] | contact | pair | unpair  # direct links + multi-device identity
 ray firewall … | apply | alias | identityof          # policy
 ray exit-node allow | disallow | use | none | status  # internet gateway (offer: Linux/macOS/BSD, use: Linux/macOS)
-ray send | files | config | gui | mdns | auto-update | update | ping | netcheck | logs | report
+ray send | files | config | gui | mdns | update | ping | netcheck | logs | report
 ray completions [shell] [--install]                  # tab completion (installed by `ray up`)
 ```
 
@@ -87,7 +87,7 @@ Android runs the same core, not a reimplementation. `ray-mobile` is a UniFFI cdy
 The rules the code upholds. Read the code for the mechanics.
 
 - **Reachability = a shared network.** Two peers exchange packets iff they share ≥1 network (a QUIC connection only exists within one; the receiver also drops any datagram whose handle-tagged network its verified roster no longer shares with the sender). The network split is coarse access; the per-device firewall is the fine layer.
-- **Room id ≠ admission.** The network public key is a discovery key, never a credential. Open networks auto-admit; closed networks gate on a one-time invite, a reusable key (carried in the signed blob), or live approval (`ray accept`).
+- **Room id ≠ admission.** The network public key is a discovery key, never a credential. Open networks auto-admit; closed networks gate on a one-time invite, a reusable key (carried in the signed blob), or live approval (`ray requests <net> accept`).
 - **The signed `GroupBlob` is the source of truth.** One pkarr record per network, signed by the per-network key (the pkarr address *is* the public key, so records are MITM-resistant). Roster, suggested firewall, reusable keys, and `nullifiers` (`ray unpair`) all ride it. Members reconverge from the signed record on the group poll or a payload-free `MemberSync`/`BlobUpdated` **trigger**: control messages are triggers, never trusted data.
 - **Coordinator = network-key holder.** Any holder can admit, suggest firewall, kick, and republish; `ray admin add` grants the key (co-coordinator). Admission survives any single coordinator being offline (the joiner dials the full coordinator set).
 - **Firewall is secure-by-default.** Inbound TCP/UDP denied, inbound ICMP allowed (a seeded, removable rule), outbound allowed; a stateful conntrack lets return traffic back. Coordinator suggestions are advisory and consented per-node; local rules are never touched by reconverge.
@@ -115,7 +115,7 @@ The rules the code upholds. Read the code for the mechanics.
   `IpcMessage`, which is why it is dispatched in `handle_ipc_client` ahead of
   `handle_request`. Keep it that way: a second streaming reply is a reason to
   factor the pattern out, not to widen every handler's signature.
-- **CLI help is grouped in `src/cli/help.rs`.** clap has no subcommand grouping (`help_heading`/`hide_short_help` are argument-only), so the `-h` command list is rendered there from the clap model and the help template drops `{subcommands}`. A new command must join a `GROUPS` entry or it appears nowhere (tests enforce both directions). Subcommands stay *visible* in the clap model on purpose: `hide = true` would suppress clap's list but `clap_complete` skips hidden subcommands, silently gutting tab completion. Keep each `about` to one line inside 80 columns and put the rest after a blank line, where it becomes `ray help <command>`.
+- **CLI help is grouped in `src/cli/help.rs`, per page.** clap has no subcommand grouping (`help_heading`/`hide_short_help` are argument-only), so a grouped `-h` list is rendered there from the clap model and the help template drops `{subcommands}`. `PAGES` maps a command path to its groups (`&[]` = the root, `&["firewall"]` = `ray firewall`); a new command must join the groups of the page it sits on or it appears nowhere, and the tests enforce both directions per page. Group a page only when it outgrows a flat list: below about eight actions a heading per two entries is noise. **`about` is one line inside 80 columns at every depth** (`every_about_fits_the_listing` walks the whole model), with the rest after a blank line, where it becomes `ray help <command> <action>`; `wrap_help` is on so those paragraphs wrap to the terminal. Subcommands stay *visible* in the clap model unless hiding them is the point: `hide = true` suppresses clap's list but `clap_complete` also skips hidden subcommands, which silently guts tab completion for a command meant to be typed — and is exactly right for one that isn't (`open`), or for an old spelling kept alive only so existing scripts keep working (`accept`, `deny`, `connections`, `auto-update`).
 - **`--json` is per-command, never on the root.** It is declared on each command that renders JSON, `global = true` so it also parses after that command's action (`ray firewall show --json`). Declaring it on `Cli` would put it back on all 44 commands, most of which would ignore it in silence.
 - **Logging** is `tracing`: console at `info`, rolling daily files at `rayfish=debug` (bundled by `ray report`). The daemon panic hook restores DNS then `abort()`s so the service manager restarts it (fail-fast, never limp).
 - **Git:** conventional commit subjects (`feat`/`fix`/`docs`/…) so git-cliff can generate the changelog.

@@ -428,7 +428,7 @@ pub struct AppConfig {
     pub idle_timeout_secs: Option<u64>,
     /// Opt-in automatic updates: when on, the daemon periodically checks for a
     /// newer stable release, swaps the binary, and restarts itself onto it. Off
-    /// by default; enable via `ray install --auto-update` or `ray auto-update on`.
+    /// by default; enable via `ray install --auto-update` or `ray config set auto-update on`.
     #[serde(default)]
     pub auto_update: bool,
     /// Last release tag the auto-updater attempted (e.g. `v0.2.0`). Persisted so a

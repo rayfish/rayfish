@@ -779,7 +779,7 @@ fn print_pending_summary(
         pending.push((
             pending_connects,
             pluralize(pending_connects, "connection request"),
-            "ray connections".to_string(),
+            "ray connect".to_string(),
         ));
     }
     if pending.is_empty() {

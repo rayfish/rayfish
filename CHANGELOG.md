@@ -8,6 +8,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`ray firewall --help` is grouped, and every help page reads in one pass.**
+  The firewall's 13 actions are now listed under Rules, Mode, Coordinator
+  suggestions and Mesh SSH, the way `ray --help` has been grouped for a while.
+  Everywhere else, a command's one-line summary is now actually one line:
+  descriptions that ran to a full paragraph on a single unwrapped line have
+  been cut back to a summary, with the detail moved into
+  `ray help <command> <action>`, which now wraps to your terminal instead of
+  printing one very long line.
+- **Four commands moved next to the thing they act on.** `ray connections` is
+  now `ray connect` (bare, it lists incoming requests) and `ray connections
+  approve <id>` is `ray connect approve <id>`. `ray accept <net> <id>` and
+  `ray deny <net> <id>` are now `ray requests <net> accept <id>` and
+  `ray requests <net> deny <id>`. `ray auto-update on|off` is now
+  `ray config set auto-update on|off`. The old spellings all still work, so
+  existing scripts are unaffected; they no longer appear in `ray --help` or in
+  tab completion. `ray open` (the `rayfish://` link handler, which nobody types)
+  is hidden for the same reason.
 - **The mobile app stops waking the radio every minute.** Every node used to
   re-resolve each network's signed record once a minute, whether or not
   anything had changed, which on a phone is a wakeup per network per minute for
