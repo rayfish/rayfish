@@ -24,6 +24,48 @@ pub struct Resolver {
     /// Per-name forwarding counters for [`LOOP_WINDOW`], kept only for names
     /// sent to another mesh's resolver. See [`Resolver::loop_guard_allows`].
     overlay_forwards: DashMap<SmolStr, (Instant, u32)>,
+    /// Suffixes that belong to somebody else's resolver, asked before
+    /// [`Self::upstreams`]. Empty on a host we do not share DNS with.
+    delegations: Arc<ArcSwap<Vec<Delegation>>>,
+}
+
+/// A DNS suffix that belongs to another resolver, and where to send it.
+///
+/// The point of naming the suffix is that the *general* upstream then does not
+/// have to be the other mesh's resolver. Sharing `/etc/resolv.conf` means we
+/// are asked first for every name on the host, including theirs; without a
+/// delegation the only way to answer theirs is to forward everything to them,
+/// which is both a detour for names neither mesh owns and the setup that loops
+/// when their resolver is pointed back at us.
+#[derive(Clone, Debug)]
+pub struct Delegation {
+    /// Lowercase, no trailing dot. Matched on label boundaries.
+    suffix: SmolStr,
+    upstream: SocketAddr,
+}
+
+impl Delegation {
+    pub fn new(suffix: &str, upstream: SocketAddr) -> Self {
+        Self {
+            suffix: SmolStr::new(suffix.trim_matches('.').to_ascii_lowercase()),
+            upstream,
+        }
+    }
+
+    /// Whether `name` (lowercase, no trailing dot) is the suffix or sits under
+    /// it. The boundary check is what keeps `nottailnet.ts.net` out of a
+    /// delegation for `tailnet.ts.net`: a bare `ends_with` would hand another
+    /// tailnet's name, or a lookalike domain, to a resolver that is not ours to
+    /// send it to.
+    fn covers(&self, name: &str) -> bool {
+        if self.suffix.is_empty() {
+            return false;
+        }
+        let Some(rest) = name.strip_suffix(self.suffix.as_str()) else {
+            return false;
+        };
+        rest.is_empty() || rest.ends_with('.')
+    }
 }
 
 /// How many times one name may go to another mesh's resolver inside
@@ -58,7 +100,14 @@ impl Resolver {
             upstreams: Arc::new(ArcSwap::from_pointee(Vec::new())),
             ipv6_only: AtomicBool::new(false),
             overlay_forwards: DashMap::new(),
+            delegations: Arc::new(ArcSwap::from_pointee(Vec::new())),
         }
+    }
+
+    /// Replace the set of suffixes handed to another resolver. Empty clears it,
+    /// which is what a host that stops sharing DNS does.
+    pub fn set_delegations(&self, delegations: Vec<Delegation>) {
+        self.delegations.store(Arc::new(delegations));
     }
 
     /// Record whether mesh IPv4 is usable on this node. Called once at daemon
@@ -154,15 +203,35 @@ impl Resolver {
 
     async fn forward(&self, query: &[u8]) -> Option<Vec<u8>> {
         let upstreams = self.upstreams.load();
-        if upstreams.is_empty() {
+        let delegations = self.delegations.load();
+
+        // The name is only needed to route and to count loops, so it is parsed
+        // only when one of those is in play. A host with ordinary resolvers and
+        // no shared file pays nothing for either.
+        let name = (!delegations.is_empty()
+            || upstreams
+                .iter()
+                .any(|a| crate::membership::is_overlay_ip(a.ip())))
+        .then(|| query_name(query))
+        .flatten();
+        let delegated = name
+            .as_deref()
+            .and_then(|n| delegations.iter().find(|d| d.covers(n)))
+            .map(|d| d.upstream);
+
+        if delegated.is_none() && upstreams.is_empty() {
             tracing::warn!("no DNS upstream configured; cannot forward off-mesh queries");
             return None;
         }
-        for up in upstreams.iter() {
+        // The delegated resolver first, then the general ones: a name under its
+        // suffix is its to answer, and falling through to the defaults after
+        // means a resolver that has gone away costs a timeout rather than the
+        // whole zone.
+        for up in delegated.iter().chain(upstreams.iter()) {
             // Skip an overlay resolver that this name has already been bounced
             // off, and fall through to the next upstream (a real server, if the
             // capture found one) rather than feeding the loop another hop.
-            if crate::membership::is_overlay_ip(up.ip()) && !self.loop_guard_allows(query) {
+            if crate::membership::is_overlay_ip(up.ip()) && !self.loop_guard_allows(name.as_ref()) {
                 continue;
             }
             match forward_once(query, *up, FORWARD_TIMEOUT).await {
@@ -177,19 +246,19 @@ impl Resolver {
     /// Count one forward of this query's name to another mesh's resolver, and
     /// say whether it is still under [`LOOP_LIMIT`] for the current window.
     ///
-    /// Only asked about overlay upstreams, so the packet parse and the map hit
-    /// stay off the path a host with ordinary resolvers takes. A query we
-    /// cannot parse a name out of is allowed: it is not the shape a loop has,
-    /// and guessing would drop real traffic.
-    fn loop_guard_allows(&self, query: &[u8]) -> bool {
-        let Some(name) = query_name(query) else {
+    /// Only asked about overlay upstreams, so the map hit stays off the path a
+    /// host with ordinary resolvers takes. A query we could not parse a name
+    /// out of is allowed: it is not the shape a loop has, and guessing would
+    /// drop real traffic.
+    fn loop_guard_allows(&self, name: Option<&SmolStr>) -> bool {
+        let Some(name) = name else {
             return true;
         };
         let now = Instant::now();
         // Evict before inserting a new name, never on a hit, so a loop's own
         // entry cannot be swept out from under the count that is tripping.
         if self.overlay_forwards.len() >= LOOP_GUARD_MAX_NAMES
-            && !self.overlay_forwards.contains_key(&name)
+            && !self.overlay_forwards.contains_key(name.as_str())
         {
             self.overlay_forwards
                 .retain(|_, (started, _)| now.duration_since(*started) < LOOP_WINDOW);
@@ -322,6 +391,56 @@ mod tests {
         pkt.build_bytes_vec().expect("build query")
     }
 
+    /// A delegated suffix covers itself and anything under it, and stops at a
+    /// label boundary. Without the boundary check `nottailnet.ts.net` would be
+    /// handed to a resolver that has no business seeing it.
+    #[test]
+    fn delegation_covers_its_zone_and_stops_at_a_label() {
+        let up = SocketAddr::from(([100, 100, 100, 100], 53));
+        let d = Delegation::new("tailnet.ts.net", up);
+        assert!(d.covers("tailnet.ts.net"));
+        assert!(d.covers("box.tailnet.ts.net"));
+        assert!(d.covers("a.b.tailnet.ts.net"));
+        assert!(!d.covers("nottailnet.ts.net"));
+        assert!(!d.covers("ts.net"));
+        assert!(!d.covers("tailnet.ts.net.evil.com"));
+        // Written with the dots a resolv.conf or a config might carry.
+        assert!(Delegation::new(".Tailnet.TS.net.", up).covers("box.tailnet.ts.net"));
+    }
+
+    /// The whole point of the delegation: their names reach their resolver
+    /// while everything else goes to a real server, so general traffic never
+    /// touches a resolver that might be pointed back at us.
+    #[tokio::test]
+    async fn delegated_names_go_to_their_resolver_and_the_rest_upstream() {
+        let theirs = Ipv4Addr::new(10, 0, 0, 1);
+        let general = Ipv4Addr::new(10, 0, 0, 2);
+        let their_server = fake_upstream(theirs).await;
+        let general_server = fake_upstream(general).await;
+
+        let r = Resolver::new(HostnameTable::default(), ReverseLookupTable::default());
+        r.set_upstream_addrs([general_server]);
+        r.set_delegations(vec![Delegation::new("tailnet.ts.net", their_server)]);
+
+        let resp = r
+            .resolve(&build_a_query("box.tailnet.ts.net"))
+            .await
+            .expect("delegated answer");
+        assert!(
+            response_has_a(&resp, theirs),
+            "a name under their suffix must go to their resolver"
+        );
+
+        let resp = r
+            .resolve(&build_a_query("example.com"))
+            .await
+            .expect("general answer");
+        assert!(
+            response_has_a(&resp, general),
+            "everything else must go to the general upstream, not to them"
+        );
+    }
+
     /// The circuit breaker opens for one name and only that name, and a query
     /// with no question in it is never what trips it.
     #[test]
@@ -333,25 +452,25 @@ mod tests {
         // name repeatedly is normal, and this must not be a rate limit on it.
         for i in 1..=LOOP_LIMIT {
             assert!(
-                r.loop_guard_allows(&looping),
+                r.loop_guard_allows(query_name(&looping).as_ref()),
                 "forward {i} of {LOOP_LIMIT} should be allowed"
             );
         }
         assert!(
-            !r.loop_guard_allows(&looping),
+            !r.loop_guard_allows(query_name(&looping).as_ref()),
             "the forward past the limit is the one that stops"
         );
         // Still shut on the next query, or a loop would get a hop per query.
-        assert!(!r.loop_guard_allows(&looping));
+        assert!(!r.loop_guard_allows(query_name(&looping).as_ref()));
 
         // A different name is unaffected: the breaker is per-name, so one
         // looping lookup cannot take the host's other DNS down with it.
-        assert!(r.loop_guard_allows(&build_a_query("fine.example.com")));
+        assert!(r.loop_guard_allows(query_name(&build_a_query("fine.example.com")).as_ref()));
 
         // A malformed query has no name to count. Allowed, since dropping what
         // we cannot parse would fail real traffic to protect against a shape a
         // loop does not have.
-        assert!(r.loop_guard_allows(&[0u8; 4]));
+        assert!(r.loop_guard_allows(query_name(&[0u8; 4]).as_ref()));
     }
 
     /// Names differing only in case are one name to DNS, so they have to be one
@@ -360,10 +479,10 @@ mod tests {
     fn loop_guard_counts_a_name_case_insensitively() {
         let r = Resolver::new(HostnameTable::default(), ReverseLookupTable::default());
         for _ in 1..=5 {
-            assert!(r.loop_guard_allows(&build_a_query("Mixed.Example.Com")));
-            assert!(r.loop_guard_allows(&build_a_query("mixed.example.com")));
+            assert!(r.loop_guard_allows(query_name(&build_a_query("Mixed.Example.Com")).as_ref()));
+            assert!(r.loop_guard_allows(query_name(&build_a_query("mixed.example.com")).as_ref()));
         }
-        assert!(!r.loop_guard_allows(&build_a_query("MIXED.EXAMPLE.COM")));
+        assert!(!r.loop_guard_allows(query_name(&build_a_query("MIXED.EXAMPLE.COM")).as_ref()));
     }
 
     fn response_has_a(bytes: &[u8], ip: Ipv4Addr) -> bool {

@@ -176,6 +176,18 @@ pub trait DnsConfigurator: Send + Sync {
     fn fallback_upstream(&self) -> Option<Ipv4Addr> {
         None
     }
+    /// The other mesh's resolver and the domains it answers for, when this
+    /// backend is sharing `/etc/resolv.conf` with one.
+    ///
+    /// Sharing the file puts us first for *every* name on the host, theirs
+    /// included, so without this the only way their names resolve is to forward
+    /// everything to them. Naming their domains instead lets general traffic go
+    /// to real servers: shorter for names neither mesh owns, and it is what
+    /// stops a resolver pointed back at us from looping.
+    /// Default: none (no other backend shares a file with anybody).
+    fn delegated_domains(&self) -> Option<(Vec<SearchDomain>, Ipv4Addr)> {
+        None
+    }
 }
 
 /// Revert a DNS configuration.
@@ -2190,6 +2202,20 @@ impl DnsConfigurator for DirectResolvConf {
 
     fn fallback_upstream(&self) -> Option<Ipv4Addr> {
         self.fallback()
+    }
+
+    /// The domains their file carried, which are theirs by construction: we
+    /// only captured them because their resolver was in the file we read.
+    fn delegated_domains(&self) -> Option<(Vec<SearchDomain>, Ipv4Addr)> {
+        let foreign = self.foreign_resolver?;
+        if self.captured_search.is_empty() {
+            // Nothing to delegate, so everything keeps going to them (their
+            // resolver is captured as an upstream). A merge with a file that
+            // named no search domains is the one case suffix routing cannot
+            // narrow, since we have no idea which names are theirs.
+            return None;
+        }
+        Some((self.captured_search.clone(), foreign))
     }
 }
 

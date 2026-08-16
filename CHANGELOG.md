@@ -30,11 +30,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   everything outside `.ray` is forwarded to it. Both meshes resolve, whichever
   VPN wrote the file last. Rayfish writes at most once a minute, so the two
   cannot spin against each other, and it goes back to managing the file alone
-  once the other VPN leaves. If that VPN is pointed back at Rayfish (it can be,
-  when it starts on a host Rayfish already configured), a name neither mesh
-  owns would bounce between the two; Rayfish now stops sending a name onward
-  after it has bounced, so the lookup falls through to the other VPN instead of
-  looping.
+  once the other VPN leaves.
+- **The other VPN's names keep resolving too.** Sharing `/etc/resolv.conf`
+  means Rayfish is asked first for every name on the host, including the other
+  VPN's. Names under the domains its own config claimed go to its resolver;
+  everything else goes to the host's real DNS servers, which is both shorter
+  and the reason the two cannot end up forwarding to each other in a circle.
+  If they somehow still do, Rayfish stops sending a name onward once it has
+  bounced.
 - **Shutting down no longer takes the other VPN's DNS with it.** When Rayfish
   shares `/etc/resolv.conf`, `ray down` (and a crash, and a restart) removes
   only the lines Rayfish added, leaving the other VPN's resolver and search
