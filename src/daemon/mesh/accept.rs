@@ -1704,7 +1704,7 @@ mod direct_grant_tests {
             })
             .unwrap();
         }
-        Arc::new(std::sync::RwLock::new(NetworkState {
+        Arc::new(RwLock::new(NetworkState {
             members: list,
             approved: ApprovedList::new(),
             snapshot: None,
