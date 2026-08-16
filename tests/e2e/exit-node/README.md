@@ -23,6 +23,26 @@ scenario is the only thing that exercises it:
 | **Inbound connections** | our SSH session to srv-b's **public IP** keeps working under the full tunnel (see below) |
 | Deny path | srv-c selects the same exit but is not on the allow-list: it gets no internet through srv-a **and** does not silently leak out its own uplink |
 | Teardown | `exit-node none` reverts egress and removes the ip rules; `ray down` removes the nft table and restores the sysctls (the host must not stay a router) |
+| **IPv6-only client** | srv-b restarts in IPv6-only mode and uses the same exit (see below) |
+
+## The IPv6-only step
+
+Step 9 puts srv-b in the mode it runs in when it shares a host with Tailscale,
+and asserts the tunnel takes IPv6 **and only IPv6**: the v6 default goes into
+table 29793, no v4 rule is installed at all, `curl -6` reports srv-a's address
+and `curl -4` still reports srv-b's own. That last one is a deliberate
+non-property, not an oversight, so it is checked rather than assumed.
+
+It also stands in for the co-resident VPN the mode exists for, by putting a
+route in table 52 behind a rule at priority 5250 before turning the tunnel on,
+and asserting it was mirrored into the tunnel table. Without that mirror our
+catch-all rule at priority 102 wins, the foreign prefix is never reached, and
+that VPN goes dark the moment `exit-node use` runs.
+
+Whether srv-a can serve such a client depends on srv-a having IPv6 egress, which
+not every instance has. Both branches are asserted: with a v6 uplink the tunnel
+must work, without one the selection must be **refused by name** rather than
+installed and left to black-hole.
 
 ## The inbound-connection assertion
 
