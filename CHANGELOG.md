@@ -19,6 +19,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The metrics endpoint no longer answers the local network.** The Prometheus
+  exporter bound `0.0.0.0:9090`, so any device on the same Wi-Fi could read
+  it. Its counters name every peer by mesh IP with per-peer round-trip times
+  and traffic volumes, which is a usable picture of who a node talks to and
+  when. It now binds `127.0.0.1:9090`. Scraping from the same machine is
+  unaffected; if you scraped a node remotely, reach it over the mesh.
+- **The mobile app no longer runs a metrics collector.** The Prometheus
+  exporter and its per-peer sampling loop were started on Android too, waking
+  the app every 60 seconds to measure connections for an endpoint that
+  nothing on a phone can scrape. Neither is started there now.
 - **Membership changes reach devices that aren't currently connected.** A
   coordinator's kick, firewall suggestion or roster edit was only delivered to
   peers holding a live connection at that moment. Phones and other on-demand

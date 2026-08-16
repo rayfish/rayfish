@@ -704,6 +704,7 @@ async fn build_daemon_inner(
     // Prometheus metrics server. Its guard is kept alive by the Daemon (dropping it
     // stops the export); built here from the local handles so it can be a plain
     // owned field. `None` if it failed to bind.
+    #[cfg(not(target_os = "android"))]
     let metrics_server = spawn_metrics_server(
         stats.clone(),
         peers.clone(),
@@ -711,6 +712,11 @@ async fn build_daemon_inner(
         token.clone(),
     )
     .await;
+    // A phone has no Prometheus scraper and no way to reach one, and the server
+    // brings a 60s per-peer sampling loop with it (`PeerMetrics::spawn_collector`):
+    // a wakeup a minute, forever, for an endpoint nobody reads.
+    #[cfg(target_os = "android")]
+    let metrics_server: Option<MetricsServer> = None;
 
     let auto_update = app_config.auto_update;
     let daemon = Arc::new(Daemon {
@@ -813,8 +819,10 @@ fn spawn_mdns_discovery(ep: &Endpoint, token: CancellationToken, lan_peers: Arc<
 }
 
 /// Register rayfish counters, per-peer gauges, and iroh endpoint metrics, then
-/// start the Prometheus HTTP endpoint on `:9090`. The returned guard must be
-/// kept alive for the process lifetime; `None` means metrics export is disabled.
+/// start the Prometheus HTTP endpoint on `127.0.0.1:9090`. The returned guard
+/// must be kept alive for the process lifetime; `None` means metrics export is
+/// disabled. Not built on Android: see the call site.
+#[cfg(not(target_os = "android"))]
 async fn spawn_metrics_server(
     stats: Arc<ForwardMetrics>,
     peers: PeerTable,
@@ -828,7 +836,12 @@ async fn spawn_metrics_server(
     peer_metrics.spawn_collector(peers, token);
     registry.register_all(endpoint.metrics());
 
-    let metrics_addr: SocketAddr = ([0, 0, 0, 0], 9090).into();
+    // Loopback, not `0.0.0.0`. These counters name every peer by mesh IP along
+    // with its RTT and traffic volumes, which is a map of who this node talks to
+    // and when: not something to serve to whatever else is on the cafe Wi-Fi.
+    // Local scraping (the usual case) is unaffected; remote scraping should go
+    // over the mesh rather than the LAN.
+    let metrics_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 9090).into();
     match iroh_metrics::service::MetricsServer::spawn(metrics_addr, Arc::new(registry)).await {
         Ok(server) => {
             tracing::info!(addr = %server.local_addr(), "metrics server started");
