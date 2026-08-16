@@ -5,9 +5,11 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
+use smol_str::SmolStr;
 
 use crate::dns::{HostnameTable, MAGIC_DNS_V4, ReverseLookupTable};
 
@@ -19,7 +21,34 @@ pub struct Resolver {
     /// responder withholds A records (see [`crate::dns::handle_query`]): mesh
     /// IPv4 is not routed here, so handing an app one is a black hole.
     ipv6_only: AtomicBool,
+    /// Per-name forwarding counters for [`LOOP_WINDOW`], kept only for names
+    /// sent to another mesh's resolver. See [`Resolver::loop_guard_allows`].
+    overlay_forwards: DashMap<SmolStr, (Instant, u32)>,
 }
+
+/// How many times one name may go to another mesh's resolver inside
+/// [`LOOP_WINDOW`] before we stop sending it there.
+///
+/// A resolver we share `/etc/resolv.conf` with can be pointed straight back at
+/// us, and then a name neither mesh owns bounces between the two until
+/// something gives. Tailscale reads the live file for its own upstreams and
+/// drops only its *own* service IPs from what it finds (`GetBaseConfig` in
+/// `net/dns/direct.go`, added for tailscale/tailscale#7816, which is this same
+/// loop with systemd-resolved on the other end), so a daemon that starts while
+/// our file is in place adopts our magic IP as its upstream and neither side's
+/// filter catches it.
+///
+/// The threshold is a circuit breaker, not a rate limit: it has to sit above
+/// what a busy host legitimately asks for (glibc does not cache, so every
+/// `getaddrinfo` is a query and parallel connections to one host are normal),
+/// and a loop blows past it inside a millisecond because each hop multiplies.
+const LOOP_LIMIT: u32 = 10;
+const LOOP_WINDOW: Duration = Duration::from_secs(5);
+
+/// Cap on distinct names tracked at once, so a host resolving endlessly many
+/// names cannot grow the map without bound. Well above the working set a loop
+/// produces (a loop hammers *one* name), so eviction never hides one.
+const LOOP_GUARD_MAX_NAMES: usize = 1024;
 
 impl Resolver {
     pub fn new(table: HostnameTable, reverse: ReverseLookupTable) -> Self {
@@ -28,6 +57,7 @@ impl Resolver {
             reverse,
             upstreams: Arc::new(ArcSwap::from_pointee(Vec::new())),
             ipv6_only: AtomicBool::new(false),
+            overlay_forwards: DashMap::new(),
         }
     }
 
@@ -129,6 +159,12 @@ impl Resolver {
             return None;
         }
         for up in upstreams.iter() {
+            // Skip an overlay resolver that this name has already been bounced
+            // off, and fall through to the next upstream (a real server, if the
+            // capture found one) rather than feeding the loop another hop.
+            if crate::membership::is_overlay_ip(up.ip()) && !self.loop_guard_allows(query) {
+                continue;
+            }
             match forward_once(query, *up, FORWARD_TIMEOUT).await {
                 Ok(resp) => return Some(resp),
                 Err(e) => tracing::debug!(upstream = %up, error = %e, "upstream DNS query failed"),
@@ -137,6 +173,62 @@ impl Resolver {
         tracing::warn!(upstreams = ?upstreams.as_ref(), "no DNS upstream answered");
         None
     }
+
+    /// Count one forward of this query's name to another mesh's resolver, and
+    /// say whether it is still under [`LOOP_LIMIT`] for the current window.
+    ///
+    /// Only asked about overlay upstreams, so the packet parse and the map hit
+    /// stay off the path a host with ordinary resolvers takes. A query we
+    /// cannot parse a name out of is allowed: it is not the shape a loop has,
+    /// and guessing would drop real traffic.
+    fn loop_guard_allows(&self, query: &[u8]) -> bool {
+        let Some(name) = query_name(query) else {
+            return true;
+        };
+        let now = Instant::now();
+        // Evict before inserting a new name, never on a hit, so a loop's own
+        // entry cannot be swept out from under the count that is tripping.
+        if self.overlay_forwards.len() >= LOOP_GUARD_MAX_NAMES
+            && !self.overlay_forwards.contains_key(&name)
+        {
+            self.overlay_forwards
+                .retain(|_, (started, _)| now.duration_since(*started) < LOOP_WINDOW);
+        }
+        let mut entry = self
+            .overlay_forwards
+            .entry(name.clone())
+            .or_insert((now, 0));
+        let (started, count) = &mut *entry;
+        if now.duration_since(*started) >= LOOP_WINDOW {
+            // Window expired: start a fresh one. A loop that is still running
+            // gets to send exactly one more burst before tripping again, which
+            // is also what lets a genuinely transient trip heal.
+            *started = now;
+            *count = 1;
+            return true;
+        }
+        *count += 1;
+        if *count > LOOP_LIMIT {
+            // Once per window, not once per query: a loop trips this thousands
+            // of times a second.
+            if *count == LOOP_LIMIT + 1 {
+                tracing::warn!(
+                    %name,
+                    "another mesh's resolver has been sent this name {LOOP_LIMIT} times in \
+                     {LOOP_WINDOW:?}; it is forwarding back to us, so no longer sending it there"
+                );
+            }
+            return false;
+        }
+        true
+    }
+}
+
+/// The first question's name in a DNS query, lowercased for comparison.
+fn query_name(query: &[u8]) -> Option<SmolStr> {
+    let packet = simple_dns::Packet::parse(query).ok()?;
+    let name = packet.questions.first()?.qname.to_string();
+    Some(SmolStr::new(name.to_ascii_lowercase()))
 }
 
 /// How long to wait for an upstream to answer a forwarded query.
@@ -228,6 +320,50 @@ mod tests {
             false,
         ));
         pkt.build_bytes_vec().expect("build query")
+    }
+
+    /// The circuit breaker opens for one name and only that name, and a query
+    /// with no question in it is never what trips it.
+    #[test]
+    fn loop_guard_trips_on_the_looping_name_alone() {
+        let r = Resolver::new(HostnameTable::default(), ReverseLookupTable::default());
+        let looping = build_a_query("bounced.example.com");
+
+        // Everything up to the limit goes through: a busy host asking for one
+        // name repeatedly is normal, and this must not be a rate limit on it.
+        for i in 1..=LOOP_LIMIT {
+            assert!(
+                r.loop_guard_allows(&looping),
+                "forward {i} of {LOOP_LIMIT} should be allowed"
+            );
+        }
+        assert!(
+            !r.loop_guard_allows(&looping),
+            "the forward past the limit is the one that stops"
+        );
+        // Still shut on the next query, or a loop would get a hop per query.
+        assert!(!r.loop_guard_allows(&looping));
+
+        // A different name is unaffected: the breaker is per-name, so one
+        // looping lookup cannot take the host's other DNS down with it.
+        assert!(r.loop_guard_allows(&build_a_query("fine.example.com")));
+
+        // A malformed query has no name to count. Allowed, since dropping what
+        // we cannot parse would fail real traffic to protect against a shape a
+        // loop does not have.
+        assert!(r.loop_guard_allows(&[0u8; 4]));
+    }
+
+    /// Names differing only in case are one name to DNS, so they have to be one
+    /// counter here: a loop that varies the case would otherwise never trip.
+    #[test]
+    fn loop_guard_counts_a_name_case_insensitively() {
+        let r = Resolver::new(HostnameTable::default(), ReverseLookupTable::default());
+        for _ in 1..=5 {
+            assert!(r.loop_guard_allows(&build_a_query("Mixed.Example.Com")));
+            assert!(r.loop_guard_allows(&build_a_query("mixed.example.com")));
+        }
+        assert!(!r.loop_guard_allows(&build_a_query("MIXED.EXAMPLE.COM")));
     }
 
     fn response_has_a(bytes: &[u8], ip: Ipv4Addr) -> bool {
