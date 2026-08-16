@@ -279,9 +279,23 @@ pub fn restore_stale_backups() {
         let path = PathBuf::from("/etc/resolv.conf");
         let backup = backup_path(&path);
         if backup.exists() {
-            tracing::info!(path = %path.display(), "restoring stale DNS backup from previous crash");
-            if let Err(e) = std::fs::copy(&backup, &path) {
-                tracing::warn!(error = %e, "failed to restore DNS backup");
+            // A hard kill skips the panic hook, so the file left behind can be
+            // one we merged into another VPN's. Copying the backup over it would
+            // undo their DNS as well as ours; subtract our lines instead. Same
+            // rule as `restore_file`, arrived at from the other direction.
+            let current = std::fs::read_to_string(&path).unwrap_or_default();
+            if let Some(ip) = other_overlay_resolver(&current) {
+                tracing::info!(
+                    resolver = %ip,
+                    "stale DNS backup, but another VPN's resolver is in the live file; \
+                     removing only our entries"
+                );
+                let _ = std::fs::write(&path, strip_our_resolv_entries(&current));
+            } else {
+                tracing::info!(path = %path.display(), "restoring stale DNS backup from previous crash");
+                if let Err(e) = std::fs::copy(&backup, &path) {
+                    tracing::warn!(error = %e, "failed to restore DNS backup");
+                }
             }
             let _ = std::fs::remove_file(&backup);
         }
@@ -1351,6 +1365,13 @@ pub(crate) fn system_nameservers() -> Option<Vec<Ipv4Addr>> {
 /// answer `.ray` authoritatively so it never reaches the second entry, but if
 /// our resolver is dead, wedged, or the daemon is gone, the libc resolver moves
 /// on to a real server instead of the machine having no DNS at all.
+///
+/// On a host we share with another mesh VPN, that second entry is *their*
+/// resolver (it is the nameserver their file named, so it is the first thing we
+/// captured), which is what makes this render a merge rather than a takeover:
+/// their names keep resolving behind ours, and keep resolving even if we stop.
+/// Only the first captured server is written, so a file naming several loses
+/// the rest as a *fallback*; all of them are still forwarding upstreams.
 #[cfg(any(target_os = "linux", test))]
 fn render_direct_resolv_conf(search: &[SearchDomain], fallback: Option<Ipv4Addr>) -> String {
     render_direct_resolv_conf_with(resolver_addr(), search, fallback)
@@ -1395,24 +1416,41 @@ enum Reassert {
     /// Something overwrote it that will not fight back (NetworkManager,
     /// dhclient). Put ours back.
     Rewrite,
-    /// Another overlay owns the file now. Stop watching and let it.
-    StoodDown(Ipv4Addr),
+    /// Another overlay took the file. Rebuild ours on top of what it wrote.
+    Merge(Ipv4Addr),
+    /// The overlay we were merged with is gone from the file. Rebuild from what
+    /// replaced it, so we stop forwarding to a resolver that left.
+    Reclaim,
 }
 
 /// Decide what to do about the current contents, without touching the file.
 /// Split out from [`reassert_resolv_conf`] so the decision is testable.
+///
+/// `merged_with` is the overlay resolver we are currently forwarding to, if any
+/// (see [`run_resolv_reassert`]). It is what separates the two ways a file that
+/// is no longer ours can read: another VPN arrived, or the one we merged with
+/// left.
 #[cfg(any(target_os = "linux", test))]
-fn reassert_decision(current: &str) -> Reassert {
+fn reassert_decision(current: &str, merged_with: Option<Ipv4Addr>) -> Reassert {
     if resolv_conf_is_ours(current) {
         return Reassert::Held;
     }
-    // Another overlay took the file while we held it. Rewriting it back is the
-    // rewrite war `DirectResolvConf::apply` refuses to start, only with the
-    // roles swapped: we would win every round in milliseconds and the host's
-    // DNS would be whichever write landed last. Which of the two booted first
-    // is not a good reason to be the one that fights.
-    match foreign_mesh_resolver(current) {
-        Some(ip) => Reassert::StoodDown(ip),
+    // Another overlay took the file while we held it. Writing ours straight back
+    // over theirs is the rewrite war `apply` used to refuse to start, only with
+    // the roles swapped. Merging is what makes losing that race harmless: our
+    // write keeps their resolver as the next nameserver and their search domains
+    // beside ours, so whichever of us wrote last, the file still resolves both
+    // meshes. The caller rate-limits how often we do it.
+    if let Some(ip) = foreign_mesh_resolver(current) {
+        return Reassert::Merge(ip);
+    }
+    // No overlay resolver in the file, and the last one we rendered pointed at
+    // one: that VPN went down and restored the host's own servers. A plain
+    // rewrite would put our file back naming a resolver that is gone, from a
+    // forwarder still aimed at it, and take the host's DNS with it (#111). Go
+    // back through detection so the upstreams are captured and probed afresh.
+    match merged_with {
+        Some(_) => Reassert::Reclaim,
         None => Reassert::Rewrite,
     }
 }
@@ -1421,10 +1459,11 @@ fn reassert_decision(current: &str) -> Reassert {
 async fn reassert_resolv_conf(
     search: &ArcSwap<Vec<SearchDomain>>,
     fallback: Option<Ipv4Addr>,
+    merged_with: Option<Ipv4Addr>,
 ) -> Result<Reassert> {
     let path = Path::new("/etc/resolv.conf");
     let current = tokio::fs::read_to_string(path).await.unwrap_or_default();
-    let decision = reassert_decision(&current);
+    let decision = reassert_decision(&current, merged_with);
     if decision == Reassert::Rewrite {
         tracing::warn!("/etc/resolv.conf was overwritten; re-asserting rayfish DNS");
         tokio::fs::write(path, render_direct_resolv_conf(&search.load(), fallback))
@@ -1444,23 +1483,28 @@ async fn reassert_resolv_conf(
 /// in direct mode, so on an NM host this watch mostly fires for dhclient or
 /// other writers; it remains the catch-all repair either way.
 ///
-/// Returns the other VPN's resolver if it stood down (see [`reassert_decision`]),
-/// `None` if it was cancelled. The caller owns what standing down means for the
-/// rest of the DNS state.
+/// Returns why it stopped, or `None` if it was cancelled. Both exit reasons mean
+/// the same thing to the caller: rebuild the backend from the file as it stands
+/// now, because the set of resolvers to forward to has changed.
 #[cfg(target_os = "linux")]
 pub async fn run_resolv_reassert(
     search: SearchDomains,
     fallback: Option<Ipv4Addr>,
     token: tokio_util::sync::CancellationToken,
-) -> Option<Ipv4Addr> {
+) -> Option<Recapture> {
     use futures::StreamExt;
+    use std::time::Instant;
 
-    // Re-assert immediately: covers any trample between apply() and our arrival.
-    match reassert_resolv_conf(&search, fallback).await {
-        Ok(Reassert::StoodDown(ip)) => return Some(ip),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "initial resolv.conf re-assert failed"),
-    }
+    // The fallback we render is also the first server our forwarder was pointed
+    // at, so an overlay address there is exactly "we are merged with that VPN".
+    // Derived rather than stored: what makes a departure dangerous is forwarding
+    // to an address that can vanish, not which VPN wrote the file we read.
+    let merged_with = fallback.filter(|ip| crate::membership::is_overlay_ip(IpAddr::V4(*ip)));
+
+    // This task is spawned immediately after the apply it belongs to, so its own
+    // uptime is the time since we last wrote the file. That is what the merge
+    // cooldown is measured against; see [`MERGE_COOLDOWN`].
+    let start = Instant::now();
 
     // Watch the parent directory, not the file: NetworkManager/resolvconf
     // replace resolv.conf via atomic rename, which a file-level watch stops
@@ -1484,7 +1528,34 @@ pub async fn run_resolv_reassert(
         }
     };
 
+    // Re-assert immediately on entry: covers any trample between apply() and our
+    // arrival. Thereafter a pass runs on a relevant inotify event or the tick.
+    let mut check = true;
     loop {
+        if check {
+            match pass(&search, fallback, merged_with).await {
+                // Hold off rather than answer their write with ours. Sleeping
+                // and re-reading (instead of exiting late) means what we finally
+                // merge with is their newest file, not the one that woke us.
+                Some(Recapture::Merge(ip)) if start.elapsed() < MERGE_COOLDOWN => {
+                    // Saturating: the guard and this line read the clock
+                    // separately, and `Duration` subtraction panics if it went
+                    // past the cooldown in between.
+                    let wait = MERGE_COOLDOWN.saturating_sub(start.elapsed());
+                    tracing::info!(
+                        resolver = %ip, ?wait,
+                        "another VPN rewrote /etc/resolv.conf; waiting out the merge cooldown"
+                    );
+                    tokio::select! {
+                        _ = token.cancelled() => return None,
+                        _ = tokio::time::sleep(wait) => continue,
+                    }
+                }
+                Some(exit) => return Some(exit),
+                None => {}
+            }
+        }
+
         // When inotify armed, wait on it; otherwise this future never resolves
         // and only the 30s tick + cancel drive the loop.
         let event = async {
@@ -1497,34 +1568,56 @@ pub async fn run_resolv_reassert(
             _ = token.cancelled() => break,
             ev = event => {
                 // Only react to events naming resolv.conf (the /etc watch is broad).
-                let relevant = match ev {
+                check = match ev {
                     Some(Ok(e)) => e.name.as_deref().is_none_or(|n| n == "resolv.conf"),
                     Some(Err(e)) => { tracing::warn!(error = %e, "inotify stream error"); false }
                     None => { stream = None; false } // stream ended; rely on the tick
                 };
-                if relevant
-                    && let Some(ip) = pass(&search, fallback).await {
-                    return Some(ip);
-                }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                if let Some(ip) = pass(&search, fallback).await {
-                    return Some(ip);
-                }
-            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => check = true,
         }
     }
     None
 }
 
-/// One re-assert pass, reporting only the outcome the loop acts on: the foreign
-/// resolver we are standing down for. Errors are logged and treated as "keep
-/// watching" (the next tick retries).
+/// Why the re-assert watcher stopped. Both reasons say the resolvers named in
+/// `/etc/resolv.conf` are no longer the ones we captured, which is a thing only
+/// detection can fix: it re-reads the file, probes what it finds, and applies a
+/// backend built from that.
 #[cfg(target_os = "linux")]
-async fn pass(search: &ArcSwap<Vec<SearchDomain>>, fallback: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
-    match reassert_resolv_conf(search, fallback).await {
-        Ok(Reassert::StoodDown(ip)) => Some(ip),
-        Ok(_) => None,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recapture {
+    /// Another VPN's resolver is in the file now. Merge ours on top of it.
+    Merge(Ipv4Addr),
+    /// The VPN we were merged with is gone from it. Take the file back.
+    Reclaim,
+}
+
+/// How long after our own last write we refuse to write again over another
+/// VPN's file.
+///
+/// Both daemons re-assert, so an unthrottled merge answers their write with
+/// ours inside a millisecond and theirs answers back: a rewrite loop that burns
+/// both CPUs and leaves the file's contents up to whoever wrote most recently.
+/// The merge is what makes the *content* of that race harmless (either file
+/// resolves both meshes); this is what stops the race itself. One write a
+/// minute converges just as surely, and the cost of being slow here is that
+/// `.ray` resolves through the stub a minute late.
+#[cfg(target_os = "linux")]
+const MERGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One re-assert pass, reporting only the outcomes the loop acts on. Errors are
+/// logged and treated as "keep watching" (the next tick retries).
+#[cfg(target_os = "linux")]
+async fn pass(
+    search: &ArcSwap<Vec<SearchDomain>>,
+    fallback: Option<Ipv4Addr>,
+    merged_with: Option<Ipv4Addr>,
+) -> Option<Recapture> {
+    match reassert_resolv_conf(search, fallback, merged_with).await {
+        Ok(Reassert::Merge(ip)) => Some(Recapture::Merge(ip)),
+        Ok(Reassert::Reclaim) => Some(Recapture::Reclaim),
+        Ok(Reassert::Held | Reassert::Rewrite) => None,
         Err(e) => {
             tracing::warn!(error = %e, "resolv.conf re-assert failed");
             None
@@ -1634,15 +1727,18 @@ fn backup_path(original: &Path) -> PathBuf {
 
 /// Capture the host's `/etc/resolv.conf` before we overwrite it, once.
 ///
-/// Never captures a file that is already ours. It can be: after standing down
-/// we drop our backup, and the VPN that took the file backed it up *while we
-/// owned it*, so when that VPN leaves it restores our old rayfish file and the
-/// retry loop finds that as "the host's". Storing it as the baseline would mean
-/// a later `ray down` restores a resolv.conf whose first nameserver is the
-/// magic IP with no daemon behind it, and every lookup on the host eats a
-/// resolver timeout before falling through to the second line. With no backup,
-/// `restore_file` takes its marker-based in-place strip instead, which is the
-/// right answer for a file we wrote.
+/// Never captures a file that is already ours, and it can be: the other VPN
+/// backed the file up *while we owned it*, so when that VPN leaves it restores
+/// our old rayfish file and the next detection finds that as "the host's".
+/// Storing it as the baseline would mean a later `ray down` restores a
+/// resolv.conf whose first nameserver is the magic IP with no daemon behind it,
+/// and every lookup on the host eats a resolver timeout before falling through
+/// to the second line. With no backup, `restore_file` takes its marker-based
+/// in-place strip instead, which is the right answer for a file we wrote.
+///
+/// Kept from the *first* apply onwards, including across a merge: the file it
+/// captures is the host as it was before us, and a merge revert never uses it
+/// anyway (it subtracts our lines in place, see [`restore_file`]).
 #[cfg(target_os = "linux")]
 async fn backup_file(path: &Path) -> Result<()> {
     let backup = backup_path(path);
@@ -1664,28 +1760,32 @@ async fn backup_file(path: &Path) -> Result<()> {
         .with_context(|| format!("backing up {}", path.display()))
 }
 
-/// Drop the `/etc/resolv.conf` backup without restoring it.
-///
-/// For the one case where restoring is the wrong move: another VPN owns the
-/// file now, and our backup is a capture of the host from before either of us
-/// touched it. Putting that back over their configuration would break their
-/// DNS, and leaving it on disk would let `revert` or [`restore_stale_backups`]
-/// do exactly that later.
-#[cfg(target_os = "linux")]
-pub async fn discard_resolv_backup() {
-    let backup = backup_path(Path::new("/etc/resolv.conf"));
-    match tokio::fs::remove_file(&backup).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            tracing::warn!(error = %e, path = %backup.display(), "failed to drop the stale DNS backup");
-        }
-    }
-}
-
 #[cfg(target_os = "linux")]
 async fn restore_file(path: &Path) -> Result<()> {
     let backup = backup_path(path);
+    // Another VPN's resolver is in this file, so our write was additive and our
+    // undo has to be subtractive. Restoring the backup here would put a snapshot
+    // of the host from before the merge over a file that is now partly theirs,
+    // taking their DNS down to undo ours. Drop our lines, keep the rest, and
+    // drop the backup so nothing restores it later behind our back.
+    if let Ok(current) = tokio::fs::read_to_string(path).await
+        && let Some(ip) = other_overlay_resolver(&current)
+    {
+        let stripped = strip_our_resolv_entries(&current);
+        if stripped != current {
+            tokio::fs::write(path, &stripped)
+                .await
+                .with_context(|| format!("removing our entries from {}", path.display()))?;
+        }
+        if backup.exists() {
+            tokio::fs::remove_file(&backup).await?;
+        }
+        tracing::info!(
+            resolver = %ip, path = %path.display(),
+            "another VPN's resolver is in this file; removed only our entries and left it to them"
+        );
+        return Ok(());
+    }
     if backup.exists() {
         tokio::fs::copy(&backup, path)
             .await
@@ -1721,29 +1821,47 @@ async fn restore_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Drop the lines [`DirectResolvConf`] adds (our marker comment and the
-/// `nameserver` line pointing at our resolver) and keep everything else, so a
-/// backup-less revert leaves the host with its other nameservers and search
-/// domains rather than an empty or missing file.
-#[cfg(target_os = "linux")]
+/// Drop everything [`DirectResolvConf`] adds (our marker comment, the
+/// `nameserver` line pointing at our resolver, and our own search domains) and
+/// keep the rest, so what is left is the file without us in it.
+///
+/// This is the undo for a write that was additive: a merged file carries the
+/// other VPN's resolver behind ours and its search domains beside ours, and
+/// removing our half has to leave that half standing. It is also the
+/// backup-less revert, where the alternative is deleting the file and taking
+/// the host's DNS with it.
+#[cfg(any(target_os = "linux", test))]
 fn strip_our_resolv_entries(contents: &str) -> String {
     // Both families: a file written before a switch to (or from) IPv6-only mode
     // names the other address, and leaving it behind would point the host at a
     // resolver that is no longer listening.
     let magic_v4 = crate::dns::MAGIC_DNS_V4.to_string();
     let magic_v6 = crate::dns::MAGIC_DNS_V6.to_string();
-    let kept: Vec<&str> = contents
-        .lines()
-        .filter(|l| {
-            let t = l.trim();
-            if t == HEADER_COMMENT.trim() || t.starts_with("# Added by rayfish") {
-                return false;
-            }
+    let mut kept: Vec<String> = Vec::new();
+    for line in contents.lines() {
+        let t = line.trim();
+        if t == HEADER_COMMENT.trim() || t.starts_with("# Added by rayfish") {
+            continue;
+        }
+        let fields: Vec<&str> = t.split_whitespace().collect();
+        match fields.as_slice() {
             // `nameserver <our ip>` in any spacing; other nameservers stay.
-            !matches!(t.split_whitespace().collect::<Vec<_>>().as_slice(),
-                ["nameserver", ip] if *ip == magic_v4 || *ip == magic_v6)
-        })
-        .collect();
+            ["nameserver", ip] if *ip == magic_v4 || *ip == magic_v6 => continue,
+            // A merged `search` line is part theirs. Keep their domains in the
+            // order they had them; drop the line only if all of it was ours.
+            [kw @ ("search" | "domain"), rest @ ..] => {
+                let theirs: Vec<&str> = rest
+                    .iter()
+                    .copied()
+                    .filter(|d| !SearchDomain::from_host(d).is_ours())
+                    .collect();
+                if !theirs.is_empty() {
+                    kept.push(format!("{kw} {}", theirs.join(" ")));
+                }
+            }
+            _ => kept.push(line.to_string()),
+        }
+    }
     let mut out = kept.join("\n");
     if !out.ends_with('\n') {
         out.push('\n');
@@ -1766,9 +1884,20 @@ fn strip_our_resolv_entries(contents: &str) -> String {
 pub fn emergency_restore_resolv_conf() {
     let path = Path::new("/etc/resolv.conf");
     let backup = backup_path(path);
-    if backup.exists() {
-        let _ = std::fs::copy(&backup, path);
-        let _ = std::fs::remove_file(&backup);
+    // Same rule as [`restore_file`], and it matters more here: the file we would
+    // copy over is one we merged into another VPN's, and the process is about to
+    // abort, so nothing will be along to notice we took their DNS down with
+    // ours. Subtract our lines instead and leave the backup alone.
+    match std::fs::read_to_string(path) {
+        Ok(current) if other_overlay_resolver(&current).is_some() => {
+            let _ = std::fs::write(path, strip_our_resolv_entries(&current));
+            let _ = std::fs::remove_file(&backup);
+        }
+        _ if backup.exists() => {
+            let _ = std::fs::copy(&backup, path);
+            let _ = std::fs::remove_file(&backup);
+        }
+        _ => {}
     }
     // Remove our NM drop-in, but only if it carries our marker (never an
     // operator's own NM config).
@@ -1800,8 +1929,10 @@ struct DirectResolvConf {
     /// [`DnsService::configure`] merges theirs in after detection, so the
     /// forwarder does get somewhere to send queries.
     operator_upstreams: bool,
-    /// Another mesh VPN's resolver, if the current file names one. See
-    /// [`foreign_mesh_resolver`].
+    /// Another mesh VPN's resolver, if the file we captured names one. Means
+    /// this apply is a merge: it is already in [`Self::captured_upstreams`], so
+    /// it is what we render behind ours and what the forwarder sends everything
+    /// outside `.ray` to. See [`foreign_mesh_resolver`].
     foreign_resolver: Option<Ipv4Addr>,
 }
 
@@ -1809,8 +1940,10 @@ struct DirectResolvConf {
 ///
 /// Taking over `/etc/resolv.conf` means owning DNS for the whole host, and this
 /// backend backs that up with an inotify watch that rewrites the file whenever
-/// something else touches it. Against a peer VPN that does exactly the same, the
-/// two just overwrite each other and the host's DNS flaps.
+/// something else touches it. Against a peer VPN that does exactly the same,
+/// neither can own it outright, so what this address selects is *how* we write:
+/// additively, keeping it as the next nameserver and forwarding to it, on a
+/// cooldown (see [`MERGE_COOLDOWN`]) rather than by return of write.
 ///
 /// A nameserver inside `100.64.0.0/10` that is not ours is the signal: nothing
 /// in that range is a real resolver, so it can only be another overlay's magic
@@ -1825,6 +1958,20 @@ fn foreign_mesh_resolver(contents: &str) -> Option<Ipv4Addr> {
     if resolv_conf_is_ours(contents) {
         return None;
     }
+    other_overlay_resolver(contents)
+}
+
+/// The first overlay-range nameserver in `contents` that is not ours, whether or
+/// not the file itself is ours.
+///
+/// [`foreign_mesh_resolver`] answers "did someone else take this file", so it
+/// stops at our own marker. This answers the question that outlives the
+/// takeover: is another VPN's resolver *in* this file, including the merged one
+/// we wrote ourselves. That is what [`restore_file`] needs, since by then the
+/// file is ours by definition and their resolver is in it because we put it
+/// there.
+#[cfg(any(target_os = "linux", test))]
+fn other_overlay_resolver(contents: &str) -> Option<Ipv4Addr> {
     // `parse_resolv_nameservers` already drops our own magic IP.
     parse_resolv_nameservers(contents)
         .into_iter()
@@ -1963,18 +2110,18 @@ impl DnsConfigurator for DirectResolvConf {
              this host unable to resolve anything; set `dns_upstreams` in the config to \
              name one explicitly"
         );
-        // Another overlay already owns this file. Both sides re-assert it, so
-        // taking it would start a rewrite war and cost the host its DNS at
-        // random. Leave it alone: `.ray` names go unresolved on this host until
-        // a DNS manager both VPNs can share is in the path, which is worse than
-        // Magic DNS working but far better than flapping system-wide DNS.
+        // Another overlay already owns this file. We take it, but additively:
+        // their resolver was captured above and is rendered as the nameserver
+        // after ours, their search domains are merged with ours, and everything
+        // we cannot answer is forwarded to them. First place is not a
+        // preference, it is the only place a `.ray` query reaches us from
+        // (glibc stops at the first server that answers, and their NXDOMAIN
+        // answers); behind us they keep resolving exactly what they did before.
         if let Some(ip) = self.foreign_resolver {
-            anyhow::bail!(
-                "/etc/resolv.conf is owned by another VPN (nameserver {ip}), and taking it \
-                 over would leave the two rewriting it against each other; run \
-                 systemd-resolved so both can register their own domains, or add \
-                 `nameserver {}` to that file yourself",
-                resolver_addr()
+            tracing::info!(
+                resolver = %ip,
+                "/etc/resolv.conf names another VPN's resolver; merging ours in ahead of it \
+                 and forwarding everything outside `.{DNS_DOMAIN}` to it"
             );
         }
 
@@ -2021,8 +2168,10 @@ impl DnsConfigurator for DirectResolvConf {
         )));
         let path = Path::new("/etc/resolv.conf");
         // Only rewrite a file that is still ours. If something else holds it,
-        // the re-assert watcher is the one that decides whether to take it back
-        // or stand down, and it has the whole file to decide from.
+        // the re-assert watcher decides what to do about that, on its own
+        // schedule: a join is not a reason to write over another VPN inside the
+        // merge cooldown, and the domains are stored above either way, so the
+        // next render carries them.
         let current = tokio::fs::read_to_string(path).await.unwrap_or_default();
         if !resolv_conf_is_ours(&current) {
             return Ok(());
@@ -2050,9 +2199,9 @@ mod tests {
 
     use super::{
         Reassert, SearchDomain, first_nameserver, foreign_mesh_resolver, join_domains,
-        merge_search_domains, nm_dns_none_dropin, parse_resolv_nameservers, reassert_decision,
-        render_direct_resolv_conf, render_direct_resolv_conf_with, resolv_conf_is_ours,
-        search_domains_for,
+        merge_search_domains, nm_dns_none_dropin, other_overlay_resolver, parse_resolv_nameservers,
+        reassert_decision, render_direct_resolv_conf, render_direct_resolv_conf_with,
+        resolv_conf_is_ours, search_domains_for,
     };
 
     /// Domains as the host had them, i.e. read back from its own config.
@@ -2111,23 +2260,85 @@ mod tests {
     }
 
     #[test]
-    fn reassert_stands_down_only_for_another_overlay() {
+    fn reassert_merges_with_another_overlay_and_rewrites_over_anything_else() {
+        let theirs: Ipv4Addr = "100.100.100.100".parse().unwrap();
         // Ours: nothing to do.
         assert_eq!(
-            reassert_decision("# Added by rayfish - do not edit\nnameserver 100.100.100.53\n"),
+            reassert_decision(
+                "# Added by rayfish - do not edit\nnameserver 100.100.100.53\n",
+                None
+            ),
             Reassert::Held
         );
-        // A trample by something that will not fight back: put ours back.
+        // A trample by something that will not fight back: put ours back now.
         assert_eq!(
-            reassert_decision("# Generated by NetworkManager\nnameserver 192.168.1.1\n"),
+            reassert_decision(
+                "# Generated by NetworkManager\nnameserver 192.168.1.1\n",
+                None
+            ),
             Reassert::Rewrite
         );
-        // Another VPN took the file while we held it. Rewriting it back here is
-        // the same fight `apply` refuses to start, so let go instead.
+        // Another VPN took the file. Ours goes back on top of theirs, not
+        // instead of it, and the caller waits out the cooldown first.
         assert_eq!(
-            reassert_decision("nameserver 100.100.100.100\nsearch ts.net\n"),
-            Reassert::StoodDown("100.100.100.100".parse::<Ipv4Addr>().unwrap())
+            reassert_decision("nameserver 100.100.100.100\nsearch ts.net\n", None),
+            Reassert::Merge(theirs)
         );
+        // Same file, but this time we are the ones already merged with them:
+        // still a merge, because their write dropped our nameserver.
+        assert_eq!(
+            reassert_decision("nameserver 100.100.100.100\n", Some(theirs)),
+            Reassert::Merge(theirs)
+        );
+        // The overlay we were merged with is gone and the host's own servers are
+        // back. Rewriting ours here would re-render `nameserver 100.100.100.100`
+        // from a forwarder still pointed at it, so go recapture instead.
+        assert_eq!(
+            reassert_decision(
+                "# Generated by NetworkManager\nnameserver 192.168.1.1\n",
+                Some(theirs)
+            ),
+            Reassert::Reclaim
+        );
+    }
+
+    /// The undo for an additive write. What is left has to be *their* file: our
+    /// marker, our nameserver, and our search domains gone, theirs untouched.
+    #[test]
+    fn stripping_our_entries_leaves_the_other_vpn_theirs() {
+        let merged = "# Added by rayfish - do not edit\nnameserver 100.100.100.53\nnameserver 100.100.100.100\nsearch tailnet.ts.net homelab.ray ray\n";
+        assert_eq!(
+            strip_our_resolv_entries(merged),
+            "nameserver 100.100.100.100\nsearch tailnet.ts.net\n"
+        );
+        // The v6 magic IP is ours too (an IPv6-only host, which is exactly the
+        // host that has another VPN on 100.64.0.0/10).
+        let merged_v6 = "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 100.100.100.100\nsearch ray\n";
+        assert_eq!(
+            strip_our_resolv_entries(merged_v6),
+            "nameserver 100.100.100.100\n"
+        );
+        // Nothing of ours in it: left exactly as found, so a revert that reads a
+        // file the other VPN just rewrote does not touch it.
+        let theirs = "nameserver 100.100.100.100\nsearch tailnet.ts.net\n";
+        assert_eq!(strip_our_resolv_entries(theirs), theirs);
+    }
+
+    /// `foreign_mesh_resolver` stops at our marker, because it answers "did
+    /// someone take this file". The revert path has to see through the marker:
+    /// the file is ours precisely because we merged theirs into it.
+    #[test]
+    fn other_overlay_resolver_sees_through_our_own_marker() {
+        let merged = "# Added by rayfish - do not edit\nnameserver 100.100.100.53\nnameserver 100.100.100.100\n";
+        assert_eq!(foreign_mesh_resolver(merged), None);
+        assert_eq!(
+            other_overlay_resolver(merged),
+            Some("100.100.100.100".parse::<Ipv4Addr>().unwrap())
+        );
+        // Ours alone is not another overlay, or every revert would think it was
+        // merged and leave the file behind.
+        let plain = "# Added by rayfish - do not edit\nnameserver 100.100.100.53\n";
+        assert_eq!(other_overlay_resolver(plain), None);
     }
 
     #[test]

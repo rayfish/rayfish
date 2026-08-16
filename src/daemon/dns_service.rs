@@ -96,7 +96,7 @@ impl DnsService {
                 warnings.push(format!(
                     "failed to configure system DNS, so .ray names won't resolve yet: {e}"
                 ));
-                self.spawn_configure_retry(tun_name.to_string());
+                self.spawn_configure_retry(tun_name.to_string(), DNS_CONFIG_RETRY_MIN);
             }
         }
     }
@@ -152,55 +152,64 @@ impl DnsService {
                 // `revert` cancelled it: the select arm is already committed by
                 // then, so the cancel is only visible here. Acting on a stale
                 // verdict would re-arm DNS for a data plane that is down.
-                if let Some(ip) = dns_config::run_resolv_reassert(search, fallback, rt).await
+                if let Some(why) = dns_config::run_resolv_reassert(search, fallback, rt).await
                     && !watcher.is_cancelled()
                     && let Some(me) = me.upgrade()
                 {
-                    me.stand_down(ip, tun_name, &watcher).await;
+                    me.recapture(why, tun_name, &watcher);
                 }
             });
         }
     }
 
-    /// Another VPN took `/etc/resolv.conf` while we held it, and the re-assert
-    /// watcher stopped rather than rewrite it back at them.
+    /// The set of resolvers in `/etc/resolv.conf` changed under us: another VPN
+    /// took the file, or the one we had merged with left it. Rebuild the backend
+    /// from the file as it stands now.
     ///
-    /// Let go of the file completely: no `revert`, because restoring our backup
-    /// would put a capture of the host from before either VPN over their
-    /// configuration. Drop that backup instead, so neither `revert` nor
-    /// `restore_stale_backups` can do it later, and go back to retrying
-    /// detection so we reclaim DNS if that VPN leaves.
+    /// Re-running detection rather than patching in place is what keeps the
+    /// forwarder honest. The upstreams we forward to were captured and probed
+    /// from this file, so when its nameservers change, ours have to be captured
+    /// and probed again: merging means forwarding everything outside `.ray` to
+    /// the other VPN's resolver, and reclaiming means noticing that resolver is
+    /// gone before we send the host's DNS to an address that stopped answering.
     ///
-    /// The `dns=none` NetworkManager drop-in stays *while* we are stood down:
-    /// un-quieting NM here would only have NM regenerate the file and start a
-    /// different fight over it. Dropping the configurator would otherwise
-    /// orphan it, since `DirectResolvConf::revert` is the only thing that
-    /// removes it, so [`revert`](Self::revert) clears it directly.
+    /// No `revert` first. The old configurator's undo is subtractive now, and
+    /// running it here would strip the very entries `apply` is about to write.
+    /// The backup and the `dns=none` drop-in both survive the swap, which is
+    /// what we want: `apply` keeps the first backup it took, and re-quieting NM
+    /// is idempotent.
+    ///
+    /// Detection runs through the retry loop with no initial delay rather than
+    /// inline: the loop is already the thing that owns "keep trying until the
+    /// host's DNS makes sense", and going through it keeps this off the cycle
+    /// `adopt_configurator` -> watcher -> here -> `adopt_configurator`, which
+    /// the compiler cannot prove `Send` when it is all one chain of awaits.
     ///
     /// `watcher` is the token of the watcher that reported this, and it is what
     /// says the verdict is still current: `revert` cancels it on the way down,
-    /// and a stand-down that re-armed the retry loop after that would point a
-    /// downed data plane's DNS back at us.
+    /// and re-arming DNS after that would point a downed data plane back at us.
     #[cfg(target_os = "linux")]
-    async fn stand_down(
+    fn recapture(
         self: &Arc<Self>,
-        foreign: std::net::Ipv4Addr,
+        why: dns_config::Recapture,
         tun_name: String,
         watcher: &CancellationToken,
     ) {
-        tracing::warn!(
-            %foreign,
-            "/etc/resolv.conf is owned by another VPN now; leaving it to them rather than \
-             rewriting it against each other. `.ray` names stop resolving on this host until \
-             that VPN goes away or a DNS manager both can register with is in the path"
-        );
+        match why {
+            dns_config::Recapture::Merge(ip) => tracing::info!(
+                resolver = %ip,
+                "another VPN wrote /etc/resolv.conf; merging ours back in ahead of theirs"
+            ),
+            dns_config::Recapture::Reclaim => tracing::info!(
+                "the VPN sharing /etc/resolv.conf is gone; recapturing the host's own resolvers"
+            ),
+        }
         self.reassert_token.lock().unwrap().take();
         self.configurator.lock().unwrap().take();
-        dns_config::discard_resolv_backup().await;
         if watcher.is_cancelled() {
             return;
         }
-        self.spawn_configure_retry(tun_name);
+        self.spawn_configure_retry(tun_name, Duration::ZERO);
     }
 
     /// Install the OS search domains for the currently joined networks, through
@@ -232,12 +241,17 @@ impl DnsService {
     /// retry that verdict was permanent: `.ray` names stayed unresolvable for
     /// the daemon's lifetime even once the host's DNS came back. Cancelled by
     /// `revert` (the data plane going down) and by a later `configure`.
-    fn spawn_configure_retry(self: &Arc<Self>, tun_name: String) {
+    ///
+    /// `first_delay` is how long to wait before the first attempt. It is the
+    /// backoff floor for a failure (there is no point asking again immediately)
+    /// and [`Duration::ZERO`] for `recapture`, where the file has demonstrably
+    /// just changed and the whole point is to act on it now.
+    fn spawn_configure_retry(self: &Arc<Self>, tun_name: String, first_delay: Duration) {
         let token = CancellationToken::new();
         *self.configure_retry.lock().unwrap() = Some(token.clone());
         let me = Arc::clone(self);
         tokio::spawn(async move {
-            let mut delay = DNS_CONFIG_RETRY_MIN;
+            let mut delay = first_delay;
             loop {
                 tokio::select! {
                     _ = token.cancelled() => return,
@@ -260,7 +274,9 @@ impl DnsService {
                         tracing::debug!(error = %e, retry_in = ?delay, "system DNS still not configurable");
                     }
                 }
-                delay = (delay * 2).min(DNS_CONFIG_RETRY_MAX);
+                // `max` first so a zero first delay backs off like any other
+                // failure instead of spinning on a doubled zero.
+                delay = (delay.max(DNS_CONFIG_RETRY_MIN) * 2).min(DNS_CONFIG_RETRY_MAX);
             }
         });
     }
@@ -304,12 +320,12 @@ impl DnsService {
             tracing::warn!(error = %e, "failed to revert DNS configuration");
         }
         // Un-quiet NetworkManager even with no configurator to do it for us.
-        // `stand_down` drops the configurator while the `dns=none` drop-in is
-        // still installed, and `DirectResolvConf::revert` is the only other
-        // thing that removes it, so without this a stood-down node leaves NM
-        // muted for good: the other VPN owns resolv.conf, and if it leaves too,
-        // nothing regenerates the file. Marker-guarded and idempotent, so this
-        // is a no-op on every backend that never installed one.
+        // `recapture` drops the configurator while the `dns=none` drop-in is
+        // still installed, so a revert landing in that window (or after the
+        // re-detect it runs failed) would otherwise leave NM muted for good:
+        // `DirectResolvConf::revert` is the only other thing that removes the
+        // drop-in, and nothing else regenerates the file. Marker-guarded and
+        // idempotent, so this is a no-op on every backend that never had one.
         #[cfg(target_os = "linux")]
         dns_config::nm_quiet_remove().await;
         dns_config::clear_search_domains(tun_name).await;

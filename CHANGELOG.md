@@ -19,14 +19,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Rayfish no longer takes `/etc/resolv.conf` back from a VPN that started
-  after it.** Where Rayfish manages that file directly, it refuses to take it
-  from another VPN that already holds it. That check ran once, when Rayfish
-  came up, so the same host in the other order got the fight it was meant to
-  prevent: the other VPN wrote the file and Rayfish put its own back within
-  milliseconds, every time, and the host's DNS was whichever write landed last.
-  Rayfish now stands down whenever the file goes to another VPN, leaves it
-  alone, and takes DNS back on its own once that VPN is gone.
+- **`.ray` names now resolve alongside another VPN that manages
+  `/etc/resolv.conf`.** On a host with no DNS manager (no systemd-resolved in
+  the resolution path), Rayfish and a VPN like Tailscale both want that file.
+  Rayfish used to refuse it and `.ray` names stopped resolving for anything
+  that goes through the system resolver, and in the other start order the two
+  overwrote each other every few milliseconds. Rayfish now shares the file
+  instead: its resolver goes in ahead of the other VPN's, the other VPN's stays
+  behind it as the next nameserver, both sets of search domains are kept, and
+  everything outside `.ray` is forwarded to it. Both meshes resolve, whichever
+  VPN wrote the file last. Rayfish writes at most once a minute, so the two
+  cannot spin against each other, and it goes back to managing the file alone
+  once the other VPN leaves.
+- **Shutting down no longer takes the other VPN's DNS with it.** When Rayfish
+  shares `/etc/resolv.conf`, `ray down` (and a crash, and a restart) removes
+  only the lines Rayfish added, leaving the other VPN's resolver and search
+  domains in place, rather than restoring a snapshot of the file from before
+  either VPN was on the host.
 - **Bare hostnames now resolve on hosts without a DNS manager.** `ping box`
   and `ssh box` worked through systemd-resolved but not on a machine where
   Rayfish manages `/etc/resolv.conf` or registers with `resolvconf`: the
