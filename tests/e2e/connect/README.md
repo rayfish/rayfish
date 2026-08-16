@@ -8,14 +8,14 @@ test in `tests/e2e/device-cert/`; shared plumbing lives in `tests/lib/`.
 
 ```
 srv-a  identity U   initiator   (ray connect <B-contact-id>)
-srv-b  identity V   recipient   (ray connections approve <id>)
+srv-b  identity V   recipient   (ray connect approve <id>)
 ```
 
 ## What it proves
 
 1. Both nodes publish a **contact id** (`ray contact id`), also shown in `ray status`.
 2. `ray connect <contact-id>` resolves the id via pkarr, dials, and queues as **pending**.
-3. The recipient sees it in `ray connections` and `ray connections approve <id>`.
+3. The recipient sees it in `ray connect` and `ray connect approve <id>`.
 4. A real 2-peer network forms, shown as role **`[direct]`** with its room id hidden.
 5. The two peers get distinct VPN IPs and reach each other by **ICMP ping** (both ways).
 6. `ray send` / `ray files accept` round-trips a file both ways (sha256 verified).

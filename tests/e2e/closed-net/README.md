@@ -8,8 +8,8 @@ scenarios don't cover.
 
 | Step | Coverage |
 |------|----------|
-| 2 | **Live approval** with no invite: `srv-b` dials the closed net → `ray requests` shows it → `ray accept` admits it. |
-| 3 | **Live denial**: `srv-c` dials → `ray deny` rejects it → it never becomes a member. |
+| 2 | **Live approval** with no invite: `srv-b` dials the closed net → `ray requests` shows it → `ray requests <net> accept` admits it. |
+| 3 | **Live denial**: `srv-c` dials → `ray requests <net> deny` rejects it → it never becomes a member. |
 | 4 | **Co-coordinator grant**: `ray admin add` promotes `srv-b`; `ray admin list` shows two key-holders. |
 | 5 | **Gatekeeper resilience**: with `srv-a` taken offline (`ray down`), the co-coordinator `srv-b` mints a `ray invite --reusable` key and admits `srv-c` unattended (`--auto-accept-firewall`). |
 | 6 | **Hostname change**: `ray hostname` propagates to the coordinator's roster and the magic-DNS name `srv-bb.priv.ray` resolves + answers. |

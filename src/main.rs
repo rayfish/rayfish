@@ -69,6 +69,7 @@ fn json_requested(command: &Command) -> bool {
         Command::Status { json }
         | Command::Invite { json, .. }
         | Command::Requests { json, .. }
+        | Command::Connect { json, .. }
         | Command::Connections { json, .. }
         | Command::Contact { json, .. }
         | Command::Ping { json, .. }
@@ -272,18 +273,22 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
-    /// List peers awaiting approval (coordinator only)
+    /// Peers awaiting approval; admit or reject them
     ///
-    /// Closed networks only. Admit one with `ray accept`, reject with `ray deny`.
+    /// Coordinator only, and closed networks only. With no action, lists who is
+    /// waiting; `accept <id>` admits one and `deny <id>` turns it away.
     Requests {
         /// Network name
         #[arg(add = complete::networks())]
         network: String,
+        #[command(subcommand)]
+        action: Option<RequestsAction>,
         /// Emit machine-readable JSON instead of styled text
         #[arg(long, global = true)]
         json: bool,
     },
-    /// Admit a peer waiting for approval (coordinator only)
+    /// The old spelling of `ray requests <network> accept <id>`.
+    #[command(hide = true)]
     Accept {
         /// Network name
         #[arg(add = complete::networks())]
@@ -291,7 +296,8 @@ pub(crate) enum Command {
         /// Short id of the pending peer (from `ray requests`)
         id: String,
     },
-    /// Reject a peer waiting for approval (coordinator only)
+    /// The old spelling of `ray requests <network> deny <id>`.
+    #[command(hide = true)]
     Deny {
         /// Network name
         #[arg(add = complete::networks())]
@@ -299,23 +305,28 @@ pub(crate) enum Command {
         /// Short id of the pending peer (from `ray requests`)
         id: String,
     },
-    /// Request a direct 2-peer connection by contact id
+    /// Request a direct link, or review incoming ones
     ///
-    /// They approve it with `ray connections approve`, forming a private 2-peer
-    /// network, no room id or invite code needed.
+    /// `ray connect <contact-id>` asks that peer for a direct 2-peer network,
+    /// with no room id or invite code needed; they run `ray connect approve` to
+    /// accept it. With no argument, lists the requests waiting on you.
     Connect {
+        #[command(subcommand)]
+        action: Option<ConnectAction>,
         /// The peer's contact id (from their `ray contact id` / `ray status`)
-        contact_id: String,
+        contact_id: Option<String>,
         /// Your hostname on the resulting network (defaults to your set name)
         #[arg(long)]
         hostname: Option<String>,
+        /// Emit machine-readable JSON instead of styled text
+        #[arg(long, global = true)]
+        json: bool,
     },
-    /// Review and approve incoming connection requests
-    ///
-    /// The other side of `ray connect`.
+    /// The old spelling of `ray connect list` / `ray connect approve`.
+    #[command(hide = true)]
     Connections {
         #[command(subcommand)]
-        action: Option<ConnectionsAction>,
+        action: Option<ConnectAction>,
         /// Emit machine-readable JSON instead of styled text
         #[arg(long, global = true)]
         json: bool,
@@ -358,10 +369,10 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
-    /// Grant the network key to a member (coordinator only)
+    /// Grant or list this network's co-coordinators
     ///
-    /// The grantee becomes a co-coordinator: it can publish the signed blob and
-    /// suggest firewall rules. Trusted-network multi-admin.
+    /// Coordinator only. A grantee holds the network key: it can publish the
+    /// signed blob and suggest firewall rules. Trusted-network multi-admin.
     Admin {
         /// Network name
         #[arg(add = complete::networks())]
@@ -465,10 +476,8 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
-    /// Enable or disable automatic stable updates
-    ///
-    /// Applied by the daemon, which swaps and restarts onto the new release.
-    #[command(name = "auto-update")]
+    /// The old spelling of `ray config set auto-update on|off`.
+    #[command(name = "auto-update", hide = true)]
     AutoUpdate {
         /// "on" or "off"
         #[arg(add = complete::words(&ON_OFF))]
@@ -527,6 +536,10 @@ pub(crate) enum Command {
         device: String,
     },
     /// Handle a rayfish:// deep link (join or pair)
+    ///
+    /// Hidden because it is what the desktop URI handler invokes, not something
+    /// typed at a prompt.
+    #[command(hide = true)]
     Open {
         /// The rayfish:// URI, e.g. rayfish://join/<code> or rayfish://pair/<ticket>
         uri: String,
@@ -535,6 +548,9 @@ pub(crate) enum Command {
     #[command(visible_alias = "ver")]
     Version,
     /// Update rayfish to the latest GitHub release
+    ///
+    /// A one-off update. To have the daemon do it for you, turn on automatic
+    /// stable updates with `ray config set auto-update on`.
     #[command(visible_alias = "upgrade")]
     Update {
         /// Reinstall even if already on the latest version
@@ -558,8 +574,10 @@ pub(crate) enum Command {
 
 #[derive(Subcommand)]
 pub(crate) enum InviteAction {
-    /// Mint a new invite code (default action). Single-use by default; `--reusable`
-    /// mints a multi-use key for unattended fleets.
+    /// Mint a new invite code (the default action)
+    ///
+    /// Single-use by default; `--reusable` mints a multi-use key for unattended
+    /// fleets.
     Create {
         /// How long the invite stays valid, e.g. 24h, 7d, 30m (default 7d;
         /// 30d for `--reusable`).
@@ -631,21 +649,25 @@ pub(crate) enum PairAction {
 
 #[derive(Subcommand)]
 pub(crate) enum AdminAction {
-    /// Grant the network key to a member (coordinator only)
+    /// Grant the network key to a member
     Add {
         /// Short id of the member to promote (from `ray status`)
         #[arg(add = complete::peers())]
         identity: String,
     },
-    /// List this network's key-holders (the local node + granted members)
+    /// List this network's key-holders
+    ///
+    /// The local node, plus every member granted the key.
     #[command(visible_alias = "ls")]
     List,
 }
 
 #[derive(Subcommand)]
 pub(crate) enum AliasAction {
-    /// Bind an alias to a user. `key` is an identity string (from `ray
-    /// identityof`) or a currently-joined hostname, resolved to its identity.
+    /// Bind an alias to a user identity
+    ///
+    /// `key` is an identity string (from `ray identityof`) or a
+    /// currently-joined hostname, resolved to its identity.
     Set {
         /// Identity string or a joined hostname
         #[arg(add = complete::peers())]
@@ -666,14 +688,32 @@ pub(crate) enum AliasAction {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum ConnectionsAction {
+pub(crate) enum RequestsAction {
+    /// Admit a peer waiting for approval
+    #[command(visible_alias = "ok")]
+    Accept {
+        /// Short id of the pending peer (from `ray requests <network>`)
+        id: String,
+    },
+    /// Reject a peer waiting for approval
+    Deny {
+        /// Short id of the pending peer (from `ray requests <network>`)
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ConnectAction {
     /// List pending incoming connection requests (default)
     #[command(visible_alias = "ls")]
     List,
-    /// Approve a pending request, forming the direct 2-peer network
-    #[command(visible_alias = "ok")]
+    /// Approve a pending request
+    ///
+    /// Forms the direct 2-peer network. `accept` is an alias, so the admit verb
+    /// reads the same here as it does under `ray requests`.
+    #[command(visible_aliases = ["ok", "accept"])]
     Approve {
-        /// Short id of the requester (from `ray connections`)
+        /// Short id of the requester (from `ray connect`)
         id: String,
     },
 }
@@ -696,8 +736,10 @@ pub(crate) enum ConfigAction {
         )]
         key: Option<String>,
     },
-    /// Set a key. List keys take a comma list of presets/URLs/IPs; on/off keys
-    /// take on or off.
+    /// Set a key to a value
+    ///
+    /// List keys take a comma list of presets/URLs/IPs; on/off keys take on or
+    /// off.
     Set {
         /// A settings key
         #[arg(
@@ -730,8 +772,10 @@ pub(crate) enum MdnsAction {
     On,
     /// Disable mDNS local peer discovery (takes effect on daemon restart)
     Off,
-    /// List rayfish nodes seen on this LAN. Seeing a node grants it nothing:
-    /// linking up still needs `ray connect` and the other side's approval.
+    /// List rayfish nodes seen on this LAN
+    ///
+    /// Seeing a node grants it nothing: linking up still needs `ray connect`
+    /// and the other side's approval.
     Scan,
 }
 
@@ -745,11 +789,13 @@ pub(crate) enum ContactAction {
 
 #[derive(Subcommand)]
 pub(crate) enum FirewallAction {
-    /// Add a firewall rule. A new rule is inserted at the front, so it
-    /// supersedes any contradicting rule under first-match, e.g. `deny in icmp`
-    /// overrides the seeded `allow in icmp` (and re-adding `allow` flips it back).
-    /// A rule with the same selector (direction/proto/port/peer/network) replaces
-    /// the old one rather than stacking, so toggling never accumulates dead rules.
+    /// Add a firewall rule
+    ///
+    /// A new rule is inserted at the front, so it supersedes any contradicting
+    /// rule under first-match, e.g. `deny in icmp` overrides the seeded
+    /// `allow in icmp` (and re-adding `allow` flips it back). A rule with the
+    /// same selector (direction/proto/port/peer/network) replaces the old one
+    /// rather than stacking, so toggling never accumulates dead rules.
     #[command(visible_alias = "a")]
     Add {
         /// Direction: in or out
@@ -782,17 +828,20 @@ pub(crate) enum FirewallAction {
     /// Show current firewall rules
     #[command(visible_aliases = ["ls", "list"])]
     Show,
-    /// Set the inbound default policy (allow or deny). `deny` (the secure
-    /// built-in default) blocks unsolicited inbound TCP/UDP; `allow` restores the
-    /// old permissive behaviour. Inbound ICMP is always allowed by default (use an
-    /// explicit `deny in icmp` rule to block it); the outbound default is always
-    /// allow and is unaffected.
+    /// Set the inbound default policy (allow or deny)
+    ///
+    /// `deny` (the secure built-in default) blocks unsolicited inbound TCP/UDP;
+    /// `allow` restores the old permissive behaviour. Inbound ICMP is always
+    /// allowed by default (use an explicit `deny in icmp` rule to block it);
+    /// the outbound default is always allow and is unaffected.
     Default {
         /// Default inbound action: allow or deny
         #[arg(add = complete::words(&ALLOW_DENY))]
         action: String,
     },
-    /// Toggle "fail fast" REJECT mode (opt-in, default off). When `on`, a denied
+    /// Reply RST/unreachable instead of dropping (on|off)
+    ///
+    /// "Fail fast" REJECT mode, opt-in and off by default. When `on`, a denied
     /// packet gets a TCP RST / ICMP-unreachable reply so the initiator fails
     /// immediately ("connection refused") instead of hanging to a timeout. When
     /// `off`, denied packets are silently dropped (stealthy, the default).
@@ -801,18 +850,22 @@ pub(crate) enum FirewallAction {
         #[arg(add = complete::words(&ON_OFF))]
         state: String,
     },
-    /// Turn the firewall back on (resume enforcing rules and defaults). Undoes
-    /// `ray firewall off`.
+    /// Turn the firewall back on
+    ///
+    /// Resumes enforcing rules and defaults. Undoes `ray firewall off`.
     #[command(visible_alias = "enable")]
     On,
-    /// Disable the firewall entirely on this device: every packet is allowed,
-    /// bypassing all rules and defaults (mesh membership still gates who can reach
-    /// you; the anti-spoof check still runs). For simple setups that don't want a
-    /// second firewall on top of the host/kernel one. Re-enable with
+    /// Allow every packet, bypassing all rules
+    ///
+    /// Disables the firewall entirely on this device: every packet is allowed,
+    /// bypassing all rules and defaults (mesh membership still gates who can
+    /// reach you; the anti-spoof check still runs). For simple setups that don't
+    /// want a second firewall on top of the host/kernel one. Re-enable with
     /// `ray firewall on`.
     #[command(visible_alias = "disable")]
     Off,
-    /// Coordinator-only: suggest firewall rules for a subject host on a network.
+    /// Coordinator: suggest rules for a subject host
+    ///
     /// Distributed in the signed blob; each node takes them per its own consent.
     Suggest {
         /// Network name
@@ -834,8 +887,9 @@ pub(crate) enum FirewallAction {
         #[arg(long, value_name = "[PEER:]SPEC")]
         deny: Vec<String>,
     },
-    /// Show suggested rules queued for manual review on a network
-    /// (a node that did not join with `--auto-accept-firewall`).
+    /// Show suggested rules queued for review on a network
+    ///
+    /// Queued on a node that did not join with `--auto-accept-firewall`.
     Pending {
         /// Network name
         #[arg(add = complete::networks())]
@@ -847,14 +901,16 @@ pub(crate) enum FirewallAction {
         #[arg(add = complete::networks())]
         network: String,
     },
-    /// Discard a network's queued suggested rules without installing them
+    /// Discard a network's queued suggested rules
     Deny {
         /// Network name
         #[arg(add = complete::networks())]
         network: String,
     },
-    /// Toggle auto-accepting this network's suggested firewall rules on this node
-    /// (`on` installs the current queue; `off` stops future auto-install).
+    /// Take future suggestions without review (on|off)
+    ///
+    /// Per network, on this node. `on` also installs the current queue; `off`
+    /// stops future auto-install.
     AutoAccept {
         /// Network name
         #[arg(add = complete::networks())]
@@ -863,9 +919,11 @@ pub(crate) enum FirewallAction {
         #[arg(add = complete::words(&ON_OFF))]
         state: String,
     },
-    /// Embedded mesh SSH server (Tailscale-style): SSH into this node by mesh
-    /// identity, no SSH keys. `ssh on` starts the server; `ssh allow <net> <peer>`
-    /// authorizes a peer to log in. Connect with a stock client: `ssh user@host.ray`.
+    /// Embedded mesh SSH server: SSH in by mesh identity
+    ///
+    /// Tailscale-style, with no SSH keys. `ssh on` starts the server;
+    /// `ssh allow <net> <peer>` authorizes a peer to log in. Connect with a
+    /// stock client: `ssh user@host.ray`.
     Ssh {
         #[command(subcommand)]
         action: SshAction,
@@ -874,13 +932,18 @@ pub(crate) enum FirewallAction {
 
 #[derive(Subcommand)]
 pub(crate) enum SshAction {
-    /// Start the embedded mesh SSH server on this node (listens on the mesh IPs'
-    /// port 22; opens tcp:22 in the local firewall).
+    /// Start the mesh SSH server on this node
+    ///
+    /// Listens on the mesh IPs' port 22, and opens tcp:22 in the local firewall.
     On,
-    /// Stop the mesh SSH server (removes the tcp:22 passthrough).
+    /// Stop the mesh SSH server
+    ///
+    /// Removes the tcp:22 passthrough.
     Off,
-    /// Authorize a peer to SSH into this node over a network. `peer` is a
-    /// hostname, mesh IP, short id, or `*` (any peer on the network).
+    /// Authorize a peer to SSH into this node
+    ///
+    /// Per network. `peer` is a hostname, mesh IP, short id, or `*` (any peer on
+    /// the network).
     #[command(visible_alias = "ok")]
     Allow {
         /// Network name
@@ -894,7 +957,7 @@ pub(crate) enum SshAction {
         #[arg(long = "user", short = 'u', value_delimiter = ',')]
         user: Vec<String>,
     },
-    /// Revoke a peer's SSH authorization on a network.
+    /// Revoke a peer's SSH authorization on a network
     #[command(visible_aliases = ["rm", "del"])]
     Deny {
         /// Network name
@@ -904,7 +967,7 @@ pub(crate) enum SshAction {
         #[arg(add = complete::peers_or_any())]
         peer: String,
     },
-    /// Show the mesh SSH server state and per-network allow lists.
+    /// Show the server state and per-network allow lists
     #[command(visible_aliases = ["ls", "list"])]
     Show {
         /// Optional network to filter to
@@ -915,7 +978,8 @@ pub(crate) enum SshAction {
 
 #[derive(Subcommand)]
 pub(crate) enum ExitNodeAction {
-    /// Permit a peer to route its internet-bound traffic out through this node.
+    /// Let a peer route its internet traffic through this node
+    ///
     /// The first `allow` turns this node into an exit node for the network;
     /// activate it with `ray up`. `peer` is a hostname, mesh IP, short id, or
     /// `*` (any peer on the network).
@@ -928,8 +992,10 @@ pub(crate) enum ExitNodeAction {
         #[arg(add = complete::peers_or_any())]
         peer: String,
     },
-    /// Revoke a peer's exit-node permission on a network. Removing the last peer
-    /// withdraws this node's exit-node offer.
+    /// Revoke a peer's exit-node permission
+    ///
+    /// Per network. Removing the last peer withdraws this node's exit-node
+    /// offer.
     #[command(visible_aliases = ["rm", "del", "deny"])]
     Disallow {
         /// Network name
@@ -939,9 +1005,10 @@ pub(crate) enum ExitNodeAction {
         #[arg(add = complete::peers_or_any())]
         peer: String,
     },
-    /// Route all this node's non-mesh traffic through an exit peer on a network.
-    /// The peer must advertise an exit node (see `ray exit-node status`). Takes
-    /// effect on the next `ray up`.
+    /// Route this node's non-mesh traffic through an exit peer
+    ///
+    /// Per network. The peer must advertise an exit node (see
+    /// `ray exit-node status`). Takes effect on the next `ray up`.
     Use {
         /// Network name
         #[arg(add = complete::networks())]
@@ -950,15 +1017,19 @@ pub(crate) enum ExitNodeAction {
         #[arg(add = complete::exit_peers())]
         peer: String,
     },
-    /// Stop routing through an exit node (restore direct egress). With no
-    /// network, clears the exit selection on every network that has one.
+    /// Stop routing through an exit node
+    ///
+    /// Restores direct egress. With no network, clears the exit selection on
+    /// every network that has one.
     #[command(visible_aliases = ["off", "disable"])]
     None {
         /// Network name (omit to clear every network's exit selection)
         #[arg(add = complete::networks())]
         network: Option<String>,
     },
-    /// Show exit-node state: this node's offer + selection, and available peers.
+    /// Show exit-node state and available peers
+    ///
+    /// This node's offer and selection, plus the peers advertising one.
     #[command(visible_aliases = ["ls", "list", "show"])]
     Status {
         /// Optional network to filter to
@@ -982,9 +1053,10 @@ pub(crate) enum FilesAction {
         /// Queued-send ID (from 'ray files')
         id: u64,
     },
-    /// Toggle auto-accepting file transfers from your own paired devices on a
-    /// network (`on` also drains any already-queued offers from your devices;
-    /// `off` stops future auto-accept). Only your own devices are auto-accepted.
+    /// Auto-accept offers from your own devices (on|off)
+    ///
+    /// Per network, and only for your own paired devices. `on` also drains any
+    /// already-queued offers from them; `off` stops future auto-accept.
     AutoAccept {
         /// Network name
         #[arg(add = complete::networks())]
@@ -993,8 +1065,10 @@ pub(crate) enum FilesAction {
         #[arg(add = complete::words(&ON_OFF))]
         state: String,
     },
-    /// Set/show/clear the directory where auto-accepted files are written
-    /// (absolute path). With no argument, prints the current value.
+    /// Set the directory auto-accepted files are written to
+    ///
+    /// An absolute path. With no argument, prints the current value; `--clear`
+    /// reverts to the download-user / operator fallback.
     DownloadDir {
         /// Absolute path (omit to show current)
         #[arg(value_hint = clap::ValueHint::DirPath)]
@@ -1003,8 +1077,10 @@ pub(crate) enum FilesAction {
         #[arg(long)]
         clear: bool,
     },
-    /// Set/show/clear the unix user that owns auto-accepted files (and whose
-    /// ~/Downloads receives them when no download-dir is set).
+    /// Set the unix user that owns auto-accepted files
+    ///
+    /// Their ~/Downloads also receives the files when no download-dir is set.
+    /// With no argument, prints the current value.
     DownloadUser {
         /// Username or numeric uid (omit to show current)
         #[arg(value_hint = clap::ValueHint::Username)]
@@ -1350,13 +1426,29 @@ async fn run() -> Result<()> {
             action,
             json: _,
         } => ipc_invite(&network, action).await,
-        Command::Requests { network, json: _ } => ipc_requests(&network).await,
+        Command::Requests {
+            network,
+            action,
+            json: _,
+        } => match action {
+            None => ipc_requests(&network).await,
+            Some(RequestsAction::Accept { id }) => ipc_accept_request(&network, &id).await,
+            Some(RequestsAction::Deny { id }) => ipc_deny_request(&network, &id).await,
+        },
         Command::Accept { network, id } => ipc_accept_request(&network, &id).await,
         Command::Deny { network, id } => ipc_deny_request(&network, &id).await,
+        // An action is a request-queue verb, a bare contact id dials that peer,
+        // and neither means "show me the queue", the same as `ray connections`
+        // did.
         Command::Connect {
+            action,
             contact_id,
             hostname,
-        } => ipc_connect(&contact_id, hostname).await,
+            json: _,
+        } => match (action, contact_id) {
+            (None, Some(id)) => ipc_connect(&id, hostname).await,
+            (action, _) => ipc_connections(action).await,
+        },
         Command::Connections { action, json: _ } => ipc_connections(action).await,
         Command::Contact { action, json: _ } => ipc_contact(action).await,
         Command::Ping {

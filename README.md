@@ -38,7 +38,7 @@ That's the whole idea. The rest of this README is the details.
 Each machine runs a small daemon (comparable to Tailscale's `tailscaled`) that creates a TUN device, captures IP packets, and tunnels them over iroh's QUIC connections. Everything else (`create`, `join`, `status`, file sharing) is an unprivileged command that talks to the daemon over a local socket.
 
 1. **Create.** One peer starts a network and becomes its coordinator. The network's public key is its **room id**: it lets others discover the network but, on a closed network, is not enough to get in.
-2. **Join.** On a closed network a peer gets in with a one-time invite code (`ray invite`) or by requesting approval (`ray requests` / `ray accept`). The coordinator is the gatekeeper.
+2. **Join.** On a closed network a peer gets in with a one-time invite code (`ray invite`) or by requesting approval (`ray requests`). The coordinator is the gatekeeper.
 3. **Mesh.** Every peer derives its own stable virtual IPv4 (`100.64.0.0/10`) and IPv6 (`200::/7`) from its identity, then connects directly to every other peer.
 4. **Use it.** Any TCP/UDP app works, addressed by IP or by `name.network.ray`.
 
@@ -110,12 +110,12 @@ sudo ray update --nightly        # track the rolling nightly (rebuilt on every c
 sudo ray update --version 0.1.0  # install a specific release (downgrades allowed)
 
 sudo ray install --auto-update   # enable automatic stable updates at install time
-ray auto-update on               # or toggle it any time (takes effect on `sudo ray restart`)
+ray config set auto-update on    # or toggle it any time (takes effect on `sudo ray restart`)
 ```
 
 `ray update` fetches a release from GitHub, verifies its SHA-256, atomically replaces the running `ray` binary, and (if the system service is installed) restarts the daemon onto the new version. By default it tracks the latest stable release; `--nightly` follows the rolling pre-release built from every commit, and `--version X` pins a specific release. There is no persisted channel: each run picks its target from the flag. It needs root when the installed binary lives in a system path (so use `sudo ray update`); `ray --version`, `ray update --check`, and `ray update --list` do not.
 
-**Automatic updates** are opt-in (off by default). Enable them with `sudo ray install --auto-update` or `ray auto-update on`: the daemon then checks for a newer **stable** release about every 6 hours and, when one exists, downloads + verifies + swaps the binary and restarts itself onto it. Nightlies are never auto-installed. Because applying an update restarts the daemon, it briefly drops the VPN (peers reconnect automatically), so it stays opt-in. `ray status` shows when auto-update is on.
+**Automatic updates** are opt-in (off by default). Enable them with `sudo ray install --auto-update` or `ray config set auto-update on`: the daemon then checks for a newer **stable** release about every 6 hours and, when one exists, downloads + verifies + swaps the binary and restarts itself onto it. Nightlies are never auto-installed. Because applying an update restarts the daemon, it briefly drops the VPN (peers reconnect automatically), so it stays opt-in. `ray status` shows when auto-update is on.
 
 ### 2. Create a network
 
@@ -256,18 +256,18 @@ you're happy to leave the door open on. The three ways into a private network
 ### Adding and removing people
 
 ```bash
-ray invite <network>          # mint a one-time code to hand to one person
-ray requests <network>        # see who's asking to join
-ray accept <network> <id>     # let them in   (ray deny <id> to refuse)
-ray kick <network> <member>   # remove someone for good; they drop mesh-wide
-ray ephemeral <network> 7d    # auto-remove members offline longer than 7d
+ray invite <network>                 # mint a one-time code to hand to one person
+ray requests <network>               # see who's asking to join
+ray requests <network> accept <id>   # let them in ("deny <id>" to refuse)
+ray kick <network> <member>          # remove someone for good; they drop mesh-wide
+ray ephemeral <network> 7d           # auto-remove members offline longer than 7d
 ```
 
 `ray kick` is the one to reach for when someone should lose access: it removes
 them from the network's signed roster and every other member disconnects them.
-`ray invite`, `ray requests`, `ray accept`, and `ray kick` are coordinator
-actions, so you run them on the machine that created the network (or on any
-co-coordinator you've added with `ray admin add`).
+`ray invite`, `ray requests`, and `ray kick` are coordinator actions, so you run
+them on the machine that created the network (or on any co-coordinator you've
+added with `ray admin add`).
 
 ### Pairing your own devices
 
@@ -301,7 +301,7 @@ The **room id** (a network's public key) is a discovery key. It's published so p
 - **Closed (default)** has three ways in:
   - **Invite code.** `ray invite <network>` mints a single-use, expiring code. The holder runs `ray join <code>`; the coordinator verifies and burns it. Manage with `ray invite <network> list` / `revoke <id>`.
   - **Reusable key.** `ray invite <network> --reusable` mints a multi-use, expiring key for unattended fleets. Its hash rides the network's signed record, so it admits many machines and `revoke` propagates to every key-holder. A server joins non-interactively with `ray join <key> --hostname web --auto-accept-firewall`. The name isn't authoritative, so two servers asking for `web` become `web` and `web-1`. For stable per-host names give each a unique `--hostname` (e.g. a cloud instance id), and prefer the `*` wildcard subject for fleet firewall suggestions (a rule keyed to one hostname can retarget as servers come and go). Key expiry is not member expiry: expiry/revoke only blocks new joins; machines already admitted stay members.
-  - **Live approval.** The holder of just the room id runs `ray join <room-id>` and lands in a queue. The coordinator runs `ray requests <network>`, then `ray accept <network> <id>` (or `ray deny`).
+  - **Live approval.** The holder of just the room id runs `ray join <room-id>` and lands in a queue. The coordinator runs `ray requests <network>`, then `ray requests <network> accept <id>` (or `deny <id>`).
 - **Open** (`ray create --open`) lets anyone with the room id join directly. Good for public or community networks.
 
 Either gate runs through a coordinator. The full coordinator set is published in the network's signed record (`Member.is_coordinator`), so a fresh joiner dials the invite minter first, then falls back across the other coordinators. Admission survives any one coordinator being offline. Once admitted, a member reconnects by cryptographic identity and no coordinator needs to be online.
@@ -312,8 +312,8 @@ To link up with one person, skip room ids and invite codes entirely. Everyone ha
 
 ```bash
 ray connect <their-contact-id>     # ask to connect; you wait, pending
-ray connections                    # they see the request…
-ray connections approve <id>       # …and approve it
+ray connect                        # they see the request…
+ray connect approve <id>           # …and approve it
 ```
 
 Approval creates a private **2-peer network** automatically (shown as `[direct]` in `ray status`). It's a real network, so firewall rules, Magic DNS, and the mesh all work the same. Approval is recipient-only: the requester consents by asking, the recipient consents by approving. Rotate your contact id anytime with `ray contact rotate` to stop new requests (existing links keep working). To stay unreachable, don't share the id.
@@ -333,7 +333,7 @@ ray connect <peer>                 # link up with one, using the id from the sca
 **nearby**, so you don't have to go looking.
 
 A sighting grants nothing. The scan marks which neighbours you already share a
-network with, and connecting to one still needs their `ray connections approve`.
+network with, and connecting to one still needs their `ray connect approve`.
 Because the scan gives you an id you can dial directly, the pair does not need
 the DHT: two machines can link up on a LAN with no internet. The flip side is
 that anyone on your LAN can send you a connect request without knowing your

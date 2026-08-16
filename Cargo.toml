@@ -67,7 +67,7 @@ blake3 = { version = "1", features = ["serde"] }
 bytes = "1"
 # `unstable-ext` is what `#[arg(add = ...)]` goes through, and is how the
 # completers in src/cli/complete.rs get attached to the arguments they answer for.
-clap = { version = "4.6.6", features = ["derive", "unstable-ext"] }
+clap = { version = "4.6.6", features = ["derive", "unstable-ext", "wrap_help"] }
 ahash = "0.8"
 # `unstable-dynamic` moves completion from a generated script to the binary
 # itself, which is the only way a tab can list the networks and peers you have

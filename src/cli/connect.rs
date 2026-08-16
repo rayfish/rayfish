@@ -28,10 +28,10 @@ pub(crate) async fn ipc_connect(contact_id: &str, hostname: Option<String>) -> R
     Ok(())
 }
 
-pub(crate) async fn ipc_connections(action: Option<ConnectionsAction>) -> Result<()> {
-    match action.unwrap_or(ConnectionsAction::List) {
-        ConnectionsAction::List => ipc_connections_list().await,
-        ConnectionsAction::Approve { id } => ipc_connections_approve(&id).await,
+pub(crate) async fn ipc_connections(action: Option<ConnectAction>) -> Result<()> {
+    match action.unwrap_or(ConnectAction::List) {
+        ConnectAction::List => ipc_connections_list().await,
+        ConnectAction::Approve { id } => ipc_connections_approve(&id).await,
     }
 }
 

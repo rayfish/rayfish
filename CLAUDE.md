@@ -31,11 +31,11 @@ Service management never calls `systemctl` directly: `init_system::InitSystem` d
 sudo ray up | down            # activate / standby (down keeps peer connections, drops only the data plane)
 sudo ray start | stop | restart | install | uninstall | set-operator
 ray create | join | leave | nuke | kick | ephemeral | hostname | status
-ray invite | requests | accept | deny | admin        # admission + coordinators
-ray connect | connections | contact | pair | unpair  # direct links + multi-device identity
+ray invite | requests [accept|deny] | admin          # admission + coordinators
+ray connect [list|approve] | contact | pair | unpair  # direct links + multi-device identity
 ray firewall … | apply | alias | identityof          # policy
 ray exit-node allow | disallow | use | none | status  # internet gateway (offer: Linux/macOS/BSD, use: Linux/macOS)
-ray send | files | config | gui | mdns | auto-update | update | ping | netcheck | logs | report
+ray send | files | config | gui | mdns | update | ping | netcheck | logs | report
 ray completions [shell] [--install]                  # tab completion (installed by `ray up`)
 ```
 
@@ -115,7 +115,7 @@ The rules the code upholds. Read the code for the mechanics.
   `IpcMessage`, which is why it is dispatched in `handle_ipc_client` ahead of
   `handle_request`. Keep it that way: a second streaming reply is a reason to
   factor the pattern out, not to widen every handler's signature.
-- **CLI help is grouped in `src/cli/help.rs`.** clap has no subcommand grouping (`help_heading`/`hide_short_help` are argument-only), so the `-h` command list is rendered there from the clap model and the help template drops `{subcommands}`. A new command must join a `GROUPS` entry or it appears nowhere (tests enforce both directions). Subcommands stay *visible* in the clap model on purpose: `hide = true` would suppress clap's list but `clap_complete` skips hidden subcommands, silently gutting tab completion. Keep each `about` to one line inside 80 columns and put the rest after a blank line, where it becomes `ray help <command>`.
+- **CLI help is grouped in `src/cli/help.rs`, per page.** clap has no subcommand grouping (`help_heading`/`hide_short_help` are argument-only), so a grouped `-h` list is rendered there from the clap model and the help template drops `{subcommands}`. `PAGES` maps a command path to its groups (`&[]` = the root, `&["firewall"]` = `ray firewall`); a new command must join the groups of the page it sits on or it appears nowhere, and the tests enforce both directions per page. Group a page only when it outgrows a flat list: below about eight actions a heading per two entries is noise. **`about` is one line inside 80 columns at every depth** (`every_about_fits_the_listing` walks the whole model), with the rest after a blank line, where it becomes `ray help <command> <action>`; `wrap_help` is on so those paragraphs wrap to the terminal. Subcommands stay *visible* in the clap model unless hiding them is the point: `hide = true` suppresses clap's list but `clap_complete` also skips hidden subcommands, which silently guts tab completion for a command meant to be typed — and is exactly right for one that isn't (`open`), or for an old spelling kept alive only so existing scripts keep working (`accept`, `deny`, `connections`, `auto-update`).
 - **`--json` is per-command, never on the root.** It is declared on each command that renders JSON, `global = true` so it also parses after that command's action (`ray firewall show --json`). Declaring it on `Cli` would put it back on all 44 commands, most of which would ignore it in silence.
 - **Logging** is `tracing`: console at `info`, rolling daily files at `rayfish=debug` (bundled by `ray report`). The daemon panic hook restores DNS then `abort()`s so the service manager restarts it (fail-fast, never limp).
 - **Git:** conventional commit subjects (`feat`/`fix`/`docs`/…) so git-cliff can generate the changelog.

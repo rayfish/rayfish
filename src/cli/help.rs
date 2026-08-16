@@ -1,4 +1,5 @@
-//! Grouped `ray -h` output.
+//! Grouped `-h` output, for the root and for any subcommand long enough to need
+//! it.
 //!
 //! clap has no notion of subcommand groups: `help_heading` is an argument-only
 //! attribute, and `hide_short_help` likewise, so neither grouping nor a terse
@@ -10,18 +11,28 @@
 //! clap model, so there is no second copy of any help text to drift, and
 //! subcommands stay visible in that model: `hide = true` would have suppressed
 //! clap's list for us, but `clap_complete` skips hidden subcommands, which would
-//! quietly gut tab completion.
+//! quietly gut tab completion. (Deliberately hidden commands are a separate
+//! thing: a spelling kept alive for old scripts is meant to leave both the
+//! listing and completion.)
+//!
+//! A page that is *not* in [`PAGES`] keeps clap's own flat list. That is the
+//! right answer below about eight actions, where a heading per two entries is
+//! noise; what those pages need instead is a one-line `about`, which
+//! `tests::every_about_fits_the_listing` enforces at every depth.
 
 use clap::{Command, CommandFactory};
 
 use crate::Cli;
 
-/// The group each subcommand is listed under, in display order.
+/// One page's groups: a title and the subcommands under it, in display order.
+type Groups = &'static [(&'static str, &'static [&'static str])];
+
+/// The group each top-level command is listed under.
 ///
 /// Every visible subcommand must appear exactly once. `tests::every_command_is_grouped`
 /// fails otherwise, so a newly added command cannot silently go missing from
 /// `-h`, and a renamed or deleted one cannot leave a dangling entry here.
-const GROUPS: &[(&str, &[&str])] = &[
+const ROOT: Groups = &[
     (
         "Networks",
         &[
@@ -36,21 +47,9 @@ const GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Members & access",
-        &[
-            "invite",
-            "requests",
-            "accept",
-            "deny",
-            "kick",
-            "admin",
-            "alias",
-            "identityof",
-        ],
+        &["invite", "requests", "kick", "admin", "alias", "identityof"],
     ),
-    (
-        "Devices & links",
-        &["connect", "connections", "contact", "pair", "unpair"],
-    ),
+    ("Devices & links", &["connect", "contact", "pair", "unpair"]),
     ("Files", &["send", "files"]),
     ("Policy", &["firewall", "exit-node", "apply"]),
     (
@@ -72,38 +71,87 @@ const GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Setup",
-        &[
-            "config",
-            "auto-update",
-            "update",
-            "completions",
-            "gui",
-            "version",
-            "open",
-        ],
+        &["config", "update", "completions", "gui", "version"],
     ),
 ];
 
+/// `ray firewall`, the one page with enough actions to need headings: rules to
+/// edit, switches that change how they are enforced, the coordinator-suggestion
+/// queue, and the SSH server that rides the same policy.
+const FIREWALL: Groups = &[
+    ("Rules", &["show", "add", "remove"]),
+    ("Mode", &["on", "off", "default", "reject"]),
+    (
+        "Coordinator suggestions",
+        &["suggest", "pending", "accept", "deny", "auto-accept"],
+    ),
+    ("Mesh SSH", &["ssh"]),
+];
+
+/// Every grouped help page: the command path it sits at (empty = the root) and
+/// its groups. Adding a page is an entry here; the tests then hold it to the
+/// same coverage rules the root has always had.
+const PAGES: &[(&[&str], Groups)] = &[(&[], ROOT), (&["firewall"], FIREWALL)];
+
+/// The help template for one page.
+///
 /// `{subcommands}` is deliberately absent: the grouped listing takes its place
 /// through `{after-help}`, which is why that placeholder sits above `{options}`
-/// rather than in its usual spot at the foot of the page. `Options:` is spelled
-/// out because `{options}` renders the option lines without their heading.
-/// `{after-help}` brings its own blank line, so it sits flush against the usage
-/// line here rather than being separated by one.
-const TEMPLATE: &str = "\
-{about-with-newline}
-{usage-heading} {usage}{after-help}
+/// rather than in its usual spot at the foot of the page. `Options:` and
+/// `Arguments:` are spelled out because `{options}` / `{positionals}` render
+/// their lines without a heading. `{after-help}` brings its own blank line, so
+/// it sits flush against the usage line rather than being separated by one.
+///
+/// The `Arguments:` block appears only when the page has positionals. The root
+/// has none, but omitting the block unconditionally would silently swallow
+/// `<NETWORK>` the day someone groups `ray invite`.
+fn template(cmd: &Command, path: &[&str]) -> String {
+    let args = if cmd.get_positionals().next().is_some() {
+        "\n\nArguments:\n{positionals}"
+    } else {
+        ""
+    };
+    // `ray help firewall <command>` on a nested page, `ray help <command>` at
+    // the root.
+    let prefix = match path.is_empty() {
+        true => String::new(),
+        false => format!("{} ", path.join(" ")),
+    };
+    format!(
+        "{{about-with-newline}}\n\
+         {{usage-heading}} {{usage}}{{after-help}}{args}\n\
+         \n\
+         Options:\n\
+         {{options}}\n\
+         \n\
+         Run `ray help {prefix}<command>` for the full description of one command."
+    )
+}
 
-Options:
-{options}
-
-Run `ray help <command>` for the full description of one command.";
-
-/// The CLI, with the grouped command listing in place of clap's flat one.
+/// The CLI, with a grouped command listing in place of clap's flat one on every
+/// page in [`PAGES`].
 pub(crate) fn command() -> Command {
-    let cmd = Cli::command();
-    let listing = render(&cmd);
-    cmd.help_template(TEMPLATE).after_help(listing)
+    let mut cmd = Cli::command();
+    for (path, groups) in PAGES {
+        cmd = at(cmd, path, &|target| group(target, path, groups));
+    }
+    cmd
+}
+
+/// Apply `f` to the command at `path`, walking down through `mut_subcommand` so
+/// nesting depth is not special-cased.
+fn at(cmd: Command, path: &[&str], f: &dyn Fn(Command) -> Command) -> Command {
+    match path.split_first() {
+        None => f(cmd),
+        Some((head, rest)) => cmd.mut_subcommand(head, |sub| at(sub, rest, f)),
+    }
+}
+
+/// Swap one page's flat subcommand list for its grouped listing.
+fn group(cmd: Command, path: &[&str], groups: Groups) -> Command {
+    let listing = render(&cmd, groups);
+    let template = template(&cmd, path);
+    cmd.help_template(template).after_help(listing)
 }
 
 /// Whether `<command>` takes `--json`.
@@ -119,19 +167,20 @@ pub(crate) fn supports_json(command: &str) -> bool {
         .is_some_and(|sub| sub.get_arguments().any(|a| a.get_id() == "json"))
 }
 
-/// Render the grouped listing, pulling each description from `cmd` itself.
-fn render(cmd: &Command) -> String {
+/// Render one page's grouped listing, pulling each description from `cmd`
+/// itself.
+fn render(cmd: &Command, groups: Groups) -> String {
     // One name column across every group, so the descriptions line up down the
     // whole page rather than per-group.
-    let width = GROUPS
+    let width = groups
         .iter()
         .flat_map(|(_, names)| names.iter())
         .map(|n| n.len())
         .max()
         .unwrap_or(0);
 
-    let mut groups = Vec::new();
-    for (title, names) in GROUPS {
+    let mut blocks = Vec::new();
+    for (title, names) in groups {
         let mut block = String::from(*title);
         for name in *names {
             let sub = cmd
@@ -147,9 +196,9 @@ fn render(cmd: &Command) -> String {
                 _ => block.push_str(&format!(" [aliases: {}]", aliases.join(", "))),
             }
         }
-        groups.push(block);
+        blocks.push(block);
     }
-    groups.join("\n\n")
+    blocks.join("\n\n")
 }
 
 #[cfg(test)]
@@ -161,27 +210,54 @@ mod tests {
     /// grouped, so the grouping table never has to mention it.
     const GENERATED: &str = "help";
 
-    /// The listing is only as good as its coverage: a command missing from
-    /// `GROUPS` would vanish from `-h` entirely, since the template no longer
-    /// renders clap's own list as a backstop.
+    /// The widest a listing line may be. A reader scans the name column, and a
+    /// wrapped line breaks that column, so nothing may reach the width a
+    /// terminal is narrowest at.
+    const LIMIT: usize = 80;
+
+    /// Resolve a page's path against the clap model.
+    fn page<'a>(cmd: &'a Command, path: &[&str]) -> &'a Command {
+        path.iter().fold(cmd, |parent, name| {
+            parent
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("`ray {}` is a grouped page but not a command", path.join(" ")))
+        })
+    }
+
+    /// How wide the trailing `[alias: …]` note renders, in `render`'s wording.
+    fn alias_width(sub: &Command) -> usize {
+        let aliases: Vec<&str> = sub.get_visible_aliases().collect();
+        match aliases.len() {
+            0 => 0,
+            1 => " [alias: ]".len() + aliases[0].len(),
+            n => " [aliases: ]".len() + aliases.iter().map(|a| a.len()).sum::<usize>() + 2 * (n - 1),
+        }
+    }
+
+    /// The listing is only as good as its coverage: a command missing from its
+    /// page's groups would vanish from `-h` entirely, since the template no
+    /// longer renders clap's own list as a backstop.
     #[test]
     fn every_command_is_grouped() {
         let cmd = Cli::command();
-        let grouped: HashSet<&str> = GROUPS
-            .iter()
-            .flat_map(|(_, names)| names.iter().copied())
-            .collect();
+        for (path, groups) in PAGES {
+            let grouped: HashSet<&str> = groups
+                .iter()
+                .flat_map(|(_, names)| names.iter().copied())
+                .collect();
 
-        let missing: Vec<&str> = cmd
-            .get_subcommands()
-            .filter(|s| !s.is_hide_set() && s.get_name() != GENERATED)
-            .map(|s| s.get_name())
-            .filter(|n| !grouped.contains(n))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "not listed in any `-h` group: {missing:?}"
-        );
+            let missing: Vec<&str> = page(&cmd, path)
+                .get_subcommands()
+                .filter(|s| !s.is_hide_set() && s.get_name() != GENERATED)
+                .map(|s| s.get_name())
+                .filter(|n| !grouped.contains(n))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "not listed in any `ray {} -h` group: {missing:?}",
+                path.join(" ")
+            );
+        }
     }
 
     /// The other direction: a renamed or deleted command must not leave an entry
@@ -189,50 +265,107 @@ mod tests {
     #[test]
     fn every_grouped_name_is_a_command() {
         let cmd = Cli::command();
-        let dangling: Vec<&str> = GROUPS
-            .iter()
-            .flat_map(|(_, names)| names.iter().copied())
-            .filter(|n| cmd.find_subcommand(n).is_none())
-            .collect();
-        assert!(
-            dangling.is_empty(),
-            "grouped but not a subcommand: {dangling:?}"
-        );
+        for (path, groups) in PAGES {
+            let target = page(&cmd, path);
+            let dangling: Vec<&str> = groups
+                .iter()
+                .flat_map(|(_, names)| names.iter().copied())
+                .filter(|n| target.find_subcommand(n).is_none())
+                .collect();
+            assert!(
+                dangling.is_empty(),
+                "grouped under `ray {}` but not a subcommand of it: {dangling:?}",
+                path.join(" ")
+            );
+        }
     }
 
     /// A command in two groups would be listed twice.
     #[test]
     fn no_command_is_grouped_twice() {
-        let mut seen = HashSet::new();
-        let dupes: Vec<&str> = GROUPS
-            .iter()
-            .flat_map(|(_, names)| names.iter().copied())
-            .filter(|n| !seen.insert(*n))
-            .collect();
+        for (path, groups) in PAGES {
+            let mut seen = HashSet::new();
+            let dupes: Vec<&str> = groups
+                .iter()
+                .flat_map(|(_, names)| names.iter().copied())
+                .filter(|n| !seen.insert(*n))
+                .collect();
+            assert!(
+                dupes.is_empty(),
+                "listed under more than one `ray {}` group: {dupes:?}",
+                path.join(" ")
+            );
+        }
+    }
+
+    /// A page that is not grouped still has to be scannable, and clap's own
+    /// listing pads to the widest name just as `render` does. So the constraint
+    /// is the same one at every depth: a subcommand's `about` has to fit beside
+    /// its name inside 80 columns, and the rest belongs in the paragraph below
+    /// it, where `ray help <command>` serves it as the long description.
+    ///
+    /// Asserted against the clap model rather than the rendered page because
+    /// `about` is the thing this file controls. clap's `Arguments:` and
+    /// `Options:` blocks have long lines of their own, which `wrap_help` handles
+    /// at display time.
+    #[test]
+    fn every_about_fits_the_listing() {
+        let cmd = {
+            let mut c = command();
+            c.build();
+            c
+        };
+
+        let mut long = Vec::new();
+        let mut stack = vec![(String::from("ray"), &cmd)];
+        while let Some((path, parent)) = stack.pop() {
+            let visible: Vec<&Command> =
+                parent.get_subcommands().filter(|s| !s.is_hide_set()).collect();
+            let width = visible
+                .iter()
+                .map(|s| s.get_name().len())
+                .max()
+                .unwrap_or(0);
+            for sub in visible {
+                let about = sub.get_about().map(|a| a.to_string()).unwrap_or_default();
+                // `  {name:width$}  {about}`, plus any alias note.
+                let line = 2 + width + 2 + about.chars().count() + alias_width(sub);
+                if line > LIMIT {
+                    long.push(format!("{line} cols: `{path} {}`", sub.get_name()));
+                }
+                stack.push((format!("{path} {}", sub.get_name()), sub));
+            }
+        }
         assert!(
-            dupes.is_empty(),
-            "listed under more than one group: {dupes:?}"
+            long.is_empty(),
+            "these `about` lines do not fit {LIMIT} columns beside their name; \
+             move the detail below a blank line in the doc comment: {long:#?}"
         );
     }
 
     /// Grouping buys scannability, not brevity: the listing is *longer* than the
     /// flat one it replaced. That only pays off if a reader can run their eye
-    /// down the name column, which a wrapped line breaks. Every line therefore
-    /// has to fit the 80 columns a terminal is narrowest at, which caps how much
-    /// a one-line `about` can say; the rest belongs under `ray help <command>`.
+    /// down the name column, which a wrapped line breaks. Every line of a
+    /// grouped page therefore has to fit the 80 columns a terminal is narrowest
+    /// at, headings, options and footer included.
     #[test]
     fn no_help_line_wraps_at_eighty_columns() {
-        let mut cmd = command();
-        let help = cmd.render_help().to_string();
-        let long: Vec<(usize, &str)> = help
-            .lines()
-            .map(|l| (l.chars().count(), l))
-            .filter(|(n, _)| *n > 80)
-            .collect();
-        assert!(
-            long.is_empty(),
-            "these `ray -h` lines wrap at 80 columns: {long:#?}"
-        );
+        for (path, _) in PAGES {
+            let mut cmd = command();
+            cmd.build();
+            let mut target = page(&cmd, path).clone();
+            let help = target.render_help().to_string();
+            let long: Vec<(usize, &str)> = help
+                .lines()
+                .map(|l| (l.chars().count(), l))
+                .filter(|(n, _)| *n > LIMIT)
+                .collect();
+            assert!(
+                long.is_empty(),
+                "these `ray {} -h` lines wrap at {LIMIT} columns: {long:#?}",
+                path.join(" ")
+            );
+        }
     }
 
     /// `--json` has to be `global` *within* the command that declares it. Half
@@ -272,6 +405,64 @@ mod tests {
                 "`{}` should parse",
                 line.join(" ")
             );
+        }
+    }
+
+    /// A command that moved under the thing it acts on keeps its old spelling as
+    /// a hidden command, so no script, README line or shell history breaks. The
+    /// point of hiding it is that it leaves the listing and tab completion, not
+    /// that it stops working.
+    #[test]
+    fn the_old_spellings_still_parse() {
+        for line in [
+            vec!["ray", "accept", "net", "abc123"],
+            vec!["ray", "deny", "net", "abc123"],
+            vec!["ray", "connections"],
+            vec!["ray", "connections", "approve", "abc123"],
+            vec!["ray", "auto-update", "on"],
+            vec!["ray", "open", "rayfish://join/abc"],
+        ] {
+            assert!(
+                command().try_get_matches_from(line.clone()).is_ok(),
+                "`{}` must keep parsing",
+                line.join(" ")
+            );
+        }
+    }
+
+    /// The spellings those old ones moved to.
+    #[test]
+    fn the_new_spellings_parse() {
+        for line in [
+            vec!["ray", "requests", "net"],
+            vec!["ray", "requests", "net", "accept", "abc123"],
+            vec!["ray", "requests", "net", "deny", "abc123"],
+            vec!["ray", "connect"],
+            vec!["ray", "connect", "somecontactid"],
+            vec!["ray", "connect", "approve", "abc123"],
+            vec!["ray", "connect", "accept", "abc123"],
+            vec!["ray", "config", "set", "auto-update", "on"],
+        ] {
+            assert!(
+                command().try_get_matches_from(line.clone()).is_ok(),
+                "`{}` should parse",
+                line.join(" ")
+            );
+        }
+    }
+
+    /// Hiding a command takes it out of the listing *and* out of the generated
+    /// completion scripts, which is the whole reason `hide` is reached for here
+    /// rather than left off. The inverse of the note in this module's header:
+    /// commands that should still be completed must stay visible.
+    #[test]
+    fn the_old_spellings_are_hidden() {
+        let cmd = Cli::command();
+        for name in ["accept", "deny", "connections", "auto-update", "open"] {
+            let sub = cmd
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("`{name}` should still exist, just hidden"));
+            assert!(sub.is_hide_set(), "`ray {name}` should be hidden");
         }
     }
 
