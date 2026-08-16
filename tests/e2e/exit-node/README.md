@@ -35,9 +35,13 @@ non-property, not an oversight, so it is checked rather than assumed.
 
 It also stands in for the co-resident VPN the mode exists for, by putting a
 route in table 52 behind a rule at priority 5250 before turning the tunnel on,
-and asserting it was mirrored into the tunnel table. Without that mirror our
-catch-all rule at priority 102 wins, the foreign prefix is never reached, and
-that VPN goes dark the moment `exit-node use` runs.
+and asserting both that it was mirrored into the tunnel table and that a rule at
+priority 98 sends that destination there. Without the mirror our catch-all rule
+at priority 102 wins and the foreign prefix is never reached; without the rule,
+the two rules at 99 and 100 look up `main`, which is exactly where a
+policy-routing VPN does not keep its prefixes, so traffic sourced from its
+address (or carrying our conntrack mark) misses and takes the physical default.
+Either way that VPN goes dark the moment `exit-node use` runs.
 
 DNS is asserted only as far as the claim goes: both a non-mesh name and a `.ray`
 name must still resolve. Where the non-mesh query *went* is deliberately not

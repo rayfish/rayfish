@@ -687,7 +687,7 @@ impl NetworkRegistry {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
-                exit_node_v6: false,
+                exit_families: ExitFamilies::Unknown,
                 // Our own entry starts out truthful, so the first published blob
                 // already tells peers not to use our mesh IPv4.
                 ipv6_only: self.ipv6_only,

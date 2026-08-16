@@ -384,6 +384,19 @@ else
   on "$B" "ip -6 route show table $TABLE" 2>/dev/null | grep -q "$FOREIGN_NET" \
     && pass "the co-resident VPN's route was mirrored into the tunnel table" \
     || fail "the co-resident VPN's route was not mirrored: our catch-all black-holes it"
+  # The mirror is only half of it. Rules 99 and 100 sit above the catch-all and
+  # both look up `main`, where a policy-routing VPN keeps nothing, so traffic
+  # sourced from its address still misses without a rule pointing that
+  # destination at our table.
+  on "$B" "ip -6 rule show" 2>/dev/null | grep -q "to $FOREIGN_NET lookup $TABLE" \
+    && pass "the co-resident VPN's destinations are routed to the mirrored copy" \
+    || fail "no pref-98 rule for $FOREIGN_NET: traffic sourced from that VPN's own address is black-holed"
+  # Sourced from the foreign address, which is the case the mirror alone misses:
+  # this is what an inbound SSH session's replies look like.
+  B_FOREIGN_SRC="$(on "$B" "ip -6 addr show scope global | awk '/inet6/{print \$2}' | cut -d/ -f1 | head -1")"
+  on "$B" "ip -6 route get ${FOREIGN_NET%%/*}1 from $B_FOREIGN_SRC" 2>/dev/null | grep -q "table $TABLE\|dev lo" \
+    && pass "traffic sourced from the co-resident VPN's address still reaches it" \
+    || fail "traffic sourced from that VPN's address takes the physical default (an inbound session over it would die)"
 
   B_V6_TUNNELED="$(on "$B" 'curl -6 -s --max-time 15 https://api6.ipify.org' 2>/dev/null | tr -d '[:space:]')"
   A_V6_PUB="$(on "$A" 'curl -6 -s --max-time 15 https://api6.ipify.org' 2>/dev/null | tr -d '[:space:]')"

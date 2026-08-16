@@ -11,7 +11,7 @@ use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{EndpointId, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 
-use crate::membership::{ApprovedEntry, Member};
+use crate::membership::{ApprovedEntry, ExitFamilies, Member};
 
 /// Certificate proving a device belongs to a user identity.
 ///
@@ -201,13 +201,19 @@ pub enum ControlMsg {
     /// [`ControlFrame`]'s `net`.
     ExitNodeOffer {
         enabled: bool,
-        /// Whether that exit node can carry IPv6 (the offering host has an IPv6
-        /// default route). Recorded as `Member.exit_node_v6`, and what lets an
-        /// IPv6-only client tell a usable gateway from one that would take its
-        /// traffic and have nowhere to send it. Additive: an older peer omits it
-        /// and reads as v4-only, which is the safe way to be wrong.
-        #[serde(default)]
-        exit_v6: bool,
+        /// Which families that exit node can egress (whether the offering host
+        /// has an IPv6 default route). Recorded as `Member.exit_families`, and
+        /// what lets an IPv6-only client tell a usable gateway from one that
+        /// would take its traffic and have nowhere to send it.
+        ///
+        /// Additive, and three-valued for the same reason the roster field is:
+        /// a gateway on a release that predates this key omits it, and reading
+        /// that silence as "IPv4 only" would pin a host that may well have IPv6
+        /// as unusable for as long as it stays on that build. `enabled` above is
+        /// deliberately left a plain `bool`: it shipped in 0.3.0, and changing
+        /// how an existing field encodes breaks every peer already running it.
+        #[serde(default, skip_serializing_if = "ExitFamilies::is_unknown")]
+        exit_families: ExitFamilies,
     },
     /// Member -> coordinators: announce whether this sender's data plane is
     /// IPv6-only (`ray config set ipv6-only on`), meaning its mesh IPv4 is
@@ -565,7 +571,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
-                exit_node_v6: false,
+                exit_families: ExitFamilies::Unknown,
                 ipv6_only: false,
             }],
         };
@@ -794,7 +800,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
-                exit_node_v6: false,
+                exit_families: ExitFamilies::Unknown,
                 ipv6_only: false,
             }],
             approved: vec![ApprovedEntry {
@@ -1004,13 +1010,19 @@ mod tests {
         }
     }
 
-    /// An `ExitNodeOffer` from a peer that predates `exit_v6` still decodes, and
-    /// reads as "cannot carry IPv6". That default is what lets the field ship
-    /// without bumping `MESH_PROTOCOL_VERSION`: an IPv6-only client declines such
-    /// a gateway, which costs it a usable exit at worst, where guessing the other
-    /// way would route its traffic into a host with nowhere to send it.
+    /// An `ExitNodeOffer` from a peer that predates `exit_families` still decodes,
+    /// and reads as *no claim* rather than as "cannot carry IPv6".
+    ///
+    /// That distinction is what lets the field ship without bumping
+    /// `MESH_PROTOCOL_VERSION`. Reading the silence as a denial would pin a
+    /// gateway that may well have IPv6 as unusable for as long as it stays on
+    /// that build, and would make the offer permanently disagree with the roster
+    /// on the coordinator side, which is a retry loop rather than a missing
+    /// feature (see `NetworkRegistry::exit_offer_out_of_sync`). `enabled` stays a
+    /// plain `bool` in the same message: it shipped in 0.3.0, and re-encoding a
+    /// field that is already deployed is what a version bump is actually for.
     #[test]
-    fn exit_node_offer_v6_defaults_when_absent() {
+    fn exit_node_offer_families_default_to_unknown_when_absent() {
         #[derive(serde::Serialize)]
         enum OldControlMsg {
             ExitNodeOffer { enabled: bool },
@@ -1023,8 +1035,28 @@ mod tests {
             decoded,
             ControlMsg::ExitNodeOffer {
                 enabled: true,
-                exit_v6: false,
+                exit_families: ExitFamilies::Unknown,
             }
         );
+
+        // And the other direction: a peer on 0.3.0 must still be able to read what
+        // this build sends, or the offer is dropped whole and the gateway stops
+        // being discoverable at all.
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        enum OldRead {
+            ExitNodeOffer { enabled: bool },
+        }
+        for families in [ExitFamilies::Unknown, ExitFamilies::V4, ExitFamilies::Dual] {
+            let ours = rmp_serde::to_vec_named(&ControlMsg::ExitNodeOffer {
+                enabled: true,
+                exit_families: families,
+            })
+            .expect("serialize");
+            assert_eq!(
+                rmp_serde::from_slice::<OldRead>(&ours).unwrap(),
+                OldRead::ExitNodeOffer { enabled: true },
+                "0.3.0 must still decode an offer carrying {families:?}"
+            );
+        }
     }
 }

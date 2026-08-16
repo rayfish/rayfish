@@ -1975,10 +1975,20 @@ struct DirectResolvConf {
     /// rayfish domains, swapped whole on every join/leave and shared with the
     /// re-assert task so a trample-repair writes the current list.
     search: SearchDomains,
-    /// The operator named `dns_upstreams` in the config. Their explicit choice
-    /// overrides our refusal to take over with no verified upstream of our own:
-    /// [`DnsService::configure`] merges theirs in after detection, so the
+    /// The operator named a *usable* `dns_upstreams` in the config. Their explicit
+    /// choice overrides our refusal to take over with no verified upstream of our
+    /// own: [`DnsService::configure`] merges theirs in after detection, so the
     /// forwarder does get somewhere to send queries.
+    ///
+    /// Counts only entries that survive [`crate::config::resolve_upstreams`],
+    /// which narrows to IPv4. `dns_upstreams` accepts any `IpAddr` since the
+    /// IPv6-only exit tunnel needed it, so a purely IPv6 setting is a real
+    /// possibility and would otherwise waive this guard while contributing
+    /// nothing: we would take over `/etc/resolv.conf`, install the re-assert
+    /// watcher, and leave the forwarder with an empty upstream list, which is the
+    /// exact black hole the `ensure!` below exists to prevent. The IPv6 entries
+    /// are not ignored, they are reached by `exit_node::tunnel_upstreams`, the one
+    /// caller whose transport can carry them.
     operator_upstreams: bool,
     /// Another mesh VPN's resolver, if the file we captured names one. Means
     /// this apply is a merge: it is already in [`Self::captured_upstreams`], so
@@ -2087,7 +2097,7 @@ impl DirectResolvConf {
             search: Arc::new(ArcSwap::from_pointee(search.clone())),
             captured_search: search,
             operator_upstreams: crate::config::load()
-                .map(|c| !c.dns_upstreams.servers.is_empty())
+                .map(|c| crate::config::has_usable_upstream(&c.dns_upstreams))
                 .unwrap_or(false),
             foreign_resolver: foreign_mesh_resolver(&contents),
         }

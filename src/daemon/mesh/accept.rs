@@ -720,7 +720,7 @@ impl CoordinatorAcceptState {
                 collision_index,
                 last_seen: Some(crate::membership::now_secs()),
                 exit_node: false,
-                exit_node_v6: false,
+                exit_families: ExitFamilies::Unknown,
                 ipv6_only: false,
             });
             s.refresh_snapshot();
@@ -1208,7 +1208,7 @@ impl MemberAcceptState {
                 collision_index: member_idx,
                 last_seen: Some(crate::membership::now_secs()),
                 exit_node: false,
-                exit_node_v6: false,
+                exit_families: ExitFamilies::Unknown,
                 ipv6_only: false,
             });
             s.refresh_snapshot();
@@ -1370,14 +1370,17 @@ impl AcceptHandler {
             // exit node. Only a network-key holder records it on the sender's
             // roster entry and republishes (`record_exit_offer` no-ops
             // otherwise). Off the demux loop: signing + DHT publish are slow.
-            ControlMsg::ExitNodeOffer { enabled, exit_v6 } => {
+            ControlMsg::ExitNodeOffer {
+                enabled,
+                exit_families,
+            } => {
                 let registry = self.registry().clone();
                 let Some(network) = self.network_name() else {
                     return true;
                 };
                 tokio::spawn(async move {
                     registry
-                        .record_exit_offer(&network, peer_id, enabled, exit_v6)
+                        .record_exit_offer(&network, peer_id, enabled, exit_families)
                         .await;
                 });
                 true
@@ -1673,7 +1676,7 @@ mod stranger_policy_tests {
             // A member's statements about itself, and its departure.
             ControlMsg::ExitNodeOffer {
                 enabled: true,
-                exit_v6: true,
+                exit_families: ExitFamilies::Dual,
             },
             ControlMsg::Ipv6Only { enabled: true },
             ControlMsg::LeaveNetwork,
@@ -1707,7 +1710,7 @@ mod direct_grant_tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
-                exit_node_v6: false,
+                exit_families: ExitFamilies::Unknown,
                 ipv6_only: false,
             })
             .unwrap();

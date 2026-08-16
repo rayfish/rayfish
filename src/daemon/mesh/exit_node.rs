@@ -57,8 +57,18 @@ fn gateway_refusal(
 /// live tunnel, so it is only ever checked when the user picks a gateway. This
 /// one is a standing property of the pair: while it holds, the tunnel carries
 /// nothing, so it is re-checked on every re-apply as well.
+///
+/// Refuses only on a claim that actually says IPv4-only. [`ExitFamilies::Unknown`]
+/// means the roster carries no claim, which is what a coordinator on a release
+/// that predates the field leaves behind, and refusing on it would make exit
+/// nodes unusable on every such network until the last coordinator upgrades.
+/// Allowing it can be wrong, but wrongly is the direction that fails loudly: the
+/// user chose this gateway, sees no internet, and clears it. The silent
+/// black-hole this whole check exists to prevent is the *other* direction, a
+/// gateway confidently marked usable. The caller warns instead, so the reason is
+/// in the log before the traffic stops.
 fn ipv6_gateway_refusal(m: &Member, name: &str, ipv6_only: bool) -> Option<String> {
-    (ipv6_only && !m.exit_node_v6).then(|| {
+    (ipv6_only && m.exit_families == ExitFamilies::V4).then(|| {
         format!(
             "{name} offers an exit node but cannot carry IPv6, and this node's data \
              plane is IPv6-only, so nothing would reach the internet through it. \
@@ -66,6 +76,38 @@ fn ipv6_gateway_refusal(m: &Member, name: &str, ipv6_only: bool) -> Option<Strin
              host an IPv6 uplink."
         )
     })
+}
+
+/// Whether selecting `m` as a gateway is a guess: it offers an exit node, we need
+/// IPv6 out of it, and nothing on the roster says whether it has any. Distinct
+/// from [`ipv6_gateway_refusal`], which answers a claim that was actually made.
+fn ipv6_gateway_unverified(m: &Member, ipv6_only: bool) -> bool {
+    ipv6_only && m.exit_node && m.exit_families.is_unknown()
+}
+
+/// Whether the roster's record of our own exit offer disagrees with what we
+/// would publish right now. Split out from
+/// [`NetworkRegistry::exit_offer_out_of_sync`] because it is the whole decision,
+/// and reaching that method needs a live registry.
+///
+/// `advertised` is `(exit_node, exit_families)` as the signed roster holds it;
+/// `claimed` is what we would send. An [`ExitFamilies::Unknown`] on the roster
+/// compares equal to anything: only a coordinator that knows the field can write
+/// it, so demanding it from one that cannot is demanding something that will
+/// never arrive, and this gates a 30-second backstop tick that reconverges (a
+/// pkarr resolve, plus a re-delivery to every coordinator) each time it says yes.
+fn offer_disagrees(
+    advertised: (bool, ExitFamilies),
+    offering: bool,
+    claimed: ExitFamilies,
+) -> bool {
+    let (advertised_offer, advertised_families) = advertised;
+    if advertised_offer != offering {
+        return true;
+    }
+    // Not offering means there is no capability to state, so `Unknown` on both
+    // sides is the settled state rather than a gap.
+    !advertised_families.is_unknown() && advertised_families != claimed
 }
 
 impl NetworkRegistry {
@@ -159,7 +201,7 @@ impl NetworkRegistry {
 
     /// Select or clear the exit peer this node routes non-mesh traffic through.
     /// On select, the peer must be in the roster and advertise `exit_node`, and on
-    /// an IPv6-only node it must advertise `exit_node_v6` as well.
+    /// an IPv6-only node the roster must not say it is IPv4-only (an absent claim is allowed, and warned about).
     ///
     /// That extra condition is the whole reason the flag exists. An IPv6-only data
     /// plane tunnels IPv6 and nothing else, so a gateway that reaches the internet
@@ -176,6 +218,10 @@ impl NetworkRegistry {
             Err(e) => return ipc_err(format!("failed to load config: {e}")),
         };
         // Validate the selection against the live roster before persisting.
+        // Set when the gateway is allowed on an absent IPv6 claim rather than a
+        // positive one, so the reply can say so: a log line is not where someone
+        // running `ray exit-node use` looks.
+        let mut unverified = false;
         let selection = match &peer {
             Some(name) => {
                 let Some(id) = self.resolve_peer_flexible(name).await else {
@@ -184,6 +230,23 @@ impl NetworkRegistry {
                 let member = self.roster_member(network, id);
                 if let Some(why) = gateway_refusal(member.as_ref(), name, network, ipv6_only) {
                     return ipc_err(why);
+                }
+                // Allowed, but on no evidence: the roster says nothing about this
+                // gateway's IPv6, which is what a coordinator too old to carry the
+                // claim leaves behind. Say so once, here, rather than let a dead
+                // tunnel be the first news of it.
+                unverified = member
+                    .as_ref()
+                    .is_some_and(|m| ipv6_gateway_unverified(m, ipv6_only));
+                if unverified {
+                    tracing::warn!(
+                        gateway = %name,
+                        network = %network,
+                        "selected gateway does not say whether it can carry IPv6, and this \
+                         node's data plane is IPv6-only; allowing it because the claim is \
+                         absent rather than negative (a coordinator on an older release \
+                         drops it). If nothing reaches the internet, that is why"
+                    );
                 }
                 Some(id.to_string())
             }
@@ -205,7 +268,14 @@ impl NetworkRegistry {
             (Some(name), false) => format!("routing all traffic through {name} on {network}"),
             (Some(name), true) => format!(
                 "routing IPv6 traffic through {name} on {network}. IPv4 is not tunnelled \
-                 in IPv6-only mode and still leaves this host directly"
+                 in IPv6-only mode and still leaves this host directly{}",
+                if unverified {
+                    ". Note: this network's coordinator does not report whether that \
+                     gateway has an IPv6 uplink, so this is unverified. If nothing \
+                     reaches the internet, that is the first thing to check"
+                } else {
+                    ""
+                }
             ),
             (None, _) => format!("direct egress restored on {network}"),
         };
@@ -301,7 +371,15 @@ impl NetworkRegistry {
         // a refusal, so with an exit selected on more than one network (warned
         // about above) a later usable gateway still wins over an earlier bad one.
         if let Some(why) = refused.filter(|_| selection.is_none()) {
-            self.exit_selection_pending.store(false, Ordering::Relaxed);
+            // Stays *pending*, unlike every other terminal branch here. The
+            // refusal rests on a roster fact that the gateway itself can change:
+            // it gains an IPv6 uplink, `refresh_v6_uplink` re-probes on the
+            // reconverge that republishes the offer, and the claim reaches us. The
+            // reconverge only nudges `exit_reapply` while this flag is set, so
+            // clearing it here would leave the client on direct egress until
+            // someone reran `ray up`, having built the gateway half of exactly
+            // that loop. Re-applying is idempotent and costs a roster read.
+            self.exit_selection_pending.store(true, Ordering::Relaxed);
             self.exit_client.set(None);
             tracing::warn!(reason = %why, "exit selection unusable; using direct egress");
             return Some(why);
@@ -364,9 +442,9 @@ impl NetworkRegistry {
         for name in names {
             if self.exit_offer_out_of_sync(&name) {
                 let offering = self.exit_server.is_offering(&name);
-                let exit_v6 = offering && self.exit_server.offers_v6();
-                tracing::debug!(network = %name, offering, exit_v6, "exit offer out of sync; publishing");
-                self.publish_exit_offer(&name, offering, exit_v6).await;
+                let families = self.claimed_exit_families(offering);
+                tracing::debug!(network = %name, offering, ?families, "exit offer out of sync; publishing");
+                self.publish_exit_offer(&name, offering, families).await;
             }
         }
     }
@@ -380,6 +458,17 @@ impl NetworkRegistry {
     /// The IPv6 claim counts as part of the offer: a gateway that gains or loses
     /// its IPv6 uplink has to republish, or an IPv6-only client keeps selecting it
     /// (or keeps refusing to) on a fact that stopped being true.
+    ///
+    /// But only when the roster carries a claim at all. A coordinator on a release
+    /// that predates `Member.exit_families` drops the key when it republishes, so
+    /// demanding it there is demanding something that side cannot supply: the
+    /// comparison would never balance, and since it gates the 30-second backstop
+    /// tick in the reconverge worker, "never balances" means a pkarr resolve and a
+    /// re-delivery to every coordinator every 30 seconds, per network, for as long
+    /// as the two builds coexist. [`ExitFamilies::Unknown`] therefore compares
+    /// equal to whatever we would have claimed: the offer itself is still synced
+    /// on `exit_node`, which that coordinator does understand, and the capability
+    /// lands on its own once the coordinator upgrades.
     pub(crate) fn exit_offer_out_of_sync(&self, network: &str) -> bool {
         if !self.exit_sync_enabled.load(Ordering::Relaxed) {
             return false;
@@ -389,10 +478,19 @@ impl NetworkRegistry {
         let advertised = [self_id, user_id]
             .into_iter()
             .find_map(|id| self.roster_member(network, id))
-            .map(|m| (m.exit_node, m.exit_node_v6))
-            .unwrap_or((false, false));
+            .map(|m| (m.exit_node, m.exit_families))
+            .unwrap_or((false, ExitFamilies::Unknown));
         let offering = self.exit_server.is_offering(network);
-        advertised != (offering, offering && self.exit_server.offers_v6())
+        offer_disagrees(advertised, offering, self.claimed_exit_families(offering))
+    }
+
+    /// The `exit_families` value this node would publish right now.
+    fn claimed_exit_families(&self, offering: bool) -> ExitFamilies {
+        if offering {
+            ExitFamilies::from_v6_uplink(self.exit_server.offers_v6())
+        } else {
+            ExitFamilies::Unknown
+        }
     }
 
     /// Report exit-node state per network: this node's own allow list + selection,
@@ -414,7 +512,7 @@ impl NetworkRegistry {
                 .collect();
             let available_v6 = offers
                 .iter()
-                .filter(|m| m.exit_node_v6)
+                .filter(|m| m.exit_families.carries_v6())
                 .map(display_name)
                 .collect();
             networks.push(ipc::ExitNodeStatusView {
@@ -445,16 +543,19 @@ impl NetworkRegistry {
     /// skipped; [`Self::sync_exit_offers`] retries on the backstop / group-poll
     /// cadence, and the reconnect loop re-establishes the link, so a later pass
     /// delivers.
-    async fn publish_exit_offer(&self, network: &str, enabled: bool, exit_v6: bool) {
+    async fn publish_exit_offer(&self, network: &str, enabled: bool, families: ExitFamilies) {
         if self
             .deliver_self_flag(
                 network,
-                &ControlMsg::ExitNodeOffer { enabled, exit_v6 },
+                &ControlMsg::ExitNodeOffer {
+                    enabled,
+                    exit_families: families,
+                },
                 "exit offer",
             )
             .await
         {
-            self.record_exit_offer(network, self.transport.endpoint.id(), enabled, exit_v6)
+            self.record_exit_offer(network, self.transport.endpoint.id(), enabled, families)
                 .await;
         }
     }
@@ -540,12 +641,21 @@ impl NetworkRegistry {
         network: &str,
         sender: EndpointId,
         enabled: bool,
-        exit_v6: bool,
+        families: ExitFamilies,
     ) {
         self.record_self_flag(network, sender, "exit offer", |m| {
-            let changed = m.exit_node != enabled || m.exit_node_v6 != exit_v6;
+            // An offer from a build that predates `exit_families` arrives as
+            // `Unknown`. Recording that over a claim we already hold would erase
+            // what a newer run of the same peer told us, so silence never
+            // overwrites a statement: it only ever fills a gap.
+            let families = if families.is_unknown() {
+                m.exit_families
+            } else {
+                families
+            };
+            let changed = m.exit_node != enabled || m.exit_families != families;
             m.exit_node = enabled;
-            m.exit_node_v6 = exit_v6;
+            m.exit_families = families;
             changed
         })
         .await;
@@ -611,9 +721,9 @@ impl NetworkRegistry {
 #[cfg(test)]
 mod tests {
     use super::{Member, gateway_refusal};
-    use crate::membership::derive_ip;
+    use crate::membership::{ExitFamilies, derive_ip};
 
-    fn gateway(exit_node: bool, exit_node_v6: bool) -> Member {
+    fn gateway(exit_node: bool, exit_families: ExitFamilies) -> Member {
         let identity = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
         Member {
             identity,
@@ -625,31 +735,57 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node,
-            exit_node_v6,
+            exit_families,
             ipv6_only: false,
         }
     }
 
-    /// Which gateways `ray exit-node use` will accept, and why it turns the two
+    /// Which gateways `ray exit-node use` will accept, and why it turns the
     /// unusable cases into a sentence instead of a dead tunnel.
     #[test]
     fn ipv6_only_needs_a_gateway_that_carries_ipv6() {
+        use ExitFamilies::{Dual, Unknown, V4};
+
         // Dual-stack: any advertised gateway will do, IPv6 uplink or not. Its
         // tunnel carries IPv4, which is what a v4-only gateway can egress.
-        assert!(gateway_refusal(Some(&gateway(true, false)), "gw", "net", false).is_none());
-        assert!(gateway_refusal(Some(&gateway(true, true)), "gw", "net", false).is_none());
+        for families in [V4, Dual, Unknown] {
+            assert!(gateway_refusal(Some(&gateway(true, families)), "gw", "net", false).is_none());
+        }
 
-        // IPv6-only: the tunnel carries IPv6 alone, so a gateway without an IPv6
-        // uplink would receive the traffic and have nowhere to send it.
-        let refusal = gateway_refusal(Some(&gateway(true, false)), "gw", "net", true)
+        // IPv6-only: the tunnel carries IPv6 alone, so a gateway that says it has
+        // no IPv6 uplink would receive the traffic and have nowhere to send it.
+        let refusal = gateway_refusal(Some(&gateway(true, V4)), "gw", "net", true)
             .expect("a v4-only gateway is unusable from an IPv6-only node");
         assert!(refusal.contains("cannot carry IPv6"), "{refusal}");
-        assert!(gateway_refusal(Some(&gateway(true, true)), "gw", "net", true).is_none());
+        assert!(gateway_refusal(Some(&gateway(true, Dual)), "gw", "net", true).is_none());
+
+        // No claim on the roster is not a denial. It is what a coordinator on a
+        // release without the field leaves behind, and refusing on it would make
+        // exit nodes unusable on that whole network. Allowed, and flagged as a
+        // guess so the caller can warn.
+        assert!(gateway_refusal(Some(&gateway(true, Unknown)), "gw", "net", true).is_none());
+        assert!(super::ipv6_gateway_unverified(
+            &gateway(true, Unknown),
+            true
+        ));
+        assert!(!super::ipv6_gateway_unverified(&gateway(true, Dual), true));
+        assert!(!super::ipv6_gateway_unverified(&gateway(true, V4), true));
+        // Dual-stack never needs IPv6 out of the gateway, so nothing is a guess.
+        assert!(!super::ipv6_gateway_unverified(
+            &gateway(true, Unknown),
+            false
+        ));
+        // Nor is a peer that offers no exit node at all: that is the other
+        // refusal's business, and reporting it twice would be noise.
+        assert!(!super::ipv6_gateway_unverified(
+            &gateway(false, Unknown),
+            true
+        ));
 
         // No offer at all, and not on the roster, are the same answer in both
         // modes: there is nothing there to route through.
         for ipv6_only in [false, true] {
-            for member in [Some(gateway(false, true)), None] {
+            for member in [Some(gateway(false, Dual)), None] {
                 let refusal = gateway_refusal(member.as_ref(), "gw", "net", ipv6_only)
                     .expect("a peer with no offer is unusable");
                 assert!(
@@ -658,6 +794,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The offer-sync comparison must converge against a coordinator that cannot
+    /// write `exit_families`, which is every coordinator on 0.3.0.
+    ///
+    /// This gates the reconverge worker's 30-second backstop tick, so a
+    /// comparison that can never balance is not a missing feature: it is a pkarr
+    /// resolve and a re-delivery to every coordinator, every 30 seconds, per
+    /// network, for as long as the two builds coexist.
+    #[test]
+    fn an_unwritable_claim_still_converges() {
+        use ExitFamilies::{Dual, Unknown, V4};
+
+        // The case that spun: we offer and have IPv6, the coordinator recorded the
+        // offer but dropped the capability. `exit_node` agrees, so we are done.
+        assert!(!super::offer_disagrees((true, Unknown), true, Dual));
+        assert!(!super::offer_disagrees((true, Unknown), true, V4));
+
+        // A coordinator that *did* record a claim is held to it, so a gateway that
+        // gains or loses its uplink still republishes.
+        assert!(super::offer_disagrees((true, V4), true, Dual));
+        assert!(super::offer_disagrees((true, Dual), true, V4));
+        assert!(!super::offer_disagrees((true, Dual), true, Dual));
+        assert!(!super::offer_disagrees((true, V4), true, V4));
+
+        // The offer itself is compared as it always was, in both directions, and
+        // is what actually reaches an old coordinator.
+        assert!(super::offer_disagrees((false, Unknown), true, Dual));
+        assert!(super::offer_disagrees((true, Dual), false, Unknown));
+
+        // Not offering: nothing to state, so no gap either way.
+        assert!(!super::offer_disagrees((false, Unknown), false, Unknown));
+
+        // Not on the roster at all while offering is a real disagreement: the
+        // delivery missed every coordinator and the backstop is what retries it.
+        assert!(super::offer_disagrees((false, Unknown), true, V4));
     }
 
     /// The two halves of the refusal have different lifetimes, and `reload_exit_state`
@@ -671,16 +843,26 @@ mod tests {
     /// dual-stack has to be caught later.
     #[test]
     fn only_the_ipv6_half_of_the_refusal_is_re_checked_after_selection() {
+        use ExitFamilies::{Dual, Unknown, V4};
+
         // A gateway that stopped advertising keeps its tunnel: no refusal from the
         // half `reload_exit_state` consults, in either mode.
         for ipv6_only in [false, true] {
-            assert!(super::ipv6_gateway_refusal(&gateway(false, true), "gw", ipv6_only).is_none());
+            assert!(super::ipv6_gateway_refusal(&gateway(false, Dual), "gw", ipv6_only).is_none());
         }
-        // A gateway with no IPv6 uplink is refused on every re-apply, not just at
-        // selection time.
-        let refusal = super::ipv6_gateway_refusal(&gateway(true, false), "gw", true)
+        // A gateway that says it has no IPv6 uplink is refused on every re-apply,
+        // not just at selection time.
+        let refusal = super::ipv6_gateway_refusal(&gateway(true, V4), "gw", true)
             .expect("a v4-only gateway stays unusable from an IPv6-only node");
         assert!(refusal.contains("cannot carry IPv6"), "{refusal}");
-        assert!(super::ipv6_gateway_refusal(&gateway(true, false), "gw", false).is_none());
+        assert!(super::ipv6_gateway_refusal(&gateway(true, V4), "gw", false).is_none());
+        // An unknown claim never tears down a live tunnel. A roster that lost the
+        // key (a coordinator on an older build republished it) must not read as a
+        // gateway that lost its uplink.
+        for ipv6_only in [false, true] {
+            assert!(
+                super::ipv6_gateway_refusal(&gateway(true, Unknown), "gw", ipv6_only).is_none()
+            );
+        }
     }
 }

@@ -98,7 +98,7 @@ impl NetworkRegistry {
                             collision_index: 0,
                             last_seen: None,
                             exit_node: false,
-                            exit_node_v6: false,
+                            exit_families: ExitFamilies::Unknown,
                             ipv6_only: false,
                         });
                     }
@@ -128,7 +128,7 @@ impl NetworkRegistry {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
-                    exit_node_v6: false,
+                    exit_families: ExitFamilies::Unknown,
                     ipv6_only: self.ipv6_only,
                 })
                 .expect("self-add cannot collide");

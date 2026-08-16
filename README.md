@@ -531,9 +531,12 @@ that stays with the other VPN. Your IPv4 internet traffic keeps leaving directly
 which `ray exit-node use` and `ray exit-node status` both say out loud. Two
 things follow from it:
 
-- The gateway needs an IPv6 uplink of its own. Ones that have it are marked
-  `(IPv6)` in `ray exit-node status`, and picking one that isn't is refused
-  rather than left to time out.
+- The gateway needs an IPv6 uplink of its own. Ones that report having it are
+  marked `(IPv6)` in `ray exit-node status`, and picking one that reports the
+  opposite is refused rather than left to time out. A gateway that reports
+  nothing either way is still selectable: that is what a network whose
+  coordinator predates this feature looks like, and refusing there would rule
+  out every gateway on it. `ray exit-node use` says so when it happens.
 - The daemon's own DNS forwarder is pointed at an IPv6 resolver while the tunnel
   is up, so the lookups it makes go through the exit rather than around it. Name
   one yourself with `ray config set dns-upstreams` (IPv6 addresses are accepted);
@@ -550,10 +553,14 @@ things follow from it:
   while the tunnel is up. Giving Linux the same switch is not done yet.
 
 The other VPN's own routes are copied into the tunnel's routing table before the
-default goes in, so it keeps working: without that our catch-all rule sits above
-its rules (Tailscale's are at priority 5210-5270) and its prefixes live in a
-table of its own, not `main`, so it would be black-holed the moment the tunnel
-came up. Serving as an exit node for others was never affected by this mode.
+default goes in, and a rule sends its destinations there, so it keeps working:
+without that our catch-all rule sits above its rules (Tailscale's are at
+priority 5210-5270) and its prefixes live in a table of its own, not `main`, so
+it would be black-holed the moment the tunnel came up. The rule matters as much
+as the copy, and covers a case the copy alone does not: an SSH session that came
+*in* over that VPN has replies sourced from its address, and those take a
+higher-priority rule that looks up `main`, where the prefix isn't. Serving as an
+exit node for others was never affected by this mode.
 
 NetworkManager's DNS backend is skipped too (it can only carry an IPv4
 nameserver); the next backend down takes over.

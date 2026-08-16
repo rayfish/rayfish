@@ -633,10 +633,16 @@ pub struct ExitNodeStatusView {
     /// Roster peers advertising `exit_node` (display strings: hostname or short
     /// id), so the user can see who is available to route through.
     pub available: Vec<String>,
-    /// The subset of `available` that also advertises `exit_node_v6`, i.e. can
-    /// carry IPv6. On an IPv6-only node these are the only usable gateways, so
-    /// the list has to say which they are rather than let the user pick one that
-    /// would take the traffic and drop it.
+    /// The subset of `available` whose roster entry *claims* IPv6 egress. On an
+    /// IPv6-only node these are the gateways known to work, so the list has to
+    /// say which they are rather than let the user pick one that would take the
+    /// traffic and drop it.
+    ///
+    /// Not the complement of "unusable": a gateway whose entry carries no claim
+    /// at all is absent from this list and still selectable, because an absent
+    /// claim is what a coordinator too old to record it leaves behind, and
+    /// refusing on it would make exit nodes unusable on that whole network. Only
+    /// a claim that positively says IPv4-only is refused.
     #[serde(default)]
     pub available_v6: Vec<String>,
     /// This node's data plane is IPv6-only, so a selection here tunnels IPv6 and

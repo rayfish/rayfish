@@ -78,8 +78,8 @@ use crate::ipc::{
     PeerStatus, ipc_err,
 };
 use crate::membership::{
-    ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
-    MemberList, canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
+    ApprovedEntry, ApprovedList, ExitFamilies, GroupMode, IdentityProvider, IrohIdentityProvider,
+    Member, MemberList, canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
 };
 use crate::network_name;
 use crate::peers::{self, PeerTable};
@@ -1944,7 +1944,7 @@ mod absent_member_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         }
     }
@@ -2036,7 +2036,7 @@ mod accept_handler_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         }
     }
@@ -2262,7 +2262,7 @@ mod accept_handler_tests {
         // roles: it once reached only the Member dispatch, so a plain
         // coordinator (the one node that can record the offer on the signed
         // roster) silently discarded it and no exit node was ever advertised.
-        use crate::membership::{Member, derive_ip};
+        use crate::membership::{ExitFamilies, Member, derive_ip};
         for handler in [
             sample_coordinator_handler().await,
             sample_member_handler().await,
@@ -2287,7 +2287,7 @@ mod accept_handler_tests {
                         collision_index: 0,
                         last_seen: None,
                         exit_node: false,
-                        exit_node_v6: false,
+                        exit_families: ExitFamilies::Unknown,
                         ipv6_only: false,
                     })
                     .unwrap();
@@ -2311,7 +2311,7 @@ mod accept_handler_tests {
                     sender,
                     &ControlMsg::ExitNodeOffer {
                         enabled: true,
-                        exit_v6: true,
+                        exit_families: ExitFamilies::Dual,
                     },
                 ),
                 "ExitNodeOffer must be consumed by the role-independent dispatch"
@@ -2328,7 +2328,7 @@ mod accept_handler_tests {
                     .unwrap()
                     .members
                     .get(&sender)
-                    .is_some_and(|m| m.exit_node && m.exit_node_v6);
+                    .is_some_and(|m| m.exit_node && m.exit_families.carries_v6());
                 if done {
                     recorded = true;
                     break;
@@ -2351,7 +2351,7 @@ mod accept_handler_tests {
         // recording path and flip the member's roster `exit_node` flag. Before the
         // fix the coordinator's accept handler dropped the frame on its catch-all,
         // so nothing was recorded and no exit node was ever advertised.
-        use crate::membership::{Member, derive_ip};
+        use crate::membership::{ExitFamilies, Member, derive_ip};
         use iroh::endpoint::presets;
         use iroh::{Endpoint, RelayMode, SecretKey};
 
@@ -2402,7 +2402,7 @@ mod accept_handler_tests {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
-                    exit_node_v6: false,
+                    exit_families: ExitFamilies::Unknown,
                     ipv6_only: false,
                 })
                 .unwrap();
@@ -2476,7 +2476,7 @@ mod accept_handler_tests {
             Some(net_pubkey),
             &ControlMsg::ExitNodeOffer {
                 enabled: true,
-                exit_v6: false,
+                exit_families: ExitFamilies::V4,
             },
         )
         .await
@@ -2513,7 +2513,7 @@ mod accept_handler_tests {
         // ConnectionManager owns); the earlier bug dialed a throwaway connection
         // and dropped it, so the frame never flushed and the coordinator's
         // roster never changed even though the sender logged "delivered".
-        use crate::membership::{Member, derive_ip, derive_ipv6};
+        use crate::membership::{ExitFamilies, Member, derive_ip, derive_ipv6};
         use iroh::endpoint::presets;
         use iroh::{Endpoint, RelayMode, SecretKey};
 
@@ -2555,7 +2555,7 @@ mod accept_handler_tests {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
-                    exit_node_v6: false,
+                    exit_families: ExitFamilies::Unknown,
                     ipv6_only: false,
                 },
                 Member {
@@ -2568,7 +2568,7 @@ mod accept_handler_tests {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
-                    exit_node_v6: false,
+                    exit_families: ExitFamilies::Unknown,
                     ipv6_only: false,
                 },
             ]
@@ -2775,7 +2775,7 @@ mod accept_handler_tests {
 #[cfg(test)]
 mod coordinator_dial_order_tests {
     use super::*;
-    use crate::membership::{Member, derive_ip};
+    use crate::membership::{ExitFamilies, Member, derive_ip};
 
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
@@ -2797,7 +2797,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
@@ -2818,7 +2818,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
 
@@ -2881,7 +2881,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         let members = vec![mk(a, true), mk(b, false), mk(c, true)];
@@ -2903,7 +2903,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         // Only members are us (coordinator) and a plain member: nobody to gossip to.

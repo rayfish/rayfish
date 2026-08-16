@@ -23,6 +23,53 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Which address families a member's exit node can actually egress, as recorded
+/// on the signed roster.
+///
+/// Three-valued because "nobody told us" and "told us it cannot" are different
+/// facts with different answers, and only a coordinator running a build that
+/// knows this field can ever write it. A coordinator on an older release
+/// deserializes `Member` into a struct without the key and republishes without
+/// it, so a claim that passed through one arrives back as [`Self::Unknown`]
+/// rather than as a denial. Collapsing the two is what made an offer that could
+/// never converge look like a gateway with no IPv6: see
+/// `NetworkRegistry::exit_offer_out_of_sync`.
+///
+/// [`Self::Unknown`] is the serde default and is skipped on the way out, so a
+/// roster that carries no claim encodes byte-for-byte as it did before this
+/// field existed and the group blob hash is unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ExitFamilies {
+    /// No claim on the roster. Either the member never made one, or a
+    /// coordinator that does not know this field republished over it.
+    #[default]
+    Unknown,
+    /// The gateway can egress IPv4 only.
+    V4,
+    /// The gateway can egress both families.
+    Dual,
+}
+
+impl ExitFamilies {
+    /// Whether this claim says IPv6 egress works. False for [`Self::Unknown`]:
+    /// callers that need to distinguish "no" from "nobody said" must ask
+    /// [`Self::is_unknown`] first.
+    pub fn carries_v6(self) -> bool {
+        matches!(self, Self::Dual)
+    }
+
+    /// Takes `&self` so it can serve as serde's `skip_serializing_if`.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    /// The claim a gateway makes about itself, where there is no third state:
+    /// it either found an IPv6 default route or it did not.
+    pub fn from_v6_uplink(has_v6: bool) -> Self {
+        if has_v6 { Self::Dual } else { Self::V4 }
+    }
+}
+
 /// A peer that has been admitted to the network.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
@@ -54,16 +101,18 @@ pub struct Member {
     /// makes clients dial a node that drops them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exit_node: bool,
-    /// The exit node this member offers can carry IPv6, i.e. that host has an
-    /// IPv6 default route to masquerade onto. Meaningless unless `exit_node`.
+    /// Which families the exit node this member offers can egress, i.e. whether
+    /// that host has an IPv6 default route to masquerade onto. Meaningless
+    /// unless `exit_node`.
     ///
     /// Separate from `exit_node` because an IPv6-only client can only use a
-    /// gateway with this set: its tunnel is IPv6-only too, so a gateway that can
-    /// reach the internet over IPv4 alone would take the traffic and have nowhere
-    /// to send it. Without the flag that failure is a silent black hole, since
-    /// nothing else on the roster says which families a gateway can egress.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub exit_node_v6: bool,
+    /// gateway that carries IPv6: its tunnel is IPv6-only too, so a gateway that
+    /// can reach the internet over IPv4 alone would take the traffic and have
+    /// nowhere to send it. Without this that failure is a silent black hole,
+    /// since nothing else on the roster says which families a gateway can
+    /// egress. See [`ExitFamilies`] for why it is three-valued.
+    #[serde(default, skip_serializing_if = "ExitFamilies::is_unknown")]
+    pub exit_families: ExitFamilies,
     /// This member's data plane is IPv6-only, so its `ip` is assigned but not
     /// routed: another VPN owns `100.64.0.0/10` on that host. A self-claim, same
     /// shape as `exit_node` and carried the same way
@@ -850,7 +899,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         list.add(member.clone()).unwrap();
@@ -873,7 +922,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         list.add(member).unwrap();
@@ -895,7 +944,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         })
         .unwrap();
@@ -909,7 +958,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         });
         assert!(result.is_err());
@@ -929,7 +978,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         })
         .unwrap();
@@ -943,7 +992,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         })
         .unwrap();
@@ -964,7 +1013,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         })
         .unwrap();
@@ -987,7 +1036,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         })
         .unwrap();
@@ -1001,7 +1050,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         })
         .unwrap();
@@ -1041,7 +1090,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
-                exit_node_v6: false,
+                exit_families: ExitFamilies::Unknown,
                 ipv6_only: false,
             })
             .unwrap();
@@ -1186,7 +1235,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
-                exit_node_v6: false,
+                exit_families: ExitFamilies::Unknown,
                 ipv6_only: false,
             });
         }
@@ -1209,7 +1258,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         })
         .unwrap();
@@ -1409,7 +1458,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: Some(12345),
                 exit_node: false,
-                exit_node_v6: false,
+                exit_families: ExitFamilies::Unknown,
                 ipv6_only: false,
             })
             .unwrap();
@@ -1453,7 +1502,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
-                exit_node_v6: false,
+                exit_families: ExitFamilies::Unknown,
                 ipv6_only: false,
             })
             .unwrap();
@@ -1585,15 +1634,16 @@ mod tests {
         assert!(rmp_serde::from_slice::<Member>(&claimed).unwrap().ipv6_only);
     }
 
-    /// `Member.exit_node_v6` is additive on the same terms, so an IPv6-capable
+    /// `Member.exit_families` is additive on the same terms, so an IPv6-capable
     /// gateway can advertise itself without bumping `MESH_PROTOCOL_VERSION`.
     ///
-    /// The direction of the default is what makes that safe: a gateway on an
-    /// older build sends no key, decodes as `false`, and an IPv6-only client
-    /// declines to select it. Erring toward "cannot carry IPv6" costs a usable
-    /// gateway; the other way round would be a silent black hole.
+    /// Three-valued rather than a bool because the absent key has to stay
+    /// distinguishable from a denial. A coordinator that predates the field
+    /// republishes the roster without it, and reading that silence as "cannot
+    /// carry IPv6" is what made an offer that could never converge look like a
+    /// settled fact: see `NetworkRegistry::exit_offer_out_of_sync`.
     #[test]
-    fn member_exit_node_v6_is_additive() {
+    fn member_exit_families_is_additive() {
         #[derive(Serialize)]
         struct OldMember {
             identity: EndpointId,
@@ -1611,19 +1661,31 @@ mod tests {
         .unwrap();
         let decoded: Member = rmp_serde::from_slice(&bytes).unwrap();
         assert!(decoded.exit_node);
-        assert!(!decoded.exit_node_v6);
+        // Absent, so unknown: not a claim that IPv6 is unavailable.
+        assert_eq!(decoded.exit_families, ExitFamilies::Unknown);
+        assert!(decoded.exit_families.is_unknown());
+        assert!(!decoded.exit_families.carries_v6());
 
-        // Not claiming it emits no key, so an old peer sees the same bytes.
+        // Not claiming it emits no key at all, so the encoding is what it was
+        // before the field existed and the group blob hash is unchanged.
         let plain = rmp_serde::to_vec_named(&decoded).unwrap();
-        let mut claiming = decoded.clone();
-        claiming.exit_node_v6 = true;
-        let claimed = rmp_serde::to_vec_named(&claiming).unwrap();
-        assert!(claimed.len() > plain.len());
         assert!(
-            rmp_serde::from_slice::<Member>(&claimed)
-                .unwrap()
-                .exit_node_v6
+            !plain.windows(13).any(|w| w == b"exit_families"),
+            "an unknown claim must not appear in the encoding"
         );
+
+        for families in [ExitFamilies::V4, ExitFamilies::Dual] {
+            let mut claiming = decoded.clone();
+            claiming.exit_families = families;
+            let claimed = rmp_serde::to_vec_named(&claiming).unwrap();
+            assert!(claimed.len() > plain.len(), "{families:?} must emit a key");
+            assert_eq!(
+                rmp_serde::from_slice::<Member>(&claimed)
+                    .unwrap()
+                    .exit_families,
+                families
+            );
+        }
     }
 
     // -- reusable keys --------------------------------------------------------
@@ -1826,7 +1888,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         assert!(validate_member(&member).is_ok());
@@ -1847,7 +1909,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         let err = validate_member(&member).unwrap_err().to_string();
@@ -1867,7 +1929,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         assert!(validate_member(&member).is_err());
@@ -1887,7 +1949,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         let gw = Member {
@@ -1900,7 +1962,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         assert!(validate_member(&net).is_err());
@@ -1936,7 +1998,7 @@ mod tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
-                exit_node_v6: false,
+                exit_families: ExitFamilies::Unknown,
                 ipv6_only: false,
             };
             assert!(
@@ -1963,7 +2025,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         let blob = GroupBlob {
@@ -1992,7 +2054,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         let blob = GroupBlob {
@@ -2021,7 +2083,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         })
         .unwrap();
@@ -2068,7 +2130,7 @@ mod tests {
             collision_index: 2,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         assert!(validate_member(&good).is_ok());
@@ -2076,7 +2138,7 @@ mod tests {
             collision_index: 1,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ..good.clone()
         }; // ip is for index 2, claims 1
         assert!(validate_member(&bad).is_err());
@@ -2095,7 +2157,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         let dup = derive_ip(&a);
@@ -2125,7 +2187,7 @@ mod tests {
             collision_index: idx_a,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         })
         .unwrap();
@@ -2165,7 +2227,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         let resolved = resolve_ip_tiebreak(vec![mk(hi), mk(lo)]);
@@ -2201,7 +2263,7 @@ mod tests {
             device_cert: None,
             last_seen: None,
             exit_node: false,
-            exit_node_v6: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         assert!(validate_member(&m).is_err());

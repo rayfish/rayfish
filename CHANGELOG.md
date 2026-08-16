@@ -14,18 +14,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mode, so your IPv4 internet traffic keeps leaving directly, and both
   `ray exit-node use` and `ray exit-node status` say so rather than leaving you
   to find out. The gateway needs an IPv6 uplink of its own; ones that have it
-  are marked `(IPv6)` in `ray exit-node status`, and picking one that doesn't is
-  refused with the reason instead of timing out, and that check now also runs on
-  every re-apply, so a gateway that loses its IPv6 uplink (or a selection made
-  before the mode turned itself on) falls back to direct egress with a message
-  rather than silently carrying nothing. While the tunnel is up, the daemon's own
+  report having it are marked `(IPv6)` in `ray exit-node status`, and picking one
+  that reports the opposite is refused with the reason instead of timing out, and
+  that check now also runs on every re-apply, so a gateway that loses its IPv6
+  uplink (or a selection made before the mode turned itself on) falls back to
+  direct egress with a message rather than silently carrying nothing (and picks
+  the tunnel back up by itself once the gateway reports an uplink again). A
+  gateway on a network whose coordinator is older than this feature reports
+  nothing either way; it stays selectable, since refusing would rule out every
+  gateway on that network, and `ray exit-node use` tells you the claim is
+  unverified. While the tunnel is up, the daemon's own
   DNS forwarder is pointed at an IPv6 resolver so its lookups go through the exit
   rather than around it; on Linux hosts using systemd-resolved, NetworkManager or
   resolvconf, applications' non-`.ray` lookups still leave directly, and the
   daemon logs a warning saying so. Offering an exit node was never affected by
   the mode.
 - **`ray config set dns-upstreams` takes IPv6 addresses.** Used by an exit-node
-  tunnel in IPv6-only mode, which has no IPv4 to reach a v4 resolver over.
+  tunnel in IPv6-only mode, which has no IPv4 to reach a v4 resolver over. Naming
+  only IPv6 servers no longer lets rayfish take over `/etc/resolv.conf` on a host
+  where it found no working one of its own: those entries are reachable only
+  through the tunnel, so counting them would have taken the file and left the
+  machine unable to resolve anything.
 
 ### Changed
 
@@ -58,11 +67,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **Using an exit node no longer cuts off another VPN on the same host.** The
-  full tunnel's routing rule sits above the ones Tailscale (and anything else
+  full tunnel's routing rules sit above the ones Tailscale (and anything else
   doing policy routing) installs, and their routes live in a table of their own
   rather than the main one, so turning our tunnel on black-holed them entirely.
-  Their routes are now copied into the tunnel's own table first, so the more
-  specific ones still win and that VPN keeps working.
+  Their routes are now copied into the tunnel's own table, and their
+  destinations are directed there, so that VPN keeps working. This covers
+  connections that arrived over it too: an SSH session into this host over its
+  Tailscale address used to die the moment `ray exit-node use` ran, because the
+  replies are sourced from that address and took a rule that looks up the main
+  routing table, where the route isn't.
 - **`.ray` names now resolve alongside another VPN that manages
   `/etc/resolv.conf`.** On a host with no DNS manager (no systemd-resolved in
   the resolution path), Rayfish and a VPN like Tailscale both want that file.

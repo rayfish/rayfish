@@ -325,7 +325,7 @@ pub struct ExitServer {
     /// alongside `self_addrs`, and re-probed on the reconverge that publishes it
     /// ([`refresh_v6_uplink`](Self::refresh_v6_uplink)), since on a gateway
     /// `apply_os` only runs on `ray up` and on a local `ray exit-node` command.
-    /// Advertised as `Member.exit_node_v6` so an IPv6-only client can tell a
+    /// Advertised as `Member.exit_families` so an IPv6-only client can tell a
     /// gateway it can use from one that would take its traffic and have nowhere
     /// to send it.
     v6_uplink: Arc<AtomicBool>,
@@ -796,6 +796,13 @@ mod names {
     pub(super) const EXIT_TABLE: &str = "29793";
     /// `ip rule` preferences (lower = higher priority). Named so install and
     /// teardown stay in sync.
+    /// Destinations another VPN's own table owns -> our table, where
+    /// `mirror_foreign_routes` put a copy of its route. Above `PREF_SRC` because
+    /// the two rules below it both look up `main`, which is exactly the table a
+    /// policy-routing VPN does *not* keep its prefixes in: without this, that
+    /// VPN's traffic reaches `main`, misses, and takes main's default out the
+    /// physical uplink. The mirror alone only rescues the `PREF_TUNNEL` path.
+    pub(super) const PREF_FOREIGN: &str = "98";
     pub(super) const PREF_SRC: &str = "99"; // physical-sourced traffic -> main table
     pub(super) const PREF_BYPASS: &str = "100"; // marked traffic -> main table
     pub(super) const PREF_MAIN: &str = "101"; // main table minus its default route
@@ -1032,11 +1039,34 @@ pub fn install_client_routing(tun_name: &str, ipv6_only: bool) -> Result<()> {
     for family in tunnel_families(ipv6_only).iter().copied() {
         // Give the tunnel table the prefixes another VPN serves out of a table of
         // its own, or our catch-all rule swallows them (see the fn docs).
-        mirror_foreign_routes(family, tun_name);
+        let foreign = mirror_foreign_routes(family, tun_name);
         run_ip(&[
             family, "route", "replace", "default", "dev", tun_name, "table", EXIT_TABLE,
         ])?;
         remove_client_rules(family);
+        // Ahead of the two `main` rules below, because neither of them can find a
+        // co-resident VPN's prefixes: those live in its own table, and
+        // `PREF_MAIN`'s `suppress_prefixlength 0` only rescues routes that are in
+        // `main` to begin with. Sending these destinations to our table instead
+        // hits the copy `mirror_foreign_routes` just made, so they go back out the
+        // interface that owned them.
+        //
+        // Paired with that mirror by construction: one rule per destination we
+        // actually copied, so the rule can never outlive the route it depends on
+        // and point a prefix at the tunnel default sitting in the same table.
+        for dest in &foreign {
+            run_ip(&[
+                family,
+                "rule",
+                "add",
+                "to",
+                dest,
+                "table",
+                EXIT_TABLE,
+                "pref",
+                PREF_FOREIGN,
+            ])?;
+        }
         // Ahead of everything else: traffic sourced from one of this host's own
         // physical addresses leaves the way it always did. That is every connection
         // that existed before the tunnel, whose socket is already bound to that
@@ -1127,6 +1157,41 @@ fn installed_source_rules(family: &str) -> Vec<String> {
     parse_source_rules(&String::from_utf8_lossy(&out))
 }
 
+/// The destinations of the [`PREF_FOREIGN`] rules currently installed for one
+/// family, read back from `ip rule show`. Same discipline as
+/// [`installed_source_rules`]: only our own shape at our own pref is touched.
+#[cfg(target_os = "linux")]
+fn installed_foreign_rules(family: &str) -> Vec<String> {
+    let out = match Command::new("ip").args([family, "rule", "show"]).output() {
+        Ok(out) if out.status.success() => out.stdout,
+        _ => return Vec::new(),
+    };
+    parse_foreign_rules(&String::from_utf8_lossy(&out))
+}
+
+/// Pull the destinations out of `ip rule show` for rules that are ours: at
+/// [`PREF_FOREIGN`], `to <dest>`, looking up our table.
+#[cfg(target_os = "linux")]
+fn parse_foreign_rules(show: &str) -> Vec<String> {
+    show.lines()
+        .filter_map(|line| {
+            let (pref, rest) = line.split_once(':')?;
+            if pref.trim() != PREF_FOREIGN {
+                return None;
+            }
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            // iproute2 always prints a `from` selector, defaulting to `all`, so a
+            // rule added with only `to` reads back as `from all to <dest> ...`.
+            match f.as_slice() {
+                ["from", "all", "to", dest, "lookup", table] if *table == EXIT_TABLE => {
+                    Some((*dest).to_string())
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// Pull the addresses out of `ip rule show` output for rules that are ours: at
 /// [`PREF_SRC`], `from <addr>`, looking up `main`.
 #[cfg(target_os = "linux")]
@@ -1161,6 +1226,23 @@ fn remove_client_rules(family: &str) {
     for addr in installed_source_rules(family) {
         let _ = run_ip(&[
             family, "rule", "del", "from", &addr, "table", "main", "pref", PREF_SRC,
+        ]);
+    }
+    // Same reason as the source rules: the mirrored set is re-read from the
+    // kernel between one install and the next (a peer came online, the other VPN
+    // reconfigured), so deleting a re-derived list would strand whatever it no
+    // longer names.
+    for dest in installed_foreign_rules(family) {
+        let _ = run_ip(&[
+            family,
+            "rule",
+            "del",
+            "to",
+            &dest,
+            "table",
+            EXIT_TABLE,
+            "pref",
+            PREF_FOREIGN,
         ]);
     }
     let mark = format!("{SOCKET_MARK:#x}");
@@ -1241,10 +1323,10 @@ struct MirroredRoute {
 /// Best-effort throughout: this is an accommodation for someone else's routing, and
 /// failing to read or write one route must not fail the install.
 #[cfg(target_os = "linux")]
-fn mirror_foreign_routes(family: &str, tun_name: &str) {
+fn mirror_foreign_routes(family: &str, tun_name: &str) -> Vec<String> {
     let wanted = match ip_output(&[family, "route", "show", "table", "all"]) {
         Some(out) => parse_foreign_routes(&out, tun_name),
-        None => return,
+        None => return Vec::new(),
     };
     // Drop copies whose source route is gone. Read from our own table, where the
     // only other entry is the default we install below and never mirror.
@@ -1277,6 +1359,7 @@ fn mirror_foreign_routes(family: &str, tun_name: &str) {
             "mirrored another VPN's routes into the tunnel table"
         );
     }
+    wanted.into_iter().map(|r| r.dest).collect()
 }
 
 /// The routes in `ip <family> route show table all` that belong to somebody else's
@@ -1811,6 +1894,50 @@ mod tests {
             vec!["212.47.229.78".to_string(), "2001:bc8:1234::1".to_string()],
             "only `from <addr> lookup main` rules at pref 99 are ours"
         );
+    }
+
+    /// The rule that hands a co-resident VPN's destinations back to it, and the
+    /// readback that reclaims those rules without touching anyone else's.
+    ///
+    /// `mirror_foreign_routes` alone only rescues the `PREF_TUNNEL` path. The two
+    /// rules above it look up `main`, and a policy-routing VPN keeps its prefixes
+    /// in its own table, so traffic *sourced from* that VPN's address (an inbound
+    /// SSH session's replies, say) reached `main`, missed, and left out the
+    /// physical uplink. Format below is real `ip -6 rule show` output from a host
+    /// running Tailscale.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreign_destinations_are_routed_back_to_their_own_table() {
+        let show = "\
+0:\tfrom all lookup local
+98:\tfrom all to fd7a:115c:a1e0::/48 lookup 29793
+98:\tfrom all to 100.64.0.0/10 lookup 29793
+98:\tfrom all to 10.9.0.0/24 lookup 42
+99:\tfrom 2a01:4f8:121:33c3::2 lookup main
+100:\tfrom all fwmark 0x7261 lookup main
+101:\tfrom all lookup main suppress_prefixlength 0
+102:\tfrom all lookup 29793
+5270:\tfrom all lookup 52
+32766:\tfrom all lookup main
+";
+        assert_eq!(
+            parse_foreign_rules(show),
+            vec![
+                "fd7a:115c:a1e0::/48".to_string(),
+                "100.64.0.0/10".to_string()
+            ],
+            "only `to <dest> lookup 29793` rules at pref 98 are ours"
+        );
+        // Ordered above the rules that look up `main`, or it would never be
+        // consulted for the traffic it exists to rescue.
+        for lower in [PREF_SRC, PREF_BYPASS, PREF_MAIN, PREF_TUNNEL] {
+            assert!(
+                PREF_FOREIGN.parse::<u32>().unwrap() < lower.parse::<u32>().unwrap(),
+                "PREF_FOREIGN must outrank {lower}"
+            );
+        }
+        // And below the kernel's `local` table, which must keep winning.
+        assert!(PREF_FOREIGN.parse::<u32>().unwrap() > 0);
     }
 
     /// Pinning iroh to a tunnel interface puts its transport inside the tunnel it
