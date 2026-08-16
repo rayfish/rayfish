@@ -9,6 +9,16 @@
 
 use super::*;
 
+/// Cap on the queue of unapproved incoming `ray connect` requests.
+///
+/// The dial that fills it is unauthenticated (a stranger needs only our contact
+/// id) and every entry is keyed by an endpoint id the requester generates, so
+/// without a bound the map is memory anyone can allocate on this daemon. Same
+/// policy and same size as [`MAX_PENDING_JOINS`](super::mesh::accept::MAX_PENDING_JOINS):
+/// at the cap the oldest unanswered request makes way, on the grounds that a
+/// request nobody approved in that long is the one least likely to be waited on.
+pub(crate) const MAX_PENDING_CONNECTS: usize = 256;
+
 /// A pending incoming `ray connect` request, awaiting `ray connections approve`.
 /// Keyed by the requester's transport endpoint id (not contact id) so it
 /// survives the requester rotating their contact key.
@@ -18,6 +28,33 @@ pub(crate) struct PendingConnect {
     pub(crate) from_endpoint: EndpointId,
     pub(crate) hostname: Option<String>,
     pub(crate) requested_at: Instant,
+}
+
+/// Make room for a connect request from `incoming`: at the cap, drop the oldest
+/// queued request and return its id. A no-op (returns `None`) when `incoming` is
+/// already queued (a re-dial must not cost anyone their slot) or there is spare
+/// capacity. Mirrors `mesh::accept::evict_oldest_pending`, over a `DashMap`.
+///
+/// The oldest id is bound before the removal so no map reference is alive across
+/// it: `DashMap` is sharded and holding one while mutating can deadlock.
+pub(crate) fn evict_oldest_connect(
+    pending: &DashMap<EndpointId, PendingConnect>,
+    incoming: EndpointId,
+    cap: usize,
+) -> Option<EndpointId> {
+    if pending.contains_key(&incoming) || pending.len() < cap {
+        return None;
+    }
+    let oldest = pending
+        .iter()
+        .min_by_key(|e| e.value().requested_at)
+        .map(|e| *e.key())?;
+    pending.remove(&oldest);
+    tracing::warn!(
+        evicted = %oldest.fmt_short(),
+        "pending connect-request queue full; evicted oldest request"
+    );
+    Some(oldest)
 }
 
 pub(crate) struct ConnectService {
@@ -419,6 +456,7 @@ impl ConnectService {
                             coordinator,
                         }
                     } else {
+                        evict_oldest_connect(&pending, from_endpoint, MAX_PENDING_CONNECTS);
                         pending.insert(
                             from_endpoint,
                             PendingConnect {
@@ -444,5 +482,62 @@ impl ConnectService {
                 tracing::warn!(error = %e, peer = %remote_id.fmt_short(), "failed to accept bi stream for connect");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_connect_cap_tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn eid(seed: u8) -> EndpointId {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        SecretKey::from(b).public()
+    }
+
+    fn queued_at(id: EndpointId, t: Instant) -> PendingConnect {
+        PendingConnect {
+            from_contact_id: id,
+            from_endpoint: id,
+            hostname: None,
+            requested_at: t,
+        }
+    }
+
+    #[test]
+    fn no_eviction_below_cap() {
+        let pending = DashMap::new();
+        pending.insert(eid(1), queued_at(eid(1), Instant::now()));
+        assert_eq!(evict_oldest_connect(&pending, eid(2), 4), None);
+        assert_eq!(pending.len(), 1);
+    }
+
+    /// The regression. `CONNECT_ALPN` takes a request from anyone holding our
+    /// contact id, keyed by an endpoint id the requester mints, so an unbounded
+    /// queue was memory a stranger could allocate here without limit.
+    #[test]
+    fn full_queue_evicts_the_oldest() {
+        let base = Instant::now();
+        let pending = DashMap::new();
+        for s in 0..4u8 {
+            pending.insert(eid(s), queued_at(eid(s), base + Duration::from_millis(s as u64)));
+        }
+        assert_eq!(evict_oldest_connect(&pending, eid(99), 4), Some(eid(0)));
+        assert_eq!(pending.len(), 3);
+        assert!(!pending.contains_key(&eid(0)));
+    }
+
+    /// A requester re-dialing (the `Pending` reply tells it to) must not cost
+    /// anyone else their slot, or a patient peer could be starved by a polite one.
+    #[test]
+    fn re_dial_from_a_queued_peer_evicts_nobody() {
+        let base = Instant::now();
+        let pending = DashMap::new();
+        for s in 0..4u8 {
+            pending.insert(eid(s), queued_at(eid(s), base + Duration::from_millis(s as u64)));
+        }
+        assert_eq!(evict_oldest_connect(&pending, eid(1), 4), None);
+        assert_eq!(pending.len(), 4);
     }
 }

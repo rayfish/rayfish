@@ -129,6 +129,28 @@ pub(crate) struct PendingFile {
     pub(crate) blob_hash: blake3::Hash,
 }
 
+/// Whether two pairing secrets match, in time independent of *where* they differ.
+///
+/// Hand-rolled rather than a `subtle` dependency for one call site. The
+/// accumulate-then-compare shape is what keeps it branch-free: every byte is read
+/// on every call, and `black_box` stops the optimizer from noticing it could stop
+/// once `diff` is nonzero.
+fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    std::hint::black_box(diff) == 0
+}
+
+/// Outcome of checking a presented pairing secret. Separate from the stored value
+/// so the lock is dropped before the (slow) success path runs.
+enum PairCheck {
+    Accepted,
+    Mismatch,
+    NoSession,
+}
+
 pub(crate) struct FileService {
     /// Received file offers awaiting `ray files accept`.
     pub(crate) pending_files: Arc<std::sync::Mutex<Vec<PendingFile>>>,
@@ -934,10 +956,33 @@ impl FileService {
                         secret,
                         device_pubkey,
                     } => {
-                        // Verify the secret matches the stored pairing secret
-                        let stored = pairing_secret.lock().unwrap().take();
-                        match stored {
-                            Some(expected) if expected == secret => {
+                        // Compare against the stored pairing secret and consume
+                        // it only on a match, both under one lock. Taking it
+                        // first meant any dialer that sent the wrong bytes (or
+                        // garbage) closed the user's pairing window from across
+                        // the internet: the ticket names our endpoint and nothing
+                        // else gates this ALPN.
+                        //
+                        // Leaving the secret in place on a mismatch is what makes
+                        // the comparison's timing matter, so it is constant-time.
+                        // A wrong guess no longer ends the session, so guesses are
+                        // now unlimited for as long as the window is open, and an
+                        // early-exiting `==` over 32 bytes would answer how much
+                        // of the prefix was right.
+                        let check = {
+                            let mut held = pairing_secret.lock().unwrap();
+                            match *held {
+                                Some(expected) if ct_eq(&expected, &secret) => {
+                                    held.take();
+                                    PairCheck::Accepted
+                                }
+                                // Keep the window open for the real device.
+                                Some(_) => PairCheck::Mismatch,
+                                None => PairCheck::NoSession,
+                            }
+                        };
+                        match check {
+                            PairCheck::Accepted => {
                                 // Sign the device's public key
                                 // Share our saved networks so the new device can auto-join them. Only
                                 // networks with a known public key (skips freshly created, unsynced ones).
@@ -986,10 +1031,10 @@ impl FileService {
                                     .await;
                                 tracing::info!(device = %device_pubkey.fmt_short(), "device paired successfully");
                             }
-                            Some(_) => {
+                            PairCheck::Mismatch => {
                                 tracing::warn!(peer = %remote_id.fmt_short(), "pairing secret mismatch");
                             }
-                            None => {
+                            PairCheck::NoSession => {
                                 tracing::warn!(peer = %remote_id.fmt_short(), "no pairing session active");
                             }
                         }
@@ -1175,5 +1220,24 @@ mod tests {
             "gc must still protect tagged blobs despite a dangling tag"
         );
         assert!(!store.blobs().has(absent).await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod pairing_secret_tests {
+    use super::ct_eq;
+
+    /// The comparison has to be exact wherever the difference falls, since the
+    /// whole point of the constant-time form is that it does not stop early.
+    #[test]
+    fn ct_eq_matches_equality() {
+        let a = [7u8; 32];
+        assert!(ct_eq(&a, &a));
+        for pos in [0usize, 15, 31] {
+            let mut b = a;
+            b[pos] ^= 1;
+            assert!(!ct_eq(&a, &b), "must differ at byte {pos}");
+        }
+        assert!(!ct_eq(&a, &[0u8; 32]));
     }
 }

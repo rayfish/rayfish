@@ -43,6 +43,116 @@ fn owner_admits(device_cert: Option<&control::DeviceCert>, own_identity: Endpoin
     device_cert.map(|c| c.user_identity) == Some(own_identity)
 }
 
+/// Whether a peer this network's roster does not account for may send `msg`.
+///
+/// A control frame reaches a per-network handler on the strength of the network
+/// public key in its envelope, and that key is a discovery key: it is in every
+/// invite code and it *is* the pkarr address, so anyone can name it. Without this
+/// list, "knows the room id" and "is in the room" were the same thing as far as
+/// the handlers were concerned, and the messages meant for members were reachable
+/// by anyone who had ever seen an invite.
+///
+/// Three messages have to survive the filter, because each one is how a peer that
+/// is legitimately not on our roster yet talks to us:
+///
+/// - `JoinRequest` is the whole point of a stranger dialing us.
+/// - `MeshHello` is a joiner announcing itself to the rest of the roster right
+///   after admission (`connect_to_roster_peers`), which reaches members that have
+///   not reconverged yet, and is also an older client's no-invite join.
+/// - `SignedRecord` carries a network-key-signed packet that is verified against
+///   the network key before anything is applied, so it needs no sender authority
+///   at all. It is also precisely the message that repairs a roster too stale to
+///   recognize its own coordinator, so gating it on that roster would be circular.
+///
+/// Everything else is either a coordinator's word (checked again in the arm), a
+/// member's statement about itself, or a trigger whose cost is a DHT resolve and
+/// a blob fetch. None of those are things to do on a stranger's say-so.
+pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
+    matches!(
+        msg,
+        ControlMsg::JoinRequest { .. } | ControlMsg::MeshHello { .. } | ControlMsg::SignedRecord { .. }
+    )
+}
+
+/// Whether admitting `joiner` onto this network should also hand it the network
+/// secret key (co-coordinator), the `ray connect` direct-link grant.
+///
+/// A direct link is symmetric, so its one intended peer coordinates it too. The
+/// grant therefore follows the *peer* recorded when the link was minted, not the
+/// network's `direct` flag, which any later `ray accept` would otherwise ride
+/// into a key it was never offered.
+///
+/// `direct_peer` is `None` on links minted before it was recorded, so those fall
+/// back to the old rule but only while we are still the sole member: that is the
+/// state a direct network sits in until its one peer arrives, and it keeps an
+/// in-flight `ray connect` from an older build working, while still refusing a
+/// third peer on an already-formed link.
+pub(crate) fn grants_direct_key(
+    net: &config::NetworkConfig,
+    joiner: EndpointId,
+    state: &SharedNetworkState,
+) -> bool {
+    if !net.direct {
+        return false;
+    }
+    match net.direct_peer {
+        Some(peer) => peer == joiner,
+        None => state.read().unwrap().members.all().len() <= 1,
+    }
+}
+
+/// What a `MeshHello`'s identity claim earns its sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelloIdentity {
+    /// Accept the hello. `Some(user)` is a device→user binding good enough to
+    /// record in the `device_user_map`; `None` means the peer speaks only for
+    /// its own transport key.
+    Accept(Option<EndpointId>),
+    /// Refuse the frame: the cert does not hold up, or it does not back the
+    /// identity the sender claimed.
+    Reject,
+}
+
+/// Decide what a `MeshHello` proved about who is sending it.
+///
+/// The `device_user_map` this feeds is daemon-wide and is what the inbound
+/// firewall (`forward::evaluate_inbound`), mesh SSH (`ssh::resolve_user_policy`),
+/// own-device file auto-accept, and member-leave pruning all authorize on. So a
+/// cert only ever earns a binding here after its signature is checked and after
+/// it is confirmed to name *this* transport key: a peer that presents a cert it
+/// did not receive must not inherit the rights of the identity that signed it.
+///
+/// The two rules are independent, which is what the earlier version of this code
+/// missed. Verifying the cert is not conditional on the sender claiming a
+/// *different* identity: a sender claiming its own transport key still hands us a
+/// `user_identity` we would otherwise store on its word alone.
+///
+/// A nullified device (`ray unpair`) keeps its valid signature forever, so the
+/// revocation has to be applied here too: its binding is dropped, and a claim
+/// that rests on it is refused outright.
+pub(crate) fn check_hello_identity(
+    transport_id: EndpointId,
+    peer_identity: EndpointId,
+    cert: Option<&control::DeviceCert>,
+    nullifiers: &BTreeSet<EndpointId>,
+) -> HelloIdentity {
+    let binding = match cert {
+        // A presented cert must verify and must bind the key that actually
+        // dialed us. Anything else is a forgery attempt, not a peer without a
+        // cert, so refuse the frame rather than quietly continuing without it.
+        Some(c) if !c.verify() || c.device_key != transport_id => return HelloIdentity::Reject,
+        // Verified, but revoked on this network: worth nothing.
+        Some(c) if nullifiers.contains(&c.device_key) => None,
+        Some(c) => Some(c.user_identity),
+        None => None,
+    };
+    if peer_identity != transport_id && binding != Some(peer_identity) {
+        // Claiming to be someone else takes a live binding that names them.
+        return HelloIdentity::Reject;
+    }
+    HelloIdentity::Accept(binding)
+}
+
 pub(crate) struct CoordinatorAcceptState {
     pub(crate) ctx: MeshCtx,
     pub(crate) network_name: String,
@@ -531,11 +641,17 @@ impl CoordinatorAcceptState {
         // A direct (`ray connect`) network is a symmetric 2-peer link, so the
         // pre-approved requester is made a co-coordinator: marked coordinator in
         // the roster here and granted the network key over its connection below.
+        //
+        // Pinned to the peer the link was minted for (`direct_peer`), not to the
+        // network's `direct` flag: the flag says the *network* is a direct link,
+        // so on its own it handed the network key to anyone ever approved here,
+        // and a later `ray accept` on that network would give the key away
+        // without saying so.
         let grant_direct = was_approved
             && config::load_network(&self.network_name)
                 .ok()
                 .flatten()
-                .is_some_and(|n| n.direct);
+                .is_some_and(|n| grants_direct_key(&n, remote_id, &self.state));
 
         let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
         let snap_bytes = {
@@ -747,12 +863,23 @@ impl MemberAcceptState {
                 self.handle_mesh_hello(conn, send, peer_id, identity, ip, hostname, device_cert)
                     .await
             }
+            // Only a coordinator admits, so only a coordinator may say who was
+            // admitted. Without this check the message was an unauthenticated
+            // write into our approved list, and an entry there is not inert: the
+            // sender's next `MeshHello` takes the `is_approved` branch below
+            // straight into `admit_approved_member`, which seats it as a member
+            // at the IP *this message* chose, writes its `.ray` name, and
+            // registers its route. Same gate as `InviteShare`/`KickedFromNetwork`.
             ControlMsg::MemberApproved {
                 identity,
                 ip,
                 hostname,
                 ..
             } => {
+                if !sender_is_coordinator(&self.state, peer_id) {
+                    tracing::warn!(peer = %peer_id.fmt_short(), "ignoring MemberApproved from non-coordinator");
+                    return None;
+                }
                 let entry = ApprovedEntry {
                     identity,
                     ip,
@@ -894,25 +1021,29 @@ impl MemberAcceptState {
         hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
     ) -> Option<Ipv4Addr> {
-        // Verify identity: either the transport key matches, or a valid device
-        // cert binds the transport key to the claimed user identity.
-        if peer_identity != transport_id {
-            match device_cert {
-                Some(ref cert)
-                    if cert.verify()
-                        && cert.device_key == transport_id
-                        && cert.user_identity == peer_identity => {}
-                _ => {
-                    tracing::warn!(peer = %transport_id.fmt_short(), "invalid device certificate");
-                    return None;
-                }
+        // Verify the cert and the identity claim together, before anything is
+        // recorded. See `check_hello_identity`: the binding this stores is what
+        // the firewall and mesh SSH later authorize on, so it is never taken on
+        // the sender's word.
+        let nullifiers = self.state.read().unwrap().nullifiers.clone();
+        let binding = match check_hello_identity(
+            transport_id,
+            peer_identity,
+            device_cert.as_ref(),
+            &nullifiers,
+        ) {
+            HelloIdentity::Accept(binding) => binding,
+            HelloIdentity::Reject => {
+                tracing::warn!(peer = %transport_id.fmt_short(), "invalid device certificate");
+                return None;
             }
+        };
+        if let Some(user_identity) = binding {
+            self.ctx.device_user_map.insert(transport_id, user_identity);
         }
-        if let Some(ref cert) = device_cert {
-            self.ctx
-                .device_user_map
-                .insert(transport_id, cert.user_identity);
-        }
+        // A cert that earned no binding (revoked on this network) is not written
+        // to the roster either, matching the coordinator's `handle_member_hello`.
+        let device_cert = binding.and(device_cert);
         let (is_member, is_approved) = {
             let s = self.state.read().unwrap();
             (
@@ -1113,6 +1244,24 @@ impl AcceptHandler {
     #[cfg(test)]
     pub(crate) fn is_coordinator(&self) -> bool {
         matches!(self, AcceptHandler::Coordinator(_))
+    }
+
+    /// Whether this network's roster accounts for `peer_id` at all: a seated
+    /// member, or a peer approved and not yet seated.
+    ///
+    /// Checked against both the transport key and the user identity it resolves
+    /// to, because a paired multi-device peer is on the roster under its *user*
+    /// identity while its datagrams arrive under a device key.
+    pub(crate) fn knows_sender(&self, peer_id: EndpointId) -> bool {
+        let (state, ctx) = match self {
+            AcceptHandler::Coordinator(s) => (&s.state, &s.ctx),
+            AcceptHandler::Member(s) => (&s.state, &s.ctx),
+        };
+        let user_id = ctx.device_user_map.resolve(&peer_id);
+        let s = state.read().unwrap();
+        [peer_id, user_id]
+            .iter()
+            .any(|id| s.members.is_member(id) || s.approved.is_approved(id))
     }
 
     /// The local name of the network this handler serves. Used by the demux to map
@@ -1342,6 +1491,281 @@ impl ProtocolRouter {
             .clone()
             .drive_mesh_connection(conn, pre_registered)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod stranger_policy_tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn eid(seed: u8) -> EndpointId {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        SecretKey::from(b).public()
+    }
+
+    /// The three ways a peer our roster does not list may legitimately speak.
+    #[test]
+    fn only_the_pre_membership_messages_pass() {
+        for msg in [
+            ControlMsg::JoinRequest {
+                invite_secret: None,
+                hostname: None,
+                device_cert: None,
+            },
+            ControlMsg::MeshHello {
+                identity: eid(1),
+                ip: Ipv4Addr::new(100, 64, 0, 2),
+                hostname: None,
+                device_cert: None,
+            },
+            ControlMsg::SignedRecord { packet: vec![] },
+        ] {
+            assert!(stranger_may_send(&msg), "{msg:?} must reach a coordinator");
+        }
+    }
+
+    /// Everything a member says, a stranger may not. Listed one by one rather
+    /// than by negation so that adding a `ControlMsg` variant is a decision made
+    /// here, not a default inherited silently.
+    #[test]
+    fn member_messages_are_refused_from_a_stranger() {
+        for msg in [
+            // Coordinator authority.
+            ControlMsg::MemberApproved {
+                identity: eid(1),
+                ip: Ipv4Addr::new(100, 64, 0, 2),
+                hostname: None,
+                device_cert: None,
+            },
+            ControlMsg::AdminGrant {
+                network_pubkey: eid(1),
+                secret_key: [0u8; 32],
+            },
+            ControlMsg::InviteShare {
+                id: "ab".into(),
+                secret_hash: vec![],
+                expires: 0,
+            },
+            ControlMsg::InviteUsed {
+                secret_hash: vec![],
+            },
+            ControlMsg::KickedFromNetwork,
+            // Triggers: cheap to send, a DHT resolve plus a blob fetch to honor.
+            ControlMsg::MemberSync,
+            ControlMsg::BlobUpdated,
+            // A member's statements about itself, and its departure.
+            ControlMsg::ExitNodeOffer { enabled: true },
+            ControlMsg::Ipv6Only { enabled: true },
+            ControlMsg::LeaveNetwork,
+        ] {
+            assert!(!stranger_may_send(&msg), "{msg:?} must need membership");
+        }
+    }
+}
+
+#[cfg(test)]
+mod direct_grant_tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn eid(seed: u8) -> EndpointId {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        SecretKey::from(b).public()
+    }
+
+    fn state_with_members(ids: &[EndpointId]) -> SharedNetworkState {
+        let mut list = MemberList::new();
+        for (i, id) in ids.iter().enumerate() {
+            list.add(Member {
+                identity: *id,
+                ip: Ipv4Addr::new(100, 64, 0, (i + 2) as u8),
+                is_coordinator: i == 0,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+                collision_index: 0,
+                last_seen: None,
+                exit_node: false,
+                ipv6_only: false,
+            })
+            .unwrap();
+        }
+        Arc::new(std::sync::RwLock::new(NetworkState {
+            members: list,
+            approved: ApprovedList::new(),
+            snapshot: None,
+            network_secret_key: None,
+            network_public_key: eid(200),
+            network_name: Some("dario-alex".to_string()),
+            mode: GroupMode::Restricted,
+            suggested_firewall: SuggestedFirewall::default(),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+            pending_suggestions: Vec::new(),
+            pending: HashMap::new(),
+        }))
+    }
+
+    fn direct_net(peer: Option<EndpointId>) -> config::NetworkConfig {
+        let mut net = config::empty_network_config("dario-alex");
+        net.direct = true;
+        net.direct_peer = peer;
+        net
+    }
+
+    /// The peer the link was minted for gets the network key: that is the whole
+    /// point of a direct link being symmetric.
+    #[test]
+    fn the_minted_for_peer_is_granted() {
+        let (me, peer) = (eid(1), eid(2));
+        let state = state_with_members(&[me]);
+        assert!(grants_direct_key(&direct_net(Some(peer)), peer, &state));
+    }
+
+    /// The regression. A direct network approving a *second* peer later (via
+    /// `ray accept`) used to hand it the network secret key too, because the
+    /// grant keyed on the network being `direct` rather than on who the link was
+    /// for. Nothing tells the user they just made a stranger a co-coordinator.
+    #[test]
+    fn a_later_approved_peer_is_not_granted() {
+        let (me, peer, third) = (eid(1), eid(2), eid(3));
+        let state = state_with_members(&[me, peer]);
+        assert!(!grants_direct_key(&direct_net(Some(peer)), third, &state));
+    }
+
+    /// An ordinary mesh never grants, approved or not.
+    #[test]
+    fn a_normal_network_never_grants() {
+        let (me, peer) = (eid(1), eid(2));
+        let state = state_with_members(&[me]);
+        let mut net = direct_net(Some(peer));
+        net.direct = false;
+        assert!(!grants_direct_key(&net, peer, &state));
+    }
+
+    /// Links minted before `direct_peer` was recorded keep working while we are
+    /// still alone on them, which is the state they sit in until their one peer
+    /// arrives.
+    #[test]
+    fn legacy_link_grants_only_while_unformed() {
+        let (me, peer, third) = (eid(1), eid(2), eid(3));
+        let alone = state_with_members(&[me]);
+        assert!(grants_direct_key(&direct_net(None), peer, &alone));
+        // Once the link has both ends, a third peer gets nothing.
+        let formed = state_with_members(&[me, peer]);
+        assert!(!grants_direct_key(&direct_net(None), third, &formed));
+    }
+}
+
+#[cfg(test)]
+mod hello_identity_tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn key(seed: u8) -> SecretKey {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        SecretKey::from(b)
+    }
+
+    /// The regression this whole helper exists for. A peer claiming its own
+    /// transport key used to skip cert verification entirely, and the very next
+    /// line recorded the cert's `user_identity` in the daemon-wide
+    /// `device_user_map`. That map is what the inbound firewall and mesh SSH
+    /// authorize on, so an unsigned cert naming a victim handed the sender the
+    /// victim's rules on this node. An unverifiable cert must buy nothing.
+    #[test]
+    fn unsigned_cert_claiming_own_key_is_refused() {
+        let attacker = key(1).public();
+        let victim = key(2).public();
+        // Signed by the attacker's *own* key but asserting the victim as the
+        // user identity: `verify()` fails because the signature does not check
+        // out against the claimed `user_identity`.
+        let forged = control::DeviceCert {
+            user_identity: victim,
+            device_key: attacker,
+            generation: 0,
+            signature: key(1).sign(attacker.as_bytes()),
+        };
+        assert!(!forged.verify(), "test fixture must be an invalid cert");
+        assert_eq!(
+            check_hello_identity(attacker, attacker, Some(&forged), &BTreeSet::new()),
+            HelloIdentity::Reject,
+        );
+    }
+
+    /// A cert that verifies but names a *different* device is someone else's,
+    /// replayed. Binding it to whoever presented it is the same escalation by
+    /// another route.
+    #[test]
+    fn valid_cert_for_another_device_is_refused() {
+        let user = key(1);
+        let real_device = key(2).public();
+        let attacker = key(3).public();
+        let cert = control::DeviceCert::create(&user, &real_device, 0);
+        assert!(cert.verify());
+        assert_eq!(
+            check_hello_identity(attacker, attacker, Some(&cert), &BTreeSet::new()),
+            HelloIdentity::Reject,
+        );
+    }
+
+    /// The legitimate case: a cert signed by the user over this very device key
+    /// binds it, whether or not the sender also claims the user identity.
+    #[test]
+    fn valid_cert_binds_its_own_device() {
+        let user = key(1);
+        let device = key(2).public();
+        let cert = control::DeviceCert::create(&user, &device, 0);
+        // Speaking as itself.
+        assert_eq!(
+            check_hello_identity(device, device, Some(&cert), &BTreeSet::new()),
+            HelloIdentity::Accept(Some(user.public())),
+        );
+        // Speaking as its user identity, which the cert backs.
+        assert_eq!(
+            check_hello_identity(device, user.public(), Some(&cert), &BTreeSet::new()),
+            HelloIdentity::Accept(Some(user.public())),
+        );
+    }
+
+    /// No cert at all is fine, it just proves nothing beyond the transport key.
+    /// Claiming another identity without one is not.
+    #[test]
+    fn certless_hello_speaks_only_for_itself() {
+        let peer = key(1).public();
+        let other = key(2).public();
+        assert_eq!(
+            check_hello_identity(peer, peer, None, &BTreeSet::new()),
+            HelloIdentity::Accept(None),
+        );
+        assert_eq!(
+            check_hello_identity(peer, other, None, &BTreeSet::new()),
+            HelloIdentity::Reject,
+        );
+    }
+
+    /// `ray unpair` cannot invalidate a signature, so the nullifier set is the
+    /// only thing standing between a revoked device and the user's rights. A
+    /// still-valid revoked cert earns no binding, and a claim resting on it is
+    /// refused rather than downgraded.
+    #[test]
+    fn nullified_device_earns_no_binding() {
+        let user = key(1);
+        let device = key(2).public();
+        let cert = control::DeviceCert::create(&user, &device, 0);
+        let revoked = BTreeSet::from([device]);
+        assert_eq!(
+            check_hello_identity(device, device, Some(&cert), &revoked),
+            HelloIdentity::Accept(None),
+        );
+        assert_eq!(
+            check_hello_identity(device, user.public(), Some(&cert), &revoked),
+            HelloIdentity::Reject,
+        );
     }
 }
 

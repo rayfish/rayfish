@@ -562,6 +562,10 @@ impl NetworkRegistry {
                 .unwrap_or_else(crate::hostname::generate_hostname),
         };
 
+        // Captured before `pre_approve` is consumed below: on a direct network
+        // this is the one peer the co-coordinator key grant is pinned to.
+        let pre_approved_peer = pre_approve.as_ref().map(|(id, _)| *id);
+
         let mut net_state = self.build_initial_roster(
             &name,
             my_ip,
@@ -601,6 +605,10 @@ impl NetworkRegistry {
             auto_accept_files: true,
             admins: vec![],
             direct,
+            // The peer this direct link was minted for. Pins the co-coordinator
+            // key grant in `admit_peer` to that one peer instead of to whoever
+            // happens to be approved on the network later.
+            direct_peer: direct.then_some(pre_approved_peer).flatten(),
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,

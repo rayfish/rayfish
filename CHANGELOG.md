@@ -17,6 +17,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   kick, a firewall suggestion or a new member still lands right away. Desktop
   and server nodes keep the 60-second poll.
 
+### Security
+
+- **Knowing a network's room id no longer lets a stranger talk to it.** A mesh
+  control message is addressed to a network by its public key, and that key is
+  a discovery key by design: it is in every invite code and it is the address
+  the network publishes under. Nothing checked that the sender of such a
+  message was actually in the network it named, so anyone who had ever seen an
+  invite could reach the handlers meant for members. They are now refused
+  unless the sender is on that network's roster, apart from the three messages
+  by which a peer that is not on it yet legitimately makes contact (a join
+  request, a hello, and a network-signed record, which is verified against the
+  network key regardless of who carried it).
+- **A device certificate is verified before it can speak for its user.**
+  Certificates bind a device key to a user identity, and that binding is what
+  the inbound firewall, mesh SSH authorization, and own-device file
+  auto-accept match on. A peer that presented a certificate under its own key
+  had that certificate recorded without its signature being checked, so an
+  unsigned one naming somebody else handed the sender that person's firewall
+  rules and SSH access on the receiving node. Certificates are now verified on
+  every path, and one revoked with `ray unpair` grants nothing even though its
+  signature stays valid forever.
+- **Only a coordinator can say who was admitted.** The message announcing a new
+  member was accepted from any sender. Acting on it seats the named peer at an
+  address the message chose, publishes its `.ray` name, and routes to it, so an
+  entry in a node's `.ray` DNS was something a stranger could place there until
+  the next roster sync. It is now honored only from a coordinator.
+- **A `ray connect` link hands its key to the one peer it was made for.**
+  Approving a direct connection makes the other peer a co-coordinator, since
+  the link is symmetric. That rule keyed on the network rather than the peer,
+  so anyone approved onto that network afterwards silently received the network
+  key as well. The grant now follows the peer the link was created for.
+- **A wrong guess no longer closes an open pairing window.** The pairing secret
+  was consumed before it was compared, so any dial carrying the wrong bytes
+  ended the pairing session and the real device had to start over. The secret
+  now survives a mismatch, and the comparison is constant-time.
+- **Two queues a stranger could grow without limit are now bounded.** A leave
+  message from a peer that was never on the roster made a coordinator re-sign
+  and republish its membership record and notify every member; it is now
+  ignored. Incoming `ray connect` requests are capped the same way pending join
+  requests already were.
+
 ### Fixed
 
 - **The metrics endpoint no longer answers the local network.** The Prometheus

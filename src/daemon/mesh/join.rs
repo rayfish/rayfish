@@ -286,18 +286,19 @@ fn persist_join_config(
     // allow-list + selected exit peer). Anything node-local left out of this
     // list is silently erased on every member daemon restart.
     let prev = config::load_network(network_name)?;
-    let (direct, pending_hostname, ssh_allow, aliases, prev_auto_accept_files) = prev
+    let (direct, direct_peer, pending_hostname, ssh_allow, aliases, prev_auto_accept_files) = prev
         .as_ref()
         .map(|n| {
             (
                 n.direct,
+                n.direct_peer,
                 n.pending_hostname.clone(),
                 n.ssh_allow.clone(),
                 n.aliases.clone(),
                 n.auto_accept_files,
             )
         })
-        .unwrap_or((false, None, vec![], BTreeMap::new(), false));
+        .unwrap_or((false, None, None, vec![], BTreeMap::new(), false));
     let (exit_allow, exit_node_use) = prev
         .map(|n| (n.exit_allow, n.exit_node_use))
         .unwrap_or((vec![], None));
@@ -320,6 +321,7 @@ fn persist_join_config(
         auto_accept_files,
         admins: vec![],
         direct,
+        direct_peer,
         ssh_allow,
         aliases,
         ephemeral_ttl_secs: None,
@@ -678,6 +680,7 @@ mod persist_config_tests {
             auto_accept_files: false,
             admins: vec![],
             direct: false,
+            direct_peer: None,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
