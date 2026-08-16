@@ -12,7 +12,7 @@ The workspace also ships the mobile client: `ray-mobile` (a UniFFI cdylib wrappi
 
 ```bash
 cargo -q build          # --features tor (Tor transport), otel (OTLP span export)
-cargo -q check          # also: clippy, test
+cargo -q check --workspace --all-targets   # also: clippy, test. CI adds --locked
 cargo bench             # per-packet data path (benches/forward.rs)
 just cross              # x86_64 Linux;  just deploy <ip> = cross-build + install + start
 just apk                # ray-mobile + UniFFI Kotlin bindings + debug APK (needs cargo-ndk, JDK 17)
@@ -20,6 +20,8 @@ just android-check      # compile the Android target in a container (no NDK need
 ```
 
 Use `cargo -q` for all cargo commands. Keep `build` / `clippy` / `test` green at every step.
+
+**Always pass `--workspace`.** The workspace is three crates (`rayfish`, `ray-proto`, `ray-mobile`) and a bare `cargo check` builds only the root, so a change to a shared type compiles locally and fails CI on the other two crates' own tests. `--all-targets` matters for the same reason: a struct literal in a `#[cfg(test)]` block is where a new field first breaks.
 
 ## Run
 

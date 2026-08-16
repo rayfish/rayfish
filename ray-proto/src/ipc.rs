@@ -1189,7 +1189,9 @@ mod tests {
                 network: "n".into(),
                 allow: vec!["*".into()],
                 using: Some("gw".into()),
-                available: vec!["gw".into()],
+                available: vec!["gw".into(), "v4only".into()],
+                available_v6: vec!["gw".into()],
+                ipv6_only: true,
             }],
         };
         let bytes = rmp_serde::to_vec_named(&resp).unwrap();
@@ -1198,9 +1200,40 @@ mod tests {
             IpcMessage::ExitNodeState { networks } => {
                 assert_eq!(networks.len(), 1);
                 assert_eq!(networks[0].using.as_deref(), Some("gw"));
+                // `available_v6` is a subset of `available`, not a replacement:
+                // an IPv6-only client needs both lists to say "this gateway
+                // exists but cannot carry your only family".
+                assert_eq!(networks[0].available_v6, vec!["gw".to_string()]);
+                assert!(networks[0].ipv6_only);
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// Both new fields are `#[serde(default)]`, so a reply from a daemon that
+    /// predates them still decodes: a CLI upgraded ahead of its daemon reads no
+    /// IPv6-capable gateways and no IPv6-only claim, which is what that daemon
+    /// meant.
+    #[test]
+    fn exit_node_state_decodes_without_the_ipv6_fields() {
+        #[derive(Serialize)]
+        struct OldView {
+            network: String,
+            allow: Vec<String>,
+            using: Option<String>,
+            available: Vec<String>,
+        }
+        let bytes = rmp_serde::to_vec_named(&OldView {
+            network: "n".into(),
+            allow: vec![],
+            using: None,
+            available: vec!["gw".into()],
+        })
+        .unwrap();
+        let decoded: ExitNodeStatusView = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.available, vec!["gw".to_string()]);
+        assert!(decoded.available_v6.is_empty());
+        assert!(!decoded.ipv6_only);
     }
 
     #[test]
