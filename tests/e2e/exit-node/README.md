@@ -39,6 +39,11 @@ and asserting it was mirrored into the tunnel table. Without that mirror our
 catch-all rule at priority 102 wins, the foreign prefix is never reached, and
 that VPN goes dark the moment `exit-node use` runs.
 
+DNS is asserted only as far as the claim goes: both a non-mesh name and a `.ray`
+name must still resolve. Where the non-mesh query *went* is deliberately not
+asserted, because on a split-DNS backend it leaves over the host's own IPv4 by
+design in this mode, which is a documented gap rather than a regression.
+
 Whether srv-a can serve such a client depends on srv-a having IPv6 egress, which
 not every instance has. Both branches are asserted: with a v6 uplink the tunnel
 must work, without one the selection must be **refused by name** rather than

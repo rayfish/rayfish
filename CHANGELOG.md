@@ -15,9 +15,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ray exit-node use` and `ray exit-node status` say so rather than leaving you
   to find out. The gateway needs an IPv6 uplink of its own; ones that have it
   are marked `(IPv6)` in `ray exit-node status`, and picking one that doesn't is
-  refused with the reason instead of timing out. While the tunnel is up,
-  non-`.ray` DNS is forwarded to an IPv6 resolver so lookups go through the exit
-  rather than around it. Offering an exit node was never affected by the mode.
+  refused with the reason instead of timing out, and that check now also runs on
+  every re-apply, so a gateway that loses its IPv6 uplink (or a selection made
+  before the mode turned itself on) falls back to direct egress with a message
+  rather than silently carrying nothing. While the tunnel is up, the daemon's own
+  DNS forwarder is pointed at an IPv6 resolver so its lookups go through the exit
+  rather than around it; on Linux hosts using systemd-resolved, NetworkManager or
+  resolvconf, applications' non-`.ray` lookups still leave directly, and the
+  daemon logs a warning saying so. Offering an exit node was never affected by
+  the mode.
 - **`ray config set dns-upstreams` takes IPv6 addresses.** Used by an exit-node
   tunnel in IPv6-only mode, which has no IPv4 to reach a v4 resolver over.
 

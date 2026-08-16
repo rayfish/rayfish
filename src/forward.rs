@@ -245,8 +245,9 @@ pub(crate) fn evaluate_inbound(
     };
     // IPv6-only: refuse mesh IPv4 outright rather than accepting a packet we
     // cannot answer. Exit-node transit (a non-overlay destination) is checked
-    // below and is not affected, since `ray exit-node use` is refused in this
-    // mode and serving one still forwards through the kernel's own routes.
+    // below and is not affected either way: this only matches overlay IPv4
+    // destinations, while a full tunnel in this mode carries IPv6 alone, so its
+    // return traffic is addressed to our mesh v6 and never meets this rule.
     if is_disabled_mesh_ipv4(ipv6_only(), info.dst_ip) {
         return InboundDecision::DropIpv4Disabled;
     }

@@ -534,10 +534,18 @@ things follow from it:
 - The gateway needs an IPv6 uplink of its own. Ones that have it are marked
   `(IPv6)` in `ray exit-node status`, and picking one that isn't is refused
   rather than left to time out.
-- Non-`.ray` DNS is forwarded to an IPv6 resolver while the tunnel is up, so
-  lookups go out through the exit rather than around it. Name one yourself with
-  `ray config set dns-upstreams` (IPv6 addresses are accepted); otherwise
-  Cloudflare and Google's IPv6 resolvers are used.
+- The daemon's own DNS forwarder is pointed at an IPv6 resolver while the tunnel
+  is up, so the lookups it makes go through the exit rather than around it. Name
+  one yourself with `ray config set dns-upstreams` (IPv6 addresses are accepted);
+  otherwise Cloudflare and Google's IPv6 resolvers are used.
+
+  This only covers applications' lookups where rayfish owns `/etc/resolv.conf`
+  outright. On systemd-resolved, NetworkManager, or resolvconf, rayfish registers
+  `~ray` as its only routing domain, so everything else goes to the host's other
+  DNS servers, over IPv4, which this mode does not tunnel: those lookups still
+  leave directly. The daemon logs a warning naming the backend when this applies.
+  macOS has no such gap, since it switches to a catch-all match domain while the
+  tunnel is up. Giving Linux the same switch is not done yet.
 
 The other VPN's own routes are copied into the tunnel's routing table before the
 default goes in, so it keeps working: without that our catch-all rule sits above

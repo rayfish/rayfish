@@ -280,6 +280,16 @@ pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<Ipv
     }
     let custom: Vec<Ipv4Addr> = o.servers.iter().filter_map(|s| s.parse().ok()).collect();
     if o.replace {
+        // `dns_upstreams` takes any `IpAddr` since IPv6-only tunnels needed it, so
+        // an all-IPv6 `--replace` narrows to nothing here. Returning that empty
+        // list would leave both consumers with no server at all: the forwarder
+        // SERVFAILs every non-`.ray` name, and `control_plane_nameservers` falls
+        // back to iroh's own resolv.conf reader, which is the #111 circle. Keep
+        // the captured ones instead: the IPv6 entries are still honoured, by
+        // `exit_node::tunnel_upstreams`, which is the caller that can reach them.
+        if custom.is_empty() {
+            return captured;
+        }
         custom
     } else {
         custom.into_iter().chain(captured).collect()
@@ -1666,6 +1676,31 @@ name = "test"
             replace: true,
         };
         assert_eq!(resolve_upstreams(&rep, captured.clone()), vec![one]);
+    }
+
+    /// `dns-upstreams` takes IPv6 since the IPv6-only tunnel needed it, so an
+    /// all-IPv6 `--replace` narrows to nothing here. Returning that empty list
+    /// would leave the forwarder with no server and hand `control_plane_nameservers`
+    /// an empty set, putting the endpoint back on iroh's resolv.conf reader (#111).
+    #[test]
+    fn replace_with_only_ipv6_keeps_the_captured_upstreams() {
+        let captured = vec![Ipv4Addr::new(192, 168, 1, 1)];
+        let v6_only = ServerOverride {
+            servers: vec!["2606:4700:4700::1111".into()],
+            replace: true,
+        };
+        assert_eq!(resolve_upstreams(&v6_only, captured.clone()), captured);
+
+        // One usable IPv4 entry and `replace` still means replace: the guard is
+        // for "nothing survived the narrowing", not "some entries were dropped".
+        let mixed = ServerOverride {
+            servers: vec!["2606:4700:4700::1111".into(), "1.1.1.1".into()],
+            replace: true,
+        };
+        assert_eq!(
+            resolve_upstreams(&mixed, captured),
+            vec![Ipv4Addr::new(1, 1, 1, 1)]
+        );
     }
 
     #[test]

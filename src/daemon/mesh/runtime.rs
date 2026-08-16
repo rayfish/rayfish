@@ -1111,7 +1111,9 @@ impl Daemon {
         let server = apply_exit_server_os(&self.registry.exit_server, &tun_name).await;
         let served = started.elapsed();
         let client = self.apply_exit_client(&tun_name).await;
-        self.apply_exit_dns();
+        // `None` from `apply_exit_client` means the install succeeded (or that
+        // there was nothing to install, in which case the selection is inactive).
+        self.apply_exit_dns(self.registry.exit_client.is_active() && client.is_none());
         let clients = started.elapsed();
         // Advertise what actually survived the reconcile: a failed enable cleared
         // the offers, so this also withdraws a stale advertisement rather than
@@ -1188,14 +1190,42 @@ impl Daemon {
     /// upstream the desktop capture produces is IPv4, so without an override the
     /// exit node would carry the traffic while each lookup that steered it went
     /// out the physical link. See [`exit_node::tunnel_upstreams`].
-    fn apply_exit_dns(&self) {
-        let over = self.registry.exit_client.is_active().then(|| {
+    /// `installed` is whether the tunnel actually went in, not merely whether one
+    /// is selected. A failed install rolls the routing back but leaves the
+    /// selection active, and pointing the forwarder at a public IPv6 resolver with
+    /// no tunnel to reach it through is worse than leaving DNS alone: a host in
+    /// this mode usually has no native IPv6 at all (the mode is about an IPv4
+    /// conflict, not about having v6 transit), so every lookup would SERVFAIL on a
+    /// host whose DNS worked a moment earlier.
+    fn apply_exit_dns(&self, installed: bool) {
+        let over = installed.then(|| {
             let configured = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
             crate::exit_node::tunnel_upstreams(self.ipv6_only.enabled(), &configured)
         });
         // `None` from either level means "no override": no tunnel, or a tunnel
         // whose own family already carries the captured upstreams.
-        self.dns.resolver.set_tunnel_upstreams(over.flatten());
+        let over = over.flatten();
+        // The override only moves the daemon's *own* forwarder. Whether an app's
+        // query ever reaches that forwarder is the OS backend's decision, and on
+        // Linux only the direct-resolv.conf backend sends us everything: the
+        // split-DNS backends register `~ray` as the sole routing domain, so
+        // non-`.ray` lookups go to the host's other links, over IPv4, which this
+        // mode deliberately does not tunnel. macOS has no such gap, because
+        // `apply_exit_client` re-asserts a catch-all match domain while the tunnel
+        // is up. Giving Linux the same flip is the real fix and is not done here.
+        #[cfg(target_os = "linux")]
+        if over.is_some()
+            && let Some(backend) = self.dns.backend_name()
+            && backend != "direct-resolv.conf"
+        {
+            tracing::warn!(
+                backend,
+                "IPv6-only full tunnel is up, but this DNS backend routes only \
+                 `.ray` to rayfish, so other lookups still leave over IPv4, \
+                 outside the exit node"
+            );
+        }
+        self.dns.resolver.set_tunnel_upstreams(over);
     }
 
     /// Install or remove the client full-tunnel routing to match the selection.
@@ -1258,7 +1288,7 @@ impl Daemon {
             // relay servers (resolved now, while DNS is still split) and, below,
             // the exit peer's direct addresses.
             let relay_ips = self.relay_underlay_ips().await;
-            crate::exit_node::exclude_from_tunnel(&relay_ips);
+            crate::exit_node::exclude_from_tunnel(&self.tunnel_relevant(relay_ips));
             // Snapshot the physical default interfaces while the routing table is
             // still clean. Once the split defaults are in, a live lookup answers
             // "the tunnel" for any family without a default route of its own, and
@@ -1277,7 +1307,9 @@ impl Daemon {
             // blackholes, iroh spends ~20s failing over, and only the relay (which
             // does have a host route) carries traffic.
             if let Some(conn) = &conn {
-                crate::exit_node::exclude_from_tunnel(&peer_underlay_ips(conn));
+                crate::exit_node::exclude_from_tunnel(
+                    &self.tunnel_relevant(peer_underlay_ips(conn)),
+                );
             }
             let failure = self.route_default_or_rollback(tun_name).await;
             if failure.is_none() {
@@ -1339,6 +1371,20 @@ impl Daemon {
         self.registry.peers.conn_for_ip(&sel.ipv4)
     }
 
+    /// Narrow underlay addresses to the families the tunnel actually captures.
+    ///
+    /// The exclusions exist to keep iroh's own traffic off the split default. In
+    /// IPv6-only mode there is no IPv4 default of ours to route around, so a v4
+    /// host route is not just wasted work: it pins that address to the physical
+    /// gateway, carving it out of whichever co-resident VPN owns IPv4 on this Mac.
+    #[cfg(target_os = "macos")]
+    fn tunnel_relevant(&self, ips: Vec<IpAddr>) -> Vec<IpAddr> {
+        let v6_only = self.ipv6_only.enabled();
+        ips.into_iter()
+            .filter(|ip| !v6_only || ip.is_ipv6())
+            .collect()
+    }
+
     /// Block until the exit peer answers over the finished tunnel, so
     /// `ray exit-node use` returns only once traffic through it actually works.
     ///
@@ -1356,7 +1402,9 @@ impl Daemon {
                 // Re-check every round: hole-punching discovers new candidate
                 // addresses as it goes, and one that appears without a host route
                 // around the tunnel is a path that will blackhole.
-                crate::exit_node::exclude_from_tunnel(&peer_underlay_ips(conn));
+                crate::exit_node::exclude_from_tunnel(
+                    &self.tunnel_relevant(peer_underlay_ips(conn)),
+                );
                 if nudge_holepunch(&self.protocol_router, conn).await {
                     break;
                 }
@@ -1487,10 +1535,10 @@ impl Daemon {
         // pinning). Teardown never reports a problem.
         self.registry.exit_client.set(None);
         let _ = self.apply_exit_client(&tun_name).await;
-        // With the selection gone this drops any tunnel DNS override, so standby
-        // does not leave the forwarder pointed at a resolver chosen for a tunnel
-        // that no longer exists.
-        self.apply_exit_dns();
+        // With the tunnel gone this drops any DNS override, so standby does not
+        // leave the forwarder pointed at a resolver chosen for a tunnel that no
+        // longer exists.
+        self.apply_exit_dns(false);
 
         tracing::info!("VPN on standby");
         IpcMessage::Ok {

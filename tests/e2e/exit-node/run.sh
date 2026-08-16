@@ -402,6 +402,18 @@ else
     && pass "mesh still works under the IPv6-only tunnel" \
     || fail "mesh broke under the IPv6-only tunnel: loop prevention failed"
 
+  # DNS still resolves under the tunnel. Deliberately not asserting *where* the
+  # query went: on a split-DNS backend only `.ray` reaches our forwarder, so
+  # non-mesh lookups leave over the host's own IPv4 by design in this mode (the
+  # daemon warns about it). What must not happen is losing name resolution.
+  on "$B" "getent hosts example.com" >/dev/null 2>&1 \
+    && pass "non-mesh DNS still resolves under the IPv6-only tunnel" \
+    || fail "DNS broke under the IPv6-only tunnel"
+  # `.ray` is the half that does go through our resolver in every backend.
+  on "$B" "getent hosts srv-a.ray" >/dev/null 2>&1 \
+    && pass "'.ray' names still resolve under the IPv6-only tunnel" \
+    || fail "'.ray' resolution broke under the IPv6-only tunnel"
+
   on "$B" "ray exit-node none $NET" 2>&1 | strip | sed 's/^/   b| /'
   disarm_failsafe "$B"
   on "$B" "ip -6 rule show" | grep -q "lookup $TABLE" \

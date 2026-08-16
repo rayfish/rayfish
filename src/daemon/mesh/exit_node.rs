@@ -47,14 +47,25 @@ fn gateway_refusal(
             "{name} does not advertise an exit node on '{network}' \
              (see `ray exit-node status`)"
         )),
-        Some(m) if ipv6_only && !m.exit_node_v6 => Some(format!(
+        Some(m) => ipv6_gateway_refusal(m, name, ipv6_only),
+    }
+}
+
+/// The IPv6 half of [`gateway_refusal`], on its own because the two halves have
+/// different lifetimes. "Does not advertise an exit node" is a roster fact that
+/// flickers (a coordinator rebuild, a gateway mid-restart) and must not drop a
+/// live tunnel, so it is only ever checked when the user picks a gateway. This
+/// one is a standing property of the pair: while it holds, the tunnel carries
+/// nothing, so it is re-checked on every re-apply as well.
+fn ipv6_gateway_refusal(m: &Member, name: &str, ipv6_only: bool) -> Option<String> {
+    (ipv6_only && !m.exit_node_v6).then(|| {
+        format!(
             "{name} offers an exit node but cannot carry IPv6, and this node's data \
              plane is IPv6-only, so nothing would reach the internet through it. \
              Pick a gateway shown as (IPv6) in `ray exit-node status`, or give that \
              host an IPv6 uplink."
-        )),
-        Some(_) => None,
-    }
+        )
+    })
 }
 
 impl NetworkRegistry {
@@ -231,15 +242,54 @@ impl NetworkRegistry {
         // roster that briefly loses the flag must not silently drop us back to
         // direct egress, leaking out our own uplink the traffic we chose to tunnel.
         let wanted = !selected.is_empty();
+        // A refusal found while resolving the selection, kept out of the closure
+        // so the no-silent-fallback rule below can tell it apart from a peer the
+        // roster simply hasn't landed yet.
+        let mut refused: Option<String> = None;
         let selection = selected.into_iter().find_map(|nc| {
             let id = nc.exit_node_use.as_ref()?.parse::<EndpointId>().ok()?;
             let member = self.roster_member(&nc.name, id)?;
+            // The IPv6 gate cannot live only in `exit_node_use`: a selection made
+            // while dual-stack is still in the config when the mode flips, and
+            // under `ipv6_only = auto` that flip needs no user action at all
+            // (`decide_ipv6_only` turns it on the first time something else holds
+            // `100.64.0.0/10`). A gateway that loses its IPv6 uplink is the same
+            // story. Re-checking here is what keeps the flag's promise true after
+            // boot. Only the IPv6 half, though: a peer that momentarily stops
+            // advertising `exit_node` keeps its tunnel, per the note above.
+            if let Some(why) = ipv6_gateway_refusal(
+                &member,
+                member
+                    .hostname
+                    .as_deref()
+                    .unwrap_or("the selected exit node"),
+                self.ipv6_only,
+            ) {
+                refused = Some(why);
+                return None;
+            }
             Some(ExitSelection {
                 peer_user: self.device_user_map.resolve(&member.identity),
                 ipv4: member.ip,
                 network: SmolStr::new(&nc.name),
             })
         });
+        // Unlike the missing-peer case below, this is not a roster gap a
+        // reconverge will heal: the gateway is present and simply cannot carry
+        // the only family this tunnel would route. Keeping or installing it would
+        // black-hole every flow, so direct egress is the better side to fail on
+        // (the opposite of the leak that rule guards against). The config entry is
+        // left alone so `ray exit-node status` still shows what to clear.
+        //
+        // Gated on there being no selection at all: `find_map` keeps looking after
+        // a refusal, so with an exit selected on more than one network (warned
+        // about above) a later usable gateway still wins over an earlier bad one.
+        if let Some(why) = refused.filter(|_| selection.is_none()) {
+            self.exit_selection_pending.store(false, Ordering::Relaxed);
+            self.exit_client.set(None);
+            tracing::warn!(reason = %why, "exit selection unusable; using direct egress");
+            return Some(why);
+        }
         // The same no-silent-fallback rule when the roster cannot resolve the
         // selected peer at all (boot before the first reconverge, or the peer
         // temporarily absent): keep whatever tunnel is in place rather than
@@ -285,6 +335,14 @@ impl NetworkRegistry {
         if !self.exit_sync_enabled.load(Ordering::Relaxed) {
             tracing::debug!("exit offer sync disabled (data plane down); skipping");
             return;
+        }
+        // Re-probe before comparing, so a gateway that gained (or lost) IPv6 since
+        // the last `ray up` republishes on this pass rather than advertising a
+        // stale capability until someone restarts the data plane. Blocking pool:
+        // it shells out, and this runs from the reconverge worker.
+        {
+            let server = self.exit_server.clone();
+            let _ = tokio::task::spawn_blocking(move || server.refresh_v6_uplink()).await;
         }
         let names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
         for name in names {
@@ -584,5 +642,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The two halves of the refusal have different lifetimes, and `reload_exit_state`
+    /// re-checks only one of them on every apply.
+    ///
+    /// "Does not advertise an exit node" is a roster fact that flickers, and
+    /// dropping a live tunnel on it would leak the traffic the user chose to
+    /// tunnel, so it stays a selection-time check. The IPv6 one is a standing
+    /// property: while it holds the tunnel carries nothing, and `ipv6_only = auto`
+    /// can turn the mode on with no user action at all, so a selection made while
+    /// dual-stack has to be caught later.
+    #[test]
+    fn only_the_ipv6_half_of_the_refusal_is_re_checked_after_selection() {
+        // A gateway that stopped advertising keeps its tunnel: no refusal from the
+        // half `reload_exit_state` consults, in either mode.
+        for ipv6_only in [false, true] {
+            assert!(super::ipv6_gateway_refusal(&gateway(false, true), "gw", ipv6_only).is_none());
+        }
+        // A gateway with no IPv6 uplink is refused on every re-apply, not just at
+        // selection time.
+        let refusal = super::ipv6_gateway_refusal(&gateway(true, false), "gw", true)
+            .expect("a v4-only gateway stays unusable from an IPv6-only node");
+        assert!(refusal.contains("cannot carry IPv6"), "{refusal}");
+        assert!(super::ipv6_gateway_refusal(&gateway(true, false), "gw", false).is_none());
     }
 }

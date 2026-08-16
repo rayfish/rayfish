@@ -319,10 +319,13 @@ pub struct ExitServer {
     /// one of them would be local-delivered by the kernel, reaching this host's
     /// services without ever passing its rayfish inbound firewall.
     self_addrs: Arc<ArcSwap<HashSet<IpAddr>>>,
-    /// Whether this host can actually egress IPv6, refreshed on every reconcile
-    /// alongside `self_addrs`. Advertised as `Member.exit_node_v6` so an
-    /// IPv6-only client can tell a gateway it can use from one that would take
-    /// its traffic and have nowhere to send it.
+    /// Whether this host can actually egress IPv6. Sampled by `apply_os`
+    /// alongside `self_addrs`, and re-probed on the reconverge that publishes it
+    /// ([`refresh_v6_uplink`](Self::refresh_v6_uplink)), since on a gateway
+    /// `apply_os` only runs on `ray up` and on a local `ray exit-node` command.
+    /// Advertised as `Member.exit_node_v6` so an IPv6-only client can tell a
+    /// gateway it can use from one that would take its traffic and have nowhere
+    /// to send it.
     v6_uplink: Arc<AtomicBool>,
 }
 
@@ -380,6 +383,23 @@ impl ExitServer {
     pub fn offers_v6(&self) -> bool {
         self.v6_uplink.load(Ordering::Relaxed)
     }
+
+    /// Re-probe the IPv6 uplink, for the reconverge that publishes the claim.
+    ///
+    /// `apply_os` samples it too, but on a gateway that path only runs on `ray up`
+    /// and on a local `ray exit-node` command, so a box that gains IPv6 an hour
+    /// later would keep advertising IPv4-only until the next `ray up`. This runs
+    /// on the roster's own cadence instead. Spawns a process, so callers put it on
+    /// the blocking pool; a no-op unless we actually offer an exit node.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    pub fn refresh_v6_uplink(&self) {
+        if self.is_active() {
+            self.v6_uplink.store(has_v6_uplink(), Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+    pub fn refresh_v6_uplink(&self) {}
 
     /// Rebuild the policy from `(network name, allow-list)` pairs. An allow entry
     /// is `"*"` (any member) or a user-identity hex; unparseable entries are
@@ -993,6 +1013,19 @@ pub fn install_client_routing(tun_name: &str, ipv6_only: bool) -> Result<()> {
     // where an SSH session to this host's public IP is routed into the tunnel and
     // cut.
     nft_load(&client_nft_script(tun_name))?;
+    // Kernel rules outlive the process, so install has to be as mode-symmetric as
+    // teardown already is. A daemon killed (or aborted by the panic hook) while a
+    // dual-stack tunnel was up, restarted in IPv6-only mode with the selection
+    // still in config, would otherwise install `-6` and leave the previous run's
+    // `-4` rules and default in place: IPv4 policy-routed into a tunnel this mode
+    // promises not to claim, sourced from the /32 it deliberately leaves
+    // unrouted, taking the co-resident VPN's IPv4 down with it.
+    for family in ["-4", "-6"] {
+        if !tunnel_families(ipv6_only).contains(&family) {
+            remove_client_rules(family);
+            let _ = run_ip(&[family, "route", "flush", "table", EXIT_TABLE]);
+        }
+    }
     let mark = format!("{SOCKET_MARK:#x}");
     for family in tunnel_families(ipv6_only).iter().copied() {
         // Give the tunnel table the prefixes another VPN serves out of a table of
@@ -1193,6 +1226,15 @@ struct MirroredRoute {
 /// dropped is deleted here, so a re-apply cannot leave traffic pointed at a tunnel
 /// that no longer claims it. Our own default is never touched, so there is no
 /// moment where the table is empty and traffic leaks past the tunnel.
+///
+/// Deliberately broader than the case it is named for: every non-default route in
+/// every non-main table is copied, whatever `ip rule` selectors reach that table.
+/// A prefix another VPN serves only for certain source addresses, or a VRF's
+/// table, becomes unconditional for our tunnel-bound traffic. That is the right
+/// trade against black-holing those destinations outright, but it is a real
+/// widening, so it is written down rather than implied: narrowing it would mean
+/// mirroring only tables named by a selector-free rule, and treating everything
+/// else as unreachable.
 ///
 /// Best-effort throughout: this is an accommodation for someone else's routing, and
 /// failing to read or write one route must not fail the install.
@@ -1905,6 +1947,20 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
     fn ipv6_only_tunnels_one_family() {
         assert_eq!(tunnel_families(true), ["-6"]);
         assert_eq!(tunnel_families(false), ["-4", "-6"]);
+
+        // Install cleans up whatever it stopped claiming, so a restart into the
+        // other mode cannot leave the previous run's rules routing a family this
+        // one promises not to touch. Kernel state outlives the process, and the
+        // panic hook `abort()`s, so "the last teardown ran" is not an assumption
+        // install gets to make.
+        for ipv6_only in [false, true] {
+            let claimed = tunnel_families(ipv6_only);
+            let dropped: Vec<&str> = ["-4", "-6"]
+                .into_iter()
+                .filter(|f| !claimed.contains(f))
+                .collect();
+            assert_eq!(dropped, if ipv6_only { vec!["-4"] } else { Vec::new() });
+        }
     }
 
     /// What gets copied into the tunnel table so a co-resident VPN survives our
