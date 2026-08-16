@@ -2201,7 +2201,7 @@ mod tests {
         Reassert, SearchDomain, first_nameserver, foreign_mesh_resolver, join_domains,
         merge_search_domains, nm_dns_none_dropin, other_overlay_resolver, parse_resolv_nameservers,
         reassert_decision, render_direct_resolv_conf, render_direct_resolv_conf_with,
-        resolv_conf_is_ours, search_domains_for,
+        resolv_conf_is_ours, search_domains_for, strip_our_resolv_entries,
     };
 
     /// Domains as the host had them, i.e. read back from its own config.
@@ -2213,7 +2213,7 @@ mod tests {
         names.iter().map(|n| n.to_string()).collect()
     }
     #[cfg(target_os = "linux")]
-    use super::{nsswitch_uses_resolve, resolv_conf_points_at_resolved, strip_our_resolv_entries};
+    use super::{nsswitch_uses_resolve, resolv_conf_points_at_resolved};
 
     #[test]
     fn resolv_conf_is_ours_detects_marker() {
