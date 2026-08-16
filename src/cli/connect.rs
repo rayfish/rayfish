@@ -66,7 +66,7 @@ pub(crate) async fn ipc_connections_list() -> Result<()> {
                 print!("{}", table(&["id", "host", "waiting"], rows, 2));
                 println!(
                     "\n  {}",
-                    style::faint("approve with: ray connections approve <id>")
+                    style::faint("approve with: ray connect approve <id>")
                 );
             }
         }

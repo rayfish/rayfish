@@ -348,10 +348,16 @@ mod tests {
     /// down the name column, which a wrapped line breaks. Every line of a
     /// grouped page therefore has to fit the 80 columns a terminal is narrowest
     /// at, headings, options and footer included.
+    ///
+    /// The width is pinned because `wrap_help` otherwise makes this assertion
+    /// depend on where it runs: clap reads the terminal at build time, so under
+    /// `--nocapture` in a narrow terminal it pre-wraps the page and every line
+    /// fits by construction. `term_width` propagates to subcommands through
+    /// `build()`.
     #[test]
     fn no_help_line_wraps_at_eighty_columns() {
         for (path, _) in PAGES {
-            let mut cmd = command();
+            let mut cmd = command().term_width(100);
             cmd.build();
             let mut target = page(&cmd, path).clone();
             let help = target.render_help().to_string();
@@ -449,6 +455,50 @@ mod tests {
                 line.join(" ")
             );
         }
+    }
+
+    /// A command that prints "run this next" has to name a spelling the reader
+    /// can then find. Three of them kept pointing at commands this file had just
+    /// hidden (`ray connect` told you to run `ray connections approve`), which
+    /// is the one way hiding a spelling can still break someone: not by failing
+    /// to parse, but by being advertised and then absent from `-h` and from tab
+    /// completion.
+    ///
+    /// Reads the handler sources rather than the clap model because the strings
+    /// are `format!` templates, not data. Comment lines are skipped: the hidden
+    /// variants are *documented* by their old spelling on purpose.
+    #[test]
+    fn no_handler_advertises_a_hidden_spelling() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli");
+        let hidden = ["accept", "deny", "connections", "auto-update", "open"];
+
+        let mut bad = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("src/cli should be readable") {
+            let path = entry.expect("readable dir entry").path();
+            if !matches!(path.extension().and_then(|e| e.to_str()), Some("rs")) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("readable source");
+            for (n, line) in text.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                for name in hidden {
+                    if line.contains(&format!("ray {name}")) {
+                        bad.push(format!(
+                            "{}:{}: names hidden `ray {name}`",
+                            path.file_name().unwrap().to_string_lossy(),
+                            n + 1
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "these print a spelling that is hidden from `-h` and completion; \
+             point them at the command that replaced it: {bad:#?}"
+        );
     }
 
     /// Hiding a command takes it out of the listing *and* out of the generated

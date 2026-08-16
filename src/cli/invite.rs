@@ -222,7 +222,9 @@ pub(crate) async fn ipc_requests(network: &str) -> Result<()> {
                 print!("{}", table(&["id", "host", "waiting"], rows, 2));
                 println!(
                     "\n  {}",
-                    style::faint(&format!("admit with: ray accept {network} <id>"))
+                    style::faint(&format!(
+                        "admit with: ray requests {network} accept <id>"
+                    ))
                 );
             }
         }

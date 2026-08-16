@@ -316,7 +316,11 @@ pub(crate) enum Command {
         /// The peer's contact id (from their `ray contact id` / `ray status`)
         contact_id: Option<String>,
         /// Your hostname on the resulting network (defaults to your set name)
-        #[arg(long)]
+        ///
+        /// `requires` because the id is what it names a hostname *on*: without
+        /// one there is nothing to dial, and the flag would be dropped in
+        /// silence while the queue got listed instead.
+        #[arg(long, requires = "contact_id")]
         hostname: Option<String>,
         /// Emit machine-readable JSON instead of styled text
         #[arg(long, global = true)]
@@ -1438,8 +1442,10 @@ async fn run() -> Result<()> {
         Command::Accept { network, id } => ipc_accept_request(&network, &id).await,
         Command::Deny { network, id } => ipc_deny_request(&network, &id).await,
         // An action is a request-queue verb, a bare contact id dials that peer,
-        // and neither means "show me the queue", the same as `ray connections`
-        // did.
+        // and with neither, show the queue, the same as `ray connections` did.
+        // The two together parse (the positional fills, then the subcommand
+        // does) and mean nothing, so they are rejected rather than served by
+        // dropping one.
         Command::Connect {
             action,
             contact_id,
@@ -1447,7 +1453,11 @@ async fn run() -> Result<()> {
             json: _,
         } => match (action, contact_id) {
             (None, Some(id)) => ipc_connect(&id, hostname).await,
-            (action, _) => ipc_connections(action).await,
+            (None, None) => ipc_connections(None).await,
+            (Some(action), None) => ipc_connections(Some(action)).await,
+            (Some(_), Some(id)) => {
+                anyhow::bail!("`ray connect {id}` dials that peer; it takes no subcommand")
+            }
         },
         Command::Connections { action, json: _ } => ipc_connections(action).await,
         Command::Contact { action, json: _ } => ipc_contact(action).await,

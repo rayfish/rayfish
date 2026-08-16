@@ -176,7 +176,7 @@ impl Daemon {
         self.connect.connect(contact_id, hostname).await
     }
 
-    /// `ray connections`: list pending incoming connect requests.
+    /// `ray connect`: list pending incoming connect requests.
     pub fn list_connections(&self) -> IpcMessage {
         self.connect.list_connections()
     }
@@ -187,7 +187,7 @@ impl Daemon {
         self.connect.reject_connect(id_prefix)
     }
 
-    /// `ray connections approve <id>`: approve a pending connect request, minting
+    /// `ray connect approve <id>`: approve a pending connect request, minting
     /// a 2-peer network with the requester pre-approved.
     pub async fn approve_connection(&self, id_prefix: &str) -> IpcMessage {
         self.connect.approve_connection(id_prefix).await
