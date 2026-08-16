@@ -121,5 +121,5 @@ The rules the code upholds. Read the code for the mechanics.
 - **`--json` is per-command, never on the root.** It is declared on each command that renders JSON, `global = true` so it also parses after that command's action (`ray firewall show --json`). Declaring it on `Cli` would put it back on all 44 commands, most of which would ignore it in silence.
 - **Logging** is `tracing`: console at `info`, rolling daily files at `rayfish=debug` (bundled by `ray report`). The daemon panic hook restores DNS then `abort()`s so the service manager restarts it (fail-fast, never limp).
 - **Git:** conventional commit subjects (`feat`/`fix`/`docs`/…) so git-cliff can generate the changelog.
-- **CHANGELOG:** add a user-facing `[Unreleased]` entry (`Added`/`Changed`/`Fixed`/`Performance`), describing behavior from the user's view, for any user-visible change; skip pure-internal churn (refactors, CI, chores).
+- **CHANGELOG:** add a user-facing `[Unreleased]` entry (`Added`/`Changed`/`Fixed`/`Security`/`Performance`, in Keep a Changelog's order, so `Security` comes after `Fixed`), describing behavior from the user's view, for any user-visible change; skip pure-internal churn (refactors, CI, chores).
 - **Docs:** keep this file and README current when a feature or invariant changes: at the principle level, pointing to code rather than restating it.

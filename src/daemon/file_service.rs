@@ -129,6 +129,53 @@ pub(crate) struct PendingFile {
     pub(crate) blob_hash: blake3::Hash,
 }
 
+/// An open pairing session: the secret the ticket carries, and when it opened.
+/// Held rather than a bare secret so [`PAIRING_TTL`] has something to measure.
+pub(crate) struct PairingSession {
+    secret: [u8; 32],
+    opened: Instant,
+}
+
+/// Cap on the queue of unaccepted incoming file offers.
+///
+/// `FILES_ALPN` takes an offer from any dialer that knows our endpoint id, and
+/// each one appends attacker-sized `filename` and `mime_type` strings, so the
+/// queue is memory a stranger can grow one dial at a time. Same policy as the
+/// join and connect queues: at the cap the oldest unanswered offer makes way.
+///
+/// The offer is only a description; the bytes are not fetched until `ray files
+/// accept`, so an evicted entry costs nothing that was not already the sender's
+/// to retry.
+pub(crate) const MAX_PENDING_FILES: usize = 256;
+
+/// Drop the oldest queued offer when `pending` is at `cap`, returning its id.
+/// Offers are pushed in arrival order, so the oldest is the front.
+pub(crate) fn evict_oldest_file(pending: &mut Vec<PendingFile>, cap: usize) -> Option<u64> {
+    if pending.len() < cap {
+        return None;
+    }
+    let dropped = pending.remove(0);
+    tracing::warn!(
+        evicted = dropped.id,
+        from = %dropped.from.fmt_short(),
+        "pending file-offer queue full; evicted oldest offer"
+    );
+    Some(dropped.id)
+}
+
+/// How long an open pairing session stays open.
+///
+/// Nothing else closes it. A wrong secret deliberately does not (that was the bug
+/// this replaced: any dialer could end the user's pairing window), a successful
+/// pair does, and there is no cancel command, so without a deadline `ray pair` on
+/// a machine that was then interrupted would leave a standing "sign a DeviceCert
+/// for whoever presents these 32 bytes" on a public ALPN until the daemon
+/// restarted. The ticket is a QR code people screenshot and paste, so the
+/// credential outliving its session by days is the worse failure of the two.
+///
+/// Five minutes is the scan-it-now window the ticket is for.
+pub(crate) const PAIRING_TTL: Duration = Duration::from_secs(300);
+
 /// Whether two pairing secrets match, in time independent of *where* they differ.
 ///
 /// Hand-rolled rather than a `subtle` dependency for one call site. The
@@ -156,8 +203,9 @@ pub(crate) struct FileService {
     pub(crate) pending_files: Arc<std::sync::Mutex<Vec<PendingFile>>>,
     /// Monotonic id source for pending offers.
     pub(crate) file_id_counter: Arc<AtomicU64>,
-    /// Active pairing secret (set by `start_pairing`, consumed by a pair request).
-    pub(crate) pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    /// Active pairing secret and when it was opened (set by `start_pairing`,
+    /// consumed by a matching pair request, and expired by [`PAIRING_TTL`]).
+    pub(crate) pairing_secret: Arc<std::sync::Mutex<Option<PairingSession>>>,
     /// This node's transport secret key, used to sign device certs on pairing.
     secret_key: SecretKey,
     /// Foundation handles (endpoint + blob store) for fetching accepted files.
@@ -236,14 +284,18 @@ impl FileService {
                         if from == remote_id {
                             let id = counter.fetch_add(1, Ordering::Relaxed);
                             tracing::info!(from = %from.fmt_short(), filename = %filename, size, "file offer received");
-                            pending.lock().unwrap().push(PendingFile {
-                                id,
-                                from,
-                                filename,
-                                size,
-                                mime_type,
-                                blob_hash,
-                            });
+                            {
+                                let mut queue = pending.lock().unwrap();
+                                evict_oldest_file(&mut queue, MAX_PENDING_FILES);
+                                queue.push(PendingFile {
+                                    id,
+                                    from,
+                                    filename,
+                                    size,
+                                    mime_type,
+                                    blob_hash,
+                                });
+                            }
                             // Evaluate own-device auto-accept directly: it accepts
                             // only offers from our own paired devices on an opted-in
                             // network, and no-ops otherwise, so the offer stays
@@ -928,7 +980,10 @@ impl FileService {
         ticket_bytes.extend_from_slice(&secret);
         let ticket = bs58::encode(&ticket_bytes).into_string();
 
-        *self.pairing_secret.lock().unwrap() = Some(secret);
+        *self.pairing_secret.lock().unwrap() = Some(PairingSession {
+            secret,
+            opened: Instant::now(),
+        });
 
         tracing::info!("pairing session opened; awaiting a secondary to scan the ticket");
         IpcMessage::PairingTicket { ticket }
@@ -956,6 +1011,19 @@ impl FileService {
                         secret,
                         device_pubkey,
                     } => {
+                        // Certify the key that actually dialed us. The client
+                        // always sends its own endpoint id here (`mesh/files.rs`),
+                        // so requiring it costs nothing and removes the question
+                        // of what a cert for a third key would mean if a ticket
+                        // were ever relayed.
+                        if device_pubkey != remote_id {
+                            tracing::warn!(
+                                claimed = %device_pubkey.fmt_short(),
+                                actual = %remote_id.fmt_short(),
+                                "pair request asks to certify a different key; refusing"
+                            );
+                            return;
+                        }
                         // Compare against the stored pairing secret and consume
                         // it only on a match, both under one lock. Taking it
                         // first meant any dialer that sent the wrong bytes (or
@@ -971,8 +1039,14 @@ impl FileService {
                         // of the prefix was right.
                         let check = {
                             let mut held = pairing_secret.lock().unwrap();
-                            match *held {
-                                Some(expected) if ct_eq(&expected, &secret) => {
+                            match held.as_ref() {
+                                // Expired: clear it on the way past, so the state
+                                // does not outlive the window the user opened.
+                                Some(s) if s.opened.elapsed() >= PAIRING_TTL => {
+                                    held.take();
+                                    PairCheck::NoSession
+                                }
+                                Some(s) if ct_eq(&s.secret, &secret) => {
                                     held.take();
                                     PairCheck::Accepted
                                 }

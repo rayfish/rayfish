@@ -137,7 +137,10 @@ impl NetworkRegistry {
         // confirmation that it no longer lists us; on any failure (can't
         // resolve/fetch) we stay, never leaving on uncertainty.
         let removed = match resolve_signed(&self.transport.endpoint, net_pubkey).await {
-            Some((signed, seeds)) => fetch_verified_blob(
+            // The timestamp is not consulted here: this only ever *confirms* a
+            // kick before leaving, and an older record listing us is a reason to
+            // stay, which is already the safe answer.
+            Some((signed, seeds, _ts)) => fetch_verified_blob(
                 &self.transport.endpoint,
                 &self.transport.blob_store,
                 &self.peers,
@@ -806,6 +809,7 @@ mod sender_authority_tests {
             nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
+            last_record_timestamp: None,
         }))
     }
 

@@ -196,6 +196,9 @@ impl NetworkRegistry {
             nullifiers,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
+            // A key holder authors records rather than applying them, so it keeps
+            // no replay floor.
+            last_record_timestamp: None,
         };
 
         self.seal_and_publish(&mut net_state, &net_secret_key).await;

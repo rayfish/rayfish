@@ -17,6 +17,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   kick, a firewall suggestion or a new member still lands right away. Desktop
   and server nodes keep the 60-second poll.
 
+### Fixed
+
+- **The metrics endpoint no longer answers the local network.** The Prometheus
+  exporter bound `0.0.0.0:9090`, so any device on the same Wi-Fi could read
+  it. Its counters name every peer by mesh IP with per-peer round-trip times
+  and traffic volumes, which is a usable picture of who a node talks to and
+  when. It now binds `127.0.0.1:9090`. Scraping from the same machine is
+  unaffected; if you scraped a node remotely, reach it over the mesh.
+- **The mobile app no longer runs a metrics collector.** The Prometheus
+  exporter and its per-peer sampling loop were started on Android too, waking
+  the app every 60 seconds to measure connections for an endpoint that
+  nothing on a phone can scrape. Neither is started there now.
+- **Membership changes reach devices that aren't currently connected.** A
+  coordinator's kick, firewall suggestion or roster edit was only delivered to
+  peers holding a live connection at that moment. Phones and other on-demand
+  nodes drop their links after a couple of idle minutes while remaining
+  reachable, so they routinely missed the notification and worked from a stale
+  roster until their next poll. Coordinators now dial those members to deliver
+  it. Devices that are genuinely offline are left alone for five minutes
+  between attempts rather than being re-dialed on every change.
+
 ### Security
 
 - **Knowing a network's room id no longer lets a stranger talk to it.** A mesh
@@ -43,6 +64,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   address the message chose, publishes its `.ray` name, and routes to it, so an
   entry in a node's `.ray` DNS was something a stranger could place there until
   the next roster sync. It is now honored only from a coordinator.
+- **A signed membership record cannot be rolled back to an older one.** A
+  signature says who wrote a record, never when, and an old record for a network
+  stays valid forever. Nodes compared only whether a record differed from the
+  one they held, so replaying a copy the network had published earlier (which
+  anyone holding the room id could have fetched) re-seated removed members,
+  restored revoked devices, and reverted the suggested firewall. Records are now
+  accepted only if they were authored after the last one applied, on both the
+  mesh and the lookup path.
+- **A pairing ticket now expires.** Opening a pairing session and never
+  completing it left the daemon willing to certify a new device for whoever
+  presented the ticket, indefinitely. Tickets are good for five minutes.
 - **A `ray connect` link hands its key to the one peer it was made for.**
   Approving a direct connection makes the other peer a co-coordinator, since
   the link is symmetric. That rule keyed on the network rather than the peer,
@@ -52,32 +84,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   was consumed before it was compared, so any dial carrying the wrong bytes
   ended the pairing session and the real device had to start over. The secret
   now survives a mismatch, and the comparison is constant-time.
-- **Two queues a stranger could grow without limit are now bounded.** A leave
-  message from a peer that was never on the roster made a coordinator re-sign
-  and republish its membership record and notify every member; it is now
-  ignored. Incoming `ray connect` requests are capped the same way pending join
-  requests already were.
-
-### Fixed
-
-- **The metrics endpoint no longer answers the local network.** The Prometheus
-  exporter bound `0.0.0.0:9090`, so any device on the same Wi-Fi could read
-  it. Its counters name every peer by mesh IP with per-peer round-trip times
-  and traffic volumes, which is a usable picture of who a node talks to and
-  when. It now binds `127.0.0.1:9090`. Scraping from the same machine is
-  unaffected; if you scraped a node remotely, reach it over the mesh.
-- **The mobile app no longer runs a metrics collector.** The Prometheus
-  exporter and its per-peer sampling loop were started on Android too, waking
-  the app every 60 seconds to measure connections for an endpoint that
-  nothing on a phone can scrape. Neither is started there now.
-- **Membership changes reach devices that aren't currently connected.** A
-  coordinator's kick, firewall suggestion or roster edit was only delivered to
-  peers holding a live connection at that moment. Phones and other on-demand
-  nodes drop their links after a couple of idle minutes while remaining
-  reachable, so they routinely missed the notification and worked from a stale
-  roster until their next poll. Coordinators now dial those members to deliver
-  it. Devices that are genuinely offline are left alone for five minutes
-  between attempts rather than being re-dialed on every change.
+- **Queues a stranger could grow without limit are now bounded.** Incoming
+  `ray connect` requests and incoming file offers are both capped the way
+  pending join requests already were, dropping the oldest unanswered entry
+  rather than growing forever on a dial anyone can make.
+- **A leave from a peer that was never a member costs nothing.** Such a message
+  still made a coordinator re-sign and republish its membership record and
+  notify every member, each of whom answered with a lookup of their own. It is
+  now ignored.
 
 ### Added
 

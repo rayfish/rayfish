@@ -43,6 +43,20 @@ fn owner_admits(device_cert: Option<&control::DeviceCert>, own_identity: Endpoin
     device_cert.map(|c| c.user_identity) == Some(own_identity)
 }
 
+/// Whether a signed record authored at `record_ts` may replace what we hold,
+/// given the timestamp of the last record applied (`floor`).
+///
+/// Strictly greater, because equal timestamps with different contents are two
+/// records we have no ordering for, and keeping ours costs at most one republish
+/// interval while taking theirs costs whatever the older one said. `None` accepts
+/// anything: we have applied nothing yet, so there is no rollback to prevent.
+pub(crate) fn record_is_newer(record_ts: u64, floor: Option<u64>) -> bool {
+    match floor {
+        Some(seen) => record_ts > seen,
+        None => true,
+    }
+}
+
 /// Whether a peer this network's roster does not account for may send `msg`.
 ///
 /// A control frame reaches a per-network handler on the strength of the network
@@ -67,11 +81,46 @@ fn owner_admits(device_cert: Option<&control::DeviceCert>, own_identity: Endpoin
 /// Everything else is either a coordinator's word (checked again in the arm), a
 /// member's statement about itself, or a trigger whose cost is a DHT resolve and
 /// a blob fetch. None of those are things to do on a stranger's say-so.
+/// Written as a full match with no `_` arm on purpose: a new `ControlMsg` variant
+/// then fails to compile until someone decides which side of the wall it belongs
+/// on, which is the same reason the settings enums are matched exhaustively.
 pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
-    matches!(
-        msg,
-        ControlMsg::JoinRequest { .. } | ControlMsg::MeshHello { .. } | ControlMsg::SignedRecord { .. }
-    )
+    match msg {
+        ControlMsg::JoinRequest { .. }
+        | ControlMsg::MeshHello { .. }
+        | ControlMsg::SignedRecord { .. } => true,
+
+        // Coordinator authority. Each is checked again in its own arm.
+        ControlMsg::MemberApproved { .. }
+        | ControlMsg::AdminGrant { .. }
+        | ControlMsg::InviteShare { .. }
+        | ControlMsg::InviteUsed { .. }
+        | ControlMsg::KickedFromNetwork
+        | ControlMsg::Welcome { .. }
+        | ControlMsg::JoinApproved { .. }
+        | ControlMsg::JoinPending
+        | ControlMsg::JoinDenied { .. } => false,
+
+        // Cheap to send, a DHT resolve plus a blob fetch to honor.
+        ControlMsg::MemberSync | ControlMsg::BlobUpdated => false,
+
+        // A member's statements about itself, and its departure.
+        ControlMsg::ExitNodeOffer { .. }
+        | ControlMsg::Ipv6Only { .. }
+        | ControlMsg::LeaveNetwork => false,
+
+        // Connection-level: the demux handles these before it ever resolves a
+        // per-network handler, so they never reach this decision. Listed rather
+        // than caught by a wildcard so the exhaustiveness holds.
+        ControlMsg::NetworkHandles { .. }
+        | ControlMsg::Ping { .. }
+        | ControlMsg::Pong { .. }
+        | ControlMsg::Unpaired
+        | ControlMsg::CertRefresh { .. }
+        | ControlMsg::RequestUnpair
+        | ControlMsg::NotSupported { .. }
+        | ControlMsg::FileOffer { .. } => false,
+    }
 }
 
 /// Whether admitting `joiner` onto this network should also hand it the network
@@ -129,20 +178,21 @@ pub(crate) enum HelloIdentity {
 ///
 /// A nullified device (`ray unpair`) keeps its valid signature forever, so the
 /// revocation has to be applied here too: its binding is dropped, and a claim
-/// that rests on it is refused outright.
+/// that rests on it is refused outright. `revoked` is asked across every network
+/// this node runs, because the binding it guards is daemon-wide.
 pub(crate) fn check_hello_identity(
     transport_id: EndpointId,
     peer_identity: EndpointId,
     cert: Option<&control::DeviceCert>,
-    nullifiers: &BTreeSet<EndpointId>,
+    revoked: bool,
 ) -> HelloIdentity {
     let binding = match cert {
         // A presented cert must verify and must bind the key that actually
         // dialed us. Anything else is a forgery attempt, not a peer without a
         // cert, so refuse the frame rather than quietly continuing without it.
         Some(c) if !c.verify() || c.device_key != transport_id => return HelloIdentity::Reject,
-        // Verified, but revoked on this network: worth nothing.
-        Some(c) if nullifiers.contains(&c.device_key) => None,
+        // Verified, but revoked: worth nothing.
+        Some(_) if revoked => None,
         Some(c) => Some(c.user_identity),
         None => None,
     };
@@ -964,12 +1014,19 @@ impl MemberAcceptState {
     }
 
     /// Apply a signed network record a coordinator handed us over the mesh (the
-    /// `SignedRecord` fast path). Verify it against this network's key, and if it
-    /// names a newer blob than we hold, fetch + apply it directly. This bypasses a
-    /// fresh DHT resolve (which can serve a stale record for ~60-90s right after a
-    /// restart), so a reconnecting member converges to the live roster in ~1s. The
-    /// trust model is unchanged: the record is network-key-signed and verified
-    /// here, exactly like the DHT copy; the peer is only its transport.
+    /// `SignedRecord` fast path). Verify it against this network's key, check it is
+    /// newer than the last record we applied, and if it names a different blob,
+    /// fetch + apply it directly. This bypasses a fresh DHT resolve (which can
+    /// serve a stale record for ~60-90s right after a restart), so a reconnecting
+    /// member converges to the live roster in ~1s. The trust model is unchanged:
+    /// the record is network-key-signed and verified here, exactly like the DHT
+    /// copy; the peer is only its transport.
+    ///
+    /// This message is deliberately exempt from the demux's roster wall (see
+    /// `stranger_may_send`), which is exactly why the freshness check belongs
+    /// here: a signature says who wrote a record, not when, so without it anyone
+    /// holding the room id could hand us a record the DHT served publicly last
+    /// week and roll the roster back to it.
     async fn apply_signed_record(&self, packet_bytes: &[u8]) {
         let packet = match dht::verify_network_record(packet_bytes, self.net_pubkey) {
             Ok(p) => p,
@@ -985,14 +1042,27 @@ impl MemberAcceptState {
                 return;
             }
         };
-        let current_hash = {
+        let record_ts = packet.timestamp().as_micros();
+        let (current_hash, floor) = {
             let s = self.state.read().unwrap();
-            s.snapshot.as_ref().map(|snap| snap.hash)
+            (
+                s.snapshot.as_ref().map(|snap| snap.hash),
+                s.last_record_timestamp,
+            )
         };
         if current_hash == Some(remote_hash) {
             return;
         }
+        if !record_is_newer(record_ts, floor) {
+            tracing::warn!(
+                record_ts,
+                floor,
+                "rejecting a signed record older than the last one applied (replay)"
+            );
+            return;
+        }
         tracing::info!(old = ?current_hash, new = %remote_hash, "applying signed record handed by coordinator");
+        self.state.write().unwrap().last_record_timestamp = Some(record_ts);
         fetch_and_apply_blob(
             &self.endpoint,
             &self.ctx.blob_store,
@@ -1025,12 +1095,17 @@ impl MemberAcceptState {
         // recorded. See `check_hello_identity`: the binding this stores is what
         // the firewall and mesh SSH later authorize on, so it is never taken on
         // the sender's word.
-        let nullifiers = self.state.read().unwrap().nullifiers.clone();
+        // Nullifiers from every network, not just this one: the binding this
+        // writes is daemon-wide, so a device revoked anywhere must not re-earn it
+        // by saying hello on a network that has not heard about the revocation.
+        let revoked = device_cert
+            .as_ref()
+            .is_some_and(|c| self.registry.is_nullified_anywhere(&c.device_key));
         let binding = match check_hello_identity(
             transport_id,
             peer_identity,
             device_cert.as_ref(),
-            &nullifiers,
+            revoked,
         ) {
             HelloIdentity::Accept(binding) => binding,
             HelloIdentity::Reject => {
@@ -1250,8 +1325,10 @@ impl AcceptHandler {
     /// member, or a peer approved and not yet seated.
     ///
     /// Checked against both the transport key and the user identity it resolves
-    /// to, because a paired multi-device peer is on the roster under its *user*
-    /// identity while its datagrams arrive under a device key.
+    /// to. Admission seats a member under the key that dialed (`admit_peer`), so
+    /// the resolved lookup is normally redundant; it is defense in depth for the
+    /// roster shapes that do key a member by user identity, and it costs one map
+    /// read.
     pub(crate) fn knows_sender(&self, peer_id: EndpointId) -> bool {
         let (state, ctx) = match self {
             AcceptHandler::Coordinator(s) => (&s.state, &s.ctx),
@@ -1495,6 +1572,40 @@ impl ProtocolRouter {
 }
 
 #[cfg(test)]
+mod record_freshness_tests {
+    use super::*;
+
+    /// Nothing applied yet, so there is no rollback to refuse.
+    #[test]
+    fn any_record_passes_an_empty_floor() {
+        assert!(record_is_newer(1, None));
+        assert!(record_is_newer(0, None));
+    }
+
+    /// The replay this guards. A signature says who authored a record, never
+    /// when, so an old record for this network stays valid forever and its hash
+    /// differs from the current one, which is all the previous check compared. It
+    /// would re-seat kicked members, restore devices the blob nullified, and
+    /// revert the suggested firewall.
+    #[test]
+    fn an_older_record_is_refused() {
+        assert!(!record_is_newer(500, Some(1_000)));
+    }
+
+    /// Equal timestamps with different contents give no ordering, so we keep
+    /// what we have and wait for the next republish rather than guess.
+    #[test]
+    fn an_equal_timestamp_is_refused() {
+        assert!(!record_is_newer(1_000, Some(1_000)));
+    }
+
+    #[test]
+    fn a_newer_record_is_taken() {
+        assert!(record_is_newer(1_001, Some(1_000)));
+    }
+}
+
+#[cfg(test)]
 mod stranger_policy_tests {
     use super::*;
     use iroh::SecretKey;
@@ -1606,6 +1717,7 @@ mod direct_grant_tests {
             nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
+            last_record_timestamp: None,
         }))
     }
 
@@ -1692,7 +1804,7 @@ mod hello_identity_tests {
         };
         assert!(!forged.verify(), "test fixture must be an invalid cert");
         assert_eq!(
-            check_hello_identity(attacker, attacker, Some(&forged), &BTreeSet::new()),
+            check_hello_identity(attacker, attacker, Some(&forged), false),
             HelloIdentity::Reject,
         );
     }
@@ -1708,7 +1820,7 @@ mod hello_identity_tests {
         let cert = control::DeviceCert::create(&user, &real_device, 0);
         assert!(cert.verify());
         assert_eq!(
-            check_hello_identity(attacker, attacker, Some(&cert), &BTreeSet::new()),
+            check_hello_identity(attacker, attacker, Some(&cert), false),
             HelloIdentity::Reject,
         );
     }
@@ -1722,12 +1834,12 @@ mod hello_identity_tests {
         let cert = control::DeviceCert::create(&user, &device, 0);
         // Speaking as itself.
         assert_eq!(
-            check_hello_identity(device, device, Some(&cert), &BTreeSet::new()),
+            check_hello_identity(device, device, Some(&cert), false),
             HelloIdentity::Accept(Some(user.public())),
         );
         // Speaking as its user identity, which the cert backs.
         assert_eq!(
-            check_hello_identity(device, user.public(), Some(&cert), &BTreeSet::new()),
+            check_hello_identity(device, user.public(), Some(&cert), false),
             HelloIdentity::Accept(Some(user.public())),
         );
     }
@@ -1739,11 +1851,11 @@ mod hello_identity_tests {
         let peer = key(1).public();
         let other = key(2).public();
         assert_eq!(
-            check_hello_identity(peer, peer, None, &BTreeSet::new()),
+            check_hello_identity(peer, peer, None, false),
             HelloIdentity::Accept(None),
         );
         assert_eq!(
-            check_hello_identity(peer, other, None, &BTreeSet::new()),
+            check_hello_identity(peer, other, None, false),
             HelloIdentity::Reject,
         );
     }
@@ -1757,13 +1869,14 @@ mod hello_identity_tests {
         let user = key(1);
         let device = key(2).public();
         let cert = control::DeviceCert::create(&user, &device, 0);
-        let revoked = BTreeSet::from([device]);
+        // Asked across every network this node runs, not just the one the hello
+        // arrived on, since the binding it guards is daemon-wide.
         assert_eq!(
-            check_hello_identity(device, device, Some(&cert), &revoked),
+            check_hello_identity(device, device, Some(&cert), true),
             HelloIdentity::Accept(None),
         );
         assert_eq!(
-            check_hello_identity(device, user.public(), Some(&cert), &revoked),
+            check_hello_identity(device, user.public(), Some(&cert), true),
             HelloIdentity::Reject,
         );
     }

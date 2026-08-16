@@ -345,6 +345,24 @@ pub(crate) struct NetworkState {
     /// on every reconverge. Enforcement (admission, MeshHello, prune) rejects a
     /// cert whose device key is listed.
     nullifiers: BTreeSet<EndpointId>,
+    /// Author timestamp (microseconds since the epoch) of the most recent signed
+    /// pkarr record applied to this state, and the floor every later one has to
+    /// clear.
+    ///
+    /// A signature proves who wrote a record, never when: an old record for this
+    /// network stays valid forever and its hash differs from the current one, so
+    /// hash inequality alone reads a rollback as a change and applies it. That
+    /// re-seats kicked members, restores devices the blob nullified, and reverts
+    /// the suggested firewall, and the record it takes is one the DHT served
+    /// publicly to anyone holding the room id. The timestamp lives inside the
+    /// signed bytes (`SignedPacket::timestamp`), so it cannot be edited to clear
+    /// the floor, and ordering on it is what pkarr relays themselves do.
+    ///
+    /// In memory only, so a restart starts from `None` and takes the first record
+    /// it sees. That is the DHT's copy, which relays keep at the highest
+    /// timestamp, and any later legitimate republish outranks a replay anyway, so
+    /// the gap is a race at startup rather than a standing hole.
+    last_record_timestamp: Option<u64>,
     /// Materialized suggested rules awaiting manual `ray firewall accept` on a
     /// node that did not opt into `--auto-accept-firewall`. Empty when
     /// auto-accepting.
@@ -1997,7 +2015,96 @@ mod accept_handler_tests {
             nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
+            last_record_timestamp: None,
         }))
+    }
+
+    /// The live state and context behind a handler, whichever role it is. Lets a
+    /// test seat members and device bindings on a handler it just built.
+    fn handler_parts(h: &AcceptHandler) -> (&SharedNetworkState, &MeshCtx) {
+        match h {
+            AcceptHandler::Coordinator(s) => (&s.state, &s.ctx),
+            AcceptHandler::Member(s) => (&s.state, &s.ctx),
+        }
+    }
+
+    fn seated(id: EndpointId, ip: u8) -> Member {
+        Member {
+            identity: id,
+            ip: Ipv4Addr::new(100, 64, 0, ip),
+            is_coordinator: false,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+            last_seen: None,
+            exit_node: false,
+            ipv6_only: false,
+        }
+    }
+
+    /// The demux wall: a peer on the roster may speak for this network.
+    #[tokio::test]
+    async fn knows_sender_accepts_a_seated_member() {
+        let h = sample_coordinator_handler().await;
+        let (state, _) = handler_parts(&h);
+        let member = SecretKey::from_bytes(&[9u8; 32]).public();
+        state.write().unwrap().members.add(seated(member, 2)).unwrap();
+        assert!(h.knows_sender(member));
+    }
+
+    /// A peer approved but not yet seated is still accounted for: it is mid-join
+    /// and its `MeshHello` is what completes the admission.
+    #[tokio::test]
+    async fn knows_sender_accepts_an_approved_peer() {
+        let h = sample_coordinator_handler().await;
+        let (state, _) = handler_parts(&h);
+        let peer = SecretKey::from_bytes(&[10u8; 32]).public();
+        {
+            let mut s = state.write().unwrap();
+            let members = s.members.clone();
+            s.approved
+                .approve(
+                    ApprovedEntry {
+                        identity: peer,
+                        ip: Ipv4Addr::new(100, 64, 0, 3),
+                        hostname: None,
+                        user_identity: None,
+                        device_cert: None,
+                        collision_index: 0,
+                    },
+                    &members,
+                )
+                .unwrap();
+        }
+        assert!(h.knows_sender(peer));
+    }
+
+    /// The branch the doc comment calls out: a paired peer can be on the roster
+    /// under its *user* identity while its frames arrive under a device key, so
+    /// the lookup has to try the resolved identity too.
+    #[tokio::test]
+    async fn knows_sender_resolves_a_device_to_its_roster_user() {
+        let h = sample_coordinator_handler().await;
+        let (state, ctx) = handler_parts(&h);
+        let user = SecretKey::from_bytes(&[11u8; 32]).public();
+        let device = SecretKey::from_bytes(&[12u8; 32]).public();
+        state.write().unwrap().members.add(seated(user, 4)).unwrap();
+        // Unmapped, the device key is a stranger.
+        assert!(!h.knows_sender(device));
+        ctx.device_user_map.insert(device, user);
+        assert!(h.knows_sender(device));
+    }
+
+    /// The case the wall exists for: knowing the room id is not being in the room.
+    #[tokio::test]
+    async fn knows_sender_refuses_a_stranger() {
+        let h = sample_coordinator_handler().await;
+        let (state, _) = handler_parts(&h);
+        let member = SecretKey::from_bytes(&[13u8; 32]).public();
+        state.write().unwrap().members.add(seated(member, 5)).unwrap();
+        let stranger = SecretKey::from_bytes(&[14u8; 32]).public();
+        assert!(!h.knows_sender(stranger));
     }
 
     /// Throwaway [`MeshCtx`] for accept-handler tests: a fresh blob store and

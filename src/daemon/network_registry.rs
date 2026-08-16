@@ -725,6 +725,8 @@ impl NetworkRegistry {
             nullifiers: BTreeSet::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
+            // We author this network's records; there is nothing to replay to us.
+            last_record_timestamp: None,
         })
     }
 
