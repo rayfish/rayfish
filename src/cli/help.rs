@@ -218,9 +218,12 @@ mod tests {
     /// Resolve a page's path against the clap model.
     fn page<'a>(cmd: &'a Command, path: &[&str]) -> &'a Command {
         path.iter().fold(cmd, |parent, name| {
-            parent
-                .find_subcommand(name)
-                .unwrap_or_else(|| panic!("`ray {}` is a grouped page but not a command", path.join(" ")))
+            parent.find_subcommand(name).unwrap_or_else(|| {
+                panic!(
+                    "`ray {}` is a grouped page but not a command",
+                    path.join(" ")
+                )
+            })
         })
     }
 
@@ -230,7 +233,9 @@ mod tests {
         match aliases.len() {
             0 => 0,
             1 => " [alias: ]".len() + aliases[0].len(),
-            n => " [aliases: ]".len() + aliases.iter().map(|a| a.len()).sum::<usize>() + 2 * (n - 1),
+            n => {
+                " [aliases: ]".len() + aliases.iter().map(|a| a.len()).sum::<usize>() + 2 * (n - 1)
+            }
         }
     }
 
@@ -319,8 +324,10 @@ mod tests {
         let mut long = Vec::new();
         let mut stack = vec![(String::from("ray"), &cmd)];
         while let Some((path, parent)) = stack.pop() {
-            let visible: Vec<&Command> =
-                parent.get_subcommands().filter(|s| !s.is_hide_set()).collect();
+            let visible: Vec<&Command> = parent
+                .get_subcommands()
+                .filter(|s| !s.is_hide_set())
+                .collect();
             let width = visible
                 .iter()
                 .map(|s| s.get_name().len())
