@@ -35,6 +35,11 @@ enum HandshakeOutcome {
         /// against the network pubkey (`admin_grant_key_valid`); adopting it makes
         /// this node a key-holder so `finalize_join` registers it as a coordinator.
         direct_key: Option<[u8; 32]>,
+        /// Author timestamp of the signed record this roster came from, when it
+        /// came from one. Seeds `NetworkState::last_record_timestamp` so the
+        /// replay floor is set from the first roster the node adopts rather than
+        /// starting open. `None` when the roster came from persisted config.
+        record_ts: Option<u64>,
     },
     Pending,
 }
@@ -112,7 +117,7 @@ pub(crate) async fn join_mesh_shared(
     let my_identity = identity.local_identity();
     let my_ip = identity.local_ip();
 
-    let (members, approved, direct_key) = match perform_join_handshake(
+    let (members, approved, direct_key, record_ts) = match perform_join_handshake(
         &initial_conn,
         ep,
         network_name,
@@ -132,7 +137,13 @@ pub(crate) async fn join_mesh_shared(
             members,
             approved,
             direct_key,
-        } => (members, approved, direct_key.map(SecretKey::from)),
+            record_ts,
+        } => (
+            members,
+            approved,
+            direct_key.map(SecretKey::from),
+            record_ts,
+        ),
         HandshakeOutcome::Pending => return Ok(JoinResult::Pending),
     };
 
@@ -161,6 +172,7 @@ pub(crate) async fn join_mesh_shared(
         reusable_keys,
         &blob_store,
         direct_key.as_ref(),
+        record_ts,
     )
     .await;
 
@@ -286,18 +298,19 @@ fn persist_join_config(
     // allow-list + selected exit peer). Anything node-local left out of this
     // list is silently erased on every member daemon restart.
     let prev = config::load_network(network_name)?;
-    let (direct, pending_hostname, ssh_allow, aliases, prev_auto_accept_files) = prev
+    let (direct, direct_peer, pending_hostname, ssh_allow, aliases, prev_auto_accept_files) = prev
         .as_ref()
         .map(|n| {
             (
                 n.direct,
+                n.direct_peer,
                 n.pending_hostname.clone(),
                 n.ssh_allow.clone(),
                 n.aliases.clone(),
                 n.auto_accept_files,
             )
         })
-        .unwrap_or((false, None, vec![], BTreeMap::new(), false));
+        .unwrap_or((false, None, None, vec![], BTreeMap::new(), false));
     let (exit_allow, exit_node_use) = prev
         .map(|n| (n.exit_allow, n.exit_node_use))
         .unwrap_or((vec![], None));
@@ -320,6 +333,7 @@ fn persist_join_config(
         auto_accept_files,
         admins: vec![],
         direct,
+        direct_peer,
         ssh_allow,
         aliases,
         ephemeral_ttl_secs: None,
@@ -344,6 +358,8 @@ async fn build_member_state(
     // state with the network key so `finalize_join` registers us as a coordinator
     // (starts a publisher, admits future peers). `None` for a plain member.
     direct_key: Option<&SecretKey>,
+    // Replay floor seeded from the record this roster came out of, if any.
+    record_ts: Option<u64>,
 ) -> SharedNetworkState {
     let mut ns = NetworkState {
         members: MemberList::from_members(members.to_vec()),
@@ -360,6 +376,7 @@ async fn build_member_state(
         // A joining member starts with an empty nullifier set and adopts the
         // coordinator's from the signed blob on its first reconverge.
         nullifiers: BTreeSet::new(),
+        last_record_timestamp: record_ts,
     };
     ns.refresh_snapshot();
     if let Some(snap) = &ns.snapshot {
@@ -490,6 +507,9 @@ async fn perform_join_handshake(
                     members,
                     approved,
                     direct_key,
+                    // A fresh join takes its roster from the coordinator's
+                    // Welcome, not from a record, so there is no floor to set.
+                    record_ts: None,
                 })
             }
             ControlMsg::JoinPending => {
@@ -520,15 +540,19 @@ async fn perform_join_handshake(
         .await
         .context("send reconnect hello")?;
         tracing::info!(network = %network_name, "reconnected; reconverging roster from signed record");
-        let (members, approved) = match resolve_signed(ep, net_pubkey).await {
-            Some((signed, seeds)) => {
+        // Seed the replay floor from the record this roster came out of, so a
+        // reconnecting node does not spend its first minutes willing to accept any
+        // older record a stranger hands it. A roster from the persisted fallback
+        // carries no record, hence no floor.
+        let (members, approved, record_ts) = match resolve_signed(ep, net_pubkey).await {
+            Some((signed, seeds, ts)) => {
                 match fetch_verified_blob(ep, blob_store, peers, signed, network_name, &seeds).await
                 {
-                    Some(data) => (data.members, data.approved),
-                    None => (persisted_roster(network_name), vec![]),
+                    Some(data) => (data.members, data.approved, Some(ts)),
+                    None => (persisted_roster(network_name), vec![], None),
                 }
             }
-            None => (persisted_roster(network_name), vec![]),
+            None => (persisted_roster(network_name), vec![], None),
         };
         // Reconnect/restore: a co-coordinator's key is restored from config on the
         // cold path, never re-granted here.
@@ -536,6 +560,7 @@ async fn perform_join_handshake(
             members,
             approved,
             direct_key: None,
+            record_ts,
         })
     }
 }
@@ -678,6 +703,7 @@ mod persist_config_tests {
             auto_accept_files: false,
             admins: vec![],
             direct: false,
+            direct_peer: None,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,

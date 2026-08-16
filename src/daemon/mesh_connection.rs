@@ -302,6 +302,21 @@ impl MeshConnection {
                 self.ctx.registry.nudge_restore();
                 continue;
             };
+            // The reachability wall for the control plane, mirroring what
+            // `resolve_inbound_by_id` does for datagrams: a frame is dispatched
+            // to a network's handler on the strength of the network id it names,
+            // and that id is public, so the sender has to be someone this
+            // network's roster accounts for. The exceptions are the messages by
+            // which a peer that is legitimately not on the roster yet reaches us;
+            // see `stranger_may_send`.
+            if !stranger_may_send(&frame.msg) && !handler.knows_sender(self.peer_id) {
+                tracing::debug!(
+                    peer = %self.peer_id.fmt_short(),
+                    net = %net_pubkey.fmt_short(),
+                    "control frame from a peer this network's roster does not list; ignoring"
+                );
+                continue;
+            }
             drop(recv); // one message per stream; the reply rides `send`
             // `handle_frame` registers the peer (route) as a side effect and
             // returns its mesh v4 once it is a member on this network.

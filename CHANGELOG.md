@@ -96,6 +96,61 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it. Devices that are genuinely offline are left alone for five minutes
   between attempts rather than being re-dialed on every change.
 
+### Security
+
+- **Knowing a network's room id no longer lets a stranger talk to it.** A mesh
+  control message is addressed to a network by its public key, and that key is
+  a discovery key by design: it is in every invite code and it is the address
+  the network publishes under. Nothing checked that the sender of such a
+  message was actually in the network it named, so anyone who had ever seen an
+  invite could reach the handlers meant for members. They are now refused
+  unless the sender is on that network's roster, apart from the three messages
+  by which a peer that is not on it yet legitimately makes contact (a join
+  request, a hello, and a network-signed record, which is verified against the
+  network key regardless of who carried it).
+- **A device certificate is verified before it can speak for its user.**
+  Certificates bind a device key to a user identity, and that binding is what
+  the inbound firewall, mesh SSH authorization, and own-device file
+  auto-accept match on. A peer that presented a certificate under its own key
+  had that certificate recorded without its signature being checked, so an
+  unsigned one naming somebody else handed the sender that person's firewall
+  rules and SSH access on the receiving node. Certificates are now verified on
+  every path, and one revoked with `ray unpair` grants nothing even though its
+  signature stays valid forever.
+- **Only a coordinator can say who was admitted.** The message announcing a new
+  member was accepted from any sender. Acting on it seats the named peer at an
+  address the message chose, publishes its `.ray` name, and routes to it, so an
+  entry in a node's `.ray` DNS was something a stranger could place there until
+  the next roster sync. It is now honored only from a coordinator.
+- **A signed membership record cannot be rolled back to an older one.** A
+  signature says who wrote a record, never when, and an old record for a network
+  stays valid forever. Nodes compared only whether a record differed from the
+  one they held, so replaying a copy the network had published earlier (which
+  anyone holding the room id could have fetched) re-seated removed members,
+  restored revoked devices, and reverted the suggested firewall. Records are now
+  accepted only if they were authored after the last one applied, on both the
+  mesh and the lookup path.
+- **A pairing ticket now expires.** Opening a pairing session and never
+  completing it left the daemon willing to certify a new device for whoever
+  presented the ticket, indefinitely. Tickets are good for five minutes.
+- **A `ray connect` link hands its key to the one peer it was made for.**
+  Approving a direct connection makes the other peer a co-coordinator, since
+  the link is symmetric. That rule keyed on the network rather than the peer,
+  so anyone approved onto that network afterwards silently received the network
+  key as well. The grant now follows the peer the link was created for.
+- **A wrong guess no longer closes an open pairing window.** The pairing secret
+  was consumed before it was compared, so any dial carrying the wrong bytes
+  ended the pairing session and the real device had to start over. The secret
+  now survives a mismatch, and the comparison is constant-time.
+- **Queues a stranger could grow without limit are now bounded.** Incoming
+  `ray connect` requests and incoming file offers are both capped the way
+  pending join requests already were, dropping the oldest unanswered entry
+  rather than growing forever on a dial anyone can make.
+- **A leave from a peer that was never a member costs nothing.** Such a message
+  still made a coordinator re-sign and republish its membership record and
+  notify every member, each of whom answered with a lookup of their own. It is
+  now ignored.
+
 ### Added
 
 - **`ray logs`: read the daemon's log without hunting for the files.** The logs

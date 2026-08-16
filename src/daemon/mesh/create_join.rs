@@ -489,6 +489,10 @@ impl NetworkRegistry {
                 nullifiers: data.nullifiers.clone(),
                 pending_suggestions: Vec::new(),
                 pending: HashMap::new(),
+                // Cold restore: nothing has been applied yet, so there is no
+                // rollback to refuse. The floor is set by whichever record lands
+                // first, the reconverge poll or a coordinator's `SignedRecord`.
+                last_record_timestamp: None,
             };
             ns.refresh_snapshot();
             Arc::new(std::sync::RwLock::new(ns))

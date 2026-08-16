@@ -144,6 +144,21 @@ pub struct NetworkConfig {
     /// and suppress its (non-shareable) room id.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub direct: bool,
+    /// The one peer this direct network was minted for, recorded at
+    /// `ray connect approve` time.
+    ///
+    /// Admission hands the network *secret key* to a pre-approved peer on a
+    /// direct network, because a direct link is symmetric and both ends
+    /// coordinate it. `direct` alone is a property of the network, so that rule
+    /// read as "any peer ever approved here becomes a co-coordinator", and a
+    /// later `ray requests accept` on the same network would silently give away
+    /// the key.
+    /// Naming the peer keeps the grant to the link it was meant for.
+    ///
+    /// `None` on networks minted before this field existed. See the fallback in
+    /// `admit_peer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_peer: Option<EndpointId>,
     /// Peers authorized to SSH into this node over this network's mesh link
     /// (`ray firewall ssh allow <net> <peer>`). Only consulted when the global
     /// `ssh_enabled` toggle is on. Empty = no peer may SSH in.
@@ -313,6 +328,7 @@ pub(crate) fn empty_network_config(name: &str) -> NetworkConfig {
         auto_accept_files: true,
         admins: vec![],
         direct: false,
+        direct_peer: None,
         ssh_allow: vec![],
         aliases: BTreeMap::new(),
         ephemeral_ttl_secs: None,
@@ -1121,6 +1137,7 @@ mod tests {
                     auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    direct_peer: None,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
@@ -1142,6 +1159,7 @@ mod tests {
                     auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    direct_peer: None,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
@@ -1184,6 +1202,7 @@ mod tests {
             auto_accept_files: false,
             admins: vec![],
             direct: false,
+            direct_peer: None,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
@@ -1214,6 +1233,7 @@ mod tests {
                 auto_accept_files: false,
                 admins: vec![],
                 direct: false,
+                direct_peer: None,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
                 ephemeral_ttl_secs: None,
@@ -1237,6 +1257,7 @@ mod tests {
             auto_accept_files: false,
             admins: vec![],
             direct: false,
+            direct_peer: None,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,
@@ -1271,6 +1292,7 @@ mod tests {
                     auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    direct_peer: None,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
@@ -1292,6 +1314,7 @@ mod tests {
                     auto_accept_files: false,
                     admins: vec![],
                     direct: false,
+                    direct_peer: None,
                     ssh_allow: vec![],
                     aliases: BTreeMap::new(),
                     ephemeral_ttl_secs: None,
@@ -1341,6 +1364,7 @@ mod tests {
                 auto_accept_files: false,
                 admins: vec![],
                 direct: false,
+                direct_peer: None,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
                 ephemeral_ttl_secs: None,
@@ -1375,6 +1399,7 @@ mod tests {
                 auto_accept_files: false,
                 admins: vec![],
                 direct: false,
+                direct_peer: None,
                 ssh_allow: vec![],
                 aliases: BTreeMap::new(),
                 ephemeral_ttl_secs: None,
@@ -1463,6 +1488,7 @@ name = "test"
             auto_accept_files: false,
             admins: vec![],
             direct: false,
+            direct_peer: None,
             ssh_allow: vec![],
             aliases: BTreeMap::new(),
             ephemeral_ttl_secs: None,

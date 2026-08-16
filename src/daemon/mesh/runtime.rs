@@ -196,6 +196,9 @@ impl NetworkRegistry {
             nullifiers,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
+            // A key holder authors records rather than applying them, so it keeps
+            // no replay floor.
+            last_record_timestamp: None,
         };
 
         self.seal_and_publish(&mut net_state, &net_secret_key).await;
@@ -225,6 +228,7 @@ impl NetworkRegistry {
             auto_accept_files: net_config.map(|nc| nc.auto_accept_files).unwrap_or(false),
             admins: net_config.map(|nc| nc.admins.clone()).unwrap_or_default(),
             direct: net_config.map(|nc| nc.direct).unwrap_or(false),
+            direct_peer: net_config.and_then(|nc| nc.direct_peer),
             ssh_allow: net_config
                 .map(|nc| nc.ssh_allow.clone())
                 .unwrap_or_default(),
