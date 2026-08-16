@@ -83,7 +83,7 @@ pub(crate) async fn join_mesh_shared(
     // Guards the single-use invite ledger. Shared with the NetworkHandle so the
     // member accept handler's `InviteShare`/`InviteUsed` handling (a co-coordinator
     // learning of invites it didn't mint) is serialized with mint/redeem.
-    invite_lock: Arc<tokio::sync::Mutex<()>>,
+    invite_lock: Arc<AsyncMutex<()>>,
     // The router this network's member accept handler is registered in, and whose
     // per-connection demux dispatches control frames (incl. ping/pong).
     protocol_router: Arc<ProtocolRouter>,

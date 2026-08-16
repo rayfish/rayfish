@@ -24,6 +24,7 @@ use anyhow::Result;
 #[cfg(target_os = "linux")]
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use smol_str::SmolStr;
 #[cfg(target_os = "linux")]
 use zbus::Connection;
 #[cfg(target_os = "linux")]
@@ -62,11 +63,74 @@ pub fn resolver_addr() -> IpAddr {
     }
 }
 
+/// A DNS search domain: a suffix the resolver appends to a bare name before
+/// giving up on it. `homelab.ray`, `ray`, or one the host already had.
+///
+/// Its own type because the strings either side of [`search_domains_for`] are
+/// otherwise indistinguishable: a *network name* goes in and a *search domain*
+/// comes out, both `String`, and nothing stopped the output being fed back in
+/// to produce `homelab.ray.ray`. The constructors are the only way to build
+/// one, so the `.{DNS_DOMAIN}` suffix is applied exactly once, in one place.
+///
+/// `SmolStr` for the same reason network names use it in `peers.rs`: a search
+/// domain is short enough to live inline, and the whole list is cloned on every
+/// join and leave.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchDomain(SmolStr);
+
+impl SearchDomain {
+    /// `<network>.ray`: what makes a bare `box` resolve inside one network.
+    fn for_network(network: &str) -> Self {
+        Self(SmolStr::new(format!("{network}.{DNS_DOMAIN}")))
+    }
+
+    /// `ray`: the catch-all every node carries, so `box.homelab` resolves too.
+    fn root() -> Self {
+        Self(SmolStr::new_static(DNS_DOMAIN))
+    }
+
+    /// One the host already had, read back from its own resolver configuration.
+    /// Unvalidated on purpose: it is the host's, and we only carry it along.
+    fn from_host(domain: &str) -> Self {
+        Self(SmolStr::new(domain))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// Ours to manage rather than the host's.
+    ///
+    /// It matters when reading back a file we wrote: a daemon restarted while
+    /// our own resolv.conf is in place captures its `search` line as "the
+    /// host's", and without this the networks that line named would stay in the
+    /// list forever, surviving the `ray leave` that should have dropped them.
+    fn is_ours(&self) -> bool {
+        self.0 == DNS_DOMAIN || self.0.ends_with(&format!(".{DNS_DOMAIN}"))
+    }
+}
+
+impl std::fmt::Display for SearchDomain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Render a list the way `resolv.conf` and `resolvconf` want it: space-separated.
+#[cfg(any(target_os = "linux", test))]
+fn join_domains(domains: &[SearchDomain]) -> String {
+    domains
+        .iter()
+        .map(SearchDomain::as_str)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The search domains a file-owning backend currently renders, shared between
 /// the configurator and its re-assert task. Swapped whole on every join/leave,
 /// so the watcher reads the current list without being restarted.
 #[cfg(target_os = "linux")]
-pub type SearchDomains = Arc<ArcSwap<Vec<String>>>;
+pub type SearchDomains = Arc<ArcSwap<Vec<SearchDomain>>>;
 
 #[async_trait]
 pub trait DnsConfigurator: Send + Sync {
@@ -87,7 +151,7 @@ pub trait DnsConfigurator: Send + Sync {
     /// because nothing else would: `set_manager_search_domains` only speaks
     /// resolved, so on a host that fell past it the domains went nowhere and a
     /// bare `box` did not resolve.
-    async fn set_search_domains(&self, domains: &[String], tun_name: &str) -> Result<()> {
+    async fn set_search_domains(&self, domains: &[SearchDomain], tun_name: &str) -> Result<()> {
         set_manager_search_domains(domains, tun_name).await
     }
     /// The live search-domain list this configurator renders into
@@ -238,12 +302,12 @@ pub fn restore_stale_backups() {
 /// network called `dev` would otherwise capture every `*.dev` lookup.
 ///
 /// Where these end up is the active backend's business ([`DnsConfigurator::set_search_domains`]).
-pub fn search_domains_for(network_names: &[String]) -> Vec<String> {
-    let mut search: Vec<String> = network_names
+pub fn search_domains_for(network_names: &[String]) -> Vec<SearchDomain> {
+    let mut search: Vec<SearchDomain> = network_names
         .iter()
-        .map(|n| format!("{n}.{DNS_DOMAIN}"))
+        .map(|n| SearchDomain::for_network(n))
         .collect();
-    search.push(DNS_DOMAIN.to_string());
+    search.push(SearchDomain::root());
     search
 }
 
@@ -262,7 +326,7 @@ pub async fn clear_search_domains(tun_name: &str) {
 /// (resolved on Linux, SCDynamicStore on macOS). The default for every
 /// split-DNS backend, and a no-op on a host with no manager at all.
 pub(crate) async fn set_manager_search_domains(
-    rayfish_domains: &[String],
+    rayfish_domains: &[SearchDomain],
     tun_name: &str,
 ) -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -346,7 +410,7 @@ mod macos {
         Ok(STORE.get().unwrap())
     }
 
-    pub fn write_dns_config(search_domains: &[String], tun_name: &str) -> Result<()> {
+    pub fn write_dns_config(search_domains: &[super::SearchDomain], tun_name: &str) -> Result<()> {
         let store = get_or_init_store()?;
         let store = store.lock().unwrap();
 
@@ -371,8 +435,10 @@ mod macos {
         let match_val = CFArray::from_CFTypes(&match_domains);
 
         let search_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSSearchDomains) };
-        let search_cfstrings: Vec<CFString> =
-            search_domains.iter().map(|s| CFString::new(s)).collect();
+        let search_cfstrings: Vec<CFString> = search_domains
+            .iter()
+            .map(|s| CFString::new(s.as_str()))
+            .collect();
         let search_val = CFArray::from_CFTypes(&search_cfstrings);
 
         // In IPv6-only mode, ask configd to trust this resolver, which is the
@@ -596,7 +662,7 @@ mod macos {
 use macos::MacosDynamicStoreDns;
 
 #[cfg(target_os = "macos")]
-fn write_dns_config_macos(search_domains: &[String], tun_name: &str) -> Result<()> {
+fn write_dns_config_macos(search_domains: &[SearchDomain], tun_name: &str) -> Result<()> {
     macos::write_dns_config(search_domains, tun_name)
 }
 
@@ -605,7 +671,7 @@ fn write_dns_config_macos(search_domains: &[String], tun_name: &str) -> Result<(
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-async fn set_search_domains_linux(rayfish_domains: &[String], tun_name: &str) -> Result<()> {
+async fn set_search_domains_linux(rayfish_domains: &[SearchDomain], tun_name: &str) -> Result<()> {
     let ifindex = linux::get_ifindex(tun_name);
 
     // Try D-Bus first
@@ -616,7 +682,7 @@ async fn set_search_domains_linux(rayfish_domains: &[String], tun_name: &str) ->
         // registered, so a network named `dev` never captures `*.dev`.
         let mut domains: Vec<(String, bool)> = vec![(DNS_DOMAIN.to_string(), true)];
         for d in rayfish_domains {
-            domains.push((d.clone(), false));
+            domains.push((d.to_string(), false));
         }
         let reply = conn
             .call_method(
@@ -641,7 +707,7 @@ async fn set_search_domains_linux(rayfish_domains: &[String], tun_name: &str) ->
     {
         let mut args = vec!["domain".to_string(), tun_name.to_string()];
         args.push(format!("~{DNS_DOMAIN}"));
-        args.extend(rayfish_domains.iter().cloned());
+        args.extend(rayfish_domains.iter().map(SearchDomain::to_string));
         let status = Command::new("resolvectl")
             .args(&args)
             .status()
@@ -1091,7 +1157,7 @@ fn try_resolvconf() -> Option<Resolvconf> {
     };
     Some(Resolvconf {
         variant,
-        search: Arc::new(ArcSwap::from_pointee(vec![DNS_DOMAIN.to_string()])),
+        search: Arc::new(ArcSwap::from_pointee(vec![SearchDomain::root()])),
     })
 }
 
@@ -1115,7 +1181,7 @@ impl Resolvconf {
         let search = self.search.load();
         let mut config = format!("nameserver {}\n", resolver_addr());
         if !search.is_empty() {
-            config.push_str(&format!("search {}\n", search.join(" ")));
+            config.push_str(&format!("search {}\n", join_domains(&search)));
         }
         let iface = self.iface_name();
         let mut child = Command::new("resolvconf")
@@ -1202,7 +1268,7 @@ impl DnsConfigurator for Resolvconf {
     /// Our stanza carries the domains, so a join or leave re-registers it.
     /// `set_manager_search_domains` would be a no-op on a host that fell this
     /// far down the ladder: there is no resolved here to hand them to.
-    async fn set_search_domains(&self, domains: &[String], _tun_name: &str) -> Result<()> {
+    async fn set_search_domains(&self, domains: &[SearchDomain], _tun_name: &str) -> Result<()> {
         self.search.store(Arc::new(domains.to_vec()));
         self.register().await
     }
@@ -1281,7 +1347,7 @@ pub(crate) fn system_nameservers() -> Option<Vec<Ipv4Addr>> {
 /// our resolver is dead, wedged, or the daemon is gone, the libc resolver moves
 /// on to a real server instead of the machine having no DNS at all.
 #[cfg(any(target_os = "linux", test))]
-fn render_direct_resolv_conf(search: &[String], fallback: Option<Ipv4Addr>) -> String {
+fn render_direct_resolv_conf(search: &[SearchDomain], fallback: Option<Ipv4Addr>) -> String {
     render_direct_resolv_conf_with(resolver_addr(), search, fallback)
 }
 
@@ -1290,7 +1356,7 @@ fn render_direct_resolv_conf(search: &[String], fallback: Option<Ipv4Addr>) -> S
 #[cfg(any(target_os = "linux", test))]
 fn render_direct_resolv_conf_with(
     resolver: IpAddr,
-    search: &[String],
+    search: &[SearchDomain],
     fallback: Option<Ipv4Addr>,
 ) -> String {
     let mut s = String::from(HEADER_COMMENT);
@@ -1299,7 +1365,7 @@ fn render_direct_resolv_conf_with(
         s.push_str(&format!("nameserver {ip}\n"));
     }
     if !search.is_empty() {
-        s.push_str(&format!("search {}\n", search.join(" ")));
+        s.push_str(&format!("search {}\n", join_domains(search)));
     }
     s
 }
@@ -1348,7 +1414,7 @@ fn reassert_decision(current: &str) -> Reassert {
 
 #[cfg(target_os = "linux")]
 async fn reassert_resolv_conf(
-    search: &ArcSwap<Vec<String>>,
+    search: &ArcSwap<Vec<SearchDomain>>,
     fallback: Option<Ipv4Addr>,
 ) -> Result<Reassert> {
     let path = Path::new("/etc/resolv.conf");
@@ -1450,7 +1516,7 @@ pub async fn run_resolv_reassert(
 /// resolver we are standing down for. Errors are logged and treated as "keep
 /// watching" (the next tick retries).
 #[cfg(target_os = "linux")]
-async fn pass(search: &ArcSwap<Vec<String>>, fallback: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+async fn pass(search: &ArcSwap<Vec<SearchDomain>>, fallback: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
     match reassert_resolv_conf(search, fallback).await {
         Ok(Reassert::StoodDown(ip)) => Some(ip),
         Ok(_) => None,
@@ -1719,7 +1785,7 @@ struct DirectResolvConf {
     /// The search domains the file already had. Kept separately from the live
     /// list so a later join/leave re-merges against the host's own domains
     /// instead of accumulating ours on top of the previous render.
-    captured_search: Vec<String>,
+    captured_search: Vec<SearchDomain>,
     /// What actually goes in the file: [`Self::captured_search`] plus the
     /// rayfish domains, swapped whole on every join/leave and shared with the
     /// re-assert task so a trample-repair writes the current list.
@@ -1791,17 +1857,17 @@ impl DirectResolvConf {
         let contents = tokio::fs::read_to_string("/etc/resolv.conf")
             .await
             .unwrap_or_default();
-        let search: Vec<String> = contents
+        let search: Vec<SearchDomain> = contents
             .lines()
             .filter_map(|l| {
                 l.trim()
                     .strip_prefix("search ")
                     .or_else(|| l.trim().strip_prefix("domain "))
             })
-            .flat_map(|s| s.split_whitespace().map(|x| x.to_string()))
+            .flat_map(|s| s.split_whitespace().map(SearchDomain::from_host))
             // Ours are re-derived from the joined networks on every refresh;
             // keeping the ones this file already names would outlive a leave.
-            .filter(|d| !is_our_search_domain(d))
+            .filter(|d| !d.is_ours())
             .collect();
 
         let captured = parse_resolv_nameservers(&contents);
@@ -1831,17 +1897,6 @@ impl DirectResolvConf {
     }
 }
 
-/// Whether a search domain is one of ours to manage rather than the host's.
-///
-/// It matters when reading back a file we wrote: a daemon restarted while our
-/// own resolv.conf is in place captures its `search` line as "the host's", and
-/// without this the networks that line named would stay in the list forever,
-/// surviving the `ray leave` that should have dropped them.
-#[cfg(any(target_os = "linux", test))]
-fn is_our_search_domain(domain: &str) -> bool {
-    domain == DNS_DOMAIN || domain.ends_with(&format!(".{DNS_DOMAIN}"))
-}
-
 /// What the resolver actually reads: glibc's `MAXDNSRCH`. Entries past it are
 /// ignored in silence, which is why the merge below truncates deliberately
 /// instead of rendering a list the host will quietly cut short.
@@ -1861,25 +1916,26 @@ const MAX_SEARCH_DOMAINS: usize = 6;
 /// bare mesh name resolve. `ray` is kept at the cost of the last thing that
 /// fits, and what got dropped is logged rather than silently cut.
 #[cfg(any(target_os = "linux", test))]
-fn merge_search_domains(captured: &[String], rayfish: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(captured.len() + rayfish.len());
+fn merge_search_domains(captured: &[SearchDomain], rayfish: &[SearchDomain]) -> Vec<SearchDomain> {
+    let mut out: Vec<SearchDomain> = Vec::with_capacity(captured.len() + rayfish.len());
     for d in captured.iter().chain(rayfish) {
-        if !out.iter().any(|k| k == d) {
+        if !out.contains(d) {
             out.push(d.clone());
         }
     }
     if out.len() <= MAX_SEARCH_DOMAINS {
         return out;
     }
+    let root = SearchDomain::root();
     let mut dropped = out.split_off(MAX_SEARCH_DOMAINS);
-    if !out.iter().any(|d| d == DNS_DOMAIN) {
-        dropped.retain(|d| d != DNS_DOMAIN);
+    if !out.contains(&root) {
+        dropped.retain(|d| *d != root);
         dropped.push(out.pop().expect("cap is non-zero"));
-        out.push(DNS_DOMAIN.to_string());
+        out.push(root);
     }
     tracing::warn!(
-        ?dropped,
-        kept = ?out,
+        dropped = ?dropped.iter().map(SearchDomain::as_str).collect::<Vec<_>>(),
+        kept = ?out.iter().map(SearchDomain::as_str).collect::<Vec<_>>(),
         "more search domains than the resolver reads ({MAX_SEARCH_DOMAINS}); \
          bare names under the dropped ones need their full `.{DNS_DOMAIN}` name"
     );
@@ -1953,7 +2009,7 @@ impl DnsConfigurator for DirectResolvConf {
     /// We own the file, so the domains go in it. Nothing else would put them
     /// there: this backend is the one the host falls to when it has no DNS
     /// manager to hand them to.
-    async fn set_search_domains(&self, domains: &[String], _tun_name: &str) -> Result<()> {
+    async fn set_search_domains(&self, domains: &[SearchDomain], _tun_name: &str) -> Result<()> {
         self.search.store(Arc::new(merge_search_domains(
             &self.captured_search,
             domains,
@@ -1988,11 +2044,20 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::{
-        Reassert, first_nameserver, foreign_mesh_resolver, is_our_search_domain,
+        Reassert, SearchDomain, first_nameserver, foreign_mesh_resolver, join_domains,
         merge_search_domains, nm_dns_none_dropin, parse_resolv_nameservers, reassert_decision,
         render_direct_resolv_conf, render_direct_resolv_conf_with, resolv_conf_is_ours,
         search_domains_for,
     };
+
+    /// Domains as the host had them, i.e. read back from its own config.
+    fn host(domains: &[&str]) -> Vec<SearchDomain> {
+        domains.iter().map(|d| SearchDomain::from_host(d)).collect()
+    }
+
+    fn networks(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
     #[cfg(target_os = "linux")]
     use super::{nsswitch_uses_resolve, resolv_conf_points_at_resolved, strip_our_resolv_entries};
 
@@ -2077,22 +2142,25 @@ mod tests {
 
     #[test]
     fn search_domains_keep_the_hosts_own_first() {
-        let rayfish = search_domains_for(&["homelab".to_string(), "work".to_string()]);
-        assert_eq!(rayfish, ["homelab.ray", "work.ray", "ray"]);
+        let rayfish = search_domains_for(&networks(&["homelab", "work"]));
+        // The suffix is applied exactly once, by the constructor: a network
+        // name goes in and a search domain comes out, and they are now
+        // different types, so the output cannot be fed back through.
+        assert_eq!(join_domains(&rayfish), "homelab.ray work.ray ray");
         // The host's own domains still resolve, and a domain named twice is
         // listed once (glibc caps the search list, so duplicates cost real
         // candidates).
         assert_eq!(
-            merge_search_domains(&["lan".to_string(), "ray".to_string()], &rayfish),
-            ["lan", "ray", "homelab.ray", "work.ray"]
+            join_domains(&merge_search_domains(&host(&["lan", "ray"]), &rayfish)),
+            "lan ray homelab.ray work.ray"
         );
         assert_eq!(merge_search_domains(&[], &rayfish), rayfish);
         // Reading back a file we wrote must not turn our own domains into the
         // host's, or a `ray leave` would never drop them.
-        assert!(is_our_search_domain("ray"));
-        assert!(is_our_search_domain("homelab.ray"));
-        assert!(!is_our_search_domain("lan"));
-        assert!(!is_our_search_domain("notray"));
+        assert!(SearchDomain::from_host("ray").is_ours());
+        assert!(SearchDomain::from_host("homelab.ray").is_ours());
+        assert!(!SearchDomain::from_host("lan").is_ours());
+        assert!(!SearchDomain::from_host("notray").is_ours());
     }
 
     #[test]
@@ -2100,22 +2168,18 @@ mod tests {
         // Three host domains plus four networks is eight entries, and the
         // resolver reads six. `ray` is last in our list, so a plain truncation
         // drops the one entry that makes any bare mesh name resolve.
-        let host = ["corp.example.com", "example.com", "lan"].map(String::from);
-        let rayfish = search_domains_for(
-            &["a", "b", "c", "d"]
-                .into_iter()
-                .map(String::from)
-                .collect::<Vec<_>>(),
-        );
-        let merged = merge_search_domains(&host, &rayfish);
+        let captured = host(&["corp.example.com", "example.com", "lan"]);
+        let rayfish = search_domains_for(&networks(&["a", "b", "c", "d"]));
+        let merged = merge_search_domains(&captured, &rayfish);
         assert_eq!(merged.len(), 6);
-        assert_eq!(merged.last().unwrap(), "ray");
         // The host's own domains outrank ours: they resolved here before.
-        assert_eq!(&merged[..3], &host[..]);
-        assert_eq!(&merged[3..], ["a.ray", "b.ray", "ray"]);
+        assert_eq!(
+            join_domains(&merged),
+            "corp.example.com example.com lan a.ray b.ray ray"
+        );
         // Already inside the cap: nothing is rearranged.
-        let small = merge_search_domains(&["lan".to_string()], &search_domains_for(&[]));
-        assert_eq!(small, ["lan", "ray"]);
+        let small = merge_search_domains(&host(&["lan"]), &search_domains_for(&[]));
+        assert_eq!(join_domains(&small), "lan ray");
     }
 
     /// The re-assert loop reads the domains through a shared handle rather than
@@ -2123,13 +2187,11 @@ mod tests {
     /// next repair writes. This is the staleness `SearchDomains` exists to fix.
     #[test]
     fn reassert_renders_the_live_search_list() {
-        let handle: std::sync::Arc<arc_swap::ArcSwap<Vec<String>>> =
-            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(vec!["ray".to_string()]));
+        let handle = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(search_domains_for(&[])));
         assert!(render_direct_resolv_conf(&handle.load(), None).contains("search ray\n"));
-        handle.store(std::sync::Arc::new(vec![
-            "homelab.ray".to_string(),
-            "ray".to_string(),
-        ]));
+        handle.store(std::sync::Arc::new(search_domains_for(&networks(&[
+            "homelab",
+        ]))));
         assert!(
             render_direct_resolv_conf(&handle.load(), None).contains("search homelab.ray ray\n")
         );
@@ -2149,7 +2211,7 @@ mod tests {
 
     #[test]
     fn render_direct_resolv_conf_points_at_magic_ip() {
-        let out = render_direct_resolv_conf(&["homelab.ray".to_string(), "ray".to_string()], None);
+        let out = render_direct_resolv_conf(&search_domains_for(&networks(&["homelab"])), None);
         assert!(out.starts_with("# Added by rayfish"));
         assert!(out.contains("nameserver 100.100.100.53"));
         assert!(out.contains("search homelab.ray ray"));
@@ -2162,7 +2224,7 @@ mod tests {
     fn render_direct_resolv_conf_can_point_at_the_v6_magic_ip() {
         let out = render_direct_resolv_conf_with(
             std::net::IpAddr::V6(crate::dns::MAGIC_DNS_V6),
-            &["ray".to_string()],
+            &search_domains_for(&[]),
             Some("1.1.1.1".parse().unwrap()),
         );
         assert!(out.contains("nameserver 200::53"));

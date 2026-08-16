@@ -131,11 +131,11 @@ pub(crate) struct PendingFile {
 
 pub(crate) struct FileService {
     /// Received file offers awaiting `ray files accept`.
-    pub(crate) pending_files: Arc<std::sync::Mutex<Vec<PendingFile>>>,
+    pub(crate) pending_files: Arc<Mutex<Vec<PendingFile>>>,
     /// Monotonic id source for pending offers.
     pub(crate) file_id_counter: Arc<AtomicU64>,
     /// Active pairing secret (set by `start_pairing`, consumed by a pair request).
-    pub(crate) pairing_secret: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    pub(crate) pairing_secret: Arc<Mutex<Option<[u8; 32]>>>,
     /// This node's transport secret key, used to sign device certs on pairing.
     secret_key: SecretKey,
     /// Foundation handles (endpoint + blob store) for fetching accepted files.
@@ -151,7 +151,7 @@ pub(crate) struct FileService {
     /// Outbound sends awaiting delivery (peer offline, or the offer dial
     /// failed). Flushed on every peer-connected event and by a slow sweep.
     /// Ids come from `file_id_counter`, shared with inbound pending offers.
-    outbox: Arc<std::sync::Mutex<Vec<OutboxEntry>>>,
+    outbox: Arc<Mutex<Vec<OutboxEntry>>>,
     /// Peers with a flush in flight, so a burst of connect events (or the
     /// sweep racing a connect) can't deliver the same offer twice.
     flushing: Arc<DashSet<EndpointId>>,
@@ -181,16 +181,16 @@ impl FileService {
             );
         }
         Self {
-            pending_files: Arc::new(std::sync::Mutex::new(Vec::new())),
+            pending_files: Arc::new(Mutex::new(Vec::new())),
             file_id_counter: Arc::new(ids),
-            pairing_secret: Arc::new(std::sync::Mutex::new(None)),
+            pairing_secret: Arc::new(Mutex::new(None)),
             secret_key,
             transport,
             registry,
             device_cert,
             device_user_map,
             transfers,
-            outbox: Arc::new(std::sync::Mutex::new(queued)),
+            outbox: Arc::new(Mutex::new(queued)),
             flushing: Arc::new(DashSet::new()),
         }
     }

@@ -31,18 +31,18 @@ pub(crate) struct DnsService {
     /// The system-DNS configurator owned while active, so `revert` can undo it and
     /// `reassert_os_config` can re-apply it. `Arc` (not `Box`) so a re-apply can
     /// clone it out and run without holding the lock across the await.
-    configurator: Arc<std::sync::Mutex<Option<Arc<dyn dns_config::DnsConfigurator>>>>,
+    configurator: Arc<Mutex<Option<Arc<dyn dns_config::DnsConfigurator>>>>,
     /// Cancellation token for the `run_resolv_reassert` task (Linux direct mode).
-    reassert_token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    reassert_token: Mutex<Option<tokio_util::sync::CancellationToken>>,
     /// Cancellation token for the retry loop spawned when the initial OS-DNS
     /// configuration fails (see [`DnsService::configure`]).
-    configure_retry: std::sync::Mutex<Option<CancellationToken>>,
+    configure_retry: Mutex<Option<CancellationToken>>,
     /// The search domains last derived from the joined networks. Kept so a
     /// backend adopted *after* the registry last announced them (the usual
     /// order at startup, and every reconfigure after a retry or a stand-down)
     /// still gets them; it is a cache of the argument, not a back-reference to
     /// the registry that produced it.
-    search_domains: std::sync::Mutex<Vec<String>>,
+    search_domains: Mutex<Vec<dns_config::SearchDomain>>,
     /// This node's identity-derived mesh IPv6. Handed to the OS-DNS backend,
     /// which on macOS publishes it as the address of the service our resolver
     /// belongs to; never rotates, so it is captured once at construction.
@@ -60,10 +60,10 @@ impl DnsService {
             hostname_table,
             reverse_table,
             resolver,
-            configurator: Arc::new(std::sync::Mutex::new(None)),
-            reassert_token: std::sync::Mutex::new(None),
-            configure_retry: std::sync::Mutex::new(None),
-            search_domains: std::sync::Mutex::new(Vec::new()),
+            configurator: Arc::new(Mutex::new(None)),
+            reassert_token: Mutex::new(None),
+            configure_retry: Mutex::new(None),
+            search_domains: Mutex::new(Vec::new()),
             mesh_v6,
         }
     }
