@@ -51,36 +51,63 @@ fn gateway_refusal(
     }
 }
 
-/// The IPv6 half of [`gateway_refusal`], on its own because the two halves have
+/// The family half of [`gateway_refusal`], on its own because the two halves have
 /// different lifetimes. "Does not advertise an exit node" is a roster fact that
 /// flickers (a coordinator rebuild, a gateway mid-restart) and must not drop a
 /// live tunnel, so it is only ever checked when the user picks a gateway. This
 /// one is a standing property of the pair: while it holds, the tunnel carries
 /// nothing, so it is re-checked on every re-apply as well.
 ///
-/// Refuses only on a claim that actually says IPv4-only. [`ExitFamilies::Unknown`]
-/// means the roster carries no claim, which is what a coordinator on a release
-/// that predates the field leaves behind, and refusing on it would make exit
-/// nodes unusable on every such network until the last coordinator upgrades.
-/// Allowing it can be wrong, but wrongly is the direction that fails loudly: the
-/// user chose this gateway, sees no internet, and clears it. The silent
-/// black-hole this whole check exists to prevent is the *other* direction, a
-/// gateway confidently marked usable. The caller warns instead, so the reason is
-/// in the log before the traffic stops.
+/// Refuses only on a claim that was actually made. [`ExitFamilies::Unknown`]
+/// means the roster carries none, which is what a coordinator on a release that
+/// predates the field leaves behind, and refusing on it would make exit nodes
+/// unusable on every such network until the last coordinator upgrades. Allowing
+/// it can be wrong, but wrongly is the direction that fails loudly: the user
+/// chose this gateway, sees no internet, and clears it. The silent black-hole
+/// this whole check exists to prevent is the *other* direction, a gateway
+/// confidently marked usable. The caller warns instead, so the reason is in the
+/// log before the traffic stops.
+///
+/// Symmetric in the family, because the mismatch is: our tunnel carries exactly
+/// the families our own mode claims, so a gateway that cannot return one of them
+/// black-holes it. [`ExitFamilies::V6`] is the case a gateway's own IPv6-only
+/// mode produces, and it is refused by a *dual-stack* client for the same reason
+/// [`ExitFamilies::V4`] is refused by an IPv6-only one.
 fn ipv6_gateway_refusal(m: &Member, name: &str, ipv6_only: bool) -> Option<String> {
-    (ipv6_only && m.exit_families == ExitFamilies::V4).then(|| {
-        format!(
+    if m.exit_families.is_unknown() {
+        return None;
+    }
+    if ipv6_only && !m.exit_families.carries_v6() {
+        return Some(format!(
             "{name} offers an exit node but cannot carry IPv6, and this node's data \
              plane is IPv6-only, so nothing would reach the internet through it. \
              Pick a gateway shown as (IPv6) in `ray exit-node status`, or give that \
              host an IPv6 uplink."
-        )
-    })
+        ));
+    }
+    if !ipv6_only && !m.exit_families.carries_v4() {
+        return Some(format!(
+            "{name} offers an exit node but cannot carry IPv4: its own data plane is \
+             IPv6-only, so it never routes the mesh IPv4 that a reply would come \
+             back on. This node's tunnel takes both families, so IPv4 through it \
+             would go one way and stop. Pick another gateway, or run this node in \
+             IPv6-only mode too (`ray config set ipv6-only on`)."
+        ));
+    }
+    None
 }
 
 /// Whether selecting `m` as a gateway is a guess: it offers an exit node, we need
 /// IPv6 out of it, and nothing on the roster says whether it has any. Distinct
 /// from [`ipv6_gateway_refusal`], which answers a claim that was actually made.
+///
+/// Deliberately asymmetric, unlike the refusal. A dual-stack client also relies
+/// on the claim now (to rule out an [`ExitFamilies::V6`] gateway), but the thing
+/// it is guessing about is a gateway that runs IPv6-only mode itself, which is
+/// rare; warning on every unclaimed gateway would fire on every network whose
+/// coordinator predates the field, which is the normal case, and say nothing.
+/// An IPv6-only client is guessing about an IPv4-only gateway, which is the
+/// normal case.
 fn ipv6_gateway_unverified(m: &Member, ipv6_only: bool) -> bool {
     ipv6_only && m.exit_node && m.exit_families.is_unknown()
 }
@@ -531,9 +558,14 @@ impl NetworkRegistry {
     }
 
     /// The `exit_families` value this node would publish right now.
+    ///
+    /// Both halves are our own state, not the peer's: the uplink probe says what
+    /// we can reach, and `ipv6_only` says whether our data plane routes mesh IPv4
+    /// well enough to bring a client's reply back. A gateway that reports only
+    /// the first is claiming a family it cannot return.
     fn claimed_exit_families(&self, offering: bool) -> ExitFamilies {
         if offering {
-            ExitFamilies::from_v6_uplink(self.exit_server.offers_v6())
+            ExitFamilies::from_uplink(self.exit_server.offers_v6(), self.ipv6_only)
         } else {
             ExitFamilies::Unknown
         }
@@ -937,5 +969,32 @@ mod tests {
                 super::ipv6_gateway_refusal(&gateway(true, Unknown), "gw", ipv6_only).is_none()
             );
         }
+    }
+
+    /// The refusal runs in both directions, because the black hole does.
+    ///
+    /// A gateway in IPv6-only mode has an IPv6 uplink but never routes mesh IPv4,
+    /// so a dual-stack client's tunnelled IPv4 reaches it, gets masqueraded out,
+    /// and the reply finds no way back into its TUN. Claiming `Dual` there (which
+    /// the uplink probe alone would) is a positive claim that is false, and a
+    /// false claim is worse than the `Unknown` this field exists to distinguish.
+    #[test]
+    fn a_v6_only_gateway_is_refused_by_a_dual_stack_client() {
+        use ExitFamilies::{Dual, V4, V6};
+
+        let refusal = super::ipv6_gateway_refusal(&gateway(true, V6), "gw", false)
+            .expect("a v6-only gateway cannot return a dual-stack client's IPv4");
+        assert!(refusal.contains("cannot carry IPv4"), "{refusal}");
+        // And is fine for a client that was only ever going to send it IPv6.
+        assert!(super::ipv6_gateway_refusal(&gateway(true, V6), "gw", true).is_none());
+
+        // The claim itself: only a dual-stack host with an uplink is `Dual`.
+        assert_eq!(ExitFamilies::from_uplink(true, false), Dual);
+        assert_eq!(ExitFamilies::from_uplink(true, true), V6);
+        assert_eq!(ExitFamilies::from_uplink(false, false), V4);
+        // No uplink and IPv6-only: nothing to offer either way, and `V4` already
+        // means "refused" to the clients that would care.
+        assert_eq!(ExitFamilies::from_uplink(false, true), V4);
+        assert!(super::ipv6_gateway_refusal(&gateway(true, V4), "gw", true).is_some());
     }
 }

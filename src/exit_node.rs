@@ -679,6 +679,17 @@ const PUBLIC_FALLBACK_DNS_V6: [Ipv6Addr; 2] = [
 /// The operator's `dns_upstreams` come first when any of them are IPv6 (the same
 /// list [`crate::config::resolve_upstreams`] reads for IPv4, from the other end),
 /// and `replace` suppresses the public fallback exactly as it does there.
+///
+/// A `replace` list with no IPv6 server in it is the case worth stating: we take
+/// their IPv4 servers rather than override them. The override exists to stop
+/// lookups leaving around the exit, so the reflex is to swap in a public IPv6
+/// resolver, but `replace` is an operator saying *these servers and no others*,
+/// usually an internal resolver holding names nothing else can answer. Silently
+/// sending those queries to Cloudflare and Google instead breaks resolution and
+/// hands a third party the names, to fix a leak that is not even total: IPv4
+/// egress deliberately still leaves directly in this mode, so their resolver is
+/// genuinely reachable. Privacy caveat is the caller's to warn about; a wrong
+/// answer is not recoverable at all.
 pub fn tunnel_upstreams(
     ipv6_only: bool,
     configured: &crate::config::ServerOverride,
@@ -686,20 +697,39 @@ pub fn tunnel_upstreams(
     if !ipv6_only {
         return None;
     }
-    let mut servers: Vec<Ipv6Addr> = configured
+    let v6: Vec<Ipv6Addr> = configured
         .servers
         .iter()
         .filter_map(|s| s.parse().ok())
         .collect();
-    if !configured.replace || servers.is_empty() {
-        servers.extend(PUBLIC_FALLBACK_DNS_V6);
-    }
-    Some(
-        servers
-            .into_iter()
+    if configured.replace {
+        if !v6.is_empty() {
+            return Some(with_port(v6));
+        }
+        // Their list, as given, including the IPv4 entries this mode leaves
+        // untunnelled. Empty only if `replace` was set with nothing usable in it,
+        // where the public fallback is all that is left.
+        let theirs: Vec<SocketAddr> = configured
+            .servers
+            .iter()
+            .filter_map(|s| s.parse::<IpAddr>().ok())
             .map(|ip| SocketAddr::from((ip, 53u16)))
-            .collect(),
-    )
+            .collect();
+        if !theirs.is_empty() {
+            return Some(theirs);
+        }
+    }
+    let mut servers = v6;
+    servers.extend(PUBLIC_FALLBACK_DNS_V6);
+    Some(with_port(servers))
+}
+
+/// Port 53 on each, the only port a resolver override ever uses here.
+fn with_port(servers: Vec<Ipv6Addr>) -> Vec<SocketAddr> {
+    servers
+        .into_iter()
+        .map(|ip| SocketAddr::from((ip, 53u16)))
+        .collect()
 }
 
 /// This node's exit-node state as the inbound data path needs it: the gateway allow
@@ -2443,14 +2473,42 @@ unreachable fd00::/8 dev lo table 52 metric 1024 pref medium
             vec!["[2001:4860:4860::8844]:53".parse::<SocketAddr>().unwrap()]
         );
 
-        // `replace` with no IPv6 entry at all would leave the forwarder with
-        // nowhere to send anything, so the fallback goes back in.
+        // `replace` with no IPv6 entry keeps the operator's own IPv4 servers
+        // rather than substituting public ones. `replace` means "these and no
+        // others", and it usually names an internal resolver holding names
+        // nothing else can answer, so swapping in Cloudflare breaks resolution
+        // and leaks the names. IPv4 egress still leaves directly in this mode, so
+        // that server is genuinely reachable; the cost is a lookup that goes
+        // around the exit, which is the lesser of the two.
         let v4_only = ServerOverride {
             servers: strs(&["192.168.1.1"]),
             replace: true,
         };
         assert_eq!(
-            tunnel_upstreams(true, &v4_only).unwrap().len(),
+            tunnel_upstreams(true, &v4_only).unwrap(),
+            vec!["192.168.1.1:53".parse::<SocketAddr>().unwrap()],
+            "an explicit --replace list is not silently swapped for public resolvers"
+        );
+
+        // Mixed: the IPv6 half is enough to keep everything inside the tunnel, so
+        // the IPv4 entries are not needed and not used.
+        let mixed = ServerOverride {
+            servers: strs(&["192.168.1.1", "2001:4860:4860::8844"]),
+            replace: true,
+        };
+        assert_eq!(
+            tunnel_upstreams(true, &mixed).unwrap(),
+            vec!["[2001:4860:4860::8844]:53".parse::<SocketAddr>().unwrap()]
+        );
+
+        // `replace` with nothing parseable in it: the fallback is all that is
+        // left, and an empty override would forward nowhere at all.
+        let junk = ServerOverride {
+            servers: strs(&["not-an-address"]),
+            replace: true,
+        };
+        assert_eq!(
+            tunnel_upstreams(true, &junk).unwrap().len(),
             PUBLIC_FALLBACK_DNS_V6.len()
         );
     }

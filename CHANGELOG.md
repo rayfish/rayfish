@@ -23,12 +23,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gateway on a network whose coordinator is older than this feature reports
   nothing either way; it stays selectable, since refusing would rule out every
   gateway on that network, and `ray exit-node use` tells you the claim is
-  unverified. While the tunnel is up, the daemon's own
+  unverified. The check runs the other way too: a gateway that is itself in
+  IPv6-only mode cannot carry a dual-stack client's IPv4, because it never routes
+  the mesh IPv4 a reply would come back on, so picking one is refused with that
+  reason rather than working for IPv6 and silently dropping IPv4. While the
+  tunnel is up, the daemon's own
   DNS forwarder is pointed at an IPv6 resolver so its lookups go through the exit
   rather than around it; on Linux hosts using systemd-resolved, NetworkManager or
   resolvconf, applications' non-`.ray` lookups still leave directly, and the
-  daemon logs a warning saying so. Offering an exit node was never affected by
-  the mode.
+  daemon logs a warning saying so. If you pinned your own resolvers with
+  `ray config set dns-upstreams … --replace` and none of them are IPv6, yours are
+  kept rather than swapped for public ones: they stay reachable over the IPv4 this
+  mode leaves direct, so those lookups go around the exit instead of to a resolver
+  you did not choose. Offering an exit node was never affected by the mode.
 - **`ray config set dns-upstreams` takes IPv6 addresses.** Used by an exit-node
   tunnel in IPv6-only mode, which has no IPv4 to reach a v4 resolver over. Naming
   only IPv6 servers no longer lets rayfish take over `/etc/resolv.conf` on a host

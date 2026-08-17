@@ -48,6 +48,16 @@ pub enum ExitFamilies {
     Unknown,
     /// The gateway can egress IPv4 only.
     V4,
+    /// The gateway can egress IPv6 only: it has an IPv6 uplink, but its own data
+    /// plane is IPv6-only, so it never routed mesh IPv4 in the first place.
+    ///
+    /// The uplink is not what is missing here, the return path is. An IPv6-only
+    /// host assigns its mesh IPv4 as a `/32` with no `100.64.0.0/10` route
+    /// (`tun::create`), so a client's tunnelled IPv4 reaches the gateway and is
+    /// masqueraded out fine, and the reply, un-NATted back to the client's mesh
+    /// `100.x`, finds no route into the TUN and leaves toward a CGNAT address on
+    /// the physical uplink. One-way, and silent from both ends.
+    V6,
     /// The gateway can egress both families.
     Dual,
 }
@@ -57,7 +67,13 @@ impl ExitFamilies {
     /// callers that need to distinguish "no" from "nobody said" must ask
     /// [`Self::is_unknown`] first.
     pub fn carries_v6(self) -> bool {
-        matches!(self, Self::Dual)
+        matches!(self, Self::Dual | Self::V6)
+    }
+
+    /// Whether this claim says IPv4 egress works, on the same terms as
+    /// [`Self::carries_v6`].
+    pub fn carries_v4(self) -> bool {
+        matches!(self, Self::Dual | Self::V4)
     }
 
     /// Whether the roster carries no claim, as distinct from a claim of "no".
@@ -66,10 +82,20 @@ impl ExitFamilies {
         matches!(self, Self::Unknown)
     }
 
-    /// The claim a gateway makes about itself, where there is no third state:
-    /// it either found an IPv6 default route or it did not.
-    pub fn from_v6_uplink(has_v6: bool) -> Self {
-        if has_v6 { Self::Dual } else { Self::V4 }
+    /// The claim a gateway makes about itself: whether it found an IPv6 default
+    /// route, and whether its own data plane carries IPv4 at all.
+    ///
+    /// A gateway in IPv6-only mode with no IPv6 uplink can carry nothing, and
+    /// says so as [`Self::V4`] rather than inventing a fourth "neither" state:
+    /// the claim is read by clients deciding what will reach them, and both
+    /// halves of that answer are already "no". It has no v6 to offer, and its v4
+    /// has no return path, so every client refuses it either way.
+    pub fn from_uplink(has_v6: bool, ipv6_only: bool) -> Self {
+        match (has_v6, ipv6_only) {
+            (true, false) => Self::Dual,
+            (true, true) => Self::V6,
+            (false, _) => Self::V4,
+        }
     }
 }
 
