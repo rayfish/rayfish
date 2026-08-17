@@ -887,10 +887,16 @@ pub const LOG_CHUNK_BYTES: usize = MAX_FRAME_LEN / 4;
 /// frame.
 ///
 /// Structs are serialized with `to_vec_named` (field-name maps, not positional
-/// arrays) — required for correctness when a struct uses `skip_serializing_if`:
-/// with positional arrays, skipping a field shifts later fields into the wrong
-/// slot on decode (e.g. `HostSuggestions` with `default: None` + non-empty
-/// `allows` misaligns and fails with "invalid type: map, expected a string").
+/// arrays). IPC has no version negotiation and is read by a CLI whose binary is
+/// swapped before the daemon restarts, so both sides must tolerate a field the
+/// other does not know; a named map is what makes that free, and it is why
+/// `skip_serializing_if` is still safe on the types below.
+///
+/// The network wire made the opposite choice (see CLAUDE.md): it is
+/// array-encoded, gated on an ALPN, and a `skip_serializing_if` there shifts
+/// every later field into the wrong slot. `HostSuggestions` crosses both
+/// boundaries and so carries no skips at all.
+///
 /// The decoder (`from_slice`) handles both named and unnamed representations,
 /// so it's forward-compatible with older peers.
 pub struct MsgpackCodec<T> {
@@ -1244,11 +1250,11 @@ mod tests {
 
     #[test]
     fn firewall_suggest_roundtrips_through_named_codec() {
-        // Regression: with positional-array (`to_vec`) serialization, a
-        // `HostSuggestions` whose `default` is `None` (skipped) but whose
-        // `allows` is non-empty misaligns on decode and fails with
-        // "invalid type: map, expected a string". The codec must serialize
-        // structs as named maps so `skip_serializing_if` is safe.
+        // `HostSuggestions` reaches the CLI through this codec and the mesh
+        // through the signed blob, and the two encodings disagree about what an
+        // absent field means. It carries no `skip_serializing_if` for that
+        // reason (see `a_deny_only_suggestion_does_not_decode_as_an_allow`); this
+        // pins the IPC half, that one pins the wire half.
         use crate::policy::HostSuggestions;
         use std::collections::BTreeMap;
 

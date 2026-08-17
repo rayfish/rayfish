@@ -91,11 +91,12 @@ fn ipv6_gateway_unverified(m: &Member, ipv6_only: bool) -> bool {
 /// and reaching that method needs a live registry.
 ///
 /// `advertised` is `(exit_node, exit_families)` as the signed roster holds it;
-/// `claimed` is what we would send. An [`ExitFamilies::Unknown`] on the roster
-/// compares equal to anything: only a coordinator that knows the field can write
-/// it, so demanding it from one that cannot is demanding something that will
-/// never arrive, and this gates a 30-second backstop tick that reconverges (a
-/// pkarr resolve, plus a re-delivery to every coordinator) each time it says yes.
+/// `claimed` is what we would send. The families are compared only while the
+/// offer stands, and an [`ExitFamilies::Unknown`] on the roster compares equal to
+/// anything; both exemptions exist because this gates a 30-second backstop tick
+/// that reconverges (a pkarr resolve, plus a re-delivery to every coordinator)
+/// each time it says yes, so a comparison that cannot balance is not a missing
+/// feature but a permanent loop.
 fn offer_disagrees(
     advertised: (bool, ExitFamilies),
     offering: bool,
@@ -105,12 +106,57 @@ fn offer_disagrees(
     if advertised_offer != offering {
         return true;
     }
-    // Not offering means there is no capability to state, so `Unknown` on both
-    // sides is the settled state rather than a gap.
+    // Not offering means there is no capability to state, so the roster's copy
+    // is not something to compare against. It is also not `Unknown` in general:
+    // withdrawing an offer publishes `Unknown`, which `record_exit_offer` maps
+    // back onto the claim already held (silence never erases a statement), so a
+    // node that stops offering leaves a `Dual` behind that it would then
+    // disagree with forever. The families only mean anything while the offer
+    // stands, and selection already gates on `exit_node`.
+    if !offering {
+        return false;
+    }
+    // An `Unknown` on the roster compares equal to anything: only a coordinator
+    // that knows the field can write it, so demanding it from one that cannot is
+    // demanding something that will never arrive, and this gates a 30-second
+    // backstop tick that reconverges (a pkarr resolve, plus a re-delivery to
+    // every coordinator) each time it says yes.
     !advertised_families.is_unknown() && advertised_families != claimed
 }
 
+/// Whether a reconverge should ask the daemon to re-run the exit reconcile.
+/// Split out from [`NetworkRegistry::nudge_exit_reapply`] for the same reason as
+/// [`offer_disagrees`]: it is the whole decision, and reaching the method needs a
+/// live registry.
+///
+/// Two states need it, and only one of them is a pending selection. An
+/// *installed* tunnel is the other: [`ipv6_gateway_refusal`] is a standing
+/// property re-checked on every apply, and the roster is exactly where it
+/// changes, so a gateway that loses its IPv6 uplink (or a coordinator that
+/// upgrades and fills in a claim we had to guess at) has to reach a re-apply.
+/// Keying the nudge on `exit_selection_pending` alone gets this backwards: the
+/// flag is cleared the moment the tunnel installs, so the case the re-check
+/// exists for is the one case it never sees, and the client keeps a full IPv6
+/// tunnel into a gateway with nowhere to send it.
+///
+/// Cheap when nothing changed: the listener re-runs `apply_exit_node`, which is
+/// idempotent, and this only fires on a reconverge that actually applied.
+fn wants_exit_reapply(selection_pending: bool, tunnel_installed: bool) -> bool {
+    selection_pending || tunnel_installed
+}
+
 impl NetworkRegistry {
+    /// Ask the daemon to re-run the exit reconcile, if a reconverge could have
+    /// changed its answer. See [`wants_exit_reapply`].
+    pub(crate) fn nudge_exit_reapply(&self) {
+        if wants_exit_reapply(
+            self.exit_selection_pending.load(Ordering::Relaxed),
+            self.exit_client.is_active(),
+        ) {
+            self.exit_reapply.notify_one();
+        }
+    }
+
     /// A network's roster, or empty if we don't have that network. Keeps the
     /// lookup-then-lock-then-clone dance (and the lock guard) out of the callers.
     pub(crate) fn roster(&self, network: &str) -> Vec<Member> {
@@ -796,6 +842,24 @@ mod tests {
         }
     }
 
+    /// An installed tunnel has to be re-nudged on a reconverge, not just a
+    /// pending selection.
+    ///
+    /// `reload_exit_state` clears `exit_selection_pending` as soon as the tunnel
+    /// installs, so keying the nudge on that flag alone means the standing IPv6
+    /// re-check never runs against a live tunnel: the roster is where a gateway's
+    /// claim changes, and a gateway that loses its IPv6 uplink would keep the
+    /// client's whole tunnel pointed into a black hole until the next `ray up`.
+    #[test]
+    fn a_live_tunnel_is_re_nudged_even_with_no_pending_selection() {
+        assert!(super::wants_exit_reapply(false, true));
+        assert!(super::wants_exit_reapply(true, false));
+        assert!(super::wants_exit_reapply(true, true));
+        // Nothing selected and nothing installed: the reconverge has no exit
+        // state to re-derive, so it stays quiet.
+        assert!(!super::wants_exit_reapply(false, false));
+    }
+
     /// The offer-sync comparison must converge against a coordinator that cannot
     /// write `exit_families`, which is every coordinator on 0.3.0.
     ///
@@ -826,6 +890,15 @@ mod tests {
 
         // Not offering: nothing to state, so no gap either way.
         assert!(!super::offer_disagrees((false, Unknown), false, Unknown));
+
+        // Withdrawing an offer settles, which needs the families ignored rather
+        // than compared. Withdrawal publishes `Unknown`, and `record_exit_offer`
+        // maps that back onto the claim already held, so the roster keeps the
+        // `Dual` it was told while `exit_node` goes false. Comparing the two
+        // there is a disagreement nothing can ever resolve: the withdrawal is
+        // already delivered, and republishing it changes nothing.
+        assert!(!super::offer_disagrees((false, Dual), false, Unknown));
+        assert!(!super::offer_disagrees((false, V4), false, Unknown));
 
         // Not on the roster at all while offering is a real disagreement: the
         // delivery missed every coordinator and the backstop is what retries it.

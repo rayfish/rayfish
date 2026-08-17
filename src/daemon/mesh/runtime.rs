@@ -1288,7 +1288,7 @@ impl Daemon {
             tun::unroute_default_via_tun(tun_name).await;
             crate::exit_node::remove_tunnel_exclusions();
             crate::exit_node::clear_physical_defaults();
-            if crate::exit_node::set_full_tunnel(false) {
+            if crate::exit_node::set_full_tunnel(false, false) {
                 self.transport.endpoint.network_change().await;
                 // The rebind that releases the pin drops every direct path too.
                 self.nudge_all_peers();
@@ -1308,7 +1308,7 @@ impl Daemon {
             // Pin and rebind before the routes go in: `network_change` rebinds
             // iroh's UDP socket to apply the pin, and until it has, the transport
             // has nothing keeping it out of the tunnel.
-            if !crate::exit_node::set_full_tunnel(true) {
+            if !crate::exit_node::set_full_tunnel(true, !self.ipv6_only.enabled()) {
                 self.transport.endpoint.network_change().await;
             }
             let conn = self.exit_peer_conn().await;
@@ -1470,7 +1470,7 @@ impl Daemon {
             Ok(()) => None,
             Err(e) => {
                 tun::unroute_default_via_tun(tun_name).await;
-                if crate::exit_node::set_full_tunnel(false) {
+                if crate::exit_node::set_full_tunnel(false, false) {
                     self.transport.endpoint.network_change().await;
                 }
                 tracing::warn!(error = %e, "failed to install exit-node client routing");

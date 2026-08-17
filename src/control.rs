@@ -778,7 +778,7 @@ mod tests {
             },
         ];
         for msg in msgs {
-            let body = rmp_serde::to_vec_named(&msg).unwrap();
+            let body = rmp_serde::to_vec(&msg).unwrap();
             let decoded: ConnectMsg = rmp_serde::from_slice(&body).unwrap();
             assert_eq!(msg, decoded);
         }

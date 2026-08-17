@@ -342,12 +342,7 @@ pub(crate) async fn reconverge_and_apply(
     // and go to zero peers. Quiet no-op when the flag already matches.
     registry.sync_exit_offers().await;
     registry.sync_ipv6_only().await;
-    if registry
-        .exit_selection_pending
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        registry.exit_reapply.notify_one();
-    }
+    registry.nudge_exit_reapply();
     tracing::info!(network = %network_name, "reconverged from signed record");
 }
 
@@ -749,18 +744,14 @@ pub(crate) async fn fetch_and_apply_blob(
 
     // Exit-node reconciliation. The fresh roster may have wiped our advertised
     // offer (a coordinator rebuild) or missed one made while every coordinator was
-    // offline: re-sync the flag with what we actually offer. And it may contain
-    // the exit peer a pending client selection has been waiting on since boot:
+    // offline: re-sync the flag with what we actually offer. And it may carry the
+    // exit peer a pending client selection has been waiting on since boot, or a
+    // changed capability claim from the gateway a live tunnel already points at:
     // nudge the daemon to re-run the exit reconcile rather than leaking traffic
-    // until the next `ray up`. Both are cheap no-ops otherwise.
+    // until the next `ray up`. All cheap no-ops otherwise.
     registry.sync_exit_offers().await;
     registry.sync_ipv6_only().await;
-    if registry
-        .exit_selection_pending
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        registry.exit_reapply.notify_one();
-    }
+    registry.nudge_exit_reapply();
     ReconvergeOutcome::Applied
 }
 

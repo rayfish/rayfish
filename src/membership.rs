@@ -35,9 +35,11 @@ pub fn now_secs() -> u64 {
 /// never converge look like a gateway with no IPv6: see
 /// `NetworkRegistry::exit_offer_out_of_sync`.
 ///
-/// [`Self::Unknown`] is the serde default and is skipped on the way out, so a
-/// roster that carries no claim encodes byte-for-byte as it did before this
-/// field existed and the group blob hash is unaffected.
+/// [`Self::Unknown`] is the serde default, and it is written like any other
+/// value: the roster is array-encoded, where a skipped field is not an absent key
+/// but a missing slot that shifts everything after it. Absent means only "the
+/// array ended before this field", which is what an older, shorter roster looks
+/// like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ExitFamilies {
     /// No claim on the roster. Either the member never made one, or a
@@ -58,7 +60,8 @@ impl ExitFamilies {
         matches!(self, Self::Dual)
     }
 
-    /// Takes `&self` so it can serve as serde's `skip_serializing_if`.
+    /// Whether the roster carries no claim, as distinct from a claim of "no".
+    /// Not a `skip_serializing_if`, and must not become one: see the type docs.
     pub fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown)
     }
@@ -1577,6 +1580,40 @@ mod tests {
             &BTreeSet::new(),
         );
         assert_ne!(h_empty, h_sf);
+    }
+
+    /// A deny-only suggestion must survive the blob round trip as a *deny*.
+    ///
+    /// The blob is array-encoded, so a `skip_serializing_if` on
+    /// `HostSuggestions::allows` would drop slot 0 and slide `denies` into it.
+    /// Both fields are `BTreeMap<String, String>`, so that decodes clean and
+    /// silently inverted, and every member then materializes the blacklist as an
+    /// allow rule. This is the one place the inversion is reachable from a
+    /// signed, network-distributed value, so it is pinned here rather than left
+    /// to the encoding convention.
+    #[test]
+    fn a_deny_only_suggestion_does_not_decode_as_an_allow() {
+        use ray_proto::{HostSuggestions, SuggestedFirewall};
+        let members = make_member_list(&[1, 2]);
+        let mut hs = HostSuggestions::default();
+        hs.denies.insert("eve".to_string(), "tcp:22".to_string());
+        assert!(
+            hs.allows.is_empty(),
+            "the empty side is the one that is cut"
+        );
+        let mut sf = SuggestedFirewall::new();
+        sf.insert("*".to_string(), hs.clone());
+
+        let bytes = canonical_group_bytes(
+            &members,
+            &ApprovedList::new(),
+            &sf,
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        let blob = decode_group_blob(&bytes).expect("blob decodes");
+        assert_eq!(blob.suggested_firewall.get("*"), Some(&hs));
     }
 
     #[test]

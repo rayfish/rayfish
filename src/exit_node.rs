@@ -64,11 +64,27 @@ pub const SOCKET_MARK: u32 = 0x7261; // "ra"
 /// tunnel is actually up, and force a rebind when this flips.
 static FULL_TUNNEL: AtomicBool = AtomicBool::new(false);
 
+/// Whether the live tunnel claims IPv4, i.e. it is not an IPv6-only one. Only the
+/// macOS pin reads it, and only to stay off the family it did not claim.
+///
+/// Pinning is per-socket and per-family, so a mode that tunnels IPv6 alone must
+/// not pin the IPv4 sockets: that would bind the whole IPv4 underlay to the
+/// physical interface and carve it out of whichever co-resident VPN owns IPv4 on
+/// that Mac, which is the configuration IPv6-only mode exists to share with.
+/// `tunnel_relevant` already applies exactly this filter to the host-route
+/// exclusions one layer up; this is the same rule for the coarser knob.
+static FULL_TUNNEL_V4: AtomicBool = AtomicBool::new(false);
+
 /// Records whether a full tunnel is up, returning the previous value. Whenever this
 /// flips, the caller must trigger an endpoint rebind (`Endpoint::network_change`)
 /// so already-bound sockets pick it up; when it did not flip, the rebind can be
 /// skipped.
-pub fn set_full_tunnel(on: bool) -> bool {
+///
+/// `claims_v4` says whether that tunnel carries IPv4 (false in IPv6-only mode).
+/// It is not part of the returned "did it flip" answer: it only ever changes
+/// alongside a daemon restart, since the mode is fixed when the TUN is created.
+pub fn set_full_tunnel(on: bool, claims_v4: bool) -> bool {
+    FULL_TUNNEL_V4.store(on && claims_v4, Ordering::Release);
     FULL_TUNNEL.swap(on, Ordering::AcqRel)
 }
 
@@ -77,6 +93,11 @@ pub fn set_full_tunnel(on: bool) -> bool {
 /// DNS (so name resolution goes out via the exit) or only `.ray` (split DNS).
 pub fn full_tunnel_active() -> bool {
     FULL_TUNNEL.load(Ordering::Acquire)
+}
+
+/// Whether the live tunnel claims IPv4. See [`FULL_TUNNEL_V4`].
+pub fn full_tunnel_claims_v4() -> bool {
+    FULL_TUNNEL_V4.load(Ordering::Acquire)
 }
 
 /// The configurator iroh runs on every socket it opens (both underlay UDP sockets
@@ -172,6 +193,11 @@ fn bind_outside_tunnel(sock: &SockRef<'_>, domain: Domain) -> std::io::Result<()
         return Ok(());
     }
     let v6 = domain == Domain::IPV6;
+    // Nothing to keep this socket out of if its family was never claimed. See
+    // [`FULL_TUNNEL_V4`].
+    if !v6 && !full_tunnel_claims_v4() {
+        return Ok(());
+    }
     let snapshot = PHYSICAL_DEFAULTS.lock().unwrap().clone();
     let name = match snapshot {
         Some((v4_if, v6_if)) => {
@@ -1031,7 +1057,7 @@ pub fn install_client_routing(tun_name: &str, ipv6_only: bool) -> Result<()> {
     // unrouted, taking the co-resident VPN's IPv4 down with it.
     for family in ["-4", "-6"] {
         if !tunnel_families(ipv6_only).contains(&family) {
-            remove_client_rules(family);
+            remove_client_rules(family, RuleSweep::All);
             let _ = run_ip(&[family, "route", "flush", "table", EXIT_TABLE]);
         }
     }
@@ -1043,7 +1069,9 @@ pub fn install_client_routing(tun_name: &str, ipv6_only: bool) -> Result<()> {
         run_ip(&[
             family, "route", "replace", "default", "dev", tun_name, "table", EXIT_TABLE,
         ])?;
-        remove_client_rules(family);
+        // Keeps the catch-all standing: everything below is a rebuild, and the
+        // rules are re-added one `ip` process at a time. See [`RuleSweep`].
+        remove_client_rules(family, RuleSweep::KeepCatchAll);
         // Ahead of the two `main` rules below, because neither of them can find a
         // co-resident VPN's prefixes: those live in its own table, and
         // `PREF_MAIN`'s `suppress_prefixlength 0` only rescues routes that are in
@@ -1113,15 +1141,20 @@ pub fn install_client_routing(tun_name: &str, ipv6_only: bool) -> Result<()> {
             "pref",
             PREF_MAIN,
         ])?;
-        run_ip(&[
-            family,
-            "rule",
-            "add",
-            "table",
-            EXIT_TABLE,
-            "pref",
-            PREF_TUNNEL,
-        ])?;
+        // Last, and only if the rebuild above did not inherit it: `ip rule add` is
+        // not idempotent, so adding it unconditionally would stack a duplicate on
+        // every re-apply, and `remove_client_rules` deletes one match at a time.
+        if !catch_all_installed(family) {
+            run_ip(&[
+                family,
+                "rule",
+                "add",
+                "table",
+                EXIT_TABLE,
+                "pref",
+                PREF_TUNNEL,
+            ])?;
+        }
     }
     tracing::info!(
         tun = tun_name,
@@ -1137,7 +1170,7 @@ pub fn install_client_routing(tun_name: &str, ipv6_only: bool) -> Result<()> {
 #[cfg(target_os = "linux")]
 pub fn teardown_client_routing() {
     for family in ["-4", "-6"] {
-        remove_client_rules(family);
+        remove_client_rules(family, RuleSweep::All);
         let _ = run_ip(&[family, "route", "flush", "table", EXIT_TABLE]);
     }
     let _ = nft_load(&drop_table(CLIENT_TABLE));
@@ -1148,6 +1181,56 @@ pub fn teardown_client_routing() {
 /// family, read back from `ip rule show`. Matches only our own shape
 /// (`<pref>: from <addr> lookup main`) so a foreign rule sharing the pref is left
 /// alone. See [`parse_source_rules`] for the parsing.
+#[cfg(target_os = "linux")]
+/// How much of our rule set [`remove_client_rules`] takes down.
+///
+/// Teardown wants [`RuleSweep::All`]. A re-install wants
+/// [`RuleSweep::KeepCatchAll`], because the catch-all at [`PREF_TUNNEL`] is the
+/// only thing standing between tunnel-bound traffic and `main`: drop it and every
+/// packet leaves the physical uplink, sourced from this host's real address,
+/// until the rebuild puts it back. That is not instant. The rebuild issues one
+/// `ip` process per mirrored foreign prefix, and a co-resident VPN with a few
+/// hundred peers has a few hundred of them, so the gap is long enough to leak
+/// real connections. Since the rule never varies (`table <EXIT_TABLE> pref
+/// <PREF_TUNNEL>`, no per-run content), leaving it standing across the rebuild
+/// costs nothing and closes the window: the routes underneath it are updated with
+/// `route replace`, which is atomic per destination.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuleSweep {
+    All,
+    KeepCatchAll,
+}
+
+/// Whether our catch-all rule is already installed for one family, read back from
+/// `ip rule show` the same way the other rule readbacks work.
+#[cfg(target_os = "linux")]
+fn catch_all_installed(family: &str) -> bool {
+    let out = match Command::new("ip").args([family, "rule", "show"]).output() {
+        Ok(out) if out.status.success() => out.stdout,
+        _ => return false,
+    };
+    parse_catch_all(&String::from_utf8_lossy(&out))
+}
+
+/// Whether `ip rule show` output contains our catch-all: at [`PREF_TUNNEL`], no
+/// selector, looking up our table.
+#[cfg(target_os = "linux")]
+fn parse_catch_all(show: &str) -> bool {
+    show.lines().any(|line| {
+        let Some((pref, rest)) = line.split_once(':') else {
+            return false;
+        };
+        if pref.trim() != PREF_TUNNEL {
+            return false;
+        }
+        // Same readback convention as `parse_foreign_rules`: iproute2 prints the
+        // `from all` selector even though the rule was added without one.
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        matches!(f.as_slice(), ["from", "all", "lookup", table] if *table == EXIT_TABLE)
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn installed_source_rules(family: &str) -> Vec<String> {
     let out = match Command::new("ip").args([family, "rule", "show"]).output() {
@@ -1218,7 +1301,7 @@ fn parse_source_rules(show: &str) -> Vec<String> {
 /// destroy a foreign rule (another VPN's, systemd-networkd's) that happens to
 /// sit at one of our preference numbers.
 #[cfg(target_os = "linux")]
-fn remove_client_rules(family: &str) {
+fn remove_client_rules(family: &str, sweep: RuleSweep) {
     // Source rules are removed by reading back what is actually installed, not by
     // re-deriving the address list: a lease change between install and teardown
     // would otherwise strand a rule pointing at an address we no longer hold. Only
@@ -1268,15 +1351,17 @@ fn remove_client_rules(family: &str) {
         "pref",
         PREF_MAIN,
     ]);
-    let _ = run_ip(&[
-        family,
-        "rule",
-        "del",
-        "table",
-        EXIT_TABLE,
-        "pref",
-        PREF_TUNNEL,
-    ]);
+    if sweep == RuleSweep::All {
+        let _ = run_ip(&[
+            family,
+            "rule",
+            "del",
+            "table",
+            EXIT_TABLE,
+            "pref",
+            PREF_TUNNEL,
+        ]);
+    }
 }
 
 /// One route, as [`parse_foreign_routes`] reads it back off `ip route show`.
@@ -1382,10 +1467,35 @@ fn mirror_foreign_routes(family: &str, tun_name: &str) -> Vec<String> {
 /// guess each one's arity we re-emit the three clauses that decide where a packet
 /// goes and let the kernel derive the rest. A copy in our own table has no need to
 /// resemble the original in anything else.
+///
+/// A multipath route is the one shape that does not fit on its line: its nexthops
+/// are printed as indented continuation lines and the route line itself carries no
+/// `dev` at all, so it is read as a group. Dropping it is not harmless, which is
+/// why it is handled rather than excluded: the prefix then falls to our catch-all
+/// and that VPN's destinations go into our tunnel and nowhere.
+///
+/// Non-unicast entries (`unreachable`, `blackhole`, `prohibit`) are still skipped,
+/// since they lead with the type instead of a destination. That is a deliberate
+/// gap and not the same failure: those destinations are ones the other VPN wants
+/// to fail, so tunnelling them costs a wrong answer rather than a lost route.
 #[cfg(target_os = "linux")]
 fn parse_foreign_routes(show: &str, tun_name: &str) -> Vec<MirroredRoute> {
-    show.lines()
-        .filter_map(|line| {
+    // Group each route with the indented `nexthop` lines that belong to it.
+    let mut groups: Vec<Vec<&str>> = Vec::new();
+    for line in show.lines() {
+        if line.starts_with([' ', '\t']) {
+            if let Some(last) = groups.last_mut() {
+                last.push(line);
+            }
+        } else if !line.trim().is_empty() {
+            groups.push(vec![line]);
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|group| {
+            let line = group[0];
+            let nexthops = &group[1..];
             let fields: Vec<&str> = line.split_whitespace().collect();
             let dest = *fields.first()?;
             // A default is another full tunnel: mirroring it would hand our egress
@@ -1411,17 +1521,55 @@ fn parse_foreign_routes(show: &str, tun_name: &str) -> Vec<MirroredRoute> {
             if matches!(table, "main" | "local" | "default") || table == EXIT_TABLE {
                 return None;
             }
-            let dev = value_after("dev")?;
-            if dev == tun_name {
-                return None;
-            }
             let mut spec: Vec<String> = Vec::new();
-            if let Some(via) = value_after("via") {
-                spec.extend(["via".to_string(), via.to_string()]);
-            }
-            spec.extend(["dev".to_string(), dev.to_string()]);
-            if let Some(metric) = value_after("metric") {
-                spec.extend(["metric".to_string(), metric.to_string()]);
+            match value_after("dev") {
+                Some(dev) => {
+                    if dev == tun_name {
+                        return None;
+                    }
+                    if let Some(via) = value_after("via") {
+                        spec.extend(["via".to_string(), via.to_string()]);
+                    }
+                    spec.extend(["dev".to_string(), dev.to_string()]);
+                    if let Some(metric) = value_after("metric") {
+                        spec.extend(["metric".to_string(), metric.to_string()]);
+                    }
+                }
+                // Multipath: the nexthops carry the `dev`, one per continuation
+                // line. Re-emitted in full rather than collapsed to the first,
+                // since `ip route replace` takes the same syntax back.
+                None => {
+                    for hop in nexthops {
+                        let f: Vec<&str> = hop.split_whitespace().collect();
+                        if f.first() != Some(&"nexthop") {
+                            continue;
+                        }
+                        let at = |key: &str| {
+                            f.iter()
+                                .position(|x| *x == key)
+                                .and_then(|i| f.get(i + 1))
+                                .copied()
+                        };
+                        let dev = at("dev")?;
+                        // Our own TUN among the nexthops makes the copy partly a
+                        // copy of the route we are installing: leave the whole
+                        // thing alone rather than mirror half of it.
+                        if dev == tun_name {
+                            return None;
+                        }
+                        spec.push("nexthop".to_string());
+                        if let Some(via) = at("via") {
+                            spec.extend(["via".to_string(), via.to_string()]);
+                        }
+                        spec.extend(["dev".to_string(), dev.to_string()]);
+                        if let Some(weight) = at("weight") {
+                            spec.extend(["weight".to_string(), weight.to_string()]);
+                        }
+                    }
+                    if spec.is_empty() {
+                        return None;
+                    }
+                }
             }
             Some(MirroredRoute {
                 dest: dest.to_string(),
@@ -1940,6 +2088,62 @@ mod tests {
         assert!(PREF_FOREIGN.parse::<u32>().unwrap() > 0);
     }
 
+    /// A re-install must recognize its own catch-all and leave it standing.
+    ///
+    /// It is the only rule between tunnel-bound traffic and `main`, and the
+    /// rebuild around it is one `ip` process per mirrored prefix, so tearing it
+    /// down first leaks every packet out the physical uplink for as long as that
+    /// takes. Recognizing it also has to be exact: a co-resident VPN's own
+    /// catch-all has the identical shape and differs only in the preference, so a
+    /// looser match would read someone else's rule as ours and skip installing
+    /// one at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn our_catch_all_is_recognized_and_a_foreign_one_is_not() {
+        assert!(parse_catch_all("102:\tfrom all lookup 29793\n"));
+        assert!(parse_catch_all(
+            "0:\tfrom all lookup local\n102:\tfrom all lookup 29793\n5270:\tfrom all lookup 52\n"
+        ));
+        // Tailscale's catch-all: same shape, different pref and table.
+        assert!(!parse_catch_all("5270:\tfrom all lookup 52\n"));
+        // Our pref, but pointing somewhere else: not the rule we would install.
+        assert!(!parse_catch_all("102:\tfrom all lookup main\n"));
+        // A selector makes it a different rule (this is the PREF_FOREIGN shape).
+        assert!(!parse_catch_all(
+            "102:\tfrom all to 10.0.0.0/8 lookup 29793\n"
+        ));
+        // Nothing installed at all, which is what a first install sees.
+        assert!(!parse_catch_all(
+            "0:\tfrom all lookup local\n32766:\tfrom all lookup main\n"
+        ));
+    }
+
+    /// An IPv6-only tunnel must not pin the IPv4 sockets.
+    ///
+    /// The pin is what keeps iroh's underlay out of the tunnel, so it is only
+    /// wanted for a family the tunnel actually claimed. Pinning IPv4 in this mode
+    /// binds the whole IPv4 underlay to the physical interface and carves it out
+    /// of the co-resident VPN that owns IPv4 on that host, which is the setup the
+    /// mode exists to share with. Sole owner of these process-wide statics; a
+    /// second test touching them needs a lock between the two.
+    #[test]
+    fn an_ipv6_only_tunnel_does_not_claim_v4_for_the_pin() {
+        set_full_tunnel(true, false);
+        assert!(full_tunnel_active(), "the tunnel itself is up");
+        assert!(
+            !full_tunnel_claims_v4(),
+            "IPv6-only mode leaves IPv4 to the other VPN, so its sockets stay unpinned"
+        );
+
+        set_full_tunnel(true, true);
+        assert!(full_tunnel_claims_v4(), "a dual-stack tunnel pins both");
+
+        // Coming down clears it, or the next dual-stack-looking read is stale.
+        set_full_tunnel(false, false);
+        assert!(!full_tunnel_active());
+        assert!(!full_tunnel_claims_v4());
+    }
+
     /// Pinning iroh to a tunnel interface puts its transport inside the tunnel it
     /// is carrying, which is worse than not pinning at all.
     #[cfg(target_os = "macos")]
@@ -2142,6 +2346,49 @@ unreachable fd00::/8 dev lo table 52 metric 1024 pref medium
                 "{absent} should not be mirrored"
             );
         }
+    }
+
+    /// A multipath route is printed across several lines, and the route line
+    /// carries no `dev` at all.
+    ///
+    /// Reading only the first line drops it, and a dropped foreign route is not a
+    /// no-op: the prefix falls through to our catch-all and that VPN's
+    /// destinations go into our tunnel and nowhere. Format below is real
+    /// `ip route show table all` output.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_multipath_foreign_route_is_mirrored_with_all_its_nexthops() {
+        let show = "\
+172.20.0.0/16 table 52
+\tnexthop via 10.0.0.1 dev eth0 weight 1
+\tnexthop via 10.0.1.1 dev eth1 weight 1
+10.7.0.0/16 table 52
+\tnexthop via 10.0.0.1 dev ray0 weight 1
+\tnexthop via 10.0.1.1 dev eth1 weight 1
+192.168.5.0/24 dev eth0 table 52
+";
+        let got = parse_foreign_routes(show, "ray0");
+        assert_eq!(
+            got,
+            vec![
+                MirroredRoute {
+                    dest: "172.20.0.0/16".into(),
+                    spec: strs(&[
+                        "nexthop", "via", "10.0.0.1", "dev", "eth0", "weight", "1", "nexthop",
+                        "via", "10.0.1.1", "dev", "eth1", "weight", "1",
+                    ]),
+                },
+                // The single-path route after a multipath one still parses: the
+                // grouping must end at the next unindented line.
+                MirroredRoute {
+                    dest: "192.168.5.0/24".into(),
+                    spec: strs(&["dev", "eth0"]),
+                },
+            ]
+        );
+        // Our own TUN among the nexthops means the copy would partly duplicate the
+        // route we are installing, so the whole entry is left alone.
+        assert!(!got.iter().any(|r| r.dest == "10.7.0.0/16"));
     }
 
     /// The IPv4 side, where the range that matters is the one IPv6-only mode

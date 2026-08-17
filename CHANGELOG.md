@@ -76,6 +76,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Re-applying an exit node no longer lets traffic out around the tunnel while
+  it rebuilds.** Every `ray exit-node` command, and every roster change that
+  reaches a live tunnel, rebuilds the routing rules. The catch-all that sends
+  traffic into the tunnel was torn down first and re-added last, so anything
+  sent in between left the physical uplink with the host's own address. It now
+  stays in place across the rebuild.
 - **Using an exit node no longer cuts off another VPN on the same host.** The
   full tunnel's routing rules sit above the ones Tailscale (and anything else
   doing policy routing) installs, and their routes live in a table of their own

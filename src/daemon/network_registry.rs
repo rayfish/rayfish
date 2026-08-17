@@ -102,7 +102,7 @@ pub(crate) struct NetworkRegistry {
     /// re-runs the exit reconcile instead of leaking traffic until the next
     /// `ray up`.
     pub(crate) exit_selection_pending: AtomicBool,
-    /// Nudged by reconverge when [`Self::exit_selection_pending`] is set; the
+    /// Nudged by reconverge via [`NetworkRegistry::nudge_exit_reapply`]; the
     /// daemon listens and re-runs `apply_exit_node`. A channel rather than a
     /// direct call because the kernel plumbing lives on `Daemon`, above the
     /// registry in the service graph.

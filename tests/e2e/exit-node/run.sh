@@ -81,7 +81,16 @@ clean_kernel(){
   for h in "$@"; do
     on "$h" "nft delete table inet rayfish_exit; nft delete table inet rayfish_exit_client" >/dev/null 2>&1
     for f in -4 -6; do
-      for p in 100 101 102; do on "$h" "ip $f rule del pref $p" >/dev/null 2>&1; done
+      # 98 and 99 hold one rule per mirrored foreign prefix and per physical
+      # address, so a single `del` leaves the rest behind. Leftovers at 98 are the
+      # ones that break a later run outright: they read back as
+      # `98: from all to <dest> lookup 29793`, so step 9's "no IPv4 tunnel rule in
+      # IPv6-only mode" grep matches state this run never installed.
+      for p in 98 99 100 101 102; do
+        for _ in $(seq 1 64); do
+          on "$h" "ip $f rule del pref $p" >/dev/null 2>&1 || break
+        done
+      done
       on "$h" "ip $f route flush table $TABLE" >/dev/null 2>&1
     done
     on "$h" "sysctl -qw net.ipv4.ip_forward=0 net.ipv6.conf.all.forwarding=0" >/dev/null 2>&1
