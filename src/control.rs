@@ -9,6 +9,7 @@ use std::net::Ipv4Addr;
 use anyhow::{Context, Result};
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{EndpointId, SecretKey, Signature};
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
 use crate::membership::{ApprovedEntry, ExitFamilies, Member};
@@ -402,8 +403,16 @@ pub enum FrameRead {
 
 /// The shape of a frame whose [`ControlMsg`] this build cannot decode: just
 /// enough structure to recover the variant name for the `NotSupported` nack.
+///
+/// It must mirror [`ControlFrame`]'s field list, `net` included, because the
+/// wire is array-encoded: a probe declaring only `msg` reads the frame's *first*
+/// slot, which is `net`, and the whole nack path goes dead. So this struct grows
+/// with `ControlFrame`, and `probe_reads_a_real_compact_frame` fails if it does
+/// not.
 #[derive(Deserialize)]
 struct FrameProbe {
+    #[allow(dead_code)]
+    net: IgnoredAny,
     msg: KindProbe,
 }
 
@@ -411,12 +420,12 @@ struct FrameProbe {
 /// single-key map keyed by the variant name; either way the name survives even
 /// when the variant itself is unknown to this build. True of `to_vec` as well as
 /// `to_vec_named`: only the *fields* of a struct become positional, not the
-/// variant tag, so the probe is unaffected by the move to compact.
+/// variant tag, so the name is still there to read.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum KindProbe {
     Unit(String),
-    Tagged(HashMap<String, serde::de::IgnoredAny>),
+    Tagged(HashMap<String, IgnoredAny>),
 }
 
 /// Decode a control-frame body (length prefix already stripped). A body that
@@ -597,18 +606,15 @@ mod tests {
 
     #[test]
     fn network_handles_missing_features_decodes_to_zero() {
-        // A v0.2.0 peer encodes NetworkHandles without the `features` field (it
-        // predates it). `#[serde(default)]` must decode that to `0` so we treat the
-        // peer as advertising no capabilities and never idle-close its link.
+        // A build that stops before the `features` field. `#[serde(default)]`
+        // must decode that to `0` so we treat the peer as advertising no
+        // capabilities and never idle-close its link.
         #[derive(serde::Serialize)]
         enum LegacyMsg {
             NetworkHandles { entries: Vec<NetworkHandle> },
         }
-        #[derive(serde::Serialize)]
-        struct LegacyFrame {
-            msg: LegacyMsg,
-        }
-        let legacy = LegacyFrame {
+        let legacy = FrameOf {
+            net: None,
             msg: LegacyMsg::NetworkHandles {
                 entries: vec![NetworkHandle {
                     network: test_id(2),
@@ -616,7 +622,7 @@ mod tests {
                 }],
             },
         };
-        let body = rmp_serde::to_vec_named(&legacy).unwrap();
+        let body = rmp_serde::to_vec(&legacy).unwrap();
         let frame: ControlFrame = rmp_serde::from_slice(&body).unwrap();
         match frame.msg {
             ControlMsg::NetworkHandles { features, entries } => {
@@ -637,41 +643,48 @@ mod tests {
         assert_eq!(msg, decoded.msg);
     }
 
+    /// A frame from a newer build, encoded the way that build would actually
+    /// send it: `to_vec`, with the full [`ControlFrame`] field list. Both halves
+    /// matter. A fixture built from a `msg`-only struct is a *shorter array*, so
+    /// it exercises a shape no peer emits, and it passed against a probe that
+    /// read `net` as the variant name.
+    #[derive(serde::Serialize)]
+    struct FrameOf<M> {
+        net: Option<EndpointId>,
+        msg: M,
+    }
+
     #[test]
     fn unknown_struct_variant_probes_its_kind() {
-        // A frame from a newer build carrying a struct variant this build has
-        // never heard of. Decode must not error: it reports the variant name
-        // recovered from the msgpack map so the demux can nack it.
         #[derive(serde::Serialize)]
         enum FutureMsg {
             ExitNodeTeleport { hops: u32 },
         }
-        #[derive(serde::Serialize)]
-        struct FutureFrame {
-            msg: FutureMsg,
-        }
-        let body = rmp_serde::to_vec_named(&FutureFrame {
-            msg: FutureMsg::ExitNodeTeleport { hops: 3 },
-        })
-        .unwrap();
-        match decode_frame(&body).unwrap() {
-            FrameRead::Unknown { msg_kind } => assert_eq!(msg_kind, "ExitNodeTeleport"),
-            FrameRead::Frame(f) => panic!("decoded a future variant: {f:?}"),
+        // Both `net` states: a network-scoped frame and a connection-level one.
+        // The scoped one is where a probe that misreads the first slot returns
+        // the network key as the variant name instead of failing outright.
+        for net in [None, Some(test_id(4))] {
+            let body = rmp_serde::to_vec(&FrameOf {
+                net,
+                msg: FutureMsg::ExitNodeTeleport { hops: 3 },
+            })
+            .unwrap();
+            match decode_frame(&body).unwrap() {
+                FrameRead::Unknown { msg_kind } => assert_eq!(msg_kind, "ExitNodeTeleport"),
+                FrameRead::Frame(f) => panic!("decoded a future variant: {f:?}"),
+            }
         }
     }
 
     #[test]
     fn unknown_unit_variant_probes_its_kind() {
-        // Unit variants encode as a bare string under `to_vec_named`, not a map.
+        // Unit variants encode as a bare string, not a single-key map.
         #[derive(serde::Serialize)]
         enum FutureMsg {
             Teleport,
         }
-        #[derive(serde::Serialize)]
-        struct FutureFrame {
-            msg: FutureMsg,
-        }
-        let body = rmp_serde::to_vec_named(&FutureFrame {
+        let body = rmp_serde::to_vec(&FrameOf {
+            net: Some(test_id(4)),
             msg: FutureMsg::Teleport,
         })
         .unwrap();
@@ -681,9 +694,23 @@ mod tests {
         }
     }
 
+    /// The probe must not fire on a frame this build *can* decode, and must read
+    /// the bytes `encode_msg` really produces rather than a hand-built fixture.
+    #[test]
+    fn probe_reads_a_real_compact_frame() {
+        let data = encode_msg(Some(test_id(4)), &ControlMsg::Ping { nonce: 7 });
+        match decode_frame(&data[4..]).unwrap() {
+            FrameRead::Frame(f) => {
+                assert_eq!(f.net, Some(test_id(4)));
+                assert_eq!(f.msg, ControlMsg::Ping { nonce: 7 });
+            }
+            FrameRead::Unknown { msg_kind } => panic!("known variant probed as {msg_kind}"),
+        }
+    }
+
     #[test]
     fn known_frame_decodes_as_frame() {
-        let body = rmp_serde::to_vec_named(&ControlFrame {
+        let body = rmp_serde::to_vec(&ControlFrame {
             net: None,
             msg: ControlMsg::Ping { nonce: 7 },
         })
@@ -994,8 +1021,9 @@ mod tests {
 
     #[test]
     fn pair_response_networks_defaults_when_absent() {
-        // An old Response encoded without the networks field must still decode,
-        // with an empty list.
+        // An older build's Response, which stops before `networks`: on the
+        // compact wire that is a shorter array, and the trailing field takes its
+        // default.
         #[derive(serde::Serialize)]
         enum OldPairMsg {
             Response { cert: DeviceCert },
@@ -1003,7 +1031,7 @@ mod tests {
         let user = SecretKey::generate();
         let device = SecretKey::generate().public();
         let cert = DeviceCert::create(&user, &device, 0);
-        let bytes = rmp_serde::to_vec_named(&OldPairMsg::Response { cert: cert.clone() }).unwrap();
+        let bytes = rmp_serde::to_vec(&OldPairMsg::Response { cert: cert.clone() }).unwrap();
 
         let decoded: PairMsg = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
@@ -1012,24 +1040,26 @@ mod tests {
         }
     }
 
-    /// An `ExitNodeOffer` from a peer that predates `exit_families` still decodes,
-    /// and reads as *no claim* rather than as "cannot carry IPv6".
+    /// An `ExitNodeOffer` that stops before `exit_families` reads as *no claim*
+    /// rather than as "cannot carry IPv6".
     ///
-    /// That distinction is what lets the field ship without bumping
-    /// `MESH_PROTOCOL_VERSION`. Reading the silence as a denial would pin a
-    /// gateway that may well have IPv6 as unusable for as long as it stays on
-    /// that build, and would make the offer permanently disagree with the roster
-    /// on the coordinator side, which is a retry loop rather than a missing
-    /// feature (see `NetworkRegistry::exit_offer_out_of_sync`). `enabled` stays a
-    /// plain `bool` in the same message: it shipped in 0.3.0, and re-encoding a
-    /// field that is already deployed is what a version bump is actually for.
+    /// Reading the silence as a denial would pin a gateway that may well have
+    /// IPv6 as unusable, and would make the offer permanently disagree with the
+    /// roster on the coordinator side, which is a retry loop rather than a
+    /// missing feature (see `NetworkRegistry::exit_offer_out_of_sync`).
+    ///
+    /// The ALPN bump to mesh 3 means no peer sends this shape today, so what
+    /// this pins now is the appending rule itself: the next field added at the
+    /// end of this variant has to default the same way, and there is no reverse
+    /// direction to test, since an older build cannot read the longer array at
+    /// all.
     #[test]
     fn exit_node_offer_families_default_to_unknown_when_absent() {
         #[derive(serde::Serialize)]
-        enum OldControlMsg {
+        enum ShortControlMsg {
             ExitNodeOffer { enabled: bool },
         }
-        let bytes = rmp_serde::to_vec_named(&OldControlMsg::ExitNodeOffer { enabled: true })
+        let bytes = rmp_serde::to_vec(&ShortControlMsg::ExitNodeOffer { enabled: true })
             .expect("serialize");
 
         let decoded: ControlMsg = rmp_serde::from_slice(&bytes).unwrap();
@@ -1040,25 +1070,5 @@ mod tests {
                 exit_families: ExitFamilies::Unknown,
             }
         );
-
-        // And the other direction: a peer on 0.3.0 must still be able to read what
-        // this build sends, or the offer is dropped whole and the gateway stops
-        // being discoverable at all.
-        #[derive(serde::Deserialize, Debug, PartialEq)]
-        enum OldRead {
-            ExitNodeOffer { enabled: bool },
-        }
-        for families in [ExitFamilies::Unknown, ExitFamilies::V4, ExitFamilies::Dual] {
-            let ours = rmp_serde::to_vec_named(&ControlMsg::ExitNodeOffer {
-                enabled: true,
-                exit_families: families,
-            })
-            .expect("serialize");
-            assert_eq!(
-                rmp_serde::from_slice::<OldRead>(&ours).unwrap(),
-                OldRead::ExitNodeOffer { enabled: true },
-                "0.3.0 must still decode an offer carrying {families:?}"
-            );
-        }
     }
 }

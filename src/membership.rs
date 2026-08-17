@@ -1580,27 +1580,27 @@ mod tests {
     }
 
     #[test]
-    fn test_old_blob_without_suggested_firewall_decodes() {
-        // A blob serialized before suggested firewall existed (no
-        // `suggested_firewall` key) must still decode, defaulting it empty.
+    fn test_short_blob_defaults_its_trailing_fields() {
+        // A blob from a build that stops after `approved`: on the compact wire
+        // that is a two-element array, and every field after it takes its
+        // default rather than failing the decode.
         #[derive(Serialize)]
-        struct OldBlob {
+        struct ShortBlob {
             members: Vec<Member>,
             approved: Vec<ApprovedEntry>,
-            name: Option<String>,
         }
         let members = make_member_list(&[1, 2]);
-        let old = OldBlob {
+        let old = ShortBlob {
             members: members.all().into_iter().cloned().collect(),
             approved: vec![],
-            name: Some("net".to_string()),
         };
-        let bytes = rmp_serde::to_vec_named(&old).unwrap();
+        let bytes = rmp_serde::to_vec(&old).unwrap();
         let blob = decode_group_blob(&bytes).unwrap();
         assert_eq!(blob.members.len(), 2);
         assert!(blob.suggested_firewall.is_empty());
-        // A pre-reusable-keys blob decodes with an empty reusable_keys map.
+        assert_eq!(blob.name, None);
         assert!(blob.reusable_keys.is_empty());
+        assert!(blob.nullifiers.is_empty());
     }
 
     /// What "additive" means now that the wire is compact (positional arrays):
@@ -2062,7 +2062,7 @@ mod tests {
             reusable_keys: BTreeMap::new(),
             nullifiers: BTreeSet::new(),
         };
-        let bytes = rmp_serde::to_vec_named(&blob).unwrap();
+        let bytes = rmp_serde::to_vec(&blob).unwrap();
         let err = decode_group_blob(&bytes).unwrap_err().to_string();
         assert!(err.contains("does not match"), "{err}");
     }
@@ -2091,7 +2091,7 @@ mod tests {
             reusable_keys: BTreeMap::new(),
             nullifiers: BTreeSet::new(),
         };
-        let bytes = rmp_serde::to_vec_named(&blob).unwrap();
+        let bytes = rmp_serde::to_vec(&blob).unwrap();
         assert!(decode_group_blob(&bytes).is_err());
     }
 
