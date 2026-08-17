@@ -650,6 +650,18 @@ pub struct ExitNodeStatusView {
     /// <peer>" otherwise reads as a full tunnel over both families.
     #[serde(default)]
     pub ipv6_only: bool,
+    /// The subset of `available` that *this* node would refuse, with the family
+    /// it cannot carry named.
+    ///
+    /// Separate from `available_v6` because the two answer different questions
+    /// and stopped agreeing once a gateway could be IPv6-only itself: such a
+    /// gateway claims IPv6 egress (so it is in `available_v6`) and is refused by
+    /// a dual-stack client (because it cannot return IPv4). Marking it usable off
+    /// the first list alone sends the user at the one gateway that will not work.
+    /// Computed daemon-side, where the refusal rule already lives, so the CLI
+    /// never re-derives it and cannot drift from it.
+    #[serde(default)]
+    pub refused: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1204,6 +1216,7 @@ mod tests {
                 available: vec!["gw".into(), "v4only".into()],
                 available_v6: vec!["gw".into()],
                 ipv6_only: true,
+                refused: vec!["v4only".into()],
             }],
         };
         let bytes = rmp_serde::to_vec_named(&resp).unwrap();

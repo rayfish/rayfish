@@ -407,8 +407,8 @@ pub enum FrameRead {
 /// It must mirror [`ControlFrame`]'s field list, `net` included, because the
 /// wire is array-encoded: a probe declaring only `msg` reads the frame's *first*
 /// slot, which is `net`, and the whole nack path goes dead. So this struct grows
-/// with `ControlFrame`, and `probe_reads_a_real_compact_frame` fails if it does
-/// not.
+/// with `ControlFrame`; the two `unknown_*_variant_probes_its_kind` tests fail if
+/// it does not.
 #[derive(Deserialize)]
 struct FrameProbe {
     #[allow(dead_code)]

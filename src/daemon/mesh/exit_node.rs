@@ -593,6 +593,13 @@ impl NetworkRegistry {
                 .filter(|m| m.exit_families.carries_v6())
                 .map(display_name)
                 .collect();
+            // From the same predicate `ray exit-node use` will run, so the list
+            // cannot disagree with what the command does.
+            let refused = offers
+                .iter()
+                .filter(|m| ipv6_gateway_refusal(m, "gw", self.ipv6_only).is_some())
+                .map(display_name)
+                .collect();
             networks.push(ipc::ExitNodeStatusView {
                 network: n.name,
                 allow: n.exit_allow,
@@ -600,6 +607,7 @@ impl NetworkRegistry {
                 available: offers.iter().map(display_name).collect(),
                 available_v6,
                 ipv6_only: self.ipv6_only,
+                refused,
             });
         }
         IpcMessage::ExitNodeState { networks }
@@ -980,7 +988,7 @@ mod tests {
     /// false claim is worse than the `Unknown` this field exists to distinguish.
     #[test]
     fn a_v6_only_gateway_is_refused_by_a_dual_stack_client() {
-        use ExitFamilies::{Dual, V4, V6};
+        use ExitFamilies::{Dual, Neither, V4, V6};
 
         let refusal = super::ipv6_gateway_refusal(&gateway(true, V6), "gw", false)
             .expect("a v6-only gateway cannot return a dual-stack client's IPv4");
@@ -988,13 +996,39 @@ mod tests {
         // And is fine for a client that was only ever going to send it IPv6.
         assert!(super::ipv6_gateway_refusal(&gateway(true, V6), "gw", true).is_none());
 
-        // The claim itself: only a dual-stack host with an uplink is `Dual`.
+        // The claim itself: the two inputs are independent, so all four states
+        // are reachable and each says something different.
         assert_eq!(ExitFamilies::from_uplink(true, false), Dual);
         assert_eq!(ExitFamilies::from_uplink(true, true), V6);
         assert_eq!(ExitFamilies::from_uplink(false, false), V4);
-        // No uplink and IPv6-only: nothing to offer either way, and `V4` already
-        // means "refused" to the clients that would care.
-        assert_eq!(ExitFamilies::from_uplink(false, true), V4);
+        assert_eq!(ExitFamilies::from_uplink(false, true), Neither);
         assert!(super::ipv6_gateway_refusal(&gateway(true, V4), "gw", true).is_some());
+    }
+
+    /// A gateway that can carry nothing is refused by everyone.
+    ///
+    /// IPv6-only mode on an ordinary IPv4 uplink is the most common shape of the
+    /// configuration this feature exists for, not a corner: its mesh IPv4 has no
+    /// return path and it has no IPv6 to offer instead. Reporting that as `V4`
+    /// makes it a positive claim to carry IPv4, which a dual-stack client
+    /// accepts, and the tunnel then carries nothing in silence.
+    #[test]
+    fn a_gateway_that_can_carry_nothing_is_refused_in_both_modes() {
+        use ExitFamilies::Neither;
+
+        assert!(
+            !Neither.carries_v4(),
+            "a claim of nothing is not a claim of v4"
+        );
+        assert!(!Neither.carries_v6());
+        assert!(
+            !Neither.is_unknown(),
+            "it is a claim, not the absence of one, so it must not read as unverified"
+        );
+        for ipv6_only in [false, true] {
+            let refusal = super::ipv6_gateway_refusal(&gateway(true, Neither), "gw", ipv6_only)
+                .unwrap_or_else(|| panic!("must be refused with ipv6_only={ipv6_only}"));
+            assert!(refusal.contains("cannot carry"), "{refusal}");
+        }
     }
 }

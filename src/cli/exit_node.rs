@@ -136,14 +136,21 @@ fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>) {
         if n.available.is_empty() {
             println!("  available: (none advertised)");
         } else {
-            // Mark which gateways can carry IPv6, since on an IPv6-only node they
-            // are the only ones `ray exit-node use` will accept.
+            // A gateway this node would refuse is marked as such, and that beats
+            // marking the ones that carry IPv6: the two lists stopped agreeing
+            // once a gateway could be IPv6-only itself, and it is the refusal
+            // that decides whether `ray exit-node use` works.
             let listed: Vec<String> = n
                 .available
                 .iter()
-                .map(|peer| match n.available_v6.contains(peer) {
-                    true => format!("{peer} (IPv6)"),
-                    false => peer.clone(),
+                .map(|peer| {
+                    if n.refused.contains(peer) {
+                        format!("{peer} (unusable from this node)")
+                    } else if n.ipv6_only && n.available_v6.contains(peer) {
+                        format!("{peer} (IPv6)")
+                    } else {
+                        peer.clone()
+                    }
                 })
                 .collect();
             println!("  available: {}", listed.join(", "));

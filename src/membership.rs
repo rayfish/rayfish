@@ -60,6 +60,12 @@ pub enum ExitFamilies {
     V6,
     /// The gateway can egress both families.
     Dual,
+    /// The gateway can egress neither: it is in IPv6-only mode (so its mesh IPv4
+    /// has no return path) and it has no IPv6 uplink to offer instead.
+    ///
+    /// Distinct from [`Self::Unknown`], which is the absence of a claim. This is
+    /// a claim, and the claim is "nothing". Every client refuses it.
+    Neither,
 }
 
 impl ExitFamilies {
@@ -85,16 +91,19 @@ impl ExitFamilies {
     /// The claim a gateway makes about itself: whether it found an IPv6 default
     /// route, and whether its own data plane carries IPv4 at all.
     ///
-    /// A gateway in IPv6-only mode with no IPv6 uplink can carry nothing, and
-    /// says so as [`Self::V4`] rather than inventing a fourth "neither" state:
-    /// the claim is read by clients deciding what will reach them, and both
-    /// halves of that answer are already "no". It has no v6 to offer, and its v4
-    /// has no return path, so every client refuses it either way.
+    /// The two inputs are independent, so all four states are reachable, and
+    /// [`Self::Neither`] is not a theoretical corner: it is what an IPv6-only
+    /// host on an ordinary IPv4 uplink is, which is the most common shape of the
+    /// configuration this whole mode exists for. Folding it into [`Self::V4`]
+    /// (this said so, wrongly, until round 2 of review) makes it a *positive*
+    /// claim to carry IPv4 that a dual-stack client accepts, which is the silent
+    /// black hole the type exists to prevent, produced by the ordinary setup.
     pub fn from_uplink(has_v6: bool, ipv6_only: bool) -> Self {
         match (has_v6, ipv6_only) {
             (true, false) => Self::Dual,
             (true, true) => Self::V6,
-            (false, _) => Self::V4,
+            (false, false) => Self::V4,
+            (false, true) => Self::Neither,
         }
     }
 }

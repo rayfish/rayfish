@@ -1102,29 +1102,17 @@ pub fn install_client_routing(tun_name: &str, ipv6_only: bool) -> Result<()> {
         // Keeps the catch-all standing: everything below is a rebuild, and the
         // rules are re-added one `ip` process at a time. See [`RuleSweep`].
         remove_client_rules(family, RuleSweep::KeepCatchAll);
-        // Ahead of the two `main` rules below, because neither of them can find a
-        // co-resident VPN's prefixes: those live in its own table, and
-        // `PREF_MAIN`'s `suppress_prefixlength 0` only rescues routes that are in
-        // `main` to begin with. Sending these destinations to our table instead
-        // hits the copy `mirror_foreign_routes` just made, so they go back out the
-        // interface that owned them.
+        // The three bypasses go back **first**, and the unbounded per-prefix loop
+        // goes last, because the catch-all now stays up across the rebuild. That
+        // closed the window where traffic leaked out the physical uplink, and it
+        // opened a worse one in the other direction: with the catch-all standing
+        // and these three gone, the highest-priority rule matching anything is
+        // ours, so for the length of the rebuild the daemon's own QUIC underlay
+        // is routed into the tunnel it is carrying, along with every pre-existing
+        // physical-sourced connection. That is precisely what `PREF_BYPASS` and
+        // `PREF_SRC` exist to prevent, and it kills the mesh rather than leaking
+        // past it. Three `ip` calls here, then the loop that can be hundreds.
         //
-        // Paired with that mirror by construction: one rule per destination we
-        // actually copied, so the rule can never outlive the route it depends on
-        // and point a prefix at the tunnel default sitting in the same table.
-        for dest in &foreign {
-            run_ip(&[
-                family,
-                "rule",
-                "add",
-                "to",
-                dest,
-                "table",
-                EXIT_TABLE,
-                "pref",
-                PREF_FOREIGN,
-            ])?;
-        }
         // Ahead of everything else: traffic sourced from one of this host's own
         // physical addresses leaves the way it always did. That is every connection
         // that existed before the tunnel, whose socket is already bound to that
@@ -1171,11 +1159,45 @@ pub fn install_client_routing(tun_name: &str, ipv6_only: bool) -> Result<()> {
             "pref",
             PREF_MAIN,
         ])?;
-        // Last, and only if the rebuild above did not inherit it: `ip rule add` is
-        // not idempotent, so adding it unconditionally would stack a duplicate on
-        // every re-apply, and `remove_client_rules` deletes one match at a time.
-        if !catch_all_installed(family) {
+        // Now the unbounded part. These outrank the two `main` rules above,
+        // because neither of them can find a co-resident VPN's prefixes: those
+        // live in its own table, and `PREF_MAIN`'s `suppress_prefixlength 0` only
+        // rescues routes that are in `main` to begin with. Sending these
+        // destinations to our table instead hits the copy `mirror_foreign_routes`
+        // just made, so they go back out the interface that owned them.
+        //
+        // Paired with that mirror by construction: one rule per destination that
+        // actually copied, so the rule can never outlive the route it depends on
+        // and point a prefix at the tunnel default sitting in the same table.
+        //
+        // Safe to be last despite outranking them: until the rule lands, these
+        // destinations still resolve through the catch-all into `EXIT_TABLE`,
+        // where longest-prefix picks the mirrored route over our default. The
+        // rules exist for the traffic that would otherwise stop at `PREF_SRC` or
+        // `PREF_BYPASS` above and look up `main`.
+        for dest in &foreign {
             run_ip(&[
+                family,
+                "rule",
+                "add",
+                "to",
+                dest,
+                "table",
+                EXIT_TABLE,
+                "pref",
+                PREF_FOREIGN,
+            ])?;
+        }
+        // Only if the rebuild did not inherit it: `ip rule add` is not idempotent,
+        // so adding it unconditionally would stack a duplicate on every re-apply,
+        // and `remove_client_rules` deletes one match at a time. `EEXIST` is
+        // tolerated rather than propagated: a false negative from the readback
+        // (`ip rule show` prints a table *name* where `/etc/iproute2/rt_tables`
+        // maps our id, or the command simply failed) would otherwise fail the
+        // whole install, and the caller answers a failed install by tearing the
+        // tunnel down. The rule being there already is the state we wanted.
+        if !catch_all_installed(family)
+            && let Err(e) = run_ip(&[
                 family,
                 "rule",
                 "add",
@@ -1183,7 +1205,12 @@ pub fn install_client_routing(tun_name: &str, ipv6_only: bool) -> Result<()> {
                 EXIT_TABLE,
                 "pref",
                 PREF_TUNNEL,
-            ])?;
+            ])
+        {
+            if !is_already_exists(&e) {
+                return Err(e);
+            }
+            tracing::debug!(family, "catch-all rule was already installed");
         }
     }
     tracing::info!(
@@ -1207,11 +1234,6 @@ pub fn teardown_client_routing() {
     tracing::info!("exit-node client full-tunnel routing removed");
 }
 
-/// The source addresses of the [`PREF_SRC`] rules currently installed for one
-/// family, read back from `ip rule show`. Matches only our own shape
-/// (`<pref>: from <addr> lookup main`) so a foreign rule sharing the pref is left
-/// alone. See [`parse_source_rules`] for the parsing.
-#[cfg(target_os = "linux")]
 /// How much of our rule set [`remove_client_rules`] takes down.
 ///
 /// Teardown wants [`RuleSweep::All`]. A re-install wants
@@ -1225,6 +1247,11 @@ pub fn teardown_client_routing() {
 /// <PREF_TUNNEL>`, no per-run content), leaving it standing across the rebuild
 /// costs nothing and closes the window: the routes underneath it are updated with
 /// `route replace`, which is atomic per destination.
+///
+/// Keeping it standing is only safe because the rebuild puts the three bypass
+/// rules back *before* the unbounded per-prefix loop: with the catch-all up and
+/// those down, ours is the highest-priority rule matching anything, and the
+/// daemon's own transport goes into the tunnel it is carrying.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RuleSweep {
@@ -1245,6 +1272,14 @@ fn catch_all_installed(family: &str) -> bool {
 
 /// Whether `ip rule show` output contains our catch-all: at [`PREF_TUNNEL`], no
 /// selector, looking up our table.
+///
+/// The table is matched by *position*, not by its printed value, because the
+/// value is not stable: `ip rule show` prints a table's **name** when
+/// `/etc/iproute2/rt_tables` maps our id, so a host that happens to have named
+/// `29793` reads back as `lookup <name>`. Only the pref distinguishes it from a
+/// co-resident VPN's catch-all, and the pref is ours by construction. Getting
+/// this wrong is not cosmetic: a false negative here used to fail the whole
+/// install, which the caller answers by tearing the tunnel down.
 #[cfg(target_os = "linux")]
 fn parse_catch_all(show: &str) -> bool {
     show.lines().any(|line| {
@@ -1257,10 +1292,14 @@ fn parse_catch_all(show: &str) -> bool {
         // Same readback convention as `parse_foreign_rules`: iproute2 prints the
         // `from all` selector even though the rule was added without one.
         let f: Vec<&str> = rest.split_whitespace().collect();
-        matches!(f.as_slice(), ["from", "all", "lookup", table] if *table == EXIT_TABLE)
+        matches!(f.as_slice(), ["from", "all", "lookup", _])
     })
 }
 
+/// The source addresses of the [`PREF_SRC`] rules currently installed for one
+/// family, read back from `ip rule show`. Matches only our own shape
+/// (`<pref>: from <addr> lookup main`) so a foreign rule sharing the pref is left
+/// alone. See [`parse_source_rules`] for the parsing.
 #[cfg(target_os = "linux")]
 fn installed_source_rules(family: &str) -> Vec<String> {
     let out = match Command::new("ip").args([family, "rule", "show"]).output() {
@@ -1437,6 +1476,24 @@ struct MirroredRoute {
 ///
 /// Best-effort throughout: this is an accommodation for someone else's routing, and
 /// failing to read or write one route must not fail the install.
+/// The `ip` arguments that copy one foreign route into [`EXIT_TABLE`].
+///
+/// Split out to be testable, because the ordering is load-bearing and invisible
+/// in the parser that feeds it: `table` must come **before** the spec. iproute2
+/// parses everything after the first `nexthop` as a nexthop list to end of line,
+/// so a trailing `table` is rejected ("nexthop or end of line is expected instead
+/// of table") and every multipath mirror fails. The position is valid for the
+/// single-path form too, so there is one order rather than two.
+#[cfg(target_os = "linux")]
+fn mirror_args(family: &str, route: &MirroredRoute) -> Vec<String> {
+    let mut args: Vec<String> = ["route", "replace"].iter().map(|s| s.to_string()).collect();
+    args.insert(0, family.to_string());
+    args.push(route.dest.clone());
+    args.extend(["table".to_string(), EXIT_TABLE.to_string()]);
+    args.extend(route.spec.iter().cloned());
+    args
+}
+
 #[cfg(target_os = "linux")]
 fn mirror_foreign_routes(family: &str, tun_name: &str) -> Vec<String> {
     let wanted = match ip_output(&[family, "route", "show", "table", "all"]) {
@@ -1453,28 +1510,34 @@ fn mirror_foreign_routes(family: &str, tun_name: &str) -> Vec<String> {
             let _ = run_ip(&[family, "route", "del", &stale.dest, "table", EXIT_TABLE]);
         }
     }
-    let mut mirrored = 0;
+    let mut installed = Vec::new();
     for route in &wanted {
-        let mut args = vec![family, "route", "replace", &route.dest];
-        args.extend(route.spec.iter().map(String::as_str));
-        args.extend(["table", EXIT_TABLE]);
-        match run_ip(&args) {
-            Ok(()) => mirrored += 1,
-            Err(e) => tracing::debug!(
+        let args = mirror_args(family, route);
+        match run_ip(&args.iter().map(String::as_str).collect::<Vec<_>>()) {
+            Ok(()) => installed.push(route.dest.clone()),
+            Err(e) => tracing::warn!(
                 dest = %route.dest,
                 error = %e,
-                "could not mirror a foreign route into the tunnel table"
+                "could not mirror a foreign route into the tunnel table; \
+                 its destinations will take the tunnel"
             ),
         }
     }
-    if mirrored > 0 {
+    if !installed.is_empty() {
         tracing::debug!(
             family,
-            mirrored,
+            mirrored = installed.len(),
             "mirrored another VPN's routes into the tunnel table"
         );
     }
-    wanted.into_iter().map(|r| r.dest).collect()
+    // Only what actually went in. The caller adds one `PREF_FOREIGN` rule per
+    // destination returned, and that rule sends the prefix to a table where a
+    // failed mirror left nothing: it would miss, fall to the tunnel default, and
+    // black-hole the very destinations this function exists to rescue. Returning
+    // a failed route is therefore worse than dropping it, which is what makes
+    // "the rule can never outlive the route it depends on" a real invariant
+    // rather than a comment.
+    installed
 }
 
 /// The routes in `ip <family> route show table all` that belong to somebody else's
@@ -1668,6 +1731,16 @@ fn nft_load(script: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether a [`run_ip`] failure is the kernel saying the object is already there.
+///
+/// `ip` reports it as `RTNETLINK answers: File exists` on stderr, which `run_ip`
+/// folds into its message. Matched on the errno text rather than the prefix,
+/// which differs between the `rule` and `route` subcommands.
+#[cfg(target_os = "linux")]
+fn is_already_exists(e: &anyhow::Error) -> bool {
+    e.to_string().contains("File exists")
 }
 
 #[cfg(target_os = "linux")]
@@ -2134,10 +2207,12 @@ mod tests {
         assert!(parse_catch_all(
             "0:\tfrom all lookup local\n102:\tfrom all lookup 29793\n5270:\tfrom all lookup 52\n"
         ));
-        // Tailscale's catch-all: same shape, different pref and table.
+        // Tailscale's catch-all: same shape, different pref.
         assert!(!parse_catch_all("5270:\tfrom all lookup 52\n"));
-        // Our pref, but pointing somewhere else: not the rule we would install.
-        assert!(!parse_catch_all("102:\tfrom all lookup main\n"));
+        // Our own table under a name, which is what `ip rule show` prints when
+        // /etc/iproute2/rt_tables maps our id. Still ours: a false negative here
+        // used to fail the install, and a failed install tears the tunnel down.
+        assert!(parse_catch_all("102:\tfrom all lookup corpvpn\n"));
         // A selector makes it a different rule (this is the PREF_FOREIGN shape).
         assert!(!parse_catch_all(
             "102:\tfrom all to 10.0.0.0/8 lookup 29793\n"
@@ -2419,6 +2494,57 @@ unreachable fd00::/8 dev lo table 52 metric 1024 pref medium
         // Our own TUN among the nexthops means the copy would partly duplicate the
         // route we are installing, so the whole entry is left alone.
         assert!(!got.iter().any(|r| r.dest == "10.7.0.0/16"));
+
+        // And the command it becomes. Parsing the route correctly is only half of
+        // it: `table` after a nexthop list is rejected by iproute2, so the
+        // original spelling failed every multipath mirror while this same parser
+        // test passed. Verified against iproute2 6.1.0.
+        let args = mirror_args("-4", &got[0]);
+        assert_eq!(
+            args,
+            strs(&[
+                "-4",
+                "route",
+                "replace",
+                "172.20.0.0/16",
+                "table",
+                EXIT_TABLE,
+                "nexthop",
+                "via",
+                "10.0.0.1",
+                "dev",
+                "eth0",
+                "weight",
+                "1",
+                "nexthop",
+                "via",
+                "10.0.1.1",
+                "dev",
+                "eth1",
+                "weight",
+                "1",
+            ])
+        );
+        let table_at = args.iter().position(|a| a == "table").unwrap();
+        let first_hop = args.iter().position(|a| a == "nexthop").unwrap();
+        assert!(
+            table_at < first_hop,
+            "`table` after a nexthop list is a parse error, not a wrong table"
+        );
+        // Single-path takes the same order, so there is only one to get right.
+        assert_eq!(
+            mirror_args("-4", &got[1]),
+            strs(&[
+                "-4",
+                "route",
+                "replace",
+                "192.168.5.0/24",
+                "table",
+                EXIT_TABLE,
+                "dev",
+                "eth0",
+            ])
+        );
     }
 
     /// The IPv4 side, where the range that matters is the one IPv6-only mode

@@ -359,7 +359,7 @@ if [[ "$A_OFFERS_V6" == "0" ]]; then
     || fail "srv-a claims IPv6 egress it does not have"
   USE_OUT="$(on "$B" "ray exit-node use $NET srv-a" 2>&1 | strip)"
   echo "$USE_OUT" | sed 's/^/   b| /'
-  # The whole point of `Member.exit_node_v6`: name the reason now, rather than
+  # The whole point of `Member.exit_families`: name the reason now, rather than
   # install a tunnel whose traffic the gateway has nowhere to send.
   echo "$USE_OUT" | grep -q 'cannot carry IPv6' \
     && pass "selecting a gateway with no IPv6 uplink is refused, with the reason" \
