@@ -480,6 +480,7 @@ impl NetworkRegistry {
                 members: MemberList::from_members(data.members.clone()),
                 approved: ApprovedList::from_entries(data.approved.clone()),
                 snapshot: None,
+                converged_hash: None,
                 network_secret_key: None,
                 network_public_key: ctx.net_pubkey,
                 network_name: Some(ctx.display_name.to_string()),

@@ -189,6 +189,7 @@ impl NetworkRegistry {
             members: member_list,
             approved: approved_list,
             snapshot: None,
+            converged_hash: None,
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: net_public_key,
             network_name: Some(name.to_string()),

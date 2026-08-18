@@ -323,6 +323,22 @@ pub(crate) struct NetworkState {
     members: MemberList,
     approved: ApprovedList,
     snapshot: Option<GroupSnapshot>,
+    /// The hash of the signed record this state is converged on, which is not
+    /// always the hash of [`Self::snapshot`].
+    ///
+    /// The snapshot is *our* encoding of the group, and on a coordinator that is
+    /// exactly what it publishes, so the two agree. On a member they need not:
+    /// applying a fetched blob re-encodes it from local state, and a publisher on
+    /// a build whose `Member` has a different field set (or the map encoding that
+    /// preceded the compact one, which rmp-serde still reads) produces bytes ours
+    /// cannot reproduce. Comparing the record against the snapshot hash then says
+    /// "a different blob" forever: every poll refetches and reapplies, and the
+    /// steady-state work on the converged branch (the self-nullify check, a
+    /// pending rename, the exit-offer sync) never runs at all.
+    ///
+    /// So convergence is tracked as what we last accepted, and the snapshot stays
+    /// what we would publish.
+    converged_hash: Option<blake3::Hash>,
     network_secret_key: Option<SecretKey>,
     network_public_key: EndpointId,
     network_name: Option<String>,
@@ -417,6 +433,10 @@ impl NetworkState {
             hash,
             msgpack_bytes: bytes,
         });
+        // Our own encoding is by definition what we are converged on. An apply
+        // from a fetched blob overwrites this with the record's hash right after,
+        // since that is the one the network agreed on.
+        self.converged_hash = Some(hash);
     }
 }
 
@@ -2003,6 +2023,7 @@ mod accept_handler_tests {
             members: MemberList::new(),
             approved: ApprovedList::new(),
             snapshot: None,
+            converged_hash: None,
             network_secret_key: None,
             network_public_key: net_pub,
             network_name: Some("test-net".to_string()),
@@ -2014,6 +2035,46 @@ mod accept_handler_tests {
             pending: HashMap::new(),
             last_record_timestamp: None,
         }))
+    }
+
+    /// Convergence is tracked as the hash we accepted, not the hash of our own
+    /// re-encoding, and the two differ whenever the publisher writes bytes we
+    /// would not.
+    ///
+    /// The case that produces it is an upgrade: rmp-serde reads a struct from a
+    /// map as well as an array, so a node on this build converges fine from a
+    /// coordinator still writing the old named blob, and then re-encodes it
+    /// compactly. Comparing the record against the snapshot hash there says "a
+    /// different blob" on every poll forever, which refetches, reapplies, and
+    /// skips the converged branch's steady-state work (self-nullify check,
+    /// pending rename, exit-offer sync) for as long as the skew lasts.
+    #[test]
+    fn convergence_is_tracked_as_the_hash_we_accepted() {
+        let state = make_network_state();
+        let mut s = state.write().unwrap();
+        let member_id = SecretKey::from_bytes(&[9u8; 32]).public();
+        s.members = MemberList::from_members(vec![seated(member_id, 1)]);
+        s.refresh_snapshot();
+
+        // Our own encoding is what we are converged on, so a coordinator (which
+        // publishes exactly these bytes) sees the two agree.
+        let ours = s.snapshot.as_ref().unwrap().hash;
+        assert_eq!(s.converged_hash, Some(ours));
+
+        // Applying a record whose bytes we cannot reproduce: the snapshot stays
+        // what we would publish, and convergence follows the record.
+        let published = blake3::hash(b"the publisher's bytes, not ours");
+        s.converged_hash = Some(published);
+        assert_eq!(
+            s.snapshot.as_ref().unwrap().hash,
+            ours,
+            "the snapshot is still our own encoding, which is what we would publish"
+        );
+        assert_eq!(
+            s.converged_hash,
+            Some(published),
+            "a second poll of the same record must read as converged, not as a change"
+        );
     }
 
     /// The live state and context behind a handler, whichever role it is. Lets a

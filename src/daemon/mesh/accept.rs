@@ -1046,10 +1046,7 @@ impl MemberAcceptState {
         let record_ts = packet.timestamp().as_micros();
         let (current_hash, floor) = {
             let s = self.state.read().unwrap();
-            (
-                s.snapshot.as_ref().map(|snap| snap.hash),
-                s.last_record_timestamp,
-            )
+            (s.converged_hash, s.last_record_timestamp)
         };
         if current_hash == Some(remote_hash) {
             return;
@@ -1719,6 +1716,7 @@ mod direct_grant_tests {
             members: list,
             approved: ApprovedList::new(),
             snapshot: None,
+            converged_hash: None,
             network_secret_key: None,
             network_public_key: eid(200),
             network_name: Some("dario-alex".to_string()),

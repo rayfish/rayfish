@@ -231,7 +231,7 @@ pub(crate) async fn reconverge_and_apply(
     } = ctx;
     let (current, floor) = {
         let s = state.read().unwrap();
-        (s.snapshot.as_ref().map(|s| s.hash), s.last_record_timestamp)
+        (s.converged_hash, s.last_record_timestamp)
     };
     let Some((signed, seeds, record_ts)) = resolve_signed(endpoint, net_pubkey).await else {
         tracing::debug!(network = %network_name, "reconverge: signed record unavailable");
@@ -329,6 +329,9 @@ pub(crate) async fn reconverge_and_apply(
         s.suggested_firewall = data.suggested_firewall.clone();
         s.nullifiers = data.nullifiers.clone();
         s.refresh_snapshot();
+        // What the network agreed on, which is not our re-encoding of it unless
+        // the publisher writes the same bytes we would. See `converged_hash`.
+        s.converged_hash = Some(signed);
         s.roster()
     };
     apply_roster_to_dns(
@@ -775,6 +778,9 @@ pub(crate) async fn fetch_and_apply_blob(
         s.suggested_firewall = data.suggested_firewall.clone();
         s.nullifiers = data.nullifiers.clone();
         s.refresh_snapshot();
+        // The hash the network agreed on, not our re-encoding of it. See
+        // `converged_hash`.
+        s.converged_hash = Some(remote_hash);
     }
     apply_suggested_firewall(fw, endpoint.id(), network_name, state);
 

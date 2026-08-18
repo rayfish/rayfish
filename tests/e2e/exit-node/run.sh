@@ -81,11 +81,11 @@ clean_kernel(){
   for h in "$@"; do
     on "$h" "nft delete table inet rayfish_exit; nft delete table inet rayfish_exit_client" >/dev/null 2>&1
     for f in -4 -6; do
-      # 98 and 99 hold one rule per mirrored foreign prefix and per physical
-      # address, so a single `del` leaves the rest behind. Leftovers at 98 are the
-      # ones that break a later run outright: they read back as
-      # `98: from all to <dest> lookup 29793`, so step 9's "no IPv4 tunnel rule in
-      # IPv6-only mode" grep matches state this run never installed.
+      # 99 holds one rule per physical address, so a single `del` leaves the rest
+      # behind. 98 and 102 are one rule each, but both read back as
+      # `lookup 29793`, and a leftover breaks a later run outright: step 9's "no
+      # IPv4 tunnel rule in IPv6-only mode" grep would match state this run never
+      # installed.
       for p in 98 99 100 101 102; do
         for _ in $(seq 1 64); do
           on "$h" "ip $f rule del pref $p" >/dev/null 2>&1 || break
@@ -397,9 +397,11 @@ else
   # both look up `main`, where a policy-routing VPN keeps nothing, so traffic
   # sourced from its address still misses without a rule pointing that
   # destination at our table.
-  on "$B" "ip -6 rule show" 2>/dev/null | grep -q "to $FOREIGN_NET lookup $TABLE" \
+  # One rule covers every mirrored prefix: `suppress_prefixlength 0` matches the
+  # copies and suppresses our own default, so the lookup is its own selector.
+  on "$B" "ip -6 rule show" 2>/dev/null | grep -q "lookup $TABLE suppress_prefixlength 0" \
     && pass "the co-resident VPN's destinations are routed to the mirrored copy" \
-    || fail "no pref-98 rule for $FOREIGN_NET: traffic sourced from that VPN's own address is black-holed"
+    || fail "no pref-98 rule: traffic sourced from that VPN's own address is black-holed"
   # Sourced from the foreign address, which is the case the mirror alone misses:
   # this is what an inbound SSH session's replies look like.
   B_FOREIGN_SRC="$(on "$B" "ip -6 addr show scope global | awk '/inet6/{print \$2}' | cut -d/ -f1 | head -1")"

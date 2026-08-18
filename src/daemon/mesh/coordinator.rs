@@ -802,6 +802,7 @@ mod sender_authority_tests {
             members: list,
             approved: ApprovedList::new(),
             snapshot: None,
+            converged_hash: None,
             network_secret_key: None,
             network_public_key: eid(200),
             network_name: Some("test-net".to_string()),
