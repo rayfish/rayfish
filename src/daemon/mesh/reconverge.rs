@@ -229,15 +229,12 @@ pub(crate) async fn reconverge_and_apply(
         registry,
         ..
     } = ctx;
-    let (current, floor) = {
-        let s = state.read().unwrap();
-        (s.converged_hash, s.last_record_timestamp)
-    };
+    let floor = state.read().unwrap().last_record_timestamp;
     let Some((signed, seeds, record_ts)) = resolve_signed(endpoint, net_pubkey).await else {
         tracing::debug!(network = %network_name, "reconverge: signed record unavailable");
         return;
     };
-    if crate::membership::trusted_reconverge_hash(current, signed).is_none() {
+    if !state.read().unwrap().needs_reconverge(signed) {
         // Already converged on the signed hash. Even so, check whether we have
         // been nullified in the blob we already hold (e.g. we applied it while
         // still offline-blocked from ever receiving `ControlMsg::Unpaired`): if so,
@@ -639,11 +636,6 @@ pub(crate) fn spawn_group_poller(
             registry.sync_exit_offers().await;
             registry.sync_ipv6_only().await;
 
-            let current_hash = {
-                let s = state.read().unwrap();
-                s.snapshot.as_ref().map(|snap| snap.hash)
-            };
-
             let (remote_hash, seed_peers) = match dht::resolve_network(&client, net_pubkey).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -652,9 +644,21 @@ pub(crate) fn spawn_group_poller(
                 }
             };
 
-            if current_hash == Some(remote_hash) {
-                continue;
-            }
+            // Through the same method as the trigger-driven path, so the two
+            // cannot answer "have we converged on this record" differently. They
+            // did: this one open-coded the comparison against the snapshot hash,
+            // our own re-encoding, and was missed when the other moved off it.
+            // This is the hotter of the two and has no timestamp floor to damp it,
+            // so a member whose bytes differ from the publisher's refetched the
+            // whole roster, re-materialized the suggested firewall and nudged the
+            // exit reconcile once a minute, forever.
+            let current_hash = {
+                let s = state.read().unwrap();
+                if !s.needs_reconverge(remote_hash) {
+                    continue;
+                }
+                s.converged_hash
+            };
 
             tracing::info!(old = ?current_hash, new = %remote_hash, "group blob changed");
 

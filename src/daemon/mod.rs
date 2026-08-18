@@ -438,6 +438,18 @@ impl NetworkState {
         // since that is the one the network agreed on.
         self.converged_hash = Some(hash);
     }
+
+    /// Whether a signed record naming `signed` is one this state has not applied.
+    ///
+    /// The single answer to "do we need to reconverge", for the group poller and
+    /// the trigger-driven path alike. It exists as a method because those two open
+    /// -coded the same comparison against different fields and drifted: one moved
+    /// to [`Self::converged_hash`] and the other kept reading the snapshot's,
+    /// which is our own re-encoding and need not equal what the publisher wrote.
+    /// A member whose bytes differ then treats every poll as a change, forever.
+    pub(crate) fn needs_reconverge(&self, signed: blake3::Hash) -> bool {
+        crate::membership::trusted_reconverge_hash(self.converged_hash, signed).is_some()
+    }
 }
 
 /// Runtime state for one active network. Created when a network is joined,
@@ -2056,6 +2068,24 @@ mod accept_handler_tests {
         s.members = MemberList::from_members(vec![seated(member_id, 1)]);
         s.refresh_snapshot();
 
+        // The mismatch this exists for needs no version skew: `network_name` is
+        // hashed into the blob and is a *local* string, so a member that joined
+        // with `ray join <code> --name <alias>` re-encodes a name the coordinator
+        // never published and can never match its record.
+        let published = canonical_group_bytes(
+            &s.members,
+            &s.approved,
+            &s.suggested_firewall,
+            Some("what the coordinator published"),
+            &s.reusable_keys,
+            &s.nullifiers,
+        );
+        assert_ne!(
+            blake3::hash(&published),
+            s.snapshot.as_ref().unwrap().hash,
+            "a local alias alone puts our re-encoding out of step with the record"
+        );
+
         // Our own encoding is what we are converged on, so a coordinator (which
         // publishes exactly these bytes) sees the two agree.
         let ours = s.snapshot.as_ref().unwrap().hash;
@@ -2070,10 +2100,19 @@ mod accept_handler_tests {
             ours,
             "the snapshot is still our own encoding, which is what we would publish"
         );
-        assert_eq!(
-            s.converged_hash,
-            Some(published),
-            "a second poll of the same record must read as converged, not as a change"
+
+        // The decision every caller actually makes. This is the assertion that
+        // fails if `needs_reconverge` reads the snapshot: polling the record we
+        // just applied has to read as converged, or the poller refetches and
+        // reapplies the whole roster on every tick for as long as the two
+        // encodings differ.
+        assert!(
+            !s.needs_reconverge(published),
+            "the record we applied is not a change"
+        );
+        assert!(
+            s.needs_reconverge(blake3::hash(b"a genuinely newer blob")),
+            "a record we have not applied still is one"
         );
     }
 

@@ -181,18 +181,6 @@ pub struct Member {
     /// makes clients dial a node that drops them.
     #[serde(default)]
     pub exit_node: bool,
-    /// Which families the exit node this member offers can egress, i.e. whether
-    /// that host has an IPv6 default route to masquerade onto. Meaningless
-    /// unless `exit_node`.
-    ///
-    /// Separate from `exit_node` because an IPv6-only client can only use a
-    /// gateway that carries IPv6: its tunnel is IPv6-only too, so a gateway that
-    /// can reach the internet over IPv4 alone would take the traffic and have
-    /// nowhere to send it. Without this that failure is a silent black hole,
-    /// since nothing else on the roster says which families a gateway can
-    /// egress. See [`ExitFamilies`] for why it is three-valued.
-    #[serde(default)]
-    pub exit_families: ExitFamilies,
     /// This member's data plane is IPv6-only, so its `ip` is assigned but not
     /// routed: another VPN owns `100.64.0.0/10` on that host. A self-claim, same
     /// shape as `exit_node` and carried the same way
@@ -201,6 +189,25 @@ pub struct Member {
     /// but the replies leave through the other VPN.
     #[serde(default)]
     pub ipv6_only: bool,
+    /// Which families the exit node this member offers can egress, i.e. whether
+    /// that host has an IPv6 default route to masquerade onto, and whether its own
+    /// data plane routes the mesh IPv4 a reply comes back on. Meaningless unless
+    /// `exit_node`.
+    ///
+    /// Separate from `exit_node` because a client can only use a gateway that
+    /// carries a family the client itself routes: the tunnel takes the
+    /// intersection, and a gateway that cannot return one would take that
+    /// family's traffic and have nowhere to send it. Without this that failure is
+    /// a silent black hole, since nothing else on the roster says which families a
+    /// gateway can egress. See [`ExitFamilies`] for why it is three-valued.
+    ///
+    /// **Last on purpose.** The wire is positional, and this is the only field
+    /// added to `Member` since the last release, so appending it is what makes an
+    /// older build's shorter array fail on its length rather than mis-slot: read
+    /// mid-struct, its `ipv6_only` would land here and be read as a family claim.
+    /// It errors either way today only because the two happen to differ in type.
+    #[serde(default)]
+    pub exit_families: ExitFamilies,
 }
 
 impl Member {
@@ -2005,7 +2012,13 @@ mod tests {
             collision_index: u32,
             last_seen: Option<u64>,
             exit_node: bool,
-            // `exit_families` and `ipv6_only` not yet declared.
+            // The released shape ends here. `exit_families` is appended after
+            // this, so what an older build sees is simply one element too many:
+            // every slot it does read still means what it meant. Inserted
+            // anywhere above instead, the failure would depend on the types that
+            // happened to line up, which is the thing the append rule exists to
+            // take off the table.
+            ipv6_only: bool,
         }
         let id = test_id(11);
         let bytes = rmp_serde::to_vec(&Member {
@@ -2052,10 +2065,13 @@ mod tests {
             device_cert: Option<DeviceCert>,
             collision_index: u32,
             last_seen: Option<u64>,
-            // `ipv6_only` and `exit_node` swapped relative to `Member`.
+            // `ipv6_only` and `exit_node` swapped relative to `Member`. Both are
+            // `bool`, and they are adjacent, which is the whole hazard: a diff that
+            // moves one line past the other changes the wire and looks like
+            // nothing. `exit_families` stays last, where `Member` has it.
             ipv6_only: bool,
-            exit_families: ExitFamilies,
             exit_node: bool,
+            exit_families: ExitFamilies,
         }
         let id = test_id(9);
         let bytes = rmp_serde::to_vec(&Reordered {
@@ -2068,8 +2084,8 @@ mod tests {
             collision_index: 0,
             last_seen: None,
             ipv6_only: true,
-            exit_families: ExitFamilies::Dual,
             exit_node: false,
+            exit_families: ExitFamilies::Dual,
         })
         .unwrap();
 

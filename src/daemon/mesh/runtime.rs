@@ -1328,7 +1328,9 @@ impl Daemon {
             // Pin and rebind before the routes go in: `network_change` rebinds
             // iroh's UDP socket to apply the pin, and until it has, the transport
             // has nothing keeping it out of the tunnel.
-            if !crate::exit_node::set_full_tunnel(true, self.tunnel_carries().carries_v4()) {
+            // Rebind whenever the pin state changed, which now includes the tunnel
+            // narrowing or widening under a live selection, not just coming up.
+            if crate::exit_node::set_full_tunnel(true, self.tunnel_carries().carries_v4()) {
                 self.transport.endpoint.network_change().await;
             }
             let conn = self.exit_peer_conn().await;
@@ -1404,15 +1406,25 @@ impl Daemon {
 
     /// Narrow underlay addresses to the families the tunnel actually captures.
     ///
-    /// The exclusions exist to keep iroh's own traffic off the split default. In
-    /// IPv6-only mode there is no IPv4 default of ours to route around, so a v4
-    /// host route is not just wasted work: it pins that address to the physical
-    /// gateway, carving it out of whichever co-resident VPN owns IPv4 on this Mac.
+    /// The exclusions exist to keep iroh's own traffic off the split default. For a
+    /// family the tunnel does not carry there is no default of ours to route
+    /// around, so a host route is not just wasted work: it pins that address to the
+    /// physical gateway, carving it out of whichever co-resident VPN owns that
+    /// family on this Mac.
+    ///
+    /// Reads [`Self::tunnel_carries`], the same fact the routing install and the
+    /// socket pin read. It used to read this node's mode, which was the same answer
+    /// only until the gateway's claim could narrow a tunnel too: a dual-stack Mac
+    /// through a gateway that can only return IPv6 has no IPv4 default of ours and
+    /// was still excluding IPv4 addresses from it.
     #[cfg(target_os = "macos")]
     fn tunnel_relevant(&self, ips: Vec<IpAddr>) -> Vec<IpAddr> {
-        let v6_only = self.ipv6_only.enabled();
+        let carries = self.tunnel_carries();
         ips.into_iter()
-            .filter(|ip| !v6_only || ip.is_ipv6())
+            .filter(|ip| match ip {
+                IpAddr::V4(_) => carries.carries_v4() || carries.is_unknown(),
+                IpAddr::V6(_) => carries.carries_v6() || carries.is_unknown(),
+            })
             .collect()
     }
 

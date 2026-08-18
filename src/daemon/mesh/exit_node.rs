@@ -667,11 +667,16 @@ impl NetworkRegistry {
             .parse::<EndpointId>()
             .ok()
             .and_then(|id| self.roster_member(network, id));
+        // The install error belongs to the network whose selection was installed,
+        // and there is only ever one: a single default route means a single
+        // tunnel. Reporting it against every configured network would blame this
+        // one's gateway for a failure that happened on another's, which is worse
+        // than saying nothing, since the reason string is the whole point.
+        let install_error = resolved
+            .then(|| self.exit_install_error.load().as_deref().cloned())
+            .flatten();
         selection_problem(
-            self.exit_install_error
-                .load()
-                .as_deref()
-                .map(|e| e.as_str()),
+            install_error.as_deref(),
             resolved,
             self.exit_sync_enabled.load(Ordering::Relaxed),
             member.as_ref(),
@@ -712,17 +717,27 @@ impl NetworkRegistry {
                 .exit_node_use
                 .as_deref()
                 .and_then(|sel| self.exit_selection_problem(&n.name, sel));
-            // What a tunnel through the selected gateway carries. An absent claim
-            // (or an unresolvable peer) defaults to `Unknown`, which `tunnelled`
-            // reads as "can carry", so this says what the install would do.
-            let carries = n
-                .exit_node_use
-                .as_deref()
-                .and_then(|sel| sel.parse::<EndpointId>().ok())
-                .and_then(|id| self.roster_member(&n.name, id))
-                .map(|m| m.exit_families)
-                .unwrap_or_default()
-                .tunnelled(self.ipv6_only);
+            // What the installed tunnel carries, which is the selection's own copy
+            // and not a fresh read of the roster: between a gateway republishing a
+            // narrower claim and the re-apply that acts on it, the roster answer
+            // describes a tunnel that is not installed, and `not_in_effect` says
+            // nothing because the selection did resolve. Fall back to the roster
+            // only when nothing is installed, so a selection waiting on a re-apply
+            // still reports what it would carry.
+            let carries = self
+                .exit_client
+                .selection()
+                .filter(|s| s.network == n.name)
+                .map(|s| s.carries)
+                .unwrap_or_else(|| {
+                    n.exit_node_use
+                        .as_deref()
+                        .and_then(|sel| sel.parse::<EndpointId>().ok())
+                        .and_then(|id| self.roster_member(&n.name, id))
+                        .map(|m| m.exit_families)
+                        .unwrap_or_default()
+                        .tunnelled(self.ipv6_only)
+                });
             networks.push(ipc::ExitNodeStatusView {
                 network: n.name,
                 allow: n.exit_allow,

@@ -1044,11 +1044,15 @@ impl MemberAcceptState {
             }
         };
         let record_ts = packet.timestamp().as_micros();
-        let (current_hash, floor) = {
+        let (current_hash, floor, needs) = {
             let s = self.state.read().unwrap();
-            (s.converged_hash, s.last_record_timestamp)
+            (
+                s.converged_hash,
+                s.last_record_timestamp,
+                s.needs_reconverge(remote_hash),
+            )
         };
-        if current_hash == Some(remote_hash) {
+        if !needs {
             return;
         }
         if !record_is_newer(record_ts, floor) {

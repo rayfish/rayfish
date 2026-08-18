@@ -76,17 +76,31 @@ static FULL_TUNNEL: AtomicBool = AtomicBool::new(false);
 /// exclusions one layer up; this is the same rule for the coarser knob.
 static FULL_TUNNEL_V4: AtomicBool = AtomicBool::new(false);
 
-/// Records whether a full tunnel is up, returning the previous value. Whenever this
-/// flips, the caller must trigger an endpoint rebind (`Endpoint::network_change`)
-/// so already-bound sockets pick it up; when it did not flip, the rebind can be
-/// skipped.
+/// Records whether a full tunnel is up and whether it carries IPv4, returning
+/// whether either of those *changed*. The caller must trigger an endpoint rebind
+/// (`Endpoint::network_change`) when it did, so already-bound sockets pick the new
+/// state up; when nothing changed the rebind can be skipped.
 ///
-/// `claims_v4` says whether that tunnel carries IPv4 (false in IPv6-only mode).
-/// It is not part of the returned "did it flip" answer: it only ever changes
-/// alongside a daemon restart, since the mode is fixed when the TUN is created.
+/// `claims_v4` used to be a restatement of the node's own mode, fixed for the
+/// daemon's lifetime, and the answer only reported the on/off flip. It is now
+/// `ExitFamilies::tunnelled`, which follows the gateway's claim and changes under
+/// a live tunnel: a gateway that gains or loses an IPv6 uplink republishes, and
+/// the re-apply arrives with a different value. Reporting only the on/off flip
+/// there returns "nothing changed" for a re-apply of a live tunnel, so the pin is
+/// never re-evaluated: IPv4 sockets bound while the tunnel did not claim IPv4 stay
+/// unpinned once it does (iroh's own IPv4 underlay then routes into the tunnel it
+/// is carrying), and sockets pinned while it did stay pinned once it stops (the
+/// host's whole IPv4 underlay stays carved out of the co-resident VPN).
 pub fn set_full_tunnel(on: bool, claims_v4: bool) -> bool {
-    FULL_TUNNEL_V4.store(on && claims_v4, Ordering::Release);
-    FULL_TUNNEL.swap(on, Ordering::AcqRel)
+    let wants_v4 = on && claims_v4;
+    // `FULL_TUNNEL_V4` first, and not for tidiness: a socket binding between the
+    // two stores reads both. Publishing `FULL_TUNNEL` first opens a window where
+    // an install looks like a tunnel that carries no IPv4, so a v4 socket binding
+    // in it skips the pin. The rebind that follows a change heals it, but the
+    // window is free to close.
+    let was_v4 = FULL_TUNNEL_V4.swap(wants_v4, Ordering::AcqRel);
+    let was_on = FULL_TUNNEL.swap(on, Ordering::AcqRel);
+    was_on != on || was_v4 != wants_v4
 }
 
 /// Whether a full tunnel (an exit-node selection) is currently active. Read by
@@ -1130,16 +1144,16 @@ pub fn install_client_routing(tun_name: &str, carries: ExitFamilies) -> Result<(
         // Keeps the catch-all standing: everything below is a rebuild, and the
         // rules are re-added one `ip` process at a time. See [`RuleSweep`].
         remove_client_rules(family, RuleSweep::KeepCatchAll);
-        // The three bypasses go back **first**, and the unbounded per-prefix loop
-        // goes last, because the catch-all now stays up across the rebuild. That
-        // closed the window where traffic leaked out the physical uplink, and it
-        // opened a worse one in the other direction: with the catch-all standing
-        // and these three gone, the highest-priority rule matching anything is
-        // ours, so for the length of the rebuild the daemon's own QUIC underlay
-        // is routed into the tunnel it is carrying, along with every pre-existing
-        // physical-sourced connection. That is precisely what `PREF_BYPASS` and
-        // `PREF_SRC` exist to prevent, and it kills the mesh rather than leaking
-        // past it. Three `ip` calls here, then the loop that can be hundreds.
+        // The three bypasses go back **first**, because the catch-all now stays up
+        // across the rebuild. That closed the window where traffic leaked out the
+        // physical uplink, and it opened a worse one in the other direction: with
+        // the catch-all standing and these three gone, the highest-priority rule
+        // matching anything is ours, so for the length of the rebuild the daemon's
+        // own QUIC underlay is routed into the tunnel it is carrying, along with
+        // every pre-existing physical-sourced connection. That is precisely what
+        // `PREF_BYPASS` and `PREF_SRC` exist to prevent, and it kills the mesh
+        // rather than leaking past it. Each of these is a separate `ip` process,
+        // so the window is real even now that it is a handful of them.
         //
         // Ahead of everything else: traffic sourced from one of this host's own
         // physical addresses leaves the way it always did. That is every connection
@@ -1214,17 +1228,7 @@ pub fn install_client_routing(tun_name: &str, carries: ExitFamilies) -> Result<(
         // rule exists for the traffic that would otherwise stop at `PREF_SRC` or
         // `PREF_BYPASS` above and look up `main`.
         if mirrored > 0 {
-            run_ip(&[
-                family,
-                "rule",
-                "add",
-                "table",
-                EXIT_TABLE,
-                "suppress_prefixlength",
-                "0",
-                "pref",
-                PREF_FOREIGN,
-            ])?;
+            run_ip(&foreign_rule_args(family, "add"))?;
         }
         // Only if the rebuild did not inherit it: `ip rule add` is not idempotent,
         // so adding it unconditionally would stack a duplicate on every re-apply,
@@ -1278,18 +1282,18 @@ pub fn teardown_client_routing() {
 /// [`RuleSweep::KeepCatchAll`], because the catch-all at [`PREF_TUNNEL`] is the
 /// only thing standing between tunnel-bound traffic and `main`: drop it and every
 /// packet leaves the physical uplink, sourced from this host's real address,
-/// until the rebuild puts it back. That is not instant. The rebuild issues one
-/// `ip` process per mirrored foreign prefix, and a co-resident VPN with a few
-/// hundred peers has a few hundred of them, so the gap is long enough to leak
-/// real connections. Since the rule never varies (`table <EXIT_TABLE> pref
-/// <PREF_TUNNEL>`, no per-run content), leaving it standing across the rebuild
-/// costs nothing and closes the window: the routes underneath it are updated with
-/// `route replace`, which is atomic per destination.
+/// until the rebuild puts it back. That is not instant: every rule is a separate
+/// `ip` process, and the mirrored routes that go in first are one process per
+/// foreign prefix, which a co-resident VPN can have hundreds of. Since the rule
+/// never varies (`table <EXIT_TABLE> pref <PREF_TUNNEL>`, no per-run content),
+/// leaving it standing across the rebuild costs nothing and closes the window:
+/// the routes underneath it are updated with `route replace`, which is atomic per
+/// destination.
 ///
 /// Keeping it standing is only safe because the rebuild puts the three bypass
-/// rules back *before* the unbounded per-prefix loop: with the catch-all up and
-/// those down, ours is the highest-priority rule matching anything, and the
-/// daemon's own transport goes into the tunnel it is carrying.
+/// rules back *first*: with the catch-all up and those down, ours is the
+/// highest-priority rule matching anything, and the daemon's own transport goes
+/// into the tunnel it is carrying.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RuleSweep {
@@ -1366,6 +1370,62 @@ fn parse_source_rules(show: &str) -> Vec<String> {
         .collect()
 }
 
+/// The one [`PREF_FOREIGN`] rule, as `ip` argv. `verb` is `add` or `del`.
+///
+/// Split out because the add and the del have to name the *same* rule and are
+/// several hundred lines apart: `ip rule del` matches on the keys it is given, so
+/// a del that omits `suppress_prefixlength` finds nothing and leaves the rule
+/// installed, which stacks a duplicate on the next add. The whole spelling is also
+/// what makes the rule mean "every prefix in our table except the default", so a
+/// test can pin it rather than the constants around it.
+#[cfg(target_os = "linux")]
+fn foreign_rule_args<'a>(family: &'a str, verb: &'a str) -> [&'a str; 9] {
+    [
+        family,
+        "rule",
+        verb,
+        "table",
+        EXIT_TABLE,
+        "suppress_prefixlength",
+        "0",
+        "pref",
+        PREF_FOREIGN,
+    ]
+}
+
+/// The destinations of any per-prefix [`PREF_FOREIGN`] rules still installed: the
+/// shape this branch used to add, before one `suppress_prefixlength` rule replaced
+/// the lot.
+///
+/// Kept only as a cleanup path. Matching is deliberately loose on the table (a
+/// name or our id, since `ip rule show` prints whichever `/etc/iproute2/rt_tables`
+/// says) and strict on the shape, so it reclaims our own leftovers without
+/// touching a foreign rule that happens to sit at the same preference.
+#[cfg(target_os = "linux")]
+fn strays_at_our_pref(family: &str) -> Vec<String> {
+    match ip_output(&[family, "rule", "show"]) {
+        Some(out) => parse_strays(&out),
+        None => Vec::new(),
+    }
+}
+
+/// The text half of [`strays_at_our_pref`], split out to be testable.
+#[cfg(target_os = "linux")]
+fn parse_strays(show: &str) -> Vec<String> {
+    show.lines()
+        .filter_map(|line| {
+            let (pref, rest) = line.split_once(':')?;
+            if pref.trim() != PREF_FOREIGN {
+                return None;
+            }
+            match rest.split_whitespace().collect::<Vec<_>>().as_slice() {
+                ["from", "all", "to", dest, "lookup", _] => Some((*dest).to_string()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// Delete our policy rules for one address family, ignoring "not found".
 /// Each del names the full rule spec, mirroring the adds in
 /// [`install_client_routing`], never the pref alone: `ip rule del` removes the
@@ -1388,17 +1448,32 @@ fn remove_client_rules(family: &str, sweep: RuleSweep) {
     // the same bug `parse_catch_all` had: `ip rule show` prints a table *name*
     // where `/etc/iproute2/rt_tables` maps our id, and a rule whose table did not
     // match the numeric string was left behind to accumulate on every re-apply.
-    let _ = run_ip(&[
-        family,
-        "rule",
-        "del",
-        "table",
-        EXIT_TABLE,
-        "suppress_prefixlength",
-        "0",
-        "pref",
-        PREF_FOREIGN,
-    ]);
+    let _ = run_ip(&foreign_rule_args(family, "del"));
+    // Then whatever the *old* shape left behind. Kernel rules outlive the process
+    // and the panic hook `abort()`s, so a host that ran a build with the per-prefix
+    // rules and then swapped the binary keeps them: the del above names a spec they
+    // do not match, and nothing else looks at pref 98 any more. A stranded
+    // `to <prefix> lookup 29793` outlives the mirrored route it depends on, and
+    // once the co-resident VPN drops that prefix it sends those destinations to the
+    // tunnel default sitting in the same table, which is the exact failure the
+    // single-rule form was meant to make impossible.
+    //
+    // By pref alone, which the comment above warns against for every other rule,
+    // and safe only here: `remove_stray_rules` deletes only rules that look like
+    // the shape we used to install, so a foreign rule parked at 98 is left alone.
+    for stray in strays_at_our_pref(family) {
+        let _ = run_ip(&[
+            family,
+            "rule",
+            "del",
+            "to",
+            &stray,
+            "table",
+            EXIT_TABLE,
+            "pref",
+            PREF_FOREIGN,
+        ]);
+    }
     let mark = format!("{SOCKET_MARK:#x}");
     let _ = run_ip(&[
         family,
@@ -2154,6 +2229,84 @@ mod tests {
         );
     }
 
+    /// The rule that hands a co-resident VPN's destinations back to it, spelled
+    /// out, and the sweep that reclaims the shape it replaced.
+    ///
+    /// `suppress_prefixlength 0` is what makes one rule cover every mirrored
+    /// prefix: the lookup itself is the selector, matching the copies and
+    /// suppressing our own default. Verified against a live kernel (iproute2
+    /// 6.1.0) with a mirrored `172.20.0.0/16` and our default in the table: a
+    /// packet to that prefix resolves to the foreign interface whether it is
+    /// sourced from the physical address or carries our mark, an ordinary
+    /// destination still takes the tunnel, and a marked one still bypasses it.
+    /// What is pinned here is the spelling, because a `del` that omits any of it
+    /// matches nothing and leaves the rule to stack on the next add.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_foreign_rule_is_spelled_the_same_way_twice() {
+        assert_eq!(
+            foreign_rule_args("-6", "add"),
+            [
+                "-6",
+                "rule",
+                "add",
+                "table",
+                EXIT_TABLE,
+                "suppress_prefixlength",
+                "0",
+                "pref",
+                PREF_FOREIGN,
+            ]
+        );
+        // The del names the identical rule, differing in the verb alone.
+        let add = foreign_rule_args("-4", "add");
+        let del = foreign_rule_args("-4", "del");
+        assert_eq!(add[2], "add");
+        assert_eq!(del[2], "del");
+        assert_eq!(add[3..], del[3..], "a del that names less matches nothing");
+
+        // `suppress_prefixlength 0` is the whole mechanism, not decoration: it is
+        // what excludes our own default from the lookup. Without it the rule sends
+        // *everything* to the tunnel table at a preference above the bypasses.
+        let spec = add.join(" ");
+        assert!(spec.contains("suppress_prefixlength 0"), "{spec}");
+        assert!(spec.contains(&format!("table {EXIT_TABLE}")), "{spec}");
+    }
+
+    /// A host that ran the per-prefix build keeps those rules across a binary
+    /// swap, and nothing else looks at pref 98 any more.
+    ///
+    /// Kernel rules outlive the process and the panic hook `abort()`s, so this is
+    /// a supported path rather than a corner. A stranded `to <prefix>` rule
+    /// outlives the mirrored route it depends on; once the co-resident VPN drops
+    /// that prefix, the rule sends those destinations to the tunnel default in the
+    /// same table, which is the failure the single-rule form exists to prevent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_old_per_prefix_rules_are_reclaimed_and_a_foreign_one_is_not() {
+        let show = "\
+0:\tfrom all lookup local
+98:\tfrom all to fd7a:115c:a1e0::/48 lookup 29793
+98:\tfrom all to 100.64.0.0/10 lookup corpvpn
+98:\tfrom all lookup 29793 suppress_prefixlength 0
+99:\tfrom 2a01:4f8:121:33c3::2 lookup main
+5270:\tfrom all to 10.9.0.0/24 lookup 52
+";
+        assert_eq!(
+            parse_strays(show),
+            vec![
+                "fd7a:115c:a1e0::/48".to_string(),
+                // Matched by shape, not by table text: `ip rule show` prints the
+                // name when /etc/iproute2/rt_tables maps our id, and reading that
+                // as somebody else's rule is what left these behind before.
+                "100.64.0.0/10".to_string(),
+            ],
+        );
+        // The current rule has no `to`, so the sweep never touches it, and a rule
+        // at another pref is not ours whatever its shape.
+        assert!(!parse_strays(show).iter().any(|d| d == "10.9.0.0/24"));
+    }
+
     /// The rule that hands a co-resident VPN's destinations back to it.
     ///
     /// `mirror_foreign_routes` alone only rescues the `PREF_TUNNEL` path. The two
@@ -2188,9 +2341,9 @@ mod tests {
     /// A re-install must recognize its own catch-all and leave it standing.
     ///
     /// It is the only rule between tunnel-bound traffic and `main`, and the
-    /// rebuild around it is one `ip` process per mirrored prefix, so tearing it
-    /// down first leaks every packet out the physical uplink for as long as that
-    /// takes. Recognizing it also has to be exact: a co-resident VPN's own
+    /// rebuild around it re-mirrors one route per foreign prefix, a separate `ip`
+    /// process each, so tearing it down first leaks every packet out the physical
+    /// uplink for as long as that takes. Recognizing it also has to be exact: a co-resident VPN's own
     /// catch-all has the identical shape and differs only in the preference, so a
     /// looser match would read someone else's rule as ours and skip installing
     /// one at all.
@@ -2217,16 +2370,29 @@ mod tests {
         ));
     }
 
-    /// An IPv6-only tunnel must not pin the IPv4 sockets.
+    /// A tunnel pins only the families it carries, and says so whenever that
+    /// changes.
     ///
     /// The pin is what keeps iroh's underlay out of the tunnel, so it is only
-    /// wanted for a family the tunnel actually claimed. Pinning IPv4 in this mode
-    /// binds the whole IPv4 underlay to the physical interface and carves it out
-    /// of the co-resident VPN that owns IPv4 on that host, which is the setup the
-    /// mode exists to share with. Sole owner of these process-wide statics; a
-    /// second test touching them needs a lock between the two.
+    /// wanted for a family the tunnel actually claimed. Pinning IPv4 in IPv6-only
+    /// mode binds the whole IPv4 underlay to the physical interface and carves it
+    /// out of the co-resident VPN that owns IPv4 on that host, which is the setup
+    /// the mode exists to share with.
+    ///
+    /// The second half is the part that changed. `claims_v4` used to restate this
+    /// node's mode, fixed for the daemon's lifetime, so reporting only the on/off
+    /// flip was enough. It now follows the gateway's claim and moves under a live
+    /// tunnel: a gateway that gains or loses an IPv6 uplink republishes and the
+    /// re-apply arrives with a different value. Answering "nothing changed" there
+    /// skips the rebind that applies `IP_BOUND_IF`, leaving IPv4 sockets unpinned
+    /// for a tunnel that now carries IPv4 (iroh's own underlay then routes into
+    /// the tunnel it is carrying), or pinned for one that no longer does.
+    ///
+    /// Sole owner of these process-wide statics, deliberately: a second test
+    /// touching them races this one under cargo's thread pool, so new cases go
+    /// here rather than in a test of their own.
     #[test]
-    fn an_ipv6_only_tunnel_does_not_claim_v4_for_the_pin() {
+    fn a_tunnel_pins_the_families_it_carries_and_reports_every_change() {
         set_full_tunnel(true, false);
         assert!(full_tunnel_active(), "the tunnel itself is up");
         assert!(
@@ -2241,6 +2407,33 @@ mod tests {
         set_full_tunnel(false, false);
         assert!(!full_tunnel_active());
         assert!(!full_tunnel_claims_v4());
+
+        // And the answer itself: every change has to be reported, not just the
+        // on/off flip, or a narrowing tunnel never re-evaluates the pin.
+
+        // From nothing to a v6-only tunnel: a flip either way round.
+        set_full_tunnel(false, false);
+        assert!(set_full_tunnel(true, false), "coming up is a change");
+        assert!(!set_full_tunnel(true, false), "a plain re-apply is not");
+
+        // Widening while up: `FULL_TUNNEL` does not move, and this is exactly the
+        // case that used to answer "no change" and leave the v4 sockets unpinned.
+        assert!(
+            set_full_tunnel(true, true),
+            "gaining IPv4 under a live tunnel is a change"
+        );
+        assert!(full_tunnel_claims_v4());
+        assert!(!set_full_tunnel(true, true), "and then it settles");
+
+        // Narrowing while up, the other direction of the same bug: the pin stays
+        // on IPv4 sockets for a family the tunnel no longer carries.
+        assert!(
+            set_full_tunnel(true, false),
+            "losing IPv4 under a live tunnel is a change"
+        );
+        assert!(!full_tunnel_claims_v4());
+
+        set_full_tunnel(false, false);
     }
 
     /// Pinning iroh to a tunnel interface puts its transport inside the tunnel it
