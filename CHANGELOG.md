@@ -98,6 +98,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **Unprivileged report requests can no longer overwrite root-owned files.**
+  Diagnostic bundles now use unpredictable, exclusively created paths and set
+  ownership through the open file descriptor, so a symlink planted in `/tmp`
+  cannot redirect the root daemon's report output.
 - **Knowing a network's room id no longer lets a stranger talk to it.** A mesh
   control message is addressed to a network by its public key, and that key is
   a discovery key by design: it is in every invite code and it is the address
