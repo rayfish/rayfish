@@ -6,7 +6,7 @@
 //! - [`spawn_tun_writer`]: single task, writes incoming packets to the TUN device
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,7 +87,6 @@ pub(crate) const SSH_LISTEN_PORT: u16 = 30022;
 /// ssh` is on.
 struct SshNat {
     active: AtomicBool,
-    v4: Ipv4Addr,
     v6: Ipv6Addr,
     listen_port: u16,
 }
@@ -121,10 +120,9 @@ fn is_disabled_mesh_ipv4(ipv6_only: bool, dst: IpAddr) -> bool {
 
 /// Register this node's mesh addresses + SSH listen port. Called once at daemon
 /// start; the NAT stays inactive until [`set_ssh_nat_active`].
-pub fn init_ssh_nat(v4: Ipv4Addr, v6: Ipv6Addr, listen_port: u16) {
+pub fn init_ssh_nat(v6: Ipv6Addr, listen_port: u16) {
     let _ = SSH_NAT.set(SshNat {
         active: AtomicBool::new(false),
-        v4,
         v6,
         listen_port,
     });
@@ -144,10 +142,7 @@ fn ssh_nat() -> Option<&'static SshNat> {
 
 impl SshNat {
     fn is_ours(&self, ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(v) => v == self.v4,
-            IpAddr::V6(v) => v == self.v6,
-        }
+        matches!(ip, IpAddr::V6(v) if v == self.v6)
     }
 }
 
@@ -980,7 +975,7 @@ mod tests {
         packet[18] = 0;
         packet[19] = 3;
         let info = firewall::parse_packet_info(&packet).unwrap();
-        assert_eq!(info.dst_ip, Ipv4Addr::new(100, 64, 0, 3));
+        assert_eq!(info.dst_ip, IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 3)));
         assert_eq!(info.protocol, 6);
     }
 
@@ -1161,25 +1156,30 @@ mod tests {
         ));
     }
 
-    /// Compute the TCP checksum of a v4 packet (20-byte IP header) with the
-    /// checksum field treated as zero, what a correct packet's field should hold.
-    fn tcp_csum_v4(pkt: &[u8]) -> u16 {
-        let tcp = &pkt[20..];
-        let mut sum = 0u32;
-        for off in [12, 14, 16, 18] {
-            sum += u16::from_be_bytes([pkt[off], pkt[off + 1]]) as u32;
+
+    /// TCP checksum over the IPv6 pseudo-header (RFC 2460 §8.1): src, dst,
+    /// the upper-layer length as a 32-bit big-endian, three zero bytes and the
+    /// next-header value, followed by the TCP segment itself.
+    fn tcp_csum_v6(pkt: &[u8]) -> u16 {
+        let tcp = &pkt[40..];
+        let mut sum: u32 = 0;
+        for chunk in pkt[8..40].chunks(2) {
+            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
         }
-        sum += 6; // protocol
         sum += tcp.len() as u32;
-        let mut i = 0;
-        while i + 1 < tcp.len() {
-            if i != 16 {
-                // skip the checksum field itself
-                sum += u16::from_be_bytes([tcp[i], tcp[i + 1]]) as u32;
+        sum += 6; // next header = TCP
+        for (i, chunk) in tcp.chunks(2).enumerate() {
+            if i == 8 {
+                continue; // the checksum field itself
             }
-            i += 2;
+            let v = if chunk.len() == 2 {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], 0])
+            };
+            sum += v as u32;
         }
-        while (sum >> 16) != 0 {
+        while sum >> 16 != 0 {
             sum = (sum & 0xffff) + (sum >> 16);
         }
         !(sum as u16)
@@ -1191,24 +1191,26 @@ mod tests {
         // (e.g. the headless daemon build) may seed it first, making our
         // `init_ssh_nat` a no-op. Read the addresses the NAT actually holds and
         // build the packet from those, so the test is independent of run order.
-        init_ssh_nat(Ipv4Addr::new(100, 88, 0, 1), Ipv6Addr::LOCALHOST, 41384);
+        init_ssh_nat(Ipv6Addr::LOCALHOST, 41384);
         set_ssh_nat_active(true);
-        let (our_v4, listen_port) = {
+        let (our_v6, listen_port) = {
             let nat = ssh_nat().expect("nat active");
-            (nat.v4, nat.listen_port)
+            (nat.v6, nat.listen_port)
         };
 
-        // v4 TCP packet from a peer to our mesh :22, with a correct checksum.
-        let mut pkt = vec![0u8; 40];
-        pkt[0] = 0x45;
-        pkt[9] = 6; // TCP
-        pkt[12..16].copy_from_slice(&[100, 88, 0, 9]); // src (peer)
-        pkt[16..20].copy_from_slice(&our_v4.octets()); // dst (us)
-        pkt[20..22].copy_from_slice(&5000u16.to_be_bytes()); // src port
-        pkt[22..24].copy_from_slice(&22u16.to_be_bytes()); // dst port 22
-        pkt[32] = 0x50; // data offset = 5 (20-byte TCP header)
-        let ck = tcp_csum_v4(&pkt);
-        pkt[36..38].copy_from_slice(&ck.to_be_bytes());
+        // IPv6 TCP packet from a peer to our mesh :22, with a correct checksum.
+        let mut pkt = vec![0u8; 60];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&20u16.to_be_bytes()); // payload = TCP header
+        pkt[6] = 6; // next header = TCP
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 9).octets());
+        pkt[24..40].copy_from_slice(&our_v6.octets()); // dst (us)
+        pkt[40..42].copy_from_slice(&5000u16.to_be_bytes()); // src port
+        pkt[42..44].copy_from_slice(&22u16.to_be_bytes()); // dst port 22
+        pkt[52] = 0x50; // data offset = 5 (20-byte TCP header)
+        let ck = tcp_csum_v6(&pkt);
+        pkt[56..58].copy_from_slice(&ck.to_be_bytes());
 
         let info = firewall::parse_packet_info(&pkt).unwrap();
         assert!(rewrite_ssh_port(&mut pkt, &info, true));
@@ -1218,10 +1220,10 @@ mod tests {
             "dest port rewritten 22 -> listen"
         );
         // The incrementally-updated checksum must equal a freshly computed one.
-        let field = u16::from_be_bytes([pkt[36], pkt[37]]);
+        let field = u16::from_be_bytes([pkt[56], pkt[57]]);
         assert_eq!(
             field,
-            tcp_csum_v4(&pkt),
+            tcp_csum_v6(&pkt),
             "checksum stays valid after rewrite"
         );
 
@@ -1628,23 +1630,18 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_only_drops_mesh_ipv4_but_not_ipv6_or_transit() {
+    fn mesh_ipv4_is_no_longer_an_overlay_destination() {
+        // `is_overlay_ip` is what the data path uses to tell "a mesh peer" from
+        // "the internet". The CGNAT range is no longer ours, so an address in it
+        // is not a mesh destination and falls through to the exit-node rules
+        // like any other non-overlay address.
         let mesh_v4: IpAddr = "100.64.0.9".parse().unwrap();
         let mesh_v6: IpAddr = "200::9".parse().unwrap();
         let internet: IpAddr = "1.1.1.1".parse().unwrap();
-        // The magic-DNS IP lives in the peer range and stays reachable: the
-        // resolver is answered locally off the TUN, never over a peer link.
-        let magic = IpAddr::V4(crate::dns::MAGIC_DNS_V4);
 
-        assert!(is_disabled_mesh_ipv4(true, mesh_v4));
-        assert!(is_disabled_mesh_ipv4(true, magic));
-        assert!(!is_disabled_mesh_ipv4(true, mesh_v6));
-        // Internet-bound is exit-node transit, judged by the exit rules instead.
-        assert!(!is_disabled_mesh_ipv4(true, internet));
-        // Dual-stack (the default) never drops anything on this rule.
-        for dst in [mesh_v4, mesh_v6, internet, magic] {
-            assert!(!is_disabled_mesh_ipv4(false, dst));
-        }
+        assert!(is_overlay_ip(mesh_v6));
+        assert!(!is_overlay_ip(mesh_v4));
+        assert!(!is_overlay_ip(internet));
     }
 
     #[test]

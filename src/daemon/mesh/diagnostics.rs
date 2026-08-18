@@ -101,13 +101,13 @@ impl Daemon {
         // Resolve a mesh IPv4 back to its `.ray` hostname via the DNS snapshot.
         // A member running an IPv6-only data plane holds no IPv4 in the table, so
         // fall back to matching on its derived IPv6.
-        let lookup_hostname = |ip: Ipv4Addr, id: EndpointId| {
+        let lookup_hostname = |id: EndpointId| {
             let v6 = derive_ipv6(&id);
             hostname_snapshot.and_then(|table| {
                 table.get(&h.name).and_then(|hosts| {
                     hosts
                         .iter()
-                        .find(|(_, v)| v.0 == Some(ip) || v.1 == v6)
+                        .find(|(_, v)| v.1 == v6)
                         .map(|(k, _)| k.clone())
                 })
             })
@@ -172,7 +172,7 @@ impl Daemon {
                 let hostname = m
                     .hostname
                     .clone()
-                    .or_else(|| lookup_hostname(m.ip, m.identity));
+                    .or_else(|| lookup_hostname(m.identity));
                 let connection = connected.get(&m.identity).map(Self::gather_conn_info);
                 let user_id = self.registry.device_user_map.resolve(&m.identity);
                 let user_identity = (user_id != m.identity).then_some(user_id);
@@ -219,7 +219,7 @@ impl Daemon {
                 Some(m) => m
                     .hostname
                     .clone()
-                    .or_else(|| lookup_hostname(m.ip, m.identity))
+                    .or_else(|| lookup_hostname(m.identity))
                     .unwrap_or_else(|| m.identity.fmt_short().to_string()),
                 None => stored,
             });
@@ -227,7 +227,7 @@ impl Daemon {
             name: h.name.clone(),
             role,
             my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
-            my_hostname: lookup_hostname(h.my_ip, self.transport.identity.local_identity()),
+            my_hostname: lookup_hostname(self.transport.identity.local_identity()),
             network_key: Some(h.network_key.to_string()),
             member_count,
             peers,

@@ -308,25 +308,13 @@ fn find_cgnat_conflict(
 /// traffic either way. Magic DNS does not depend on it in this mode: it is
 /// reached at [`crate::dns::MAGIC_DNS_V6`] instead.
 #[cfg(not(target_os = "android"))]
-pub async fn create(
-    v4: Ipv4Addr,
-    v6: Ipv6Addr,
-    ipv6_only: bool,
-) -> Result<(TunReader, TunWriter, String)> {
-    let gateway = Ipv4Addr::new(100, 64, 0, 1);
-    // `10` is the /10 prefix (was the (255,192,0,0) netmask); `Some(gateway)` is
-    // the point-to-point destination. `ipv6(v6, 128)` assigns just our own
-    // address (a /128, no connected route) cross-platform, replacing the old
-    // netlink/`ifconfig` `configure_ipv6` shell-out. `enable(true)` brings the
-    // link up at creation (as the old `.up()` did); `set_link_up` and the
-    // peer-range route helpers still run later on activate.
-    let (prefix, gateway) = if ipv6_only {
-        (32, None)
-    } else {
-        (10, Some(gateway))
-    };
+pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
+    // `ipv6(v6, 128)` assigns just our own address (a /128, no connected route)
+    // cross-platform. `enable(true)` brings the link up at creation (as the old
+    // `.up()` did); `set_link_up` and the peer-range route helpers still run
+    // later on activate. No IPv4 is assigned at all: the overlay is IPv6-only,
+    // and `100.64.0.0/10` belongs to whatever else may be sharing the host.
     let device = DeviceBuilder::new()
-        .ipv4(v4, prefix, gateway)
         .ipv6(v6, 128)
         .mtu(TUN_MTU)
         .enable(true)
@@ -334,7 +322,7 @@ pub async fn create(
         .context("create tun-rs device")?;
 
     let tun_name = device.name().unwrap_or_else(|_| "unknown".to_string());
-    tracing::info!(addr = %v4, ipv6 = %v6, tun = %tun_name, ipv6_only, "TUN device created");
+    tracing::info!(ipv6 = %v6, tun = %tun_name, "TUN device created");
 
     // `recv`/`send` take `&self`, so both halves share one device via `Arc`
     // instead of splitting into independent read/write objects.
@@ -638,14 +626,8 @@ pub async fn route_magic_dns(_tun_name: &str) -> Result<()> {
 /// `local` route in the `local` table that already delivers self-traffic via
 /// loopback, so pinging your own TUN address works out of the box.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub async fn route_self_loopback(v4: Ipv4Addr, v6: Ipv6Addr, ipv6_only: bool) -> Result<()> {
-    // IPv6-only mode carries no IPv4 mesh traffic, so only the v6 self-route is
-    // wanted; a `/32` for our own IPv4 sitting on lo0 would just shadow that one
-    // address for the VPN that owns the range.
-    let mut families = vec![("-inet6", v6.to_string())];
-    if !ipv6_only {
-        families.insert(0, ("-inet", v4.to_string()));
-    }
+pub async fn route_self_loopback(v6: Ipv6Addr) -> Result<()> {
+    let families = [("-inet6", v6.to_string())];
     for (family, addr) in families {
         let _ = Command::new("route")
             .args(["-n", "delete", family, "-host", &addr, "-interface", "lo0"])
@@ -667,7 +649,7 @@ pub async fn route_self_loopback(v4: Ipv4Addr, v6: Ipv6Addr, ipv6_only: bool) ->
     not(target_os = "android"),
     not(target_os = "freebsd")
 ))]
-pub async fn route_self_loopback(_v4: Ipv4Addr, _v6: Ipv6Addr, _ipv6_only: bool) -> Result<()> {
+pub async fn route_self_loopback(_v6: Ipv6Addr) -> Result<()> {
     // Linux installs the loopback `local` route automatically on address
     // assignment; self-traffic already works without an explicit route.
     Ok(())

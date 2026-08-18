@@ -13,6 +13,18 @@ use smol_str::SmolStr;
 
 use crate::dns::{HostnameTable, MAGIC_DNS_V4, MAGIC_DNS_V6, ReverseLookupTable};
 
+/// Whether forwarding a query to `ip` could loop back into this resolver.
+///
+/// Our own overlay is the obvious case. The CGNAT range is the other one: a
+/// co-resident VPN's resolver lives there, and if it forwards back to us (as
+/// Tailscale does, since it only filters out its *own* service IPs) the two
+/// resolvers point at each other. Neither range is a place a real upstream
+/// lives, so refusing both costs nothing.
+fn is_loopable_upstream(ip: IpAddr) -> bool {
+    crate::membership::is_overlay_ip(ip)
+        || matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
+}
+
 /// Our own Magic DNS addresses. Forwarding to either is a loop: the query would
 /// come straight back in through `handle_tun_query`.
 fn is_magic_dns(ip: IpAddr) -> bool {
@@ -257,14 +269,14 @@ impl Resolver {
         // upstream could loop. A host with ordinary resolvers pays nothing.
         let name = upstreams
             .iter()
-            .any(|a| crate::membership::is_overlay_ip(a.ip()))
+            .any(|a| is_loopable_upstream(a.ip()))
             .then(|| query_name(query))
             .flatten();
         for up in upstreams.iter() {
             // Skip an overlay resolver that this name has already been bounced
             // off, and fall through to the next upstream (a real server, if the
             // capture found one) rather than feeding the loop another hop.
-            if crate::membership::is_overlay_ip(up.ip()) && !self.loop_guard_allows(name.as_ref()) {
+            if is_loopable_upstream(up.ip()) && !self.loop_guard_allows(name.as_ref()) {
                 continue;
             }
             match forward_once(query, *up, FORWARD_TIMEOUT).await {

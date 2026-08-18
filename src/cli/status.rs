@@ -116,14 +116,13 @@ pub(crate) async fn ipc_status() -> Result<()> {
         }
         println!("  {}", style::faint("saved networks:"));
         for net in &app_config.networks {
-            let ip_str = net
-                .my_ip
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "?".to_string());
+            // No address here: it derives from our identity, which this path
+            // deliberately does not load (the daemon is down and the config is
+            // all we have). The name and member count are what the listing is
+            // for; `ray status` with the daemon up prints the address.
             println!(
-                "    {} {}  {}",
+                "    {}  {}",
                 style::value(&net.name),
-                style::faint(&format!("({ip_str})")),
                 style::faint(&format!("{} members", net.members.len()))
             );
         }

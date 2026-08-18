@@ -19,7 +19,6 @@ struct JoinContext<'a> {
     display_name: &'a str,
     my_hostname: &'a str,
     alpn: &'a [u8],
-    my_ip: Ipv4Addr,
     net_pubkey: EndpointId,
     /// Single-use invite secret to redeem at admission, if any. Cloned per dial
     /// attempt (a fresh join may try several coordinators).
@@ -250,7 +249,6 @@ impl NetworkRegistry {
         }
 
         let alpn = transport::mesh_alpn();
-        let my_ip = self.transport.identity.local_ip();
         // Use coordinator's network name from GroupBlob, or user alias, or truncated key as fallback
         let blob_name = data
             .name
@@ -287,7 +285,6 @@ impl NetworkRegistry {
             display_name,
             my_hostname: &my_hostname,
             alpn: &alpn,
-            my_ip,
             net_pubkey,
             invite,
             auto_accept_firewall,
@@ -625,7 +622,6 @@ impl NetworkRegistry {
         let JoinContext {
             display_name,
             my_hostname,
-            my_ip,
             net_pubkey,
             invite_lock,
             ..
@@ -715,7 +711,6 @@ impl NetworkRegistry {
             name: display_name.to_string(),
             network_key: net_pubkey,
             role: NetworkRole::Member,
-            my_ip,
             state,
             dht_notify: None,
             cancel,
@@ -731,7 +726,7 @@ impl NetworkRegistry {
             &self.dns.reverse_table,
             display_name,
             my_hostname,
-            (!self.ipv6_only).then_some(my_ip),
+            None,
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
@@ -742,14 +737,14 @@ impl NetworkRegistry {
                     &self.dns.reverse_table,
                     display_name,
                     h,
-                    (!member.ipv6_only).then_some(member.ip),
+                    None,
                     derive_ipv6(&member.identity),
                 )
                 .await;
             }
         }
 
-        tracing::info!(network = %display_name, key = %net_pubkey, ip = %my_ip, "joined network");
+        tracing::info!(network = %display_name, key = %net_pubkey, "joined network");
 
         Ok(TryJoin::Joined(Box::new(IpcMessage::Joined {
             name: display_name.to_string(),
@@ -857,7 +852,6 @@ impl NetworkRegistry {
         net_pubkey: EndpointId,
         network_name: &str,
         my_identity: EndpointId,
-        my_ip: Ipv4Addr,
         my_hostname: Option<String>,
     ) {
         // Announce the current name (a pending rename or the confirmed one),
@@ -888,7 +882,6 @@ impl NetworkRegistry {
                             Some(net_pubkey),
                             &ControlMsg::MeshHello {
                                 identity: my_identity,
-                                ip: my_ip,
                                 hostname: my_hostname.clone(),
                                 device_cert: self.current_device_cert(),
                             },

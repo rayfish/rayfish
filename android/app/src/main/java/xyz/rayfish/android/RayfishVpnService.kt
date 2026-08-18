@@ -337,7 +337,7 @@ class RayfishVpnService : VpnService() {
         val (meshIp, meshV6) = try {
             runBlocking {
                 val snapshot = NodeHolder.get(applicationContext).status()
-                snapshot.ipv4 to snapshot.ipv6
+                "" to snapshot.ipv6
             }
         } catch (t: Throwable) {
             Log.e(TAG, "could not read mesh IP before tunnel build", t)

@@ -65,11 +65,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     #[cfg(not(target_os = "android"))]
     {
         let my_ipv6 = derive_ipv6(&daemon.transport.identity.local_identity());
-        let (tun_reader, tun_writer, tun_name) = tun::create(
-            daemon.transport.identity.local_ip(),
-            my_ipv6,
-            daemon.ipv6_only.enabled(),
-        )
+        let (tun_reader, tun_writer, tun_name) = tun::create(my_ipv6)
         .await
         .context("failed to create TUN device")?;
         daemon.tun_name.store(Arc::new(tun_name));
@@ -249,16 +245,11 @@ async fn build_daemon_inner(
     if let Some(ref cert) = device_cert {
         tracing::info!(user = %cert.user_identity.fmt_short(), "loaded device certificate");
     }
-    let collision_index = identity::load_collision_index()?;
-    let identity = IrohIdentityProvider::new(public_key, collision_index);
-    let my_ip = identity.local_ip();
-    // Register our mesh addresses for the userspace SSH port NAT (mesh `:22`
+    let identity = IrohIdentityProvider::new(public_key);
+    let my_ip = identity.local_ipv6();
+    // Register our mesh address for the userspace SSH port NAT (mesh `:22`
     // <-> the embedded server's listen port). Stays inactive until `ssh on`.
-    forward::init_ssh_nat(
-        my_ip,
-        derive_ipv6(&identity.local_identity()),
-        crate::forward::SSH_LISTEN_PORT,
-    );
+    forward::init_ssh_nat(my_ip, crate::forward::SSH_LISTEN_PORT);
 
     // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
     let mut app_config = config::load()?;

@@ -75,11 +75,9 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 }
             }
             val nodeId = status?.nodeId?.takeIf { it.isNotEmpty() }
-            val ip4 = status?.ipv4?.takeIf { it.isNotEmpty() }
             val ip6 = status?.ipv6?.takeIf { it.isNotEmpty() }
             KeyValueRow("Node ID", nodeId?.let { if (it.length > 12) "${it.take(6)}…${it.takeLast(4)}" else it } ?: "-",
                 onClick = nodeId?.let { v -> { copyToClipboard(context, "Node ID", v); onToast("Copied node ID") } })
-            KeyValueRow("IPv4", ip4 ?: "-", onClick = ip4?.let { v -> { copyToClipboard(context, "IPv4", v); onToast("Copied $v") } })
             KeyValueRow("IPv6", ip6 ?: "-", onClick = ip6?.let { v -> { copyToClipboard(context, "IPv6", v); onToast("Copied $v") } })
         }
         SectionCard {

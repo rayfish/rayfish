@@ -4,7 +4,6 @@
 //! Control messages manage membership (join, approve, sync) and mesh topology (hello, reconnect).
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result};
 use iroh::endpoint::{RecvStream, SendStream};
@@ -137,7 +136,6 @@ pub enum ControlMsg {
     /// approval (closed network, no invite). The joiner retries until accepted.
     JoinPending,
     JoinApproved {
-        your_ip: Ipv4Addr,
         members: Vec<Member>,
     },
     JoinDenied {
@@ -160,7 +158,6 @@ pub enum ControlMsg {
     },
     MeshHello {
         identity: EndpointId,
-        ip: Ipv4Addr,
         #[serde(default)]
         hostname: Option<String>,
         #[serde(default)]
@@ -168,7 +165,6 @@ pub enum ControlMsg {
     },
     MemberApproved {
         identity: EndpointId,
-        ip: Ipv4Addr,
         #[serde(default)]
         hostname: Option<String>,
         #[serde(default)]
@@ -572,15 +568,12 @@ mod tests {
     #[test]
     fn test_roundtrip_join_approved() {
         let msg = ControlMsg::JoinApproved {
-            your_ip: Ipv4Addr::new(100, 64, 0, 3),
             members: vec![Member {
                 identity: test_id(1),
-                ip: Ipv4Addr::new(100, 64, 0, 2),
                 is_coordinator: true,
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
-                collision_index: 0,
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
@@ -596,7 +589,6 @@ mod tests {
     fn test_roundtrip_mesh_hello() {
         let msg = ControlMsg::MeshHello {
             identity: test_id(1),
-            ip: Ipv4Addr::new(100, 64, 0, 4),
             hostname: None,
             device_cert: None,
         };
@@ -807,7 +799,6 @@ mod tests {
     fn test_roundtrip_member_approved() {
         let msg = ControlMsg::MemberApproved {
             identity: test_id(1),
-            ip: Ipv4Addr::new(100, 64, 12, 34),
             hostname: None,
             device_cert: None,
         };
@@ -822,12 +813,10 @@ mod tests {
         let msg = ControlMsg::Welcome {
             members: vec![Member {
                 identity: test_id(1),
-                ip: Ipv4Addr::new(100, 64, 0, 2),
                 is_coordinator: true,
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
-                collision_index: 0,
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
@@ -835,11 +824,9 @@ mod tests {
             }],
             approved: vec![ApprovedEntry {
                 identity: test_id(2),
-                ip: Ipv4Addr::new(100, 64, 0, 5),
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
-                collision_index: 0,
             }],
             direct_key: Some([7u8; 32]),
         };
@@ -953,7 +940,6 @@ mod tests {
         let cert = DeviceCert::create(&user_key, &device_key.public(), 0);
         let msg = ControlMsg::MeshHello {
             identity: device_key.public(),
-            ip: Ipv4Addr::new(100, 64, 0, 5),
             hostname: Some("alice".to_string()),
             device_cert: Some(cert),
         };

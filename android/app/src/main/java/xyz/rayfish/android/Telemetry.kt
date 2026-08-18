@@ -128,7 +128,6 @@ object Telemetry {
                     "networks" to h.networkCount.toLong(),
                     "peers_online" to h.peersOnline.toLong(),
                     "node_id" to h.nodeId,
-                    "mesh_ipv4" to h.meshIpv4,
                     "warn_count" to h.warnCount.toLong(),
                     "error_count" to h.errorCount.toLong(),
                 ))

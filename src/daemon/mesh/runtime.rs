@@ -52,7 +52,6 @@ impl NetworkRegistry {
         name: &str,
         net_public_key: EndpointId,
         net_config: Option<&config::NetworkConfig>,
-        my_ip: Ipv4Addr,
         persisted_hostname: &Option<String>,
     ) -> RestoredRoster {
         let mut member_list = MemberList::new();
@@ -69,10 +68,10 @@ impl NetworkRegistry {
                 reusable_keys = data.reusable_keys.clone();
                 nullifiers = data.nullifiers.clone();
                 for m in &data.members {
-                    let _ = member_list.add(m.clone());
+                    member_list.add(m.clone());
                 }
                 for a in &data.approved {
-                    let _ = approved_list.approve(a.clone(), &member_list);
+                    approved_list.approve(a.clone());
                 }
                 tracing::info!(
                     network = %name,
@@ -88,14 +87,12 @@ impl NetworkRegistry {
                 );
                 if let Some(nc) = net_config {
                     for entry in &nc.members {
-                        let _ = member_list.add(Member {
+                        member_list.add(Member {
                             identity: entry.identity,
-                            ip: entry.ip,
                             is_coordinator: entry.is_coordinator,
                             hostname: entry.hostname.clone(),
                             user_identity: None,
                             device_cert: None,
-                            collision_index: 0,
                             last_seen: None,
                             exit_node: false,
                             exit_families: ExitFamilies::Unknown,
@@ -105,33 +102,27 @@ impl NetworkRegistry {
                     for entry in &nc.approved {
                         let ae = ApprovedEntry {
                             identity: entry.identity,
-                            ip: entry.ip,
                             hostname: entry.hostname.clone(),
                             user_identity: None,
                             device_cert: None,
-                            collision_index: 0,
                         };
-                        let _ = approved_list.approve(ae, &member_list);
+                        approved_list.approve(ae);
                     }
                 }
             }
         }
         if !member_list.is_member(&self.transport.identity.local_identity()) {
-            member_list
-                .add(Member {
+            member_list.add(Member {
                     identity: self.transport.identity.local_identity(),
-                    ip: my_ip,
                     is_coordinator: true,
                     hostname: persisted_hostname.clone(),
                     user_identity: None,
                     device_cert: None,
-                    collision_index: 0,
                     last_seen: None,
                     exit_node: false,
                     exit_families: ExitFamilies::Unknown,
-                    ipv6_only: self.ipv6_only,
-                })
-                .expect("self-add cannot collide");
+                ipv6_only: self.ipv6_only,
+            });
         }
         RestoredRoster {
             members: member_list,
@@ -154,7 +145,7 @@ impl NetworkRegistry {
             }
         }
 
-        let my_ip = self.transport.identity.local_ip();
+        let my_ip = self.transport.identity.local_ipv6();
 
         // Load persisted network secret key from config
         let app_config = config::load()?;
@@ -182,7 +173,7 @@ impl NetworkRegistry {
             reusable_keys,
             nullifiers,
         } = self
-            .restore_member_roster(name, net_public_key, net_config, my_ip, &persisted_hostname)
+            .restore_member_roster(name, net_public_key, net_config, &persisted_hostname)
             .await;
 
         let mut net_state = NetworkState {
@@ -212,7 +203,6 @@ impl NetworkRegistry {
         config::save_network(&config::NetworkConfig {
             name: name.to_string(),
             group_mode: mode,
-            my_ip: Some(my_ip),
             my_hostname: persisted_hostname.clone(),
             // Coordinators publish renames directly, so they never carry a
             // pending intent.
@@ -279,7 +269,7 @@ impl NetworkRegistry {
                         m.hostname.as_ref().map(|h| {
                             (
                                 h.clone(),
-                                (!m.ipv6_only).then_some(m.ip),
+                                None,
                                 derive_ipv6(&m.identity),
                             )
                         })
@@ -320,7 +310,6 @@ impl NetworkRegistry {
             net_public_key,
             name,
             self.transport.identity.local_identity(),
-            my_ip,
             persisted_hostname.clone(),
         )
         .await;
@@ -334,7 +323,6 @@ impl NetworkRegistry {
             name: name.to_string(),
             network_key: net_public_key,
             role: NetworkRole::Coordinator,
-            my_ip,
             state,
             dht_notify: Some(dht_notify),
             cancel: cancel.clone(),
@@ -361,7 +349,6 @@ impl NetworkRegistry {
                     net_public_key,
                     &network_name,
                     me.transport.identity.local_identity(),
-                    my_ip,
                     persisted_hostname,
                 )
                 .await;
@@ -486,7 +473,7 @@ impl NetworkRegistry {
             {
                 Some(m) => (
                     m.identity,
-                    m.ip,
+                    derive_ipv6(&m.identity),
                     m.is_coordinator,
                     m.hostname
                         .clone()
@@ -878,7 +865,6 @@ impl Daemon {
         *guard = Some(token.clone());
         drop(guard);
         self.rebuild_ssh_authz();
-        let my_v4 = self.transport.identity.local_ip();
         let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
         let server = crate::ssh::SshServer::new(
             self.registry.peers.clone(),
@@ -887,11 +873,7 @@ impl Daemon {
         );
         // IPv6-only mode carries no mesh IPv4, so binding our v4 would create a
         // listener nothing can reach.
-        let binds = if self.ipv6_only.enabled() {
-            vec![IpAddr::V6(my_v6)]
-        } else {
-            vec![IpAddr::V4(my_v4), IpAddr::V6(my_v6)]
-        };
+        let binds = vec![IpAddr::V6(my_v6)];
         server.spawn(binds, token);
         // Turn on the userspace port NAT so mesh `:22` reaches the listener.
         crate::forward::set_ssh_nat_active(true);
@@ -999,7 +981,6 @@ impl Daemon {
         #[cfg(not(target_os = "android"))]
         {
             let tun_name = self.tun_name.load().as_str().to_owned();
-            let my_v4 = self.transport.identity.local_ip();
             let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
             if let Err(e) = tun::set_link_up(&tun_name) {
                 tracing::warn!(error = %e, "failed to bring TUN interface up");
@@ -1039,7 +1020,7 @@ impl Daemon {
             // the TUN, where the forwarding loop would drop it as "no peer for
             // dst". No-op on Linux (kernel installs the `local` route
             // automatically).
-            if let Err(e) = tun::route_self_loopback(my_v4, my_v6, self.ipv6_only.enabled()).await {
+            if let Err(e) = tun::route_self_loopback(my_v6).await {
                 tracing::warn!(error = %e, "failed to install loopback self-route");
                 warnings.push(format!("failed to install loopback self-route: {e}"));
             }

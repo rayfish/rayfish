@@ -1366,7 +1366,7 @@ pub(crate) fn system_nameservers() -> Option<Vec<Ipv4Addr>> {
     Some(
         found?
             .into_iter()
-            .filter(|ip| !crate::membership::is_overlay_ip(IpAddr::V4(*ip)))
+            .filter(|ip| !crate::membership::is_cgnat_range(*ip))
             .collect(),
     )
 }
@@ -1518,7 +1518,7 @@ pub async fn run_resolv_reassert(
     let merged_with = fallbacks
         .iter()
         .copied()
-        .find(|ip| crate::membership::is_overlay_ip(IpAddr::V4(*ip)));
+        .find(|ip| crate::membership::is_cgnat_range(*ip));
     // Consecutive liveness failures for `merged_with`. Two, so one lost packet
     // or a restart does not hand the file back.
     let mut shared_misses = 0u32;
@@ -2036,7 +2036,7 @@ fn other_overlay_resolver(contents: &str) -> Option<Ipv4Addr> {
     // `parse_resolv_nameservers` already drops our own magic IP.
     parse_resolv_nameservers(contents)
         .into_iter()
-        .find(|ip| crate::membership::is_overlay_ip(IpAddr::V4(*ip)))
+        .find(|ip| crate::membership::is_cgnat_range(*ip))
 }
 
 /// The first `nameserver` in `contents`, whatever its family.

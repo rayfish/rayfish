@@ -948,18 +948,16 @@ impl NetworkRegistry {
 #[cfg(test)]
 mod tests {
     use super::{Member, gateway_refusal};
-    use crate::membership::{ExitFamilies, derive_ip};
+    use crate::membership::ExitFamilies;
 
     fn gateway(exit_node: bool, exit_families: ExitFamilies) -> Member {
         let identity = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
         Member {
             identity,
-            ip: derive_ip(&identity),
             is_coordinator: false,
             hostname: Some("gw".to_string()),
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node,
             exit_families,

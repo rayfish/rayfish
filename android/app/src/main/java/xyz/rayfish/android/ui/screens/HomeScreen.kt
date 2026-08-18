@@ -207,14 +207,12 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
         StatusEyebrow(connected = vpnOn && !starting, text = banner)
         ToggleCard(
             title = "Tunnel",
-            subtitle = if (vpnOn) "running · this device ${status?.ipv4.orEmpty()}" else "stopped",
+            subtitle = if (vpnOn) "running · this device ${status?.ipv6.orEmpty()}" else "stopped",
             checked = vpnOn, onCheckedChange = { toggle(it) },
         )
         SectionCard {
             SectionLabel("This device")
-            val ip4 = status?.ipv4?.takeIf { it.isNotEmpty() }
             val ip6 = status?.ipv6?.takeIf { it.isNotEmpty() }
-            KeyValueRow("IPv4", ip4 ?: "-", onClick = ip4?.let { v -> { copyToClipboard(context, "IPv4", v); onToast("Copied $v") } })
             KeyValueRow("IPv6", ip6 ?: "-", onClick = ip6?.let { v -> { copyToClipboard(context, "IPv6", v); onToast("Copied $v") } })
             KeyValueRow("Networks", "${nets.size} · $online peers online")
         }

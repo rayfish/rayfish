@@ -578,7 +578,7 @@ fn has_v6_uplink() -> bool {
 }
 
 pub fn is_transitable(dst: IpAddr) -> bool {
-    if is_overlay_ip(dst) {
+    if is_overlay_ip(dst) || matches!(dst, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4)) {
         return false;
     }
     match dst {
@@ -1006,7 +1006,9 @@ pub fn teardown_client_routing() {}
 /// that never leave the host.
 #[cfg(target_os = "linux")]
 fn is_bypass_source(addr: IpAddr) -> bool {
-    if crate::membership::is_overlay_ip(addr) {
+    if crate::membership::is_overlay_ip(addr)
+        || matches!(addr, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
+    {
         return false;
     }
     match addr {

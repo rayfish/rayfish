@@ -2953,7 +2953,7 @@ data class HealthSnapshot (
     var `networks`: List<NetworkHealth>, 
     var `meshUp`: kotlin.Boolean, 
     var `nodeId`: kotlin.String, 
-    var `meshIpv4`: kotlin.String, 
+    var `meshIpv6`: kotlin.String, 
     var `warnCount`: kotlin.ULong, 
     var `errorCount`: kotlin.ULong, 
     var `recentErrors`: List<kotlin.String>
@@ -2988,7 +2988,7 @@ public object FfiConverterTypeHealthSnapshot: FfiConverterRustBuffer<HealthSnaps
             FfiConverterSequenceTypeNetworkHealth.allocationSize(value.`networks`) +
             FfiConverterBoolean.allocationSize(value.`meshUp`) +
             FfiConverterString.allocationSize(value.`nodeId`) +
-            FfiConverterString.allocationSize(value.`meshIpv4`) +
+            FfiConverterString.allocationSize(value.`meshIpv6`) +
             FfiConverterULong.allocationSize(value.`warnCount`) +
             FfiConverterULong.allocationSize(value.`errorCount`) +
             FfiConverterSequenceString.allocationSize(value.`recentErrors`)
@@ -3001,7 +3001,7 @@ public object FfiConverterTypeHealthSnapshot: FfiConverterRustBuffer<HealthSnaps
             FfiConverterSequenceTypeNetworkHealth.write(value.`networks`, buf)
             FfiConverterBoolean.write(value.`meshUp`, buf)
             FfiConverterString.write(value.`nodeId`, buf)
-            FfiConverterString.write(value.`meshIpv4`, buf)
+            FfiConverterString.write(value.`meshIpv6`, buf)
             FfiConverterULong.write(value.`warnCount`, buf)
             FfiConverterULong.write(value.`errorCount`, buf)
             FfiConverterSequenceString.write(value.`recentErrors`, buf)
@@ -3015,7 +3015,6 @@ public object FfiConverterTypeHealthSnapshot: FfiConverterRustBuffer<HealthSnaps
  */
 data class NetworkDetail (
     var `name`: kotlin.String, 
-    var `ipv4`: kotlin.String, 
     var `ipv6`: kotlin.String, 
     var `hostname`: kotlin.String, 
     var `isCoordinator`: kotlin.Boolean, 
@@ -3034,7 +3033,6 @@ public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetai
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
-            FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceTypePeerInfo.read(buf),
         )
@@ -3042,7 +3040,6 @@ public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetai
 
     override fun allocationSize(value: NetworkDetail) = (
             FfiConverterString.allocationSize(value.`name`) +
-            FfiConverterString.allocationSize(value.`ipv4`) +
             FfiConverterString.allocationSize(value.`ipv6`) +
             FfiConverterString.allocationSize(value.`hostname`) +
             FfiConverterBoolean.allocationSize(value.`isCoordinator`) +
@@ -3051,7 +3048,6 @@ public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetai
 
     override fun write(value: NetworkDetail, buf: ByteBuffer) {
             FfiConverterString.write(value.`name`, buf)
-            FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`ipv6`, buf)
             FfiConverterString.write(value.`hostname`, buf)
             FfiConverterBoolean.write(value.`isCoordinator`, buf)
@@ -3102,7 +3098,6 @@ public object FfiConverterTypeNetworkHealth: FfiConverterRustBuffer<NetworkHealt
 data class NetworkInfo (
     var `name`: kotlin.String, 
     var `nodeId`: kotlin.String, 
-    var `ipv4`: kotlin.String, 
     var `ipv6`: kotlin.String, 
     /**
      * True when the join was queued for coordinator approval (no IP yet).
@@ -3122,7 +3117,6 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
-            FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
         )
     }
@@ -3130,7 +3124,6 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
     override fun allocationSize(value: NetworkInfo) = (
             FfiConverterString.allocationSize(value.`name`) +
             FfiConverterString.allocationSize(value.`nodeId`) +
-            FfiConverterString.allocationSize(value.`ipv4`) +
             FfiConverterString.allocationSize(value.`ipv6`) +
             FfiConverterBoolean.allocationSize(value.`pending`)
     )
@@ -3138,7 +3131,6 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
     override fun write(value: NetworkInfo, buf: ByteBuffer) {
             FfiConverterString.write(value.`name`, buf)
             FfiConverterString.write(value.`nodeId`, buf)
-            FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`ipv6`, buf)
             FfiConverterBoolean.write(value.`pending`, buf)
     }
@@ -3150,7 +3142,11 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
  * One peer in a network snapshot.
  */
 data class PeerInfo (
-    var `ipv4`: kotlin.String, 
+    /**
+     * The peer's mesh IPv6, derived from its identity. The only address it has:
+     * the overlay carries no IPv4.
+     */
+    var `ipv6`: kotlin.String, 
     var `nodeId`: kotlin.String, 
     var `hostname`: kotlin.String, 
     var `state`: PeerConnState
@@ -3173,14 +3169,14 @@ public object FfiConverterTypePeerInfo: FfiConverterRustBuffer<PeerInfo> {
     }
 
     override fun allocationSize(value: PeerInfo) = (
-            FfiConverterString.allocationSize(value.`ipv4`) +
+            FfiConverterString.allocationSize(value.`ipv6`) +
             FfiConverterString.allocationSize(value.`nodeId`) +
             FfiConverterString.allocationSize(value.`hostname`) +
             FfiConverterTypePeerConnState.allocationSize(value.`state`)
     )
 
     override fun write(value: PeerInfo, buf: ByteBuffer) {
-            FfiConverterString.write(value.`ipv4`, buf)
+            FfiConverterString.write(value.`ipv6`, buf)
             FfiConverterString.write(value.`nodeId`, buf)
             FfiConverterString.write(value.`hostname`, buf)
             FfiConverterTypePeerConnState.write(value.`state`, buf)
@@ -3283,7 +3279,6 @@ public object FfiConverterTypeQueuedSend: FfiConverterRustBuffer<QueuedSend> {
 data class Status (
     var `running`: kotlin.Boolean, 
     var `nodeId`: kotlin.String, 
-    var `ipv4`: kotlin.String, 
     var `ipv6`: kotlin.String, 
     /**
      * The running node's data-plane mode. `On` and `Auto` both mean IPv6-only;
@@ -3310,7 +3305,6 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterBoolean.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
-            FfiConverterString.read(buf),
             FfiConverterTypeIpv6OnlyMode.read(buf),
             FfiConverterSequenceTypePeerInfo.read(buf),
             FfiConverterSequenceTypeNetworkDetail.read(buf),
@@ -3321,7 +3315,6 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
     override fun allocationSize(value: Status) = (
             FfiConverterBoolean.allocationSize(value.`running`) +
             FfiConverterString.allocationSize(value.`nodeId`) +
-            FfiConverterString.allocationSize(value.`ipv4`) +
             FfiConverterString.allocationSize(value.`ipv6`) +
             FfiConverterTypeIpv6OnlyMode.allocationSize(value.`ipv6Only`) +
             FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`) +
@@ -3332,7 +3325,6 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
     override fun write(value: Status, buf: ByteBuffer) {
             FfiConverterBoolean.write(value.`running`, buf)
             FfiConverterString.write(value.`nodeId`, buf)
-            FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`ipv6`, buf)
             FfiConverterTypeIpv6OnlyMode.write(value.`ipv6Only`, buf)
             FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)

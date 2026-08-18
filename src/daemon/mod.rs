@@ -286,7 +286,6 @@ pub(crate) fn to_member_entries<'a>(
         .into_iter()
         .map(|m| config::MemberEntry {
             identity: m.identity,
-            ip: m.ip,
             is_coordinator: m.is_coordinator,
             hostname: m.hostname.clone(),
         })
@@ -301,7 +300,6 @@ pub(crate) fn to_approved_entries<'a>(
         .into_iter()
         .map(|a| config::ApprovedConfigEntry {
             identity: a.identity,
-            ip: a.ip,
             hostname: a.hostname.clone(),
         })
         .collect()
@@ -459,7 +457,6 @@ pub struct NetworkHandle {
     name: String,
     network_key: EndpointId,
     role: NetworkRole,
-    my_ip: Ipv4Addr,
     state: SharedNetworkState,
     /// DHT republish trigger; `Some` only on the coordinator (the sole publisher).
     /// Lets `set_hostname` re-publish the group blob on a coordinator self-rename.
@@ -1288,9 +1285,8 @@ impl Daemon {
             return ipc_err("invalid hostname (lowercase ASCII, 1-63 chars)".to_string());
         }
 
-        let (my_ip, is_coord, state, dht_notify) = match self.registry.networks.get(network) {
+        let (is_coord, state, dht_notify) = match self.registry.networks.get(network) {
             Some(h) => (
-                h.my_ip,
                 h.role.is_coordinator(),
                 h.state.clone(),
                 h.dht_notify.clone(),
@@ -1333,7 +1329,7 @@ impl Daemon {
             &self.dns.reverse_table,
             network,
             &new_hostname,
-            (!self.ipv6_only.enabled()).then_some(my_ip),
+            None,
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
@@ -1359,7 +1355,7 @@ impl Daemon {
         // `BlobUpdated` trigger, and coordinators don't run the group poller. So
         // without this, a co-coordinator's rename never reached its peer
         // coordinators (roster + `.ray` DNS both stayed stale on them).
-        self.announce_rename_to_peers(network, my_identity, my_ip, &new_hostname)
+        self.announce_rename_to_peers(network, my_identity, &new_hostname)
             .await;
         if is_coord {
             // Authoritative: republish the signed blob so members reconverge from
@@ -1388,7 +1384,6 @@ impl Daemon {
         &self,
         network: &str,
         my_identity: EndpointId,
-        my_ip: Ipv4Addr,
         new_hostname: &str,
     ) {
         let peers = self.registry.peers.peers_for_network_with_conn(network);
@@ -1404,7 +1399,6 @@ impl Daemon {
             if let Ok((mut send, _recv)) = conn.open_bi().await {
                 let msg = ControlMsg::MeshHello {
                     identity: my_identity,
-                    ip: my_ip,
                     hostname: Some(new_hostname.to_string()),
                     device_cert: self.current_device_cert(),
                 };
@@ -1964,15 +1958,13 @@ mod absent_member_tests {
         SecretKey::from(b).public()
     }
 
-    fn member(seed: u8, last: u8) -> Member {
+    fn member(seed: u8) -> Member {
         Member {
             identity: id(seed),
-            ip: Ipv4Addr::new(100, 64, 0, last),
             is_coordinator: false,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
@@ -1985,7 +1977,7 @@ mod absent_member_tests {
     /// links while staying reachable.
     #[test]
     fn unconnected_member_is_a_dial_candidate() {
-        let roster = vec![member(1, 1), member(2, 2)];
+        let roster = vec![member(1), member(2)];
         let reached: HashSet<EndpointId> = [id(1)].into_iter().collect();
         let got = absent_member_ips(&roster, id(9), None, &reached, |_| false);
         assert_eq!(got, vec![derive_ipv6(&id(2))]);
@@ -1996,7 +1988,7 @@ mod absent_member_tests {
     /// the peer the caller deliberately skipped, the third already got it.
     #[test]
     fn self_excluded_and_reached_are_skipped() {
-        let roster = vec![member(1, 1), member(2, 2), member(3, 3), member(4, 4)];
+        let roster = vec![member(1), member(2), member(3), member(4)];
         let reached: HashSet<EndpointId> = [id(3)].into_iter().collect();
         let got = absent_member_ips(
             &roster,
@@ -2013,7 +2005,7 @@ mod absent_member_tests {
     /// edit and teach us nothing.
     #[test]
     fn known_offline_member_is_not_redialed() {
-        let roster = vec![member(1, 1), member(2, 2)];
+        let roster = vec![member(1), member(2)];
         let offline = id(1);
         let got = absent_member_ips(&roster, id(9), None, &HashSet::new(), |i| *i == offline);
         assert_eq!(got, vec![derive_ipv6(&id(2))]);
@@ -2064,7 +2056,7 @@ mod accept_handler_tests {
         let state = make_network_state();
         let mut s = state.write().unwrap();
         let member_id = SecretKey::from_bytes(&[9u8; 32]).public();
-        s.members = MemberList::from_members(vec![seated(member_id, 1)]);
+        s.members = MemberList::from_members(vec![seated(member_id)]);
         s.refresh_snapshot();
 
         // The mismatch this exists for needs no version skew: `network_name` is
@@ -2124,15 +2116,13 @@ mod accept_handler_tests {
         }
     }
 
-    fn seated(id: EndpointId, ip: u8) -> Member {
+    fn seated(id: EndpointId) -> Member {
         Member {
             identity: id,
-            ip: Ipv4Addr::new(100, 64, 0, ip),
             is_coordinator: false,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
@@ -2150,8 +2140,7 @@ mod accept_handler_tests {
             .write()
             .unwrap()
             .members
-            .add(seated(member, 2))
-            .unwrap();
+            .add(seated(member));
         assert!(h.knows_sender(member));
     }
 
@@ -2164,20 +2153,14 @@ mod accept_handler_tests {
         let peer = SecretKey::from_bytes(&[10u8; 32]).public();
         {
             let mut s = state.write().unwrap();
-            let members = s.members.clone();
             s.approved
                 .approve(
                     ApprovedEntry {
                         identity: peer,
-                        ip: Ipv4Addr::new(100, 64, 0, 3),
                         hostname: None,
                         user_identity: None,
                         device_cert: None,
-                        collision_index: 0,
-                    },
-                    &members,
-                )
-                .unwrap();
+                    });
         }
         assert!(h.knows_sender(peer));
     }
@@ -2191,7 +2174,7 @@ mod accept_handler_tests {
         let (state, ctx) = handler_parts(&h);
         let user = SecretKey::from_bytes(&[11u8; 32]).public();
         let device = SecretKey::from_bytes(&[12u8; 32]).public();
-        state.write().unwrap().members.add(seated(user, 4)).unwrap();
+        state.write().unwrap().members.add(seated(user));
         // Unmapped, the device key is a stranger.
         assert!(!h.knows_sender(device));
         ctx.device_user_map.insert(device, user);
@@ -2208,8 +2191,7 @@ mod accept_handler_tests {
             .write()
             .unwrap()
             .members
-            .add(seated(member, 5))
-            .unwrap();
+            .add(seated(member));
         let stranger = SecretKey::from_bytes(&[14u8; 32]).public();
         assert!(!h.knows_sender(stranger));
     }
@@ -2247,12 +2229,12 @@ mod accept_handler_tests {
         let my_id = my_key.public();
         let registry = sample_registry(
             sample_test_endpoint().await,
-            IrohIdentityProvider::new(my_id, 0),
+            IrohIdentityProvider::new(my_id),
             blob_store.clone(),
             my_id,
         );
         AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store, registry),
+            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id), blob_store, registry),
             network_name: "test-net".to_string(),
             state: make_network_state(),
             dht_notify: None,
@@ -2320,13 +2302,13 @@ mod accept_handler_tests {
         let endpoint = sample_test_endpoint().await;
         let registry = sample_registry(
             endpoint.clone(),
-            IrohIdentityProvider::new(my_id, 0),
+            IrohIdentityProvider::new(my_id),
             blob_store.clone(),
             my_id,
         );
         AcceptHandler::Member(Arc::new(MemberAcceptState {
             ctx: sample_mesh_ctx(
-                IrohIdentityProvider::new(my_id, 0),
+                IrohIdentityProvider::new(my_id),
                 blob_store.clone(),
                 registry.clone(),
             ),
@@ -2361,7 +2343,7 @@ mod accept_handler_tests {
         // roles: it once reached only the Member dispatch, so a plain
         // coordinator (the one node that can record the offer on the signed
         // roster) silently discarded it and no exit node was ever advertised.
-        use crate::membership::{ExitFamilies, Member, derive_ip};
+        use crate::membership::{ExitFamilies, Member};
         for handler in [
             sample_coordinator_handler().await,
             sample_member_handler().await,
@@ -2378,18 +2360,15 @@ mod accept_handler_tests {
                 s.members
                     .add(Member {
                         identity: sender,
-                        ip: derive_ip(&sender),
                         is_coordinator: false,
                         hostname: None,
                         user_identity: None,
                         device_cert: None,
-                        collision_index: 0,
                         last_seen: None,
                         exit_node: false,
                         exit_families: ExitFamilies::Unknown,
                         ipv6_only: false,
-                    })
-                    .unwrap();
+                    });
             }
             registry.networks.insert(
                 "test-net".to_string(),
@@ -2397,7 +2376,6 @@ mod accept_handler_tests {
                     name: "test-net".to_string(),
                     network_key: state.read().unwrap().network_public_key,
                     role: NetworkRole::Coordinator,
-                    my_ip: Ipv4Addr::new(100, 64, 0, 1),
                     state: state.clone(),
                     dht_notify: None,
                     cancel: CancellationToken::new(),
@@ -2450,7 +2428,7 @@ mod accept_handler_tests {
         // recording path and flip the member's roster `exit_node` flag. Before the
         // fix the coordinator's accept handler dropped the frame on its catch-all,
         // so nothing was recorded and no exit node was ever advertised.
-        use crate::membership::{ExitFamilies, Member, derive_ip};
+        use crate::membership::{ExitFamilies, Member};
         use iroh::endpoint::presets;
         use iroh::{Endpoint, RelayMode, SecretKey};
 
@@ -2481,7 +2459,7 @@ mod accept_handler_tests {
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
         let registry = sample_registry(
             coord_ep.clone(),
-            IrohIdentityProvider::new(coord_id, 0),
+            IrohIdentityProvider::new(coord_id),
             blob_store.clone(),
             coord_id,
         );
@@ -2493,18 +2471,15 @@ mod accept_handler_tests {
             s.members
                 .add(Member {
                     identity: member_id,
-                    ip: derive_ip(&member_id),
                     is_coordinator: false,
                     hostname: None,
                     user_identity: None,
                     device_cert: None,
-                    collision_index: 0,
                     last_seen: None,
                     exit_node: false,
                     exit_families: ExitFamilies::Unknown,
                     ipv6_only: false,
-                })
-                .unwrap();
+                });
         }
         registry.networks.insert(
             "test-net".to_string(),
@@ -2512,7 +2487,6 @@ mod accept_handler_tests {
                 name: "test-net".to_string(),
                 network_key: net_pubkey,
                 role: NetworkRole::Coordinator,
-                my_ip: Ipv4Addr::new(100, 64, 0, 1),
                 state: state.clone(),
                 dht_notify: None,
                 cancel: CancellationToken::new(),
@@ -2526,7 +2500,7 @@ mod accept_handler_tests {
         let connmgr = Arc::new(ConnectionManager::new());
         connmgr.set_mesh_dispatch(MeshDispatch {
             ctx: sample_mesh_ctx(
-                IrohIdentityProvider::new(coord_id, 0),
+                IrohIdentityProvider::new(coord_id),
                 blob_store.clone(),
                 registry.clone(),
             ),
@@ -2537,7 +2511,7 @@ mod accept_handler_tests {
             net_pubkey,
             AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
                 ctx: sample_mesh_ctx(
-                    IrohIdentityProvider::new(coord_id, 0),
+                    IrohIdentityProvider::new(coord_id),
                     blob_store.clone(),
                     registry.clone(),
                 ),
@@ -2612,7 +2586,7 @@ mod accept_handler_tests {
         // ConnectionManager owns); the earlier bug dialed a throwaway connection
         // and dropped it, so the frame never flushed and the coordinator's
         // roster never changed even though the sender logged "delivered".
-        use crate::membership::{ExitFamilies, Member, derive_ip, derive_ipv6};
+        use crate::membership::{ExitFamilies, Member, derive_ipv6};
         use iroh::endpoint::presets;
         use iroh::{Endpoint, RelayMode, SecretKey};
 
@@ -2622,7 +2596,6 @@ mod accept_handler_tests {
 
         let coord_key = SecretKey::from_bytes(&[7u8; 32]);
         let coord_id = coord_key.public();
-        let coord_ip = derive_ip(&coord_id);
         let coord_ep = Endpoint::builder(presets::N0)
             .secret_key(coord_key)
             .alpns(vec![alpn.clone()])
@@ -2632,7 +2605,6 @@ mod accept_handler_tests {
             .unwrap();
         let member_key = SecretKey::from_bytes(&[8u8; 32]);
         let member_id = member_key.public();
-        let member_ip = derive_ip(&member_id);
         let member_ep = Endpoint::builder(presets::N0)
             .secret_key(member_key)
             .alpns(vec![alpn.clone()])
@@ -2646,12 +2618,10 @@ mod accept_handler_tests {
             vec![
                 Member {
                     identity: coord_id,
-                    ip: coord_ip,
                     is_coordinator: true,
                     hostname: None,
                     user_identity: None,
                     device_cert: None,
-                    collision_index: 0,
                     last_seen: None,
                     exit_node: false,
                     exit_families: ExitFamilies::Unknown,
@@ -2659,12 +2629,10 @@ mod accept_handler_tests {
                 },
                 Member {
                     identity: member_id,
-                    ip: member_ip,
                     is_coordinator: false,
                     hostname: None,
                     user_identity: None,
                     device_cert: None,
-                    collision_index: 0,
                     last_seen: None,
                     exit_node: false,
                     exit_families: ExitFamilies::Unknown,
@@ -2678,7 +2646,7 @@ mod accept_handler_tests {
         let coord_blobs = FsStore::load(coord_tmp.path()).await.unwrap();
         let coord_reg = sample_registry(
             coord_ep.clone(),
-            IrohIdentityProvider::new(coord_id, 0),
+            IrohIdentityProvider::new(coord_id),
             coord_blobs.clone(),
             coord_id,
         );
@@ -2694,7 +2662,6 @@ mod accept_handler_tests {
                 name: "test-net".to_string(),
                 network_key: net_pubkey,
                 role: NetworkRole::Coordinator,
-                my_ip: coord_ip,
                 state: coord_state.clone(),
                 dht_notify: None,
                 cancel: CancellationToken::new(),
@@ -2705,7 +2672,7 @@ mod accept_handler_tests {
         let connmgr = Arc::new(ConnectionManager::new());
         connmgr.set_mesh_dispatch(MeshDispatch {
             ctx: sample_mesh_ctx(
-                IrohIdentityProvider::new(coord_id, 0),
+                IrohIdentityProvider::new(coord_id),
                 coord_blobs.clone(),
                 coord_reg.clone(),
             ),
@@ -2716,7 +2683,7 @@ mod accept_handler_tests {
             net_pubkey,
             AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
                 ctx: sample_mesh_ctx(
-                    IrohIdentityProvider::new(coord_id, 0),
+                    IrohIdentityProvider::new(coord_id),
                     coord_blobs.clone(),
                     coord_reg.clone(),
                 ),
@@ -2745,7 +2712,7 @@ mod accept_handler_tests {
         let member_blobs = FsStore::load(member_tmp.path()).await.unwrap();
         let member_reg = sample_registry(
             member_ep.clone(),
-            IrohIdentityProvider::new(member_id, 0),
+            IrohIdentityProvider::new(member_id),
             member_blobs.clone(),
             member_id,
         );
@@ -2761,7 +2728,6 @@ mod accept_handler_tests {
                 name: "test-net".to_string(),
                 network_key: net_pubkey,
                 role: NetworkRole::Member,
-                my_ip: member_ip,
                 state: member_state.clone(),
                 dht_notify: None,
                 cancel: CancellationToken::new(),
@@ -2873,7 +2839,7 @@ mod accept_handler_tests {
 #[cfg(test)]
 mod coordinator_dial_order_tests {
     use super::*;
-    use crate::membership::{ExitFamilies, Member, derive_ip};
+    use crate::membership::{ExitFamilies, Member};
 
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
@@ -2887,12 +2853,10 @@ mod coordinator_dial_order_tests {
         let (a, b, c, me) = (test_id(1), test_id(2), test_id(3), test_id(9));
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
@@ -2908,12 +2872,10 @@ mod coordinator_dial_order_tests {
         let (a, b, me) = (test_id(1), test_id(2), test_id(9));
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
@@ -2971,12 +2933,10 @@ mod coordinator_dial_order_tests {
         let (a, b, c) = (test_id(1), test_id(2), test_id(3));
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
@@ -2993,12 +2953,10 @@ mod coordinator_dial_order_tests {
         let me = test_id(1);
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,

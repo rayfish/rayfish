@@ -127,7 +127,6 @@ impl RayError {
 pub struct NetworkInfo {
     pub name: String,
     pub node_id: String,
-    pub ipv4: String,
     pub ipv6: String,
     /// True when the join was queued for coordinator approval (no IP yet).
     pub pending: bool,
@@ -157,7 +156,9 @@ impl From<ipc::PeerState> for PeerConnState {
 /// One peer in a network snapshot.
 #[derive(uniffi::Record)]
 pub struct PeerInfo {
-    pub ipv4: String,
+    /// The peer's mesh IPv6, derived from its identity. The only address it has:
+    /// the overlay carries no IPv4.
+    pub ipv6: String,
     pub node_id: String,
     pub hostname: String,
     pub state: PeerConnState,
@@ -167,7 +168,6 @@ pub struct PeerInfo {
 #[derive(uniffi::Record)]
 pub struct NetworkDetail {
     pub name: String,
-    pub ipv4: String,
     pub ipv6: String,
     pub hostname: String,
     pub is_coordinator: bool,
@@ -179,7 +179,6 @@ pub struct NetworkDetail {
 pub struct Status {
     pub running: bool,
     pub node_id: String,
-    pub ipv4: String,
     pub ipv6: String,
     /// The running node's data-plane mode. `On` and `Auto` both mean IPv6-only;
     /// `Auto` says it was decided for the user (something else on this device
@@ -247,7 +246,7 @@ pub struct HealthSnapshot {
     pub networks: Vec<NetworkHealth>,
     pub mesh_up: bool,
     pub node_id: String,
-    pub mesh_ipv4: String,
+    pub mesh_ipv6: String,
     pub warn_count: u64,
     pub error_count: u64,
     pub recent_errors: Vec<String>,
@@ -366,22 +365,8 @@ impl Node {
             _ => String::new(),
         }
     }
-
-    /// Our mesh IPv4, derived rather than read back from a response.
-    ///
-    /// The overlay is moving to IPv6 and the control plane no longer reports a
-    /// v4 at all, but the UniFFI records still expose one and the Kotlin screens
-    /// still read it. Deriving it here keeps that surface stable for one more
-    /// step; it goes when the app stops asking for it.
-    fn legacy_ipv4(state: &Arc<DaemonState>) -> String {
-        match state.status() {
-            IpcMessage::StatusResponse { endpoint_id, .. } => {
-                rayfish::membership::derive_ip(&endpoint_id).to_string()
-            }
-            _ => String::new(),
-        }
-    }
 }
+
 
 /// Build an offline status snapshot from the on-disk config, used when the node
 /// is stopped so the UI can still show the user's saved networks. Everything is
@@ -395,7 +380,6 @@ fn saved_networks_status() -> Status {
     let empty = Status {
         running: false,
         node_id: String::new(),
-        ipv4: String::new(),
         ipv6: String::new(),
         // A stopped node has no data plane, so it is in no mode at all.
         ipv6_only: Ipv6OnlyMode::Off,
@@ -409,22 +393,10 @@ fn saved_networks_status() -> Status {
     // Derive this device's stable identity-based fields off disk. Without a
     // persisted identity there are no saved networks to show either, so fall
     // back to the empty snapshot.
-    let (node_id, device_ipv4, device_ipv6) = match identity::load_or_create() {
+    let (node_id, device_ipv6) = match identity::load_or_create() {
         Ok(secret) => {
             let id = secret.public();
-            // Prefer the assigned per-network IPv4 (it accounts for any
-            // collision-avoidance offset); otherwise use the base derived
-            // address. IPv6 is always derived from the identity.
-            let ipv4 = cfg
-                .networks
-                .iter()
-                .find_map(|n| n.my_ip)
-                .unwrap_or_else(|| membership::derive_ip(&id));
-            (
-                id.to_string(),
-                ipv4.to_string(),
-                membership::derive_ipv6(&id).to_string(),
-            )
+            (id.to_string(), membership::derive_ipv6(&id).to_string())
         }
         Err(_) => return empty,
     };
@@ -434,14 +406,14 @@ fn saved_networks_status() -> Status {
     let networks = sorted
         .iter()
         .map(|net| {
-            // Exclude our own roster entry (matched by our IP) so the peer list
-            // mirrors the live snapshot, which lists only the other members.
+            // Exclude our own roster entry so the peer list mirrors the live
+            // snapshot, which lists only the other members.
             let peers = net
                 .members
                 .iter()
-                .filter(|m| Some(m.ip) != net.my_ip)
+                .filter(|m| m.identity.to_string() != node_id)
                 .map(|m| PeerInfo {
-                    ipv4: m.ip.to_string(),
+                    ipv6: membership::derive_ipv6(&m.identity).to_string(),
                     node_id: m.identity.to_string(),
                     hostname: m.hostname.clone().unwrap_or_default(),
                     state: PeerConnState::Offline,
@@ -449,8 +421,7 @@ fn saved_networks_status() -> Status {
                 .collect();
             NetworkDetail {
                 name: net.name.clone(),
-                ipv4: net.my_ip.map(|ip| ip.to_string()).unwrap_or_default(),
-                ipv6: String::new(),
+                ipv6: device_ipv6.clone(),
                 hostname: net.my_hostname.clone().unwrap_or_default(),
                 is_coordinator: net.network_secret_key.is_some(),
                 peers,
@@ -459,7 +430,6 @@ fn saved_networks_status() -> Status {
         .collect();
     Status {
         node_id,
-        ipv4: device_ipv4,
         ipv6: device_ipv6,
         networks,
         ..empty
@@ -592,7 +562,6 @@ impl Node {
             IpcMessage::Joined { name, my_ipv6 } => Ok(NetworkInfo {
                 name,
                 node_id: Self::node_id(&state),
-                ipv4: Self::legacy_ipv4(&state),
                 ipv6: my_ipv6.to_string(),
                 pending: false,
             }),
@@ -601,7 +570,6 @@ impl Node {
             IpcMessage::Ok { .. } => Ok(NetworkInfo {
                 name: network_key,
                 node_id: Self::node_id(&state),
-                ipv4: String::new(),
                 ipv6: String::new(),
                 pending: true,
             }),
@@ -627,7 +595,6 @@ impl Node {
             IpcMessage::Created { name, my_ipv6, .. } => Ok(NetworkInfo {
                 name,
                 node_id: Self::node_id(&state),
-                ipv4: Self::legacy_ipv4(&state),
                 ipv6: my_ipv6.to_string(),
                 pending: false,
             }),
@@ -1235,7 +1202,6 @@ impl Node {
         let empty = || Status {
             running: false,
             node_id: String::new(),
-            ipv4: String::new(),
             ipv6: String::new(),
             ipv6_only: Ipv6OnlyMode::Off,
             peers: Vec::new(),
@@ -1269,21 +1235,20 @@ impl Node {
                 .peers
                 .iter()
                 .map(|p| PeerInfo {
-                    ipv4: rayfish::membership::derive_ip(&p.endpoint_id).to_string(),
+                    ipv6: rayfish::membership::derive_ipv6(&p.endpoint_id).to_string(),
                     node_id: p.endpoint_id.to_string(),
                     hostname: p.hostname.clone().unwrap_or_default(),
                     state: p.state.into(),
                 })
                 .collect();
             flat_peers.extend(peers.iter().map(|p| PeerInfo {
-                ipv4: p.ipv4.clone(),
+                ipv6: p.ipv6.clone(),
                 node_id: p.node_id.clone(),
                 hostname: p.hostname.clone(),
                 state: p.state,
             }));
             detail.push(NetworkDetail {
                 name: n.name.clone(),
-                ipv4: rayfish::membership::derive_ip(&endpoint_id).to_string(),
                 ipv6: n.my_ipv6.to_string(),
                 hostname: n.my_hostname.clone().unwrap_or_default(),
                 is_coordinator: n.role.is_coordinator(),
@@ -1293,17 +1258,13 @@ impl Node {
         // Present networks in a stable alphabetical order so the UI list does
         // not shuffle between status refreshes with the core's iteration order.
         detail.sort_by_key(|n| n.name.to_lowercase());
-        // Both of the node's own mesh addresses derive from its identity, so
-        // neither needs a joined network to be known. The IPv6 is the address
-        // the tunnel binds; the IPv4 is a display-only leftover this shim still
-        // exposes over UniFFI, and it goes when the Kotlin side stops reading it.
-        let ipv4 = rayfish::membership::derive_ip(&endpoint_id).to_string();
+        // The node's own mesh address derives from its identity, so it needs no
+        // joined network to be known. It is what the tunnel binds.
         let ipv6 = rayfish::membership::derive_ipv6(&endpoint_id).to_string();
 
         Status {
             running: active,
             node_id: endpoint_id.to_string(),
-            ipv4,
             ipv6,
             ipv6_only: ipv6_only.into(),
             peers: flat_peers,
@@ -1337,7 +1298,7 @@ impl Node {
             networks,
             mesh_up: peers_online > 0,
             node_id: s.node_id.chars().take(10).collect(),
-            mesh_ipv4: s.ipv4.clone(),
+            mesh_ipv6: s.ipv6.clone(),
             warn_count: diag::warn_count(),
             error_count: diag::error_count(),
             recent_errors: diag::recent_errors(),

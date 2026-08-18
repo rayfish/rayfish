@@ -5,7 +5,7 @@
 //! reader and coordinator/member accept handlers now live in the per-connection
 //! demux (`ProtocolRouter::drive_mesh_connection` → `AcceptHandler::handle_frame`).
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv6Addr;
 
 use super::super::*;
 
@@ -310,7 +310,7 @@ impl NetworkRegistry {
                         .all()
                         .iter()
                         .find(|m| m.identity == target)
-                        .map(|m| m.ip);
+                        .map(|m| derive_ipv6(&m.identity));
                     s.members.remove(&target);
                     s.approved.remove(&target);
                     ip
@@ -388,7 +388,6 @@ impl NetworkRegistry {
             };
             let hello = ControlMsg::MeshHello {
                 identity: my_identity,
-                ip: t.my_ip,
                 hostname: outgoing_hostname(&t.network),
                 device_cert: device_cert.clone(),
             };
@@ -477,7 +476,6 @@ impl NetworkRegistry {
                             this.networks.get(net.as_str()).map(|h| DialTarget {
                                 network: net.to_string(),
                                 network_key: h.network_key,
-                                my_ip: h.my_ip,
                             })
                         })
                         .collect();
@@ -658,7 +656,7 @@ pub(crate) fn spawn_stale_member_pruner(
                 .into_iter()
                 .map(|(eid, _, _)| eid)
                 .collect();
-            let victims: Vec<(EndpointId, Ipv4Addr)> = {
+            let victims: Vec<(EndpointId, Ipv6Addr)> = {
                 let s = state.read().unwrap();
                 s.members
                     .all()
@@ -672,7 +670,7 @@ pub(crate) fn spawn_stale_member_pruner(
                             now,
                         )
                     })
-                    .map(|m| (m.identity, m.ip))
+                    .map(|m| (m.identity, derive_ipv6(&m.identity)))
                     .collect()
             };
             if victims.is_empty() {
@@ -698,12 +696,10 @@ mod prune_tests {
         let id = SecretKey::from(key_bytes).public();
         Member {
             identity: id,
-            ip: std::net::Ipv4Addr::new(100, 64, 0, 2),
             is_coordinator,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
@@ -776,12 +772,10 @@ mod sender_authority_tests {
     fn member(id: EndpointId, is_coordinator: bool) -> Member {
         Member {
             identity: id,
-            ip: std::net::Ipv4Addr::new(100, 64, 0, 2),
             is_coordinator,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
@@ -791,10 +785,8 @@ mod sender_authority_tests {
 
     fn state_with(members: Vec<Member>) -> SharedNetworkState {
         let mut list = MemberList::new();
-        for (i, mut m) in members.into_iter().enumerate() {
-            // Distinct addresses so `MemberList::add` doesn't reject a collision.
-            m.ip = std::net::Ipv4Addr::new(100, 64, 0, (i + 2) as u8);
-            list.add(m).unwrap();
+        for m in members {
+            list.add(m);
         }
         Arc::new(RwLock::new(NetworkState {
             members: list,

@@ -69,17 +69,12 @@ pub async fn resolve_ipv6_only(setting: Ipv6Only) -> Result<Ipv6Only> {
     resolve_with(setting, crate::tun::check_cgnat_conflict(own).await.err())
 }
 
-/// Our own identity-derived mesh IPv4, for the scan to ignore. Best-effort: a
-/// missing identity means we have no address on any interface yet, so there is
-/// nothing of ours to mistake for another VPN.
+/// Our own mesh IPv4, for the scan to ignore. There is none: the overlay is
+/// IPv6-only and we never claim an address in `100.64.0.0/10`, so anything the
+/// scan finds there belongs to something else and is a real conflict.
 #[cfg(target_os = "android")]
 fn own_mesh_ipv4() -> Option<std::net::Ipv4Addr> {
-    let key = crate::identity::load_or_create().ok()?;
-    let index = crate::identity::load_collision_index().unwrap_or(0);
-    Some(crate::membership::derive_ip_with_index(
-        &key.public(),
-        index,
-    ))
+    None
 }
 
 /// Shared tail of both `resolve_ipv6_only`s: apply the table to a scan result.

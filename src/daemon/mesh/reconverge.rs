@@ -214,7 +214,6 @@ pub(crate) async fn reconverge_and_apply(
     state: &SharedNetworkState,
     my_identity: EndpointId,
     alpn: &[u8],
-    my_ip: Ipv4Addr,
     device_cert: &Option<control::DeviceCert>,
 ) {
     let MeshCtx {
@@ -260,7 +259,6 @@ pub(crate) async fn reconverge_and_apply(
             alpn,
             network_name,
             my_identity,
-            my_ip,
             device_cert,
         )
         .await;
@@ -311,17 +309,11 @@ pub(crate) async fn reconverge_and_apply(
         });
         return;
     }
-    // Two coordinators can independently admit a fresh joiner at the same
-    // collision index, producing a roster with duplicate IPs. Resolve it
-    // deterministically (lowest identity keeps the slot, others re-roll) before
-    // it reaches the PeerTable/DNS so every node converges on the same map.
-    let tiebroken = crate::membership::resolve_ip_tiebreak(data.members.clone());
-    if let Err(e) = crate::membership::validate_no_duplicate_ips(&tiebroken) {
-        tracing::warn!(network = %network_name, error = %e, "roster still has duplicate IPs after tiebreak; applying tiebroken version");
-    }
+    // No tiebreak: an address is blake3 of the identity, so two coordinators
+    // admitting concurrently cannot produce a roster with duplicate addresses.
     let roster = {
         let mut s = state.write().unwrap();
-        s.members = MemberList::from_members(tiebroken);
+        s.members = MemberList::from_members(data.members.clone());
         s.approved = ApprovedList::from_entries(data.approved.clone());
         s.suggested_firewall = data.suggested_firewall.clone();
         s.nullifiers = data.nullifiers.clone();
@@ -366,7 +358,6 @@ pub(crate) async fn reconverge_and_apply(
         alpn,
         network_name,
         my_identity,
-        my_ip,
         device_cert,
     )
     .await;
@@ -521,7 +512,7 @@ pub(crate) async fn apply_roster_to_dns(
             m.hostname.as_ref().map(|h| {
                 (
                     h.clone(),
-                    (!m.ipv6_only).then_some(m.ip),
+                    None,
                     derive_ipv6(&m.identity),
                 )
             })
@@ -550,8 +541,8 @@ pub(crate) async fn apply_roster_to_dns(
                     // Override our own DNS entry so `.ray` resolution and
                     // `ray status` reflect the pending name immediately.
                     let v6 = derive_ipv6(&my_identity);
-                    entries.retain(|(_, v4, _)| *v4 != Some(me.ip));
-                    entries.push((pending.clone(), (!me.ipv6_only).then_some(me.ip), v6));
+                    entries.retain(|(_, _, v6)| *v6 != derive_ipv6(&me.identity));
+                    entries.push((pending.clone(), None, v6));
                 }
                 if net.my_hostname.as_deref() != Some(pending.as_str()) {
                     net.my_hostname = Some(pending);
@@ -815,12 +806,10 @@ mod self_nullified_tests {
     fn member(identity: EndpointId, is_coordinator: bool) -> Member {
         Member {
             identity,
-            ip: std::net::Ipv4Addr::new(100, 64, 0, 2),
             is_coordinator,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,

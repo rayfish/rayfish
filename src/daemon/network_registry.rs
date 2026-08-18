@@ -30,7 +30,6 @@ const LAZY_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct DialTarget {
     pub network: String,
     pub network_key: EndpointId,
-    pub my_ip: Ipv4Addr,
 }
 
 pub(crate) struct NetworkRegistry {
@@ -260,7 +259,6 @@ impl NetworkRegistry {
                 self.networks.get(net.as_str()).map(|h| DialTarget {
                     network: net.to_string(),
                     network_key: h.network_key,
-                    my_ip: h.my_ip,
                 })
             })
             .collect();
@@ -557,7 +555,7 @@ impl NetworkRegistry {
             return Ok(ipc_err(format!("network '{name}' already active")));
         }
 
-        let my_ip = self.transport.identity.local_ip();
+        let my_ip = self.transport.identity.local_ipv6();
 
         let my_hostname = match hostname {
             Some(h) => {
@@ -579,7 +577,6 @@ impl NetworkRegistry {
 
         let mut net_state = self.build_initial_roster(
             &name,
-            my_ip,
             &my_hostname,
             mode,
             &net_secret_key,
@@ -591,7 +588,7 @@ impl NetworkRegistry {
             &self.dns.reverse_table,
             &name,
             &my_hostname,
-            (!self.ipv6_only).then_some(my_ip),
+            None,
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
@@ -603,7 +600,6 @@ impl NetworkRegistry {
         config::save_network(&config::NetworkConfig {
             name: name.clone(),
             group_mode: mode,
-            my_ip: Some(my_ip),
             my_hostname: Some(my_hostname.clone()),
             pending_hostname: None,
             members: member_entries,
@@ -645,7 +641,6 @@ impl NetworkRegistry {
             name: name.clone(),
             network_key: net_public_key,
             role: NetworkRole::Coordinator,
-            my_ip,
             state: state.clone(),
             dht_notify: Some(dht_notify.clone()),
             cancel: cancel.clone(),
@@ -679,7 +674,6 @@ impl NetworkRegistry {
     pub(crate) fn build_initial_roster(
         &self,
         name: &str,
-        my_ip: Ipv4Addr,
         my_hostname: &str,
         mode: GroupMode,
         net_secret_key: &SecretKey,
@@ -689,37 +683,26 @@ impl NetworkRegistry {
         member_list
             .add(Member {
                 identity: self.transport.identity.local_identity(),
-                ip: my_ip,
                 is_coordinator: true,
                 hostname: Some(my_hostname.to_string()),
                 user_identity: None,
                 device_cert: None,
-                collision_index: 0,
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
                 // Our own entry starts out truthful, so the first published blob
                 // already tells peers not to use our mesh IPv4.
                 ipv6_only: self.ipv6_only,
-            })
-            .expect("self-add cannot collide");
+            });
 
         let mut approved = ApprovedList::new();
         if let Some((peer_id, peer_hostname)) = pre_approve {
-            let peer_ip = self.transport.identity.derive_ip(&peer_id);
-            approved
-                .approve(
-                    ApprovedEntry {
-                        identity: peer_id,
-                        ip: peer_ip,
-                        hostname: peer_hostname,
-                        user_identity: None,
-                        device_cert: None,
-                        collision_index: 0,
-                    },
-                    &member_list,
-                )
-                .map_err(|e| anyhow::anyhow!("failed to pre-approve peer: {e:?}"))?;
+            approved.approve(ApprovedEntry {
+                identity: peer_id,
+                hostname: peer_hostname,
+                user_identity: None,
+                device_cert: None,
+            });
         }
 
         Ok(NetworkState {
@@ -901,7 +884,7 @@ impl NetworkRegistry {
         // The IPv4 half is absent for a peer running an IPv6-only data plane; its
         // IPv6 is always there, so match on that when there is no address to key
         // on. (Both halves derive from the same identity, so either resolves it.)
-        if let Some((v4, v6)) = self.dns.resolve(&qualified, &suffix).await {
+        if let Some((_v4, v6)) = self.dns.resolve(&qualified, &suffix).await {
             if let Some(route) = self.peers.lookup_v6(&v6) {
                 return Some(route.endpoint_id);
             }
@@ -911,7 +894,7 @@ impl NetworkRegistry {
                     .members
                     .all()
                     .iter()
-                    .find(|m| Some(m.ip) == v4 || derive_ipv6(&m.identity) == v6)
+                    .find(|m| derive_ipv6(&m.identity) == v6)
                 {
                     return Some(m.identity);
                 }
