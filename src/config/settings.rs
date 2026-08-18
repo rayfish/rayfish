@@ -8,7 +8,7 @@
 //! pair matches its scope's key enum exhaustively, so a new key cannot be
 //! added without teaching every handler that serves it.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -91,9 +91,14 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
             if entries.is_empty() {
                 cfg.dns_upstreams = ServerOverride::default();
             } else {
+                // Either family. IPv4 entries are merged with the system-captured
+                // upstreams (`config::resolve_upstreams`); IPv6 ones are what an
+                // exit-node full tunnel in IPv6-only mode forwards to, since that
+                // tunnel carries no IPv4 for a v4 resolver to be reached over
+                // (`exit_node::tunnel_upstreams`).
                 for e in &entries {
-                    e.parse::<Ipv4Addr>()
-                        .with_context(|| format!("invalid IPv4 address: {e}"))?;
+                    e.parse::<IpAddr>()
+                        .with_context(|| format!("invalid IP address: {e}"))?;
                 }
                 cfg.dns_upstreams = ServerOverride {
                     servers: entries,

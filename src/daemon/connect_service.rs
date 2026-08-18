@@ -521,7 +521,10 @@ mod pending_connect_cap_tests {
         let base = Instant::now();
         let pending = DashMap::new();
         for s in 0..4u8 {
-            pending.insert(eid(s), queued_at(eid(s), base + Duration::from_millis(s as u64)));
+            pending.insert(
+                eid(s),
+                queued_at(eid(s), base + Duration::from_millis(s as u64)),
+            );
         }
         assert_eq!(evict_oldest_connect(&pending, eid(99), 4), Some(eid(0)));
         assert_eq!(pending.len(), 3);
@@ -535,7 +538,10 @@ mod pending_connect_cap_tests {
         let base = Instant::now();
         let pending = DashMap::new();
         for s in 0..4u8 {
-            pending.insert(eid(s), queued_at(eid(s), base + Duration::from_millis(s as u64)));
+            pending.insert(
+                eid(s),
+                queued_at(eid(s), base + Duration::from_millis(s as u64)),
+            );
         }
         assert_eq!(evict_oldest_connect(&pending, eid(1), 4), None);
         assert_eq!(pending.len(), 4);

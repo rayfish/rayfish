@@ -633,6 +633,57 @@ pub struct ExitNodeStatusView {
     /// Roster peers advertising `exit_node` (display strings: hostname or short
     /// id), so the user can see who is available to route through.
     pub available: Vec<String>,
+    /// The subset of `available` whose roster entry *claims* IPv6 egress. On an
+    /// IPv6-only node these are the gateways known to work, so the list has to
+    /// say which they are rather than let the user pick one that would take the
+    /// traffic and drop it.
+    ///
+    /// Not the complement of "unusable": a gateway whose entry carries no claim
+    /// at all is absent from this list and still selectable, because an absent
+    /// claim is what a coordinator too old to record it leaves behind, and
+    /// refusing on it would make exit nodes unusable on that whole network. Only
+    /// a claim that positively says IPv4-only is refused.
+    #[serde(default)]
+    pub available_v6: Vec<String>,
+    /// This node's data plane is IPv6-only, so a selection here tunnels IPv6 and
+    /// leaves the host's IPv4 egress alone. Rendered as a note, because "using:
+    /// <peer>" otherwise reads as a full tunnel over both families.
+    #[serde(default)]
+    pub ipv6_only: bool,
+    /// The subset of `available` that *this* node would refuse, with the family
+    /// it cannot carry named.
+    ///
+    /// Separate from `available_v6` because the two answer different questions
+    /// and stopped agreeing once a gateway could be IPv6-only itself: such a
+    /// gateway claims IPv6 egress (so it is in `available_v6`) and is refused by
+    /// a dual-stack client (because it cannot return IPv4). Marking it usable off
+    /// the first list alone sends the user at the one gateway that will not work.
+    /// Computed daemon-side, where the refusal rule already lives, so the CLI
+    /// never re-derives it and cannot drift from it.
+    #[serde(default)]
+    pub refused: Vec<String>,
+    /// Why the `using` selection above is not the tunnel that is actually
+    /// installed, or `None` when it is (and when nothing is selected).
+    ///
+    /// The selection is config and the tunnel is kernel state, and they are
+    /// deliberately allowed to disagree: a gateway that stops being usable does
+    /// not clear the config, so `ray exit-node status` still shows what to change.
+    /// The gap has to be visible, though. Without this the line reads `using:
+    /// <peer>` while every packet leaves directly, which is the one thing a user
+    /// who chose to tunnel needs told, and the reason can arrive without anybody
+    /// touching the selection (the gateway republishes a family claim, or this
+    /// node's `ipv6_only = auto` flips).
+    #[serde(default)]
+    pub not_in_effect: Option<String>,
+    /// Which families the tunnel through `using` carries. A tunnel takes the
+    /// families this node's data plane routes *and* the gateway says it can
+    /// return, so it can be narrower than either: on an IPv6-only node, or
+    /// through a gateway that can only return one of the two, the other family
+    /// keeps leaving this host directly. Meaningless when `using` is `None`.
+    #[serde(default)]
+    pub tunnel_v4: bool,
+    #[serde(default)]
+    pub tunnel_v6: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -870,10 +921,16 @@ pub const LOG_CHUNK_BYTES: usize = MAX_FRAME_LEN / 4;
 /// frame.
 ///
 /// Structs are serialized with `to_vec_named` (field-name maps, not positional
-/// arrays) — required for correctness when a struct uses `skip_serializing_if`:
-/// with positional arrays, skipping a field shifts later fields into the wrong
-/// slot on decode (e.g. `HostSuggestions` with `default: None` + non-empty
-/// `allows` misaligns and fails with "invalid type: map, expected a string").
+/// arrays). IPC has no version negotiation and is read by a CLI whose binary is
+/// swapped before the daemon restarts, so both sides must tolerate a field the
+/// other does not know; a named map is what makes that free, and it is why
+/// `skip_serializing_if` is still safe on the types below.
+///
+/// The network wire made the opposite choice (see CLAUDE.md): it is
+/// array-encoded, gated on an ALPN, and a `skip_serializing_if` there shifts
+/// every later field into the wrong slot. `HostSuggestions` crosses both
+/// boundaries and so carries no skips at all.
+///
 /// The decoder (`from_slice`) handles both named and unnamed representations,
 /// so it's forward-compatible with older peers.
 pub struct MsgpackCodec<T> {
@@ -1178,7 +1235,13 @@ mod tests {
                 network: "n".into(),
                 allow: vec!["*".into()],
                 using: Some("gw".into()),
-                available: vec!["gw".into()],
+                available: vec!["gw".into(), "v4only".into()],
+                available_v6: vec!["gw".into()],
+                ipv6_only: true,
+                refused: vec!["v4only".into()],
+                not_in_effect: Some("the peer is not in this network's roster".into()),
+                tunnel_v4: false,
+                tunnel_v6: true,
             }],
         };
         let bytes = rmp_serde::to_vec_named(&resp).unwrap();
@@ -1187,18 +1250,52 @@ mod tests {
             IpcMessage::ExitNodeState { networks } => {
                 assert_eq!(networks.len(), 1);
                 assert_eq!(networks[0].using.as_deref(), Some("gw"));
+                // `available_v6` is a subset of `available`, not a replacement:
+                // an IPv6-only client needs both lists to say "this gateway
+                // exists but cannot carry your only family".
+                assert_eq!(networks[0].available_v6, vec!["gw".to_string()]);
+                assert!(networks[0].ipv6_only);
+                // A selection that is configured but not installed says so, or
+                // `using: gw` reads as a tunnel that is carrying traffic.
+                assert!(networks[0].not_in_effect.is_some());
             }
             other => panic!("wrong variant: {other:?}"),
         }
     }
 
+    /// Both new fields are `#[serde(default)]`, so a reply from a daemon that
+    /// predates them still decodes: a CLI upgraded ahead of its daemon reads no
+    /// IPv6-capable gateways and no IPv6-only claim, which is what that daemon
+    /// meant.
+    #[test]
+    fn exit_node_state_decodes_without_the_ipv6_fields() {
+        #[derive(Serialize)]
+        struct OldView {
+            network: String,
+            allow: Vec<String>,
+            using: Option<String>,
+            available: Vec<String>,
+        }
+        let bytes = rmp_serde::to_vec_named(&OldView {
+            network: "n".into(),
+            allow: vec![],
+            using: None,
+            available: vec!["gw".into()],
+        })
+        .unwrap();
+        let decoded: ExitNodeStatusView = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.available, vec!["gw".to_string()]);
+        assert!(decoded.available_v6.is_empty());
+        assert!(!decoded.ipv6_only);
+    }
+
     #[test]
     fn firewall_suggest_roundtrips_through_named_codec() {
-        // Regression: with positional-array (`to_vec`) serialization, a
-        // `HostSuggestions` whose `default` is `None` (skipped) but whose
-        // `allows` is non-empty misaligns on decode and fails with
-        // "invalid type: map, expected a string". The codec must serialize
-        // structs as named maps so `skip_serializing_if` is safe.
+        // `HostSuggestions` reaches the CLI through this codec and the mesh
+        // through the signed blob, and the two encodings disagree about what an
+        // absent field means. It carries no `skip_serializing_if` for that
+        // reason (see `a_deny_only_suggestion_does_not_decode_as_an_allow`); this
+        // pins the IPC half, that one pins the wire half.
         use crate::policy::HostSuggestions;
         use std::collections::BTreeMap;
 

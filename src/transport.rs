@@ -25,14 +25,14 @@ use std::sync::Arc;
 /// protocol** (`FileOffer`/blob handshake). iroh negotiates the ALPN at the QUIC
 /// handshake, so a peer on a different version shares no common ALPN and the
 /// transfer simply can't connect: the version gate needs no in-band check.
-pub const FILES_ALPN: &[u8] = b"rayfish/files/1";
+pub const FILES_ALPN: &[u8] = b"rayfish/files/2";
 
 /// Identity-level ALPN for the `ray connect` friend-request handshake. Unlike
 /// `network_alpn`, this is not per-network: it accepts connection requests
 /// addressed to this node's contact key. The trailing `/1` is its protocol
 /// version, **bump it on any breaking change to the `ConnectMsg` handshake**;
 /// peers on different versions can't negotiate a connection (transport-enforced).
-pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/1";
+pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/2";
 
 /// Fixed UDP port the endpoint binds so users can port-forward a stable, known
 /// port for guaranteed direct reachability (Tailscale-style). Unlike an ephemeral
@@ -62,18 +62,23 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// (`ray connect`) network's co-coordinator key grant into the join handshake's
 /// Welcome (deterministic) instead of a separate best-effort `AdminGrant` stream.
 ///
-/// *Additive* wire changes do not bump this version. The frame reader skips any
-/// frame it cannot decode (so an unknown `ControlMsg` variant is dropped, not
-/// fatal) and nacks it with `ControlMsg::NotSupported` so the mismatch shows in
-/// the sender's log (builds before the nack existed skip silently), and every
-/// frame and blob is msgpack map-encoded (`to_vec_named`) with
-/// `serde(default)` on new fields, so unknown fields are ignored and missing ones
-/// defaulted in both directions. Exit nodes ride that: a v2 peer that predates
-/// `ControlMsg::ExitNodeOffer` and `Member.exit_node` stays connected and simply
-/// cannot offer or discover exit nodes until updated. Bump only for changes an
-/// old peer would *misinterpret* (removed/repurposed fields or variants, changed
-/// semantics of existing ones), not for ones it safely ignores.
-pub const MESH_PROTOCOL_VERSION: u32 = 2;
+/// A new *variant* does not bump this version: the frame reader skips any frame
+/// it cannot decode (so an unknown `ControlMsg` variant is dropped, not fatal)
+/// and nacks it with `ControlMsg::NotSupported` so the mismatch shows in the
+/// sender's log (builds before the nack existed skip silently). A new *field*
+/// does. Every frame and blob is msgpack array-encoded (`to_vec`), so a struct's
+/// slot count is part of the wire: a new build reads an older peer's shorter
+/// array and defaults the tail (`serde(default)`), but the older peer reads the
+/// longer one and rejects it whole. Both ends of a connection share this ALPN,
+/// so an un-bumped field addition leaves the old side dropping and nacking every
+/// frame that carries it, on a connection that stays up and no longer works.
+/// Under the map encoding this was free, and exit nodes are what that bought: a
+/// v2 peer predating `ControlMsg::ExitNodeOffer` and `Member.exit_node` stayed
+/// connected and simply could not offer or discover exit nodes until updated.
+/// Compact gave that up. Bump for anything that changes a struct's shape, and
+/// for anything an old peer would *misinterpret* (removed or repurposed fields
+/// and variants, changed semantics of existing ones).
+pub const MESH_PROTOCOL_VERSION: u32 = 3;
 
 /// Capability bits a peer advertises in its `MeshHello.features`. These are
 /// negotiated *inside* the single mesh ALPN, so adding one needs no version bump:

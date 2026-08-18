@@ -720,6 +720,7 @@ impl CoordinatorAcceptState {
                 collision_index,
                 last_seen: Some(crate::membership::now_secs()),
                 exit_node: false,
+                exit_families: ExitFamilies::Unknown,
                 ipv6_only: false,
             });
             s.refresh_snapshot();
@@ -1043,14 +1044,15 @@ impl MemberAcceptState {
             }
         };
         let record_ts = packet.timestamp().as_micros();
-        let (current_hash, floor) = {
+        let (current_hash, floor, needs) = {
             let s = self.state.read().unwrap();
             (
-                s.snapshot.as_ref().map(|snap| snap.hash),
+                s.converged_hash,
                 s.last_record_timestamp,
+                s.needs_reconverge(remote_hash),
             )
         };
-        if current_hash == Some(remote_hash) {
+        if !needs {
             return;
         }
         if !record_is_newer(record_ts, floor) {
@@ -1207,6 +1209,7 @@ impl MemberAcceptState {
                 collision_index: member_idx,
                 last_seen: Some(crate::membership::now_secs()),
                 exit_node: false,
+                exit_families: ExitFamilies::Unknown,
                 ipv6_only: false,
             });
             s.refresh_snapshot();
@@ -1368,13 +1371,18 @@ impl AcceptHandler {
             // exit node. Only a network-key holder records it on the sender's
             // roster entry and republishes (`record_exit_offer` no-ops
             // otherwise). Off the demux loop: signing + DHT publish are slow.
-            ControlMsg::ExitNodeOffer { enabled } => {
+            ControlMsg::ExitNodeOffer {
+                enabled,
+                exit_families,
+            } => {
                 let registry = self.registry().clone();
                 let Some(network) = self.network_name() else {
                     return true;
                 };
                 tokio::spawn(async move {
-                    registry.record_exit_offer(&network, peer_id, enabled).await;
+                    registry
+                        .record_exit_offer(&network, peer_id, enabled, exit_families)
+                        .await;
                 });
                 true
             }
@@ -1667,7 +1675,10 @@ mod stranger_policy_tests {
             ControlMsg::MemberSync,
             ControlMsg::BlobUpdated,
             // A member's statements about itself, and its departure.
-            ControlMsg::ExitNodeOffer { enabled: true },
+            ControlMsg::ExitNodeOffer {
+                enabled: true,
+                exit_families: ExitFamilies::Dual,
+            },
             ControlMsg::Ipv6Only { enabled: true },
             ControlMsg::LeaveNetwork,
         ] {
@@ -1700,6 +1711,7 @@ mod direct_grant_tests {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                exit_families: ExitFamilies::Unknown,
                 ipv6_only: false,
             })
             .unwrap();
@@ -1708,6 +1720,7 @@ mod direct_grant_tests {
             members: list,
             approved: ApprovedList::new(),
             snapshot: None,
+            converged_hash: None,
             network_secret_key: None,
             network_public_key: eid(200),
             network_name: Some("dario-alex".to_string()),

@@ -2,21 +2,31 @@
 //! Answers names held in the hostname tables and forwards everything else to
 //! the captured system upstreams.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use smol_str::SmolStr;
 
-use crate::dns::{HostnameTable, MAGIC_DNS_V4, ReverseLookupTable};
+use crate::dns::{HostnameTable, MAGIC_DNS_V4, MAGIC_DNS_V6, ReverseLookupTable};
+
+/// Our own Magic DNS addresses. Forwarding to either is a loop: the query would
+/// come straight back in through `handle_tun_query`.
+fn is_magic_dns(ip: IpAddr) -> bool {
+    ip == IpAddr::V4(MAGIC_DNS_V4) || ip == IpAddr::V6(MAGIC_DNS_V6)
+}
 
 pub struct Resolver {
     table: HostnameTable,
     reverse: ReverseLookupTable,
     upstreams: Arc<ArcSwap<Vec<SocketAddr>>>,
+    /// Upstreams to use instead of `upstreams` while a full tunnel is up, so
+    /// lookups leave by the exit node rather than around it. See
+    /// [`set_tunnel_upstreams`](Resolver::set_tunnel_upstreams).
+    tunnel_upstreams: Arc<ArcSwapOption<Vec<SocketAddr>>>,
     /// Whether this node's data plane is IPv6-only. When set, the roster
     /// responder withholds A records (see [`crate::dns::handle_query`]): mesh
     /// IPv4 is not routed here, so handing an app one is a black hole.
@@ -60,10 +70,49 @@ impl Resolver {
             table,
             reverse,
             upstreams: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            tunnel_upstreams: Arc::new(ArcSwapOption::empty()),
             ipv6_only: AtomicBool::new(false),
             overlay_forwards: DashMap::new(),
             defer_off_mesh: AtomicBool::new(false),
         }
+    }
+
+    /// Override the upstream set for as long as a full tunnel is up, or with
+    /// `None` go back to the captured one.
+    ///
+    /// A layer rather than a write to `upstreams`, so teardown restores what the
+    /// system capture found without having to re-detect the OS DNS backend.
+    ///
+    /// It exists for the IPv6-only client tunnel. The daemon forwards non-`.ray`
+    /// queries itself, and every upstream the desktop capture can produce is IPv4
+    /// (`DnsConfigurator::captured_upstreams`), while that tunnel carries IPv6
+    /// alone: left as they are, the exit node would see the traffic and none of
+    /// the lookups that steered it. Pointing the forwarder at an IPv6 resolver
+    /// puts the queries back inside the tunnel.
+    ///
+    /// Filters the magic IPs for the same reason [`Self::set_upstream_addrs`]
+    /// does: `dns_upstreams` now accepts any `IpAddr`, so `ray config set
+    /// dns-upstreams 200::53` would otherwise hand the forwarder its own address
+    /// and every miss would recurse through `handle_tun_query`.
+    ///
+    /// It governs only what *we* forward, so it does nothing on a host that
+    /// declines off-mesh names ([`Self::set_defer_off_mesh`]): there the stub
+    /// asks the next `nameserver` itself and never reaches the forwarder. That
+    /// combination is not hypothetical, it is the same host this mode exists
+    /// for, so `apply_exit_dns` warns about it rather than leaving the override
+    /// looking effective.
+    pub fn set_tunnel_upstreams(&self, addrs: Option<Vec<SocketAddr>>) {
+        // An override that filters down to nothing becomes no override: `forward`
+        // reads an empty list as "no upstream configured" and refuses, where
+        // falling back to the captured ones at least resolves something.
+        let addrs = addrs
+            .map(|v| {
+                v.into_iter()
+                    .filter(|a| !is_magic_dns(a.ip()))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v: &Vec<SocketAddr>| !v.is_empty());
+        self.tunnel_upstreams.store(addrs.map(Arc::new));
     }
 
     /// Whether to decline names outside `.ray` instead of forwarding them.
@@ -77,6 +126,12 @@ impl Resolver {
     /// and declining would take the machine's DNS down.
     pub fn set_defer_off_mesh(&self, on: bool) {
         self.defer_off_mesh.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether off-mesh names are being declined, for the callers that need to
+    /// know the forwarder is out of the path.
+    pub fn defers_off_mesh(&self) -> bool {
+        self.defer_off_mesh.load(Ordering::Relaxed)
     }
 
     /// Record whether mesh IPv4 is usable on this node. Called once at daemon
@@ -99,15 +154,21 @@ impl Resolver {
     pub fn set_upstream_addrs(&self, addrs: impl IntoIterator<Item = SocketAddr>) {
         let v: Vec<SocketAddr> = addrs
             .into_iter()
-            .filter(|a| {
-                a.ip() != IpAddr::V4(MAGIC_DNS_V4) && a.ip() != IpAddr::V6(crate::dns::MAGIC_DNS_V6)
-            })
+            .filter(|a| !is_magic_dns(a.ip()))
             .collect();
         self.upstreams.store(Arc::new(v));
     }
 
     pub fn upstreams(&self) -> Vec<SocketAddr> {
         self.upstreams.load().as_ref().clone()
+    }
+
+    /// The tunnel override in force, if any. `None` means queries go to the
+    /// captured upstreams.
+    pub fn tunnel_upstreams(&self) -> Option<Vec<SocketAddr>> {
+        self.tunnel_upstreams
+            .load_full()
+            .map(|v| v.as_ref().clone())
     }
 
     /// Answer from the roster, and fall back to the system resolver for
@@ -183,7 +244,11 @@ impl Resolver {
     }
 
     async fn forward(&self, query: &[u8]) -> Option<Vec<u8>> {
-        let upstreams = self.upstreams.load();
+        let tunnel = self.tunnel_upstreams.load_full();
+        let upstreams = match &tunnel {
+            Some(over) => Arc::clone(over),
+            None => self.upstreams.load_full(),
+        };
         if upstreams.is_empty() {
             tracing::warn!("no DNS upstream configured; cannot forward off-mesh queries");
             return None;
@@ -276,7 +341,13 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 async fn forward_once(query: &[u8], up: SocketAddr, wait: Duration) -> std::io::Result<Vec<u8>> {
-    let sock = tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await?;
+    // Bind the upstream's own family: a `0.0.0.0` socket cannot reach an IPv6
+    // resolver, which is the only kind a full tunnel in IPv6-only mode has.
+    let bind: SocketAddr = match up {
+        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let sock = tokio::net::UdpSocket::bind(bind).await?;
     sock.connect(up).await?;
     sock.send(query).await?;
     let mut buf = vec![0u8; 4096];
@@ -827,5 +898,52 @@ mod tests {
             r.upstreams(),
             vec!["127.0.0.1:5353".parse::<SocketAddr>().unwrap()]
         );
+    }
+
+    /// The tunnel override wins while it is set, and `None` puts the captured
+    /// upstreams back without re-detecting the OS DNS backend.
+    #[tokio::test]
+    async fn tunnel_override_wins_and_clears() {
+        let r = Resolver::new(
+            crate::dns::new_hostname_table(),
+            crate::dns::new_reverse_table(),
+        );
+        let captured = "192.168.1.1:53".parse::<SocketAddr>().unwrap();
+        let v6 = "[2606:4700:4700::1111]:53".parse::<SocketAddr>().unwrap();
+        r.set_upstream_addrs([captured]);
+        assert_eq!(r.tunnel_upstreams(), None);
+
+        r.set_tunnel_upstreams(Some(vec![v6]));
+        assert_eq!(r.tunnel_upstreams(), Some(vec![v6]));
+        // Layered, not written through: teardown has to find these unchanged.
+        assert_eq!(r.upstreams(), vec![captured]);
+
+        r.set_tunnel_upstreams(None);
+        assert_eq!(r.tunnel_upstreams(), None);
+        assert_eq!(r.upstreams(), vec![captured]);
+    }
+
+    /// The override takes the same magic-IP filter as the capture path, because
+    /// `dns_upstreams` now accepts any `IpAddr` and `200::53` is a loop back into
+    /// our own responder. Filtering to empty means no override at all, not an
+    /// override with nowhere to send.
+    #[tokio::test]
+    async fn tunnel_override_drops_the_magic_ips() {
+        let r = Resolver::new(
+            crate::dns::new_hostname_table(),
+            crate::dns::new_reverse_table(),
+        );
+        let v6 = "[2606:4700:4700::1111]:53".parse::<SocketAddr>().unwrap();
+        r.set_tunnel_upstreams(Some(vec![
+            SocketAddr::from((crate::dns::MAGIC_DNS_V6, 53)),
+            v6,
+        ]));
+        assert_eq!(r.tunnel_upstreams(), Some(vec![v6]));
+
+        r.set_tunnel_upstreams(Some(vec![
+            SocketAddr::from((crate::dns::MAGIC_DNS_V6, 53)),
+            SocketAddr::from((crate::dns::MAGIC_DNS_V4, 53)),
+        ]));
+        assert_eq!(r.tunnel_upstreams(), None);
     }
 }

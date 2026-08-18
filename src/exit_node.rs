@@ -20,8 +20,9 @@
 //! ([`ExitClient`]) are plain userspace state, live on every platform, and are
 //! bundled for the data path as [`ExitContext`].
 
+use crate::membership::ExitFamilies;
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(target_os = "macos")]
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -64,12 +65,42 @@ pub const SOCKET_MARK: u32 = 0x7261; // "ra"
 /// tunnel is actually up, and force a rebind when this flips.
 static FULL_TUNNEL: AtomicBool = AtomicBool::new(false);
 
-/// Records whether a full tunnel is up, returning the previous value. Whenever this
-/// flips, the caller must trigger an endpoint rebind (`Endpoint::network_change`)
-/// so already-bound sockets pick it up; when it did not flip, the rebind can be
-/// skipped.
-pub fn set_full_tunnel(on: bool) -> bool {
-    FULL_TUNNEL.swap(on, Ordering::AcqRel)
+/// Whether the live tunnel claims IPv4, i.e. it is not an IPv6-only one. Only the
+/// macOS pin reads it, and only to stay off the family it did not claim.
+///
+/// Pinning is per-socket and per-family, so a mode that tunnels IPv6 alone must
+/// not pin the IPv4 sockets: that would bind the whole IPv4 underlay to the
+/// physical interface and carve it out of whichever co-resident VPN owns IPv4 on
+/// that Mac, which is the configuration IPv6-only mode exists to share with.
+/// `tunnel_relevant` already applies exactly this filter to the host-route
+/// exclusions one layer up; this is the same rule for the coarser knob.
+static FULL_TUNNEL_V4: AtomicBool = AtomicBool::new(false);
+
+/// Records whether a full tunnel is up and whether it carries IPv4, returning
+/// whether either of those *changed*. The caller must trigger an endpoint rebind
+/// (`Endpoint::network_change`) when it did, so already-bound sockets pick the new
+/// state up; when nothing changed the rebind can be skipped.
+///
+/// `claims_v4` used to be a restatement of the node's own mode, fixed for the
+/// daemon's lifetime, and the answer only reported the on/off flip. It is now
+/// `ExitFamilies::tunnelled`, which follows the gateway's claim and changes under
+/// a live tunnel: a gateway that gains or loses an IPv6 uplink republishes, and
+/// the re-apply arrives with a different value. Reporting only the on/off flip
+/// there returns "nothing changed" for a re-apply of a live tunnel, so the pin is
+/// never re-evaluated: IPv4 sockets bound while the tunnel did not claim IPv4 stay
+/// unpinned once it does (iroh's own IPv4 underlay then routes into the tunnel it
+/// is carrying), and sockets pinned while it did stay pinned once it stops (the
+/// host's whole IPv4 underlay stays carved out of the co-resident VPN).
+pub fn set_full_tunnel(on: bool, claims_v4: bool) -> bool {
+    let wants_v4 = on && claims_v4;
+    // `FULL_TUNNEL_V4` first, and not for tidiness: a socket binding between the
+    // two stores reads both. Publishing `FULL_TUNNEL` first opens a window where
+    // an install looks like a tunnel that carries no IPv4, so a v4 socket binding
+    // in it skips the pin. The rebind that follows a change heals it, but the
+    // window is free to close.
+    let was_v4 = FULL_TUNNEL_V4.swap(wants_v4, Ordering::AcqRel);
+    let was_on = FULL_TUNNEL.swap(on, Ordering::AcqRel);
+    was_on != on || was_v4 != wants_v4
 }
 
 /// Whether a full tunnel (an exit-node selection) is currently active. Read by
@@ -77,6 +108,11 @@ pub fn set_full_tunnel(on: bool) -> bool {
 /// DNS (so name resolution goes out via the exit) or only `.ray` (split DNS).
 pub fn full_tunnel_active() -> bool {
     FULL_TUNNEL.load(Ordering::Acquire)
+}
+
+/// Whether the live tunnel claims IPv4. See [`FULL_TUNNEL_V4`].
+pub fn full_tunnel_claims_v4() -> bool {
+    FULL_TUNNEL_V4.load(Ordering::Acquire)
 }
 
 /// The configurator iroh runs on every socket it opens (both underlay UDP sockets
@@ -172,6 +208,11 @@ fn bind_outside_tunnel(sock: &SockRef<'_>, domain: Domain) -> std::io::Result<()
         return Ok(());
     }
     let v6 = domain == Domain::IPV6;
+    // Nothing to keep this socket out of if its family was never claimed. See
+    // [`FULL_TUNNEL_V4`].
+    if !v6 && !full_tunnel_claims_v4() {
+        return Ok(());
+    }
     let snapshot = PHYSICAL_DEFAULTS.lock().unwrap().clone();
     let name = match snapshot {
         Some((v4_if, v6_if)) => {
@@ -203,12 +244,13 @@ fn if_index(name: &str) -> Option<NonZeroU32> {
     NonZeroU32::new(unsafe { libc::if_nametoindex(cname.as_ptr()) })
 }
 
-/// The physical default-route gateway, for host routes that must bypass the full
-/// tunnel.
+/// The physical default-route gateway for one family, for host routes that must
+/// bypass the full tunnel. `None` when that family has no default route, which is
+/// the ordinary state of a Mac with no native IPv6.
 #[cfg(target_os = "macos")]
-fn default_gateway() -> Option<String> {
+fn default_gateway(family: &str) -> Option<String> {
     let out = Command::new("route")
-        .args(["-n", "get", "-inet", "default"])
+        .args(["-n", "get", family, "default"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -224,11 +266,12 @@ fn default_gateway() -> Option<String> {
 /// Host routes installed to keep iroh's own underlay traffic off the full tunnel,
 /// tracked so teardown can remove exactly what it added.
 #[cfg(target_os = "macos")]
-static EXCLUDED_IPS: Mutex<Vec<Ipv4Addr>> = Mutex::new(Vec::new());
+static EXCLUDED_IPS: Mutex<Vec<IpAddr>> = Mutex::new(Vec::new());
 
 /// Route each underlay IP straight out the physical gateway so iroh's own traffic
-/// is not swallowed by the full tunnel it is carrying. A `/32` host route beats the
-/// `0/1`+`128/1` split default, so it bypasses the TUN. Idempotent.
+/// is not swallowed by the full tunnel it is carrying. A `/32` or `/128` host route
+/// beats the `0/1`+`128/1` (or `::/1`+`8000::/1`) split default, so it bypasses the
+/// TUN. Idempotent.
 ///
 /// This, not the socket pin, is what actually keeps the transport alive. The pin
 /// only takes effect when iroh rebinds its sockets, and `Endpoint::network_change`
@@ -238,26 +281,39 @@ static EXCLUDED_IPS: Mutex<Vec<Ipv4Addr>> = Mutex::new(Vec::new());
 /// goes into the tunnel and disappears.
 ///
 /// Applies to the relay servers (resolved while DNS is still split) and to the exit
-/// peer's own direct addresses. IPv6 underlay addresses are not excluded yet, so a
-/// peer reachable only over IPv6 still falls back to the relay.
+/// peer's own direct addresses. Both families: an IPv6-only node's tunnel is IPv6,
+/// so IPv6 underlay paths are exactly the ones it would otherwise swallow, and the
+/// address a peer is reachable at is not something we get to choose.
+///
+/// Per family, and best-effort per address: a host with no default route in one
+/// family simply has nothing to route around, and the addresses in the other
+/// family still get their exclusion.
 #[cfg(target_os = "macos")]
-pub fn exclude_from_tunnel(ips: &[Ipv4Addr]) {
-    let Some(gw) = default_gateway() else {
-        tracing::warn!("no default gateway; cannot keep iroh's traffic off the exit tunnel");
-        return;
-    };
+pub fn exclude_from_tunnel(ips: &[IpAddr]) {
     let mut excluded = EXCLUDED_IPS.lock().unwrap();
     let mut added = 0;
+    let mut gateways: HashMap<&str, Option<String>> = HashMap::new();
+    let mut ungatewayed: HashSet<&str> = HashSet::new();
     for ip in ips {
         if excluded.contains(ip) {
             continue;
         }
+        let family = if ip.is_ipv6() { "-inet6" } else { "-inet" };
+        let gw = gateways
+            .entry(family)
+            .or_insert_with(|| default_gateway(family));
+        let Some(gw) = gw.as_deref() else {
+            // Worth saying: an address in a family with no default route is one
+            // this host cannot reach at all, so it is not merely un-excluded.
+            ungatewayed.insert(family);
+            continue;
+        };
         let s = ip.to_string();
         let _ = Command::new("route")
-            .args(["-n", "delete", "-host", &s])
+            .args(["-n", "delete", family, "-host", &s])
             .status();
         let ok = Command::new("route")
-            .args(["-n", "add", "-host", &s, &gw])
+            .args(["-n", "add", family, "-host", &s, gw])
             .status()
             .map(|st| st.success())
             .unwrap_or(false);
@@ -266,8 +322,19 @@ pub fn exclude_from_tunnel(ips: &[Ipv4Addr]) {
             added += 1;
         }
     }
+    for family in ungatewayed {
+        tracing::warn!(
+            family,
+            "no default gateway for this family; cannot keep iroh's traffic there \
+             off the exit tunnel"
+        );
+    }
     if added > 0 {
-        tracing::debug!(added, total = excluded.len(), %gw, "excluded IPs from the exit tunnel");
+        tracing::debug!(
+            added,
+            total = excluded.len(),
+            "excluded IPs from the exit tunnel"
+        );
     }
 }
 
@@ -276,8 +343,9 @@ pub fn exclude_from_tunnel(ips: &[Ipv4Addr]) {
 pub fn remove_tunnel_exclusions() {
     let mut excluded = EXCLUDED_IPS.lock().unwrap();
     for ip in excluded.drain(..) {
+        let family = if ip.is_ipv6() { "-inet6" } else { "-inet" };
         let _ = Command::new("route")
-            .args(["-n", "delete", "-host", &ip.to_string()])
+            .args(["-n", "delete", family, "-host", &ip.to_string()])
             .status();
     }
 }
@@ -294,6 +362,14 @@ pub struct ExitServer {
     /// one of them would be local-delivered by the kernel, reaching this host's
     /// services without ever passing its rayfish inbound firewall.
     self_addrs: Arc<ArcSwap<HashSet<IpAddr>>>,
+    /// Whether this host can actually egress IPv6. Sampled by `apply_os`
+    /// alongside `self_addrs`, and re-probed on the reconverge that publishes it
+    /// ([`refresh_v6_uplink`](Self::refresh_v6_uplink)), since on a gateway
+    /// `apply_os` only runs on `ray up` and on a local `ray exit-node` command.
+    /// Advertised as `Member.exit_families` so an IPv6-only client can tell a
+    /// gateway it can use from one that would take its traffic and have nowhere
+    /// to send it.
+    v6_uplink: Arc<AtomicBool>,
 }
 
 /// Who may route out through us on one network.
@@ -344,6 +420,30 @@ impl ExitServer {
         self.nets.load().contains_key(network)
     }
 
+    /// Whether an exit node we offer can carry IPv6. Read at the same moment as
+    /// [`is_offering`](Self::is_offering) when publishing the roster claim, so the
+    /// two never disagree about what this host does.
+    pub fn offers_v6(&self) -> bool {
+        self.v6_uplink.load(Ordering::Relaxed)
+    }
+
+    /// Re-probe the IPv6 uplink, for the reconverge that publishes the claim.
+    ///
+    /// `apply_os` samples it too, but on a gateway that path only runs on `ray up`
+    /// and on a local `ray exit-node` command, so a box that gains IPv6 an hour
+    /// later would keep advertising IPv4-only until the next `ray up`. This runs
+    /// on the roster's own cadence instead. Spawns a process, so callers put it on
+    /// the blocking pool; a no-op unless we actually offer an exit node.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    pub fn refresh_v6_uplink(&self) {
+        if self.is_active() {
+            self.v6_uplink.store(has_v6_uplink(), Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+    pub fn refresh_v6_uplink(&self) {}
+
     /// Rebuild the policy from `(network name, allow-list)` pairs. An allow entry
     /// is `"*"` (any member) or a user-identity hex; unparseable entries are
     /// skipped. Networks with an empty list are omitted, so `is_active` reflects
@@ -387,6 +487,9 @@ impl ExitServer {
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         if self.is_active() {
             self.set_self_addrs(host_addresses());
+            // Re-read rather than cache: an uplink gains or loses IPv6 with a
+            // lease or a link change, and the claim we publish has to follow.
+            self.v6_uplink.store(has_v6_uplink(), Ordering::Relaxed);
             if let Err(e) = enable(tun_name) {
                 disable();
                 self.clear();
@@ -395,6 +498,7 @@ impl ExitServer {
             }
         } else {
             disable();
+            self.v6_uplink.store(false, Ordering::Relaxed);
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
         let _ = tun_name;
@@ -458,6 +562,21 @@ fn parse_host_addresses(out: &str) -> HashSet<IpAddr> {
     addrs
 }
 
+/// Whether this host has an IPv6 default route, i.e. an exit node it offers can
+/// masquerade IPv6 onto something. A gateway without one is still a perfectly good
+/// IPv4 exit node, which is why this is advertised rather than refused.
+#[cfg(target_os = "linux")]
+fn has_v6_uplink() -> bool {
+    ip_output(&["-6", "route", "show", "default"]).is_some_and(|out| !out.trim().is_empty())
+}
+
+/// The BSD counterpart, over the same `route -n get` the NAT rules already use to
+/// find the interface to masquerade onto.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn has_v6_uplink() -> bool {
+    default_interface("-inet6").is_some()
+}
+
 pub fn is_transitable(dst: IpAddr) -> bool {
     if is_overlay_ip(dst) {
         return false;
@@ -506,6 +625,15 @@ pub struct ExitSelection {
     /// The network we route through the exit peer on (so we tag the datagram with
     /// that network's handle, which its allow-list is scoped to).
     pub network: SmolStr,
+    /// Which families this tunnel carries: [`ExitFamilies::tunnelled`] of the
+    /// gateway's claim and our own data plane. Never `Unknown` or `Neither`, since
+    /// a selection that carries nothing is refused rather than installed.
+    ///
+    /// Held on the selection rather than re-derived at install time because the
+    /// two must not be able to disagree: the routing rules, the socket pin and the
+    /// DNS override are three separate decisions that all have to be made about
+    /// the same tunnel.
+    pub carries: ExitFamilies,
 }
 
 impl ExitClient {
@@ -552,6 +680,82 @@ impl ExitClient {
     pub fn set(&self, selection: Option<ExitSelection>) {
         self.inner.store(selection.map(Arc::new));
     }
+}
+
+/// The IPv6 resolvers a full tunnel forwards DNS to when the operator has named
+/// none of their own: the v6 addresses of the same pair the control plane falls
+/// back to (`transport::PUBLIC_FALLBACK_DNS`).
+const PUBLIC_FALLBACK_DNS_V6: [Ipv6Addr; 2] = [
+    Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
+    Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+];
+
+/// The upstreams a client full tunnel should forward DNS to, or `None` when it
+/// needs no override.
+///
+/// Only a tunnel that carries IPv6 and not IPv4 needs one, which is IPv6-only
+/// mode and, since the gateway's claim narrows the tunnel too, a dual-stack node
+/// routing through a gateway that can only return IPv6. Every upstream the
+/// desktop capture can produce is IPv4 (`DnsConfigurator::captured_upstreams`),
+/// so left alone the daemon would forward each lookup out the physical link: the
+/// exit node would carry the traffic and see none of the names that chose it. A
+/// tunnel that carries IPv4 has no such gap, since it carries the captured
+/// upstreams' own family.
+///
+/// The operator's `dns_upstreams` come first when any of them are IPv6 (the same
+/// list [`crate::config::resolve_upstreams`] reads for IPv4, from the other end),
+/// and `replace` suppresses the public fallback exactly as it does there.
+///
+/// A `replace` list with no IPv6 server in it is the case worth stating: we take
+/// their IPv4 servers rather than override them. The override exists to stop
+/// lookups leaving around the exit, so the reflex is to swap in a public IPv6
+/// resolver, but `replace` is an operator saying *these servers and no others*,
+/// usually an internal resolver holding names nothing else can answer. Silently
+/// sending those queries to Cloudflare and Google instead breaks resolution and
+/// hands a third party the names, to fix a leak that is not even total: IPv4
+/// egress deliberately still leaves directly in this mode, so their resolver is
+/// genuinely reachable. Privacy caveat is the caller's to warn about; a wrong
+/// answer is not recoverable at all.
+pub fn tunnel_upstreams(
+    carries: ExitFamilies,
+    configured: &crate::config::ServerOverride,
+) -> Option<Vec<SocketAddr>> {
+    if carries.carries_v4() || !carries.carries_v6() {
+        return None;
+    }
+    let v6: Vec<Ipv6Addr> = configured
+        .servers
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    if configured.replace {
+        if !v6.is_empty() {
+            return Some(with_port(v6));
+        }
+        // Their list, as given, including the IPv4 entries this mode leaves
+        // untunnelled. Empty only if `replace` was set with nothing usable in it,
+        // where the public fallback is all that is left.
+        let theirs: Vec<SocketAddr> = configured
+            .servers
+            .iter()
+            .filter_map(|s| s.parse::<IpAddr>().ok())
+            .map(|ip| SocketAddr::from((ip, 53u16)))
+            .collect();
+        if !theirs.is_empty() {
+            return Some(theirs);
+        }
+    }
+    let mut servers = v6;
+    servers.extend(PUBLIC_FALLBACK_DNS_V6);
+    Some(with_port(servers))
+}
+
+/// Port 53 on each, the only port a resolver override ever uses here.
+fn with_port(servers: Vec<Ipv6Addr>) -> Vec<SocketAddr> {
+    servers
+        .into_iter()
+        .map(|ip| SocketAddr::from((ip, 53u16)))
+        .collect()
 }
 
 /// This node's exit-node state as the inbound data path needs it: the gateway allow
@@ -674,6 +878,13 @@ mod names {
     pub(super) const EXIT_TABLE: &str = "29793";
     /// `ip rule` preferences (lower = higher priority). Named so install and
     /// teardown stay in sync.
+    /// Destinations another VPN's own table owns -> our table, where
+    /// `mirror_foreign_routes` put a copy of its route. Above `PREF_SRC` because
+    /// the two rules below it both look up `main`, which is exactly the table a
+    /// policy-routing VPN does *not* keep its prefixes in: without this, that
+    /// VPN's traffic reaches `main`, misses, and takes main's default out the
+    /// physical uplink. The mirror alone only rescues the `PREF_TUNNEL` path.
+    pub(super) const PREF_FOREIGN: &str = "98";
     pub(super) const PREF_SRC: &str = "99"; // physical-sourced traffic -> main table
     pub(super) const PREF_BYPASS: &str = "100"; // marked traffic -> main table
     pub(super) const PREF_MAIN: &str = "101"; // main table minus its default route
@@ -870,8 +1081,38 @@ fn client_nft_script(tun_name: &str) -> String {
     )
 }
 
+/// The `ip` family flags a client full tunnel is installed for.
+///
+/// `carries` is [`ExitFamilies::tunnelled`], the intersection of what this node's
+/// data plane routes and what the chosen gateway says it can return. Both have to
+/// hold: an IPv6-only data plane carries no mesh IPv4 at all, so claiming the
+/// host's IPv4 egress would source transit from a `/32` it deliberately leaves
+/// unrouted and pull IPv4 out from under the very VPN the mode exists to share a
+/// host with; and a gateway that cannot return a family drops it just as
+/// completely at the other end.
+///
+/// Teardown is not symmetric with this: it always sweeps both families, so a
+/// daemon restarted with a different selection still cleans up what the last one
+/// left.
+///
+/// [`ExitFamilies::Unknown`] is not a `tunnelled()` output, and is read here as
+/// both families, since that is what an absent claim meant before the field
+/// existed.
 #[cfg(target_os = "linux")]
-pub fn install_client_routing(tun_name: &str) -> Result<()> {
+fn tunnel_families(carries: ExitFamilies) -> &'static [&'static str] {
+    match (
+        carries.carries_v4() || carries.is_unknown(),
+        carries.carries_v6() || carries.is_unknown(),
+    ) {
+        (true, true) => &["-4", "-6"],
+        (true, false) => &["-4"],
+        (false, true) => &["-6"],
+        (false, false) => &[],
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn install_client_routing(tun_name: &str, carries: ExitFamilies) -> Result<()> {
     // The conntrack-mark table loads first: nothing routes into the tunnel until
     // the `ip rule`s below go in, but the moment they do, an inbound connection's
     // replies depend on this table already restoring the mark. Loading it after
@@ -879,12 +1120,41 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
     // where an SSH session to this host's public IP is routed into the tunnel and
     // cut.
     nft_load(&client_nft_script(tun_name))?;
-    let mark = format!("{SOCKET_MARK:#x}");
+    // Kernel rules outlive the process, so install has to be as mode-symmetric as
+    // teardown already is. A daemon killed (or aborted by the panic hook) while a
+    // dual-stack tunnel was up, restarted in IPv6-only mode with the selection
+    // still in config, would otherwise install `-6` and leave the previous run's
+    // `-4` rules and default in place: IPv4 policy-routed into a tunnel this mode
+    // promises not to claim, sourced from the /32 it deliberately leaves
+    // unrouted, taking the co-resident VPN's IPv4 down with it.
     for family in ["-4", "-6"] {
+        if !tunnel_families(carries).contains(&family) {
+            remove_client_rules(family, RuleSweep::All);
+            let _ = run_ip(&[family, "route", "flush", "table", EXIT_TABLE]);
+        }
+    }
+    let mark = format!("{SOCKET_MARK:#x}");
+    for family in tunnel_families(carries).iter().copied() {
+        // Give the tunnel table the prefixes another VPN serves out of a table of
+        // its own, or our catch-all rule swallows them (see the fn docs).
+        let mirrored = mirror_foreign_routes(family, tun_name);
         run_ip(&[
             family, "route", "replace", "default", "dev", tun_name, "table", EXIT_TABLE,
         ])?;
-        remove_client_rules(family);
+        // Keeps the catch-all standing: everything below is a rebuild, and the
+        // rules are re-added one `ip` process at a time. See [`RuleSweep`].
+        remove_client_rules(family, RuleSweep::KeepCatchAll);
+        // The three bypasses go back **first**, because the catch-all now stays up
+        // across the rebuild. That closed the window where traffic leaked out the
+        // physical uplink, and it opened a worse one in the other direction: with
+        // the catch-all standing and these three gone, the highest-priority rule
+        // matching anything is ours, so for the length of the rebuild the daemon's
+        // own QUIC underlay is routed into the tunnel it is carrying, along with
+        // every pre-existing physical-sourced connection. That is precisely what
+        // `PREF_BYPASS` and `PREF_SRC` exist to prevent, and it kills the mesh
+        // rather than leaking past it. Each of these is a separate `ip` process,
+        // so the window is real even now that it is a handful of them.
+        //
         // Ahead of everything else: traffic sourced from one of this host's own
         // physical addresses leaves the way it always did. That is every connection
         // that existed before the tunnel, whose socket is already bound to that
@@ -931,15 +1201,59 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
             "pref",
             PREF_MAIN,
         ])?;
-        run_ip(&[
-            family,
-            "rule",
-            "add",
-            "table",
-            EXIT_TABLE,
-            "pref",
-            PREF_TUNNEL,
-        ])?;
+        // The mirrored destinations, in one rule. It outranks the two `main`
+        // rules above, because neither of them can find a co-resident VPN's
+        // prefixes: those live in its own table, and `PREF_MAIN`'s
+        // `suppress_prefixlength 0` only rescues routes that are in `main` to
+        // begin with. Sending those destinations to our table instead hits the
+        // copy `mirror_foreign_routes` just made, so they go back out the
+        // interface that owned them.
+        //
+        // `suppress_prefixlength 0` is what keeps this to one rule rather than
+        // one per prefix: the rule consults `EXIT_TABLE` and a match on a
+        // prefix length of 0, our own default route, is suppressed, so the
+        // lookup succeeds for exactly the mirrored prefixes and falls through
+        // for everything else. Same trick as `PREF_MAIN`, pointed at our table
+        // instead of `main`.
+        //
+        // It also makes the pairing with the mirror structural instead of
+        // bookkept. The rule reads the routes rather than naming them, so it
+        // cannot outlive one that failed to install and send its prefix to the
+        // tunnel default sitting in the same table, and the count no longer
+        // grows with the other VPN's route count.
+        //
+        // Safe to be last despite outranking them: until the rule lands, those
+        // destinations still resolve through the catch-all into `EXIT_TABLE`,
+        // where longest-prefix picks the mirrored route over our default. The
+        // rule exists for the traffic that would otherwise stop at `PREF_SRC` or
+        // `PREF_BYPASS` above and look up `main`.
+        if mirrored > 0 {
+            run_ip(&foreign_rule_args(family, "add"))?;
+        }
+        // Only if the rebuild did not inherit it: `ip rule add` is not idempotent,
+        // so adding it unconditionally would stack a duplicate on every re-apply,
+        // and `remove_client_rules` deletes one match at a time. `EEXIST` is
+        // tolerated rather than propagated: a false negative from the readback
+        // (`ip rule show` prints a table *name* where `/etc/iproute2/rt_tables`
+        // maps our id, or the command simply failed) would otherwise fail the
+        // whole install, and the caller answers a failed install by tearing the
+        // tunnel down. The rule being there already is the state we wanted.
+        if !catch_all_installed(family)
+            && let Err(e) = run_ip(&[
+                family,
+                "rule",
+                "add",
+                "table",
+                EXIT_TABLE,
+                "pref",
+                PREF_TUNNEL,
+            ])
+        {
+            if !is_already_exists(&e) {
+                return Err(e);
+            }
+            tracing::debug!(family, "catch-all rule was already installed");
+        }
     }
     tracing::info!(
         tun = tun_name,
@@ -955,11 +1269,73 @@ pub fn install_client_routing(tun_name: &str) -> Result<()> {
 #[cfg(target_os = "linux")]
 pub fn teardown_client_routing() {
     for family in ["-4", "-6"] {
-        remove_client_rules(family);
+        remove_client_rules(family, RuleSweep::All);
         let _ = run_ip(&[family, "route", "flush", "table", EXIT_TABLE]);
     }
     let _ = nft_load(&drop_table(CLIENT_TABLE));
     tracing::info!("exit-node client full-tunnel routing removed");
+}
+
+/// How much of our rule set [`remove_client_rules`] takes down.
+///
+/// Teardown wants [`RuleSweep::All`]. A re-install wants
+/// [`RuleSweep::KeepCatchAll`], because the catch-all at [`PREF_TUNNEL`] is the
+/// only thing standing between tunnel-bound traffic and `main`: drop it and every
+/// packet leaves the physical uplink, sourced from this host's real address,
+/// until the rebuild puts it back. That is not instant: every rule is a separate
+/// `ip` process, and the mirrored routes that go in first are one process per
+/// foreign prefix, which a co-resident VPN can have hundreds of. Since the rule
+/// never varies (`table <EXIT_TABLE> pref <PREF_TUNNEL>`, no per-run content),
+/// leaving it standing across the rebuild costs nothing and closes the window:
+/// the routes underneath it are updated with `route replace`, which is atomic per
+/// destination.
+///
+/// Keeping it standing is only safe because the rebuild puts the three bypass
+/// rules back *first*: with the catch-all up and those down, ours is the
+/// highest-priority rule matching anything, and the daemon's own transport goes
+/// into the tunnel it is carrying.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuleSweep {
+    All,
+    KeepCatchAll,
+}
+
+/// Whether our catch-all rule is already installed for one family, read back from
+/// `ip rule show` the same way the other rule readbacks work.
+#[cfg(target_os = "linux")]
+fn catch_all_installed(family: &str) -> bool {
+    let out = match Command::new("ip").args([family, "rule", "show"]).output() {
+        Ok(out) if out.status.success() => out.stdout,
+        _ => return false,
+    };
+    parse_catch_all(&String::from_utf8_lossy(&out))
+}
+
+/// Whether `ip rule show` output contains our catch-all: at [`PREF_TUNNEL`], no
+/// selector, looking up our table.
+///
+/// The table is matched by *position*, not by its printed value, because the
+/// value is not stable: `ip rule show` prints a table's **name** when
+/// `/etc/iproute2/rt_tables` maps our id, so a host that happens to have named
+/// `29793` reads back as `lookup <name>`. Only the pref distinguishes it from a
+/// co-resident VPN's catch-all, and the pref is ours by construction. Getting
+/// this wrong is not cosmetic: a false negative here used to fail the whole
+/// install, which the caller answers by tearing the tunnel down.
+#[cfg(target_os = "linux")]
+fn parse_catch_all(show: &str) -> bool {
+    show.lines().any(|line| {
+        let Some((pref, rest)) = line.split_once(':') else {
+            return false;
+        };
+        if pref.trim() != PREF_TUNNEL {
+            return false;
+        }
+        // Same readback convention as `parse_source_rules`: iproute2 prints the
+        // `from all` selector even though the rule was added without one.
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        matches!(f.as_slice(), ["from", "all", "lookup", _])
+    })
 }
 
 /// The source addresses of the [`PREF_SRC`] rules currently installed for one
@@ -994,6 +1370,62 @@ fn parse_source_rules(show: &str) -> Vec<String> {
         .collect()
 }
 
+/// The one [`PREF_FOREIGN`] rule, as `ip` argv. `verb` is `add` or `del`.
+///
+/// Split out because the add and the del have to name the *same* rule and are
+/// several hundred lines apart: `ip rule del` matches on the keys it is given, so
+/// a del that omits `suppress_prefixlength` finds nothing and leaves the rule
+/// installed, which stacks a duplicate on the next add. The whole spelling is also
+/// what makes the rule mean "every prefix in our table except the default", so a
+/// test can pin it rather than the constants around it.
+#[cfg(target_os = "linux")]
+fn foreign_rule_args<'a>(family: &'a str, verb: &'a str) -> [&'a str; 9] {
+    [
+        family,
+        "rule",
+        verb,
+        "table",
+        EXIT_TABLE,
+        "suppress_prefixlength",
+        "0",
+        "pref",
+        PREF_FOREIGN,
+    ]
+}
+
+/// The destinations of any per-prefix [`PREF_FOREIGN`] rules still installed: the
+/// shape this branch used to add, before one `suppress_prefixlength` rule replaced
+/// the lot.
+///
+/// Kept only as a cleanup path. Matching is deliberately loose on the table (a
+/// name or our id, since `ip rule show` prints whichever `/etc/iproute2/rt_tables`
+/// says) and strict on the shape, so it reclaims our own leftovers without
+/// touching a foreign rule that happens to sit at the same preference.
+#[cfg(target_os = "linux")]
+fn strays_at_our_pref(family: &str) -> Vec<String> {
+    match ip_output(&[family, "rule", "show"]) {
+        Some(out) => parse_strays(&out),
+        None => Vec::new(),
+    }
+}
+
+/// The text half of [`strays_at_our_pref`], split out to be testable.
+#[cfg(target_os = "linux")]
+fn parse_strays(show: &str) -> Vec<String> {
+    show.lines()
+        .filter_map(|line| {
+            let (pref, rest) = line.split_once(':')?;
+            if pref.trim() != PREF_FOREIGN {
+                return None;
+            }
+            match rest.split_whitespace().collect::<Vec<_>>().as_slice() {
+                ["from", "all", "to", dest, "lookup", _] => Some((*dest).to_string()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// Delete our policy rules for one address family, ignoring "not found".
 /// Each del names the full rule spec, mirroring the adds in
 /// [`install_client_routing`], never the pref alone: `ip rule del` removes the
@@ -1001,7 +1433,7 @@ fn parse_source_rules(show: &str) -> Vec<String> {
 /// destroy a foreign rule (another VPN's, systemd-networkd's) that happens to
 /// sit at one of our preference numbers.
 #[cfg(target_os = "linux")]
-fn remove_client_rules(family: &str) {
+fn remove_client_rules(family: &str, sweep: RuleSweep) {
     // Source rules are removed by reading back what is actually installed, not by
     // re-deriving the address list: a lease change between install and teardown
     // would otherwise strand a rule pointing at an address we no longer hold. Only
@@ -1009,6 +1441,37 @@ fn remove_client_rules(family: &str) {
     for addr in installed_source_rules(family) {
         let _ = run_ip(&[
             family, "rule", "del", "from", &addr, "table", "main", "pref", PREF_SRC,
+        ]);
+    }
+    // One rule, deleted by its full spec, so this needs no readback at all.
+    // While it was a rule per mirrored prefix it did, and that readback carried
+    // the same bug `parse_catch_all` had: `ip rule show` prints a table *name*
+    // where `/etc/iproute2/rt_tables` maps our id, and a rule whose table did not
+    // match the numeric string was left behind to accumulate on every re-apply.
+    let _ = run_ip(&foreign_rule_args(family, "del"));
+    // Then whatever the *old* shape left behind. Kernel rules outlive the process
+    // and the panic hook `abort()`s, so a host that ran a build with the per-prefix
+    // rules and then swapped the binary keeps them: the del above names a spec they
+    // do not match, and nothing else looks at pref 98 any more. A stranded
+    // `to <prefix> lookup 29793` outlives the mirrored route it depends on, and
+    // once the co-resident VPN drops that prefix it sends those destinations to the
+    // tunnel default sitting in the same table, which is the exact failure the
+    // single-rule form was meant to make impossible.
+    //
+    // By pref alone, which the comment above warns against for every other rule,
+    // and safe only here: `remove_stray_rules` deletes only rules that look like
+    // the shape we used to install, so a foreign rule parked at 98 is left alone.
+    for stray in strays_at_our_pref(family) {
+        let _ = run_ip(&[
+            family,
+            "rule",
+            "del",
+            "to",
+            &stray,
+            "table",
+            EXIT_TABLE,
+            "pref",
+            PREF_FOREIGN,
         ]);
     }
     let mark = format!("{SOCKET_MARK:#x}");
@@ -1034,15 +1497,287 @@ fn remove_client_rules(family: &str) {
         "pref",
         PREF_MAIN,
     ]);
-    let _ = run_ip(&[
-        family,
-        "rule",
-        "del",
-        "table",
-        EXIT_TABLE,
-        "pref",
-        PREF_TUNNEL,
-    ]);
+    if sweep == RuleSweep::All {
+        let _ = run_ip(&[
+            family,
+            "rule",
+            "del",
+            "table",
+            EXIT_TABLE,
+            "pref",
+            PREF_TUNNEL,
+        ]);
+    }
+}
+
+/// One route, as [`parse_foreign_routes`] reads it back off `ip route show`.
+/// `spec` is the route minus its destination and its `table` clause, in the order
+/// `ip` printed it, so re-emitting it is a matter of appending our own table.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct MirroredRoute {
+    dest: String,
+    spec: Vec<String>,
+}
+
+/// Copy into the tunnel table every prefix another VPN serves out of a routing
+/// table of its own, so that VPN keeps working while our full tunnel is up.
+///
+/// [`PREF_TUNNEL`] is a catch-all, and it sits far above the preferences a peer
+/// VPN uses (Tailscale's are 5210-5270), so once it is in, that VPN's own rules are
+/// never reached. [`PREF_MAIN`] does not save them: `suppress_prefixlength 0` only
+/// rescues routes in `main`, and a policy-routing VPN keeps its prefixes in a
+/// private table (Tailscale's `100.64.0.0/10` and `fd7a:115c:a1e0::/48` live in
+/// table 52). The result would be the co-resident VPN black-holed the moment we
+/// route anything, which is precisely what IPv6-only mode exists to avoid.
+///
+/// Mirroring is one-directional: we only ever write our own table, never a foreign
+/// rule or a foreign table, and the teardown flush drops the copies with the
+/// default. Inside the table longest-prefix decides, so a mirrored `/48` beats our
+/// own `default` without either needing to know about the other, and insertion
+/// order is irrelevant.
+///
+/// Reconciled rather than merely added to: a prefix the other VPN has since
+/// dropped is deleted here, so a re-apply cannot leave traffic pointed at a tunnel
+/// that no longer claims it. Our own default is never touched, so there is no
+/// moment where the table is empty and traffic leaks past the tunnel.
+///
+/// Deliberately broader than the case it is named for: every non-default route in
+/// every non-main table is copied, whatever `ip rule` selectors reach that table.
+/// A prefix another VPN serves only for certain source addresses, or a VRF's
+/// table, becomes unconditional for our tunnel-bound traffic. That is the right
+/// trade against black-holing those destinations outright, but it is a real
+/// widening, so it is written down rather than implied: narrowing it would mean
+/// mirroring only tables named by a selector-free rule, and treating everything
+/// else as unreachable.
+///
+/// Best-effort throughout: this is an accommodation for someone else's routing, and
+/// failing to read or write one route must not fail the install.
+/// The `ip` arguments that copy one foreign route into [`EXIT_TABLE`].
+///
+/// Split out to be testable, because the ordering is load-bearing and invisible
+/// in the parser that feeds it: `table` must come **before** the spec. iproute2
+/// parses everything after the first `nexthop` as a nexthop list to end of line,
+/// so a trailing `table` is rejected ("nexthop or end of line is expected instead
+/// of table") and every multipath mirror fails. The position is valid for the
+/// single-path form too, so there is one order rather than two.
+#[cfg(target_os = "linux")]
+fn mirror_args(family: &str, route: &MirroredRoute) -> Vec<String> {
+    let mut args: Vec<String> = ["route", "replace"].iter().map(|s| s.to_string()).collect();
+    args.insert(0, family.to_string());
+    args.push(route.dest.clone());
+    args.extend(["table".to_string(), EXIT_TABLE.to_string()]);
+    args.extend(route.spec.iter().cloned());
+    args
+}
+
+#[cfg(target_os = "linux")]
+fn mirror_foreign_routes(family: &str, tun_name: &str) -> usize {
+    let wanted = match ip_output(&[family, "route", "show", "table", "all"]) {
+        Some(out) => parse_foreign_routes(&out, tun_name),
+        None => return 0,
+    };
+    // Drop copies whose source route is gone. Read from our own table, where the
+    // only other entry is the default we install below and never mirror.
+    if let Some(out) = ip_output(&[family, "route", "show", "table", EXIT_TABLE]) {
+        for stale in parse_table_routes(&out)
+            .into_iter()
+            .filter(|r| r.dest != "default" && !wanted.iter().any(|w| w.dest == r.dest))
+        {
+            let _ = run_ip(&[family, "route", "del", &stale.dest, "table", EXIT_TABLE]);
+        }
+    }
+    let mut installed = Vec::new();
+    for route in &wanted {
+        let args = mirror_args(family, route);
+        match run_ip(&args.iter().map(String::as_str).collect::<Vec<_>>()) {
+            Ok(()) => installed.push(route.dest.clone()),
+            Err(e) => tracing::warn!(
+                dest = %route.dest,
+                error = %e,
+                "could not mirror a foreign route into the tunnel table; \
+                 its destinations will take the tunnel"
+            ),
+        }
+    }
+    if !installed.is_empty() {
+        tracing::debug!(
+            family,
+            mirrored = installed.len(),
+            "mirrored another VPN's routes into the tunnel table"
+        );
+    }
+    // How many went in, so the caller can skip the rule when there is nothing for
+    // it to find. Which ones no longer matters: the rule reads the table rather
+    // than naming destinations, so a route that failed to install simply is not
+    // matched, instead of being pointed at a table where nothing answers.
+    installed.len()
+}
+
+/// The routes in `ip <family> route show table all` that belong to somebody else's
+/// policy-routing table, so [`mirror_foreign_routes`] can copy them.
+///
+/// Kept only when all of these hold, which between them is the definition of "a
+/// route our catch-all rule would otherwise steal":
+///
+/// - it names a `table` that is not `main`, `local`, `default`, or our own. `main`
+///   is already rescued by [`PREF_MAIN`], and the kernel's `local` table is
+///   reached ahead of every rule we install.
+/// - its destination is a real prefix. A foreign `default` is another full tunnel,
+///   and mirroring it would hand our egress straight back rather than tunnel it.
+/// - it does not leave by our own TUN, which would be a copy of the route we are
+///   installing anyway.
+///
+/// Only `via`, `dev` and `metric` are carried over. `ip route show` prints plenty
+/// besides (`proto`, `scope`, `src`, `pref`, `expires`, and bare flags like
+/// `onlink`), some of which take a value and some of which do not; rather than
+/// guess each one's arity we re-emit the three clauses that decide where a packet
+/// goes and let the kernel derive the rest. A copy in our own table has no need to
+/// resemble the original in anything else.
+///
+/// A multipath route is the one shape that does not fit on its line: its nexthops
+/// are printed as indented continuation lines and the route line itself carries no
+/// `dev` at all, so it is read as a group. Dropping it is not harmless, which is
+/// why it is handled rather than excluded: the prefix then falls to our catch-all
+/// and that VPN's destinations go into our tunnel and nowhere.
+///
+/// Non-unicast entries (`unreachable`, `blackhole`, `prohibit`) are still skipped,
+/// since they lead with the type instead of a destination. That is a deliberate
+/// gap and not the same failure: those destinations are ones the other VPN wants
+/// to fail, so tunnelling them costs a wrong answer rather than a lost route.
+#[cfg(target_os = "linux")]
+fn parse_foreign_routes(show: &str, tun_name: &str) -> Vec<MirroredRoute> {
+    // Group each route with the indented `nexthop` lines that belong to it.
+    let mut groups: Vec<Vec<&str>> = Vec::new();
+    for line in show.lines() {
+        if line.starts_with([' ', '\t']) {
+            if let Some(last) = groups.last_mut() {
+                last.push(line);
+            }
+        } else if !line.trim().is_empty() {
+            groups.push(vec![line]);
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|group| {
+            let line = group[0];
+            let nexthops = &group[1..];
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let dest = *fields.first()?;
+            // A default is another full tunnel: mirroring it would hand our egress
+            // straight back. A non-unicast type (`local`, `broadcast`,
+            // `unreachable`, `blackhole`, ...) leads with the type instead of a
+            // destination, so anything that is not an address is not ours to copy.
+            if dest == "default"
+                || dest
+                    .split('/')
+                    .next()
+                    .is_none_or(|a| a.parse::<IpAddr>().is_err())
+            {
+                return None;
+            }
+            let value_after = |key: &str| {
+                fields
+                    .iter()
+                    .position(|f| *f == key)
+                    .and_then(|i| fields.get(i + 1))
+                    .copied()
+            };
+            let table = value_after("table")?;
+            if matches!(table, "main" | "local" | "default") || table == EXIT_TABLE {
+                return None;
+            }
+            let mut spec: Vec<String> = Vec::new();
+            match value_after("dev") {
+                Some(dev) => {
+                    if dev == tun_name {
+                        return None;
+                    }
+                    if let Some(via) = value_after("via") {
+                        spec.extend(["via".to_string(), via.to_string()]);
+                    }
+                    spec.extend(["dev".to_string(), dev.to_string()]);
+                    if let Some(metric) = value_after("metric") {
+                        spec.extend(["metric".to_string(), metric.to_string()]);
+                    }
+                }
+                // Multipath: the nexthops carry the `dev`, one per continuation
+                // line. Re-emitted in full rather than collapsed to the first,
+                // since `ip route replace` takes the same syntax back.
+                None => {
+                    for hop in nexthops {
+                        let f: Vec<&str> = hop.split_whitespace().collect();
+                        if f.first() != Some(&"nexthop") {
+                            continue;
+                        }
+                        let at = |key: &str| {
+                            f.iter()
+                                .position(|x| *x == key)
+                                .and_then(|i| f.get(i + 1))
+                                .copied()
+                        };
+                        let dev = at("dev")?;
+                        // Our own TUN among the nexthops makes the copy partly a
+                        // copy of the route we are installing: leave the whole
+                        // thing alone rather than mirror half of it.
+                        if dev == tun_name {
+                            return None;
+                        }
+                        spec.push("nexthop".to_string());
+                        if let Some(via) = at("via") {
+                            spec.extend(["via".to_string(), via.to_string()]);
+                        }
+                        spec.extend(["dev".to_string(), dev.to_string()]);
+                        if let Some(weight) = at("weight") {
+                            spec.extend(["weight".to_string(), weight.to_string()]);
+                        }
+                    }
+                    if spec.is_empty() {
+                        return None;
+                    }
+                }
+            }
+            Some(MirroredRoute {
+                dest: dest.to_string(),
+                spec,
+            })
+        })
+        .collect()
+}
+
+/// The destinations currently in one table, for the stale-copy sweep in
+/// [`mirror_foreign_routes`]. Only `dest` is used; `spec` comes along because the
+/// two parses share a shape.
+///
+/// Indented lines are skipped for the same reason [`parse_foreign_routes`] groups
+/// them: a multipath route prints its nexthops as continuation lines, and reading
+/// the first token of one yields a destination called `nexthop`, which is in no
+/// wanted set and so is "swept" with a `route del nexthop` that fails on every
+/// re-apply. Our own table holds mirrors of exactly the routes that parse feeds
+/// it, multipath included, so this is the same input read twice.
+#[cfg(target_os = "linux")]
+fn parse_table_routes(show: &str) -> Vec<MirroredRoute> {
+    show.lines()
+        .filter(|line| !line.starts_with([' ', '\t']))
+        .filter_map(|line| {
+            let dest = line.split_whitespace().next()?;
+            Some(MirroredRoute {
+                dest: dest.to_string(),
+                spec: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+/// `ip <args>` stdout, or `None` when it could not be run or failed. The read-only
+/// counterpart to [`run_ip`], which reports the failure instead.
+#[cfg(target_os = "linux")]
+fn ip_output(args: &[&str]) -> Option<String> {
+    let out = Command::new("ip").args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// nft script fragment that removes `table`, whether or not it exists: `delete
@@ -1078,6 +1813,16 @@ fn nft_load(script: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether a [`run_ip`] failure is the kernel saying the object is already there.
+///
+/// `ip` reports it as `RTNETLINK answers: File exists` on stderr, which `run_ip`
+/// folds into its message. Matched on the errno text rather than the prefix,
+/// which differs between the `rule` and `route` subcommands.
+#[cfg(target_os = "linux")]
+fn is_already_exists(e: &anyhow::Error) -> bool {
+    e.to_string().contains("File exists")
 }
 
 #[cfg(target_os = "linux")]
@@ -1484,6 +2229,213 @@ mod tests {
         );
     }
 
+    /// The rule that hands a co-resident VPN's destinations back to it, spelled
+    /// out, and the sweep that reclaims the shape it replaced.
+    ///
+    /// `suppress_prefixlength 0` is what makes one rule cover every mirrored
+    /// prefix: the lookup itself is the selector, matching the copies and
+    /// suppressing our own default. Verified against a live kernel (iproute2
+    /// 6.1.0) with a mirrored `172.20.0.0/16` and our default in the table: a
+    /// packet to that prefix resolves to the foreign interface whether it is
+    /// sourced from the physical address or carries our mark, an ordinary
+    /// destination still takes the tunnel, and a marked one still bypasses it.
+    /// What is pinned here is the spelling, because a `del` that omits any of it
+    /// matches nothing and leaves the rule to stack on the next add.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_foreign_rule_is_spelled_the_same_way_twice() {
+        assert_eq!(
+            foreign_rule_args("-6", "add"),
+            [
+                "-6",
+                "rule",
+                "add",
+                "table",
+                EXIT_TABLE,
+                "suppress_prefixlength",
+                "0",
+                "pref",
+                PREF_FOREIGN,
+            ]
+        );
+        // The del names the identical rule, differing in the verb alone.
+        let add = foreign_rule_args("-4", "add");
+        let del = foreign_rule_args("-4", "del");
+        assert_eq!(add[2], "add");
+        assert_eq!(del[2], "del");
+        assert_eq!(add[3..], del[3..], "a del that names less matches nothing");
+
+        // `suppress_prefixlength 0` is the whole mechanism, not decoration: it is
+        // what excludes our own default from the lookup. Without it the rule sends
+        // *everything* to the tunnel table at a preference above the bypasses.
+        let spec = add.join(" ");
+        assert!(spec.contains("suppress_prefixlength 0"), "{spec}");
+        assert!(spec.contains(&format!("table {EXIT_TABLE}")), "{spec}");
+    }
+
+    /// A host that ran the per-prefix build keeps those rules across a binary
+    /// swap, and nothing else looks at pref 98 any more.
+    ///
+    /// Kernel rules outlive the process and the panic hook `abort()`s, so this is
+    /// a supported path rather than a corner. A stranded `to <prefix>` rule
+    /// outlives the mirrored route it depends on; once the co-resident VPN drops
+    /// that prefix, the rule sends those destinations to the tunnel default in the
+    /// same table, which is the failure the single-rule form exists to prevent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_old_per_prefix_rules_are_reclaimed_and_a_foreign_one_is_not() {
+        let show = "\
+0:\tfrom all lookup local
+98:\tfrom all to fd7a:115c:a1e0::/48 lookup 29793
+98:\tfrom all to 100.64.0.0/10 lookup corpvpn
+98:\tfrom all lookup 29793 suppress_prefixlength 0
+99:\tfrom 2a01:4f8:121:33c3::2 lookup main
+5270:\tfrom all to 10.9.0.0/24 lookup 52
+";
+        assert_eq!(
+            parse_strays(show),
+            vec![
+                "fd7a:115c:a1e0::/48".to_string(),
+                // Matched by shape, not by table text: `ip rule show` prints the
+                // name when /etc/iproute2/rt_tables maps our id, and reading that
+                // as somebody else's rule is what left these behind before.
+                "100.64.0.0/10".to_string(),
+            ],
+        );
+        // The current rule has no `to`, so the sweep never touches it, and a rule
+        // at another pref is not ours whatever its shape.
+        assert!(!parse_strays(show).iter().any(|d| d == "10.9.0.0/24"));
+    }
+
+    /// The rule that hands a co-resident VPN's destinations back to it.
+    ///
+    /// `mirror_foreign_routes` alone only rescues the `PREF_TUNNEL` path. The two
+    /// rules above it look up `main`, and a policy-routing VPN keeps its prefixes
+    /// in its own table, so traffic *sourced from* that VPN's address (an inbound
+    /// SSH session's replies, say) reached `main`, missed, and left out the
+    /// physical uplink.
+    ///
+    /// One rule covers every mirrored prefix, because `suppress_prefixlength 0`
+    /// makes the lookup itself the selector. Verified against a live kernel
+    /// (iproute2 6.1.0) with a mirrored `172.20.0.0/16` and our default in the
+    /// table: a packet to that prefix resolves to the foreign interface whether
+    /// it is sourced from the physical address or carries our mark, while an
+    /// ordinary destination still takes the tunnel and a marked one still
+    /// bypasses it. What is pinned here is the ordering that makes any of it
+    /// reachable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreign_destinations_are_routed_back_to_their_own_table() {
+        // Ordered above the rules that look up `main`, or it would never be
+        // consulted for the traffic it exists to rescue.
+        for lower in [PREF_SRC, PREF_BYPASS, PREF_MAIN, PREF_TUNNEL] {
+            assert!(
+                PREF_FOREIGN.parse::<u32>().unwrap() < lower.parse::<u32>().unwrap(),
+                "PREF_FOREIGN must outrank {lower}"
+            );
+        }
+        // And below the kernel's `local` table, which must keep winning.
+        assert!(PREF_FOREIGN.parse::<u32>().unwrap() > 0);
+    }
+
+    /// A re-install must recognize its own catch-all and leave it standing.
+    ///
+    /// It is the only rule between tunnel-bound traffic and `main`, and the
+    /// rebuild around it re-mirrors one route per foreign prefix, a separate `ip`
+    /// process each, so tearing it down first leaks every packet out the physical
+    /// uplink for as long as that takes. Recognizing it also has to be exact: a co-resident VPN's own
+    /// catch-all has the identical shape and differs only in the preference, so a
+    /// looser match would read someone else's rule as ours and skip installing
+    /// one at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn our_catch_all_is_recognized_and_a_foreign_one_is_not() {
+        assert!(parse_catch_all("102:\tfrom all lookup 29793\n"));
+        assert!(parse_catch_all(
+            "0:\tfrom all lookup local\n102:\tfrom all lookup 29793\n5270:\tfrom all lookup 52\n"
+        ));
+        // Tailscale's catch-all: same shape, different pref.
+        assert!(!parse_catch_all("5270:\tfrom all lookup 52\n"));
+        // Our own table under a name, which is what `ip rule show` prints when
+        // /etc/iproute2/rt_tables maps our id. Still ours: a false negative here
+        // used to fail the install, and a failed install tears the tunnel down.
+        assert!(parse_catch_all("102:\tfrom all lookup corpvpn\n"));
+        // A selector makes it a different rule (this is the PREF_FOREIGN shape).
+        assert!(!parse_catch_all(
+            "102:\tfrom all to 10.0.0.0/8 lookup 29793\n"
+        ));
+        // Nothing installed at all, which is what a first install sees.
+        assert!(!parse_catch_all(
+            "0:\tfrom all lookup local\n32766:\tfrom all lookup main\n"
+        ));
+    }
+
+    /// A tunnel pins only the families it carries, and says so whenever that
+    /// changes.
+    ///
+    /// The pin is what keeps iroh's underlay out of the tunnel, so it is only
+    /// wanted for a family the tunnel actually claimed. Pinning IPv4 in IPv6-only
+    /// mode binds the whole IPv4 underlay to the physical interface and carves it
+    /// out of the co-resident VPN that owns IPv4 on that host, which is the setup
+    /// the mode exists to share with.
+    ///
+    /// The second half is the part that changed. `claims_v4` used to restate this
+    /// node's mode, fixed for the daemon's lifetime, so reporting only the on/off
+    /// flip was enough. It now follows the gateway's claim and moves under a live
+    /// tunnel: a gateway that gains or loses an IPv6 uplink republishes and the
+    /// re-apply arrives with a different value. Answering "nothing changed" there
+    /// skips the rebind that applies `IP_BOUND_IF`, leaving IPv4 sockets unpinned
+    /// for a tunnel that now carries IPv4 (iroh's own underlay then routes into
+    /// the tunnel it is carrying), or pinned for one that no longer does.
+    ///
+    /// Sole owner of these process-wide statics, deliberately: a second test
+    /// touching them races this one under cargo's thread pool, so new cases go
+    /// here rather than in a test of their own.
+    #[test]
+    fn a_tunnel_pins_the_families_it_carries_and_reports_every_change() {
+        set_full_tunnel(true, false);
+        assert!(full_tunnel_active(), "the tunnel itself is up");
+        assert!(
+            !full_tunnel_claims_v4(),
+            "IPv6-only mode leaves IPv4 to the other VPN, so its sockets stay unpinned"
+        );
+
+        set_full_tunnel(true, true);
+        assert!(full_tunnel_claims_v4(), "a dual-stack tunnel pins both");
+
+        // Coming down clears it, or the next dual-stack-looking read is stale.
+        set_full_tunnel(false, false);
+        assert!(!full_tunnel_active());
+        assert!(!full_tunnel_claims_v4());
+
+        // And the answer itself: every change has to be reported, not just the
+        // on/off flip, or a narrowing tunnel never re-evaluates the pin.
+
+        // From nothing to a v6-only tunnel: a flip either way round.
+        set_full_tunnel(false, false);
+        assert!(set_full_tunnel(true, false), "coming up is a change");
+        assert!(!set_full_tunnel(true, false), "a plain re-apply is not");
+
+        // Widening while up: `FULL_TUNNEL` does not move, and this is exactly the
+        // case that used to answer "no change" and leave the v4 sockets unpinned.
+        assert!(
+            set_full_tunnel(true, true),
+            "gaining IPv4 under a live tunnel is a change"
+        );
+        assert!(full_tunnel_claims_v4());
+        assert!(!set_full_tunnel(true, true), "and then it settles");
+
+        // Narrowing while up, the other direction of the same bug: the pin stays
+        // on IPv4 sockets for a family the tunnel no longer carries.
+        assert!(
+            set_full_tunnel(true, false),
+            "losing IPv4 under a live tunnel is a change"
+        );
+        assert!(!full_tunnel_claims_v4());
+
+        set_full_tunnel(false, false);
+    }
+
     /// Pinning iroh to a tunnel interface puts its transport inside the tunnel it
     /// is carrying, which is worse than not pinning at all.
     #[cfg(target_os = "macos")]
@@ -1610,5 +2562,306 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         s.reload([("n", strs(&["*"]).as_slice())]);
         s.clear();
         assert!(!s.is_active());
+    }
+
+    /// The tunnel installs exactly the families it carries, and cleans up the rest.
+    ///
+    /// `carries` is already the intersection of this node's data plane and the
+    /// gateway's claim, so all three shapes are reachable: an IPv6-only node (or
+    /// any node through a v6-only gateway) takes `-6`, a node through a gateway
+    /// that can only return IPv4 takes `-4`, and the ordinary pair takes both.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tunnel_installs_only_the_families_it_carries() {
+        use ExitFamilies::{Dual, V4, V6};
+        assert_eq!(tunnel_families(V6), ["-6"]);
+        assert_eq!(tunnel_families(V4), ["-4"]);
+        assert_eq!(tunnel_families(Dual), ["-4", "-6"]);
+        // Not a `tunnelled()` output, and read as the pre-claim behaviour rather
+        // than as "install nothing", which would silently drop the tunnel on
+        // every network whose coordinator predates the field.
+        assert_eq!(tunnel_families(ExitFamilies::Unknown), ["-4", "-6"]);
+
+        // Install cleans up whatever it stopped claiming, so a restart under a
+        // different selection cannot leave the previous run's rules routing a
+        // family this one promises not to touch. Kernel state outlives the
+        // process, and the panic hook `abort()`s, so "the last teardown ran" is
+        // not an assumption install gets to make.
+        for (carries, expected) in [(V6, vec!["-4"]), (V4, vec!["-6"]), (Dual, vec![])] {
+            let claimed = tunnel_families(carries);
+            let dropped: Vec<&str> = ["-4", "-6"]
+                .into_iter()
+                .filter(|f| !claimed.contains(f))
+                .collect();
+            assert_eq!(dropped, expected, "{carries:?}");
+        }
+    }
+
+    /// What gets copied into the tunnel table so a co-resident VPN survives our
+    /// catch-all rule, and what deliberately does not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreign_routes_are_mirrored_but_defaults_and_our_own_are_not() {
+        let show = "\
+fd7a:115c:a1e0::/48 dev tailscale0 table 52 metric 1024 pref medium
+2001:db8:1::/64 via fe80::1 dev eth0 table 52 metric 100 pref medium
+default via fe80::ff dev tailscale0 table 52 metric 1024 pref medium
+200::/7 dev ray0 table 52 metric 1024 pref medium
+2001:db8:9::/64 dev eth0 proto kernel metric 256 pref medium
+::1 dev lo table local proto kernel metric 0 pref medium
+local 2001:db8:9::5 dev eth0 table local proto kernel metric 0 pref medium
+unreachable fd00::/8 dev lo table 52 metric 1024 pref medium
+";
+        let got = parse_foreign_routes(show, "ray0");
+
+        // A foreign table's real prefixes, carried over with just what decides
+        // where a packet goes.
+        assert_eq!(
+            got,
+            vec![
+                MirroredRoute {
+                    dest: "fd7a:115c:a1e0::/48".into(),
+                    spec: strs(&["dev", "tailscale0", "metric", "1024"]),
+                },
+                MirroredRoute {
+                    dest: "2001:db8:1::/64".into(),
+                    spec: strs(&["via", "fe80::1", "dev", "eth0", "metric", "100"]),
+                },
+            ]
+        );
+        // And what is left out: a foreign `default` (mirroring another full
+        // tunnel would hand our egress straight back), our own TUN's route, a
+        // route with no `table` of its own (that is `main`, already rescued by
+        // PREF_MAIN), the kernel's `local` table, and non-unicast route types
+        // that lead with a type instead of a destination.
+        for absent in [
+            "default",
+            "200::/7",
+            "2001:db8:9::/64",
+            "::1",
+            "fd00::/8",
+            "2001:db8:9::5",
+        ] {
+            assert!(
+                !got.iter().any(|r| r.dest == absent),
+                "{absent} should not be mirrored"
+            );
+        }
+    }
+
+    /// A multipath route is printed across several lines, and the route line
+    /// carries no `dev` at all.
+    ///
+    /// Reading only the first line drops it, and a dropped foreign route is not a
+    /// no-op: the prefix falls through to our catch-all and that VPN's
+    /// destinations go into our tunnel and nowhere. Format below is real
+    /// `ip route show table all` output.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_multipath_foreign_route_is_mirrored_with_all_its_nexthops() {
+        let show = "\
+172.20.0.0/16 table 52
+\tnexthop via 10.0.0.1 dev eth0 weight 1
+\tnexthop via 10.0.1.1 dev eth1 weight 1
+10.7.0.0/16 table 52
+\tnexthop via 10.0.0.1 dev ray0 weight 1
+\tnexthop via 10.0.1.1 dev eth1 weight 1
+192.168.5.0/24 dev eth0 table 52
+";
+        let got = parse_foreign_routes(show, "ray0");
+        assert_eq!(
+            got,
+            vec![
+                MirroredRoute {
+                    dest: "172.20.0.0/16".into(),
+                    spec: strs(&[
+                        "nexthop", "via", "10.0.0.1", "dev", "eth0", "weight", "1", "nexthop",
+                        "via", "10.0.1.1", "dev", "eth1", "weight", "1",
+                    ]),
+                },
+                // The single-path route after a multipath one still parses: the
+                // grouping must end at the next unindented line.
+                MirroredRoute {
+                    dest: "192.168.5.0/24".into(),
+                    spec: strs(&["dev", "eth0"]),
+                },
+            ]
+        );
+        // Our own TUN among the nexthops means the copy would partly duplicate the
+        // route we are installing, so the whole entry is left alone.
+        assert!(!got.iter().any(|r| r.dest == "10.7.0.0/16"));
+
+        // And the command it becomes. Parsing the route correctly is only half of
+        // it: `table` after a nexthop list is rejected by iproute2, so the
+        // original spelling failed every multipath mirror while this same parser
+        // test passed. Verified against iproute2 6.1.0.
+        let args = mirror_args("-4", &got[0]);
+        assert_eq!(
+            args,
+            strs(&[
+                "-4",
+                "route",
+                "replace",
+                "172.20.0.0/16",
+                "table",
+                EXIT_TABLE,
+                "nexthop",
+                "via",
+                "10.0.0.1",
+                "dev",
+                "eth0",
+                "weight",
+                "1",
+                "nexthop",
+                "via",
+                "10.0.1.1",
+                "dev",
+                "eth1",
+                "weight",
+                "1",
+            ])
+        );
+        let table_at = args.iter().position(|a| a == "table").unwrap();
+        let first_hop = args.iter().position(|a| a == "nexthop").unwrap();
+        assert!(
+            table_at < first_hop,
+            "`table` after a nexthop list is a parse error, not a wrong table"
+        );
+        // Single-path takes the same order, so there is only one to get right.
+        assert_eq!(
+            mirror_args("-4", &got[1]),
+            strs(&[
+                "-4",
+                "route",
+                "replace",
+                "192.168.5.0/24",
+                "table",
+                EXIT_TABLE,
+                "dev",
+                "eth0",
+            ])
+        );
+    }
+
+    /// The sweep reads our own table with the same shape, so it has the same
+    /// multipath problem, and a `nexthop` line read as a destination is swept
+    /// forever: it is in no wanted set, so every re-apply runs a `route del
+    /// nexthop` that fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_stale_sweep_does_not_read_a_nexthop_line_as_a_destination() {
+        let show = "\
+default dev ray0 table 29793
+172.20.0.0/16 table 29793
+\tnexthop via 10.0.0.1 dev eth0 weight 1
+\tnexthop via 10.0.1.1 dev eth1 weight 1
+192.168.5.0/24 dev eth0 table 29793
+";
+        let dests: Vec<String> = parse_table_routes(show)
+            .into_iter()
+            .map(|r| r.dest)
+            .collect();
+        assert_eq!(
+            dests,
+            strs(&["default", "172.20.0.0/16", "192.168.5.0/24"]),
+            "continuation lines are part of the route above them, not routes"
+        );
+    }
+
+    /// The IPv4 side, where the range that matters is the one IPv6-only mode
+    /// hands over in the first place.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreign_cgnat_route_is_mirrored() {
+        let show = "100.64.0.0/10 dev tailscale0 table 52 \n";
+        assert_eq!(
+            parse_foreign_routes(show, "ray0"),
+            vec![MirroredRoute {
+                dest: "100.64.0.0/10".into(),
+                spec: strs(&["dev", "tailscale0"]),
+            }]
+        );
+    }
+
+    /// Only a tunnel carrying IPv6 and not IPv4 needs its own DNS upstreams: any
+    /// tunnel that carries IPv4 already carries the family the captured upstreams
+    /// live in. That is IPv6-only mode, and now also a dual-stack node routing
+    /// through a gateway that can only return IPv6.
+    #[test]
+    fn only_a_v6_carrying_tunnel_overrides_dns_upstreams() {
+        use crate::config::ServerOverride;
+        use ExitFamilies::{Dual, V4, V6};
+
+        // Both families, or IPv4 alone: the captured upstreams already ride it.
+        assert!(tunnel_upstreams(Dual, &ServerOverride::default()).is_none());
+        assert!(tunnel_upstreams(V4, &ServerOverride::default()).is_none());
+
+        // Nothing configured: the public fallback pair, on port 53.
+        let got = tunnel_upstreams(V6, &ServerOverride::default()).unwrap();
+        assert_eq!(
+            got,
+            PUBLIC_FALLBACK_DNS_V6
+                .map(|ip| SocketAddr::from((ip, 53)))
+                .to_vec()
+        );
+
+        // The operator's own IPv6 entries come first; their IPv4 ones are not
+        // reachable through this tunnel and are left to `resolve_upstreams`.
+        let augment = ServerOverride {
+            servers: strs(&["2001:4860:4860::8844", "192.168.1.1"]),
+            replace: false,
+        };
+        let got = tunnel_upstreams(V6, &augment).unwrap();
+        assert_eq!(got[0], "[2001:4860:4860::8844]:53".parse().unwrap());
+        assert_eq!(got.len(), 1 + PUBLIC_FALLBACK_DNS_V6.len());
+
+        // `replace` suppresses the fallback, exactly as it does for IPv4.
+        let replace = ServerOverride {
+            servers: strs(&["2001:4860:4860::8844"]),
+            replace: true,
+        };
+        assert_eq!(
+            tunnel_upstreams(V6, &replace).unwrap(),
+            vec!["[2001:4860:4860::8844]:53".parse::<SocketAddr>().unwrap()]
+        );
+
+        // `replace` with no IPv6 entry keeps the operator's own IPv4 servers
+        // rather than substituting public ones. `replace` means "these and no
+        // others", and it usually names an internal resolver holding names
+        // nothing else can answer, so swapping in Cloudflare breaks resolution
+        // and leaks the names. IPv4 egress still leaves directly in this mode, so
+        // that server is genuinely reachable; the cost is a lookup that goes
+        // around the exit, which is the lesser of the two.
+        let v4_only = ServerOverride {
+            servers: strs(&["192.168.1.1"]),
+            replace: true,
+        };
+        assert_eq!(
+            tunnel_upstreams(V6, &v4_only).unwrap(),
+            vec!["192.168.1.1:53".parse::<SocketAddr>().unwrap()],
+            "an explicit --replace list is not silently swapped for public resolvers"
+        );
+
+        // Mixed: the IPv6 half is enough to keep everything inside the tunnel, so
+        // the IPv4 entries are not needed and not used.
+        let mixed = ServerOverride {
+            servers: strs(&["192.168.1.1", "2001:4860:4860::8844"]),
+            replace: true,
+        };
+        assert_eq!(
+            tunnel_upstreams(V6, &mixed).unwrap(),
+            vec!["[2001:4860:4860::8844]:53".parse::<SocketAddr>().unwrap()]
+        );
+
+        // `replace` with nothing parseable in it: the fallback is all that is
+        // left, and an empty override would forward nowhere at all.
+        let junk = ServerOverride {
+            servers: strs(&["not-an-address"]),
+            replace: true,
+        };
+        assert_eq!(
+            tunnel_upstreams(V6, &junk).unwrap().len(),
+            PUBLIC_FALLBACK_DNS_V6.len()
+        );
     }
 }

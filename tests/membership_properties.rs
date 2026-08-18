@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use proptest::prelude::*;
 use rayfish::hostname::{admission_hostname, is_valid_hostname, resolve_collision};
 use rayfish::membership::{
-    ApprovedList, Member, MemberList, assign_ip, canonical_group_bytes, derive_ip,
+    ApprovedList, ExitFamilies, Member, MemberList, assign_ip, canonical_group_bytes, derive_ip,
     derive_ip_with_index, derive_ipv6, group_blob_hash, is_overlay_ip, resolve_ip_tiebreak,
 };
 
@@ -38,6 +38,7 @@ fn member(identity: EndpointId, ip: Ipv4Addr, collision_index: u32) -> Member {
         collision_index,
         last_seen: None,
         exit_node: false,
+        exit_families: ExitFamilies::Unknown,
         ipv6_only: false,
     }
 }
