@@ -537,6 +537,11 @@ things follow from it:
   nothing either way is still selectable: that is what a network whose
   coordinator predates this feature looks like, and refusing there would rule
   out every gateway on it. `ray exit-node use` says so when it happens.
+
+  The same rule applies in reverse on a dual-stack node: a tunnel carries the
+  families both ends can carry, so a gateway that can return only one of them
+  narrows the tunnel to it and the other family keeps leaving directly, rather
+  than being tunnelled into a hole. `ray exit-node status` says which.
 - The daemon's own DNS forwarder is pointed at an IPv6 resolver while the tunnel
   is up, so the lookups it makes go through the exit rather than around it. Name
   one yourself with `ray config set dns-upstreams` (IPv6 addresses are accepted);

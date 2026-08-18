@@ -101,6 +101,35 @@ impl ExitFamilies {
         matches!(self, Self::Unknown)
     }
 
+    /// What a client tunnel through this gateway actually carries, given the
+    /// client's own data plane.
+    ///
+    /// The intersection of the two, because both ends have to hold for a family
+    /// to survive the round trip: our data plane has to route it (an IPv6-only
+    /// node never routes mesh IPv4, so it cannot source transit from it) and the
+    /// gateway has to be able to egress it and get the reply back. A family only
+    /// one side can carry is not a tunnel, it is a black hole, so it is left to
+    /// leave directly and the user is told.
+    ///
+    /// [`Self::Unknown`] counts as "can carry", which is the same exemption the
+    /// refusal makes: the claim is absent on every network whose coordinator
+    /// predates the field, and narrowing a tunnel on the strength of nothing
+    /// would quietly stop tunnelling a family that works.
+    ///
+    /// [`Self::Neither`] out means there is nothing to install at all, which is
+    /// the only case the caller refuses on.
+    pub fn tunnelled(self, client_ipv6_only: bool) -> Self {
+        let assume = self.is_unknown();
+        let v6 = assume || self.carries_v6();
+        let v4 = !client_ipv6_only && (assume || self.carries_v4());
+        match (v4, v6) {
+            (true, true) => Self::Dual,
+            (true, false) => Self::V4,
+            (false, true) => Self::V6,
+            (false, false) => Self::Neither,
+        }
+    }
+
     /// The claim a gateway makes about itself: whether it found an IPv6 default
     /// route, and whether its own data plane carries IPv4 at all.
     ///
@@ -1896,6 +1925,35 @@ mod tests {
         // And re-encoding it compactly gives different bytes, which is what makes
         // the local snapshot hash disagree with the signed one.
         assert_ne!(rmp_serde::to_vec(&blob).unwrap(), bytes);
+    }
+
+    /// A tunnel carries what both ends can carry, and nothing else.
+    ///
+    /// The cases that used to be a refusal or a black hole are the mixed ones: a
+    /// dual-stack client through a gateway that can only return one family. The
+    /// family that works is tunnelled and the other leaves directly, which is
+    /// the same trade IPv6-only mode already makes with its own data plane.
+    #[test]
+    fn a_tunnel_carries_the_intersection_of_both_ends() {
+        use ExitFamilies::{Dual, Neither, Unknown, V4, V6};
+
+        // Dual-stack client: the gateway's claim is the whole answer.
+        assert_eq!(Dual.tunnelled(false), Dual);
+        assert_eq!(V6.tunnelled(false), V6, "IPv4 would die at the gateway");
+        assert_eq!(V4.tunnelled(false), V4, "IPv6 would have nowhere to egress");
+        assert_eq!(Neither.tunnelled(false), Neither);
+
+        // IPv6-only client: never IPv4, whatever the gateway says, because this
+        // node has no routed mesh IPv4 to source transit from.
+        assert_eq!(Dual.tunnelled(true), V6);
+        assert_eq!(V6.tunnelled(true), V6);
+        assert_eq!(V4.tunnelled(true), Neither, "nothing left to install");
+        assert_eq!(Neither.tunnelled(true), Neither);
+
+        // No claim means no narrowing: every network whose coordinator predates
+        // the field would otherwise lose a family that works.
+        assert_eq!(Unknown.tunnelled(false), Dual);
+        assert_eq!(Unknown.tunnelled(true), V6);
     }
 
     /// The default claim rides every roster entry, so its tag is sized for that.

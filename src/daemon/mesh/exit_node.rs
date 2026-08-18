@@ -54,30 +54,30 @@ fn gateway_refusal(
 /// The family half of [`gateway_refusal`], on its own because the two halves have
 /// different lifetimes. "Does not advertise an exit node" is a roster fact that
 /// flickers (a coordinator rebuild, a gateway mid-restart) and must not drop a
-/// live tunnel, so it is only ever checked when the user picks a gateway. This
-/// one is a standing property of the pair: while it holds, the tunnel carries
-/// nothing, so it is re-checked on every re-apply as well.
+/// live tunnel, so it is only ever checked when the user picks. This one is a
+/// standing property of the pair: while it holds, the tunnel carries nothing, so
+/// it is re-checked on every re-apply as well.
 ///
-/// Refuses only on a claim that was actually made. [`ExitFamilies::Unknown`]
-/// means the roster carries none, which is what a coordinator on a release that
-/// predates the field leaves behind, and refusing on it would make exit nodes
-/// unusable on every such network until the last coordinator upgrades. Allowing
-/// it can be wrong, but wrongly is the direction that fails loudly: the user
-/// chose this gateway, sees no internet, and clears it. The silent black-hole
-/// this whole check exists to prevent is the *other* direction, a gateway
-/// confidently marked usable. The caller warns instead, so the reason is in the
-/// log before the traffic stops.
+/// Refuses only when the tunnel would carry *nothing*
+/// ([`ExitFamilies::tunnelled`] is [`ExitFamilies::Neither`]). A gateway that can
+/// return one of the two families is not refused: the tunnel narrows to that
+/// family and the other leaves directly, the same trade IPv6-only mode already
+/// makes with its own data plane. Refusing there would take down a tunnel that
+/// works for the family the user has, to avoid a family it cannot carry anyway.
 ///
-/// Symmetric in the family, because the mismatch is: our tunnel carries exactly
-/// the families our own mode claims, so a gateway that cannot return one of them
-/// black-holes it. [`ExitFamilies::V6`] is the case a gateway's own IPv6-only
-/// mode produces, and it is refused by a *dual-stack* client for the same reason
-/// [`ExitFamilies::V4`] is refused by an IPv6-only one.
+/// [`ExitFamilies::Unknown`] never refuses, because `tunnelled` reads it as "can
+/// carry": it is what a coordinator on a release that predates the field leaves
+/// behind, and treating silence as denial would make exit nodes unusable on every
+/// such network. Allowing it can be wrong, but wrongly is the direction that
+/// fails loudly (the user chose this gateway, sees no internet, and clears it),
+/// while the silent black hole this exists to prevent is a gateway confidently
+/// marked usable. The caller warns instead, so the reason is in the log before the
+/// traffic stops.
 fn ipv6_gateway_refusal(m: &Member, name: &str, ipv6_only: bool) -> Option<String> {
-    if m.exit_families.is_unknown() {
+    if m.exit_families.tunnelled(ipv6_only) != ExitFamilies::Neither {
         return None;
     }
-    if ipv6_only && !m.exit_families.carries_v6() {
+    if ipv6_only {
         return Some(format!(
             "{name} offers an exit node but cannot carry IPv6, and this node's data \
              plane is IPv6-only, so nothing would reach the internet through it. \
@@ -85,16 +85,38 @@ fn ipv6_gateway_refusal(m: &Member, name: &str, ipv6_only: bool) -> Option<Strin
              host an IPv6 uplink."
         ));
     }
-    if !ipv6_only && !m.exit_families.carries_v4() {
-        return Some(format!(
-            "{name} offers an exit node but cannot carry IPv4: its own data plane is \
-             IPv6-only, so it never routes the mesh IPv4 that a reply would come \
-             back on. This node's tunnel takes both families, so IPv4 through it \
-             would go one way and stop. Pick another gateway, or run this node in \
-             IPv6-only mode too (`ray config set ipv6-only on`)."
-        ));
+    Some(format!(
+        "{name} offers an exit node but says it can carry neither IPv4 nor IPv6: \
+         its own data plane is IPv6-only, so it never routes the mesh IPv4 a reply \
+         would come back on, and it has no IPv6 uplink to offer instead. Nothing \
+         would reach the internet through it. Pick another gateway, or give that \
+         host an IPv6 uplink."
+    ))
+}
+
+/// Whether a tunnel through `m` would leave a family of ours untunnelled, and
+/// which. `None` when it carries everything this node routes.
+///
+/// Not a refusal: the tunnel is installed and the family that works goes through
+/// it. It is a warning, because a user who asked for a full tunnel and got half
+/// of one has to be told which half, and `ray exit-node status` says the same
+/// thing standing.
+fn partial_tunnel_warning(m: &Member, name: &str, ipv6_only: bool) -> Option<String> {
+    match m.exit_families.tunnelled(ipv6_only) {
+        // Not a partial tunnel on an IPv6-only node: IPv4 is untunnelled there
+        // whatever gateway is chosen, which `ray exit-node use` already says.
+        ExitFamilies::V6 if !ipv6_only => Some(format!(
+            "{name} can only carry IPv6, so IPv4 traffic keeps leaving this host \
+             directly. It never routes the mesh IPv4 a tunnelled reply would come \
+             back on, so tunnelling IPv4 through it would black-hole it instead."
+        )),
+        ExitFamilies::V4 => Some(format!(
+            "{name} can only carry IPv4, so IPv6 traffic keeps leaving this host \
+             directly. It has no IPv6 uplink to masquerade onto, so tunnelling IPv6 \
+             through it would black-hole it instead."
+        )),
+        _ => None,
     }
-    None
 }
 
 /// Whether selecting `m` as a gateway is a guess: it offers an exit node, we need
@@ -330,6 +352,10 @@ impl NetworkRegistry {
         // positive one, so the reply can say so: a log line is not where someone
         // running `ray exit-node use` looks.
         let mut unverified = false;
+        // Set when the gateway can carry one family and not the other, so the
+        // tunnel narrows to it. Not a refusal: the family that works is
+        // tunnelled, and the user is told which one is not.
+        let mut partial: Option<String> = None;
         let selection = match &peer {
             Some(name) => {
                 let Some(id) = self.resolve_peer_flexible(name).await else {
@@ -356,6 +382,12 @@ impl NetworkRegistry {
                          drops it). If nothing reaches the internet, that is why"
                     );
                 }
+                partial = member
+                    .as_ref()
+                    .and_then(|m| partial_tunnel_warning(m, name, ipv6_only));
+                if let Some(why) = &partial {
+                    tracing::warn!(gateway = %name, network = %network, "{why}");
+                }
                 Some(id.to_string())
             }
             None => None,
@@ -373,6 +405,13 @@ impl NetworkRegistry {
         // IPv6 and leaves the host's IPv4 egress where it already was. Say which
         // one this is rather than let the user find out from a leak test.
         let message = match (&peer, ipv6_only) {
+            // The gateway can only return one family, so the tunnel takes that one
+            // and the other keeps leaving directly. Said here because "routing all
+            // traffic" would be the same lie IPv6-only mode makes it.
+            (Some(name), _) if partial.is_some() => format!(
+                "routing traffic through {name} on {network}, except: {}",
+                partial.unwrap_or_default()
+            ),
             (Some(name), false) => format!("routing all traffic through {name} on {network}"),
             (Some(name), true) => format!(
                 "routing IPv6 traffic through {name} on {network}. IPv4 is not tunnelled \
@@ -466,6 +505,7 @@ impl NetworkRegistry {
                 peer_user: self.device_user_map.resolve(&member.identity),
                 ipv4: member.ip,
                 network: SmolStr::new(&nc.name),
+                carries: member.exit_families.tunnelled(self.ipv6_only),
             })
         });
         // Unlike the missing-peer case below, this is not a roster gap a
@@ -672,6 +712,17 @@ impl NetworkRegistry {
                 .exit_node_use
                 .as_deref()
                 .and_then(|sel| self.exit_selection_problem(&n.name, sel));
+            // What a tunnel through the selected gateway carries. An absent claim
+            // (or an unresolvable peer) defaults to `Unknown`, which `tunnelled`
+            // reads as "can carry", so this says what the install would do.
+            let carries = n
+                .exit_node_use
+                .as_deref()
+                .and_then(|sel| sel.parse::<EndpointId>().ok())
+                .and_then(|id| self.roster_member(&n.name, id))
+                .map(|m| m.exit_families)
+                .unwrap_or_default()
+                .tunnelled(self.ipv6_only);
             networks.push(ipc::ExitNodeStatusView {
                 network: n.name,
                 allow: n.exit_allow,
@@ -681,6 +732,8 @@ impl NetworkRegistry {
                 ipv6_only: self.ipv6_only,
                 refused,
                 not_in_effect,
+                tunnel_v4: carries.carries_v4(),
+                tunnel_v6: carries.carries_v6(),
             });
         }
         IpcMessage::ExitNodeState { networks }
@@ -1096,22 +1149,39 @@ mod tests {
         assert!(why.contains("cannot carry IPv6"), "{why}");
     }
 
-    /// The refusal runs in both directions, because the black hole does.
+    /// A gateway that can return only one family narrows the tunnel to it,
+    /// instead of being refused.
     ///
     /// A gateway in IPv6-only mode has an IPv6 uplink but never routes mesh IPv4,
     /// so a dual-stack client's tunnelled IPv4 reaches it, gets masqueraded out,
-    /// and the reply finds no way back into its TUN. Claiming `Dual` there (which
-    /// the uplink probe alone would) is a positive claim that is false, and a
-    /// false claim is worse than the `Unknown` this field exists to distinguish.
+    /// and the reply finds no way back into its TUN. Tunnelling IPv4 there is a
+    /// black hole, but refusing the gateway outright takes IPv6 out of the tunnel
+    /// too, so the user loses the family that works to avoid one that never
+    /// could. The tunnel takes IPv6, IPv4 keeps leaving directly, and both
+    /// `ray exit-node use` and `ray exit-node status` say which is which.
     #[test]
-    fn a_v6_only_gateway_is_refused_by_a_dual_stack_client() {
+    fn a_gateway_that_carries_one_family_narrows_the_tunnel_to_it() {
         use ExitFamilies::{Dual, Neither, V4, V6};
 
-        let refusal = super::ipv6_gateway_refusal(&gateway(true, V6), "gw", false)
-            .expect("a v6-only gateway cannot return a dual-stack client's IPv4");
-        assert!(refusal.contains("cannot carry IPv4"), "{refusal}");
-        // And is fine for a client that was only ever going to send it IPv6.
+        // Not refused, in either direction.
+        assert!(super::ipv6_gateway_refusal(&gateway(true, V6), "gw", false).is_none());
+        assert!(super::ipv6_gateway_refusal(&gateway(true, V4), "gw", false).is_none());
         assert!(super::ipv6_gateway_refusal(&gateway(true, V6), "gw", true).is_none());
+
+        // Told, though, and in terms of the family that stops being tunnelled.
+        let why = super::partial_tunnel_warning(&gateway(true, V6), "gw", false)
+            .expect("a dual-stack node loses IPv4 through a v6-only gateway");
+        assert!(why.contains("only carry IPv6"), "{why}");
+        let why = super::partial_tunnel_warning(&gateway(true, V4), "gw", false)
+            .expect("a dual-stack node loses IPv6 through a v4-only gateway");
+        assert!(why.contains("only carry IPv4"), "{why}");
+
+        // Nothing to warn about when the tunnel takes everything this node
+        // routes: a dual-stack pair, or an IPv6-only node whose untunnelled IPv4
+        // is the mode's own premise and is said at `ray exit-node use` already.
+        assert!(super::partial_tunnel_warning(&gateway(true, Dual), "gw", false).is_none());
+        assert!(super::partial_tunnel_warning(&gateway(true, V6), "gw", true).is_none());
+        assert!(super::partial_tunnel_warning(&gateway(true, Dual), "gw", true).is_none());
 
         // The claim itself: the two inputs are independent, so all four states
         // are reachable and each says something different.
@@ -1119,6 +1189,7 @@ mod tests {
         assert_eq!(ExitFamilies::from_uplink(true, true), V6);
         assert_eq!(ExitFamilies::from_uplink(false, false), V4);
         assert_eq!(ExitFamilies::from_uplink(false, true), Neither);
+        // The one family gap that is still a refusal: nothing left to tunnel.
         assert!(super::ipv6_gateway_refusal(&gateway(true, V4), "gw", true).is_some());
     }
 
@@ -1145,7 +1216,10 @@ mod tests {
         for ipv6_only in [false, true] {
             let refusal = super::ipv6_gateway_refusal(&gateway(true, Neither), "gw", ipv6_only)
                 .unwrap_or_else(|| panic!("must be refused with ipv6_only={ipv6_only}"));
-            assert!(refusal.contains("cannot carry"), "{refusal}");
+            assert!(
+                refusal.contains("cannot carry IPv6") || refusal.contains("neither IPv4 nor IPv6"),
+                "{refusal}"
+            );
         }
     }
 }

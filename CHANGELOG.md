@@ -13,29 +13,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   useful. It now works, tunnelling IPv6: mesh IPv4 carries no traffic in that
   mode, so your IPv4 internet traffic keeps leaving directly, and both
   `ray exit-node use` and `ray exit-node status` say so rather than leaving you
-  to find out. The gateway needs an IPv6 uplink of its own; ones that have it
-  report having it are marked `(IPv6)` in `ray exit-node status`, and picking one
-  that reports the opposite is refused with the reason instead of timing out, and
-  that check now also runs on every re-apply, so a gateway that loses its IPv6
-  uplink (or a selection made before the mode turned itself on) falls back to
-  direct egress with a message rather than silently carrying nothing (and picks
-  the tunnel back up by itself once the gateway reports an uplink again). A
-  gateway on a network whose coordinator is older than this feature reports
-  nothing either way; it stays selectable, since refusing would rule out every
-  gateway on that network, and `ray exit-node use` tells you the claim is
-  unverified. The check runs the other way too: a gateway that is itself in
-  IPv6-only mode cannot carry a dual-stack client's IPv4, because it never routes
-  the mesh IPv4 a reply would come back on, so picking one is refused with that
-  reason rather than working for IPv6 and silently dropping IPv4. While the
-  tunnel is up, the daemon's own
-  DNS forwarder is pointed at an IPv6 resolver so its lookups go through the exit
-  rather than around it; on Linux hosts using systemd-resolved, NetworkManager or
-  resolvconf, applications' non-`.ray` lookups still leave directly, and the
-  daemon logs a warning saying so. If you pinned your own resolvers with
-  `ray config set dns-upstreams … --replace` and none of them are IPv6, yours are
-  kept rather than swapped for public ones: they stay reachable over the IPv4 this
-  mode leaves direct, so those lookups go around the exit instead of to a resolver
-  you did not choose. Offering an exit node was never affected by the mode.
+  to find out. Offering an exit node was never affected by the mode.
+- **A tunnel carries only what both ends can carry, and says which.** A gateway
+  reports whether it can return IPv4, IPv6 or both, and the tunnel takes the
+  families your node and that gateway have in common. A gateway that can return
+  only one of them narrows the tunnel to it: that family goes through the exit,
+  the other keeps leaving this host directly, and `ray exit-node use` and
+  `ray exit-node status` both name which is which. This covers a gateway running
+  IPv6-only mode itself (it never routes the mesh IPv4 your reply would come back
+  on) and a gateway with no IPv6 uplink, whose tunnelled IPv6 used to vanish at
+  the far end with nothing said. Only a gateway that can return neither family is
+  refused, and that check runs on every re-apply rather than only when you pick,
+  so a gateway that loses its uplink (or a node whose IPv6-only mode turns itself
+  on) stops tunnelling with a message instead of silently carrying nothing, and
+  picks the tunnel back up by itself when the gateway reports an uplink again.
+  Gateways that report IPv6 are marked `(IPv6)` in `ray exit-node status`. A
+  gateway on a network whose coordinator predates this feature reports nothing
+  either way: it stays selectable and narrows nothing, since refusing would rule
+  out every gateway on such a network, and `ray exit-node use` tells you the
+  claim is unverified.
+- **DNS follows the tunnel when the tunnel is the only way out.** While a tunnel
+  carries IPv6 and not IPv4, the daemon's own DNS forwarder is pointed at an IPv6
+  resolver, so its lookups go through the exit rather than around it. On Linux
+  hosts using systemd-resolved, NetworkManager or resolvconf, applications'
+  non-`.ray` lookups still leave directly, and the daemon logs a warning saying
+  so. If you pinned your own resolvers with `ray config set dns-upstreams …
+  --replace` and none of them are IPv6, yours are kept rather than swapped for
+  public ones: they stay reachable over the IPv4 such a tunnel leaves direct, so
+  those lookups go around the exit instead of to a resolver you did not choose.
 - **`ray config set dns-upstreams` takes IPv6 addresses.** Used by an exit-node
   tunnel in IPv6-only mode, which has no IPv4 to reach a v4 resolver over. Naming
   only IPv6 servers no longer lets rayfish take over `/etc/resolv.conf` on a host

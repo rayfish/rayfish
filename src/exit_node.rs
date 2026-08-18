@@ -20,6 +20,7 @@
 //! ([`ExitClient`]) are plain userspace state, live on every platform, and are
 //! bundled for the data path as [`ExitContext`].
 
+use crate::membership::ExitFamilies;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(target_os = "macos")]
@@ -610,6 +611,15 @@ pub struct ExitSelection {
     /// The network we route through the exit peer on (so we tag the datagram with
     /// that network's handle, which its allow-list is scoped to).
     pub network: SmolStr,
+    /// Which families this tunnel carries: [`ExitFamilies::tunnelled`] of the
+    /// gateway's claim and our own data plane. Never `Unknown` or `Neither`, since
+    /// a selection that carries nothing is refused rather than installed.
+    ///
+    /// Held on the selection rather than re-derived at install time because the
+    /// two must not be able to disagree: the routing rules, the socket pin and the
+    /// DNS override are three separate decisions that all have to be made about
+    /// the same tunnel.
+    pub carries: ExitFamilies,
 }
 
 impl ExitClient {
@@ -669,12 +679,14 @@ const PUBLIC_FALLBACK_DNS_V6: [Ipv6Addr; 2] = [
 /// The upstreams a client full tunnel should forward DNS to, or `None` when it
 /// needs no override.
 ///
-/// Only IPv6-only mode needs one. Its tunnel carries IPv6 alone, while every
-/// upstream the desktop capture can produce is IPv4
-/// (`DnsConfigurator::captured_upstreams`), so left alone the daemon would forward
-/// each lookup out the physical link: the exit node would carry the traffic and
-/// see none of the names that chose it. A dual-stack tunnel has no such gap, since
-/// it carries the captured upstreams' own family.
+/// Only a tunnel that carries IPv6 and not IPv4 needs one, which is IPv6-only
+/// mode and, since the gateway's claim narrows the tunnel too, a dual-stack node
+/// routing through a gateway that can only return IPv6. Every upstream the
+/// desktop capture can produce is IPv4 (`DnsConfigurator::captured_upstreams`),
+/// so left alone the daemon would forward each lookup out the physical link: the
+/// exit node would carry the traffic and see none of the names that chose it. A
+/// tunnel that carries IPv4 has no such gap, since it carries the captured
+/// upstreams' own family.
 ///
 /// The operator's `dns_upstreams` come first when any of them are IPv6 (the same
 /// list [`crate::config::resolve_upstreams`] reads for IPv4, from the other end),
@@ -691,10 +703,10 @@ const PUBLIC_FALLBACK_DNS_V6: [Ipv6Addr; 2] = [
 /// genuinely reachable. Privacy caveat is the caller's to warn about; a wrong
 /// answer is not recoverable at all.
 pub fn tunnel_upstreams(
-    ipv6_only: bool,
+    carries: ExitFamilies,
     configured: &crate::config::ServerOverride,
 ) -> Option<Vec<SocketAddr>> {
-    if !ipv6_only {
+    if carries.carries_v4() || !carries.carries_v6() {
         return None;
     }
     let v6: Vec<Ipv6Addr> = configured
@@ -1057,20 +1069,36 @@ fn client_nft_script(tun_name: &str) -> String {
 
 /// The `ip` family flags a client full tunnel is installed for.
 ///
-/// An IPv6-only data plane carries no mesh IPv4 at all, so its tunnel does not
-/// claim IPv4 either: the host's IPv4 egress stays exactly where it was, with the
-/// VPN that owns `100.64.0.0/10` or with the physical uplink. Taking it would mean
-/// sourcing transit from a `/32` this mode deliberately leaves unrouted, and
-/// pulling IPv4 out from under the very VPN the mode exists to share a host with.
+/// `carries` is [`ExitFamilies::tunnelled`], the intersection of what this node's
+/// data plane routes and what the chosen gateway says it can return. Both have to
+/// hold: an IPv6-only data plane carries no mesh IPv4 at all, so claiming the
+/// host's IPv4 egress would source transit from a `/32` it deliberately leaves
+/// unrouted and pull IPv4 out from under the very VPN the mode exists to share a
+/// host with; and a gateway that cannot return a family drops it just as
+/// completely at the other end.
+///
 /// Teardown is not symmetric with this: it always sweeps both families, so a
-/// daemon restarted into the other mode still cleans up what the last one left.
+/// daemon restarted with a different selection still cleans up what the last one
+/// left.
+///
+/// [`ExitFamilies::Unknown`] is not a `tunnelled()` output, and is read here as
+/// both families, since that is what an absent claim meant before the field
+/// existed.
 #[cfg(target_os = "linux")]
-fn tunnel_families(ipv6_only: bool) -> &'static [&'static str] {
-    if ipv6_only { &["-6"] } else { &["-4", "-6"] }
+fn tunnel_families(carries: ExitFamilies) -> &'static [&'static str] {
+    match (
+        carries.carries_v4() || carries.is_unknown(),
+        carries.carries_v6() || carries.is_unknown(),
+    ) {
+        (true, true) => &["-4", "-6"],
+        (true, false) => &["-4"],
+        (false, true) => &["-6"],
+        (false, false) => &[],
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub fn install_client_routing(tun_name: &str, ipv6_only: bool) -> Result<()> {
+pub fn install_client_routing(tun_name: &str, carries: ExitFamilies) -> Result<()> {
     // The conntrack-mark table loads first: nothing routes into the tunnel until
     // the `ip rule`s below go in, but the moment they do, an inbound connection's
     // replies depend on this table already restoring the mark. Loading it after
@@ -1086,13 +1114,13 @@ pub fn install_client_routing(tun_name: &str, ipv6_only: bool) -> Result<()> {
     // promises not to claim, sourced from the /32 it deliberately leaves
     // unrouted, taking the co-resident VPN's IPv4 down with it.
     for family in ["-4", "-6"] {
-        if !tunnel_families(ipv6_only).contains(&family) {
+        if !tunnel_families(carries).contains(&family) {
             remove_client_rules(family, RuleSweep::All);
             let _ = run_ip(&[family, "route", "flush", "table", EXIT_TABLE]);
         }
     }
     let mark = format!("{SOCKET_MARK:#x}");
-    for family in tunnel_families(ipv6_only).iter().copied() {
+    for family in tunnel_families(carries).iter().copied() {
         // Give the tunnel table the prefixes another VPN serves out of a table of
         // its own, or our catch-all rule swallows them (see the fn docs).
         let mirrored = mirror_foreign_routes(family, tun_name);
@@ -2343,27 +2371,36 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         assert!(!s.is_active());
     }
 
-    /// An IPv6-only node tunnels IPv6 and leaves the host's IPv4 egress alone,
-    /// because mesh IPv4 carries nothing there and the `100.64.0.0/10` range is
-    /// another VPN's. A dual-stack node still takes both.
+    /// The tunnel installs exactly the families it carries, and cleans up the rest.
+    ///
+    /// `carries` is already the intersection of this node's data plane and the
+    /// gateway's claim, so all three shapes are reachable: an IPv6-only node (or
+    /// any node through a v6-only gateway) takes `-6`, a node through a gateway
+    /// that can only return IPv4 takes `-4`, and the ordinary pair takes both.
     #[cfg(target_os = "linux")]
     #[test]
-    fn ipv6_only_tunnels_one_family() {
-        assert_eq!(tunnel_families(true), ["-6"]);
-        assert_eq!(tunnel_families(false), ["-4", "-6"]);
+    fn a_tunnel_installs_only_the_families_it_carries() {
+        use ExitFamilies::{Dual, V4, V6};
+        assert_eq!(tunnel_families(V6), ["-6"]);
+        assert_eq!(tunnel_families(V4), ["-4"]);
+        assert_eq!(tunnel_families(Dual), ["-4", "-6"]);
+        // Not a `tunnelled()` output, and read as the pre-claim behaviour rather
+        // than as "install nothing", which would silently drop the tunnel on
+        // every network whose coordinator predates the field.
+        assert_eq!(tunnel_families(ExitFamilies::Unknown), ["-4", "-6"]);
 
-        // Install cleans up whatever it stopped claiming, so a restart into the
-        // other mode cannot leave the previous run's rules routing a family this
-        // one promises not to touch. Kernel state outlives the process, and the
-        // panic hook `abort()`s, so "the last teardown ran" is not an assumption
-        // install gets to make.
-        for ipv6_only in [false, true] {
-            let claimed = tunnel_families(ipv6_only);
+        // Install cleans up whatever it stopped claiming, so a restart under a
+        // different selection cannot leave the previous run's rules routing a
+        // family this one promises not to touch. Kernel state outlives the
+        // process, and the panic hook `abort()`s, so "the last teardown ran" is
+        // not an assumption install gets to make.
+        for (carries, expected) in [(V6, vec!["-4"]), (V4, vec!["-6"]), (Dual, vec![])] {
+            let claimed = tunnel_families(carries);
             let dropped: Vec<&str> = ["-4", "-6"]
                 .into_iter()
                 .filter(|f| !claimed.contains(f))
                 .collect();
-            assert_eq!(dropped, if ipv6_only { vec!["-4"] } else { Vec::new() });
+            assert_eq!(dropped, expected, "{carries:?}");
         }
     }
 
@@ -2553,16 +2590,21 @@ default dev ray0 table 29793
         );
     }
 
-    /// Only an IPv6-only tunnel needs its own DNS upstreams: a dual-stack one
-    /// already carries the family the captured IPv4 upstreams live in.
+    /// Only a tunnel carrying IPv6 and not IPv4 needs its own DNS upstreams: any
+    /// tunnel that carries IPv4 already carries the family the captured upstreams
+    /// live in. That is IPv6-only mode, and now also a dual-stack node routing
+    /// through a gateway that can only return IPv6.
     #[test]
-    fn only_an_ipv6_only_tunnel_overrides_dns_upstreams() {
+    fn only_a_v6_carrying_tunnel_overrides_dns_upstreams() {
         use crate::config::ServerOverride;
+        use ExitFamilies::{Dual, V4, V6};
 
-        assert!(tunnel_upstreams(false, &ServerOverride::default()).is_none());
+        // Both families, or IPv4 alone: the captured upstreams already ride it.
+        assert!(tunnel_upstreams(Dual, &ServerOverride::default()).is_none());
+        assert!(tunnel_upstreams(V4, &ServerOverride::default()).is_none());
 
         // Nothing configured: the public fallback pair, on port 53.
-        let got = tunnel_upstreams(true, &ServerOverride::default()).unwrap();
+        let got = tunnel_upstreams(V6, &ServerOverride::default()).unwrap();
         assert_eq!(
             got,
             PUBLIC_FALLBACK_DNS_V6
@@ -2576,7 +2618,7 @@ default dev ray0 table 29793
             servers: strs(&["2001:4860:4860::8844", "192.168.1.1"]),
             replace: false,
         };
-        let got = tunnel_upstreams(true, &augment).unwrap();
+        let got = tunnel_upstreams(V6, &augment).unwrap();
         assert_eq!(got[0], "[2001:4860:4860::8844]:53".parse().unwrap());
         assert_eq!(got.len(), 1 + PUBLIC_FALLBACK_DNS_V6.len());
 
@@ -2586,7 +2628,7 @@ default dev ray0 table 29793
             replace: true,
         };
         assert_eq!(
-            tunnel_upstreams(true, &replace).unwrap(),
+            tunnel_upstreams(V6, &replace).unwrap(),
             vec!["[2001:4860:4860::8844]:53".parse::<SocketAddr>().unwrap()]
         );
 
@@ -2602,7 +2644,7 @@ default dev ray0 table 29793
             replace: true,
         };
         assert_eq!(
-            tunnel_upstreams(true, &v4_only).unwrap(),
+            tunnel_upstreams(V6, &v4_only).unwrap(),
             vec!["192.168.1.1:53".parse::<SocketAddr>().unwrap()],
             "an explicit --replace list is not silently swapped for public resolvers"
         );
@@ -2614,7 +2656,7 @@ default dev ray0 table 29793
             replace: true,
         };
         assert_eq!(
-            tunnel_upstreams(true, &mixed).unwrap(),
+            tunnel_upstreams(V6, &mixed).unwrap(),
             vec!["[2001:4860:4860::8844]:53".parse::<SocketAddr>().unwrap()]
         );
 
@@ -2625,7 +2667,7 @@ default dev ray0 table 29793
             replace: true,
         };
         assert_eq!(
-            tunnel_upstreams(true, &junk).unwrap().len(),
+            tunnel_upstreams(V6, &junk).unwrap().len(),
             PUBLIC_FALLBACK_DNS_V6.len()
         );
     }

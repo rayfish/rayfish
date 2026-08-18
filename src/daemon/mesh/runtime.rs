@@ -1194,13 +1194,26 @@ impl Daemon {
         }
     }
 
+    /// Which families the tunnel currently selected would carry, or
+    /// [`ExitFamilies::Neither`] when nothing is selected.
+    ///
+    /// One reader for the routing install, the socket pin and the DNS override,
+    /// so the three cannot end up describing different tunnels.
+    fn tunnel_carries(&self) -> ExitFamilies {
+        self.registry
+            .exit_client
+            .selection()
+            .map(|s| s.carries)
+            .unwrap_or(ExitFamilies::Neither)
+    }
+
     /// Point the Magic DNS forwarder at upstreams the tunnel can actually reach,
     /// or put the captured ones back when no tunnel is up.
     ///
-    /// Only IPv6-only mode needs this: its tunnel carries IPv6 alone, and every
-    /// upstream the desktop capture produces is IPv4, so without an override the
-    /// exit node would carry the traffic while each lookup that steered it went
-    /// out the physical link. See [`exit_node::tunnel_upstreams`].
+    /// Only a tunnel that carries IPv6 and not IPv4 needs this: every upstream the
+    /// desktop capture produces is IPv4, so without an override the exit node
+    /// would carry the traffic while each lookup that steered it went out the
+    /// physical link. See [`exit_node::tunnel_upstreams`].
     /// `installed` is whether the tunnel actually went in, not merely whether one
     /// is selected. A failed install rolls the routing back but leaves the
     /// selection active, and pointing the forwarder at a public IPv6 resolver with
@@ -1211,7 +1224,7 @@ impl Daemon {
     fn apply_exit_dns(&self, installed: bool) {
         let over = installed.then(|| {
             let configured = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
-            crate::exit_node::tunnel_upstreams(self.ipv6_only.enabled(), &configured)
+            crate::exit_node::tunnel_upstreams(self.tunnel_carries(), &configured)
         });
         // `None` from either level means "no override": no tunnel, or a tunnel
         // whose own family already carries the captured upstreams.
@@ -1253,14 +1266,14 @@ impl Daemon {
     #[cfg(target_os = "linux")]
     async fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
         let install = self.registry.exit_client.is_active();
-        let ipv6_only = self.ipv6_only.enabled();
+        let carries = self.tunnel_carries();
         let tun_name = tun_name.to_owned();
         let result = tokio::task::spawn_blocking(move || {
             if !install {
                 crate::exit_node::teardown_client_routing();
                 return Ok(());
             }
-            crate::exit_node::install_client_routing(&tun_name, ipv6_only).inspect_err(|_| {
+            crate::exit_node::install_client_routing(&tun_name, carries).inspect_err(|_| {
                 // A partial install must not stay live: rules that went in before
                 // the failure (say v4's, with `ipv6.disable=1` failing the v6 half)
                 // would keep routing traffic into a tunnel that was never fully set
@@ -1315,7 +1328,7 @@ impl Daemon {
             // Pin and rebind before the routes go in: `network_change` rebinds
             // iroh's UDP socket to apply the pin, and until it has, the transport
             // has nothing keeping it out of the tunnel.
-            if !crate::exit_node::set_full_tunnel(true, !self.ipv6_only.enabled()) {
+            if !crate::exit_node::set_full_tunnel(true, self.tunnel_carries().carries_v4()) {
                 self.transport.endpoint.network_change().await;
             }
             let conn = self.exit_peer_conn().await;
@@ -1473,7 +1486,7 @@ impl Daemon {
     /// not blackhole traffic.
     #[cfg(target_os = "macos")]
     async fn route_default_or_rollback(&self, tun_name: &str) -> Option<String> {
-        match tun::route_default_via_tun(tun_name, self.ipv6_only.enabled()).await {
+        match tun::route_default_via_tun(tun_name, self.tunnel_carries()).await {
             Ok(()) => None,
             Err(e) => {
                 tun::unroute_default_via_tun(tun_name).await;

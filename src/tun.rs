@@ -8,6 +8,8 @@
 // `ifconfig`/`ip`/netlink) and the CGNAT preflight, none of which compile on
 // Android where the packet interface is a `VpnService` fd.
 #[cfg(target_os = "linux")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+use crate::membership::ExitFamilies;
 use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
@@ -487,16 +489,21 @@ const SPLIT_DEFAULT: [(&str, &str); 4] = [
 /// this goes in: from here on, everything the routing table decides, including
 /// the daemon's own transport unless it is pinned elsewhere, goes to the TUN.
 ///
-/// In IPv6-only mode only the `::/1` + `8000::/1` half goes in: mesh IPv4 carries
-/// no traffic on such a host, so the tunnel does not claim the host's IPv4 egress
-/// either, leaving it with whoever owns `100.64.0.0/10` there. Unlike Linux, no
-/// hole has to be punched for that VPN's own prefixes: the split default lives in
-/// the one routing table, where its more specific routes already win.
+/// Only the halves of the families the tunnel actually carries go in
+/// (`ExitFamilies::tunnelled`: what this node's data plane routes, intersected
+/// with what the gateway says it can return). In IPv6-only mode that is `::/1` +
+/// `8000::/1`, since mesh IPv4 carries no traffic on such a host and its egress
+/// stays with whoever owns `100.64.0.0/10` there. Unlike Linux, no hole has to be
+/// punched for that VPN's own prefixes: the split default lives in the one routing
+/// table, where its more specific routes already win.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub async fn route_default_via_tun(tun_name: &str, ipv6_only: bool) -> Result<()> {
+pub async fn route_default_via_tun(tun_name: &str, carries: ExitFamilies) -> Result<()> {
     for (family, net) in SPLIT_DEFAULT
         .into_iter()
-        .filter(|(family, _)| !ipv6_only || *family == "-inet6")
+        .filter(|(family, _)| match *family {
+            "-inet" => carries.carries_v4() || carries.is_unknown(),
+            _ => carries.carries_v6() || carries.is_unknown(),
+        })
     {
         let _ = Command::new("route")
             .args(["-n", "delete", family, "-net", net, "-interface", tun_name])

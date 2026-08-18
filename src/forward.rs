@@ -1433,6 +1433,7 @@ mod tests {
     fn exit_via(peer: EndpointId) -> ExitContext {
         let exit = no_exit();
         exit.client.set(Some(crate::exit_node::ExitSelection {
+            carries: crate::membership::ExitFamilies::Dual,
             peer_user: peer,
             ipv4: TEST_V4,
             network: SmolStr::new("test-net"),
@@ -1564,6 +1565,7 @@ mod tests {
         let fw = SharedFirewall::new(firewall::FirewallConfig::default());
         let exit = no_exit();
         exit.client.set(Some(crate::exit_node::ExitSelection {
+            carries: crate::membership::ExitFamilies::Dual,
             peer_user: selected_user,
             ipv4: TEST_V4, // the exit peer's mesh IPv4
             network: SmolStr::new("test-net"),

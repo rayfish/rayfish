@@ -675,6 +675,15 @@ pub struct ExitNodeStatusView {
     /// node's `ipv6_only = auto` flips).
     #[serde(default)]
     pub not_in_effect: Option<String>,
+    /// Which families the tunnel through `using` carries. A tunnel takes the
+    /// families this node's data plane routes *and* the gateway says it can
+    /// return, so it can be narrower than either: on an IPv6-only node, or
+    /// through a gateway that can only return one of the two, the other family
+    /// keeps leaving this host directly. Meaningless when `using` is `None`.
+    #[serde(default)]
+    pub tunnel_v4: bool,
+    #[serde(default)]
+    pub tunnel_v6: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1231,6 +1240,8 @@ mod tests {
                 ipv6_only: true,
                 refused: vec!["v4only".into()],
                 not_in_effect: Some("the peer is not in this network's roster".into()),
+                tunnel_v4: false,
+                tunnel_v6: true,
             }],
         };
         let bytes = rmp_serde::to_vec_named(&resp).unwrap();

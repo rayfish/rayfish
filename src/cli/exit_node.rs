@@ -104,6 +104,8 @@ fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>) {
                 "ipv6_only": n.ipv6_only,
                 "refused": n.refused,
                 "not_in_effect": n.not_in_effect,
+                "tunnel_v4": n.tunnel_v4,
+                "tunnel_v6": n.tunnel_v6,
             })).collect::<Vec<_>>(),
         }));
         return;
@@ -128,18 +130,22 @@ fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>) {
                 .collect();
             println!("  offering: yes (allow: {})", peers.join(", "));
         }
-        match (&n.using, n.ipv6_only) {
+        match (&n.using, n.not_in_effect.as_deref()) {
             // A selection the daemon is not acting on is the one thing this line
             // must not print bare: the config says `gw` and the packets leave
             // directly, and nothing else on screen says so.
-            (Some(peer), _) if n.not_in_effect.is_some() => {
-                let why = n.not_in_effect.as_deref().unwrap_or_default();
-                println!("  using: {peer} (NOT in effect: {why}; traffic leaves directly)");
+            (Some(peer), Some(why)) => {
+                println!("  using: {peer} (NOT in effect: {why}; traffic leaves directly)")
             }
-            // In IPv6-only mode the tunnel carries IPv6 and nothing else, so say
-            // so: a bare "using: <peer>" reads as a full tunnel over both.
-            (Some(peer), true) => println!("  using: {peer} (IPv6 only; IPv4 leaves directly)"),
-            (Some(peer), false) => println!("  using: {peer}"),
+            // A tunnel takes only the families both ends carry, so a bare
+            // "using: <peer>" would read as a full tunnel over both when it is
+            // one family and a direct path for the other.
+            (Some(peer), None) => match (n.tunnel_v4, n.tunnel_v6) {
+                (true, true) => println!("  using: {peer}"),
+                (false, true) => println!("  using: {peer} (IPv6 only; IPv4 leaves directly)"),
+                (true, false) => println!("  using: {peer} (IPv4 only; IPv6 leaves directly)"),
+                (false, false) => println!("  using: {peer} (carries neither family)"),
+            },
             (None, _) => println!("  using: direct egress"),
         }
         if n.available.is_empty() {
