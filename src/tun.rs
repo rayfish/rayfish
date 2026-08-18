@@ -7,9 +7,9 @@
 // These support the desktop TUN setup (address/route/link configuration via
 // `ifconfig`/`ip`/netlink) and the CGNAT preflight, none of which compile on
 // Android where the packet interface is a `VpnService` fd.
-#[cfg(target_os = "linux")]
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use crate::membership::ExitFamilies;
+#[cfg(target_os = "linux")]
 use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
