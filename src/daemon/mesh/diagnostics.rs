@@ -305,24 +305,13 @@ impl Daemon {
         let has_panics = files.iter().any(|(name, _)| name == "logs/panic.log");
 
         // --- write the gzipped tarball ---
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let path = std::path::PathBuf::from("/tmp").join(format!("rayfish-report-{ts}.tgz"));
-        if let Err(e) = write_bundle(&path, &files) {
-            return ipc_err(format!("failed to write report bundle: {e}"));
-        }
-
-        // Make it readable by, and owned by, the user who invoked `ray report`.
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
-        if let Some((uid, gid)) = peer_cred {
-            use std::os::unix::ffi::OsStrExt;
-            if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
-                unsafe { libc::chown(c.as_ptr(), uid, gid) };
-            }
-        }
+        // The daemon is root and `/tmp` is attacker-controlled, so allocation,
+        // writes, permissions, and ownership all stay on one exclusively-created
+        // file descriptor. A random name also prevents same-second collisions.
+        let path = match create_report_bundle(std::path::Path::new("/tmp"), &files, peer_cred) {
+            Ok(path) => path,
+            Err(e) => return ipc_err(format!("failed to write report bundle: {e}")),
+        };
 
         let issue_title = if has_panics {
             format!("[report] crash diagnostics from {os} (rayfish {version})")
