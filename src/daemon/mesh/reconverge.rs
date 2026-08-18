@@ -414,7 +414,7 @@ pub(crate) fn prune_departed_peers(
 ) {
     // Device keys nullified on this network (`ray unpair`), read once.
     let nullifiers = state.read().unwrap().nullifiers.clone();
-    for (peer_id, ip, _conn) in peers.peers_for_network_with_conn(network_name) {
+    for (peer_id, _ip, _conn) in peers.peers_for_network_with_conn(network_name) {
         // Membership is by roster identity, which for a paired peer is its user
         // identity, not the transport id the PeerTable is keyed on. Check both.
         let user_id = device_user_map.resolve(&peer_id);
@@ -436,9 +436,7 @@ pub(crate) fn prune_departed_peers(
         // was the peer's last network with us; otherwise just drop this network's
         // route and leave the peer reachable on the others (`remove_peer_from_network`
         // returns the connection iff its network set emptied).
-        if let Some(conn) =
-            peers.remove_peer_from_network(&ip, &derive_ipv6(&peer_id), network_name)
-        {
+        if let Some(conn) = peers.remove_peer_from_network(&derive_ipv6(&peer_id), network_name) {
             conn.close(
                 VarInt::from_u32(forward::KICK_CODE),
                 b"removed from network",
@@ -475,11 +473,11 @@ pub(crate) async fn attach_rejoined_peers(
         // The roster keys a paired peer by its user identity, while the peer table
         // is keyed on the transport (device) id, so resolve through the same map
         // the prune pass uses before looking the connection up.
-        let Some((ip, ipv6, conn)) = peers.connected_device_for(&m.identity, device_user_map)
+        let Some((ip, conn)) = peers.connected_device_for(&m.identity, device_user_map)
         else {
             continue;
         };
-        if peers.attach_network(&ip, &ipv6, network_name).is_none() {
+        if peers.attach_network(&ip, network_name).is_none() {
             continue;
         }
         tracing::info!(
@@ -509,7 +507,6 @@ pub(crate) async fn apply_roster_to_dns(
         .filter(|m| m.identity != my_identity)
         .map(|m| peers::RouteMember {
             endpoint_id: m.identity,
-            ipv4: m.ip,
             ipv6: derive_ipv6(&m.identity),
         })
         .collect();
@@ -760,8 +757,8 @@ pub(crate) async fn fetch_and_apply_blob(
     for old_id in &old_members {
         if !new_member_ids.contains(old_id) {
             let s = state.read().unwrap();
-            if let Some(member) = s.members.get(old_id) {
-                peers.remove(&member.ip, &derive_ipv6(old_id));
+            if s.members.get(old_id).is_some() {
+                peers.remove(&derive_ipv6(old_id));
                 tracing::info!(peer = %old_id.fmt_short(), "removed kicked peer");
             }
         }

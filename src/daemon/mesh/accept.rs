@@ -406,7 +406,7 @@ impl CoordinatorAcceptState {
             .map(|m| m.ip)?;
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
         self.ctx
-            .register_peer_conn(conn, remote_id, peer_ip, &self.network_name);
+            .register_peer_conn(conn, remote_id, &self.network_name);
 
         // Hand this (re)connecting member our current signed record over the mesh
         // so it converges to the live roster in ~1s instead of waiting out a stale
@@ -485,7 +485,7 @@ impl CoordinatorAcceptState {
             &self.ctx.hostname_table,
             &self.ctx.reverse_table,
             &self.network_name,
-            peer_ip,
+            derive_ipv6(&remote_id),
         )
         .await;
         dns::update_hostname(
@@ -788,13 +788,13 @@ impl CoordinatorAcceptState {
         // demux already owns this connection's control loop).
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
         self.ctx
-            .register_peer_conn(conn, remote_id, peer_ip, &self.network_name);
+            .register_peer_conn(conn, remote_id, &self.network_name);
 
         broadcast_member_sync(
             &self.ctx.registry,
             net_pubkey,
             &self.network_name,
-            Some(peer_ip),
+            Some(derive_ipv6(&remote_id)),
         )
         .await;
 
@@ -1170,7 +1170,7 @@ impl MemberAcceptState {
                 .await;
             }
             self.ctx
-                .register_peer_conn(conn, peer_identity, member_ip, &self.network_name);
+                .register_peer_conn(conn, peer_identity, &self.network_name);
             return Some(member_ip);
         }
         None
@@ -1249,12 +1249,12 @@ impl MemberAcceptState {
         )
         .await;
         self.ctx
-            .register_peer_conn(conn, peer_identity, member_ip, &self.network_name);
+            .register_peer_conn(conn, peer_identity, &self.network_name);
         broadcast_member_sync(
             &self.ctx.registry,
             self.net_pubkey,
             &self.network_name,
-            Some(member_ip),
+            Some(derive_ipv6(&peer_identity)),
         )
         .await;
         Some(member_ip)

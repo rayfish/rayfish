@@ -477,7 +477,7 @@ impl NetworkRegistry {
             }
         };
         let candidate_user = self.device_user_map.resolve(&candidate);
-        let (member_id, member_ip, is_coord, display) = {
+        let (member_id, _member_ip, is_coord, display) = {
             let s = state.read().unwrap();
             match s
                 .members
@@ -519,7 +519,7 @@ impl NetworkRegistry {
             &self.dns.hostname_table,
             &self.dns.reverse_table,
             network,
-            member_ip,
+            derive_ipv6(&member_id),
         )
         .await;
         update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
@@ -535,8 +535,7 @@ impl NetworkRegistry {
                 // network with us; otherwise just drop this network's route so a
                 // peer we share other networks with stays reachable there.
                 if let Some(conn) =
-                    self.peers
-                        .remove_peer_from_network(&ip, &derive_ipv6(&pid), network)
+                    self.peers.remove_peer_from_network(&ip, network)
                 {
                     conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
                 }

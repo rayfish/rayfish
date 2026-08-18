@@ -107,14 +107,16 @@ pub async fn remove_hostname_by_ip(
     table: &HostnameTable,
     reverse: &ReverseLookupTable,
     network: &str,
-    ipv4: Ipv4Addr,
+    ipv6: Ipv6Addr,
 ) {
     let mut t = table.write().await;
     if let Some(hosts) = t.get_mut(network) {
         hosts.retain(|_, (v4, v6)| {
-            if *v4 == Some(ipv4) {
-                reverse.remove(&IpAddr::V4(ipv4));
-                reverse.remove(&IpAddr::V6(*v6));
+            if *v6 == ipv6 {
+                if let Some(v4) = *v4 {
+                    reverse.remove(&IpAddr::V4(v4));
+                }
+                reverse.remove(&IpAddr::V6(ipv6));
                 false
             } else {
                 true

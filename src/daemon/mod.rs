@@ -40,7 +40,7 @@ use bytes::Bytes;
 use iroh_metrics::service::MetricsServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -212,7 +212,6 @@ impl MeshCtx {
             exit: crate::exit_node::ExitContext {
                 server: self.registry.exit_server.clone(),
                 client: self.registry.exit_client.clone(),
-                my_v4: self.identity.local_ip(),
                 my_v6: derive_ipv6(&self.identity.local_identity()),
             },
         }
@@ -229,15 +228,14 @@ impl MeshCtx {
         &self,
         conn: &Connection,
         peer_id: EndpointId,
-        ip: Ipv4Addr,
         network: &str,
     ) -> bool {
         let ipv6 = derive_ipv6(&peer_id);
         // Keep the roster route map current with every peer we connect to, so a
         // later idle teardown can re-dial it on demand (reconverge covers the
         // roster-wide sync + removals; this is the incremental add).
-        self.route_map.sync_add(network, ip, ipv6, peer_id);
-        self.peers.add(ip, ipv6, conn.clone(), peer_id, network)
+        self.route_map.sync_add(network, ipv6, peer_id);
+        self.peers.add(ipv6, conn.clone(), peer_id, network)
     }
 }
 
@@ -249,7 +247,7 @@ impl MeshCtx {
 pub(crate) async fn announce_network_handles(
     peers: &PeerTable,
     conn: &Connection,
-    peer_ip: Ipv4Addr,
+    peer_ip: Ipv6Addr,
 ) {
     let entries: Vec<control::NetworkHandle> = peers
         .outbound_handles(&peer_ip)
@@ -1327,7 +1325,7 @@ impl Daemon {
             &self.dns.hostname_table,
             &self.dns.reverse_table,
             network,
-            my_ip,
+            derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
         dns::update_hostname(
@@ -1808,7 +1806,7 @@ async fn broadcast_member_sync(
     registry: &Arc<NetworkRegistry>,
     net_pubkey: EndpointId,
     network_name: &str,
-    exclude_ip: Option<Ipv4Addr>,
+    exclude_ip: Option<Ipv6Addr>,
 ) {
     let mut reached: HashSet<EndpointId> = HashSet::new();
     for (id, ip, conn) in registry.peers.peers_for_network_with_conn(network_name) {
@@ -1830,16 +1828,17 @@ async fn broadcast_member_sync(
 fn absent_member_ips(
     roster: &[Member],
     my_id: EndpointId,
-    exclude_ip: Option<Ipv4Addr>,
+    exclude_ip: Option<Ipv6Addr>,
     reached: &HashSet<EndpointId>,
     is_offline: impl Fn(&EndpointId) -> bool,
-) -> Vec<Ipv4Addr> {
+) -> Vec<Ipv6Addr> {
     roster
         .iter()
-        .filter(|m| m.identity != my_id && !reached.contains(&m.identity))
-        .filter(|m| Some(m.ip) != exclude_ip)
-        .filter(|m| !is_offline(&m.identity))
-        .map(|m| m.ip)
+        .map(|m| (m, derive_ipv6(&m.identity)))
+        .filter(|(m, _)| m.identity != my_id && !reached.contains(&m.identity))
+        .filter(|(_, v6)| Some(*v6) != exclude_ip)
+        .filter(|(m, _)| !is_offline(&m.identity))
+        .map(|(_, v6)| v6)
         .collect()
 }
 
@@ -1852,7 +1851,7 @@ fn spawn_absent_member_sync(
     registry: &Arc<NetworkRegistry>,
     net_pubkey: EndpointId,
     network_name: &str,
-    exclude_ip: Option<Ipv4Addr>,
+    exclude_ip: Option<Ipv6Addr>,
     reached: HashSet<EndpointId>,
 ) {
     let my_id = registry.transport.identity.local_identity();
@@ -1866,7 +1865,7 @@ fn spawn_absent_member_sync(
         |id| registry.reachability.is_offline(id, ABSENT_DIAL_COOLDOWN),
     )
     .into_iter()
-    .filter_map(|ip| registry.resolve_route(IpAddr::V4(ip)))
+    .filter_map(|ip| registry.resolve_route(IpAddr::V6(ip)))
     .collect();
     if absent.is_empty() {
         return;
@@ -1883,11 +1882,11 @@ fn spawn_absent_member_sync(
             if !registry.dial_target(&target).await {
                 continue;
             }
-            let Some(conn) = registry.peers.conn_for_ip(&target.ipv4) else {
+            let Some(conn) = registry.peers.conn_for_ip(&target.ipv6) else {
                 continue;
             };
             if let Err(e) = open_and_send(&conn, Some(net_pubkey), &ControlMsg::MemberSync).await {
-                tracing::debug!(peer_ip = %target.ipv4, error = %e, "failed to sync dialed member");
+                tracing::debug!(peer_ip = %target.ipv6, error = %e, "failed to sync dialed member");
             }
         }
     });
@@ -1989,7 +1988,7 @@ mod absent_member_tests {
         let roster = vec![member(1, 1), member(2, 2)];
         let reached: HashSet<EndpointId> = [id(1)].into_iter().collect();
         let got = absent_member_ips(&roster, id(9), None, &reached, |_| false);
-        assert_eq!(got, vec![Ipv4Addr::new(100, 64, 0, 2)]);
+        assert_eq!(got, vec![derive_ipv6(&id(2))]);
     }
 
     /// Self, the excluded peer, and anyone already reached over a live
@@ -2002,11 +2001,11 @@ mod absent_member_tests {
         let got = absent_member_ips(
             &roster,
             id(1),
-            Some(Ipv4Addr::new(100, 64, 0, 2)),
+            Some(derive_ipv6(&id(2))),
             &reached,
             |_| false,
         );
-        assert_eq!(got, vec![Ipv4Addr::new(100, 64, 0, 4)]);
+        assert_eq!(got, vec![derive_ipv6(&id(4))]);
     }
 
     /// A member whose last dial failed recently is offline for real, not
@@ -2017,7 +2016,7 @@ mod absent_member_tests {
         let roster = vec![member(1, 1), member(2, 2)];
         let offline = id(1);
         let got = absent_member_ips(&roster, id(9), None, &HashSet::new(), |i| *i == offline);
-        assert_eq!(got, vec![Ipv4Addr::new(100, 64, 0, 2)]);
+        assert_eq!(got, vec![derive_ipv6(&id(2))]);
     }
 }
 
@@ -2785,7 +2784,6 @@ mod accept_handler_tests {
             .await
             .expect("member dials coordinator");
         member_reg.peers.add(
-            coord_ip,
             derive_ipv6(&coord_id),
             member_conn.clone(),
             coord_id,

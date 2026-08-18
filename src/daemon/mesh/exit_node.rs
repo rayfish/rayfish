@@ -503,7 +503,7 @@ impl NetworkRegistry {
             }
             Some(ExitSelection {
                 peer_user: self.device_user_map.resolve(&member.identity),
-                ipv4: member.ip,
+                ipv6: derive_ipv6(&member.identity),
                 network: SmolStr::new(&nc.name),
                 carries: member.exit_families.tunnelled(self.ipv6_only),
             })
@@ -554,7 +554,7 @@ impl NetworkRegistry {
             Some(s) => tracing::info!(
                 network = %s.network,
                 peer_user = %s.peer_user.fmt_short(),
-                ipv4 = %s.ipv4,
+                ipv4 = %s.ipv6,
                 "exit selection active (return traffic from this peer will be admitted)"
             ),
             None => tracing::debug!("exit selection cleared (direct egress)"),
@@ -833,7 +833,7 @@ impl NetworkRegistry {
         for m in coordinators {
             // Reuse the live, ConnectionManager-owned link. Never a connection we
             // dial and own here: it would be dropped before the frame flushes.
-            let Some(conn) = self.peers.conn_for_ip(&m.ip) else {
+            let Some(conn) = self.peers.conn_for_ip(&derive_ipv6(&m.identity)) else {
                 tracing::debug!(
                     network = %network,
                     coordinator = %m.identity.fmt_short(),

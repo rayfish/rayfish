@@ -22,7 +22,7 @@
 
 use crate::membership::ExitFamilies;
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 #[cfg(target_os = "macos")]
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -620,8 +620,8 @@ pub struct ExitSelection {
     /// The exit peer's user identity, matched against a datagram sender to accept
     /// its return traffic. (Folds multi-device peers via the device/user map.)
     pub peer_user: EndpointId,
-    /// The exit peer's mesh IPv4, used to look up its live route and to dial it.
-    pub ipv4: Ipv4Addr,
+    /// The exit peer's mesh IPv6, used to look up its live route and to dial it.
+    pub ipv6: Ipv6Addr,
     /// The network we route through the exit peer on (so we tag the datagram with
     /// that network's handle, which its allow-list is scoped to).
     pub network: SmolStr,
@@ -669,11 +669,11 @@ impl ExitClient {
     /// the same whatever family the reply packet is, which makes it a more robust
     /// match than the resolved user identity (a device-vs-user-key mismatch would
     /// wrongly reject every reply). Matches by identity *or* IPv4.
-    pub fn is_return_from(&self, peer_user: &EndpointId, peer_v4: Ipv4Addr) -> bool {
+    pub fn is_return_from(&self, peer_user: &EndpointId, peer_v6: Ipv6Addr) -> bool {
         self.inner
             .load()
             .as_ref()
-            .is_some_and(|s| &s.peer_user == peer_user || s.ipv4 == peer_v4)
+            .is_some_and(|s| &s.peer_user == peer_user || s.ipv6 == peer_v6)
     }
 
     /// Set (or with `None`, clear) the exit selection.
@@ -766,7 +766,6 @@ fn with_port(servers: Vec<Ipv6Addr>) -> Vec<SocketAddr> {
 pub struct ExitContext {
     pub server: ExitServer,
     pub client: ExitClient,
-    pub my_v4: Ipv4Addr,
     pub my_v6: Ipv6Addr,
 }
 
@@ -775,7 +774,6 @@ impl Default for ExitContext {
         Self {
             server: ExitServer::new(),
             client: ExitClient::new(),
-            my_v4: Ipv4Addr::UNSPECIFIED,
             my_v6: Ipv6Addr::UNSPECIFIED,
         }
     }

@@ -161,7 +161,6 @@ pub(crate) async fn join_mesh_shared(
     )?;
 
     let remote_id = initial_conn.remote_id();
-    let remote_ip = identity.derive_ip(&remote_id);
 
     let live_state = build_member_state(
         &members,
@@ -225,7 +224,6 @@ pub(crate) async fn join_mesh_shared(
         &protocol_router,
         initial_conn,
         remote_id,
-        remote_ip,
         network_name,
     )
     .await;
@@ -255,16 +253,15 @@ async fn register_dialed_peer(
     router: &Arc<ProtocolRouter>,
     conn: Connection,
     peer_id: EndpointId,
-    ip: Ipv4Addr,
     network_name: &str,
 ) {
-    let conn_changed = ctx.register_peer_conn(&conn, peer_id, ip, network_name);
+    let conn_changed = ctx.register_peer_conn(&conn, peer_id, network_name);
     if conn_changed {
         let router = router.clone();
         let dconn = conn.clone();
         tokio::spawn(async move { router.drive_mesh_connection(dconn, true).await });
     }
-    announce_network_handles(&ctx.peers, &conn, ip).await;
+    announce_network_handles(&ctx.peers, &conn, derive_ipv6(&peer_id)).await;
 }
 
 /// Persist this network's membership to config after a successful handshake.
@@ -423,7 +420,7 @@ async fn connect_to_roster_peers(
                     },
                 )
                 .await?;
-                register_dialed_peer(ctx, router, conn, member.identity, member.ip, network_name)
+                register_dialed_peer(ctx, router, conn, member.identity, network_name)
                     .await;
                 tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
             }

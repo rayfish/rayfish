@@ -414,10 +414,10 @@ impl Daemon {
     // Diagnostics (ray ping / ray netcheck)
     // -----------------------------------------------------------------------
 
-    /// Resolve a `ray ping` peer argument (hostname / IPv4 / short id / `self`)
-    /// to its virtual IPv4 plus a display name. Mirrors `resolve_peer_name` but
-    /// returns the address (so `lookup_v4` can yield a live connection).
-    pub(crate) async fn resolve_peer_ip(&self, name: &str) -> Option<(Ipv4Addr, String)> {
+    /// Resolve a `ray ping` peer argument (hostname / mesh IPv6 / short id /
+    /// `self`) to its mesh IPv6 plus a display name. Mirrors `resolve_peer_name`
+    /// but returns the address (so `lookup_v6` can yield a live connection).
+    pub(crate) async fn resolve_peer_ip(&self, name: &str) -> Option<(Ipv6Addr, String)> {
         let id = self.resolve_peer_name(name).await?;
         for entry in self.registry.networks.iter() {
             let state = entry.value().state.read().unwrap();
@@ -426,7 +426,7 @@ impl Daemon {
                     .hostname
                     .clone()
                     .unwrap_or_else(|| id.fmt_short().to_string());
-                return Some((m.ip, display));
+                return Some((derive_ipv6(&m.identity), display));
             }
         }
         None
@@ -448,25 +448,26 @@ impl Daemon {
             return false;
         };
         // A live link already exists (the peer table only holds connected peers).
-        if self.registry.peers.v4_for_id(&id).is_some() {
+        if self.registry.peers.ipv6_for_id(&id).is_some() {
             return true;
         }
-        let Some(ip) = self.member_ipv4(&id) else {
+        let Some(ip) = self.member_ipv6(&id) else {
             return false;
         };
-        match self.registry.resolve_route(IpAddr::V4(ip)) {
+        match self.registry.resolve_route(IpAddr::V6(ip)) {
             Some(target) => self.registry.dial_target(&target).await,
             None => false,
         }
     }
 
-    /// The peer's mesh IPv4 as recorded in the roster, for peers with no live
-    /// connection (where `PeerTable::v4_for_id` has nothing).
-    fn member_ipv4(&self, id: &EndpointId) -> Option<Ipv4Addr> {
+    /// The peer's mesh IPv6, for peers with no live connection (where
+    /// `PeerTable::ipv6_for_id` has nothing). Derived from the identity, so the
+    /// roster only has to confirm the peer is a member somewhere.
+    fn member_ipv6(&self, id: &EndpointId) -> Option<Ipv6Addr> {
         for entry in self.registry.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            if let Some(m) = state.members.all().iter().find(|m| &m.identity == id) {
-                return Some(m.ip);
+            if state.members.all().iter().any(|m| &m.identity == id) {
+                return Some(derive_ipv6(id));
             }
         }
         None
@@ -481,16 +482,16 @@ impl Daemon {
                 return ipc_err(format!("unknown peer '{peer}'"));
             }
         };
-        let route = match self.registry.peers.lookup_v4(&ip) {
+        let route = match self.registry.peers.lookup_v6(&ip) {
             Some(r) => r,
             None => {
                 // No live link (an on-demand idle peer holds none): dial it on
                 // demand so ping works like a reach probe, then re-look up.
                 // `dial_target` stamps reachability, so a failure here also flips
                 // the peer's status to offline.
-                match self.registry.resolve_route(IpAddr::V4(ip)) {
+                match self.registry.resolve_route(IpAddr::V6(ip)) {
                     Some(target) if self.registry.dial_target(&target).await => {
-                        match self.registry.peers.lookup_v4(&ip) {
+                        match self.registry.peers.lookup_v6(&ip) {
                             Some(r) => r,
                             None => {
                                 return ipc_err(format!("{display}: dialed but no route to {ip}"));

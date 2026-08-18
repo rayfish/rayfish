@@ -5,7 +5,7 @@
 //! reader and coordinator/member accept handlers now live in the per-connection
 //! demux (`ProtocolRouter::drive_mesh_connection` → `AcceptHandler::handle_frame`).
 
-use std::net::IpAddr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use super::super::*;
 
@@ -36,23 +36,23 @@ impl NetworkRegistry {
         // the peer already re-dialed. Ignore the stale event rather than tearing
         // down the live link (see DisconnectEvent::conn_stable_id).
         if let Some(id) = ev.conn_stable_id
-            && !self.peers.conn_is_current(&ev.ip, id)
+            && !self.peers.conn_is_current(&ev.ipv6, id)
         {
-            tracing::debug!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, "ignoring stale disconnect; peer already reconnected");
+            tracing::debug!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ipv6, "ignoring stale disconnect; peer already reconnected");
             return;
         }
 
         // The networks this peer was reachable on, captured before removal.
         let nets: Vec<SmolStr> = self
             .peers
-            .identity_and_networks(IpAddr::V4(ev.ip))
+            .identity_and_networks(&ev.ipv6)
             .map(|(_, nets)| nets)
             .unwrap_or_default();
 
         // One connection carried every network, so the drop removes the peer
         // everywhere at once.
-        self.peers.remove(&ev.ip, &ev.ipv6);
-        tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, reason = ?ev.reason, "peer connection dropped");
+        self.peers.remove(&ev.ipv6);
+        tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ipv6, reason = ?ev.reason, "peer connection dropped");
 
         if ev.reason.prunes_member() {
             // Deliberate `ray leave` (graceful close with the leave code): prune
@@ -95,7 +95,7 @@ impl NetworkRegistry {
             // close the healed link again if it stays quiet.
             if !reconnect_nets.is_empty() {
                 self.clone()
-                    .spawn_reconnect(ev.endpoint_id, ev.ip, reconnect_nets);
+                    .spawn_reconnect(ev.endpoint_id, ev.ipv6, reconnect_nets);
             }
             return;
         }
@@ -118,7 +118,7 @@ impl NetworkRegistry {
             }
         }
 
-        self.spawn_reconnect(ev.endpoint_id, ev.ip, nets);
+        self.spawn_reconnect(ev.endpoint_id, ev.ipv6, nets);
     }
 
     /// Confirm a coordinator's `ControlMsg::KickedFromNetwork` against `network`'s
@@ -180,7 +180,7 @@ impl NetworkRegistry {
             &self.dns.hostname_table,
             &self.dns.reverse_table,
             network,
-            ev.ip,
+            ev.ipv6,
         )
         .await;
         update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
@@ -200,7 +200,7 @@ impl NetworkRegistry {
     pub(crate) async fn handle_member_leave(self: &Arc<Self>, network: &str, peer_id: EndpointId) {
         // Capture the leaver's mesh IP before removal (needed for the DNS prune);
         // the by-id lookup is gone once this was its last shared network.
-        let leaver_ip = self.peers.v4_for_id(&peer_id);
+        let leaver_ip = self.peers.ipv6_for_id(&peer_id);
         if let Some(conn) = self.peers.remove_peer_from_network_by_id(&peer_id, network) {
             conn.close(VarInt::from_u32(forward::LEAVE_CODE), b"leave");
         }
@@ -315,12 +315,12 @@ impl NetworkRegistry {
                     s.approved.remove(&target);
                     ip
                 };
-                if let Some(ip) = member_ip {
+                if member_ip.is_some() {
                     dns::remove_hostname_by_ip(
                         &self.dns.hostname_table,
                         &self.dns.reverse_table,
                         &net,
-                        ip,
+                        derive_ipv6(&target),
                     )
                     .await;
                 }
@@ -332,8 +332,7 @@ impl NetworkRegistry {
                 if pid == target {
                     self.pruned_peers.insert((net.clone(), pid));
                     conn.close(VarInt::from_u32(forward::KICK_CODE), b"unpaired");
-                    self.peers
-                        .remove_peer_from_network(&ip, &derive_ipv6(&pid), &net);
+                    self.peers.remove_peer_from_network(&ip, &net);
                 }
             }
         }
@@ -350,7 +349,7 @@ impl NetworkRegistry {
     pub(crate) async fn dial_peer_once(
         self: &Arc<Self>,
         peer_id: EndpointId,
-        peer_ip: Ipv4Addr,
+        peer_ip: Ipv6Addr,
         targets: &[DialTarget],
     ) -> bool {
         let my_identity = self.transport.identity.local_identity();
@@ -401,7 +400,7 @@ impl NetworkRegistry {
             }
             conn_changed |= self
                 .mesh_ctx()
-                .register_peer_conn(&conn, peer_id, peer_ip, &t.network);
+                .register_peer_conn(&conn, peer_id, &t.network);
         }
         // A live connection now exists (either freshly stored, or already current
         // when `conn_changed` is false), so the peer is reachable either way.
@@ -426,7 +425,7 @@ impl NetworkRegistry {
     pub(crate) fn spawn_reconnect(
         self: Arc<Self>,
         peer_id: EndpointId,
-        peer_ip: Ipv4Addr,
+        peer_ip: Ipv6Addr,
         nets: Vec<SmolStr>,
     ) {
         // Networks to re-handshake: those we haven't pruned this peer from
@@ -572,14 +571,14 @@ pub(crate) async fn remove_member_roster_only(
     network: &str,
     state: &SharedNetworkState,
     member_id: EndpointId,
-    member_ip: Ipv4Addr,
+    member_ipv6: Ipv6Addr,
 ) {
     {
         let mut s = state.write().unwrap();
         s.members.remove(&member_id);
         s.approved.remove(&member_id);
     }
-    dns::remove_hostname_by_ip(&ctx.hostname_table, &ctx.reverse_table, network, member_ip).await;
+    dns::remove_hostname_by_ip(&ctx.hostname_table, &ctx.reverse_table, network, member_ipv6).await;
 }
 
 /// Republish the signed blob, broadcast a payload-free `MemberSync`, and send each
@@ -616,8 +615,7 @@ pub(crate) async fn finalize_removal(
             // racing a connection close, and the victim's message-triggered leave
             // (or idle timeout) tears the link down. A link the victim still shares
             // another network on stays up for those.
-            ctx.peers
-                .remove_peer_from_network(&ip, &derive_ipv6(&pid), network);
+            ctx.peers.remove_peer_from_network(&ip, network);
         }
     }
 }
@@ -680,8 +678,8 @@ pub(crate) fn spawn_stale_member_pruner(
             if victims.is_empty() {
                 continue;
             }
-            for (id, ip) in &victims {
-                remove_member_roster_only(&ctx, &network, &state, *id, *ip).await;
+            for (id, _) in &victims {
+                remove_member_roster_only(&ctx, &network, &state, *id, derive_ipv6(id)).await;
                 tracing::info!(peer = %id.fmt_short(), network = %network, ttl_secs = ttl, "auto-kicked stale member (ephemeral TTL)");
             }
             let ids: Vec<EndpointId> = victims.iter().map(|(id, _)| *id).collect();

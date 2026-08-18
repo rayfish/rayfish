@@ -239,9 +239,11 @@ impl NetworkRegistry {
     /// loop can dial, if we know one. Just a route-map lookup; the loop owns the
     /// packet buffering and dedup.
     pub(crate) fn resolve_route(&self, dst: IpAddr) -> Option<peers::RouteTarget> {
+        // Only the IPv6 half of the overlay is routed, so an IPv4 destination
+        // never names a roster member to dial.
         match dst {
-            IpAddr::V4(v4) => self.route_map.resolve_v4(&v4),
             IpAddr::V6(v6) => self.route_map.resolve_v6(&v6),
+            IpAddr::V4(_) => None,
         }
     }
 
@@ -268,7 +270,7 @@ impl NetworkRegistry {
         let ok = !targets.is_empty()
             && match tokio::time::timeout(
                 LAZY_DIAL_TIMEOUT,
-                self.dial_peer_once(id, target.ipv4, &targets),
+                self.dial_peer_once(id, target.ipv6, &targets),
             )
             .await
             {
@@ -292,7 +294,6 @@ impl NetworkRegistry {
             .filter(|m| m.identity != my_id)
             .map(|m| peers::RouteMember {
                 endpoint_id: m.identity,
-                ipv4: m.ip,
                 ipv6: derive_ipv6(&m.identity),
             })
             .collect();
@@ -902,10 +903,7 @@ impl NetworkRegistry {
         // IPv6 is always there, so match on that when there is no address to key
         // on. (Both halves derive from the same identity, so either resolves it.)
         if let Some((v4, v6)) = self.dns.resolve(&qualified, &suffix).await {
-            if let Some(route) = v4
-                .and_then(|ip| self.peers.lookup_v4(&ip))
-                .or_else(|| self.peers.lookup_v6(&v6))
-            {
+            if let Some(route) = self.peers.lookup_v6(&v6) {
                 return Some(route.endpoint_id);
             }
             for entry in self.networks.iter() {
@@ -930,11 +928,6 @@ impl NetworkRegistry {
     pub(crate) async fn resolve_peer_flexible(&self, name: &str) -> Option<EndpointId> {
         if let Some(id) = self.resolve_peer_name(name).await {
             return Some(id);
-        }
-        if let Ok(v4) = name.parse::<Ipv4Addr>()
-            && let Some(route) = self.peers.lookup_v4(&v4)
-        {
-            return Some(route.endpoint_id);
         }
         if let Ok(v6) = name.parse::<std::net::Ipv6Addr>()
             && let Some(route) = self.peers.lookup_v6(&v6)
