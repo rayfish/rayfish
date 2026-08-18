@@ -662,6 +662,19 @@ pub struct ExitNodeStatusView {
     /// never re-derives it and cannot drift from it.
     #[serde(default)]
     pub refused: Vec<String>,
+    /// Why the `using` selection above is not the tunnel that is actually
+    /// installed, or `None` when it is (and when nothing is selected).
+    ///
+    /// The selection is config and the tunnel is kernel state, and they are
+    /// deliberately allowed to disagree: a gateway that stops being usable does
+    /// not clear the config, so `ray exit-node status` still shows what to change.
+    /// The gap has to be visible, though. Without this the line reads `using:
+    /// <peer>` while every packet leaves directly, which is the one thing a user
+    /// who chose to tunnel needs told, and the reason can arrive without anybody
+    /// touching the selection (the gateway republishes a family claim, or this
+    /// node's `ipv6_only = auto` flips).
+    #[serde(default)]
+    pub not_in_effect: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1217,6 +1230,7 @@ mod tests {
                 available_v6: vec!["gw".into()],
                 ipv6_only: true,
                 refused: vec!["v4only".into()],
+                not_in_effect: Some("the peer is not in this network's roster".into()),
             }],
         };
         let bytes = rmp_serde::to_vec_named(&resp).unwrap();
@@ -1230,6 +1244,9 @@ mod tests {
                 // exists but cannot carry your only family".
                 assert_eq!(networks[0].available_v6, vec!["gw".to_string()]);
                 assert!(networks[0].ipv6_only);
+                // A selection that is configured but not installed says so, or
+                // `using: gw` reads as a tunnel that is carrying traffic.
+                assert!(networks[0].not_in_effect.is_some());
             }
             other => panic!("wrong variant: {other:?}"),
         }

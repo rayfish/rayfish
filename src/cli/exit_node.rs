@@ -102,6 +102,8 @@ fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>) {
                 "available": n.available,
                 "available_v6": n.available_v6,
                 "ipv6_only": n.ipv6_only,
+                "refused": n.refused,
+                "not_in_effect": n.not_in_effect,
             })).collect::<Vec<_>>(),
         }));
         return;
@@ -127,6 +129,13 @@ fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>) {
             println!("  offering: yes (allow: {})", peers.join(", "));
         }
         match (&n.using, n.ipv6_only) {
+            // A selection the daemon is not acting on is the one thing this line
+            // must not print bare: the config says `gw` and the packets leave
+            // directly, and nothing else on screen says so.
+            (Some(peer), _) if n.not_in_effect.is_some() => {
+                let why = n.not_in_effect.as_deref().unwrap_or_default();
+                println!("  using: {peer} (NOT in effect: {why}; traffic leaves directly)");
+            }
             // In IPv6-only mode the tunnel carries IPv6 and nothing else, so say
             // so: a bare "using: <peer>" reads as a full tunnel over both.
             (Some(peer), true) => println!("  using: {peer} (IPv6 only; IPv4 leaves directly)"),

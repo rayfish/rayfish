@@ -112,6 +112,41 @@ fn ipv6_gateway_unverified(m: &Member, ipv6_only: bool) -> bool {
     ipv6_only && m.exit_node && m.exit_families.is_unknown()
 }
 
+/// The reason half of [`NetworkRegistry::exit_selection_problem`], pure so the
+/// wording of each case is pinned by a test rather than by a running daemon.
+///
+/// Ordered by what the user can act on, with the kernel's answer ahead of the
+/// config's. The refusal is last of the specific ones
+/// because it is the only one that is not a wait: down and not-yet-in-the-roster
+/// both heal on their own, while a gateway that cannot carry our family stays
+/// that way until something changes on one of the two hosts.
+fn selection_problem(
+    install_error: Option<&str>,
+    selection_resolved: bool,
+    data_plane_up: bool,
+    member: Option<&Member>,
+    ipv6_only: bool,
+) -> Option<String> {
+    // First, because a failed install leaves the selection resolved: it rolled
+    // its own rules back and the next re-apply will retry, so the config is
+    // still what the user wants and nothing is carrying traffic meanwhile.
+    if let Some(e) = install_error {
+        return Some(format!("the tunnel could not be installed: {e}"));
+    }
+    if selection_resolved {
+        return None;
+    }
+    if !data_plane_up {
+        return Some("the data plane is down (`ray up`)".to_string());
+    }
+    let Some(member) = member else {
+        return Some("the peer is not in this network's roster".to_string());
+    };
+    ipv6_gateway_refusal(member, &display_name(member), ipv6_only).or(Some(
+        "the full tunnel is not installed; see the daemon log".to_string(),
+    ))
+}
+
 /// Whether the roster's record of our own exit offer disagrees with what we
 /// would publish right now. Split out from
 /// [`NetworkRegistry::exit_offer_out_of_sync`] because it is the whole decision,
@@ -571,6 +606,39 @@ impl NetworkRegistry {
         }
     }
 
+    /// Why the selection configured on `network` is not the tunnel that is
+    /// actually installed, or `None` when it is.
+    ///
+    /// The two are allowed to disagree, and both directions of that are
+    /// deliberate: [`Self::reload_exit_state`] keeps a live tunnel through a
+    /// roster that briefly loses the peer, and drops one whose gateway now says
+    /// it cannot carry our family. Neither touches the config, so `ray exit-node
+    /// status` keeps showing what to change. What it must not do is keep printing
+    /// `using: <peer>` while the traffic leaves directly: the second case needs no
+    /// user action to arrive (the gateway republishes a claim, or `ipv6_only =
+    /// auto` flips on this node the first time something else takes
+    /// `100.64.0.0/10`), so the user has no reason to suspect it.
+    fn exit_selection_problem(&self, network: &str, selected: &str) -> Option<String> {
+        let resolved = self
+            .exit_client
+            .selection()
+            .is_some_and(|s| s.network == network);
+        let member = selected
+            .parse::<EndpointId>()
+            .ok()
+            .and_then(|id| self.roster_member(network, id));
+        selection_problem(
+            self.exit_install_error
+                .load()
+                .as_deref()
+                .map(|e| e.as_str()),
+            resolved,
+            self.exit_sync_enabled.load(Ordering::Relaxed),
+            member.as_ref(),
+            self.ipv6_only,
+        )
+    }
+
     /// Report exit-node state per network: this node's own allow list + selection,
     /// and which roster peers advertise an exit node.
     pub(crate) fn exit_node_status(&self, network: Option<String>) -> IpcMessage {
@@ -600,6 +668,10 @@ impl NetworkRegistry {
                 .filter(|m| ipv6_gateway_refusal(m, "gw", self.ipv6_only).is_some())
                 .map(display_name)
                 .collect();
+            let not_in_effect = n
+                .exit_node_use
+                .as_deref()
+                .and_then(|sel| self.exit_selection_problem(&n.name, sel));
             networks.push(ipc::ExitNodeStatusView {
                 network: n.name,
                 allow: n.exit_allow,
@@ -608,6 +680,7 @@ impl NetworkRegistry {
                 available_v6,
                 ipv6_only: self.ipv6_only,
                 refused,
+                not_in_effect,
             });
         }
         IpcMessage::ExitNodeState { networks }
@@ -977,6 +1050,50 @@ mod tests {
                 super::ipv6_gateway_refusal(&gateway(true, Unknown), "gw", ipv6_only).is_none()
             );
         }
+    }
+
+    /// A configured selection that is not the installed tunnel says so.
+    ///
+    /// `reload_exit_state` deliberately leaves the config alone when it refuses a
+    /// gateway or cannot resolve one, so the status line is the only place the
+    /// gap can show. Printing `using: gw` for a node whose packets all leave
+    /// directly is the failure this pins, and it needs no user action to arrive:
+    /// the gateway republishes a family claim it worked out for itself.
+    #[test]
+    fn a_selection_that_is_not_installed_is_reported_as_not_installed() {
+        use super::selection_problem;
+        use ExitFamilies::{Dual, V4};
+
+        // Resolved and installed: nothing to say, whatever the roster now claims.
+        assert!(selection_problem(None, true, true, Some(&gateway(true, V4)), true).is_none());
+
+        // A failed install rolls back its rules and leaves the selection
+        // resolved, so it has to be answered ahead of it or the status line
+        // reports a tunnel the kernel refused.
+        let why = selection_problem(
+            Some("RTNETLINK answers: operation not permitted"),
+            true,
+            true,
+            Some(&gateway(true, Dual)),
+            false,
+        )
+        .expect("a rolled-back install is not a tunnel");
+        assert!(why.contains("operation not permitted"), "{why}");
+
+        // Down is a wait, and says which command ends it.
+        let why = selection_problem(None, false, false, Some(&gateway(true, Dual)), false)
+            .expect("a selection cannot be in effect while the data plane is down");
+        assert!(why.contains("ray up"), "{why}");
+
+        // Not on the roster yet is the other wait.
+        let why = selection_problem(None, false, true, None, false).expect("no peer, no tunnel");
+        assert!(why.contains("roster"), "{why}");
+
+        // The one that is not a wait: the reason the tunnel came down is the same
+        // string `ray exit-node use` would have refused with.
+        let why = selection_problem(None, false, true, Some(&gateway(true, V4)), true)
+            .expect("a v4-only gateway is unusable from an IPv6-only node");
+        assert!(why.contains("cannot carry IPv6"), "{why}");
     }
 
     /// The refusal runs in both directions, because the black hole does.

@@ -47,8 +47,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **The mesh protocol version is now 3, and every peer must be on it.** Control
   frames, pairing, `ray connect`, file transfer and the signed roster are now
-  encoded more compactly, which takes about a third off the largest thing on the
-  wire (a 50-member roster drops from 6041 to 4061 bytes). The encoding is not
+  encoded more compactly, which takes a bit under 30% off the largest thing on
+  the wire (a 50-member roster drops from 5194 to 3764 bytes, and about 30% when
+  every member is a paired device). The encoding is not
   backward compatible, and peers on different protocol versions cannot connect
   at all, so a mesh has to upgrade together: a node left on 0.3.x will stop
   seeing the rest of the network rather than degrading. Nothing on disk changes,
@@ -99,6 +100,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Tailscale address used to die the moment `ray exit-node use` ran, because the
   replies are sourced from that address and took a rule that looks up the main
   routing table, where the route isn't.
+- **`ray exit-node status` says when the exit node you picked is not actually
+  carrying anything.** The selection is config and the tunnel is kernel state,
+  and they are allowed to differ: a gateway that stops being usable does not
+  clear your selection, so you can still see what to change. But the line read
+  `using: <peer>` either way, while every packet left directly. It now says the
+  selection is not in effect and why (the routing rules would not install, the
+  data plane is down, the peer is not in the roster yet, or the gateway cannot
+  carry the family this node tunnels).
 - **`.ray` names now resolve alongside another VPN that manages
   `/etc/resolv.conf`.** On a host with no DNS manager (no systemd-resolved in
   the resolution path), Rayfish and a VPN like Tailscale both want that file.

@@ -1675,9 +1675,17 @@ fn parse_foreign_routes(show: &str, tun_name: &str) -> Vec<MirroredRoute> {
 /// The destinations currently in one table, for the stale-copy sweep in
 /// [`mirror_foreign_routes`]. Only `dest` is used; `spec` comes along because the
 /// two parses share a shape.
+///
+/// Indented lines are skipped for the same reason [`parse_foreign_routes`] groups
+/// them: a multipath route prints its nexthops as continuation lines, and reading
+/// the first token of one yields a destination called `nexthop`, which is in no
+/// wanted set and so is "swept" with a `route del nexthop` that fails on every
+/// re-apply. Our own table holds mirrors of exactly the routes that parse feeds
+/// it, multipath included, so this is the same input read twice.
 #[cfg(target_os = "linux")]
 fn parse_table_routes(show: &str) -> Vec<MirroredRoute> {
     show.lines()
+        .filter(|line| !line.starts_with([' ', '\t']))
         .filter_map(|line| {
             let dest = line.split_whitespace().next()?;
             Some(MirroredRoute {
@@ -2544,6 +2552,31 @@ unreachable fd00::/8 dev lo table 52 metric 1024 pref medium
                 "dev",
                 "eth0",
             ])
+        );
+    }
+
+    /// The sweep reads our own table with the same shape, so it has the same
+    /// multipath problem, and a `nexthop` line read as a destination is swept
+    /// forever: it is in no wanted set, so every re-apply runs a `route del
+    /// nexthop` that fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_stale_sweep_does_not_read_a_nexthop_line_as_a_destination() {
+        let show = "\
+default dev ray0 table 29793
+172.20.0.0/16 table 29793
+\tnexthop via 10.0.0.1 dev eth0 weight 1
+\tnexthop via 10.0.1.1 dev eth1 weight 1
+192.168.5.0/24 dev eth0 table 29793
+";
+        let dests: Vec<String> = parse_table_routes(show)
+            .into_iter()
+            .map(|r| r.dest)
+            .collect();
+        assert_eq!(
+            dests,
+            strs(&["default", "172.20.0.0/16", "192.168.5.0/24"]),
+            "continuation lines are part of the route above them, not routes"
         );
     }
 

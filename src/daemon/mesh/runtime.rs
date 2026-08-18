@@ -1115,6 +1115,12 @@ impl Daemon {
         let server = apply_exit_server_os(&self.registry.exit_server, &tun_name).await;
         let served = started.elapsed();
         let client = self.apply_exit_client(&tun_name).await;
+        // What the kernel accepted, for `ray exit-node status`: a failed install
+        // rolls back its own rules and leaves the selection standing, so the
+        // selection alone cannot say whether anything is being tunnelled.
+        self.registry
+            .exit_install_error
+            .store(client.clone().map(Arc::new));
         // `None` from `apply_exit_client` means the install succeeded (or that
         // there was nothing to install, in which case the selection is inactive).
         self.apply_exit_dns(self.registry.exit_client.is_active() && client.is_none());
@@ -1546,6 +1552,10 @@ impl Daemon {
         // pinning). Teardown never reports a problem.
         self.registry.exit_client.set(None);
         let _ = self.apply_exit_client(&tun_name).await;
+        // Standby is not a failed install: leaving the last one recorded would
+        // have `ray exit-node status` blame it for a tunnel that is down because
+        // the user put it down.
+        self.registry.exit_install_error.store(None);
         // With the tunnel gone this drops any DNS override, so standby does not
         // leave the forwarder pointed at a resolver chosen for a tunnel that no
         // longer exists.

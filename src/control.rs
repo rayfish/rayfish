@@ -207,8 +207,9 @@ pub enum ControlMsg {
         /// what lets an IPv6-only client tell a usable gateway from one that
         /// would take its traffic and have nowhere to send it.
         ///
-        /// Additive, and three-valued for the same reason the roster field is:
-        /// a gateway on a release that predates this key omits it, and reading
+        /// Appended in mesh 3, and three-valued for the same reason the roster
+        /// field is: a gateway on a build that predates this key sends a shorter
+        /// array and we default the slot, and reading
         /// that silence as "IPv4 only" would pin a host that may well have IPv6
         /// as unusable for as long as it stays on that build. `enabled` above is
         /// deliberately left a plain `bool`: it shipped in 0.3.0, and changing

@@ -131,6 +131,17 @@ pub(crate) async fn resolve_signed(
 /// its bytes against `signed`. Returns the verified blob, or `None` if no source
 /// could serve a blob matching the signed hash. The blob is content-addressed by
 /// `signed`, so a peer can only ever serve the authentic blob, never a forgery.
+///
+/// The two ways this returns `None` are told apart in the log, and the second one
+/// stops the loop early. Bytes that do not hash to `signed` are that peer's
+/// problem, so the next source is worth trying. Bytes that hash correctly and
+/// then fail to decode are *everyone's*: the blob is content-addressed, so every
+/// source serves those same bytes, and what we are looking at is a publisher on a
+/// build whose `GroupBlob` is not the shape ours is (the roster rides the shared
+/// `iroh_blobs` ALPN, which gates nothing). That reads as an unreachable
+/// coordinator when it is a version split, and it repeats every group poll, so
+/// the decode error itself goes in the log rather than being swallowed with the
+/// dial failures.
 pub(crate) async fn fetch_verified_blob(
     endpoint: &Endpoint,
     blob_store: &FsStore,
@@ -149,17 +160,42 @@ pub(crate) async fn fetch_verified_blob(
     peer_ids.sort_by_key(|id| id.to_string());
     peer_ids.dedup();
     for pid in &peer_ids {
-        if let Ok(conn) =
+        let Ok(conn) =
             transport::connect_to_peer_with_alpn(endpoint, *pid, iroh_blobs::protocol::ALPN).await
-            && blob_store
-                .remote()
-                .fetch(conn, HashAndFormat::raw(blob_hash))
-                .await
-                .is_ok()
-            && let Ok(bytes) = blob_store.blobs().get_bytes(blob_hash).await
-            && let Ok(data) = crate::membership::verify_group_blob(&bytes, &signed)
+        else {
+            continue;
+        };
+        if blob_store
+            .remote()
+            .fetch(conn, HashAndFormat::raw(blob_hash))
+            .await
+            .is_err()
         {
-            return Some(data);
+            continue;
+        }
+        let Ok(bytes) = blob_store.blobs().get_bytes(blob_hash).await else {
+            continue;
+        };
+        if blake3::hash(&bytes) != signed {
+            tracing::warn!(
+                network = %network_name,
+                peer = %pid.fmt_short(),
+                "reconverge: a peer served bytes that do not match the signed hash"
+            );
+            continue;
+        }
+        match crate::membership::decode_group_blob(&bytes) {
+            Ok(data) => return Some(data),
+            Err(e) => {
+                tracing::warn!(
+                    network = %network_name,
+                    peer = %pid.fmt_short(),
+                    error = %e,
+                    "reconverge: the signed group blob does not decode against this build; \
+                     the network's coordinator is on an incompatible version"
+                );
+                return None;
+            }
         }
     }
     None

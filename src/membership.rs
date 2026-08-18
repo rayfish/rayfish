@@ -40,13 +40,23 @@ pub fn now_secs() -> u64 {
 /// but a missing slot that shifts everything after it. Absent means only "the
 /// array ended before this field", which is what an older, shorter roster looks
 /// like.
+///
+/// The variants are renamed to one character each because msgpack writes a unit
+/// variant as its *name*, and this field sits on every roster entry whether or
+/// not that member is a gateway: `Unknown` spelt out costs 8 bytes per member,
+/// which on the largest thing we put on the wire is most of what array-encoding
+/// the blob went and saved. The names never reach a user (this type is wire-only:
+/// `ray exit-node status` carries display strings), so the tag is free to be
+/// short.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ExitFamilies {
     /// No claim on the roster. Either the member never made one, or a
     /// coordinator that does not know this field republished over it.
     #[default]
+    #[serde(rename = "?")]
     Unknown,
     /// The gateway can egress IPv4 only.
+    #[serde(rename = "4")]
     V4,
     /// The gateway can egress IPv6 only: it has an IPv6 uplink, but its own data
     /// plane is IPv6-only, so it never routed mesh IPv4 in the first place.
@@ -57,14 +67,17 @@ pub enum ExitFamilies {
     /// masqueraded out fine, and the reply, un-NATted back to the client's mesh
     /// `100.x`, finds no route into the TUN and leaves toward a CGNAT address on
     /// the physical uplink. One-way, and silent from both ends.
+    #[serde(rename = "6")]
     V6,
     /// The gateway can egress both families.
+    #[serde(rename = "d")]
     Dual,
     /// The gateway can egress neither: it is in IPv6-only mode (so its mesh IPv4
     /// has no return path) and it has no IPv6 uplink to offer instead.
     ///
     /// Distinct from [`Self::Unknown`], which is the absence of a claim. This is
     /// a claim, and the claim is "nothing". Every client refuses it.
+    #[serde(rename = "n")]
     Neither,
 }
 
@@ -95,7 +108,7 @@ impl ExitFamilies {
     /// [`Self::Neither`] is not a theoretical corner: it is what an IPv6-only
     /// host on an ordinary IPv4 uplink is, which is the most common shape of the
     /// configuration this whole mode exists for. Folding it into [`Self::V4`]
-    /// (this said so, wrongly, until round 2 of review) makes it a *positive*
+    /// (as an earlier draft of this did) makes it a *positive*
     /// claim to carry IPv4 that a dual-stack client accepts, which is the silent
     /// black hole the type exists to prevent, produced by the ordinary setup.
     pub fn from_uplink(has_v6: bool, ipv6_only: bool) -> Self {
@@ -1736,6 +1749,228 @@ mod tests {
             assert_eq!(round.exit_families, families);
             assert_eq!(round.ipv6_only, ipv6_only);
         }
+    }
+
+    /// What array-encoding the blob actually saves, measured rather than claimed.
+    ///
+    /// The baseline is the *released* named encoding, not `to_vec_named` of the
+    /// current struct: the released `Member` carried `skip_serializing_if` on
+    /// every optional field, so an absent hostname or `last_seen` cost nothing
+    /// there, while compact writes a slot for it either way. Comparing against
+    /// today's struct (which cannot carry those attributes any more, see the type
+    /// docs) would flatter the result by counting keys the old build never sent.
+    ///
+    /// A 50-member roster of joined-but-unpaired nodes measures 5194 bytes named
+    /// against 3764 compact, about 28%. The heavier shape (every member paired,
+    /// so `user_identity` and `last_seen` are set) is 9206 against 6476, about
+    /// 30%. The assertion is the floor, not the figure, since any field added
+    /// later moves both numbers.
+    #[test]
+    fn compact_encoding_takes_about_a_quarter_off_a_roster() {
+        #[derive(Serialize)]
+        struct ReleasedMember {
+            identity: EndpointId,
+            ip: Ipv4Addr,
+            is_coordinator: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            hostname: Option<String>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            exit_node: bool,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            ipv6_only: bool,
+        }
+        #[derive(Serialize)]
+        struct ReleasedBlob {
+            members: Vec<ReleasedMember>,
+            approved: Vec<ApprovedEntry>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            name: Option<String>,
+        }
+
+        let mut members = Vec::new();
+        let mut released = Vec::new();
+        for i in 0..50u8 {
+            let id = test_id(i);
+            let ip = derive_ip(&id);
+            let hostname = Some(format!("host-{i}"));
+            members.push(Member {
+                identity: id,
+                ip,
+                is_coordinator: i == 0,
+                hostname: hostname.clone(),
+                user_identity: None,
+                device_cert: None,
+                collision_index: 0,
+                last_seen: None,
+                exit_node: i == 1,
+                exit_families: match i {
+                    1 => ExitFamilies::Dual,
+                    _ => ExitFamilies::Unknown,
+                },
+                ipv6_only: false,
+            });
+            released.push(ReleasedMember {
+                identity: id,
+                ip,
+                is_coordinator: i == 0,
+                hostname,
+                exit_node: i == 1,
+                ipv6_only: false,
+            });
+        }
+        let compact = canonical_group_bytes(
+            &MemberList::from_members(members),
+            &ApprovedList::new(),
+            &SuggestedFirewall::new(),
+            Some("net"),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        let named = rmp_serde::to_vec_named(&ReleasedBlob {
+            members: released,
+            approved: vec![],
+            name: Some("net".to_string()),
+        })
+        .unwrap();
+
+        let saved = 1.0 - compact.len() as f64 / named.len() as f64;
+        assert!(
+            saved > 0.25,
+            "compact saved only {:.1}% ({} vs {} bytes)",
+            saved * 100.0,
+            compact.len(),
+            named.len()
+        );
+    }
+
+    /// An older build's blob is a msgpack *map*, and this build still reads it.
+    ///
+    /// rmp-serde's struct decoder accepts either shape, which is the only reason
+    /// a node that upgrades ahead of its coordinator keeps converging: the blob
+    /// rides the shared `iroh_blobs` ALPN, so the mesh version bump that
+    /// separates the two builds does not separate them here. The reverse does not
+    /// hold (an old build reads our array and rejects the length), so this is a
+    /// one-way bridge and not a claim that the two encodings interoperate.
+    ///
+    /// It also explains a thing that looks like a bug: a member that reads a
+    /// named blob re-encodes it compactly in `refresh_snapshot`, so its local
+    /// hash never equals the one the record commits to, and the record's
+    /// timestamp floor rather than the hash is what stops it re-applying on every
+    /// poll.
+    #[test]
+    fn a_named_encoded_blob_from_an_older_build_still_decodes() {
+        #[derive(Serialize)]
+        struct OldMember {
+            identity: EndpointId,
+            ip: Ipv4Addr,
+            is_coordinator: bool,
+            hostname: Option<String>,
+            exit_node: bool,
+            ipv6_only: bool,
+            // No `exit_families`: a key this build knows and that one never wrote.
+        }
+        #[derive(Serialize)]
+        struct OldBlob {
+            members: Vec<OldMember>,
+            approved: Vec<ApprovedEntry>,
+        }
+        let id = test_id(12);
+        let bytes = rmp_serde::to_vec_named(&OldBlob {
+            members: vec![OldMember {
+                identity: id,
+                ip: derive_ip(&id),
+                is_coordinator: true,
+                hostname: Some("box".into()),
+                exit_node: true,
+                ipv6_only: true,
+            }],
+            approved: vec![],
+        })
+        .unwrap();
+
+        let blob = decode_group_blob(&bytes).expect("a named map still decodes");
+        assert_eq!(blob.members.len(), 1);
+        assert!(blob.members[0].exit_node);
+        assert!(blob.members[0].ipv6_only);
+        assert_eq!(blob.members[0].exit_families, ExitFamilies::Unknown);
+        // And re-encoding it compactly gives different bytes, which is what makes
+        // the local snapshot hash disagree with the signed one.
+        assert_ne!(rmp_serde::to_vec(&blob).unwrap(), bytes);
+    }
+
+    /// The default claim rides every roster entry, so its tag is sized for that.
+    ///
+    /// msgpack writes a unit variant as its name, and `Unknown` is what almost
+    /// every member carries: not a gateway, or a gateway whose coordinator
+    /// predates the field. Spelt out that is 8 bytes each, which on a large
+    /// roster is a good part of what array-encoding the blob saved in the first
+    /// place.
+    #[test]
+    fn the_unknown_claim_costs_two_bytes_on_the_wire() {
+        for (v, tag) in [
+            (ExitFamilies::Unknown, "?"),
+            (ExitFamilies::V4, "4"),
+            (ExitFamilies::V6, "6"),
+            (ExitFamilies::Dual, "d"),
+            (ExitFamilies::Neither, "n"),
+        ] {
+            let bytes = rmp_serde::to_vec(&v).unwrap();
+            assert_eq!(bytes.len(), 2, "{v:?} encodes as more than a one-char tag");
+            assert!(bytes.ends_with(tag.as_bytes()), "{v:?} is not tagged {tag}");
+            let back: ExitFamilies = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(back, v);
+        }
+    }
+
+    /// The tolerance runs one way only, and the roster blob is where that bites.
+    ///
+    /// A build that predates an appended field reads a *longer* array than its
+    /// struct has slots, and rmp-serde rejects the whole value rather than
+    /// dropping the tail. So appending is what lets a new build read an old
+    /// peer; it does nothing for the other direction. Everything else compact
+    /// rides an ALPN we bump, which keeps the two builds off the same
+    /// connection, but the blob rides the shared `iroh_blobs` ALPN and the group
+    /// poll checks no version at all, so an appended `Member` field stops an old
+    /// peer converging until it upgrades. That is a reason to bump the mesh
+    /// version with the field, not a reason to trust the append.
+    #[test]
+    fn an_older_build_cannot_read_an_appended_field() {
+        #[derive(Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct OlderMember {
+            identity: EndpointId,
+            ip: Ipv4Addr,
+            is_coordinator: bool,
+            hostname: Option<String>,
+            user_identity: Option<EndpointId>,
+            device_cert: Option<DeviceCert>,
+            collision_index: u32,
+            last_seen: Option<u64>,
+            exit_node: bool,
+            // `exit_families` and `ipv6_only` not yet declared.
+        }
+        let id = test_id(11);
+        let bytes = rmp_serde::to_vec(&Member {
+            identity: id,
+            ip: derive_ip(&id),
+            is_coordinator: false,
+            hostname: Some("box".into()),
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+            last_seen: None,
+            exit_node: true,
+            exit_families: ExitFamilies::Dual,
+            ipv6_only: false,
+        })
+        .unwrap();
+
+        let err = rmp_serde::from_slice::<OlderMember>(&bytes)
+            .expect_err("an 11-element array does not fit a 9-field struct");
+        assert!(
+            matches!(err, rmp_serde::decode::Error::LengthMismatch(_)),
+            "expected a length mismatch, got {err:?}"
+        );
     }
 
     /// Reordering two same-typed fields silently swaps their values, and this is
