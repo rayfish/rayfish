@@ -1774,8 +1774,12 @@ fn create_report_bundle(
     owner: Option<(u32, u32)>,
 ) -> std::io::Result<PathBuf> {
     for _ in 0..16 {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let nonce: u64 = rand::random();
-        let path = dir.join(format!("rayfish-report-{nonce:016x}.tgz"));
+        let path = dir.join(format!("rayfish-report-{timestamp}-{nonce:016x}.tgz"));
         match write_bundle(&path, files, owner) {
             Ok(()) => return Ok(path),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
