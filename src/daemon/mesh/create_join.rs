@@ -753,8 +753,7 @@ impl NetworkRegistry {
 
         Ok(TryJoin::Joined(Box::new(IpcMessage::Joined {
             name: display_name.to_string(),
-            my_ip,
-            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
+            my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
         })))
     }
 

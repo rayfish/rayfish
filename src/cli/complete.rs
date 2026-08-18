@@ -240,7 +240,7 @@ fn peer_candidates(current: &OsStr, filter: PeerFilter) -> Vec<CompletionCandida
                 PeerState::Idle => "idle",
                 PeerState::Offline => "offline",
             };
-            Some((name, format!("{}, {state}", peer.ip)))
+            Some((name, format!("{}, {state}", peer.ipv6)))
         })
         .collect();
     // The same device is on the roster of every network it shares with us, and

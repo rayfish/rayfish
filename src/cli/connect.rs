@@ -14,12 +14,12 @@ pub(crate) async fn ipc_connect(contact_id: &str, hostname: Option<String>) -> R
     .await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Joined { name, my_ip, .. } => {
+        ipc::IpcMessage::Joined { name, my_ipv6, .. } => {
             println!(
                 "  {} connected — direct network {} ({})",
                 style::green("✓"),
                 style::value(&name),
-                style::faint(&my_ip.to_string()),
+                style::faint(&my_ipv6.to_string()),
             );
         }
         ipc::IpcMessage::Error { message } => print_error("connect failed", &message, None),

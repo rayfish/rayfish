@@ -120,8 +120,7 @@ impl Daemon {
                     return NetworkStatus {
                         name: h.name.clone(),
                         role,
-                        my_ip: h.my_ip,
-                        my_ipv6: Some(derive_ipv6(&my_id)),
+                        my_ipv6: derive_ipv6(&my_id),
                         my_hostname: None,
                         network_key: Some(h.network_key.to_string()),
                         member_count: 0,
@@ -179,8 +178,7 @@ impl Daemon {
                 let user_identity = (user_id != m.identity).then_some(user_id);
                 PeerStatus {
                     endpoint_id: m.identity,
-                    ip: m.ip,
-                    ipv6: Some(derive_ipv6(&m.identity)),
+                    ipv6: derive_ipv6(&m.identity),
                     hostname,
                     user_identity,
                     is_own_device: user_id == own_user,
@@ -228,8 +226,7 @@ impl Daemon {
         NetworkStatus {
             name: h.name.clone(),
             role,
-            my_ip: h.my_ip,
-            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
+            my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
             my_hostname: lookup_hostname(h.my_ip, self.transport.identity.local_identity()),
             network_key: Some(h.network_key.to_string()),
             member_count,

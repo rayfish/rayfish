@@ -669,8 +669,7 @@ impl NetworkRegistry {
         Ok(IpcMessage::Created {
             name,
             network_key: net_public_key,
-            my_ip,
-            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
+            my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
         })
     }
 

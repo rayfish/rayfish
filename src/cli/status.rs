@@ -245,7 +245,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 println!("  {}", style::faint("no active networks"));
             } else {
                 for net in &networks {
-                    print_network(net, ipv6_only.enabled());
+                    print_network(net);
                 }
             }
 
@@ -364,7 +364,7 @@ fn print_nearby(peers: &[ipc::LanPeerInfo]) {
 /// Render one network block: header (name · role · dns · ip · member count),
 /// the aligned peer table, and the shareable join code (suppressed for direct
 /// `ray connect` networks).
-fn print_network(net: &ipc::NetworkStatus, ipv6_only: bool) {
+fn print_network(net: &ipc::NetworkStatus) {
     let role = net.role.to_string();
     // Just the hostname: the network name is already the block header, so the
     // `.{network}.ray` suffix would only repeat it.
@@ -378,12 +378,7 @@ fn print_network(net: &ipc::NetworkStatus, ipv6_only: bool) {
     if let Some(ref dns) = dns_name {
         print!("   {}", style::value(dns));
     }
-    // In IPv6-only mode the mesh IPv4 carries no traffic, so showing it would
-    // hand out an address that goes nowhere. Show the address actually in use.
-    let my_addr = match (ipv6_only, net.my_ipv6) {
-        (true, Some(v6)) => v6.to_string(),
-        _ => net.my_ip.to_string(),
-    };
+    let my_addr = net.my_ipv6.to_string();
     print!("   {}", style::faint(&my_addr));
     print!(
         "   {} {}",
@@ -428,7 +423,7 @@ fn print_network(net: &ipc::NetworkStatus, ipv6_only: bool) {
     };
     let up_w = counter_width(|c| c.bytes_tx);
     let down_w = counter_width(|c| c.bytes_rx);
-    let rows = grouped_peer_rows(net, &alias_by_identity, up_w, down_w, ipv6_only);
+    let rows = grouped_peer_rows(net, &alias_by_identity, up_w, down_w);
     if rows.is_empty() {
         println!("    {}", style::faint("(no other members)"));
     } else {
@@ -468,7 +463,6 @@ fn grouped_peer_rows(
     alias_by_identity: &HashMap<&str, &str>,
     up_w: usize,
     down_w: usize,
-    ipv6_only: bool,
 ) -> Vec<Vec<layout::Cell>> {
     let mut rows = Vec::new();
     let mut emitted: std::collections::HashSet<EndpointId> = std::collections::HashSet::new();
@@ -492,7 +486,6 @@ fn grouped_peer_rows(
                 "",
                 up_w,
                 down_w,
-                ipv6_only,
             ));
             continue;
         }
@@ -524,7 +517,6 @@ fn grouped_peer_rows(
                     "",
                     up_w,
                     down_w,
-                    ipv6_only,
                 ));
                 for (i, d) in secondaries.iter().enumerate() {
                     let branch = if i + 1 == secondaries.len() {
@@ -532,7 +524,7 @@ fn grouped_peer_rows(
                     } else {
                         "   ├─ "
                     };
-                    rows.push(device_row(d, None, branch, up_w, down_w, ipv6_only));
+                    rows.push(device_row(d, None, branch, up_w, down_w));
                 }
             }
             // The primary is not visible here (e.g. it is us, filtered out of our
@@ -546,7 +538,7 @@ fn grouped_peer_rows(
                     } else {
                         "   ├─ "
                     };
-                    rows.push(device_row(d, None, branch, up_w, down_w, ipv6_only));
+                    rows.push(device_row(d, None, branch, up_w, down_w));
                 }
             }
         }
@@ -639,16 +631,13 @@ fn device_row(
     prefix: &str,
     up_w: usize,
     down_w: usize,
-    ipv6_only: bool,
 ) -> Vec<layout::Cell> {
-    // The address column carries whatever this node can actually reach the peer
-    // on, matching the network header: in IPv6-only mode the peer's mesh IPv4 is
-    // an address nothing here can send to, and it is the column people copy into
-    // `ssh` and `ping`. Wider rows are the price; a wrong address is not.
-    let addr = match (ipv6_only, peer.ipv6) {
-        (true, Some(v6)) => v6.to_string(),
-        _ => peer.ip.to_string(),
-    };
+    // The address column is the peer's mesh IPv6, which is the only address it
+    // can be reached on and the one people copy into `ssh` and `ping`. It is
+    // three times the width of the old dotted quad, which the IPv6-only mode
+    // this replaces had already accepted: wider rows are the price, a wrong
+    // address is not.
+    let addr = peer.ipv6.to_string();
     let base = peer.hostname.clone().unwrap_or_else(|| addr.clone());
     let host = match alias {
         Some(a) => format!("{base} [{a}]"),
@@ -892,7 +881,6 @@ pub(crate) async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()
 
 #[cfg(test)]
 mod grouping_tests {
-    use std::net::Ipv4Addr;
 
     use super::*;
 
@@ -918,8 +906,7 @@ mod grouping_tests {
     ) -> ipc::PeerStatus {
         ipc::PeerStatus {
             endpoint_id: iroh::SecretKey::generate().public(),
-            ip: Ipv4Addr::new(100, 64, 0, 2),
-            ipv6: None,
+            ipv6: "200::2".parse().unwrap(),
             hostname: Some(host.to_string()),
             user_identity: user,
             is_own_device: own,
@@ -942,8 +929,7 @@ mod grouping_tests {
         ipc::NetworkStatus {
             name: "n".to_string(),
             role: ipc::NetworkRole::Coordinator,
-            my_ip: Ipv4Addr::new(100, 64, 0, 1),
-            my_ipv6: None,
+            my_ipv6: "200::1".parse().unwrap(),
             my_hostname: Some(my_hostname.to_string()),
             network_key: None,
             member_count: peers.len(),
@@ -958,11 +944,7 @@ mod grouping_tests {
     }
 
     fn render(net: &ipc::NetworkStatus) -> String {
-        render_in(net, false)
-    }
-
-    fn render_in(net: &ipc::NetworkStatus, ipv6_only: bool) -> String {
-        layout::columns(&grouped_peer_rows(net, &HashMap::new(), 0, 0, ipv6_only), 3)
+        layout::columns(&grouped_peer_rows(net, &HashMap::new(), 0, 0), 3)
     }
 
     #[test]
@@ -990,31 +972,18 @@ mod grouping_tests {
         assert!(out.contains("server"));
     }
 
-    /// The address column has to be one this node can send to. In IPv6-only mode
-    /// the peer's mesh IPv4 is not routed here (another VPN owns the range), so
-    /// printing it would hand out an address that goes nowhere, and this column
-    /// is what people copy into `ssh`.
+    /// The address column has to be one this node can send to, and the mesh
+    /// IPv6 is the only one there is. It is also the column people copy into
+    /// `ssh`, so a stale IPv4 here would be worse than a wide row.
     #[test]
     fn peer_rows_carry_the_reachable_address() {
         let mut p = peer("dev", None, false, true, false);
-        p.ipv6 = Some("200::9".parse().unwrap());
+        p.ipv6 = "200::9".parse().unwrap();
         let net = net("dario", vec![p]);
 
-        let dual = render_in(&net, false);
-        assert!(dual.contains("100.64.0.2"), "{dual}");
-        assert!(!dual.contains("200::9"), "{dual}");
-
-        let v6_only = render_in(&net, true);
-        assert!(v6_only.contains("200::9"), "{v6_only}");
-        assert!(!v6_only.contains("100.64.0.2"), "{v6_only}");
-    }
-
-    /// A peer whose roster entry predates the v6 address still has to render:
-    /// falling back to its mesh IPv4 beats an empty column.
-    #[test]
-    fn peer_without_ipv6_falls_back_to_its_ipv4() {
-        let net = net("dario", vec![peer("dev", None, false, true, false)]);
-        assert!(render_in(&net, true).contains("100.64.0.2"));
+        let out = render(&net);
+        assert!(out.contains("200::9"), "{out}");
+        assert!(!out.contains("100.64."), "{out}");
     }
 
     #[test]
@@ -1026,8 +995,7 @@ mod grouping_tests {
         let dario = iroh::SecretKey::generate().public();
         let primary = ipc::PeerStatus {
             endpoint_id: dario,
-            ip: Ipv4Addr::new(100, 64, 0, 3),
-            ipv6: None,
+            ipv6: "200::3".parse().unwrap(),
             hostname: Some("dario".to_string()),
             user_identity: None,
             is_own_device: false,

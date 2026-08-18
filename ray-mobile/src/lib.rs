@@ -366,6 +366,21 @@ impl Node {
             _ => String::new(),
         }
     }
+
+    /// Our mesh IPv4, derived rather than read back from a response.
+    ///
+    /// The overlay is moving to IPv6 and the control plane no longer reports a
+    /// v4 at all, but the UniFFI records still expose one and the Kotlin screens
+    /// still read it. Deriving it here keeps that surface stable for one more
+    /// step; it goes when the app stops asking for it.
+    fn legacy_ipv4(state: &Arc<DaemonState>) -> String {
+        match state.status() {
+            IpcMessage::StatusResponse { endpoint_id, .. } => {
+                rayfish::membership::derive_ip(&endpoint_id).to_string()
+            }
+            _ => String::new(),
+        }
+    }
 }
 
 /// Build an offline status snapshot from the on-disk config, used when the node
@@ -574,15 +589,11 @@ impl Node {
         ));
 
         match result {
-            IpcMessage::Joined {
-                name,
-                my_ip,
-                my_ipv6,
-            } => Ok(NetworkInfo {
+            IpcMessage::Joined { name, my_ipv6 } => Ok(NetworkInfo {
                 name,
                 node_id: Self::node_id(&state),
-                ipv4: my_ip.to_string(),
-                ipv6: my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
+                ipv4: Self::legacy_ipv4(&state),
+                ipv6: my_ipv6.to_string(),
                 pending: false,
             }),
             // Closed network without a valid invite: queued for coordinator approval
@@ -613,16 +624,11 @@ impl Node {
             .block_on(state.create_network(GroupMode::default(), name, None));
 
         match result {
-            IpcMessage::Created {
-                name,
-                my_ip,
-                my_ipv6,
-                ..
-            } => Ok(NetworkInfo {
+            IpcMessage::Created { name, my_ipv6, .. } => Ok(NetworkInfo {
                 name,
                 node_id: Self::node_id(&state),
-                ipv4: my_ip.to_string(),
-                ipv6: my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
+                ipv4: Self::legacy_ipv4(&state),
+                ipv6: my_ipv6.to_string(),
                 pending: false,
             }),
             IpcMessage::Error { message } => Err(RayError::Network(message)),
@@ -1263,7 +1269,7 @@ impl Node {
                 .peers
                 .iter()
                 .map(|p| PeerInfo {
-                    ipv4: p.ip.to_string(),
+                    ipv4: rayfish::membership::derive_ip(&p.endpoint_id).to_string(),
                     node_id: p.endpoint_id.to_string(),
                     hostname: p.hostname.clone().unwrap_or_default(),
                     state: p.state.into(),
@@ -1277,8 +1283,8 @@ impl Node {
             }));
             detail.push(NetworkDetail {
                 name: n.name.clone(),
-                ipv4: n.my_ip.to_string(),
-                ipv6: n.my_ipv6.map(|v| v.to_string()).unwrap_or_default(),
+                ipv4: rayfish::membership::derive_ip(&endpoint_id).to_string(),
+                ipv6: n.my_ipv6.to_string(),
                 hostname: n.my_hostname.clone().unwrap_or_default(),
                 is_coordinator: n.role.is_coordinator(),
                 peers,
@@ -1287,29 +1293,12 @@ impl Node {
         // Present networks in a stable alphabetical order so the UI list does
         // not shuffle between status refreshes with the core's iteration order.
         detail.sort_by_key(|n| n.name.to_lowercase());
-        // The node's own mesh IPs are the same across networks (derived
-        // from its identity); take them from the first network if any. With no
-        // networks yet, derive the IPv4 from our identity so the tunnel still
-        // gets our real mesh address (the same value every network would use)
-        // instead of a placeholder.
-        //
-        // The IPv6 falls back to the derived value even when a network *is*
-        // joined, because a roster entry can carry no IPv6 (an old record, a
-        // peer that predates the v6 field). The derivation is the same blake3 of
-        // our identity that put the address on the roster in the first place, so
-        // this is the address either way. An IPv6-only tunnel has nothing to
-        // bind without it.
-        let (ipv4, ipv6) = networks
-            .first()
-            .map(|n| (n.my_ip.to_string(), n.my_ipv6.map(|v| v.to_string())))
-            .unwrap_or_else(|| {
-                (
-                    rayfish::membership::derive_ip(&endpoint_id).to_string(),
-                    None,
-                )
-            });
-        let ipv6 =
-            ipv6.unwrap_or_else(|| rayfish::membership::derive_ipv6(&endpoint_id).to_string());
+        // Both of the node's own mesh addresses derive from its identity, so
+        // neither needs a joined network to be known. The IPv6 is the address
+        // the tunnel binds; the IPv4 is a display-only leftover this shim still
+        // exposes over UniFFI, and it goes when the Kotlin side stops reading it.
+        let ipv4 = rayfish::membership::derive_ip(&endpoint_id).to_string();
+        let ipv6 = rayfish::membership::derive_ipv6(&endpoint_id).to_string();
 
         Status {
             running: active,

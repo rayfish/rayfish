@@ -373,8 +373,7 @@ impl NetworkRegistry {
         Ok(IpcMessage::Created {
             name: name.to_string(),
             network_key: net_public_key,
-            my_ip,
-            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
+            my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
         })
     }
 
@@ -589,9 +588,9 @@ impl NetworkRegistry {
                 // are told apart inside the arm rather than by pattern.
                 Ok(TryJoin::Joined(resp)) => match *resp {
                     IpcMessage::Joined {
-                        ref name, my_ip, ..
+                        ref name, my_ipv6, ..
                     } => {
-                        tracing::info!(network = %name, ip = %my_ip, attempt, "restored member network");
+                        tracing::info!(network = %name, ip = %my_ipv6, attempt, "restored member network");
                         return;
                     }
                     // Not reachable today (a reconnect handshake only ever returns

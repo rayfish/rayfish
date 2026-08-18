@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{IoSlice, IoSliceMut};
 use std::marker::PhantomData;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv6Addr;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -390,13 +390,11 @@ pub enum IpcMessage {
     Created {
         name: String,
         network_key: EndpointId,
-        my_ip: Ipv4Addr,
-        my_ipv6: Option<Ipv6Addr>,
+        my_ipv6: Ipv6Addr,
     },
     Joined {
         name: String,
-        my_ip: Ipv4Addr,
-        my_ipv6: Option<Ipv6Addr>,
+        my_ipv6: Ipv6Addr,
     },
     StatusResponse {
         endpoint_id: EndpointId,
@@ -776,8 +774,7 @@ pub struct PendingFileInfo {
 pub struct NetworkStatus {
     pub name: String,
     pub role: NetworkRole,
-    pub my_ip: Ipv4Addr,
-    pub my_ipv6: Option<Ipv6Addr>,
+    pub my_ipv6: Ipv6Addr,
     pub my_hostname: Option<String>,
     pub network_key: Option<String>,
     pub member_count: usize,
@@ -828,8 +825,7 @@ pub enum NetworkRole {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PeerStatus {
     pub endpoint_id: EndpointId,
-    pub ip: Ipv4Addr,
-    pub ipv6: Option<Ipv6Addr>,
+    pub ipv6: Ipv6Addr,
     pub hostname: Option<String>,
     pub user_identity: Option<EndpointId>,
     /// True when this peer is another of the local user's own paired devices
@@ -1344,8 +1340,7 @@ mod tests {
         let resp = IpcMessage::Created {
             name: "test".to_string(),
             network_key: key,
-            my_ip: Ipv4Addr::new(100, 64, 10, 5),
-            my_ipv6: None,
+            my_ipv6: Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 5),
         };
         let bytes = rmp_serde::to_vec_named(&resp).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
@@ -1353,12 +1348,11 @@ mod tests {
             IpcMessage::Created {
                 name,
                 network_key,
-                my_ip,
-                ..
+                my_ipv6,
             } => {
                 assert_eq!(name, "test");
                 assert_eq!(network_key, key);
-                assert_eq!(my_ip, Ipv4Addr::new(100, 64, 10, 5));
+                assert_eq!(my_ipv6, Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 5));
             }
             _ => panic!("wrong variant"),
         }
@@ -1590,15 +1584,13 @@ mod tests {
             networks: vec![NetworkStatus {
                 name: "gaming".to_string(),
                 role: NetworkRole::Coordinator,
-                my_ip: Ipv4Addr::new(100, 64, 10, 5),
-                my_ipv6: None,
+                my_ipv6: Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 5),
                 my_hostname: Some("alice".to_string()),
                 network_key: Some("abc123".to_string()),
                 member_count: 2,
                 peers: vec![PeerStatus {
                     endpoint_id: peer_id,
-                    ip: Ipv4Addr::new(100, 64, 10, 6),
-                    ipv6: None,
+                    ipv6: Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 6),
                     hostname: None,
                     user_identity: None,
                     is_own_device: false,
