@@ -158,7 +158,7 @@ REPORT="$RESDIR/$STAMP.md"
 {
   echo "# Rayfish benchmark — $STAMP"
   echo
-  echo "Two Scaleway $(grep srv-a "$SERVERS" >/dev/null && echo DEV1-S) instances, same zone."
+  echo "Two droplets in region $(awk 'NR==1{print $4}' "$SERVERS"), same region."
   echo "iperf3 TCP, ${DURATION}s/run, mean of ${ITERATIONS} iterations; ping = mean RTT over 20 packets."
   echo "tx = client→server, rx = server→client (iperf3 -R)."
   echo

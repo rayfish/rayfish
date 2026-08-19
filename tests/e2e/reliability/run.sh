@@ -8,7 +8,7 @@
 # Open networks form a full mesh: once everyone has joined, every pair holds a
 # direct QUIC connection. We then probe every unordered pair in BOTH directions,
 # over two paths:
-#   - direct   : the host's PUBLIC IP (raw Scaleway link, the baseline)
+#   - direct   : the host's PUBLIC IP (raw provider link, the baseline)
 #   - rayfish  : the peer's 200::/7 TUN IP (iroh QUIC datagrams over the VPN)
 #
 # Three probes per direction, each run over both paths:
@@ -198,7 +198,7 @@ REPORT="$RESDIR/$STAMP.md"
 {
   echo "# Rayfish reliability — $STAMP"
   echo
-  echo "Four Scaleway instances, OPEN network full mesh."
+  echo "Four droplets, OPEN network full mesh."
   echo "Loss % per probe; a probe fails when rayfish exceeds direct by > ${MARGIN}pp."
   echo "icmp = ping -c $PING_COUNT -i 0.01; flood = ping -f -c $FLOOD_COUNT; udp = iperf3 -u -b $RATE -t ${DURATION}s."
   echo

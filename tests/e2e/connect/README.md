@@ -1,7 +1,7 @@
 # `ray connect` direct-connection e2e
 
 End-to-end test for the **direct 2-peer connection** flow (`ray connect`) over two
-real Scaleway hosts and the public pkarr DHT. Companion to the 3-peer device-cert
+real cloud hosts and the public pkarr DHT. Companion to the 3-peer device-cert
 test in `tests/e2e/device-cert/`; shared plumbing lives in `tests/lib/`.
 
 ## Topology
@@ -26,15 +26,15 @@ srv-b  identity V   recipient   (ray connect approve <id>)
 ## Usage
 
 ```bash
-# Requires: scw (authenticated), jq, just, cross + docker, an SSH key.
+# Requires: doctl (authenticated), jq, just, cross + docker, an SSH key.
 tests/e2e.sh connect             # provision (if needed), cross-build, deploy, drive, assert
-tests/e2e.sh connect provision   # just spin up 2 DEV1-S instances -> .servers
+tests/e2e.sh connect provision   # just spin up 2 droplets -> .servers
 tests/e2e.sh connect teardown    # destroy the instances when done
 ```
 
 `tests/e2e.sh` is the shared dispatcher (the scenario steps live in `run.sh`,
-which you can also invoke directly once `.servers` exists). Env knobs: `ZONE`,
-`TYPE`, `IMAGE` (provision); `SSH_KEY`, `KEEP_STATE=1` (run, skips the per-run
+which you can also invoke directly once `.servers` exists). Env knobs: `REGION`,
+`SIZE`, `IMAGE` (provision); `SSH_KEY`, `KEEP_STATE=1` (run, skips the per-run
 state reset). The run is re-runnable — it resets rayfish state on each host
 (fresh identities, contact ids, and a fresh direct network) unless
 `KEEP_STATE=1`.

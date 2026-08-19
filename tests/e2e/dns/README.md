@@ -33,7 +33,7 @@ See [`../README.md`](../README.md) for prerequisites and environment overrides.
 
 ## Note on the umbrelOS case
 
-Stock Scaleway Ubuntu runs systemd-resolved, so the split-DNS path is usually
+Stock DigitalOcean Ubuntu runs systemd-resolved, so the split-DNS path is usually
 taken and step 6 is skipped. The hardest real-world environment (NetworkManager
 in default mode **with** a `:53` resolver like AdGuard, which forces the direct
 takeover) is covered by step 4's coexistence guarantee plus the conditional
