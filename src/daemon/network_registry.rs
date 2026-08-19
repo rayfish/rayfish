@@ -120,11 +120,6 @@ pub(crate) struct NetworkRegistry {
     /// fires while the data plane is down (boot, standby) from withdrawing an
     /// offer that `activate()` is about to re-advertise.
     pub(crate) exit_sync_enabled: AtomicBool,
-    /// Whether this node's data plane is IPv6-only (`AppConfig::ipv6_only`).
-    /// Fixed for the daemon's lifetime (the TUN's addressing is decided at
-    /// startup), and advertised on every network's signed roster so peers stop
-    /// resolving us to a mesh IPv4 that carries nothing. See `mesh/ipv6_only.rs`.
-    pub(crate) ipv6_only: bool,
     /// Networks whose restore is already running, so a sweep never starts a
     /// second one for the same network. Removed when the restore finishes,
     /// however it finishes.
@@ -200,7 +195,6 @@ impl NetworkRegistry {
         disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
         on_demand: bool,
         idle_timeout: Duration,
-        ipv6_only: bool,
     ) -> Self {
         Self {
             networks,
@@ -227,7 +221,6 @@ impl NetworkRegistry {
             exit_install_error: ArcSwapOption::empty(),
             exit_reapply: Arc::new(Notify::new()),
             exit_sync_enabled: AtomicBool::new(false),
-            ipv6_only,
             restoring: Arc::new(DashSet::new()),
             restore_nudge: Arc::new(Notify::new()),
             poll_nudge: Arc::new(Notify::new()),
@@ -691,7 +684,6 @@ impl NetworkRegistry {
                 exit_families: ExitFamilies::Unknown,
                 // Our own entry starts out truthful, so the first published blob
                 // already tells peers not to use our mesh IPv4.
-                ipv6_only: self.ipv6_only,
             });
 
         let mut approved = ApprovedList::new();

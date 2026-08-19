@@ -5,7 +5,6 @@ use std::collections::HashMap;
 
 use iroh::EndpointId;
 
-use crate::config::Ipv6Only;
 use crate::*;
 
 /// Human-readable byte size (GiB/MiB/KiB/B) for traffic and transfer counters.
@@ -137,7 +136,6 @@ pub(crate) async fn ipc_status() -> Result<()> {
             endpoint_id,
             mdns_enabled,
             auto_update,
-            ipv6_only,
             active,
             contact_id,
             daemon_version,
@@ -165,8 +163,6 @@ pub(crate) async fn ipc_status() -> Result<()> {
                         }))
                         .collect::<Vec<_>>(),
                     "auto_update": auto_update,
-                    // "on", "off", or "auto" (on, chosen by the daemon).
-                    "ipv6_only": ipv6_only,
                     "active": active,
                     "contact_id": contact_id,
                     "daemon_version": daemon_version,
@@ -205,30 +201,13 @@ pub(crate) async fn ipc_status() -> Result<()> {
             } else {
                 String::new()
             };
-            // Same treatment for IPv6-only: off is the default, so only say
-            // something when the data plane is actually running without IPv4.
-            // `(auto)` marks a mode the daemon chose on finding another VPN on
-            // `100.64.0.0/10`, which nobody would otherwise know to expect.
-            let v6only = match ipv6_only {
-                Ipv6Only::Off => String::new(),
-                mode => {
-                    let how = match mode {
-                        Ipv6Only::Auto => {
-                            format!("{} {}", style::green("on"), style::faint("(auto)"))
-                        }
-                        _ => style::green("on").to_string(),
-                    };
-                    format!("      {} {how}", style::label("ipv6-only"))
-                }
-            };
             println!();
             println!(
-                "  {}  {}      {}{}{}      {} {}",
+                "  {}  {}      {}{}      {} {}",
                 style::bold("rayfish"),
                 state,
                 mdns,
                 auto,
-                v6only,
                 style::label("endpoint"),
                 style::value(&endpoint_id.fmt_short().to_string()),
             );

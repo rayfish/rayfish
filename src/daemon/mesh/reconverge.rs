@@ -268,7 +268,6 @@ pub(crate) async fn reconverge_and_apply(
         // so the apply path below would never run and the offer would stay
         // invisible forever. Quiet no-op when the flag already matches.
         registry.sync_exit_offers().await;
-        registry.sync_ipv6_only().await;
         return;
     }
     // The record names a different blob than we hold. Take it only if it was
@@ -368,7 +367,6 @@ pub(crate) async fn reconverge_and_apply(
     // the activation-time one, which can fire before any network is connected
     // and go to zero peers. Quiet no-op when the flag already matches.
     registry.sync_exit_offers().await;
-    registry.sync_ipv6_only().await;
     registry.nudge_exit_reapply();
     tracing::info!(network = %network_name, "reconverged from signed record");
 }
@@ -621,7 +619,6 @@ pub(crate) fn spawn_group_poller(
             // blob, so no reconverge trigger would ever heal it. Quiet local
             // no-op when the flag already matches.
             registry.sync_exit_offers().await;
-            registry.sync_ipv6_only().await;
 
             let (remote_hash, seed_peers) = match dht::resolve_network(&client, net_pubkey).await {
                 Ok(r) => r,
@@ -783,7 +780,6 @@ pub(crate) async fn fetch_and_apply_blob(
     // nudge the daemon to re-run the exit reconcile rather than leaking traffic
     // until the next `ray up`. All cheap no-ops otherwise.
     registry.sync_exit_offers().await;
-    registry.sync_ipv6_only().await;
     registry.nudge_exit_reapply();
     ReconvergeOutcome::Applied
 }
@@ -812,7 +808,6 @@ mod self_nullified_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         }
     }
 

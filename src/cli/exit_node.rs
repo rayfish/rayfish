@@ -101,7 +101,6 @@ fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>) {
                 "using": n.using,
                 "available": n.available,
                 "available_v6": n.available_v6,
-                "ipv6_only": n.ipv6_only,
                 "refused": n.refused,
                 "not_in_effect": n.not_in_effect,
                 "tunnel_v4": n.tunnel_v4,
@@ -161,7 +160,7 @@ fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>) {
                 .map(|peer| {
                     if n.refused.contains(peer) {
                         format!("{peer} (unusable from this node)")
-                    } else if n.ipv6_only && n.available_v6.contains(peer) {
+                    } else if n.available_v6.contains(peer) {
                         format!("{peer} (IPv6)")
                     } else {
                         peer.clone()

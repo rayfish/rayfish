@@ -213,17 +213,6 @@ pub enum ControlMsg {
         #[serde(default)]
         exit_families: ExitFamilies,
     },
-    /// Member -> coordinators: announce whether this sender's data plane is
-    /// IPv6-only (`ray config set ipv6-only on`), meaning its mesh IPv4 is
-    /// assigned but not routed because another VPN owns `100.64.0.0/10` there.
-    /// The coordinator records it on the sender's roster entry
-    /// (`Member.ipv6_only`) and republishes, so peers stop handing out an A
-    /// record whose replies would leave through the other VPN. A self-claim
-    /// about the sender's own addressing, same shape as [`Self::ExitNodeOffer`].
-    /// Scoped to the enclosing [`ControlFrame`]'s `net`.
-    Ipv6Only {
-        enabled: bool,
-    },
     /// Coordinator grants the per-network secret key to another member, making it
     /// a co-coordinator (can publish the signed blob / suggest firewall rules).
     /// Sent over the network's authenticated mesh ALPN, so only the targeted peer
@@ -577,7 +566,6 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
             }],
         };
         let bytes = encode_msg(None, &msg);
@@ -820,7 +808,6 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
             }],
             approved: vec![ApprovedEntry {
                 identity: test_id(2),

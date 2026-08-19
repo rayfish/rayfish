@@ -100,52 +100,40 @@ impl ExitFamilies {
         matches!(self, Self::Unknown)
     }
 
-    /// What a client tunnel through this gateway actually carries, given the
-    /// client's own data plane.
+    /// What a client tunnel through this gateway actually carries.
     ///
-    /// The intersection of the two, because both ends have to hold for a family
-    /// to survive the round trip: our data plane has to route it (an IPv6-only
-    /// node never routes mesh IPv4, so it cannot source transit from it) and the
-    /// gateway has to be able to egress it and get the reply back. A family only
-    /// one side can carry is not a tunnel, it is a black hole, so it is left to
-    /// leave directly and the user is told.
+    /// Only ever [`Self::V6`] or [`Self::Neither`]: the overlay carries no IPv4,
+    /// so a client cannot source transit from a mesh IPv4 whatever the gateway
+    /// claims, and a claim of [`Self::V4`] or [`Self::Dual`] narrows to its IPv6
+    /// half. A tunnel that carries nothing is not a tunnel, so `Neither` is what
+    /// the caller refuses on.
     ///
-    /// [`Self::Unknown`] counts as "can carry", which is the same exemption the
-    /// refusal makes: the claim is absent on every network whose coordinator
-    /// predates the field, and narrowing a tunnel on the strength of nothing
-    /// would quietly stop tunnelling a family that works.
-    ///
-    /// [`Self::Neither`] out means there is nothing to install at all, which is
-    /// the only case the caller refuses on.
-    pub fn tunnelled(self, client_ipv6_only: bool) -> Self {
-        let assume = self.is_unknown();
-        let v6 = assume || self.carries_v6();
-        let v4 = !client_ipv6_only && (assume || self.carries_v4());
-        match (v4, v6) {
-            (true, true) => Self::Dual,
-            (true, false) => Self::V4,
-            (false, true) => Self::V6,
-            (false, false) => Self::Neither,
+    /// [`Self::Unknown`] counts as "can carry": the claim is absent on every
+    /// network whose coordinator predates the field, and narrowing a tunnel on
+    /// the strength of nothing would quietly stop tunnelling a family that works.
+    pub fn tunnelled(self) -> Self {
+        if self.is_unknown() || self.carries_v6() {
+            Self::V6
+        } else {
+            Self::Neither
         }
     }
 
     /// The claim a gateway makes about itself: whether it found an IPv6 default
-    /// route, and whether its own data plane carries IPv4 at all.
+    /// route to masquerade onto.
     ///
-    /// The two inputs are independent, so all four states are reachable, and
-    /// [`Self::Neither`] is not a theoretical corner: it is what an IPv6-only
-    /// host on an ordinary IPv4 uplink is, which is the most common shape of the
-    /// configuration this whole mode exists for. Folding it into [`Self::V4`]
-    /// (as an earlier draft of this did) makes it a *positive*
-    /// claim to carry IPv4 that a dual-stack client accepts, which is the silent
-    /// black hole the type exists to prevent, produced by the ordinary setup.
-    pub fn from_uplink(has_v6: bool, ipv6_only: bool) -> Self {
-        match (has_v6, ipv6_only) {
-            (true, false) => Self::Dual,
-            (true, true) => Self::V6,
-            (false, false) => Self::V4,
-            (false, true) => Self::Neither,
-        }
+    /// Only [`Self::V6`] or [`Self::Neither`] is produced. The IPv4 half of the
+    /// old claim is gone with the overlay's IPv4: a gateway assigns no mesh IPv4
+    /// and installs no `100.64.0.0/10` route, so an un-NATted IPv4 reply has no
+    /// way back into its TUN and it could never honestly claim to carry that
+    /// family. `Neither` is not a theoretical corner: it is what a host with no
+    /// IPv6 uplink is, and refusing it is the whole point of the type.
+    ///
+    /// [`Self::V4`] and [`Self::Dual`] survive as *decodable* variants because
+    /// this rides the signed roster and a claim is read as well as written;
+    /// [`Self::tunnelled`] narrows either to IPv6.
+    pub fn from_uplink(has_v6: bool) -> Self {
+        if has_v6 { Self::V6 } else { Self::Neither }
     }
 }
 
@@ -174,14 +162,6 @@ pub struct Member {
     /// makes clients dial a node that drops them.
     #[serde(default)]
     pub exit_node: bool,
-    /// This member's data plane is IPv6-only, so its `ip` is assigned but not
-    /// routed: another VPN owns `100.64.0.0/10` on that host. A self-claim, same
-    /// shape as `exit_node` and carried the same way
-    /// (`ControlMsg::Ipv6Only` -> coordinator -> signed blob). Peers use it to
-    /// withhold the member's A record, since packets sent to that address arrive
-    /// but the replies leave through the other VPN.
-    #[serde(default)]
-    pub ipv6_only: bool,
     /// Which families the exit node this member offers can egress, i.e. whether
     /// that host has an IPv6 default route to masquerade onto, and whether its own
     /// data plane routes the mesh IPv4 a reply comes back on. Meaningless unless
@@ -708,7 +688,6 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         };
         list.add(member.clone());
         assert!(list.is_member(&id));
@@ -728,7 +707,6 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         });
         list.add(Member {
             identity: id,
@@ -739,7 +717,6 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         });
         assert!(list.get(&id).unwrap().is_coordinator);
     }
@@ -757,7 +734,6 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         });
         let removed = list.remove(&id);
         assert!(removed.is_some());
@@ -777,7 +753,6 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         });
         list.add(Member {
             identity: test_id(2),
@@ -788,7 +763,6 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         });
         assert_eq!(list.all().len(), 2);
     }
@@ -885,7 +859,6 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
             });
         }
         list
@@ -906,7 +879,6 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         });
 
         // Mesh IPv6 literal -> the member's device id.
@@ -1098,7 +1070,6 @@ mod tests {
                 last_seen: Some(12345),
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
             });
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
@@ -1139,7 +1110,6 @@ mod tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
             });
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
@@ -1311,23 +1281,16 @@ mod tests {
         assert_eq!(decoded.identity, id);
         assert_eq!(decoded.hostname.as_deref(), Some("box"));
         assert!(decoded.exit_node);
-        // The two appended fields take their defaults rather than failing.
+        // The appended field takes its default rather than failing.
         assert_eq!(decoded.exit_families, ExitFamilies::Unknown);
-        assert!(!decoded.ipv6_only);
 
         // Every field is now written, claimed or not: there is no key to omit.
         // A round-trip is the property that survives, not a byte comparison.
-        for (families, ipv6_only) in [
-            (ExitFamilies::Unknown, false),
-            (ExitFamilies::V4, true),
-            (ExitFamilies::Dual, false),
-        ] {
+        for families in [ExitFamilies::Unknown, ExitFamilies::V4, ExitFamilies::Dual] {
             let mut m = decoded.clone();
             m.exit_families = families;
-            m.ipv6_only = ipv6_only;
             let round: Member = rmp_serde::from_slice(&rmp_serde::to_vec(&m).unwrap()).unwrap();
             assert_eq!(round.exit_families, families);
-            assert_eq!(round.ipv6_only, ipv6_only);
         }
     }
 
@@ -1383,7 +1346,6 @@ mod tests {
                     1 => ExitFamilies::Dual,
                     _ => ExitFamilies::Unknown,
                 },
-                ipv6_only: false,
             });
             released.push(ReleasedMember {
                 identity: id,
@@ -1440,7 +1402,6 @@ mod tests {
             is_coordinator: bool,
             hostname: Option<String>,
             exit_node: bool,
-            ipv6_only: bool,
             // No `exit_families`: a key this build knows and that one never wrote.
         }
         #[derive(Serialize)]
@@ -1455,7 +1416,6 @@ mod tests {
                 is_coordinator: true,
                 hostname: Some("box".into()),
                 exit_node: true,
-                ipv6_only: true,
             }],
             approved: vec![],
         })
@@ -1464,40 +1424,29 @@ mod tests {
         let blob = decode_group_blob(&bytes).expect("a named map still decodes");
         assert_eq!(blob.members.len(), 1);
         assert!(blob.members[0].exit_node);
-        assert!(blob.members[0].ipv6_only);
         assert_eq!(blob.members[0].exit_families, ExitFamilies::Unknown);
         // And re-encoding it compactly gives different bytes, which is what makes
         // the local snapshot hash disagree with the signed one.
         assert_ne!(rmp_serde::to_vec(&blob).unwrap(), bytes);
     }
 
-    /// A tunnel carries what both ends can carry, and nothing else.
+    /// A tunnel carries IPv6 or it carries nothing.
     ///
-    /// The cases that used to be a refusal or a black hole are the mixed ones: a
-    /// dual-stack client through a gateway that can only return one family. The
-    /// family that works is tunnelled and the other leaves directly, which is
-    /// the same trade IPv6-only mode already makes with its own data plane.
+    /// The overlay routes no IPv4, so a client cannot source transit from a mesh
+    /// IPv4 whatever the gateway claims. A claim that includes IPv4 narrows to
+    /// its IPv6 half rather than being taken at face value.
     #[test]
-    fn a_tunnel_carries_the_intersection_of_both_ends() {
+    fn a_tunnel_carries_ipv6_or_nothing() {
         use ExitFamilies::{Dual, Neither, Unknown, V4, V6};
 
-        // Dual-stack client: the gateway's claim is the whole answer.
-        assert_eq!(Dual.tunnelled(false), Dual);
-        assert_eq!(V6.tunnelled(false), V6, "IPv4 would die at the gateway");
-        assert_eq!(V4.tunnelled(false), V4, "IPv6 would have nowhere to egress");
-        assert_eq!(Neither.tunnelled(false), Neither);
-
-        // IPv6-only client: never IPv4, whatever the gateway says, because this
-        // node has no routed mesh IPv4 to source transit from.
-        assert_eq!(Dual.tunnelled(true), V6);
-        assert_eq!(V6.tunnelled(true), V6);
-        assert_eq!(V4.tunnelled(true), Neither, "nothing left to install");
-        assert_eq!(Neither.tunnelled(true), Neither);
+        assert_eq!(Dual.tunnelled(), V6, "the IPv4 half has nowhere to come back");
+        assert_eq!(V6.tunnelled(), V6);
+        assert_eq!(V4.tunnelled(), Neither, "nothing left to install");
+        assert_eq!(Neither.tunnelled(), Neither);
 
         // No claim means no narrowing: every network whose coordinator predates
-        // the field would otherwise lose a family that works.
-        assert_eq!(Unknown.tunnelled(false), Dual);
-        assert_eq!(Unknown.tunnelled(true), V6);
+        // the field would otherwise lose the one family that works.
+        assert_eq!(Unknown.tunnelled(), V6);
     }
 
     /// The default claim rides every roster entry, so its tag is sized for that.
@@ -1546,14 +1495,12 @@ mod tests {
             user_identity: Option<EndpointId>,
             device_cert: Option<DeviceCert>,
             last_seen: Option<u64>,
-            exit_node: bool,
-            // The released shape ends here. `exit_families` is appended after
-            // this, so what an older build sees is simply one element too many:
-            // every slot it does read still means what it meant. Inserted
-            // anywhere above instead, the failure would depend on the types that
-            // happened to line up, which is the thing the append rule exists to
-            // take off the table.
-            ipv6_only: bool,
+            // The older shape ends here. `exit_families` is appended after this,
+            // so what an older build sees is simply one element too many: every
+            // slot it does read still means what it meant. Inserted anywhere
+            // above instead, the failure would depend on the types that happened
+            // to line up, which is the thing the append rule exists to take off
+            // the table.
         }
         let id = test_id(11);
         let bytes = rmp_serde::to_vec(&Member {
@@ -1565,7 +1512,6 @@ mod tests {
             last_seen: None,
             exit_node: true,
             exit_families: ExitFamilies::Dual,
-            ipv6_only: false,
         })
         .unwrap();
 
@@ -1577,51 +1523,43 @@ mod tests {
         );
     }
 
-    /// Reordering two same-typed fields silently swaps their values, and this is
-    /// the one way the compact wire fails without saying so.
+    /// Reordering two same-typed fields is the one way the compact wire fails
+    /// without saying so.
     ///
     /// A shift between differently-typed fields errors loudly ("invalid type"),
-    /// which is survivable. Between two `bool`s there is nothing to detect: the
-    /// bytes are valid, the struct decodes, and `exit_node` now holds what
-    /// `ipv6_only` meant. Declaration order *is* the wire format here, and a diff
-    /// that merely moves a line does not look like a protocol change, so this is
-    /// recorded as a test rather than left to review.
+    /// which is survivable. Between two fields of the same type there is nothing
+    /// to detect: the bytes are valid, the struct decodes, and each field now
+    /// holds what the other meant. Declaration order *is* the wire format here,
+    /// and a diff that merely moves a line does not look like a protocol change,
+    /// so this is recorded as a test rather than left to review.
+    ///
+    /// Pinned against a local pair rather than whichever `Member` fields happen
+    /// to be adjacent today: the hazard belongs to the codec, and tying the test
+    /// to one struct's current layout makes it vanish the moment that layout
+    /// changes, which is exactly when it is needed.
     #[test]
     fn reordering_same_typed_fields_silently_swaps_them() {
         #[derive(Serialize)]
-        struct Reordered {
-            identity: EndpointId,
-            is_coordinator: bool,
-            hostname: Option<String>,
-            user_identity: Option<EndpointId>,
-            device_cert: Option<DeviceCert>,
-            last_seen: Option<u64>,
-            // `ipv6_only` and `exit_node` swapped relative to `Member`. Both are
-            // `bool`, and they are adjacent, which is the whole hazard: a diff that
-            // moves one line past the other changes the wire and looks like
-            // nothing. `exit_families` stays last, where `Member` has it.
-            ipv6_only: bool,
-            exit_node: bool,
-            exit_families: ExitFamilies,
+        struct Written {
+            first: bool,
+            second: bool,
         }
-        let id = test_id(9);
-        let bytes = rmp_serde::to_vec(&Reordered {
-            identity: id,
-            is_coordinator: false,
-            hostname: Some("box".into()),
-            user_identity: None,
-            device_cert: None,
-            last_seen: None,
-            ipv6_only: true,
-            exit_node: false,
-            exit_families: ExitFamilies::Dual,
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct Read {
+            // The same two fields, declared the other way round.
+            second: bool,
+            first: bool,
+        }
+        let bytes = rmp_serde::to_vec(&Written {
+            first: true,
+            second: false,
         })
         .unwrap();
 
-        let decoded: Member = rmp_serde::from_slice(&bytes).expect("decodes without complaint");
+        let decoded: Read = rmp_serde::from_slice(&bytes).expect("decodes without complaint");
         // No error, and both booleans now say the opposite of what was sent.
-        assert!(decoded.exit_node, "ipv6_only was read as exit_node");
-        assert!(!decoded.ipv6_only, "exit_node was read as ipv6_only");
+        assert!(decoded.second, "`first` was read as `second`");
+        assert!(!decoded.first, "`second` was read as `first`");
     }
 
     // -- reusable keys --------------------------------------------------------
@@ -1824,7 +1762,6 @@ mod tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         });
         mark_coordinator(&mut list, &id);
         assert!(list.get(&id).unwrap().is_coordinator);

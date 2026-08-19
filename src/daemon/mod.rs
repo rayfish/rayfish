@@ -105,11 +105,7 @@ pub(crate) use mesh::*;
 // `run_daemon` (the `ray daemon` entry point) stays public for the binary.
 pub use mesh::run_daemon;
 // `build_headless` is the embedder (mobile) construction entry point.
-pub use mesh::{build_headless, build_headless_with_setting};
-// The IPv6-only decision, resolved from a tri-state setting plus a scan of this
-// host. Public because the embedder (mobile) holds its own copy of the setting.
-use crate::config::Ipv6Only;
-pub use mesh::resolve_ipv6_only;
+pub use mesh::build_headless;
 
 /// Legacy name for [`Daemon`], kept so embedders (`ray-mobile`) that were
 /// written against `DaemonState` compile unchanged after the daemon refactor.
@@ -527,17 +523,6 @@ pub struct Daemon {
     /// startup; when set, `run_daemon` spawns the periodic update task. Echoed
     /// back in `ray status`.
     auto_update: bool,
-    /// The resolved data-plane mode (`ray config set ipv6-only on`), for
-    /// sharing a host with another VPN that owns `100.64.0.0/10`. Resolved once
-    /// at startup because the TUN's addressing is decided there; `ray up
-    /// --ipv6-only` persists the setting and asks for a restart rather than
-    /// pretending to apply it live.
-    ///
-    /// [`Ipv6Only::Auto`] here is not "undecided": it is the mode, on, with the
-    /// startup scan having chosen it rather than the operator, which `ray
-    /// status` reports so a mode nobody asked for still explains itself. Ask
-    /// [`Ipv6Only::enabled`] whether mesh IPv4 carries traffic.
-    pub(crate) ipv6_only: Ipv6Only,
     /// Name of the OS TUN device (desktop) or a placeholder until a packet
     /// interface is attached. Interior-mutable because on embedders (mobile) the
     /// interface is attached after construction via [`Daemon::attach_tun`],
@@ -973,7 +958,6 @@ impl Daemon {
                 | GlobalKey::DnsUpstreams
                 | GlobalKey::AutoUpdate
                 | GlobalKey::OnDemand
-                | GlobalKey::Ipv6Only
                 | GlobalKey::DownloadDir
                 | GlobalKey::DownloadUser),
             ) => k,
@@ -1112,10 +1096,7 @@ impl Daemon {
             IpcMessage::Kick { network, peer } => self.registry.kick_member(&network, &peer).await,
             IpcMessage::Status => self.status(),
             IpcMessage::Report => self.build_report(peer_cred),
-            IpcMessage::Up {
-                hostname,
-                ipv6_only,
-            } => self.activate(hostname, ipv6_only).await,
+            IpcMessage::Up { hostname } => self.activate(hostname).await,
             IpcMessage::Down => self.deactivate().await,
             IpcMessage::Shutdown => {
                 self.shutdown_token.cancel();
@@ -1181,7 +1162,7 @@ impl Daemon {
             IpcMessage::ExitNodeUse { network, peer } => {
                 let resp = self
                     .registry
-                    .exit_node_use(&network, peer, self.ipv6_only.enabled())
+                    .exit_node_use(&network, peer)
                     .await;
                 self.reconcile_exit_node(resp).await
             }
@@ -1454,15 +1435,6 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
             format!("download-user cleared. {restart}")
         }
         GlobalKey::DownloadUser => format!("download-user set. {restart}"),
-        // Worth saying what it resolved to rather than echoing the key: `auto`
-        // is not a mode, it is a decision the next start makes.
-        GlobalKey::Ipv6Only => match cfg.ipv6_only {
-            Ipv6Only::On => format!("IPv6-only mode on. {restart}"),
-            Ipv6Only::Off => format!("IPv6-only mode off. {restart}"),
-            Ipv6Only::Auto => format!(
-                "IPv6-only mode automatic: on when another VPN holds 100.64.0.0/10. {restart}"
-            ),
-        },
         // Spelled out rather than caught by `_`, so a new global key cannot
         // inherit this generic wording (and its "Restart the daemon" claim) by
         // default. `Ssh` never reaches here (`config_apply` routes it to
@@ -1967,7 +1939,6 @@ mod absent_member_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         }
     }
 
@@ -2125,7 +2096,6 @@ mod accept_handler_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         }
     }
 
@@ -2289,7 +2259,6 @@ mod accept_handler_tests {
             disconnect_tx,
             false,
             Duration::from_secs(config::DEFAULT_IDLE_TIMEOUT_SECS),
-            false,
         ))
     }
 
@@ -2366,7 +2335,6 @@ mod accept_handler_tests {
                         last_seen: None,
                         exit_node: false,
                         exit_families: ExitFamilies::Unknown,
-                        ipv6_only: false,
                     });
             }
             registry.networks.insert(
@@ -2477,7 +2445,6 @@ mod accept_handler_tests {
                     last_seen: None,
                     exit_node: false,
                     exit_families: ExitFamilies::Unknown,
-                    ipv6_only: false,
                 });
         }
         registry.networks.insert(
@@ -2624,7 +2591,6 @@ mod accept_handler_tests {
                     last_seen: None,
                     exit_node: false,
                     exit_families: ExitFamilies::Unknown,
-                    ipv6_only: false,
                 },
                 Member {
                     identity: member_id,
@@ -2635,7 +2601,6 @@ mod accept_handler_tests {
                     last_seen: None,
                     exit_node: false,
                     exit_families: ExitFamilies::Unknown,
-                    ipv6_only: false,
                 },
             ]
         };
@@ -2859,7 +2824,6 @@ mod coordinator_dial_order_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         };
         let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
         // minter = b: b first, then the other coordinator a, never c (not coord), never me.
@@ -2878,7 +2842,6 @@ mod coordinator_dial_order_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         };
 
         // No coordinators in the roster ⇒ empty order (caller bails).
@@ -2939,7 +2902,6 @@ mod coordinator_dial_order_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         };
         let members = vec![mk(a, true), mk(b, false), mk(c, true)];
         let me = a;
@@ -2959,7 +2921,6 @@ mod coordinator_dial_order_tests {
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         };
         // Only members are us (coordinator) and a plain member: nobody to gossip to.
         let members = vec![mk(me, true), mk(test_id(2), false)];
@@ -3035,7 +2996,7 @@ mod headless_tests {
 
         let daemon = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            build_headless(false, Ipv6Only::Off),
+            build_headless(false),
         )
         .await
         .expect("build_headless should not hang")
@@ -3064,7 +3025,7 @@ mod headless_tests {
 
         let daemon = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            build_headless(false, Ipv6Only::Off),
+            build_headless(false),
         )
         .await
         .expect("build_headless should not hang")
@@ -3119,7 +3080,7 @@ mod headless_tests {
 
         let first = tokio::time::timeout(
             Duration::from_secs(30),
-            build_headless(false, Ipv6Only::Off),
+            build_headless(false),
         )
         .await
         .expect("first build_headless should not hang")
@@ -3151,7 +3112,7 @@ mod headless_tests {
         // And the whole rebuild works, which is what the app actually does.
         tokio::time::timeout(
             Duration::from_secs(30),
-            build_headless(false, Ipv6Only::Off),
+            build_headless(false),
         )
         .await
         .expect("rebuild should not hang")
@@ -3169,7 +3130,7 @@ mod headless_tests {
 
         let daemon = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            build_headless(false, Ipv6Only::Off),
+            build_headless(false),
         )
         .await
         .expect("build_headless should not hang")
@@ -3278,7 +3239,7 @@ mod headless_tests {
 
         let daemon = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            build_headless(false, Ipv6Only::Off),
+            build_headless(false),
         )
         .await
         .expect("build_headless should not hang")

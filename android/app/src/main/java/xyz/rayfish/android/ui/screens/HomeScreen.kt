@@ -19,7 +19,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.FileOffer
-import uniffi.ray_mobile.Ipv6OnlyMode
 import uniffi.ray_mobile.PendingRequest
 import uniffi.ray_mobile.QueuedSend
 import uniffi.ray_mobile.Status
@@ -322,8 +321,7 @@ private fun HomePreview() {
     xyz.rayfish.android.ui.theme.RayfishTheme {
         HomeScreen(
             status = Status(
-                true, "7f3ac2e1", "100.88.0.3", "fd00::7f3a",
-                ipv6Only = Ipv6OnlyMode.OFF,
+                true, "7f3ac2e1", "200::7f3a",
                 peers = emptyList(), networks = emptyList(), pendingNetworks = emptyList(),
             ),
             starting = false, onToast = {},

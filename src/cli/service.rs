@@ -1,7 +1,6 @@
 //! CLI service-management handlers: up, install, start/stop/restart, operator.
 
 use crate::*;
-use rayfish::config::Ipv6Only;
 #[cfg(target_os = "linux")]
 use rayfish::init_system::InitSystem;
 #[cfg(target_os = "macos")]
@@ -87,14 +86,11 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
 /// to bring the TUN up, configure DNS, and reconnect networks. Only when no
 /// daemon is reachable do we fall back to installing/starting the system
 /// service, which requires root.
-pub(crate) async fn cmd_up(hostname: Option<String>, ipv6_only: Option<Ipv6Only>) -> Result<()> {
+pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
     if let Ok(mut stream) = ipc::connect().await {
         ipc::send(
             &mut stream,
-            ipc::IpcMessage::Up {
-                hostname,
-                ipv6_only,
-            },
+            ipc::IpcMessage::Up { hostname },
         )
         .await?;
         match ipc::recv(&mut stream).await? {
@@ -113,7 +109,7 @@ pub(crate) async fn cmd_up(hostname: Option<String>, ipv6_only: Option<Ipv6Only>
         );
         std::process::exit(1);
     }
-    install_and_start_service(hostname, ipv6_only).await
+    install_and_start_service(hostname).await
 }
 
 /// Install/refresh the system service and (re)start it. Requires root.
@@ -125,7 +121,6 @@ pub(crate) async fn cmd_up(hostname: Option<String>, ipv6_only: Option<Ipv6Only>
 /// instead of seeing a cheerful "started" followed by a dead `ray status`.
 pub(crate) async fn install_and_start_service(
     hostname: Option<String>,
-    ipv6_only: Option<Ipv6Only>,
 ) -> Result<()> {
     ensure_service_installed()?;
     // We are root here, which is what it takes to write into the directories
@@ -170,10 +165,7 @@ pub(crate) async fn install_and_start_service(
         Some(mut stream) => {
             ipc::send(
                 &mut stream,
-                ipc::IpcMessage::Up {
-                    hostname,
-                    ipv6_only,
-                },
+                ipc::IpcMessage::Up { hostname },
             )
             .await?;
             match ipc::recv(&mut stream).await? {
@@ -253,7 +245,7 @@ pub(crate) async fn cmd_install(auto_update: bool) -> Result<()> {
         }
         println!("automatic stable updates enabled for this node");
     }
-    install_and_start_service(None, None).await
+    install_and_start_service(None).await
 }
 
 /// Whether the system service unit/plist is installed on this host.

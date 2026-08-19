@@ -37,7 +37,6 @@ fn member(identity: EndpointId) -> Member {
         last_seen: None,
         exit_node: false,
         exit_families: ExitFamilies::Unknown,
-        ipv6_only: false,
     }
 }
 

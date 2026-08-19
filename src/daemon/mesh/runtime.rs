@@ -96,7 +96,6 @@ impl NetworkRegistry {
                             last_seen: None,
                             exit_node: false,
                             exit_families: ExitFamilies::Unknown,
-                            ipv6_only: false,
                         });
                     }
                     for entry in &nc.approved {
@@ -121,7 +120,6 @@ impl NetworkRegistry {
                     last_seen: None,
                     exit_node: false,
                     exit_families: ExitFamilies::Unknown,
-                ipv6_only: self.ipv6_only,
             });
         }
         RestoredRoster {
@@ -896,7 +894,6 @@ impl Daemon {
     pub async fn activate(
         self: &Arc<Self>,
         hostname: Option<String>,
-        ipv6_only: Option<Ipv6Only>,
     ) -> IpcMessage {
         // Persist the personal default hostname first (before the already-active
         // short-circuit) so `ray up --hostname X` records the new default even
@@ -921,44 +918,9 @@ impl Daemon {
             }
         }
 
-        // Same deal for `ray up --ipv6-only`: persist before the short-circuit.
-        // The TUN's addressing is fixed when the device is created at daemon
-        // start, so this can only take effect on the next restart; say so
-        // instead of reporting a mode the data plane is not actually in.
-        // Compared against the *stored setting*, not the running mode: on `auto`
-        // the daemon may already be IPv6-only because it found another VPN, and
-        // an explicit `--ipv6-only` still has to be written down or the mode
-        // would vanish along with that VPN.
-        let restart_note = match ipv6_only {
-            Some(want) => match config::load() {
-                Ok(mut app_config) if app_config.ipv6_only != want => {
-                    app_config.ipv6_only = want;
-                    match config::save_settings(&app_config) {
-                        // Only a data plane that is not already in the requested
-                        // mode needs the restart.
-                        Ok(()) if want.enabled() != self.ipv6_only.enabled() => Some(
-                            ". IPv6-only mode set; restart the daemon for changes to take effect.",
-                        ),
-                        Ok(()) => None,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to persist ipv6-only setting");
-                            Some(". Failed to persist the IPv6-only setting, see the log.")
-                        }
-                    }
-                }
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to load config to set ipv6-only");
-                    Some(". Failed to persist the IPv6-only setting, see the log.")
-                }
-            },
-            None => None,
-        };
-        let restart_note = restart_note.unwrap_or("");
-
         if self.active.swap(true, Ordering::SeqCst) {
             return IpcMessage::Ok {
-                message: format!("already up{restart_note}"),
+                message: "already up".to_string(),
             };
         }
 
@@ -1034,7 +996,6 @@ impl Daemon {
             if let Some(w) = crate::hostfw::check_inbound_tcp(
                 &dns_tun_name,
                 crate::ssh::SSH_LISTEN_PORT,
-                self.ipv6_only.enabled(),
             )
             .warning(crate::ssh::SSH_LISTEN_PORT)
             {
@@ -1053,10 +1014,10 @@ impl Daemon {
         tracing::info!("data plane activated");
         if warnings.is_empty() {
             IpcMessage::Ok {
-                message: format!("VPN up{restart_note}"),
+                message: "VPN up".to_string(),
             }
         } else {
-            let mut message = format!("VPN up{restart_note} Some things need attention:");
+            let mut message = "VPN up. Some things need attention:".to_string();
             for w in &warnings {
                 message.push_str("\n  - ");
                 message.push_str(w);
@@ -1099,7 +1060,6 @@ impl Daemon {
         // the offers, so this also withdraws a stale advertisement rather than
         // keeping clients routed into a gateway that forwards nothing.
         self.registry.sync_exit_offers().await;
-        self.registry.sync_ipv6_only().await;
         // This runs inside the IPC request, so anything slow here is time the user
         // spends staring at `ray exit-node use`. Timed per phase because a stall in
         // any of them is indistinguishable from the outside.
@@ -1537,7 +1497,6 @@ impl Daemon {
         // otherwise. `activate()` re-advertises. Then disable syncing, so a
         // reconverge during standby leaves the (withdrawn) flag alone.
         self.registry.sync_exit_offers().await;
-        self.registry.sync_ipv6_only().await;
         self.registry
             .exit_sync_enabled
             .store(false, Ordering::SeqCst);

@@ -679,8 +679,6 @@ mod tests {
             domain_of(key.help())
         };
         assert_eq!(domain("mdns"), ["on", "off"]);
-        // The one three-valued key: its third value has to reach the shell too.
-        assert_eq!(domain("ipv6-only"), ["on", "off", "auto"]);
         assert_eq!(domain("firewall.default-in"), ["allow", "deny"]);
 
         // Free-form values: a trailing parenthesis that is prose, not a domain.

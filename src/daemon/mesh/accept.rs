@@ -106,7 +106,6 @@ pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
 
         // A member's statements about itself, and its departure.
         ControlMsg::ExitNodeOffer { .. }
-        | ControlMsg::Ipv6Only { .. }
         | ControlMsg::LeaveNetwork => false,
 
         // Connection-level: the demux handles these before it ever resolves a
@@ -718,7 +717,6 @@ impl CoordinatorAcceptState {
                 last_seen: Some(crate::membership::now_secs()),
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
             });
             s.refresh_snapshot();
             s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
@@ -1170,7 +1168,6 @@ impl MemberAcceptState {
                 last_seen: Some(crate::membership::now_secs()),
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
             });
             s.refresh_snapshot();
             (
@@ -1342,18 +1339,6 @@ impl AcceptHandler {
                     registry
                         .record_exit_offer(&network, peer_id, enabled, exit_families)
                         .await;
-                });
-                true
-            }
-            // Same shape for a member telling us its data plane is IPv6-only, so
-            // its mesh IPv4 must not be handed out in DNS answers.
-            ControlMsg::Ipv6Only { enabled } => {
-                let registry = self.registry().clone();
-                let Some(network) = self.network_name() else {
-                    return true;
-                };
-                tokio::spawn(async move {
-                    registry.record_ipv6_only(&network, peer_id, enabled).await;
                 });
                 true
             }
@@ -1636,7 +1621,6 @@ mod stranger_policy_tests {
                 enabled: true,
                 exit_families: ExitFamilies::Dual,
             },
-            ControlMsg::Ipv6Only { enabled: true },
             ControlMsg::LeaveNetwork,
         ] {
             assert!(!stranger_may_send(&msg), "{msg:?} must need membership");
@@ -1667,7 +1651,6 @@ mod direct_grant_tests {
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
             });
         }
         Arc::new(RwLock::new(NetworkState {

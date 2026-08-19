@@ -15,7 +15,7 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
 
 use crate::{
-    Action, Direction, GroupMode, Ipv6Only, NetworkKey, NodeKey, Protocol, SuggestedFirewall,
+    Action, Direction, GroupMode, NetworkKey, NodeKey, Protocol, SuggestedFirewall,
     TransportMode,
 };
 
@@ -90,10 +90,6 @@ pub enum IpcMessage {
     Up {
         #[serde(default)]
         hostname: Option<String>,
-        /// Asks to pin the `ipv6-only` setting (see `AppConfig::ipv6_only`).
-        /// `None` leaves it untouched, which is what a plain `ray up` sends.
-        #[serde(default)]
-        ipv6_only: Option<Ipv6Only>,
     },
     /// Put the daemon on standby: tear down active network connections, revert
     /// system DNS, and bring the TUN interface down. The daemon process keeps
@@ -404,14 +400,6 @@ pub enum IpcMessage {
         /// restart). Defaulted so an older CLI/daemon pair still deserializes.
         #[serde(default)]
         auto_update: bool,
-        /// The running daemon's data-plane mode. `On` and `Auto` both mean
-        /// IPv6-only (mesh IPv4 is not routable, so `ray status` shows the IPv6
-        /// address in place of the IPv4 one); `Auto` additionally says the
-        /// daemon chose it at startup, another VPN holding `100.64.0.0/10`, so
-        /// a mode nobody asked for still explains itself. An older daemon does
-        /// not send the field at all, and is not in the mode.
-        #[serde(default = "Ipv6Only::off")]
-        ipv6_only: Ipv6Only,
         /// Whether the VPN is active (TUN up, networks connected) or on standby.
         active: bool,
         /// This node's contact id (`ray connect`), shown at the top of status.
@@ -643,11 +631,6 @@ pub struct ExitNodeStatusView {
     /// a claim that positively says IPv4-only is refused.
     #[serde(default)]
     pub available_v6: Vec<String>,
-    /// This node's data plane is IPv6-only, so a selection here tunnels IPv6 and
-    /// leaves the host's IPv4 egress alone. Rendered as a note, because "using:
-    /// <peer>" otherwise reads as a full tunnel over both families.
-    #[serde(default)]
-    pub ipv6_only: bool,
     /// The subset of `available` that *this* node would refuse, with the family
     /// it cannot carry named.
     ///
@@ -669,8 +652,7 @@ pub struct ExitNodeStatusView {
     /// The gap has to be visible, though. Without this the line reads `using:
     /// <peer>` while every packet leaves directly, which is the one thing a user
     /// who chose to tunnel needs told, and the reason can arrive without anybody
-    /// touching the selection (the gateway republishes a family claim, or this
-    /// node's `ipv6_only = auto` flips).
+    /// touching the selection (the gateway republishes a family claim).
     #[serde(default)]
     pub not_in_effect: Option<String>,
     /// Which families the tunnel through `using` carries. A tunnel takes the
@@ -1233,7 +1215,6 @@ mod tests {
                 using: Some("gw".into()),
                 available: vec!["gw".into(), "v4only".into()],
                 available_v6: vec!["gw".into()],
-                ipv6_only: true,
                 refused: vec!["v4only".into()],
                 not_in_effect: Some("the peer is not in this network's roster".into()),
                 tunnel_v4: false,
@@ -1250,7 +1231,6 @@ mod tests {
                 // an IPv6-only client needs both lists to say "this gateway
                 // exists but cannot carry your only family".
                 assert_eq!(networks[0].available_v6, vec!["gw".to_string()]);
-                assert!(networks[0].ipv6_only);
                 // A selection that is configured but not installed says so, or
                 // `using: gw` reads as a tunnel that is carrying traffic.
                 assert!(networks[0].not_in_effect.is_some());
@@ -1259,10 +1239,9 @@ mod tests {
         }
     }
 
-    /// Both new fields are `#[serde(default)]`, so a reply from a daemon that
-    /// predates them still decodes: a CLI upgraded ahead of its daemon reads no
-    /// IPv6-capable gateways and no IPv6-only claim, which is what that daemon
-    /// meant.
+    /// `available_v6` is `#[serde(default)]`, so a reply from a daemon that
+    /// predates it still decodes: a CLI upgraded ahead of its daemon reads no
+    /// IPv6-capable gateways, which is what that daemon meant.
     #[test]
     fn exit_node_state_decodes_without_the_ipv6_fields() {
         #[derive(Serialize)]
@@ -1282,7 +1261,6 @@ mod tests {
         let decoded: ExitNodeStatusView = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(decoded.available, vec!["gw".to_string()]);
         assert!(decoded.available_v6.is_empty());
-        assert!(!decoded.ipv6_only);
     }
 
     #[test]
@@ -1614,7 +1592,6 @@ mod tests {
             pending_files: 0,
             pending_connects: 0,
             pending_networks: vec![],
-            ipv6_only: Ipv6Only::Off,
             lan_peers: vec![LanPeerInfo {
                 endpoint_id: peer_id,
                 short_id: peer_id.fmt_short().to_string(),
