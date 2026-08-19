@@ -332,10 +332,11 @@ on "$A" 'ray up' >/dev/null 2>&1 || true
 sleep 3
 
 # ---------------------------------------------------------------------------
-step "8. the overlay survives the down/up cycle (both families)"
+step "8. the overlay survives the down/up cycle"
 # Linux flushes an interface's global IPv6 addresses on link-down, so a standby
-# cycle used to leave the node on IPv4 only: it still routed 200::/7 into the TUN
-# but owned no address in it, and every IPv6 peer silently got no answer.
+# cycle used to leave the node with no mesh address at all: it still routed
+# 200::/7 into the TUN but owned nothing in it, and every peer silently got no
+# answer. With no second family to limp along on, that is now total.
 A_V6=$(on "$A" "ip -6 addr show dev tun0 scope global | awk '/inet6/{print \$2}' | cut -d/ -f1")
 [[ -n "$A_V6" ]] \
   && pass "srv-a kept its overlay IPv6 address across 'ray down' + 'ray up' ($A_V6)" \
@@ -345,9 +346,11 @@ if [[ -n "$A_V6" ]] && on "$B" "ping6 -c2 -W2 $A_V6" >/dev/null 2>&1; then
 else
   fail "srv-b cannot reach srv-a over IPv6 after the cycle"
 fi
-on "$B" "ping -c2 -W2 $(own_ip "$(on "$A" 'ray status' | strip)")" >/dev/null 2>&1 \
-  && pass "srv-b still reaches srv-a over IPv4 after the cycle" \
-  || fail "srv-b cannot reach srv-a over IPv4 after the cycle"
+# `ray status` must report the address the interface actually holds: the check
+# above reads the link, this one reads what a user would be told to dial.
+[[ "$(own_ip "$(on "$A" 'ray status' | strip)")" == "$A_V6" ]] \
+  && pass "srv-a's 'ray status' reports the address on its TUN" \
+  || fail "srv-a's 'ray status' address disagrees with its TUN ($A_V6)"
 
 # ---------------------------------------------------------------------------
 summary

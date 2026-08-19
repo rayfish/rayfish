@@ -38,11 +38,16 @@ on(){ local ip="$1"; shift
 strip(){ sed -r 's/\x1B\[[0-9;]*[mGKH]//g'; }
 
 # own_ip <status-text> : extract a node's own mesh IPv6 (the 200::/7 range).
-# Fatal when there is none: every caller uses the result as a ping/ssh target,
-# and an empty string there turns a real failure into a test that passes.
+# The prefix is /7, so only the first seven bits are fixed and the leading hextet
+# runs from 200 to 2ff: matching a literal `200:` finds 1 address in 256, which is
+# how this read as "no mesh IPv6" against real output.
+# Loud when there is none: every caller uses the result as a ping/ssh target, and
+# an empty string there turns a real failure into a test that passes. The message
+# goes to stderr because every caller reads this through `$(...)`, which would
+# otherwise capture the complaint into the command line it is building.
 own_ip(){
-  local ip; ip="$(echo "$1" | grep -oE '\b200:[0-9a-f:]+' | head -1)"
-  [[ -n "$ip" ]] || { fail "own_ip: no mesh IPv6 in status output"; return 1; }
+  local ip; ip="$(echo "$1" | grep -oE '\b2[0-9a-f]{2}:[0-9a-f:]+' | head -1)"
+  [[ -n "$ip" ]] || { printf '  \033[31mFAIL\033[0m own_ip: no mesh IPv6 in status output\n' >&2; return 1; }
   echo "$ip"
 }
 
@@ -50,7 +55,7 @@ own_ip(){
 # peer_host <status-text> : the first peer row's hostname. Peer rows carry a
 # status dot (●/○) and a mesh IP; the hostname is the token right after the dot.
 # (The status peer row prints the bare hostname, not the `.ray` FQDN.)
-peer_host(){ echo "$1" | sed 's/\x1b\[[0-9;]*m//g' | awk '/[●○]/ && /200:/ {for(i=1;i<=NF;i++) if($i=="●"||$i=="○"){print $(i+1); exit}}'; }
+peer_host(){ echo "$1" | sed 's/\x1b\[[0-9;]*m//g' | awk '/[●○]/ && /2[0-9a-f][0-9a-f]:/ {for(i=1;i<=NF;i++) if($i=="●"||$i=="○"){print $(i+1); exit}}'; }
 
 # ping_loss <from-ip> <target-ip> : echo the packet-loss percentage (number only).
 ping_loss(){ on "$1" "ping -c 3 -W 2 $2" 2>&1 | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+'; }
@@ -229,9 +234,16 @@ tcp_probe(){
 }
 
 # start_tcp_listener <ip> <port> / stop_tcp_listener <ip> <port> : a detached
-# HTTP server bound to 0.0.0.0 (incl. the TUN ip) on the host, and its teardown.
+# HTTP server on the host, and its teardown.
+#
+# Binds `::`, not `0.0.0.0`. The overlay is IPv6-only, so a socket on the IPv4
+# wildcard has no presence on the TUN at all and every probe against it reads
+# CLOSED whatever the firewall says: the deny assertions would pass for the wrong
+# reason and the allow assertions could never pass. `::` accepts both families
+# on Linux (net.ipv6.bindv6only defaults to 0), which is the same fix a user hits
+# when a service of theirs stops answering over the mesh.
 start_tcp_listener(){
-  on "$1" "setsid python3 -m http.server $2 --bind 0.0.0.0 >/tmp/lst_$2.log 2>&1 </dev/null & sleep 1" \
+  on "$1" "setsid python3 -m http.server $2 --bind :: >/tmp/lst_$2.log 2>&1 </dev/null & sleep 1" \
     >/dev/null 2>&1 || true
 }
 stop_tcp_listener(){ on "$1" "pkill -f 'http.server $2'" >/dev/null 2>&1 || true; }
@@ -244,11 +256,13 @@ stop_tcp_listener(){ on "$1" "pkill -f 'http.server $2'" >/dev/null 2>&1 || true
 # A one-shot python receiver on the destination drops a marker on first packet.
 udp_probe(){
   local from_pub="$1" dst_pub="$2" dst_vpn="$3" port="$4"
-  on "$dst_pub" "rm -f /tmp/udp_got_$port; setsid python3 -c 'import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(8); s.bind((\"0.0.0.0\",$port));
+  # AF_INET6 on both ends: <dst-vpn-ip> is a mesh address and there is no other
+  # family to fall back to, so an AF_INET socket here never sees the datagram.
+  on "$dst_pub" "rm -f /tmp/udp_got_$port; setsid python3 -c 'import socket; s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM); s.settimeout(8); s.bind((\"::\",$port));
 try:
  s.recvfrom(64); open(\"/tmp/udp_got_$port\",\"w\").write(\"1\")
 except Exception: pass' >/dev/null 2>&1 </dev/null & sleep 1" >/dev/null 2>&1 || true
-  on "$from_pub" "python3 -c 'import socket; socket.socket(socket.AF_INET,socket.SOCK_DGRAM).sendto(b\"x\",(\"$dst_vpn\",$port))'" >/dev/null 2>&1 || true
+  on "$from_pub" "python3 -c 'import socket; socket.socket(socket.AF_INET6,socket.SOCK_DGRAM).sendto(b\"x\",(\"$dst_vpn\",$port))'" >/dev/null 2>&1 || true
   sleep 2
   on "$dst_pub" "[ -f /tmp/udp_got_$port ] && echo OPEN || echo CLOSED" 2>/dev/null | strip | tr -d '[:space:]'
 }
