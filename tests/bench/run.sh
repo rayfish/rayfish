@@ -6,7 +6,7 @@
 #   srv-b  joins it with the room id (open net = no invite needed)
 #
 # For both directions we measure, over the public IP (DIRECT) and over the
-# rayfish 100.64.x.x TUN address (RAYFISH):
+# rayfish 200::/7 TUN address (RAYFISH):
 #   - ping RTT (latency)
 #   - iperf3 TCP throughput
 # so the delta isolates the cost rayfish (iroh QUIC datagrams, MTU 1200,

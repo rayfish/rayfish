@@ -8,58 +8,81 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Exit nodes work in IPv6-only mode.** `ray exit-node use` was refused on a
-  host sharing the box with another VPN, which is where the feature is most
-  useful. It now works, tunnelling IPv6: mesh IPv4 carries no traffic in that
-  mode, so your IPv4 internet traffic keeps leaving directly, and both
-  `ray exit-node use` and `ray exit-node status` say so rather than leaving you
-  to find out. Offering an exit node was never affected by the mode.
-- **A tunnel carries only what both ends can carry, and says which.** A gateway
-  reports whether it can return IPv4, IPv6 or both, and the tunnel takes the
-  families your node and that gateway have in common. A gateway that can return
-  only one of them narrows the tunnel to it: that family goes through the exit,
-  the other keeps leaving this host directly, and `ray exit-node use` and
-  `ray exit-node status` both name which is which. This covers a gateway running
-  IPv6-only mode itself (it never routes the mesh IPv4 your reply would come back
-  on) and a gateway with no IPv6 uplink, whose tunnelled IPv6 used to vanish at
-  the far end with nothing said. Only a gateway that can return neither family is
-  refused, and that check runs on every re-apply rather than only when you pick,
-  so a gateway that loses its uplink (or a node whose IPv6-only mode turns itself
-  on) stops tunnelling with a message instead of silently carrying nothing, and
-  picks the tunnel back up by itself when the gateway reports an uplink again.
-  Gateways that report IPv6 are marked `(IPv6)` in `ray exit-node status`. A
-  gateway on a network whose coordinator predates this feature reports nothing
-  either way: it stays selectable and narrows nothing, since refusing would rule
-  out every gateway on such a network, and `ray exit-node use` tells you the
-  claim is unverified.
-- **DNS follows the tunnel when the tunnel is the only way out.** While a tunnel
-  carries IPv6 and not IPv4, the daemon's own DNS forwarder is pointed at an IPv6
-  resolver, so its lookups go through the exit rather than around it. On Linux
-  hosts using systemd-resolved, NetworkManager or resolvconf, applications'
-  non-`.ray` lookups still leave directly, and the daemon logs a warning saying
-  so. If you pinned your own resolvers with `ray config set dns-upstreams …
-  --replace` and none of them are IPv6, yours are kept rather than swapped for
-  public ones: they stay reachable over the IPv4 such a tunnel leaves direct, so
-  those lookups go around the exit instead of to a resolver you did not choose.
-- **`ray config set dns-upstreams` takes IPv6 addresses.** Used by an exit-node
-  tunnel in IPv6-only mode, which has no IPv4 to reach a v4 resolver over. Naming
-  only IPv6 servers no longer lets rayfish take over `/etc/resolv.conf` on a host
-  where it found no working one of its own: those entries are reachable only
-  through the tunnel, so counting them would have taken the file and left the
-  machine unable to resolve anything.
+- **Exit nodes tunnel IPv6.** `ray exit-node use` routes your IPv6 internet
+  traffic through the gateway and leaves your IPv4 traffic leaving directly,
+  which both `ray exit-node use` and `ray exit-node status` say out loud rather
+  than leaving you to find out from a leak test. The mesh carries no IPv4, so
+  there is no IPv4 for a tunnel to source transit from; claiming your IPv4
+  default would take it from whatever else is using the box and send it into a
+  hole. Offering an exit node is unaffected.
+- **A gateway that cannot carry IPv6 is refused, with a reason.** Gateways report
+  whether they have an IPv6 uplink, and ones that do are marked `(IPv6)` in
+  `ray exit-node status`. Picking one that reports otherwise is refused rather
+  than left to time out. The check runs on every re-apply, not only when you
+  pick, so a gateway that loses its uplink stops tunnelling with a message
+  instead of silently carrying nothing, and picks the tunnel back up by itself
+  when it reports one again. A gateway on a network whose coordinator predates
+  this feature reports nothing either way: it stays selectable, since refusing
+  would rule out every gateway on such a network, and `ray exit-node use` tells
+  you the claim is unverified.
+- **DNS follows the tunnel.** While a tunnel is up, the daemon's own DNS
+  forwarder is pointed at an IPv6 resolver, so its lookups go through the exit
+  rather than around it. On Linux hosts using systemd-resolved or resolvconf,
+  applications' non-`.ray` lookups still leave directly, and the daemon logs a
+  warning saying so. If you pinned your own resolvers with `ray config set
+  dns-upstreams … --replace` and none of them are IPv6, yours are kept rather
+  than swapped for public ones: they stay reachable over the IPv4 a tunnel
+  leaves direct, so those lookups go around the exit instead of to a resolver
+  you did not choose.
+- **`ray config set dns-upstreams` takes IPv6 addresses.** Naming only IPv6
+  servers no longer lets rayfish take over `/etc/resolv.conf` on a host where it
+  found no working resolver of its own: those entries are reachable only through
+  the tunnel, so counting them would have taken the file and left the machine
+  unable to resolve anything.
 
 ### Changed
 
-- **The mesh protocol version is now 3, and every peer must be on it.** Control
-  frames, pairing, `ray connect`, file transfer and the signed roster are now
-  encoded more compactly, which takes a bit under 30% off the largest thing on
-  the wire (a 50-member roster drops from 5194 to 3764 bytes, and about 30% when
-  every member is a paired device). The encoding is not
-  backward compatible, and peers on different protocol versions cannot connect
-  at all, so a mesh has to upgrade together: a node left on 0.3.x will stop
-  seeing the rest of the network rather than degrading. Nothing on disk changes,
-  so upgrading in place keeps your networks, identity and pairings.
+- **Rayfish is IPv6-only. Mesh IPv4 is gone.** Every peer had two mesh addresses:
+  an IPv4 in `100.64.0.0/10` and an IPv6 in `200::/7`. Only the IPv6 remains.
+  It is blake3 of the peer's identity, so it is collision-free, never rotates,
+  and is derived locally by every node rather than carried on the wire. `ray
+  status`, `ray ping`, Magic DNS, the exit node and the Android app all use it.
+  A `.ray` name answers AAAA only; an A query returns NODATA, because there is
+  no IPv4 address to give.
 
+  Two consequences worth knowing before you upgrade:
+
+  - **Every node must upgrade together.** The mesh protocol goes to 4 and peers
+    on different versions cannot connect at all, so a node left behind stops
+    seeing the network rather than degrading. `ray status` marks such a peer
+    incompatible, and a join against a network on another version fails naming
+    both.
+  - **Check what your services listen on.** `0.0.0.0` is the IPv4 wildcard, not
+    "any address", so a service bound there has no IPv6 socket and peers can no
+    longer reach it. Bind `::` instead, which accepts both families on Linux.
+    Go and Node already do this; nginx needs `listen [::]:80;` adding, and
+    `--bind 0.0.0.0` defaults and Docker published ports need the flag changed.
+    `ss -tlnp` shows which is which: `0.0.0.0:port` is affected, `[::]:port` is
+    not.
+
+- **`ipv6-only` is gone as a setting.** `ray config set ipv6-only` and `ray up
+  --ipv6-only` no longer exist, and neither does the startup scan behind them.
+  There is nothing left to choose: the overlay never claims `100.64.0.0/10`, so
+  sharing a host with Tailscale needs no mode and no configuration. A stale
+  `ipv6_only` key in `settings.toml` is ignored rather than an error.
+- **Magic DNS answers at `200::53` only.** The old `100.100.100.53` is not used;
+  an upgrade strips it from `/etc/resolv.conf` on the way through. Use
+  `dig @200::53 <host>.ray`.
+- **NetworkManager is no longer used to configure DNS.** Its D-Bus interface can
+  only carry an IPv4 nameserver, so it cannot point the system at an IPv6
+  resolver. The detection ladder falls through to resolvconf or a direct
+  `/etc/resolv.conf`, both of which take either family.
+- **The wire is more compact.** Control frames, pairing, `ray connect`, file
+  transfer and the signed roster are array-encoded, taking a bit under 30% off
+  the largest thing on the wire (a 50-member roster drops from 5194 to 3764
+  bytes). Dropping the mesh IPv4 and its collision index takes more off again.
+  This is part of what the protocol bump above covers. Nothing on disk changes,
+  so upgrading in place keeps your networks, identity and pairings.
 
 - **`ray firewall --help` is grouped, and every help page reads in one pass.**
   The firewall's 13 actions are now listed under Rules, Mode, Coordinator

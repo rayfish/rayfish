@@ -125,7 +125,7 @@ else
   fail "srv-c does not see srv-b after its restart"
 fi
 # 4d. The coordinator is still listed as a peer, and correctly offline.
-[[ -n "$(peer_ip4 "$B" srv-a "$NET")" ]] \
+[[ -n "$(peer_ip "$B" srv-a "$NET")" ]] \
   && pass "srv-b's roster still lists the coordinator (offline peer)" \
   || fail "srv-b's roster is missing the coordinator after blob restore"
 [[ "$(peer_online "$B" srv-a "$NET")" == 0 ]] \

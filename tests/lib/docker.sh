@@ -22,8 +22,8 @@
 
 DOCKER_IMAGE="${E2E_DOCKER_IMAGE:-rayfish-e2e-node}"
 DOCKER_NET="${E2E_DOCKER_NET:-rayfish-e2e}"
-# Must avoid the overlay ranges (100.64.0.0/10, 200::/7) and the magic resolver
-# 100.100.100.53, or the nodes would route mesh traffic straight out the bridge.
+# Must avoid the overlay range (200::/7), which covers the magic resolver at
+# 200::53 too, or the nodes would route mesh traffic straight out the bridge.
 DOCKER_SUBNET="${E2E_DOCKER_SUBNET:-172.31.66.0/24}"
 DOCKER_SUBNET6="${E2E_DOCKER_SUBNET6:-fd00:e2e::/64}"
 DOCKER_CTX="$(cd "$(dirname "${BASH_SOURCE[0]}")/../docker" && pwd)"

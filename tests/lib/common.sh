@@ -37,14 +37,20 @@ on(){ local ip="$1"; shift
 # strip : remove ANSI colour codes from rayfish CLI output (stdin -> stdout).
 strip(){ sed -r 's/\x1B\[[0-9;]*[mGKH]//g'; }
 
-# own_ip <status-text> : extract a node's own VPN IPv4 (100.64.0.0/10 CGNAT range).
-own_ip(){ echo "$1" | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
+# own_ip <status-text> : extract a node's own mesh IPv6 (the 200::/7 range).
+# Fatal when there is none: every caller uses the result as a ping/ssh target,
+# and an empty string there turns a real failure into a test that passes.
+own_ip(){
+  local ip; ip="$(echo "$1" | grep -oE '\b200:[0-9a-f:]+' | head -1)"
+  [[ -n "$ip" ]] || { fail "own_ip: no mesh IPv6 in status output"; return 1; }
+  echo "$ip"
+}
 
 # peer_host <status-text> : first peer row's `<host>.<net>.ray` hostname label.
 # peer_host <status-text> : the first peer row's hostname. Peer rows carry a
 # status dot (●/○) and a mesh IP; the hostname is the token right after the dot.
 # (The status peer row prints the bare hostname, not the `.ray` FQDN.)
-peer_host(){ echo "$1" | sed 's/\x1b\[[0-9;]*m//g' | awk '/[●○]/ && /(100\.|200:)/ {for(i=1;i<=NF;i++) if($i=="●"||$i=="○"){print $(i+1); exit}}'; }
+peer_host(){ echo "$1" | sed 's/\x1b\[[0-9;]*m//g' | awk '/[●○]/ && /200:/ {for(i=1;i<=NF;i++) if($i=="●"||$i=="○"){print $(i+1); exit}}'; }
 
 # ping_loss <from-ip> <target-ip> : echo the packet-loss percentage (number only).
 ping_loss(){ on "$1" "ping -c 3 -W 2 $2" 2>&1 | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+'; }
@@ -127,23 +133,27 @@ wait_daemons(){
 # status_json <ip> : echo `ray status --json` from a host (raw JSON).
 status_json(){ on "$1" 'ray status --json' 2>/dev/null; }
 
-# my_ip4 <ip> [net] : this node's own VPN IPv4 — for the named network, or the
-# first network if omitted. Empty if none.
-my_ip4(){
-  status_json "$1" | jq -r --arg n "${2:-}" '
+# my_ip <ip> [net] : this node's own mesh IPv6, for the named network or the
+# first if omitted. Fatal when absent, for the same reason as `own_ip`.
+my_ip(){
+  local ip
+  ip="$(status_json "$1" | jq -r --arg n "${2:-}" '
     (.networks // [])
     | (if $n == "" then .[0] else (map(select(.name == $n)) | .[0]) end)
-    | .my_ip // empty'
+    | .my_ipv6 // empty')"
+  [[ -n "$ip" ]] || { fail "my_ip: $1 reports no mesh IPv6 for network '${2:-<first>}'"; return 1; }
+  echo "$ip"
 }
 
-# peer_ip4 <ip> <peer-hostname> [net] : a specific peer's VPN IPv4 as seen by
-# <ip>. Searches the named network, or all networks if net omitted. Empty if the
-# peer isn't present.
-peer_ip4(){
+# peer_ip <ip> <peer-hostname> [net] : a specific peer's mesh IPv6 as seen by
+# <ip>. Searches the named network, or all networks if net omitted. Empty when
+# the peer is genuinely absent, which several callers test for, so this one does
+# not fail on empty.
+peer_ip(){
   status_json "$1" | jq -r --arg h "$2" --arg n "${3:-}" '
     (.networks // [])
     | (if $n == "" then . else map(select(.name == $n)) end)
-    | [ .[].peers[] | select((.hostname // "") == $h) ] | .[0].ip // empty'
+    | [ .[].peers[] | select((.hostname // "") == $h) ] | .[0].ipv6 // empty'
 }
 
 # peer_online <ip> <peer-hostname> [net] : echo 1 if that peer has a live

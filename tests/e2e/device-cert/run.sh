@@ -118,7 +118,7 @@ echo "---- srv-a status ----"; echo "$SA" | sed 's/^/   a| /'
 echo "---- srv-b status ----"; echo "$SB" | sed 's/^/   b| /'
 echo "---- srv-c status ----"; echo "$SC" | sed 's/^/   c| /'
 
-# Extract each node's own VPN IPv4 (own_ip from common.sh; CGNAT 100.64.0.0/10).
+# Extract each node's own mesh IPv6 (own_ip from common.sh; the 200::/7 range).
 A_IP="$(own_ip "$SA")"; B_IP="$(own_ip "$SB")"; C_IP="$(own_ip "$SC")"
 echo "   A_IP=$A_IP  B_IP=$B_IP  C_IP=$C_IP"
 
