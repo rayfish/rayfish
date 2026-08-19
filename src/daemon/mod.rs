@@ -1329,7 +1329,6 @@ impl Daemon {
             &self.dns.reverse_table,
             network,
             &new_hostname,
-            None,
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;

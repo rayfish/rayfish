@@ -439,14 +439,11 @@ pub struct ForwardCtx {
     pub exit: ExitContext,
 }
 
-/// True when a parsed packet is a DNS query addressed to the magic resolver IP,
-/// in either family. The IPv6 address is the one an IPv6-only data plane hands
-/// the OS (see [`dns::MAGIC_DNS_V6`]); both are always intercepted, so a host
-/// that names either one gets an answer.
+/// True when a parsed packet is a DNS query addressed to the magic resolver IP
+/// ([`dns::MAGIC_DNS_V6`]), the only address the resolver answers on and the one
+/// handed to the OS.
 pub(crate) fn is_magic_dns(info: &firewall::PacketInfo) -> bool {
-    info.dst_port == 53
-        && (info.dst_ip == IpAddr::V4(dns::MAGIC_DNS_V4)
-            || info.dst_ip == IpAddr::V6(dns::MAGIC_DNS_V6))
+    info.dst_port == 53 && info.dst_ip == IpAddr::V6(dns::MAGIC_DNS_V6)
 }
 
 /// Main TUN read loop. Reads outgoing packets from the TUN device and sends each
@@ -1647,7 +1644,7 @@ mod tests {
     #[test]
     fn magic_dns_predicate_matches_only_magic_ip_port_53() {
         let mk = |ip: IpAddr, port: u16| firewall::PacketInfo {
-            src_ip: "100.64.0.5".parse().unwrap(),
+            src_ip: "200::5".parse().unwrap(),
             dst_ip: ip,
             protocol: 17,
             src_port: 50000,
@@ -1656,9 +1653,11 @@ mod tests {
             icmp_type: 0,
             icmp_id: 0,
         };
-        assert!(is_magic_dns(&mk(IpAddr::V4(crate::dns::MAGIC_DNS_V4), 53)));
-        assert!(!is_magic_dns(&mk(IpAddr::V4(crate::dns::MAGIC_DNS_V4), 80)));
-        assert!(!is_magic_dns(&mk("100.64.0.9".parse().unwrap(), 53)));
+        assert!(is_magic_dns(&mk(IpAddr::V6(crate::dns::MAGIC_DNS_V6), 53)));
+        assert!(!is_magic_dns(&mk(IpAddr::V6(crate::dns::MAGIC_DNS_V6), 80)));
+        assert!(!is_magic_dns(&mk("200::9".parse().unwrap(), 53)));
+        // The old v4 magic address is nobody's resolver now.
+        assert!(!is_magic_dns(&mk("100.100.100.53".parse().unwrap(), 53)));
     }
 
     #[test]

@@ -726,7 +726,6 @@ impl NetworkRegistry {
             &self.dns.reverse_table,
             display_name,
             my_hostname,
-            None,
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
@@ -737,7 +736,6 @@ impl NetworkRegistry {
                     &self.dns.reverse_table,
                     display_name,
                     h,
-                    None,
                     derive_ipv6(&member.identity),
                 )
                 .await;

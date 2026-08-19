@@ -107,7 +107,7 @@ impl Daemon {
                 table.get(&h.name).and_then(|hosts| {
                     hosts
                         .iter()
-                        .find(|(_, v)| v.1 == v6)
+                        .find(|(_, v)| **v == v6)
                         .map(|(k, _)| k.clone())
                 })
             })

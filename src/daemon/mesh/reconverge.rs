@@ -506,13 +506,12 @@ pub(crate) async fn apply_roster_to_dns(
     // usable mesh IPv4: a member running an IPv6-only data plane gets `None`, so
     // the responder withholds its A record instead of pointing apps at an
     // address another VPN owns on that host.
-    let mut entries: Vec<(String, Option<Ipv4Addr>, Ipv6Addr)> = members
+    let mut entries: Vec<(String, Ipv6Addr)> = members
         .iter()
         .filter_map(|m| {
             m.hostname.as_ref().map(|h| {
                 (
                     h.clone(),
-                    None,
                     derive_ipv6(&m.identity),
                 )
             })
@@ -541,8 +540,8 @@ pub(crate) async fn apply_roster_to_dns(
                     // Override our own DNS entry so `.ray` resolution and
                     // `ray status` reflect the pending name immediately.
                     let v6 = derive_ipv6(&my_identity);
-                    entries.retain(|(_, _, v6)| *v6 != derive_ipv6(&me.identity));
-                    entries.push((pending.clone(), None, v6));
+                    entries.retain(|(_, addr)| *addr != derive_ipv6(&me.identity));
+                    entries.push((pending.clone(), v6));
                 }
                 if net.my_hostname.as_deref() != Some(pending.as_str()) {
                     net.my_hostname = Some(pending);

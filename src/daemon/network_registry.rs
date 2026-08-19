@@ -588,7 +588,6 @@ impl NetworkRegistry {
             &self.dns.reverse_table,
             &name,
             &my_hostname,
-            None,
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
@@ -881,10 +880,7 @@ impl NetworkRegistry {
         } else {
             format!("{name}{suffix}")
         };
-        // The IPv4 half is absent for a peer running an IPv6-only data plane; its
-        // IPv6 is always there, so match on that when there is no address to key
-        // on. (Both halves derive from the same identity, so either resolves it.)
-        if let Some((_v4, v6)) = self.dns.resolve(&qualified, &suffix).await {
+        if let Some(v6) = self.dns.resolve(&qualified, &suffix).await {
             if let Some(route) = self.peers.lookup_v6(&v6) {
                 return Some(route.endpoint_id);
             }

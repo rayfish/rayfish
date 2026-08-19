@@ -395,16 +395,14 @@ pub async fn ensure_ipv6_addr(tun_name: &str, v6: Ipv6Addr) -> Result<()> {
     .await
 }
 
-/// Routes the peer ranges into the TUN. Must be called *after* the interface is
-/// up (see [`set_link_up`]). On Linux only the IPv6 `200::/7` route needs adding:
-/// the kernel does not reliably install an IPv6 connected route while the link is
-/// down (peer traffic would otherwise leak out the host's default IPv6 route),
-/// whereas it re-installs the IPv4 `100.64.0.0/10` connected route from the /10
-/// netmask automatically on link-up. On macOS the point-to-point utun installs
-/// neither range reliably, so *both* `100.64.0.0/10` and `200::/7` are added
-/// explicitly. Idempotent, safe to call on every `up` cycle.
+/// Routes the peer range into the TUN. Must be called *after* the interface is
+/// up (see [`set_link_up`]): the kernel does not reliably install an IPv6
+/// connected route while the link is down, and peer traffic would otherwise leak
+/// out the host's default IPv6 route. `200::/7` is the whole range, magic DNS
+/// (`dns::MAGIC_DNS_V6`) included, so nothing else needs a host route.
+/// Idempotent, safe to call on every `up` cycle.
 #[cfg(target_os = "linux")]
-pub async fn route_peer_range(tun_name: &str, _ipv6_only: bool) -> Result<()> {
+pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     use rtnetlink::RouteMessageBuilder;
 
     with_tun_link(tun_name, async |handle, index| {
@@ -424,23 +422,13 @@ pub async fn route_peer_range(tun_name: &str, _ipv6_only: bool) -> Result<()> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub async fn route_peer_range(tun_name: &str, ipv6_only: bool) -> Result<()> {
+pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     // utun is point-to-point, so the address prefix alone does not reliably
-    // create the range route, we add both families explicitly. The IPv4 `/10`
-    // is only installed implicitly by the `tun` crate at device creation and
-    // macOS drops it across an `up`/`down` cycle, so (like the IPv6 `/7`) we
-    // re-add it on every activate or peers become unreachable over IPv4 while
-    // IPv6 still works. `route add` fails if the route already exists (e.g. an
-    // earlier `up`), so delete any stale entry first and ignore its result.
-    //
-    // In IPv6-only mode the `/10` is left to the other VPN; only `200::/7` is
-    // ours, and it already covers `dns::MAGIC_DNS_V6`, so that mode installs no
-    // magic-DNS host route at all.
-    let ranges: &[(&str, &str)] = if ipv6_only {
-        &[("-inet6", "200::/7")]
-    } else {
-        &[("-inet", "100.64.0.0/10"), ("-inet6", "200::/7")]
-    };
+    // create the range route; macOS also drops it across an `up`/`down` cycle,
+    // so it is re-added on every activate. `route add` fails if the route
+    // already exists (e.g. an earlier `up`), so delete any stale entry first and
+    // ignore its result. `200::/7` covers `dns::MAGIC_DNS_V6` too.
+    let ranges: &[(&str, &str)] = &[("-inet6", "200::/7")];
     for (family, net) in ranges.iter().copied() {
         let _ = Command::new("route")
             .args(["-n", "delete", family, "-net", net, "-interface", tun_name])
@@ -554,61 +542,6 @@ pub async fn unroute_default_via_tun(tun_name: &str) {
             .args(["-n", "delete", family, "-net", net, "-interface", tun_name])
             .status();
     }
-}
-
-/// Routes the magic-DNS virtual IP (`dns::MAGIC_DNS_V4`) into the TUN as a `/32`
-/// host route so that packets from the kernel addressed to that IP are delivered
-/// to the TUN device (and thus intercepted by our DNS server) rather than going
-/// out the host's default gateway. The IP is **never** assigned as a local
-/// interface address, it is a route-only entry. Idempotent across `up`/`down`.
-#[cfg(target_os = "linux")]
-pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
-    use rtnetlink::RouteMessageBuilder;
-
-    with_tun_link(tun_name, async |handle, index| {
-        let route = RouteMessageBuilder::<Ipv4Addr>::new()
-            .destination_prefix(crate::dns::MAGIC_DNS_V4, 32)
-            .output_interface(index)
-            .build();
-        handle
-            .route()
-            .add(route)
-            .replace()
-            .execute()
-            .await
-            .context("add magic-DNS /32 route via netlink")
-    })
-    .await
-}
-
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
-    let ip = crate::dns::MAGIC_DNS_V4.to_string();
-    let _ = Command::new("route")
-        .args([
-            "-n",
-            "delete",
-            "-inet",
-            "-host",
-            &ip,
-            "-interface",
-            tun_name,
-        ])
-        .status();
-    let status = Command::new("route")
-        .args(["-n", "add", "-inet", "-host", &ip, "-interface", tun_name])
-        .status()
-        .context("run route add magic dns")?;
-    anyhow::ensure!(status.success(), "route add magic dns failed with {status}");
-    Ok(())
-}
-
-#[cfg(all(
-    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")),
-    not(target_os = "android")
-))]
-pub async fn route_magic_dns(_tun_name: &str) -> Result<()> {
-    Ok(())
 }
 
 /// Install host routes for our *own* dual-stack addresses via the loopback

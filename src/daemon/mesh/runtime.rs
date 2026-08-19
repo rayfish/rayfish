@@ -269,20 +269,18 @@ impl NetworkRegistry {
                         m.hostname.as_ref().map(|h| {
                             (
                                 h.clone(),
-                                None,
                                 derive_ipv6(&m.identity),
                             )
                         })
                     })
                     .collect()
             };
-            for (hostname, ip, ipv6) in members_snapshot {
+            for (hostname, ipv6) in members_snapshot {
                 dns::update_hostname(
                     &self.dns.hostname_table,
                     &self.dns.reverse_table,
                     name,
                     &hostname,
-                    ip,
                     ipv6,
                 )
                 .await;
@@ -1000,19 +998,11 @@ impl Daemon {
             // link-up: on Linux the kernel won't install an IPv6 connected route
             // while the link is down, so without this peer traffic leaks out the
             // default route.
-            if let Err(e) = tun::route_peer_range(&tun_name, self.ipv6_only.enabled()).await {
+            // `200::/7` also delivers `dns::MAGIC_DNS_V6`, so the resolver needs
+            // no host route of its own.
+            if let Err(e) = tun::route_peer_range(&tun_name).await {
                 tracing::warn!(error = %e, "failed to route 200::/7 into TUN");
                 warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
-            }
-
-            // IPv6-only mode answers on `dns::MAGIC_DNS_V6`, which the `200::/7`
-            // route above already delivers. Installing the v4 `/32` there would
-            // plant a dead route inside the `100.64.0.0/10` range this mode
-            // exists to hand over to another VPN.
-            if !self.ipv6_only.enabled()
-                && let Err(e) = tun::route_magic_dns(&tun_name).await
-            {
-                tracing::warn!(error = %e, "failed to route magic DNS IP into TUN");
             }
 
             // Loop our own addresses back through lo0 so self-traffic (e.g.

@@ -11,7 +11,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use smol_str::SmolStr;
 
-use crate::dns::{HostnameTable, MAGIC_DNS_V4, MAGIC_DNS_V6, ReverseLookupTable};
+use crate::dns::{HostnameTable, ReverseLookupTable};
 
 /// Whether forwarding a query to `ip` could loop back into this resolver.
 ///
@@ -23,12 +23,6 @@ use crate::dns::{HostnameTable, MAGIC_DNS_V4, MAGIC_DNS_V6, ReverseLookupTable};
 fn is_loopable_upstream(ip: IpAddr) -> bool {
     crate::membership::is_overlay_ip(ip)
         || matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
-}
-
-/// Our own Magic DNS addresses. Forwarding to either is a loop: the query would
-/// come straight back in through `handle_tun_query`.
-fn is_magic_dns(ip: IpAddr) -> bool {
-    ip == IpAddr::V4(MAGIC_DNS_V4) || ip == IpAddr::V6(MAGIC_DNS_V6)
 }
 
 pub struct Resolver {
@@ -120,7 +114,7 @@ impl Resolver {
         let addrs = addrs
             .map(|v| {
                 v.into_iter()
-                    .filter(|a| !is_magic_dns(a.ip()))
+                    .filter(|a| !is_loopable_upstream(a.ip()))
                     .collect::<Vec<_>>()
             })
             .filter(|v: &Vec<SocketAddr>| !v.is_empty());
@@ -166,7 +160,7 @@ impl Resolver {
     pub fn set_upstream_addrs(&self, addrs: impl IntoIterator<Item = SocketAddr>) {
         let v: Vec<SocketAddr> = addrs
             .into_iter()
-            .filter(|a| !is_magic_dns(a.ip()))
+            .filter(|a| !is_loopable_upstream(a.ip()))
             .collect();
         self.upstreams.store(Arc::new(v));
     }
@@ -191,10 +185,7 @@ impl Resolver {
     /// goes upstream to the real internet instead of failing. It does not apply
     /// inside `.ray`, where [`crate::dns::handle_query`] answers a miss itself.
     pub async fn resolve(&self, query: &[u8]) -> Option<Vec<u8>> {
-        let ipv6_only = self.ipv6_only.load(Ordering::Relaxed);
-        if let Some(local) =
-            crate::dns::handle_query(query, &self.table, &self.reverse, ipv6_only).await
-        {
+        if let Some(local) = crate::dns::handle_query(query, &self.table, &self.reverse).await {
             return Some(local);
         }
         // Sharing resolv.conf means the stub has another nameserver listed
@@ -541,6 +532,8 @@ mod tests {
         assert!(!r.loop_guard_allows(query_name(&build_a_query("MIXED.EXAMPLE.COM")).as_ref()));
     }
 
+    /// An A record in a response. Still meaningful for *upstream* answers: the
+    /// mesh has no IPv4, but the public names we forward do.
     fn response_has_a(bytes: &[u8], ip: Ipv4Addr) -> bool {
         let pkt = Packet::parse(bytes).expect("parse response");
         pkt.answers.iter().any(|rr| {
@@ -552,9 +545,32 @@ mod tests {
         })
     }
 
+    fn build_aaaa_query(name: &str) -> Vec<u8> {
+        let mut pkt = Packet::new_query(1);
+        pkt.set_flags(PacketFlag::RECURSION_DESIRED);
+        pkt.questions.push(Question::new(
+            Name::new_unchecked(name),
+            QTYPE::TYPE(simple_dns::TYPE::AAAA),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        pkt.build_bytes_vec().expect("build query")
+    }
+
+    fn response_has_aaaa(bytes: &[u8], ip: std::net::Ipv6Addr) -> bool {
+        let pkt = Packet::parse(bytes).expect("parse response");
+        pkt.answers.iter().any(|rr| {
+            if let simple_dns::rdata::RData::AAAA(a) = &rr.rdata {
+                std::net::Ipv6Addr::from(a.address) == ip
+            } else {
+                false
+            }
+        })
+    }
+
     #[tokio::test]
     async fn handle_tun_query_injects_reply_for_ray_name() {
-        use std::net::{IpAddr, Ipv4Addr};
+        use std::net::IpAddr;
         let table = crate::dns::new_hostname_table();
         let reverse = crate::dns::new_reverse_table();
         crate::dns::update_hostname(
@@ -562,18 +578,17 @@ mod tests {
             &reverse,
             "homelab",
             "dario",
-            Some(Ipv4Addr::new(100, 64, 0, 7)),
             "200::7".parse().unwrap(),
         )
         .await;
         let r = Resolver::new(table, reverse);
 
-        // Build a full IPv4/UDP query packet to MAGIC_IP:53 (use build_udp_reply
+        // Build a full IPv6/UDP query packet to MAGIC_IP:53 (use build_udp_reply
         // in reverse: synthesize a query with src=app, dst=magic).
-        let dns_query = build_a_query("dario.homelab.ray");
+        let dns_query = build_aaaa_query("dario.homelab.ray");
         let app = crate::firewall::PacketInfo {
-            src_ip: IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5)),
-            dst_ip: IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            src_ip: IpAddr::V6("200::5".parse().unwrap()),
+            dst_ip: IpAddr::V6(crate::dns::MAGIC_DNS_V6),
             protocol: 17,
             src_port: 50000,
             dst_port: 53,
@@ -600,9 +615,9 @@ mod tests {
 
         let reply = rx.try_recv().expect("a reply was injected");
         let rinfo = crate::firewall::parse_packet_info(&reply).unwrap();
-        assert_eq!(rinfo.src_ip, IpAddr::V4(crate::dns::MAGIC_DNS_V4));
+        assert_eq!(rinfo.src_ip, IpAddr::V6(crate::dns::MAGIC_DNS_V6));
         assert_eq!(rinfo.dst_port, 50000);
-        assert!(response_has_a(&reply[28..], Ipv4Addr::new(100, 64, 0, 7)));
+        assert!(response_has_aaaa(&reply[48..], "200::7".parse().unwrap()));
     }
 
     #[tokio::test]
@@ -614,7 +629,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let info = crate::firewall::PacketInfo {
             src_ip: "100.64.0.5".parse().unwrap(),
-            dst_ip: std::net::IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            dst_ip: std::net::IpAddr::V6(crate::dns::MAGIC_DNS_V6),
             protocol: 6,
             src_port: 50000,
             dst_port: 53,
@@ -635,15 +650,14 @@ mod tests {
             &reverse,
             "homelab",
             "dario",
-            Some(Ipv4Addr::new(100, 64, 0, 7)),
             "200::7".parse().unwrap(),
         )
         .await;
         let r = Resolver::new(table, reverse);
         // No upstreams set; a .ray name must still resolve locally.
-        let query = build_a_query("dario.homelab.ray");
+        let query = build_aaaa_query("dario.homelab.ray");
         let resp = r.resolve(&query).await.expect("local answer");
-        assert!(response_has_a(&resp, Ipv4Addr::new(100, 64, 0, 7)));
+        assert!(response_has_aaaa(&resp, "200::7".parse().unwrap()));
     }
 
     /// A network named `dev` must not swallow `zed.dev`. The roster holds a
@@ -651,18 +665,10 @@ mod tests {
     /// internet, while `box.dev` still resolves to its mesh IP.
     #[tokio::test]
     async fn unknown_bare_network_name_falls_back_upstream() {
-        let peer_ip = Ipv4Addr::new(100, 64, 0, 7);
         let table = crate::dns::new_hostname_table();
         let reverse = crate::dns::new_reverse_table();
-        crate::dns::update_hostname(
-            &table,
-            &reverse,
-            "dev",
-            "box",
-            Some(peer_ip),
-            "200::7".parse().unwrap(),
-        )
-        .await;
+        crate::dns::update_hostname(&table, &reverse, "dev", "box", "200::7".parse().unwrap())
+            .await;
 
         let upstream_answer = Ipv4Addr::new(93, 184, 216, 34);
         let up = fake_upstream(upstream_answer).await;
@@ -679,10 +685,15 @@ mod tests {
         );
 
         // The peer that does exist keeps resolving to the mesh, suffix or not.
+        // AAAA, because the overlay has no IPv4 to put in an A record.
+        let peer_ip: std::net::Ipv6Addr = "200::7".parse().unwrap();
         for name in ["box.dev", "box.dev.ray", "box.ray"] {
-            let resp = r.resolve(&build_a_query(name)).await.expect("local answer");
+            let resp = r
+                .resolve(&build_aaaa_query(name))
+                .await
+                .expect("local answer");
             assert!(
-                response_has_a(&resp, peer_ip),
+                response_has_aaaa(&resp, peer_ip),
                 "{name} must resolve locally"
             );
         }
@@ -761,8 +772,8 @@ mod tests {
 
         let dns_query = build_a_query("example.com");
         let app = crate::firewall::PacketInfo {
-            src_ip: IpAddr::V4(Ipv4Addr::new(100, 69, 9, 225)),
-            dst_ip: IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            src_ip: IpAddr::V6("200::9".parse().unwrap()),
+            dst_ip: IpAddr::V6(crate::dns::MAGIC_DNS_V6),
             protocol: 17,
             src_port: 50000,
             dst_port: 53,
@@ -788,9 +799,9 @@ mod tests {
 
         let reply = rx.try_recv().expect("forwarded answer injected into TUN");
         let rinfo = crate::firewall::parse_packet_info(&reply).unwrap();
-        assert_eq!(rinfo.src_ip, IpAddr::V4(crate::dns::MAGIC_DNS_V4));
+        assert_eq!(rinfo.src_ip, IpAddr::V6(crate::dns::MAGIC_DNS_V6));
         assert_eq!(rinfo.dst_port, 50000);
-        assert!(response_has_a(&reply[28..], upstream_answer));
+        assert!(response_has_a(&reply[48..], upstream_answer));
     }
 
     /// A dead address: bind a socket to claim a port, then drop it, so nothing
@@ -839,8 +850,8 @@ mod tests {
 
         let dns_query = build_a_query("example.com");
         let app = crate::firewall::PacketInfo {
-            src_ip: IpAddr::V4(Ipv4Addr::new(100, 69, 9, 225)),
-            dst_ip: IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            src_ip: IpAddr::V6("200::9".parse().unwrap()),
+            dst_ip: IpAddr::V6(crate::dns::MAGIC_DNS_V6),
             protocol: 17,
             src_port: 50000,
             dst_port: 53,
@@ -867,7 +878,7 @@ mod tests {
         let reply = rx
             .try_recv()
             .expect("SERVFAIL injected, not a dropped query");
-        let pkt = Packet::parse(&reply[28..]).expect("parse SERVFAIL");
+        let pkt = Packet::parse(&reply[48..]).expect("parse SERVFAIL");
         assert_eq!(pkt.rcode(), simple_dns::RCODE::ServerFailure);
         // The id and question have to survive or the client can't match the
         // response to its outstanding query and will ignore it.

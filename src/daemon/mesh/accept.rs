@@ -493,7 +493,6 @@ impl CoordinatorAcceptState {
             &self.ctx.reverse_table,
             &self.network_name,
             &final_hostname,
-            None,
             derive_ipv6(&remote_id),
         )
         .await;
@@ -734,7 +733,6 @@ impl CoordinatorAcceptState {
                 &self.ctx.reverse_table,
                 &self.network_name,
                 h,
-                None,
                 derive_ipv6(&remote_id),
             )
             .await;
@@ -1132,7 +1130,6 @@ impl MemberAcceptState {
                     &self.ctx.reverse_table,
                     &self.network_name,
                     h,
-                    None,
                     derive_ipv6(&peer_identity),
                 )
                 .await;
@@ -1190,7 +1187,6 @@ impl MemberAcceptState {
                 &self.ctx.reverse_table,
                 &self.network_name,
                 h,
-                None,
                 derive_ipv6(&peer_identity),
             )
             .await;
