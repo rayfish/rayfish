@@ -61,7 +61,11 @@ pub4(){ on "$1" "curl -4 -s --max-time 20 https://api.ipify.org || curl -4 -s --
 
 # pub6 <host> : the host's public IPv6 as an external service sees it. Empty when
 # the host has no IPv6 egress at all, which several instances do not.
-pub6(){ on "$1" "curl -6 -s --max-time 20 https://api6.ipify.org" 2>/dev/null | tr -d '[:space:]'; }
+#
+# Two services, as `pub4` has: the baseline reading decides whether steps 4-6 run
+# at all, so one flaky probe would turn the tunnel and deny-path assertions into
+# skips whose message claims something about the host that was never established.
+pub6(){ on "$1" "curl -6 -s --max-time 20 https://api6.ipify.org || curl -6 -s --max-time 20 https://icanhazip.com" 2>/dev/null | tr -d '[:space:]'; }
 
 # exit_json <host> : `ray exit-node status --json` from a host.
 exit_json(){ on "$1" "ray exit-node status --json" 2>/dev/null; }
@@ -191,112 +195,135 @@ on "$B" "ray status" | strip | grep -q 'srv-a.*offers' \
   || fail "ray status did not flag srv-a as an exit node on srv-b"
 
 # ---------------------------------------------------------------------------
-step "4. srv-b tunnels IPv6 through srv-a and leaves its IPv4 egress alone"
-arm_failsafe "$B" 240
-use_started=$SECONDS
-USE_OUT="$(on "$B" "ray exit-node use $NET srv-a" 2>&1)"; USE_RC=$?
-use_took=$((SECONDS - use_started))
-printf '%s\n' "$USE_OUT" | strip | sed 's/^/   b| /'
-# A refusal here is silent in the assertions below: with no tunnel installed they
-# all read a host egressing directly and blame the part that did not run. The
-# common cause is a gateway with no IPv6 uplink, which the CLI names.
-[[ $USE_RC -eq 0 ]] || { disarm_failsafe "$B"; fail "srv-b's \`exit-node use\` was refused: no tunnel to test"; summary; }
-# The command runs over SSH, and the tunnel comes up underneath that very session.
-# If the conntrack-mark rules do not cover a connection that predates the tunnel,
-# the reply is swallowed and this returns minutes later, after the failsafe has
-# already reverted the host: every assertion below then measures a torn-down
-# tunnel and lies about which part is broken. Time it so that failure names itself.
-[[ $use_took -le 30 ]] \
-  && pass "\`exit-node use\` returned promptly (${use_took}s)" \
-  || fail "\`exit-node use\` took ${use_took}s: the SSH session running it stalled under the tunnel"
-sleep 8
-
-# The assertion this whole feature lives or dies on for a headless host: we are
-# still talking to srv-b over its PUBLIC IP while its default route points into the
-# tunnel. Without the conntrack-mark rules, sshd's replies egress via srv-a, come
-# out NATed as srv-a's address, and every command below hangs instead of answering.
-if on "$B" 'true' 2>/dev/null; then
-  pass "SSH to srv-b's public IP survived the full tunnel (inbound conns bypass it)"
+# Both steps need a tunnel to exist, and the gateway is what decides whether one
+# can: with no IPv6 uplink on srv-a the selection is refused and there is nothing
+# to measure. Skipped rather than fatal, the same way step 6 treats it, so a fleet
+# without IPv6 still runs the steps that never needed it (7 and 8).
+if [[ -z "$A_PUB_V6" ]]; then
+  step "4-5. tunnel install and revert (skipped)"
+  echo "   (srv-a has no IPv6 egress: it cannot carry a tunnel, so there is none to test)"
 else
-  fail "srv-b cut off its own SSH under the full tunnel: inbound-connection bypass is broken"
-  echo "   (the failsafe will revert srv-b within 240s)"
-  summary
-fi
-
-# The headline, and it is the *opposite* of what a dual-stack tunnel asserted:
-# the mesh carries no IPv4, so a tunnel cannot source IPv4 transit and the host's
-# own IPv4 egress must be left exactly where it was. Tunnelling it would take
-# IPv4 away from whatever else is using this box and send it into a hole.
-B_VIA_EXIT="$(pub4 "$B")"
-echo "   srv-b public IPv4 while tunneled: '$B_VIA_EXIT'  (srv-a=$A_PUB, srv-b own=$B_PUB)"
-if [[ "$B_VIA_EXIT" == "$B_PUB" ]]; then
-  pass "srv-b's IPv4 egress is untouched by the tunnel (as it must be)"
-elif [[ "$B_VIA_EXIT" == "$A_PUB" ]]; then
-  fail "srv-b's IPv4 egress was hijacked into the tunnel: it has no return path"
-else
-  fail "srv-b egressed via an unexpected IPv4 '$B_VIA_EXIT' (wanted its own $B_PUB)"
-fi
-
-# The loop-prevention assertion. If SO_MARK / the fwmark rule were missing, iroh's
-# own UDP would have looped into the tunnel and the mesh would be dead here.
-if on "$B" "ping -c 3 -W 2 $A_VPN" 2>/dev/null | grep -q "0% packet loss"; then
-  pass "mesh still works under the full tunnel (srv-b pinged srv-a's mesh IP)"
-else
-  fail "mesh broke under the full tunnel: loop prevention failed (SO_MARK/ip rule)"
-fi
-on "$B" "ip -6 rule show" 2>/dev/null | grep -q "$MARK" \
-  && pass "srv-b installed the fwmark bypass rule ($MARK -> main)" \
-  || fail "srv-b has no fwmark bypass rule: iroh's transport would loop"
-on "$B" "ip -6 route show table $TABLE" 2>/dev/null | grep -q default \
-  && pass "srv-b installed the tunnel default route (table $TABLE)" \
-  || fail "srv-b has no default route in the tunnel table"
-# And nothing IPv4 was installed at all: the family the tunnel does not carry
-# must not have rules pointing at a table with no return path.
-on "$B" "ip -4 rule show" 2>/dev/null | grep -q "lookup $TABLE" \
-  && fail "srv-b installed an IPv4 tunnel rule: its IPv4 egress is hijacked" \
-  || pass "srv-b installed no IPv4 tunnel rule"
-on "$B" 'nft list table inet rayfish_exit_client 2>/dev/null | grep -q "ct mark"' \
-  && pass "srv-b installed the conntrack-mark table (inbound connections bypass the tunnel)" \
-  || fail "srv-b has no conntrack-mark table: inbound connections would be swallowed"
-# The exit column now names srv-a as the peer carrying our traffic, not just one
-# offering to (it read `offers` in step 3, before we selected it).
-on "$B" "ray status" | strip | grep -q 'srv-a.*in use' \
-  && pass "ray status marks srv-a 'in use' in the exit column" \
-  || fail "ray status does not mark srv-a as the exit node in use"
-
-# IPv6 is the family the tunnel actually carries, and the one assertion that
-# says the feature works at all. Still conditional, because not every instance
-# or zone has working v6 egress to tunnel in the first place.
-if [[ -n "$B_PUB_V6" && -n "$A_PUB_V6" ]]; then
-  B_V6="$(pub6 "$B")"
-  [[ "$B_V6" == "$A_PUB_V6" ]] \
-    && pass "srv-b's IPv6 traffic egressed via srv-a ($B_V6): the exit node works" \
-    || fail "srv-b IPv6 egressed via '$B_V6', wanted srv-a's '$A_PUB_V6'"
-else
-  echo "   (no IPv6 egress on these instances: the tunnel has nothing to carry)"
-fi
-
-# ---------------------------------------------------------------------------
-step "5. egress reverts after 'ray exit-node none'"
-# Asserted over IPv6, the family the tunnel carried. IPv4 never entered it, so a
-# v4 probe here would pass whether teardown worked or not.
-on "$B" "ray exit-node none $NET" 2>&1 | strip | sed 's/^/   b| /'
-disarm_failsafe "$B"
-if [[ -n "$B_PUB_V6" ]]; then
-  if retry_until 60 "[[ \"\$(pub6 '$B')\" == '$B_PUB_V6' ]]"; then
-    pass "srv-b egresses via its own IPv6 uplink again ($B_PUB_V6)"
-  else
-    fail "srv-b did not revert to direct IPv6 egress (got '$(pub6 "$B")')"
+  step "4. srv-b tunnels IPv6 through srv-a and leaves its IPv4 egress alone"
+  arm_failsafe "$B" 240
+  use_started=$SECONDS
+  USE_OUT="$(on "$B" "ray exit-node use $NET srv-a" 2>&1)"; USE_RC=$?
+  use_took=$((SECONDS - use_started))
+  printf '%s\n' "$USE_OUT" | strip | sed 's/^/   b| /'
+  # A refusal here is silent in the assertions below: with no tunnel installed they
+  # all read a host egressing directly and blame the part that did not run. The
+  # common cause is a gateway with no IPv6 uplink, which the CLI names.
+  #
+  # Revert before disarming, and in that order: `disarm_failsafe` only touches the
+  # flag file, so disarming a half-installed tunnel takes away the automatic revert
+  # without doing one. 255 is ssh itself failing, which is not a refusal.
+  if [[ $USE_RC -ne 0 ]]; then
+    on "$B" "ray exit-node none $NET" >/dev/null 2>&1
+    disarm_failsafe "$B"
+    [[ $USE_RC -eq 255 ]] \
+      && fail "lost ssh to srv-b running \`exit-node use\` (rc=255): cannot tell what happened" \
+      || fail "srv-b's \`exit-node use\` failed (rc=$USE_RC): no tunnel to test"
+    summary
   fi
-else
-  echo "   (srv-b has no IPv6 egress: nothing was tunnelled, nothing to revert)"
+  # The command runs over SSH, and the tunnel comes up underneath that very session.
+  # If the conntrack-mark rules do not cover a connection that predates the tunnel,
+  # the reply is swallowed and this returns minutes later, after the failsafe has
+  # already reverted the host: every assertion below then measures a torn-down
+  # tunnel and lies about which part is broken. Time it so that failure names itself.
+  [[ $use_took -le 30 ]] \
+    && pass "\`exit-node use\` returned promptly (${use_took}s)" \
+    || fail "\`exit-node use\` took ${use_took}s: the SSH session running it stalled under the tunnel"
+  sleep 8
+
+  # The assertion this whole feature lives or dies on for a headless host: we are
+  # still talking to srv-b over its PUBLIC IP while its default route points into the
+  # tunnel. Without the conntrack-mark rules, sshd's replies egress via srv-a, come
+  # out NATed as srv-a's address, and every command below hangs instead of answering.
+  if on "$B" 'true' 2>/dev/null; then
+    pass "SSH to srv-b's public IP survived the full tunnel (inbound conns bypass it)"
+  else
+    fail "srv-b cut off its own SSH under the full tunnel: inbound-connection bypass is broken"
+    echo "   (the failsafe will revert srv-b within 240s)"
+    summary
+  fi
+
+  # The headline, and it is the *opposite* of what a dual-stack tunnel asserted:
+  # the mesh carries no IPv4, so a tunnel cannot source IPv4 transit and the host's
+  # own IPv4 egress must be left exactly where it was. Tunnelling it would take
+  # IPv4 away from whatever else is using this box and send it into a hole.
+  B_VIA_EXIT="$(pub4 "$B")"
+  echo "   srv-b public IPv4 while tunneled: '$B_VIA_EXIT'  (srv-a=$A_PUB, srv-b own=$B_PUB)"
+  if [[ "$B_VIA_EXIT" == "$B_PUB" ]]; then
+    pass "srv-b's IPv4 egress is untouched by the tunnel (as it must be)"
+  elif [[ "$B_VIA_EXIT" == "$A_PUB" ]]; then
+    fail "srv-b's IPv4 egress was hijacked into the tunnel: it has no return path"
+  else
+    fail "srv-b egressed via an unexpected IPv4 '$B_VIA_EXIT' (wanted its own $B_PUB)"
+  fi
+
+  # The loop-prevention assertion. If SO_MARK / the fwmark rule were missing, iroh's
+  # own UDP would have looped into the tunnel and the mesh would be dead here.
+  if on "$B" "ping -c 3 -W 2 $A_VPN" 2>/dev/null | grep -q "0% packet loss"; then
+    pass "mesh still works under the full tunnel (srv-b pinged srv-a's mesh IP)"
+  else
+    fail "mesh broke under the full tunnel: loop prevention failed (SO_MARK/ip rule)"
+  fi
+  on "$B" "ip -6 rule show" 2>/dev/null | grep -q "$MARK" \
+    && pass "srv-b installed the fwmark bypass rule ($MARK -> main)" \
+    || fail "srv-b has no fwmark bypass rule: iroh's transport would loop"
+  on "$B" "ip -6 route show table $TABLE" 2>/dev/null | grep -q default \
+    && pass "srv-b installed the tunnel default route (table $TABLE)" \
+    || fail "srv-b has no default route in the tunnel table"
+  # And nothing IPv4 was installed at all: the family the tunnel does not carry
+  # must not have rules pointing at a table with no return path.
+  on "$B" "ip -4 rule show" 2>/dev/null | grep -q "lookup $TABLE" \
+    && fail "srv-b installed an IPv4 tunnel rule: its IPv4 egress is hijacked" \
+    || pass "srv-b installed no IPv4 tunnel rule"
+  on "$B" 'nft list table inet rayfish_exit_client 2>/dev/null | grep -q "ct mark"' \
+    && pass "srv-b installed the conntrack-mark table (inbound connections bypass the tunnel)" \
+    || fail "srv-b has no conntrack-mark table: inbound connections would be swallowed"
+  # The exit column now names srv-a as the peer carrying our traffic, not just one
+  # offering to (it read `offers` in step 3, before we selected it).
+  on "$B" "ray status" | strip | grep -q 'srv-a.*in use' \
+    && pass "ray status marks srv-a 'in use' in the exit column" \
+    || fail "ray status does not mark srv-a as the exit node in use"
+
+  # IPv6 is the family the tunnel actually carries, and the one assertion that
+  # says the feature works at all. Still conditional, because not every instance
+  # or zone has working v6 egress to tunnel in the first place.
+  # srv-a's IPv6 is a given inside this branch; srv-b still needs its own to have
+  # had anything to send.
+  if [[ -n "$B_PUB_V6" ]]; then
+    B_V6="$(pub6 "$B")"
+    [[ "$B_V6" == "$A_PUB_V6" ]] \
+      && pass "srv-b's IPv6 traffic egressed via srv-a ($B_V6): the exit node works" \
+      || fail "srv-b IPv6 egressed via '$B_V6', wanted srv-a's '$A_PUB_V6'"
+  else
+    echo "   (srv-b has no IPv6 egress: the tunnel has nothing to carry)"
+  fi
+
+  # ---------------------------------------------------------------------------
+  step "5. egress reverts after 'ray exit-node none'"
+  # Asserted over IPv6, the family the tunnel carried. IPv4 never entered it, so a
+  # v4 probe here would pass whether teardown worked or not.
+  on "$B" "ray exit-node none $NET" 2>&1 | strip | sed 's/^/   b| /'
+  disarm_failsafe "$B"
+  if [[ -n "$B_PUB_V6" ]]; then
+    if retry_until 60 "[[ \"\$(pub6 '$B')\" == '$B_PUB_V6' ]]"; then
+      pass "srv-b egresses via its own IPv6 uplink again ($B_PUB_V6)"
+    else
+      fail "srv-b did not revert to direct IPv6 egress (got '$(pub6 "$B")')"
+    fi
+  else
+    echo "   (srv-b has no IPv6 egress: nothing was tunnelled, nothing to revert)"
+  fi
+  on "$B" "ip -6 rule show" | grep -q "$MARK" \
+    && fail "srv-b's fwmark rule survived 'exit-node none' (policy routing not torn down)" \
+    || pass "srv-b's full-tunnel ip rules were removed"
+  on "$B" 'nft list table inet rayfish_exit_client' >/dev/null 2>&1 \
+    && fail "srv-b's conntrack-mark table survived 'exit-node none'" \
+    || pass "srv-b's conntrack-mark table was removed"
+
 fi
-on "$B" "ip -6 rule show" | grep -q "$MARK" \
-  && fail "srv-b's fwmark rule survived 'exit-node none' (policy routing not torn down)" \
-  || pass "srv-b's full-tunnel ip rules were removed"
-on "$B" 'nft list table inet rayfish_exit_client' >/dev/null 2>&1 \
-  && fail "srv-b's conntrack-mark table survived 'exit-node none'" \
-  || pass "srv-b's conntrack-mark table was removed"
 
 # ---------------------------------------------------------------------------
 step "6. deny path: srv-c is NOT allowed: its traffic is dropped, not leaked"
@@ -313,7 +340,7 @@ step "6. deny path: srv-c is NOT allowed: its traffic is dropped, not leaked"
 # refused outright, srv-c egresses directly, and the last branch below reports a
 # leak that is really a skipped test.
 if [[ -z "$A_PUB_V6" || -z "$C_PUB_V6" ]]; then
-  echo "   (no IPv6 egress on srv-a or srv-c: the deny path has nothing to carry, skipping)"
+  echo "   (no IPv6 egress on ${A_PUB_V6:+srv-c}${A_PUB_V6:-srv-a}: the deny path has nothing to carry, skipping)"
 else
   arm_failsafe "$C" 180
   on "$C" "ray exit-node use $NET srv-a" 2>&1 | strip | sed 's/^/   c| /'
