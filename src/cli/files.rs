@@ -68,7 +68,7 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     };
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
@@ -249,7 +249,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                         println!();
                     }
                 }
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => eprintln!("Unexpected response: {:?}", other),
             }
         }
@@ -269,7 +269,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 ipc::IpcMessage::Ok { message } => {
                     println!("  {} {}", style::check(), style::value(&message));
                 }
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => eprintln!("Unexpected response: {:?}", other),
             }
         }
@@ -279,7 +279,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 ipc::IpcMessage::Ok { message } => {
                     println!("  {} {}", style::check(), style::value(&message));
                 }
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => eprintln!("Unexpected response: {:?}", other),
             }
         }
@@ -301,7 +301,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 ipc::IpcMessage::Ok { message } => {
                     println!("  {} {}", style::check(), style::value(&message));
                 }
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => eprintln!("Unexpected response: {:?}", other),
             }
         }

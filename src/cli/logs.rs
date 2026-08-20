@@ -36,8 +36,7 @@ pub(crate) async fn ipc_logs(since: Option<String>, follow: bool) -> Result<()> 
             Ok(ipc::IpcMessage::Ok { .. }) => break,
             Ok(ipc::IpcMessage::Error { message }) => {
                 sink.finish();
-                print_error("error", &message, None);
-                std::process::exit(1);
+                fail_with("error", &message);
             }
             Ok(other) => {
                 eprintln!("Unexpected response: {other:?}");

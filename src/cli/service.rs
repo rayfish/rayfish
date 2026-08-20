@@ -95,7 +95,7 @@ pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
         .await?;
         match ipc::recv(&mut stream).await? {
             ipc::IpcMessage::Ok { message } => println!("{message}"),
-            ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+            ipc::IpcMessage::Error { message } => fail_with("error", &message),
             other => eprintln!("Unexpected response: {other:?}"),
         }
         return Ok(());
@@ -168,15 +168,28 @@ pub(crate) async fn install_and_start_service(
                 ipc::IpcMessage::Up { hostname },
             )
             .await?;
-            match ipc::recv(&mut stream).await? {
-                ipc::IpcMessage::Ok { message } => println!("rayfish service started. {message}"),
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-                other => eprintln!("Unexpected response: {other:?}"),
-            }
+            // A failed `up` still exits non-zero, but not before the grant below:
+            // the service is installed and running by this point, and the user's
+            // next move is to retry `ray up` without sudo. Taking that away as
+            // well would make the failure harder to recover from than it is.
+            let failed = match ipc::recv(&mut stream).await? {
+                ipc::IpcMessage::Ok { message } => {
+                    println!("rayfish service started. {message}");
+                    None
+                }
+                ipc::IpcMessage::Error { message } => Some(message),
+                other => {
+                    eprintln!("Unexpected response: {other:?}");
+                    None
+                }
+            };
             // We're root here (installing the service). Grant the invoking user
             // operator access so they can run `ray` without sudo from now on,
             // the way `tailscale up --operator=$USER` does.
             grant_operator_to_invoking_user().await;
+            if let Some(message) = failed {
+                fail_with("error", &message);
+            }
             Ok(())
         }
         None => {

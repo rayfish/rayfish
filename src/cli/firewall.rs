@@ -52,7 +52,7 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
                 );
             }
         }
-        ipc::IpcMessage::Error { message } => print_error("firewall", &message, None),
+        ipc::IpcMessage::Error { message } => fail_with("firewall", &message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
@@ -187,7 +187,7 @@ async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
         ipc::IpcMessage::FirewallSshState { enabled, networks } => {
             render_ssh_state(enabled, networks, filter.as_deref())
         }
-        ipc::IpcMessage::Error { message } => print_error("firewall ssh", &message, None),
+        ipc::IpcMessage::Error { message } => fail_with("firewall ssh", &message),
         other => eprintln!("Unexpected response: {other:?}"),
     }
     Ok(())
@@ -418,7 +418,7 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
         ipc::IpcMessage::Ok { message } => {
             println!("  {} {}", style::check(), style::value(&message));
         }
-        ipc::IpcMessage::Error { message } => print_error("firewall pending", &message, None),
+        ipc::IpcMessage::Error { message } => fail_with("firewall pending", &message),
         other => eprintln!("Unexpected response: {other:?}"),
     }
     Ok(())
@@ -474,10 +474,7 @@ pub(crate) async fn ipc_firewall_suggest(
     .await?;
     let mut suggestions = match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::FirewallSuggestionsResponse { suggestions } => suggestions,
-        ipc::IpcMessage::Error { message } => {
-            print_error("error", &message, None);
-            std::process::exit(1);
-        }
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => {
             eprintln!("Unexpected response: {other:?}");
             std::process::exit(1);
@@ -509,7 +506,7 @@ pub(crate) async fn ipc_firewall_suggest(
     .await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => eprintln!("Unexpected response: {other:?}"),
     }
     Ok(())

@@ -30,6 +30,19 @@ pub(crate) fn print_error(title: &str, detail: &str, hint: Option<&str>) {
     }
 }
 
+/// [`print_error`] for a daemon-side `IpcMessage::Error`, which ends the command
+/// non-zero.
+///
+/// The daemon rejecting a request is a failed command, and a CLI that says so on
+/// stderr alone is one no script can check: `ray join` on a spent invite, or
+/// `ray exit-node use` on a gateway that cannot carry IPv6, printed the reason
+/// and exited 0 exactly like a success. Returns `!`, so it drops into a match arm
+/// of any type.
+pub(crate) fn fail_with(title: &str, detail: &str) -> ! {
+    print_error(title, detail, None);
+    std::process::exit(1);
+}
+
 /// Map a daemon error message to an actionable hint, best-effort.
 pub(crate) fn infer_hint(message: &str) -> Option<String> {
     let m = message.to_lowercase();
@@ -283,7 +296,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
             }
             println!();
         }
-        ipc::IpcMessage::Error { message } => print_error("status failed", &message, None),
+        ipc::IpcMessage::Error { message } => fail_with("status failed", &message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
@@ -777,7 +790,7 @@ pub(crate) async fn ipc_down() -> Result<()> {
     let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
@@ -817,7 +830,7 @@ pub(crate) async fn ipc_report() -> Result<()> {
                 println!("\nCouldn't open a browser. Open this URL manually:\n{url}");
             }
         }
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
@@ -851,7 +864,7 @@ pub(crate) async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()
     let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())

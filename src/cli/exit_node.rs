@@ -36,7 +36,7 @@ pub(crate) async fn ipc_exit_node(action: ExitNodeAction) -> Result<()> {
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
         ipc::IpcMessage::ExitNodeState { networks } => render_exit_node_state(networks),
-        ipc::IpcMessage::Error { message } => print_error("exit-node", &message, None),
+        ipc::IpcMessage::Error { message } => fail_with("exit-node", &message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
@@ -83,7 +83,7 @@ async fn clear_all_exit_selections() -> Result<()> {
         .await?;
         match ipc::recv(&mut s).await? {
             ipc::IpcMessage::Ok { message } => println!("{message}"),
-            ipc::IpcMessage::Error { message } => print_error("exit-node", &message, None),
+            ipc::IpcMessage::Error { message } => fail_with("exit-node", &message),
             other => eprintln!("Unexpected response: {:?}", other),
         }
     }

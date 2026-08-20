@@ -112,6 +112,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ray` exits non-zero when a command fails.** Every command that talks to the
+  daemon printed a rejection to stderr and then exited 0, so `ray join` on a
+  spent invite, `ray exit-node use` on a gateway that cannot carry IPv6, and
+  forty-odd others reported success to whatever ran them. They now exit 1.
+  Scripts that only checked the exit status were being told every command
+  worked; scripts that deliberately relied on the old behaviour will need
+  updating.
 - **Re-applying an exit node no longer lets traffic out around the tunnel while
   it rebuilds.** Every `ray exit-node` command, and every roster change that
   reaches a live tunnel, rebuilds the routing rules. The catch-all that sends
