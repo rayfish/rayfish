@@ -100,6 +100,12 @@ fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>) {
                 "allow": n.allow,
                 "using": n.using,
                 "available": n.available,
+                "available_v6": n.available_v6,
+                "ipv6_only": n.ipv6_only,
+                "refused": n.refused,
+                "not_in_effect": n.not_in_effect,
+                "tunnel_v4": n.tunnel_v4,
+                "tunnel_v6": n.tunnel_v6,
             })).collect::<Vec<_>>(),
         }));
         return;
@@ -124,14 +130,45 @@ fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>) {
                 .collect();
             println!("  offering: yes (allow: {})", peers.join(", "));
         }
-        match &n.using {
-            Some(peer) => println!("  using: {peer}"),
-            None => println!("  using: direct egress"),
+        match (&n.using, n.not_in_effect.as_deref()) {
+            // A selection the daemon is not acting on is the one thing this line
+            // must not print bare: the config says `gw` and the packets leave
+            // directly, and nothing else on screen says so.
+            (Some(peer), Some(why)) => {
+                println!("  using: {peer} (NOT in effect: {why}; traffic leaves directly)")
+            }
+            // A tunnel takes only the families both ends carry, so a bare
+            // "using: <peer>" would read as a full tunnel over both when it is
+            // one family and a direct path for the other.
+            (Some(peer), None) => match (n.tunnel_v4, n.tunnel_v6) {
+                (true, true) => println!("  using: {peer}"),
+                (false, true) => println!("  using: {peer} (IPv6 only; IPv4 leaves directly)"),
+                (true, false) => println!("  using: {peer} (IPv4 only; IPv6 leaves directly)"),
+                (false, false) => println!("  using: {peer} (carries neither family)"),
+            },
+            (None, _) => println!("  using: direct egress"),
         }
         if n.available.is_empty() {
             println!("  available: (none advertised)");
         } else {
-            println!("  available: {}", n.available.join(", "));
+            // A gateway this node would refuse is marked as such, and that beats
+            // marking the ones that carry IPv6: the two lists stopped agreeing
+            // once a gateway could be IPv6-only itself, and it is the refusal
+            // that decides whether `ray exit-node use` works.
+            let listed: Vec<String> = n
+                .available
+                .iter()
+                .map(|peer| {
+                    if n.refused.contains(peer) {
+                        format!("{peer} (unusable from this node)")
+                    } else if n.ipv6_only && n.available_v6.contains(peer) {
+                        format!("{peer} (IPv6)")
+                    } else {
+                        peer.clone()
+                    }
+                })
+                .collect();
+            println!("  available: {}", listed.join(", "));
         }
     }
 }

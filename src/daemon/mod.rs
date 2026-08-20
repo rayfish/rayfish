@@ -78,8 +78,8 @@ use crate::ipc::{
     PeerStatus, ipc_err,
 };
 use crate::membership::{
-    ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
-    MemberList, canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
+    ApprovedEntry, ApprovedList, ExitFamilies, GroupMode, IdentityProvider, IrohIdentityProvider,
+    Member, MemberList, canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
 };
 use crate::network_name;
 use crate::peers::{self, PeerTable};
@@ -155,7 +155,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// ALPN for the device-pairing protocol. The trailing `/1` is its protocol
 /// version - **bump it on any breaking change to the `PairMsg` handshake**;
 /// peers on different versions can't negotiate a connection (transport-enforced).
-const PAIR_ALPN: &[u8] = b"rayfish/pair/1";
+const PAIR_ALPN: &[u8] = b"rayfish/pair/2";
 
 /// Node-wide shared handles, cloned into every per-network accept handler and
 /// background task. Every field is a cheap `Clone` (an `Arc`-backed handle, a
@@ -323,6 +323,22 @@ pub(crate) struct NetworkState {
     members: MemberList,
     approved: ApprovedList,
     snapshot: Option<GroupSnapshot>,
+    /// The hash of the signed record this state is converged on, which is not
+    /// always the hash of [`Self::snapshot`].
+    ///
+    /// The snapshot is *our* encoding of the group, and on a coordinator that is
+    /// exactly what it publishes, so the two agree. On a member they need not:
+    /// applying a fetched blob re-encodes it from local state, and a publisher on
+    /// a build whose `Member` has a different field set (or the map encoding that
+    /// preceded the compact one, which rmp-serde still reads) produces bytes ours
+    /// cannot reproduce. Comparing the record against the snapshot hash then says
+    /// "a different blob" forever: every poll refetches and reapplies, and the
+    /// steady-state work on the converged branch (the self-nullify check, a
+    /// pending rename, the exit-offer sync) never runs at all.
+    ///
+    /// So convergence is tracked as what we last accepted, and the snapshot stays
+    /// what we would publish.
+    converged_hash: Option<blake3::Hash>,
     network_secret_key: Option<SecretKey>,
     network_public_key: EndpointId,
     network_name: Option<String>,
@@ -417,6 +433,22 @@ impl NetworkState {
             hash,
             msgpack_bytes: bytes,
         });
+        // Our own encoding is by definition what we are converged on. An apply
+        // from a fetched blob overwrites this with the record's hash right after,
+        // since that is the one the network agreed on.
+        self.converged_hash = Some(hash);
+    }
+
+    /// Whether a signed record naming `signed` is one this state has not applied.
+    ///
+    /// The single answer to "do we need to reconverge", for the group poller and
+    /// the trigger-driven path alike. It exists as a method because those two open
+    /// -coded the same comparison against different fields and drifted: one moved
+    /// to [`Self::converged_hash`] and the other kept reading the snapshot's,
+    /// which is our own re-encoding and need not equal what the publisher wrote.
+    /// A member whose bytes differ then treats every poll as a change, forever.
+    pub(crate) fn needs_reconverge(&self, signed: blake3::Hash) -> bool {
+        crate::membership::trusted_reconverge_hash(self.converged_hash, signed).is_some()
     }
 }
 
@@ -1152,17 +1184,10 @@ impl Daemon {
                 self.reconcile_exit_node(resp).await
             }
             IpcMessage::ExitNodeUse { network, peer } => {
-                // The client-side full tunnel is IPv4 policy routing through the
-                // exit peer's mesh IPv4, which this node does not have a working
-                // path to in IPv6-only mode. Clearing a selection stays allowed.
-                if peer.is_some() && self.ipv6_only.enabled() {
-                    return ipc_err(
-                        "cannot use an exit node in IPv6-only mode: the full tunnel routes \
-                         over mesh IPv4. Turn the mode off (`ray config set ipv6-only off`) \
-                         and restart the daemon.",
-                    );
-                }
-                let resp = self.registry.exit_node_use(&network, peer).await;
+                let resp = self
+                    .registry
+                    .exit_node_use(&network, peer, self.ipv6_only.enabled())
+                    .await;
                 self.reconcile_exit_node(resp).await
             }
             IpcMessage::ExitNodeStatus { network } => self.registry.exit_node_status(network),
@@ -1951,6 +1976,7 @@ mod absent_member_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         }
     }
@@ -2009,6 +2035,7 @@ mod accept_handler_tests {
             members: MemberList::new(),
             approved: ApprovedList::new(),
             snapshot: None,
+            converged_hash: None,
             network_secret_key: None,
             network_public_key: net_pub,
             network_name: Some("test-net".to_string()),
@@ -2020,6 +2047,73 @@ mod accept_handler_tests {
             pending: HashMap::new(),
             last_record_timestamp: None,
         }))
+    }
+
+    /// Convergence is tracked as the hash we accepted, not the hash of our own
+    /// re-encoding, and the two differ whenever the publisher writes bytes we
+    /// would not.
+    ///
+    /// The case that produces it is an upgrade: rmp-serde reads a struct from a
+    /// map as well as an array, so a node on this build converges fine from a
+    /// coordinator still writing the old named blob, and then re-encodes it
+    /// compactly. Comparing the record against the snapshot hash there says "a
+    /// different blob" on every poll forever, which refetches, reapplies, and
+    /// skips the converged branch's steady-state work (self-nullify check,
+    /// pending rename, exit-offer sync) for as long as the skew lasts.
+    #[test]
+    fn convergence_is_tracked_as_the_hash_we_accepted() {
+        let state = make_network_state();
+        let mut s = state.write().unwrap();
+        let member_id = SecretKey::from_bytes(&[9u8; 32]).public();
+        s.members = MemberList::from_members(vec![seated(member_id, 1)]);
+        s.refresh_snapshot();
+
+        // The mismatch this exists for needs no version skew: `network_name` is
+        // hashed into the blob and is a *local* string, so a member that joined
+        // with `ray join <code> --name <alias>` re-encodes a name the coordinator
+        // never published and can never match its record.
+        let published = canonical_group_bytes(
+            &s.members,
+            &s.approved,
+            &s.suggested_firewall,
+            Some("what the coordinator published"),
+            &s.reusable_keys,
+            &s.nullifiers,
+        );
+        assert_ne!(
+            blake3::hash(&published),
+            s.snapshot.as_ref().unwrap().hash,
+            "a local alias alone puts our re-encoding out of step with the record"
+        );
+
+        // Our own encoding is what we are converged on, so a coordinator (which
+        // publishes exactly these bytes) sees the two agree.
+        let ours = s.snapshot.as_ref().unwrap().hash;
+        assert_eq!(s.converged_hash, Some(ours));
+
+        // Applying a record whose bytes we cannot reproduce: the snapshot stays
+        // what we would publish, and convergence follows the record.
+        let published = blake3::hash(b"the publisher's bytes, not ours");
+        s.converged_hash = Some(published);
+        assert_eq!(
+            s.snapshot.as_ref().unwrap().hash,
+            ours,
+            "the snapshot is still our own encoding, which is what we would publish"
+        );
+
+        // The decision every caller actually makes. This is the assertion that
+        // fails if `needs_reconverge` reads the snapshot: polling the record we
+        // just applied has to read as converged, or the poller refetches and
+        // reapplies the whole roster on every tick for as long as the two
+        // encodings differ.
+        assert!(
+            !s.needs_reconverge(published),
+            "the record we applied is not a change"
+        );
+        assert!(
+            s.needs_reconverge(blake3::hash(b"a genuinely newer blob")),
+            "a record we have not applied still is one"
+        );
     }
 
     /// The live state and context behind a handler, whichever role it is. Lets a
@@ -2042,6 +2136,7 @@ mod accept_handler_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         }
     }
@@ -2052,7 +2147,12 @@ mod accept_handler_tests {
         let h = sample_coordinator_handler().await;
         let (state, _) = handler_parts(&h);
         let member = SecretKey::from_bytes(&[9u8; 32]).public();
-        state.write().unwrap().members.add(seated(member, 2)).unwrap();
+        state
+            .write()
+            .unwrap()
+            .members
+            .add(seated(member, 2))
+            .unwrap();
         assert!(h.knows_sender(member));
     }
 
@@ -2105,7 +2205,12 @@ mod accept_handler_tests {
         let h = sample_coordinator_handler().await;
         let (state, _) = handler_parts(&h);
         let member = SecretKey::from_bytes(&[13u8; 32]).public();
-        state.write().unwrap().members.add(seated(member, 5)).unwrap();
+        state
+            .write()
+            .unwrap()
+            .members
+            .add(seated(member, 5))
+            .unwrap();
         let stranger = SecretKey::from_bytes(&[14u8; 32]).public();
         assert!(!h.knows_sender(stranger));
     }
@@ -2257,7 +2362,7 @@ mod accept_handler_tests {
         // roles: it once reached only the Member dispatch, so a plain
         // coordinator (the one node that can record the offer on the signed
         // roster) silently discarded it and no exit node was ever advertised.
-        use crate::membership::{Member, derive_ip};
+        use crate::membership::{ExitFamilies, Member, derive_ip};
         for handler in [
             sample_coordinator_handler().await,
             sample_member_handler().await,
@@ -2282,6 +2387,7 @@ mod accept_handler_tests {
                         collision_index: 0,
                         last_seen: None,
                         exit_node: false,
+                        exit_families: ExitFamilies::Unknown,
                         ipv6_only: false,
                     })
                     .unwrap();
@@ -2301,19 +2407,28 @@ mod accept_handler_tests {
                 },
             );
             assert!(
-                handler.handle_common(sender, &ControlMsg::ExitNodeOffer { enabled: true }),
+                handler.handle_common(
+                    sender,
+                    &ControlMsg::ExitNodeOffer {
+                        enabled: true,
+                        exit_families: ExitFamilies::Dual,
+                    },
+                ),
                 "ExitNodeOffer must be consumed by the role-independent dispatch"
             );
             // The recording runs off the demux loop; wait for it to land.
             let mut recorded = false;
             for _ in 0..100 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
+                // Both halves of the offer: the IPv6 claim rides the same message
+                // and has to reach the signed roster with it, or an IPv6-only
+                // client sees a gateway it will refuse to select.
                 let done = state
                     .read()
                     .unwrap()
                     .members
                     .get(&sender)
-                    .is_some_and(|m| m.exit_node);
+                    .is_some_and(|m| m.exit_node && m.exit_families.carries_v6());
                 if done {
                     recorded = true;
                     break;
@@ -2336,7 +2451,7 @@ mod accept_handler_tests {
         // recording path and flip the member's roster `exit_node` flag. Before the
         // fix the coordinator's accept handler dropped the frame on its catch-all,
         // so nothing was recorded and no exit node was ever advertised.
-        use crate::membership::{Member, derive_ip};
+        use crate::membership::{ExitFamilies, Member, derive_ip};
         use iroh::endpoint::presets;
         use iroh::{Endpoint, RelayMode, SecretKey};
 
@@ -2387,6 +2502,7 @@ mod accept_handler_tests {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    exit_families: ExitFamilies::Unknown,
                     ipv6_only: false,
                 })
                 .unwrap();
@@ -2458,7 +2574,10 @@ mod accept_handler_tests {
         control::send_msg(
             &mut send,
             Some(net_pubkey),
-            &ControlMsg::ExitNodeOffer { enabled: true },
+            &ControlMsg::ExitNodeOffer {
+                enabled: true,
+                exit_families: ExitFamilies::V4,
+            },
         )
         .await
         .unwrap();
@@ -2494,7 +2613,7 @@ mod accept_handler_tests {
         // ConnectionManager owns); the earlier bug dialed a throwaway connection
         // and dropped it, so the frame never flushed and the coordinator's
         // roster never changed even though the sender logged "delivered".
-        use crate::membership::{Member, derive_ip, derive_ipv6};
+        use crate::membership::{ExitFamilies, Member, derive_ip, derive_ipv6};
         use iroh::endpoint::presets;
         use iroh::{Endpoint, RelayMode, SecretKey};
 
@@ -2536,6 +2655,7 @@ mod accept_handler_tests {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    exit_families: ExitFamilies::Unknown,
                     ipv6_only: false,
                 },
                 Member {
@@ -2548,6 +2668,7 @@ mod accept_handler_tests {
                     collision_index: 0,
                     last_seen: None,
                     exit_node: false,
+                    exit_families: ExitFamilies::Unknown,
                     ipv6_only: false,
                 },
             ]
@@ -2754,7 +2875,7 @@ mod accept_handler_tests {
 #[cfg(test)]
 mod coordinator_dial_order_tests {
     use super::*;
-    use crate::membership::{Member, derive_ip};
+    use crate::membership::{ExitFamilies, Member, derive_ip};
 
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
@@ -2776,6 +2897,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
@@ -2796,6 +2918,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
 
@@ -2858,6 +2981,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         let members = vec![mk(a, true), mk(b, false), mk(c, true)];
@@ -2879,6 +3003,7 @@ mod coordinator_dial_order_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         };
         // Only members are us (coordinator) and a plain member: nobody to gossip to.

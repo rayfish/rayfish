@@ -245,8 +245,9 @@ pub(crate) fn evaluate_inbound(
     };
     // IPv6-only: refuse mesh IPv4 outright rather than accepting a packet we
     // cannot answer. Exit-node transit (a non-overlay destination) is checked
-    // below and is not affected, since `ray exit-node use` is refused in this
-    // mode and serving one still forwards through the kernel's own routes.
+    // below and is not affected either way: this only matches overlay IPv4
+    // destinations, while a full tunnel in this mode carries IPv6 alone, so its
+    // return traffic is addressed to our mesh v6 and never meets this rule.
     if is_disabled_mesh_ipv4(ipv6_only(), info.dst_ip) {
         return InboundDecision::DropIpv4Disabled;
     }
@@ -1432,6 +1433,7 @@ mod tests {
     fn exit_via(peer: EndpointId) -> ExitContext {
         let exit = no_exit();
         exit.client.set(Some(crate::exit_node::ExitSelection {
+            carries: crate::membership::ExitFamilies::Dual,
             peer_user: peer,
             ipv4: TEST_V4,
             network: SmolStr::new("test-net"),
@@ -1563,6 +1565,7 @@ mod tests {
         let fw = SharedFirewall::new(firewall::FirewallConfig::default());
         let exit = no_exit();
         exit.client.set(Some(crate::exit_node::ExitSelection {
+            carries: crate::membership::ExitFamilies::Dual,
             peer_user: selected_user,
             ipv4: TEST_V4, // the exit peer's mesh IPv4
             network: SmolStr::new("test-net"),

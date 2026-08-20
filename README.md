@@ -493,7 +493,8 @@ ray config unset relay                        # back to defaults
 ```
 
 Keys: `relay`, `discovery-dns`, `dns-upstreams`. Values are a comma list of
-presets (`rayfish`, `n0`), URLs, or IPv4 addresses. By default custom servers are
+presets (`rayfish`, `n0`), URLs, or IP addresses (`dns-upstreams` takes IPv6 ones
+too, used by an exit-node tunnel in IPv6-only mode). By default custom servers are
 added alongside the defaults; `--replace` swaps them out (a bad custom server
 with no fallback can isolate the node). Settings are saved to `settings.toml` and
 take effect on `sudo ray restart`.
@@ -524,10 +525,50 @@ sits in the range the other VPN is filtering (Tailscale drops anything sourced
 from `100.64.0.0/10` that doesn't arrive on `tailscale0`, which includes our own
 DNS replies).
 
-The one thing that doesn't work is `ray exit-node use`: the full tunnel is IPv4
-policy routing, so it's refused in this mode. Serving as an exit node for others
-is unaffected. NetworkManager's DNS backend is skipped too (it can only carry an
-IPv4 nameserver); the next backend down takes over.
+`ray exit-node use` works here too, and tunnels IPv6 only. Mesh IPv4 carries no
+traffic in this mode, so the tunnel doesn't claim the host's IPv4 egress either:
+that stays with the other VPN. Your IPv4 internet traffic keeps leaving directly,
+which `ray exit-node use` and `ray exit-node status` both say out loud. Two
+things follow from it:
+
+- The gateway needs an IPv6 uplink of its own. Ones that report having it are
+  marked `(IPv6)` in `ray exit-node status`, and picking one that reports the
+  opposite is refused rather than left to time out. A gateway that reports
+  nothing either way is still selectable: that is what a network whose
+  coordinator predates this feature looks like, and refusing there would rule
+  out every gateway on it. `ray exit-node use` says so when it happens.
+
+  The same rule applies in reverse on a dual-stack node: a tunnel carries the
+  families both ends can carry, so a gateway that can return only one of them
+  narrows the tunnel to it and the other family keeps leaving directly, rather
+  than being tunnelled into a hole. `ray exit-node status` says which.
+- The daemon's own DNS forwarder is pointed at an IPv6 resolver while the tunnel
+  is up, so the lookups it makes go through the exit rather than around it. Name
+  one yourself with `ray config set dns-upstreams` (IPv6 addresses are accepted);
+  otherwise Cloudflare and Google's IPv6 resolvers are used.
+
+  This only covers applications' lookups on a host where rayfish is the whole
+  of DNS. On systemd-resolved, NetworkManager, or resolvconf, rayfish registers
+  `~ray` as its only routing domain, so everything else goes to the host's other
+  DNS servers, over IPv4, which this mode does not tunnel: those lookups still
+  leave directly. Sharing `/etc/resolv.conf` with another VPN (below) has the
+  same effect, since rayfish declines names outside `.ray` there and the system
+  resolver asks that VPN's server itself. The daemon logs a warning when either
+  applies. macOS has no such gap, since it switches to a catch-all match domain
+  while the tunnel is up. Giving Linux the same switch is not done yet.
+
+The other VPN's own routes are copied into the tunnel's routing table before the
+default goes in, and a rule sends its destinations there, so it keeps working:
+without that our catch-all rule sits above its rules (Tailscale's are at
+priority 5210-5270) and its prefixes live in a table of its own, not `main`, so
+it would be black-holed the moment the tunnel came up. The rule matters as much
+as the copy, and covers a case the copy alone does not: an SSH session that came
+*in* over that VPN has replies sourced from its address, and those take a
+higher-priority rule that looks up `main`, where the prefix isn't. Serving as an
+exit node for others was never affected by this mode.
+
+NetworkManager's DNS backend is skipped too (it can only carry an IPv4
+nameserver); the next backend down takes over.
 
 If both VPNs manage `/etc/resolv.conf` directly (no systemd-resolved), rayfish
 shares the file rather than fighting over it or giving it up. It writes its own

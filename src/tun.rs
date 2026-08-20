@@ -7,6 +7,8 @@
 // These support the desktop TUN setup (address/route/link configuration via
 // `ifconfig`/`ip`/netlink) and the CGNAT preflight, none of which compile on
 // Android where the packet interface is a `VpnService` fd.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+use crate::membership::ExitFamilies;
 #[cfg(target_os = "linux")]
 use std::future::Future;
 #[cfg(target_os = "linux")]
@@ -486,26 +488,77 @@ const SPLIT_DEFAULT: [(&str, &str); 4] = [
 /// across re-applies. The caller is responsible for loop prevention *before*
 /// this goes in: from here on, everything the routing table decides, including
 /// the daemon's own transport unless it is pinned elsewhere, goes to the TUN.
+///
+/// Only the halves of the families the tunnel actually carries go in
+/// (`ExitFamilies::tunnelled`: what this node's data plane routes, intersected
+/// with what the gateway says it can return). In IPv6-only mode that is `::/1` +
+/// `8000::/1`, since mesh IPv4 carries no traffic on such a host and its egress
+/// stays with whoever owns `100.64.0.0/10` there. Unlike Linux, no hole has to be
+/// punched for that VPN's own prefixes: the split default lives in the one routing
+/// table, where its more specific routes already win.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub async fn route_default_via_tun(tun_name: &str) -> Result<()> {
-    for (family, net) in SPLIT_DEFAULT {
-        let _ = Command::new("route")
-            .args(["-n", "delete", family, "-net", net, "-interface", tun_name])
-            .status();
+pub async fn route_default_via_tun(tun_name: &str, carries: ExitFamilies) -> Result<()> {
+    for step in split_default_plan(carries, tun_name) {
+        let _ = Command::new("route").args(&step.delete).status();
+        let Some(add) = &step.add else { continue };
         let status = Command::new("route")
-            .args(["-n", "add", family, "-net", net, "-interface", tun_name])
+            .args(add)
             .status()
-            .with_context(|| format!("run route add {family} {net}"))?;
+            .with_context(|| format!("run route {}", add.join(" ")))?;
         anyhow::ensure!(
             status.success(),
-            "route add {family} {net} failed with {status}"
+            "route {} failed with {status}",
+            add.join(" ")
         );
     }
     Ok(())
 }
 
+/// What one [`SPLIT_DEFAULT`] entry costs: always a delete, and an add only if
+/// this tunnel carries that family.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+struct SplitDefaultStep {
+    delete: Vec<String>,
+    add: Option<Vec<String>>,
+}
+
+/// The `route` invocations an install makes, as data, so the shape is pinned by a
+/// test instead of by reading the loop.
+///
+/// Every entry is deleted whatever the answer, and only the carried ones are added
+/// back. That asymmetry is the point: this is an install, and an install has to be
+/// as family-symmetric as a teardown. `carries` follows the gateway's claim, so a
+/// live tunnel can narrow (its gateway loses an uplink, or `ipv6_only = auto`
+/// turns on here) and the re-apply arrives with one family fewer. Skipping the
+/// dropped family entirely would leave its half-space routes pointing at a utun
+/// that is still up, so that family keeps entering a tunnel whose far end cannot
+/// return it while the daemon tells the user it is leaving directly.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn split_default_plan(carries: ExitFamilies, tun_name: &str) -> [SplitDefaultStep; 4] {
+    SPLIT_DEFAULT.map(|(family, net)| {
+        let args = |verb: &str| {
+            ["-n", verb, family, "-net", net, "-interface", tun_name]
+                .map(str::to_string)
+                .to_vec()
+        };
+        // `Unknown` is not a `tunnelled()` output; read as both families, which is
+        // what an absent claim meant before the field existed.
+        let wanted = match family {
+            "-inet" => carries.carries_v4() || carries.is_unknown(),
+            _ => carries.carries_v6() || carries.is_unknown(),
+        };
+        SplitDefaultStep {
+            delete: args("delete"),
+            add: wanted.then(|| args("add")),
+        }
+    })
+}
+
 /// Removes the full-tunnel half-space routes. Best-effort and idempotent: routes
 /// that are already gone (never installed, or dropped with the utun) are fine.
+///
+/// Always both families, whatever mode installed them, so a daemon restarted into
+/// the other one still clears what the last left behind.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub async fn unroute_default_via_tun(tun_name: &str) {
     for (family, net) in SPLIT_DEFAULT {
@@ -696,6 +749,64 @@ mod tests {
             // What a carrier hands a phone on mobile data.
             ("rmnet_data0".into(), Ipv4Addr::new(100, 79, 3, 4)),
         ]
+    }
+
+    /// A narrowing tunnel must delete the family it stopped carrying.
+    ///
+    /// `carries` follows the gateway's claim, so it changes under a live tunnel:
+    /// the gateway loses an IPv6 uplink, or `ipv6_only = auto` turns on here, and
+    /// the re-apply arrives with one family fewer. The utun is still up, so
+    /// nothing reaps the dropped family's half-space routes on their own, and that
+    /// family keeps entering a tunnel whose far end cannot return it while
+    /// `ray exit-node status` says it is leaving directly.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn the_split_default_plan_visits_every_family_and_adds_only_what_it_carries() {
+        use crate::membership::ExitFamilies::{Dual, Neither, V4, V6};
+
+        let deletes = |carries| -> Vec<String> {
+            super::split_default_plan(carries, "utun9")
+                .into_iter()
+                .map(|s| s.delete.join(" "))
+                .collect()
+        };
+        let adds = |carries| -> Vec<String> {
+            super::split_default_plan(carries, "utun9")
+                .into_iter()
+                .filter_map(|s| s.add.map(|a| a.join(" ")))
+                .collect()
+        };
+
+        // Every family is deleted whatever the tunnel carries. This is the half
+        // that a narrowing tunnel depends on, and the half that reads as dead code
+        // if you only look at the family it is installing.
+        let all_four = [
+            "-n delete -inet -net 0.0.0.0/1 -interface utun9",
+            "-n delete -inet -net 128.0.0.0/1 -interface utun9",
+            "-n delete -inet6 -net ::/1 -interface utun9",
+            "-n delete -inet6 -net 8000::/1 -interface utun9",
+        ];
+        for carries in [Dual, V6, V4, Neither] {
+            assert_eq!(deletes(carries), all_four, "{carries:?}");
+        }
+
+        // And only the carried family is added back.
+        assert_eq!(
+            adds(V6),
+            [
+                "-n add -inet6 -net ::/1 -interface utun9",
+                "-n add -inet6 -net 8000::/1 -interface utun9",
+            ]
+        );
+        assert_eq!(
+            adds(V4),
+            [
+                "-n add -inet -net 0.0.0.0/1 -interface utun9",
+                "-n add -inet -net 128.0.0.0/1 -interface utun9",
+            ]
+        );
+        assert_eq!(adds(Dual).len(), 4);
+        assert!(adds(Neither).is_empty(), "nothing to carry, nothing to add");
     }
 
     #[test]

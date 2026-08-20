@@ -115,7 +115,7 @@ impl NetworkRegistry {
         // (members + approved) is signed by the per-network key and published
         // to DHT, so it is the source of truth and survives a daemon restart. The
         // local blob store still holds the bytes we published before going down, so
-        // we read them back by the hash in the pkarr record (falling back to a seed
+        // we read them back by the hash in the pkarr record, falling back to a seed
         // peer. If neither source has it, restoration fails and is retried without
         // publishing anything.
         // Restoring from the blob is also what prevents a clobber: the rebuilt
@@ -134,6 +134,7 @@ impl NetworkRegistry {
             members: member_list,
             approved: approved_list,
             snapshot: None,
+            converged_hash: None,
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: net_public_key,
             network_name: Some(name.to_string()),
@@ -1060,6 +1061,15 @@ impl Daemon {
         let server = apply_exit_server_os(&self.registry.exit_server, &tun_name).await;
         let served = started.elapsed();
         let client = self.apply_exit_client(&tun_name).await;
+        // What the kernel accepted, for `ray exit-node status`: a failed install
+        // rolls back its own rules and leaves the selection standing, so the
+        // selection alone cannot say whether anything is being tunnelled.
+        self.registry
+            .exit_install_error
+            .store(client.clone().map(Arc::new));
+        // `None` from `apply_exit_client` means the install succeeded (or that
+        // there was nothing to install, in which case the selection is inactive).
+        self.apply_exit_dns(self.registry.exit_client.is_active() && client.is_none());
         let clients = started.elapsed();
         // Advertise what actually survived the reconcile: a failed enable cleared
         // the offers, so this also withdraws a stale advertisement rather than
@@ -1129,6 +1139,71 @@ impl Daemon {
         }
     }
 
+    /// Which families the tunnel currently selected would carry, or
+    /// [`ExitFamilies::Neither`] when nothing is selected.
+    ///
+    /// One reader for the routing install, the socket pin and the DNS override,
+    /// so the three cannot end up describing different tunnels.
+    fn tunnel_carries(&self) -> ExitFamilies {
+        self.registry
+            .exit_client
+            .selection()
+            .map(|s| s.carries)
+            .unwrap_or(ExitFamilies::Neither)
+    }
+
+    /// Point the Magic DNS forwarder at upstreams the tunnel can actually reach,
+    /// or put the captured ones back when no tunnel is up.
+    ///
+    /// Only a tunnel that carries IPv6 and not IPv4 needs this: every upstream the
+    /// desktop capture produces is IPv4, so without an override the exit node
+    /// would carry the traffic while each lookup that steered it went out the
+    /// physical link. See [`exit_node::tunnel_upstreams`].
+    /// `installed` is whether the tunnel actually went in, not merely whether one
+    /// is selected. A failed install rolls the routing back but leaves the
+    /// selection active, and pointing the forwarder at a public IPv6 resolver with
+    /// no tunnel to reach it through is worse than leaving DNS alone: a host in
+    /// this mode usually has no native IPv6 at all (the mode is about an IPv4
+    /// conflict, not about having v6 transit), so every lookup would SERVFAIL on a
+    /// host whose DNS worked a moment earlier.
+    fn apply_exit_dns(&self, installed: bool) {
+        let over = installed.then(|| {
+            let configured = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
+            crate::exit_node::tunnel_upstreams(self.tunnel_carries(), &configured)
+        });
+        // `None` from either level means "no override": no tunnel, or a tunnel
+        // whose own family already carries the captured upstreams.
+        let over = over.flatten();
+        // The override only moves the daemon's *own* forwarder. Whether an app's
+        // query ever reaches that forwarder is the OS backend's decision, and on
+        // Linux only the direct-resolv.conf backend sends us everything: the
+        // split-DNS backends register `~ray` as the sole routing domain, so
+        // non-`.ray` lookups go to the host's other links, over IPv4, which this
+        // mode deliberately does not tunnel. macOS has no such gap, because
+        // `apply_exit_client` re-asserts a catch-all match domain while the tunnel
+        // is up. Giving Linux the same flip is the real fix and is not done here.
+        //
+        // Sharing `/etc/resolv.conf` with another mesh is the same gap by a
+        // different route: we are the first nameserver and get every name, but a
+        // name outside `.ray` is answered REFUSED so the stub asks the next line,
+        // which is that mesh's resolver. The forwarder is out of the path either
+        // way, and this is the host the mode is for, so it is worth saying.
+        #[cfg(target_os = "linux")]
+        if over.is_some()
+            && let Some(backend) = self.dns.backend_name()
+            && (backend != "direct-resolv.conf" || self.dns.resolver.defers_off_mesh())
+        {
+            tracing::warn!(
+                backend,
+                shared_resolv_conf = self.dns.resolver.defers_off_mesh(),
+                "IPv6-only full tunnel is up, but non-`.ray` lookups do not reach \
+                 rayfish's forwarder on this host, so they still leave over IPv4, \
+                 outside the exit node"
+            );
+        }
+        self.dns.resolver.set_tunnel_upstreams(over);
+    }
+
     /// Install or remove the client full-tunnel routing to match the selection.
     /// The kernel plumbing spawns a series of `ip`/`nft` children and waits on
     /// them, so it runs on the blocking pool rather than stalling a runtime
@@ -1136,13 +1211,14 @@ impl Daemon {
     #[cfg(target_os = "linux")]
     async fn apply_exit_client(&self, tun_name: &str) -> Option<String> {
         let install = self.registry.exit_client.is_active();
+        let carries = self.tunnel_carries();
         let tun_name = tun_name.to_owned();
         let result = tokio::task::spawn_blocking(move || {
             if !install {
                 crate::exit_node::teardown_client_routing();
                 return Ok(());
             }
-            crate::exit_node::install_client_routing(&tun_name).inspect_err(|_| {
+            crate::exit_node::install_client_routing(&tun_name, carries).inspect_err(|_| {
                 // A partial install must not stay live: rules that went in before
                 // the failure (say v4's, with `ipv6.disable=1` failing the v6 half)
                 // would keep routing traffic into a tunnel that was never fully set
@@ -1177,7 +1253,7 @@ impl Daemon {
             tun::unroute_default_via_tun(tun_name).await;
             crate::exit_node::remove_tunnel_exclusions();
             crate::exit_node::clear_physical_defaults();
-            if crate::exit_node::set_full_tunnel(false) {
+            if crate::exit_node::set_full_tunnel(false, false) {
                 self.transport.endpoint.network_change().await;
                 // The rebind that releases the pin drops every direct path too.
                 self.nudge_all_peers();
@@ -1188,7 +1264,7 @@ impl Daemon {
             // relay servers (resolved now, while DNS is still split) and, below,
             // the exit peer's direct addresses.
             let relay_ips = self.relay_underlay_ips().await;
-            crate::exit_node::exclude_from_tunnel(&relay_ips);
+            crate::exit_node::exclude_from_tunnel(&self.tunnel_relevant(relay_ips));
             // Snapshot the physical default interfaces while the routing table is
             // still clean. Once the split defaults are in, a live lookup answers
             // "the tunnel" for any family without a default route of its own, and
@@ -1197,7 +1273,9 @@ impl Daemon {
             // Pin and rebind before the routes go in: `network_change` rebinds
             // iroh's UDP socket to apply the pin, and until it has, the transport
             // has nothing keeping it out of the tunnel.
-            if !crate::exit_node::set_full_tunnel(true) {
+            // Rebind whenever the pin state changed, which now includes the tunnel
+            // narrowing or widening under a live selection, not just coming up.
+            if crate::exit_node::set_full_tunnel(true, self.tunnel_carries().carries_v4()) {
                 self.transport.endpoint.network_change().await;
             }
             let conn = self.exit_peer_conn().await;
@@ -1207,7 +1285,9 @@ impl Daemon {
             // blackholes, iroh spends ~20s failing over, and only the relay (which
             // does have a host route) carries traffic.
             if let Some(conn) = &conn {
-                crate::exit_node::exclude_from_tunnel(&peer_underlay_ips(conn));
+                crate::exit_node::exclude_from_tunnel(
+                    &self.tunnel_relevant(peer_underlay_ips(conn)),
+                );
             }
             let failure = self.route_default_or_rollback(tun_name).await;
             if failure.is_none() {
@@ -1269,6 +1349,30 @@ impl Daemon {
         self.registry.peers.conn_for_ip(&sel.ipv4)
     }
 
+    /// Narrow underlay addresses to the families the tunnel actually captures.
+    ///
+    /// The exclusions exist to keep iroh's own traffic off the split default. For a
+    /// family the tunnel does not carry there is no default of ours to route
+    /// around, so a host route is not just wasted work: it pins that address to the
+    /// physical gateway, carving it out of whichever co-resident VPN owns that
+    /// family on this Mac.
+    ///
+    /// Reads [`Self::tunnel_carries`], the same fact the routing install and the
+    /// socket pin read. It used to read this node's mode, which was the same answer
+    /// only until the gateway's claim could narrow a tunnel too: a dual-stack Mac
+    /// through a gateway that can only return IPv6 has no IPv4 default of ours and
+    /// was still excluding IPv4 addresses from it.
+    #[cfg(target_os = "macos")]
+    fn tunnel_relevant(&self, ips: Vec<IpAddr>) -> Vec<IpAddr> {
+        let carries = self.tunnel_carries();
+        ips.into_iter()
+            .filter(|ip| match ip {
+                IpAddr::V4(_) => carries.carries_v4() || carries.is_unknown(),
+                IpAddr::V6(_) => carries.carries_v6() || carries.is_unknown(),
+            })
+            .collect()
+    }
+
     /// Block until the exit peer answers over the finished tunnel, so
     /// `ray exit-node use` returns only once traffic through it actually works.
     ///
@@ -1286,7 +1390,9 @@ impl Daemon {
                 // Re-check every round: hole-punching discovers new candidate
                 // addresses as it goes, and one that appears without a host route
                 // around the tunnel is a path that will blackhole.
-                crate::exit_node::exclude_from_tunnel(&peer_underlay_ips(conn));
+                crate::exit_node::exclude_from_tunnel(
+                    &self.tunnel_relevant(peer_underlay_ips(conn)),
+                );
                 if nudge_holepunch(&self.protocol_router, conn).await {
                     break;
                 }
@@ -1308,7 +1414,7 @@ impl Daemon {
     /// around the full tunnel. Resolved via the system resolver, so call this
     /// while DNS is still split (before the tunnel's DNS catch-all goes in).
     #[cfg(target_os = "macos")]
-    async fn relay_underlay_ips(&self) -> Vec<std::net::Ipv4Addr> {
+    async fn relay_underlay_ips(&self) -> Vec<IpAddr> {
         // The configured relay set (custom override + n0 default fallback), the
         // same the endpoint dials. Excluding the whole set (a handful of host
         // routes) covers whichever relay it is actually homed on.
@@ -1323,10 +1429,8 @@ impl Daemon {
             let port = url.port_or_known_default().unwrap_or(443);
             if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
                 for a in addrs {
-                    if let IpAddr::V4(v4) = a.ip()
-                        && !ips.contains(&v4)
-                    {
-                        ips.push(v4);
+                    if !ips.contains(&a.ip()) {
+                        ips.push(a.ip());
                     }
                 }
             }
@@ -1339,11 +1443,11 @@ impl Daemon {
     /// not blackhole traffic.
     #[cfg(target_os = "macos")]
     async fn route_default_or_rollback(&self, tun_name: &str) -> Option<String> {
-        match tun::route_default_via_tun(tun_name).await {
+        match tun::route_default_via_tun(tun_name, self.tunnel_carries()).await {
             Ok(()) => None,
             Err(e) => {
                 tun::unroute_default_via_tun(tun_name).await;
-                if crate::exit_node::set_full_tunnel(false) {
+                if crate::exit_node::set_full_tunnel(false, false) {
                     self.transport.endpoint.network_change().await;
                 }
                 tracing::warn!(error = %e, "failed to install exit-node client routing");
@@ -1419,6 +1523,14 @@ impl Daemon {
         // pinning). Teardown never reports a problem.
         self.registry.exit_client.set(None);
         let _ = self.apply_exit_client(&tun_name).await;
+        // Standby is not a failed install: leaving the last one recorded would
+        // have `ray exit-node status` blame it for a tunnel that is down because
+        // the user put it down.
+        self.registry.exit_install_error.store(None);
+        // With the tunnel gone this drops any DNS override, so standby does not
+        // leave the forwarder pointed at a resolver chosen for a tunnel that no
+        // longer exists.
+        self.apply_exit_dns(false);
 
         tracing::info!("VPN on standby");
         IpcMessage::Ok {
@@ -1470,21 +1582,24 @@ async fn nudge_holepunch(router: &ProtocolRouter, conn: &Connection) -> bool {
     answered
 }
 
-/// The exit peer's own underlay IPv4 addresses, as iroh currently knows them.
+/// The exit peer's own underlay addresses, as iroh currently knows them.
 ///
 /// These are the addresses our QUIC packets to the exit peer are actually sent to,
 /// so they are exactly what must be routed around the full tunnel. Relay paths are
 /// skipped: the relay servers are excluded separately, by name, before DNS moves
 /// into the tunnel.
+///
+/// Both families. Which one a peer is reachable over is not ours to pick, and in
+/// IPv6-only mode the tunnel is IPv6, so an IPv6 path is precisely the one that
+/// would otherwise be swallowed by the tunnel it is carrying.
 #[cfg(target_os = "macos")]
-fn peer_underlay_ips(conn: &Connection) -> Vec<std::net::Ipv4Addr> {
+fn peer_underlay_ips(conn: &Connection) -> Vec<IpAddr> {
     let mut ips = Vec::new();
     for path in conn.paths().iter() {
         if let iroh::TransportAddr::Ip(addr) = path.remote_addr()
-            && let IpAddr::V4(v4) = addr.ip()
-            && !ips.contains(&v4)
+            && !ips.contains(&addr.ip())
         {
-            ips.push(v4);
+            ips.push(addr.ip());
         }
     }
     ips

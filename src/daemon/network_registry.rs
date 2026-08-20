@@ -12,7 +12,7 @@
 //! signalling the daemon through a channel.
 
 use super::*;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -102,7 +102,16 @@ pub(crate) struct NetworkRegistry {
     /// re-runs the exit reconcile instead of leaking traffic until the next
     /// `ray up`.
     pub(crate) exit_selection_pending: AtomicBool,
-    /// Nudged by reconverge when [`Self::exit_selection_pending`] is set; the
+    /// The last failure from installing the client full tunnel, or `None` when
+    /// the last attempt succeeded (or there was nothing to install).
+    ///
+    /// A failed install rolls its own rules back and leaves the *selection* in
+    /// place, which is right (the next re-apply retries it) but makes the
+    /// selection a poor answer to "is traffic being tunnelled". `ray exit-node
+    /// status` reads this so the answer comes from what the kernel accepted
+    /// rather than from what the config asked for.
+    pub(crate) exit_install_error: ArcSwapOption<String>,
+    /// Nudged by reconverge via [`NetworkRegistry::nudge_exit_reapply`]; the
     /// daemon listens and re-runs `apply_exit_node`. A channel rather than a
     /// direct call because the kernel plumbing lives on `Daemon`, above the
     /// registry in the service graph.
@@ -216,6 +225,7 @@ impl NetworkRegistry {
             exit_server: crate::exit_node::ExitServer::new(),
             exit_client: crate::exit_node::ExitClient::new(),
             exit_selection_pending: AtomicBool::new(false),
+            exit_install_error: ArcSwapOption::empty(),
             exit_reapply: Arc::new(Notify::new()),
             exit_sync_enabled: AtomicBool::new(false),
             ipv6_only,
@@ -687,6 +697,7 @@ impl NetworkRegistry {
                 collision_index: 0,
                 last_seen: None,
                 exit_node: false,
+                exit_families: ExitFamilies::Unknown,
                 // Our own entry starts out truthful, so the first published blob
                 // already tells peers not to use our mesh IPv4.
                 ipv6_only: self.ipv6_only,
@@ -715,6 +726,7 @@ impl NetworkRegistry {
             members: member_list,
             approved,
             snapshot: None,
+            converged_hash: None,
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: net_secret_key.public(),
             network_name: Some(name.to_string()),

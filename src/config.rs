@@ -285,16 +285,46 @@ pub fn discovery_urls(o: &ServerOverride) -> Result<Vec<String>> {
 /// Merge configured DNS upstreams with the system-captured ones. `replace`
 /// drops the captured set; otherwise custom upstreams are tried first, then the
 /// captured ones. Unset returns the captured set unchanged.
+///
+/// IPv4 only, and deliberately so: the captured set this merges with comes from
+/// the OS DNS backends, every one of which reads an IPv4 nameserver. A configured
+/// IPv6 entry is not dropped so much as handled elsewhere, by
+/// [`crate::exit_node::tunnel_upstreams`], which is the one caller that has a
+/// path to reach it (an IPv6-only full tunnel, where the IPv4 ones are the
+/// unreachable half).
 pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<Ipv4Addr> {
     if o.servers.is_empty() {
         return captured;
     }
     let custom: Vec<Ipv4Addr> = o.servers.iter().filter_map(|s| s.parse().ok()).collect();
     if o.replace {
+        // `dns_upstreams` takes any `IpAddr` since IPv6-only tunnels needed it, so
+        // an all-IPv6 `--replace` narrows to nothing here. Returning that empty
+        // list would leave both consumers with no server at all: the forwarder
+        // SERVFAILs every non-`.ray` name, and `control_plane_nameservers` falls
+        // back to iroh's own resolv.conf reader, which is the #111 circle. Keep
+        // the captured ones instead: the IPv6 entries are still honoured, by
+        // `exit_node::tunnel_upstreams`, which is the caller that can reach them.
+        if custom.is_empty() {
+            return captured;
+        }
         custom
     } else {
         custom.into_iter().chain(captured).collect()
     }
+}
+
+/// Whether `o` contributes anything to [`resolve_upstreams`], i.e. names at least
+/// one server the captured-upstream path can actually use.
+///
+/// Beside `resolve_upstreams` because it has to narrow the same way: this is what
+/// lets an operator's setting waive the refusal to take over `/etc/resolv.conf`
+/// with no verified upstream (`DnsConfigurator::operator_upstreams`), and waiving
+/// it on entries that then get filtered out would take the host's DNS down
+/// instead of saving it. A bare `!servers.is_empty()` was exactly that bug once
+/// `dns_upstreams` started accepting IPv6.
+pub fn has_usable_upstream(o: &ServerOverride) -> bool {
+    o.servers.iter().any(|s| s.parse::<Ipv4Addr>().is_ok())
 }
 
 /// Parse a comma list of entries (trimmed, empties dropped).
@@ -1688,6 +1718,67 @@ name = "test"
             replace: true,
         };
         assert_eq!(resolve_upstreams(&rep, captured.clone()), vec![one]);
+    }
+
+    /// `dns-upstreams` takes IPv6 since the IPv6-only tunnel needed it, so an
+    /// all-IPv6 `--replace` narrows to nothing here. Returning that empty list
+    /// would leave the forwarder with no server and hand `control_plane_nameservers`
+    /// an empty set, putting the endpoint back on iroh's resolv.conf reader (#111).
+    #[test]
+    fn replace_with_only_ipv6_keeps_the_captured_upstreams() {
+        let captured = vec![Ipv4Addr::new(192, 168, 1, 1)];
+        let v6_only = ServerOverride {
+            servers: vec!["2606:4700:4700::1111".into()],
+            replace: true,
+        };
+        assert_eq!(resolve_upstreams(&v6_only, captured.clone()), captured);
+
+        // One usable IPv4 entry and `replace` still means replace: the guard is
+        // for "nothing survived the narrowing", not "some entries were dropped".
+        let mixed = ServerOverride {
+            servers: vec!["2606:4700:4700::1111".into(), "1.1.1.1".into()],
+            replace: true,
+        };
+        assert_eq!(
+            resolve_upstreams(&mixed, captured),
+            vec![Ipv4Addr::new(1, 1, 1, 1)]
+        );
+    }
+
+    /// `has_usable_upstream` has to agree with what `resolve_upstreams` keeps.
+    ///
+    /// It waives the refusal to take over `/etc/resolv.conf` with no verified
+    /// upstream of our own. Answering yes on a setting that then narrows to
+    /// nothing would take the file, install the re-assert watcher, and leave the
+    /// forwarder with an empty list: the host loses every name outside `.ray`,
+    /// and repairing the file by hand is undone by the watcher. That is worse
+    /// than the refusal it bypassed, so the two must not disagree.
+    #[test]
+    fn only_a_usable_upstream_waives_the_takeover_guard() {
+        let captured: Vec<Ipv4Addr> = Vec::new();
+        for (servers, usable) in [
+            (vec!["2606:4700:4700::1111"], false),
+            (vec!["2606:4700:4700::1111", "2001:4860:4860::8888"], false),
+            (vec!["1.1.1.1"], true),
+            (vec!["2606:4700:4700::1111", "1.1.1.1"], true),
+            (vec!["not-an-address"], false),
+            (vec![], false),
+        ] {
+            for replace in [false, true] {
+                let o = ServerOverride {
+                    servers: servers.iter().map(|s| s.to_string()).collect(),
+                    replace,
+                };
+                assert_eq!(has_usable_upstream(&o), usable, "{servers:?}");
+                // The claim this guard makes, stated the other way round: saying
+                // yes must mean the forwarder actually gets a server.
+                assert_eq!(
+                    !resolve_upstreams(&o, captured.clone()).is_empty(),
+                    usable,
+                    "{servers:?} replace={replace}"
+                );
+            }
+        }
     }
 
     #[test]

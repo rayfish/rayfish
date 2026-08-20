@@ -6,7 +6,60 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Exit nodes work in IPv6-only mode.** `ray exit-node use` was refused on a
+  host sharing the box with another VPN, which is where the feature is most
+  useful. It now works, tunnelling IPv6: mesh IPv4 carries no traffic in that
+  mode, so your IPv4 internet traffic keeps leaving directly, and both
+  `ray exit-node use` and `ray exit-node status` say so rather than leaving you
+  to find out. Offering an exit node was never affected by the mode.
+- **A tunnel carries only what both ends can carry, and says which.** A gateway
+  reports whether it can return IPv4, IPv6 or both, and the tunnel takes the
+  families your node and that gateway have in common. A gateway that can return
+  only one of them narrows the tunnel to it: that family goes through the exit,
+  the other keeps leaving this host directly, and `ray exit-node use` and
+  `ray exit-node status` both name which is which. This covers a gateway running
+  IPv6-only mode itself (it never routes the mesh IPv4 your reply would come back
+  on) and a gateway with no IPv6 uplink, whose tunnelled IPv6 used to vanish at
+  the far end with nothing said. Only a gateway that can return neither family is
+  refused, and that check runs on every re-apply rather than only when you pick,
+  so a gateway that loses its uplink (or a node whose IPv6-only mode turns itself
+  on) stops tunnelling with a message instead of silently carrying nothing, and
+  picks the tunnel back up by itself when the gateway reports an uplink again.
+  Gateways that report IPv6 are marked `(IPv6)` in `ray exit-node status`. A
+  gateway on a network whose coordinator predates this feature reports nothing
+  either way: it stays selectable and narrows nothing, since refusing would rule
+  out every gateway on such a network, and `ray exit-node use` tells you the
+  claim is unverified.
+- **DNS follows the tunnel when the tunnel is the only way out.** While a tunnel
+  carries IPv6 and not IPv4, the daemon's own DNS forwarder is pointed at an IPv6
+  resolver, so its lookups go through the exit rather than around it. On Linux
+  hosts using systemd-resolved, NetworkManager or resolvconf, applications'
+  non-`.ray` lookups still leave directly, and the daemon logs a warning saying
+  so. If you pinned your own resolvers with `ray config set dns-upstreams …
+  --replace` and none of them are IPv6, yours are kept rather than swapped for
+  public ones: they stay reachable over the IPv4 such a tunnel leaves direct, so
+  those lookups go around the exit instead of to a resolver you did not choose.
+- **`ray config set dns-upstreams` takes IPv6 addresses.** Used by an exit-node
+  tunnel in IPv6-only mode, which has no IPv4 to reach a v4 resolver over. Naming
+  only IPv6 servers no longer lets rayfish take over `/etc/resolv.conf` on a host
+  where it found no working one of its own: those entries are reachable only
+  through the tunnel, so counting them would have taken the file and left the
+  machine unable to resolve anything.
+
 ### Changed
+
+- **The mesh protocol version is now 3, and every peer must be on it.** Control
+  frames, pairing, `ray connect`, file transfer and the signed roster are now
+  encoded more compactly, which takes a bit under 30% off the largest thing on
+  the wire (a 50-member roster drops from 5194 to 3764 bytes, and about 30% when
+  every member is a paired device). The encoding is not
+  backward compatible, and peers on different protocol versions cannot connect
+  at all, so a mesh has to upgrade together: a node left on 0.3.x will stop
+  seeing the rest of the network rather than degrading. Nothing on disk changes,
+  so upgrading in place keeps your networks, identity and pairings.
+
 
 - **`ray firewall --help` is grouped, and every help page reads in one pass.**
   The firewall's 13 actions are now listed under Rules, Mode, Coordinator
@@ -42,6 +95,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as authoritative; that copy could contain only the coordinator, making every
   member disappear. Coordinator restore now stays inactive and retries until it
   has the signed blob.
+- **Re-applying an exit node no longer lets traffic out around the tunnel while
+  it rebuilds.** Every `ray exit-node` command, and every roster change that
+  reaches a live tunnel, rebuilds the routing rules. The catch-all that sends
+  traffic into the tunnel was torn down first and re-added last, so anything
+  sent in between left the physical uplink with the host's own address. It now
+  stays in place across the rebuild.
+- **Using an exit node no longer cuts off another VPN on the same host.** The
+  full tunnel's routing rules sit above the ones Tailscale (and anything else
+  doing policy routing) installs, and their routes live in a table of their own
+  rather than the main one, so turning our tunnel on black-holed them entirely.
+  Their routes are now copied into the tunnel's own table, and their
+  destinations are directed there, so that VPN keeps working. This covers
+  connections that arrived over it too: an SSH session into this host over its
+  Tailscale address used to die the moment `ray exit-node use` ran, because the
+  replies are sourced from that address and took a rule that looks up the main
+  routing table, where the route isn't.
+- **`ray exit-node status` says when the exit node you picked is not actually
+  carrying anything.** The selection is config and the tunnel is kernel state,
+  and they are allowed to differ: a gateway that stops being usable does not
+  clear your selection, so you can still see what to change. But the line read
+  `using: <peer>` either way, while every packet left directly. It now says the
+  selection is not in effect and why (the routing rules would not install, the
+  data plane is down, the peer is not in the roster yet, or the gateway cannot
+  carry the family this node tunnels).
 - **`.ray` names now resolve alongside another VPN that manages
   `/etc/resolv.conf`.** On a host with no DNS manager (no systemd-resolved in
   the resolution path), Rayfish and a VPN like Tailscale both want that file.

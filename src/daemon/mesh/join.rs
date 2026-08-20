@@ -365,6 +365,7 @@ async fn build_member_state(
         members: MemberList::from_members(members.to_vec()),
         approved: ApprovedList::from_entries(approved),
         snapshot: None,
+        converged_hash: None,
         network_secret_key: direct_key.cloned(),
         network_public_key: net_pubkey,
         network_name: Some(network_name.to_string()),
@@ -660,6 +661,7 @@ mod persist_config_tests {
             collision_index: 0,
             last_seen: None,
             exit_node: false,
+            exit_families: ExitFamilies::Unknown,
             ipv6_only: false,
         }
     }
