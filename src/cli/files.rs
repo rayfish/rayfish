@@ -68,15 +68,18 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     };
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        // Returned, not exited: [`ipc_send_files`] calls this once per file and
+        // is written to keep going, so ending the process here would drop every
+        // file after the first rejected one. The caller prints this with the
+        // file's name and still exits non-zero at the end.
+        ipc::IpcMessage::Error { message } => anyhow::bail!(message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
 }
 
-/// Read one global settings key from the daemon. Returns the rendered value, or
-/// `None` once the daemon's error has been printed, so the caller can just
-/// return.
+/// Read one global settings key from the daemon. Returns the rendered value; a
+/// daemon-side error ends the command.
 async fn config_row(key: NodeKey) -> Result<Option<String>> {
     let mut stream = ipc::connect().await?;
     ipc::send(&mut stream, ipc::IpcMessage::ConfigGet { key: Some(key) }).await?;
@@ -84,10 +87,7 @@ async fn config_row(key: NodeKey) -> Result<Option<String>> {
         ipc::IpcMessage::ConfigValues { rows } => Ok(Some(
             rows.into_iter().next().map(|(_, v)| v).unwrap_or_default(),
         )),
-        ipc::IpcMessage::Error { message } => {
-            print_error("error", &message, None);
-            Ok(None)
-        }
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => {
             eprintln!("Unexpected response: {other:?}");
             Ok(None)
@@ -284,8 +284,6 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
             }
         }
         Some(FilesAction::AutoAccept { network, state }) => {
-            // This arm prints a daemon error without failing, so a typo caught
-            // only server-side would exit 0 instead of 1.
             parse_on_off(&state)?;
             ipc::send(
                 &mut stream,

@@ -1530,10 +1530,7 @@ pub(crate) async fn ipc_mutate(msg: ipc::IpcMessage) -> Result<()> {
     ipc::send(&mut stream, msg).await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::Error { message } => {
-            print_error("error", &message, None);
-            std::process::exit(1);
-        }
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => eprintln!("Unexpected response: {other:?}"),
     }
     Ok(())
@@ -1594,10 +1591,7 @@ async fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
                         }
                     }
                 }
-                ipc::IpcMessage::Error { message } => {
-                    print_error("error", &message, None);
-                    std::process::exit(1);
-                }
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
                 other => eprintln!("Unexpected response: {other:?}"),
             }
             Ok(())
@@ -1633,10 +1627,7 @@ async fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
 fn parse_node_key(key: &str) -> ipc::NodeKey {
     match key.parse() {
         Ok(k) => k,
-        Err(e) => {
-            print_error("error", &e, None);
-            std::process::exit(1);
-        }
+        Err(e) => fail_with("error", &e),
     }
 }
 
@@ -1663,10 +1654,7 @@ async fn cmd_set_operator(user: &str) -> Result<()> {
     ipc::send(&mut stream, ipc::IpcMessage::SetOperator { uid }).await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::Error { message } => {
-            print_error("error", &message, None);
-            std::process::exit(1);
-        }
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => eprintln!("Unexpected response: {other:?}"),
     }
     Ok(())

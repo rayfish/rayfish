@@ -58,10 +58,7 @@ async fn clear_all_exit_selections() -> Result<()> {
             .filter(|n| n.using.is_some())
             .map(|n| n.network)
             .collect(),
-        ipc::IpcMessage::Error { message } => {
-            print_error("exit-node", &message, None);
-            return Ok(());
-        }
+        ipc::IpcMessage::Error { message } => fail_with("exit-node", &message),
         other => {
             eprintln!("Unexpected response: {:?}", other);
             return Ok(());
@@ -71,22 +68,34 @@ async fn clear_all_exit_selections() -> Result<()> {
         println!("no exit node in use");
         return Ok(());
     }
+    // Every network is attempted even after one fails, and the exit code comes
+    // at the end. Stopping at the first would leave the rest still routing
+    // through their exit nodes, which is the opposite of what was asked, and
+    // would say so only about the network it got to.
+    let mut failed = 0usize;
     for network in active {
         let mut s = ipc::connect().await?;
         ipc::send(
             &mut s,
             ipc::IpcMessage::ExitNodeUse {
-                network,
+                network: network.clone(),
                 peer: None,
             },
         )
         .await?;
         match ipc::recv(&mut s).await? {
             ipc::IpcMessage::Ok { message } => println!("{message}"),
-            ipc::IpcMessage::Error { message } => fail_with("exit-node", &message),
+            ipc::IpcMessage::Error { message } => {
+                print_error("exit-node", &format!("{network}: {message}"), None);
+                failed += 1;
+            }
             other => eprintln!("Unexpected response: {:?}", other),
         }
     }
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} network(s) are still using an exit node"
+    );
     Ok(())
 }
 

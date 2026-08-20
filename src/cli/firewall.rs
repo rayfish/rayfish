@@ -371,10 +371,7 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
     .await?;
     let rules = match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::FirewallPendingResponse { rules, .. } => rules,
-        ipc::IpcMessage::Error { message } => {
-            print_error("firewall pending", &message, None);
-            return Ok(());
-        }
+        ipc::IpcMessage::Error { message } => fail_with("firewall pending", &message),
         other => {
             eprintln!("Unexpected response: {other:?}");
             return Ok(());
