@@ -31,8 +31,8 @@ const RESTORE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// [`NetworkRegistry::run_restore_supervisor`].
 const NUDGE_DEBOUNCE: Duration = Duration::from_secs(5);
 
-/// The membership a coordinator restores at startup, sourced from the signed
-/// `GroupBlob` (authoritative) or the stale config roster as a fallback.
+/// The membership a coordinator restores at startup from the authoritative,
+/// network-key-signed `GroupBlob`.
 struct RestoredRoster {
     members: MemberList,
     approved: ApprovedList,
@@ -42,104 +42,50 @@ struct RestoredRoster {
 }
 
 impl NetworkRegistry {
-    /// Rebuild a network's roster for a coordinator restart. Prefers the
-    /// published, network-key-signed `GroupBlob` (members + approved + suggested
-    /// firewall + reusable keys); if the DHT is unreachable, falls back to the
-    /// last-persisted config roster (which may be stale). Always ensures this
-    /// node is present as a coordinator member.
+    /// Rebuild a network's roster for a coordinator restart from the published,
+    /// network-key-signed `GroupBlob` (members + approved + suggested firewall +
+    /// reusable keys). A transient resolve/fetch failure is an error so the
+    /// restore supervisor retries without publishing stale local config.
     async fn restore_member_roster(
         &self,
         name: &str,
         net_public_key: EndpointId,
-        net_config: Option<&config::NetworkConfig>,
-        my_ip: Ipv4Addr,
-        persisted_hostname: &Option<String>,
-    ) -> RestoredRoster {
+    ) -> Result<RestoredRoster> {
+        let data = self
+            .restore_roster_from_blob(net_public_key)
+            .await
+            .with_context(|| format!("restore authoritative roster for '{name}'"))?;
         let mut member_list = MemberList::new();
         let mut approved_list = ApprovedList::new();
-        // `suggested_firewall` is authoritative in the signed blob; fall back to
-        // an empty set only if the blob can't be fetched.
-        let mut suggested_firewall = SuggestedFirewall::default();
-        // Reusable join keys are authoritative in the signed blob too.
-        let mut reusable_keys = BTreeMap::new();
-        let mut nullifiers = BTreeSet::new();
-        match self.restore_roster_from_blob(net_public_key).await {
-            Ok(data) => {
-                suggested_firewall = data.suggested_firewall.clone();
-                reusable_keys = data.reusable_keys.clone();
-                nullifiers = data.nullifiers.clone();
-                for m in &data.members {
-                    let _ = member_list.add(m.clone());
-                }
-                for a in &data.approved {
-                    let _ = approved_list.approve(a.clone(), &member_list);
-                }
-                tracing::info!(
-                    network = %name,
-                    members = member_list.all().len(),
-                    "restored roster from published group blob"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    network = %name,
-                    error = %e,
-                    "could not restore roster from DHT blob; falling back to config (may be stale)"
-                );
-                if let Some(nc) = net_config {
-                    for entry in &nc.members {
-                        let _ = member_list.add(Member {
-                            identity: entry.identity,
-                            ip: entry.ip,
-                            is_coordinator: entry.is_coordinator,
-                            hostname: entry.hostname.clone(),
-                            user_identity: None,
-                            device_cert: None,
-                            collision_index: 0,
-                            last_seen: None,
-                            exit_node: false,
-                            exit_families: ExitFamilies::Unknown,
-                            ipv6_only: false,
-                        });
-                    }
-                    for entry in &nc.approved {
-                        let ae = ApprovedEntry {
-                            identity: entry.identity,
-                            ip: entry.ip,
-                            hostname: entry.hostname.clone(),
-                            user_identity: None,
-                            device_cert: None,
-                            collision_index: 0,
-                        };
-                        let _ = approved_list.approve(ae, &member_list);
-                    }
-                }
-            }
-        }
-        if !member_list.is_member(&self.transport.identity.local_identity()) {
+        for member in &data.members {
             member_list
-                .add(Member {
-                    identity: self.transport.identity.local_identity(),
-                    ip: my_ip,
-                    is_coordinator: true,
-                    hostname: persisted_hostname.clone(),
-                    user_identity: None,
-                    device_cert: None,
-                    collision_index: 0,
-                    last_seen: None,
-                    exit_node: false,
-                    exit_families: ExitFamilies::Unknown,
-                    ipv6_only: self.ipv6_only,
-                })
-                .expect("self-add cannot collide");
+                .add(member.clone())
+                .map_err(|e| anyhow::anyhow!(e))?;
         }
-        RestoredRoster {
+        for approved in &data.approved {
+            approved_list
+                .approve(approved.clone(), &member_list)
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
+        let me = self.transport.identity.local_identity();
+        if !member_list
+            .get(&me)
+            .is_some_and(|member| member.is_coordinator)
+        {
+            anyhow::bail!("authoritative roster does not list this key holder as a coordinator");
+        }
+        tracing::info!(
+            network = %name,
+            members = member_list.all().len(),
+            "restored roster from published group blob"
+        );
+        Ok(RestoredRoster {
             members: member_list,
             approved: approved_list,
-            suggested_firewall,
-            reusable_keys,
-            nullifiers,
-        }
+            suggested_firewall: data.suggested_firewall,
+            reusable_keys: data.reusable_keys,
+            nullifiers: data.nullifiers,
+        })
     }
 
     /// Restores a coordinator network from saved config (uses the existing name).
@@ -169,8 +115,9 @@ impl NetworkRegistry {
         // (members + approved) is signed by the per-network key and published
         // to DHT, so it is the source of truth and survives a daemon restart. The
         // local blob store still holds the bytes we published before going down, so
-        // we read them back by the hash in the pkarr record (falling back to a seed
-        // peer, then to the stale config roster only if the DHT is unreachable).
+        // we read them back by the hash in the pkarr record, falling back to a seed
+        // peer. If neither source has it, restoration fails and is retried without
+        // publishing anything.
         // Restoring from the blob is also what prevents a clobber: the rebuilt
         // snapshot hashes identical to the published record, so the periodic
         // re-publish becomes a no-op instead of overwriting the roster with a
@@ -181,9 +128,7 @@ impl NetworkRegistry {
             suggested_firewall,
             reusable_keys,
             nullifiers,
-        } = self
-            .restore_member_roster(name, net_public_key, net_config, my_ip, &persisted_hostname)
-            .await;
+        } = self.restore_member_roster(name, net_public_key).await?;
 
         let mut net_state = NetworkState {
             members: member_list,

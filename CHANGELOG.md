@@ -89,6 +89,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A coordinator restart can no longer erase a healthy network roster.** If
+  the signed membership blob was temporarily unavailable at startup, a
+  coordinator fell back to its stale config copy and immediately published it
+  as authoritative; that copy could contain only the coordinator, making every
+  member disappear. Coordinator restore now stays inactive and retries until it
+  has the signed blob.
 - **Re-applying an exit node no longer lets traffic out around the tunnel while
   it rebuilds.** Every `ray exit-node` command, and every roster change that
   reaches a live tunnel, rebuilds the routing rules. The catch-all that sends

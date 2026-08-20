@@ -763,9 +763,9 @@ impl NetworkRegistry {
     /// get the blob hash, reads the bytes back from the local blob store (where
     /// we stored them before publishing, no network round-trip), and verifies +
     /// decodes. Falls back to fetching from a seed peer if the local store
-    /// doesn't have them (e.g. blobs dir was wiped). Returns an error if the DHT
-    /// is unreachable, so the caller can fall back to the (possibly stale)
-    /// config roster rather than booting empty.
+    /// doesn't have them (e.g. blobs dir was wiped). Returns an error if the
+    /// authoritative record or blob is unavailable, so the caller retries
+    /// without publishing stale local state.
     pub(crate) async fn restore_roster_from_blob(
         &self,
         net_pubkey: EndpointId,
