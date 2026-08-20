@@ -93,31 +93,6 @@ struct SshNat {
 
 static SSH_NAT: OnceLock<SshNat> = OnceLock::new();
 
-/// Whether this node's data plane runs IPv6-only (`AppConfig::ipv6_only`). Set
-/// once at daemon start, before any packet moves. A process-wide flag rather
-/// than a field because the forwarding core is reached from the peer readers and
-/// the TUN loop alike, neither of which carries the daemon's config; the SSH NAT
-/// above uses the same shape for the same reason.
-static IPV6_ONLY: AtomicBool = AtomicBool::new(false);
-
-/// Record the IPv6-only mode for the forwarding path. Called at daemon start.
-pub fn set_ipv6_only(on: bool) {
-    IPV6_ONLY.store(on, Ordering::Relaxed);
-}
-
-/// True when mesh IPv4 carries no traffic on this node.
-pub(crate) fn ipv6_only() -> bool {
-    IPV6_ONLY.load(Ordering::Relaxed)
-}
-
-/// Whether an inbound datagram must be dropped for being mesh IPv4 on a node
-/// whose data plane is IPv6-only. Split out from [`evaluate_inbound`] so the
-/// rule is testable without flipping the process-wide flag under the other
-/// tests. Non-overlay destinations are exit-node transit, judged separately.
-fn is_disabled_mesh_ipv4(ipv6_only: bool, dst: IpAddr) -> bool {
-    ipv6_only && dst.is_ipv4() && is_overlay_ip(dst)
-}
-
 /// Register this node's mesh addresses + SSH listen port. Called once at daemon
 /// start; the NAT stays inactive until [`set_ssh_nat_active`].
 pub fn init_ssh_nat(v6: Ipv6Addr, listen_port: u16) {
@@ -211,11 +186,6 @@ pub(crate) enum InboundDecision {
     /// this node does not offer the sender an exit node on this network. Prevents
     /// a non-exit node from silently transiting a peer's internet traffic.
     DropExit,
-    /// Dropped: mesh IPv4 addressed to this node while it runs an IPv6-only data
-    /// plane. Accepting it would half-work: the packet reaches the local service,
-    /// but the reply follows the host's `100.64.0.0/10` route, which in this mode
-    /// belongs to another VPN.
-    DropIpv4Disabled,
 }
 
 /// Pure evaluation of an inbound peer datagram against the firewall and basic
@@ -237,14 +207,6 @@ pub(crate) fn evaluate_inbound(
     let Some(info) = firewall::parse_packet_info(packet) else {
         return InboundDecision::DropMalformed;
     };
-    // IPv6-only: refuse mesh IPv4 outright rather than accepting a packet we
-    // cannot answer. Exit-node transit (a non-overlay destination) is checked
-    // below and is not affected either way: this only matches overlay IPv4
-    // destinations, while a full tunnel in this mode carries IPv6 alone, so its
-    // return traffic is addressed to our mesh v6 and never meets this rule.
-    if is_disabled_mesh_ipv4(ipv6_only(), info.dst_ip) {
-        return InboundDecision::DropIpv4Disabled;
-    }
     // Ingress anti-spoofing: a peer may only inject packets sourced from its own
     // assigned mesh address. Anything else (e.g. one peer forging another's mesh
     // IP) is dropped before the firewall or any in-daemon listener sees it, so
@@ -862,13 +824,6 @@ pub fn spawn_peer_reader(
                     tracing::debug!(
                         peer = %peer_id.fmt_short(),
                         "dropped internet-bound packet: not an exit node for this sender"
-                    );
-                }
-                InboundDecision::DropIpv4Disabled => {
-                    stats.record_drop(DropReason::Ipv4Disabled);
-                    tracing::debug!(
-                        peer = %peer_id.fmt_short(),
-                        "dropped mesh IPv4 packet: this node runs an IPv6-only data plane"
                     );
                 }
             }

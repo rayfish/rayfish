@@ -486,7 +486,7 @@ impl NetworkRegistry {
             Some(s) => tracing::info!(
                 network = %s.network,
                 peer_user = %s.peer_user.fmt_short(),
-                ipv4 = %s.ipv6,
+                peer_ip = %s.ipv6,
                 "exit selection active (return traffic from this peer will be admitted)"
             ),
             None => tracing::debug!("exit selection cleared (direct egress)"),

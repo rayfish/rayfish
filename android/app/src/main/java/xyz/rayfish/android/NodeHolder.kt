@@ -211,10 +211,6 @@ object NodeHolder {
                         // Register Android's trust store before start(): building
                         // the iroh endpoint sets up TLS, which fails without it.
                         RustlsInit.ensureInitialized(context)
-                        // The mode is fixed for this daemon's lifetime, so it is
-                        // read here, at the one place a daemon is built. On Auto
-                        // the core resolves it against the device's addresses;
-                        // ask `status()` afterwards for what it decided.
                         get(context).start()
                     } catch (t: Throwable) {
                         // A node that will not start leaves the device offline in

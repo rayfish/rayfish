@@ -41,15 +41,10 @@ pub enum DropReason {
     /// rather than blackholing. Seen mostly under an exit-node full tunnel
     /// carrying bulk traffic over a relayed peer.
     PacketTooBig,
-    /// Inbound mesh IPv4 datagram dropped because this node runs an IPv6-only
-    /// data plane (`ray config set ipv6-only on`). Its mesh IPv4 is not routed,
-    /// so accepting the packet would give the sender a one-way path: the reply
-    /// would leave through whichever interface owns `100.64.0.0/10` here.
-    Ipv4Disabled,
 }
 
 impl DropReason {
-    const ALL: [DropReason; 9] = [
+    const ALL: [DropReason; 8] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
@@ -58,7 +53,6 @@ impl DropReason {
         DropReason::Spoof,
         DropReason::ExitDenied,
         DropReason::PacketTooBig,
-        DropReason::Ipv4Disabled,
     ];
 }
 
