@@ -339,13 +339,19 @@ mod tests {
     /// snapshot iterate, so a variant left out of it is invisible in both and
     /// still compiles.
     ///
-    /// Iterating `ALL` cannot detect that on its own: a variant missing from it
-    /// is a variant the loop never sees. What this buys is a *compile* error at
-    /// a line that names `ALL`, because the match is exhaustive: a new variant
-    /// needs an arm here, and the count beside it has to move at the same time.
-    /// So the omission is caught while the author who caused it is still looking.
+    /// This does not catch that, and cannot: iterating `ALL` never sees a
+    /// variant missing from `ALL`, and the `assert_eq!` adds nothing that the
+    /// fixed length on `ALL` does not already enforce. What it is, is a
+    /// tripwire. The match is exhaustive, so adding a variant is a compile error
+    /// *in this file*, three lines from the `ALL` it has to be added to. The
+    /// omission gets caught because the author is standing next to it, not
+    /// because a test found it.
+    ///
+    /// A real assertion needs the list generated from the enum rather than typed
+    /// out twice, which means a derive (`strum::EnumIter`) this crate does not
+    /// depend on. Worth it if `DropReason` keeps growing; not yet.
     #[test]
-    fn adding_a_drop_reason_forces_updating_all() {
+    fn adding_a_drop_reason_lands_next_to_all() {
         let counted = DropReason::ALL.iter().fold(0usize, |n, r| {
             n + match r {
                 DropReason::Firewall
@@ -358,6 +364,6 @@ mod tests {
                 | DropReason::PacketTooBig => 1,
             }
         });
-        assert_eq!(counted, 8, "a DropReason variant is missing from ALL");
+        assert_eq!(counted, DropReason::ALL.len());
     }
 }
