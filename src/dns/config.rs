@@ -1976,22 +1976,11 @@ impl DnsConfigurator for DirectResolvConf {
         // answers); behind us they keep resolving exactly what they did before.
         if let Some(ip) = self.foreign_resolver {
             // Going first in the file is only worth anything if we can be
-            // reached there. A v4 magic address sits inside `100.64.0.0/10`,
-            // which is the range this other VPN owns and filters, so our reply
-            // is dropped before the stub sees it: we would be an unanswering
-            // first nameserver and every lookup on the host would eat the
-            // resolver timeout before falling through to them. That is worse
-            // than not taking the file, which is what the IPv6-only mode exists
-            // to avoid; a host that opted out of it (`ipv6-only = off`) keeps
-            // its DNS instead of Magic DNS.
-            anyhow::ensure!(
-                resolver_addr().is_ipv6(),
-                "/etc/resolv.conf is shared with another VPN (nameserver {ip}) that filters \
-                 {}, so our resolver could not answer from there; set `ipv6-only` to auto or \
-                 on so Magic DNS moves to {}",
-                "100.64.0.0/10",
-                crate::dns::MAGIC_DNS_V6
-            );
+            // reached there, and we can: [`resolver_addr`] is in `200::/7`, not
+            // in the `100.64.0.0/10` this other VPN owns and filters. A v4 magic
+            // address there would have been an unanswering first nameserver, and
+            // every lookup on the host would have eaten the resolver timeout
+            // before falling through to them.
             tracing::info!(
                 resolver = %ip,
                 "/etc/resolv.conf names another VPN's resolver; merging ours in ahead of it \

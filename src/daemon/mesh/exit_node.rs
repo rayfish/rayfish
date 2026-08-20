@@ -999,9 +999,9 @@ mod tests {
     /// "Does not advertise an exit node" is a roster fact that flickers, and
     /// dropping a live tunnel on it would leak the traffic the user chose to
     /// tunnel, so it stays a selection-time check. The IPv6 one is a standing
-    /// property: while it holds the tunnel carries nothing, and `ipv6_only = auto`
-    /// can turn the mode on with no user action at all, so a selection made while
-    /// dual-stack has to be caught later.
+    /// property: while it holds the tunnel carries nothing, and the gateway can
+    /// republish a narrower claim with no user action at all, so a selection made
+    /// against a gateway that had IPv6 has to be caught later.
     #[test]
     fn only_the_ipv6_half_of_the_refusal_is_re_checked_after_selection() {
         use ExitFamilies::{Dual, Unknown, V4};

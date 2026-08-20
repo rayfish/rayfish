@@ -54,10 +54,10 @@ impl Manager {
         }
     }
 
-    /// The command that opens `port` for inbound TCP on `tun` only. `v6` picks
-    /// the address family the mesh SSH listener actually binds, which is the
-    /// only one whose ruleset can drop the connection. ufw and firewalld apply
-    /// to both families from one command, so only the raw `iptables` fix splits.
+    /// The command that opens `port` for inbound TCP on `tun` only. Mesh SSH
+    /// binds the overlay's IPv6 address, so `ip6tables` is the only raw ruleset
+    /// that can drop the connection. ufw and firewalld apply to both families
+    /// from one command and so name neither.
     /// Only the Linux detector builds a fix; elsewhere nothing constructs a
     /// `WouldBlock`, and this module's tests are Linux-only too (they parse
     /// `iptables`/`ufw` output), so off Linux nothing calls this at all.

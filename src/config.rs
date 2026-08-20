@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::membership::GroupMode;
 
-/// The `ipv6-only` tri-state, also the shape `ray status` reports it in.
 /// Per-network transport preference. Defined in `ray-proto` (shared with GUI
 /// frontends); re-exported here so existing `crate::config::TransportMode` paths work.
 pub use ray_proto::TransportMode;

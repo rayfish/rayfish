@@ -102,22 +102,14 @@ pub struct TunWriter {
     dev: Arc<AsyncDevice>,
 }
 
-/// Creates a TUN device with the given virtual IPs and shares it between
-/// independent read/write halves. IPv4 gets a /10 (100.64.0.0/10); IPv6 gets our
-/// own /128 address. The `200::/7` peer range is routed in separately by
-/// [`route_peer_range`] after link-up (the kernel does not reliably install an
-/// IPv6 connected route while the link is down), mirroring how the IPv4 /10 works.
+/// Creates a TUN device with this node's mesh address and shares it between
+/// independent read/write halves. The device gets our own `/128` and nothing
+/// else; the `200::/7` peer range is routed in separately by [`route_peer_range`]
+/// after link-up, because the kernel does not reliably install an IPv6 connected
+/// route while the link is down.
 ///
-/// In `ipv6_only` mode the IPv4 address is assigned as a `/32` instead, so no
-/// connected route for the `/10` is installed and another VPN keeps the range.
-/// The `/10` is the part that collides; a single address does not.
-///
-/// The address itself stays because it is still this node's identity-derived
-/// handle: the peer table is keyed on it (`conn_for_ip`), `ray status` reports
-/// it, and the roster carries it for every member. Dropping it would mean
-/// reworking all of that to buy nothing, since an unrouted `/32` carries no
-/// traffic either way. Magic DNS does not depend on it in this mode: it is
-/// reached at [`crate::dns::MAGIC_DNS_V6`] instead.
+/// No IPv4 is assigned at all. `100.64.0.0/10` belongs to whatever other VPN
+/// shares the host, and the overlay carries no IPv4 to put there.
 #[cfg(not(target_os = "android"))]
 pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
     // `ipv6(v6, 128)` assigns just our own address (a /128, no connected route)
@@ -315,8 +307,8 @@ struct SplitDefaultStep {
 /// Every entry is deleted whatever the answer, and only the carried ones are added
 /// back. That asymmetry is the point: this is an install, and an install has to be
 /// as family-symmetric as a teardown. `carries` follows the gateway's claim, so a
-/// live tunnel can narrow (its gateway loses an uplink, or `ipv6_only = auto`
-/// turns on here) and the re-apply arrives with one family fewer. Skipping the
+/// live tunnel can narrow (the gateway loses its IPv6 uplink and republishes a
+/// narrower claim) and the re-apply arrives with one family fewer. Skipping the
 /// dropped family entirely would leave its half-space routes pointing at a utun
 /// that is still up, so that family keeps entering a tunnel whose far end cannot
 /// return it while the daemon tells the user it is leaving directly.
