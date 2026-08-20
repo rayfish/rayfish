@@ -340,7 +340,8 @@ step "6. deny path: srv-c is NOT allowed: its traffic is dropped, not leaked"
 # refused outright, srv-c egresses directly, and the last branch below reports a
 # leak that is really a skipped test.
 if [[ -z "$A_PUB_V6" || -z "$C_PUB_V6" ]]; then
-  echo "   (no IPv6 egress on ${A_PUB_V6:+srv-c}${A_PUB_V6:-srv-a}: the deny path has nothing to carry, skipping)"
+  [[ -z "$A_PUB_V6" ]] && WHO=srv-a || WHO=srv-c
+  echo "   (no IPv6 egress on $WHO: the deny path has nothing to carry, skipping)"
 else
   arm_failsafe "$C" 180
   on "$C" "ray exit-node use $NET srv-a" 2>&1 | strip | sed 's/^/   c| /'
