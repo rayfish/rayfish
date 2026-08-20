@@ -254,7 +254,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `using: <peer>` either way, while every packet left directly. It now says the
   selection is not in effect and why (the routing rules would not install, the
   data plane is down, the peer is not in the roster yet, or the gateway cannot
-  carry the family this node tunnels).
+  carry the family this node tunnels).- **A coordinator restart can no longer erase a healthy network roster.** If
+  the signed membership blob was temporarily unavailable at startup, a
+  coordinator fell back to its stale config copy and immediately published it
+  as authoritative; that copy could contain only the coordinator, making every
+  member disappear. Coordinator restore now stays inactive and retries until it
+  has the signed blob.
 - **`.ray` names now resolve alongside another VPN that manages
   `/etc/resolv.conf`.** On a host with no DNS manager (no systemd-resolved in
   the resolution path), Rayfish and a VPN like Tailscale both want that file.
