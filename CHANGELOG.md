@@ -36,6 +36,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A coordinator restart can no longer erase a healthy network roster.** If
+  the signed membership blob was temporarily unavailable at startup, a
+  coordinator fell back to its stale config copy and immediately published it
+  as authoritative; that copy could contain only the coordinator, making every
+  member disappear. Coordinator restore now stays inactive and retries until it
+  has the signed blob.
 - **`.ray` names now resolve alongside another VPN that manages
   `/etc/resolv.conf`.** On a host with no DNS manager (no systemd-resolved in
   the resolution path), Rayfish and a VPN like Tailscale both want that file.
