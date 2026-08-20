@@ -11,16 +11,22 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use smol_str::SmolStr;
 
-use crate::dns::{HostnameTable, MAGIC_DNS_V4, ReverseLookupTable};
+use crate::dns::{HostnameTable, MAGIC_DNS_V4, MAGIC_DNS_V6, ReverseLookupTable};
 
 /// Whether `ip` is this resolver's own address, so forwarding to it is a loop
 /// with no second party: the query comes straight back in through
-/// `handle_tun_query`. The overlay range covers the address we answer on; the
-/// v4 magic address is only here because an older build may have left it in a
-/// file we then captured. Neither is a place another resolver lives, so both
-/// are dropped from the upstream set outright.
+/// `handle_tun_query`. Dropped from the upstream set outright, since neither is
+/// a place another resolver lives.
+///
+/// The two magic addresses and nothing else. **Not** the whole `200::/7`: the
+/// intercept is `dst_ip == MAGIC_DNS_V6` alone (`forward::is_magic_dns`), so a
+/// query aimed at any other overlay address is routed out to the peer that owns
+/// it, which is a real second party. A resolver a user runs on a mesh peer is a
+/// legitimate upstream, and under a full tunnel it is the *best* one, being
+/// reachable only through the tunnel by construction. `MAGIC_DNS_V4` is here
+/// only because an older build may have left it in a file we then captured.
 fn is_own_resolver(ip: IpAddr) -> bool {
-    crate::membership::is_overlay_ip(ip) || ip == IpAddr::V4(MAGIC_DNS_V4)
+    ip == IpAddr::V6(MAGIC_DNS_V6) || ip == IpAddr::V4(MAGIC_DNS_V4)
 }
 
 /// Whether forwarding to `ip` could loop back into this resolver *via somebody
@@ -104,7 +110,9 @@ impl Resolver {
     /// Filters the magic IPs for the same reason [`Self::set_upstream_addrs`]
     /// does: `dns_upstreams` now accepts any `IpAddr`, so `ray config set
     /// dns-upstreams 200::53` would otherwise hand the forwarder its own address
-    /// and every miss would recurse through `handle_tun_query`.
+    /// and every miss would recurse through `handle_tun_query`. Only those two,
+    /// though: see [`is_own_resolver`] for why a *peer's* mesh address has to
+    /// survive this, being the one upstream a tunnel is guaranteed to reach.
     ///
     /// It governs only what *we* forward, so it does nothing on a host that
     /// declines off-mesh names ([`Self::set_defer_off_mesh`]): there the stub
@@ -973,6 +981,35 @@ mod tests {
         let foreign = SocketAddr::from((Ipv4Addr::new(100, 100, 100, 100), 53));
         r.set_tunnel_upstreams(Some(vec![foreign]));
         assert_eq!(r.tunnel_upstreams(), Some(vec![foreign]));
+    }
+
+    /// A resolver running on a mesh peer is an upstream, not a loop. `200::53`
+    /// is the only overlay address that comes back to us; every other one is
+    /// routed to the peer that owns it, so filtering the whole `200::/7` would
+    /// throw away the one upstream a full tunnel is guaranteed to reach and
+    /// leave the override empty, which is no override at all.
+    #[tokio::test]
+    async fn a_resolver_on_a_mesh_peer_is_a_usable_upstream() {
+        let r = Resolver::new(
+            crate::dns::new_hostname_table(),
+            crate::dns::new_reverse_table(),
+        );
+        let peer = SocketAddr::from((Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 9), 53));
+        let magic = SocketAddr::from((crate::dns::MAGIC_DNS_V6, 53));
+
+        // The capture/override path a `dns_upstreams` setting takes.
+        r.set_upstream_addrs([magic, peer]);
+        assert_eq!(r.upstreams(), vec![peer]);
+
+        // And the tunnel override, where dropping it is worst: an empty result
+        // becomes `None`, and the forwarder falls back to the captured IPv4
+        // servers, which leave around the exit.
+        r.set_tunnel_upstreams(Some(vec![peer]));
+        assert_eq!(r.tunnel_upstreams(), Some(vec![peer]));
+
+        // It is nobody's loop either: only `200::53` is intercepted.
+        assert!(!is_own_resolver(peer.ip()));
+        assert!(is_own_resolver(magic.ip()));
     }
 
     /// Another mesh's resolver is kept, not filtered. It is a real server that
