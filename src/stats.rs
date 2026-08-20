@@ -334,4 +334,30 @@ mod tests {
             .map(|(_, c)| *c);
         assert_eq!(no_peer, Some(1));
     }
+
+    /// `ALL` is hand-maintained and is the only thing `total_drops` and the
+    /// snapshot iterate, so a variant left out of it is invisible in both and
+    /// still compiles.
+    ///
+    /// Iterating `ALL` cannot detect that on its own: a variant missing from it
+    /// is a variant the loop never sees. What this buys is a *compile* error at
+    /// a line that names `ALL`, because the match is exhaustive: a new variant
+    /// needs an arm here, and the count beside it has to move at the same time.
+    /// So the omission is caught while the author who caused it is still looking.
+    #[test]
+    fn adding_a_drop_reason_forces_updating_all() {
+        let counted = DropReason::ALL.iter().fold(0usize, |n, r| {
+            n + match r {
+                DropReason::Firewall
+                | DropReason::SendFailure
+                | DropReason::NoPeer
+                | DropReason::Malformed
+                | DropReason::Backpressure
+                | DropReason::Spoof
+                | DropReason::ExitDenied
+                | DropReason::PacketTooBig => 1,
+            }
+        });
+        assert_eq!(counted, 8, "a DropReason variant is missing from ALL");
+    }
 }

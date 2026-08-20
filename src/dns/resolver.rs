@@ -966,6 +966,13 @@ mod tests {
             SocketAddr::from((crate::dns::MAGIC_DNS_V4, 53)),
         ]));
         assert_eq!(r.tunnel_upstreams(), None);
+
+        // Another mesh's resolver is not one of ours and is not dropped here
+        // either, for the same reason the capture path keeps it. It reaches the
+        // loop guard in `forward` instead.
+        let foreign = SocketAddr::from((Ipv4Addr::new(100, 100, 100, 100), 53));
+        r.set_tunnel_upstreams(Some(vec![foreign]));
+        assert_eq!(r.tunnel_upstreams(), Some(vec![foreign]));
     }
 
     /// Another mesh's resolver is kept, not filtered. It is a real server that

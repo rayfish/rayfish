@@ -977,6 +977,25 @@ mod tests {
         make_tcp_packet_between(TEST_V6, OTHER_V6, dst_port)
     }
 
+    /// An IPv4 TCP packet. Nothing on the mesh produces one any more, which is
+    /// the reason to build one by hand: the rules that reject it have to be
+    /// exercised by something.
+    fn make_tcp_packet_v4(src: [u8; 4], dst: [u8; 4], dst_port: u16) -> Vec<u8> {
+        let mut p = vec![0u8; 24];
+        p[0] = 0x45; // IPv4, 5-word header
+        p[2] = 0;
+        p[3] = 24; // total length
+        p[8] = 64; // TTL
+        p[9] = 6; // protocol = TCP
+        p[12..16].copy_from_slice(&src);
+        p[16..20].copy_from_slice(&dst);
+        p[20] = 0;
+        p[21] = 80; // src port 80
+        p[22] = (dst_port >> 8) as u8;
+        p[23] = dst_port as u8;
+        p
+    }
+
     /// This node's mesh address in the `evaluate_inbound` tests. Distinct from the
     /// peer/packet addresses; only consulted by the exit return-traffic path.
     const MY_V6: Ipv6Addr = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 1);
@@ -1193,6 +1212,37 @@ mod tests {
         assert_eq!(csum_replace2(csum_replace2(c, 22, 41384), 41384, 22), c);
     }
 
+    /// The overlay routes no IPv4, and there is no longer a rule that names it:
+    /// `DropIpv4Disabled` went with the setting, having been unreachable twice
+    /// over. What must not go with it is the outcome. An IPv4 destination makes
+    /// the whole packet IPv4, so its source is IPv4 too, and a mesh source is
+    /// always the peer's derived IPv6: anti-spoofing takes it and neither the
+    /// exit-return exemption nor the transit branch below can hand it back, the
+    /// first because `dst_is_me` compares an IPv6, the second because it is never
+    /// reached. Accepting one would half-work, which is the failure the deleted
+    /// rule existed to prevent.
+    #[test]
+    fn inbound_mesh_ipv4_is_never_accepted() {
+        let peer = iroh::SecretKey::generate().public();
+        let fw = inbound_fw(Action::Allow, vec![]);
+        let pkt = make_tcp_packet_v4([100, 64, 0, 5], [100, 64, 0, 9], 80);
+
+        // Not our exit peer: plain anti-spoofing.
+        assert!(matches!(
+            evaluate_inbound(&pkt, &fw, &no_exit(), &peer, TEST_V6, "test-net"),
+            InboundDecision::DropSpoof
+        ));
+
+        // And with the sender as our selected exit peer, where the exemption for
+        // return traffic fires for real return packets. `100.64.0.0/10` is not
+        // transitable and the destination is not our mesh v6, so it still cannot
+        // be mistaken for one.
+        assert!(matches!(
+            evaluate_inbound(&pkt, &fw, &exit_via(peer), &peer, TEST_V6, "test-net"),
+            InboundDecision::DropSpoof
+        ));
+    }
+
     #[test]
     fn inbound_spoofed_source_ip_dropped() {
         // A packet whose source IP isn't the sending peer's assigned mesh IP is
@@ -1200,7 +1250,7 @@ mod tests {
         // it, even when the firewall would otherwise allow it.
         let peer = iroh::SecretKey::generate().public();
         let fw = inbound_fw(Action::Allow, vec![]);
-        let pkt = make_tcp_packet(80); // sourced from TEST_V4 (100.64.0.5)
+        let pkt = make_tcp_packet(80); // sourced from TEST_V6
         // Same packet, but the peer is supposedly assigned a different IP.
         assert!(matches!(
             evaluate_inbound(
