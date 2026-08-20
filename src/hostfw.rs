@@ -380,10 +380,10 @@ table inet filter {
                 .fix_command("tun0", 30022)
                 .starts_with("ip6tables -I INPUT -i tun0")
         );
-        // ufw covers both families from one command, so it does not split.
+        // ufw covers both families from one command, so it names neither.
         assert_eq!(
             Manager::Ufw.fix_command("tun0", 30022),
-            Manager::Ufw.fix_command("tun0", 30022)
+            "ufw allow in on tun0 to any port 30022 proto tcp"
         );
     }
 }

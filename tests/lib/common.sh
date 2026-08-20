@@ -12,6 +12,13 @@ SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
 FAILS=0
 pass(){ printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 fail(){ printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILS=$((FAILS+1)); }
+# Same complaint, on stderr and without the tally. For helpers whose every caller
+# reads them through `$(...)`: on stdout the message is captured into the command
+# line the caller is building instead of leaving it empty, so the caller's own
+# `[[ -n ... ]]` guard passes and every probe below runs against garbage. The
+# increment is dropped for the same reason (it would happen in the subshell), so
+# these helpers `return 1` and the caller counts the failure.
+fail_out(){ printf '  \033[31mFAIL\033[0m %s\n' "$*" >&2; }
 step(){ printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 
 # summary : print the final tally and exit non-zero if any check failed.
@@ -42,12 +49,11 @@ strip(){ sed -r 's/\x1B\[[0-9;]*[mGKH]//g'; }
 # runs from 200 to 2ff: matching a literal `200:` finds 1 address in 256, which is
 # how this read as "no mesh IPv6" against real output.
 # Loud when there is none: every caller uses the result as a ping/ssh target, and
-# an empty string there turns a real failure into a test that passes. The message
-# goes to stderr because every caller reads this through `$(...)`, which would
-# otherwise capture the complaint into the command line it is building.
+# an empty string there turns a real failure into a test that passes. See
+# `fail_out` for why the complaint goes to stderr.
 own_ip(){
   local ip; ip="$(echo "$1" | grep -oE '\b2[0-9a-f]{2}:[0-9a-f:]+' | head -1)"
-  [[ -n "$ip" ]] || { printf '  \033[31mFAIL\033[0m own_ip: no mesh IPv6 in status output\n' >&2; return 1; }
+  [[ -n "$ip" ]] || { fail_out "own_ip: no mesh IPv6 in status output"; return 1; }
   echo "$ip"
 }
 
@@ -146,7 +152,7 @@ my_ip(){
     (.networks // [])
     | (if $n == "" then .[0] else (map(select(.name == $n)) | .[0]) end)
     | .my_ipv6 // empty')"
-  [[ -n "$ip" ]] || { fail "my_ip: $1 reports no mesh IPv6 for network '${2:-<first>}'"; return 1; }
+  [[ -n "$ip" ]] || { fail_out "my_ip: $1 reports no mesh IPv6 for network '${2:-<first>}'"; return 1; }
   echo "$ip"
 }
 

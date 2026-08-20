@@ -462,3 +462,71 @@ impl TunWrite for TunWriter {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// A narrowing tunnel must delete the family it stopped carrying.
+    ///
+    /// `carries` follows the gateway's claim, so it changes under a live tunnel:
+    /// the gateway republishes a claim with no IPv6 in it, and the re-apply
+    /// arrives with one family fewer. The utun is still up, so nothing reaps the
+    /// dropped family's half-space routes on their own, and that family keeps
+    /// entering a tunnel whose far end cannot return it while
+    /// `ray exit-node status` says it is leaving directly.
+    ///
+    /// `tunnelled` narrows to `V6` or `Neither`, but the plan is written against
+    /// the whole enum because the claim rides the signed roster and is decoded
+    /// as well as written.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn the_split_default_plan_visits_every_family_and_adds_only_what_it_carries() {
+        use crate::membership::ExitFamilies::{Dual, Neither, Unknown, V4, V6};
+
+        let deletes = |carries| -> Vec<String> {
+            super::split_default_plan(carries, "utun9")
+                .into_iter()
+                .map(|s| s.delete.join(" "))
+                .collect()
+        };
+        let adds = |carries| -> Vec<String> {
+            super::split_default_plan(carries, "utun9")
+                .into_iter()
+                .filter_map(|s| s.add.map(|a| a.join(" ")))
+                .collect()
+        };
+
+        // Every family is deleted whatever the tunnel carries. This is the half
+        // that a narrowing tunnel depends on, and the half that reads as dead code
+        // if you only look at the family it is installing.
+        let all_four = [
+            "-n delete -inet -net 0.0.0.0/1 -interface utun9",
+            "-n delete -inet -net 128.0.0.0/1 -interface utun9",
+            "-n delete -inet6 -net ::/1 -interface utun9",
+            "-n delete -inet6 -net 8000::/1 -interface utun9",
+        ];
+        for carries in [Dual, V6, V4, Neither, Unknown] {
+            assert_eq!(deletes(carries), all_four, "{carries:?}");
+        }
+
+        // And only the carried family is added back. `V6` and `Neither` are the
+        // two a real selection produces.
+        assert_eq!(
+            adds(V6),
+            [
+                "-n add -inet6 -net ::/1 -interface utun9",
+                "-n add -inet6 -net 8000::/1 -interface utun9",
+            ]
+        );
+        assert!(adds(Neither).is_empty(), "nothing to carry, nothing to add");
+        assert_eq!(
+            adds(V4),
+            [
+                "-n add -inet -net 0.0.0.0/1 -interface utun9",
+                "-n add -inet -net 128.0.0.0/1 -interface utun9",
+            ]
+        );
+        assert_eq!(adds(Dual).len(), 4);
+        // An absent claim predates the field, so it is read as both families.
+        assert_eq!(adds(Unknown).len(), 4);
+    }
+}

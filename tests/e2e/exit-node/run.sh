@@ -140,6 +140,7 @@ wait_roster "$A" srv-b srv-c
 
 A_VPN="$(my_ip "$A" "$NET")"
 echo "   srv-a mesh ip = $A_VPN"
+[[ -n "$A_VPN" ]] || { fail "could not read srv-a's mesh IPv6"; summary; }
 
 # Real public IPs (the baseline: each host normally egresses via its own uplink).
 A_PUB="$(pub4 "$A")"; B_PUB="$(pub4 "$B")"; C_PUB="$(pub4 "$C")"
@@ -193,8 +194,13 @@ on "$B" "ray status" | strip | grep -q 'srv-a.*offers' \
 step "4. srv-b tunnels IPv6 through srv-a and leaves its IPv4 egress alone"
 arm_failsafe "$B" 240
 use_started=$SECONDS
-on "$B" "ray exit-node use $NET srv-a" 2>&1 | strip | sed 's/^/   b| /'
+USE_OUT="$(on "$B" "ray exit-node use $NET srv-a" 2>&1)"; USE_RC=$?
 use_took=$((SECONDS - use_started))
+printf '%s\n' "$USE_OUT" | strip | sed 's/^/   b| /'
+# A refusal here is silent in the assertions below: with no tunnel installed they
+# all read a host egressing directly and blame the part that did not run. The
+# common cause is a gateway with no IPv6 uplink, which the CLI names.
+[[ $USE_RC -eq 0 ]] || { disarm_failsafe "$B"; fail "srv-b's \`exit-node use\` was refused: no tunnel to test"; summary; }
 # The command runs over SSH, and the tunnel comes up underneath that very session.
 # If the conntrack-mark rules do not cover a connection that predates the tunnel,
 # the reply is swallowed and this returns minutes later, after the failsafe has
@@ -298,23 +304,30 @@ step "6. deny path: srv-c is NOT allowed: its traffic is dropped, not leaked"
 # allow-list has only srv-b, so the gateway drops srv-c's packets. The critical
 # property: srv-c must not reach the internet via srv-a AND must not silently fall
 # back to its own uplink (that would be a leak the user never asked for).
-arm_failsafe "$C" 180
 # Probed over IPv6: that is the family the tunnel takes, so it is the only one
 # whose fate the allow-list decides. srv-c's IPv4 keeps leaving directly either
 # way, and reading it here would report a leak that is simply the design.
-on "$C" "ray exit-node use $NET srv-a" 2>&1 | strip | sed 's/^/   c| /'
-sleep 5
-C_VIA_EXIT="$(pub6 "$C")"
-on "$C" "ray exit-node none $NET" >/dev/null 2>&1
-disarm_failsafe "$C"
-if [[ -z "$C_PUB_V6" ]]; then
-  echo "   (srv-c has no IPv6 egress: the deny path has nothing to carry, skipping)"
-elif [[ -z "$C_VIA_EXIT" ]]; then
-  pass "srv-c got no internet through srv-a (dropped by the allow-list, no leak)"
-elif [[ "$C_VIA_EXIT" == "$A_PUB_V6" ]]; then
-  fail "SECURITY: srv-c routed through srv-a despite not being on the allow-list"
+#
+# Both ends have to have IPv6 for the probe to mean anything, and srv-a's is the
+# one that is easy to forget: with no IPv6 uplink on the gateway the selection is
+# refused outright, srv-c egresses directly, and the last branch below reports a
+# leak that is really a skipped test.
+if [[ -z "$A_PUB_V6" || -z "$C_PUB_V6" ]]; then
+  echo "   (no IPv6 egress on srv-a or srv-c: the deny path has nothing to carry, skipping)"
 else
-  fail "LEAK: srv-c's traffic escaped via '$C_VIA_EXIT' instead of being dropped"
+  arm_failsafe "$C" 180
+  on "$C" "ray exit-node use $NET srv-a" 2>&1 | strip | sed 's/^/   c| /'
+  sleep 5
+  C_VIA_EXIT="$(pub6 "$C")"
+  on "$C" "ray exit-node none $NET" >/dev/null 2>&1
+  disarm_failsafe "$C"
+  if [[ -z "$C_VIA_EXIT" ]]; then
+    pass "srv-c got no internet through srv-a (dropped by the allow-list, no leak)"
+  elif [[ "$C_VIA_EXIT" == "$A_PUB_V6" ]]; then
+    fail "SECURITY: srv-c routed through srv-a despite not being on the allow-list"
+  else
+    fail "LEAK: srv-c's traffic escaped via '$C_VIA_EXIT' instead of being dropped"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
