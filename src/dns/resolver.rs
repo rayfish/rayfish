@@ -11,18 +11,28 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use smol_str::SmolStr;
 
-use crate::dns::{HostnameTable, ReverseLookupTable};
+use crate::dns::{HostnameTable, MAGIC_DNS_V4, ReverseLookupTable};
 
-/// Whether forwarding a query to `ip` could loop back into this resolver.
+/// Whether `ip` is this resolver's own address, so forwarding to it is a loop
+/// with no second party: the query comes straight back in through
+/// `handle_tun_query`. The overlay range covers the address we answer on; the
+/// v4 magic address is only here because an older build may have left it in a
+/// file we then captured. Neither is a place another resolver lives, so both
+/// are dropped from the upstream set outright.
+fn is_own_resolver(ip: IpAddr) -> bool {
+    crate::membership::is_overlay_ip(ip) || ip == IpAddr::V4(MAGIC_DNS_V4)
+}
+
+/// Whether forwarding to `ip` could loop back into this resolver *via somebody
+/// else*: a co-resident VPN's resolver lives in the CGNAT range, and if it
+/// forwards back to us (as Tailscale does, since it only filters out its own
+/// service IPs) the two resolvers point at each other.
 ///
-/// Our own overlay is the obvious case. The CGNAT range is the other one: a
-/// co-resident VPN's resolver lives there, and if it forwards back to us (as
-/// Tailscale does, since it only filters out its *own* service IPs) the two
-/// resolvers point at each other. Neither range is a place a real upstream
-/// lives, so refusing both costs nothing.
+/// Rate-limited rather than dropped, unlike [`is_own_resolver`]: it is a real
+/// resolver that really answers, and on a host where the capture found nothing
+/// else, dropping it leaves the forwarder with nothing to ask at all.
 fn is_loopable_upstream(ip: IpAddr) -> bool {
-    crate::membership::is_overlay_ip(ip)
-        || matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
+    matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
 }
 
 pub struct Resolver {
@@ -33,10 +43,6 @@ pub struct Resolver {
     /// lookups leave by the exit node rather than around it. See
     /// [`set_tunnel_upstreams`](Resolver::set_tunnel_upstreams).
     tunnel_upstreams: Arc<ArcSwapOption<Vec<SocketAddr>>>,
-    /// Whether this node's data plane is IPv6-only. When set, the roster
-    /// responder withholds A records (see [`crate::dns::handle_query`]): mesh
-    /// IPv4 is not routed here, so handing an app one is a black hole.
-    ipv6_only: AtomicBool,
     /// Per-name forwarding counters for [`LOOP_WINDOW`], kept only for names
     /// sent to another mesh's resolver. See [`Resolver::loop_guard_allows`].
     overlay_forwards: DashMap<SmolStr, (Instant, u32)>,
@@ -77,7 +83,6 @@ impl Resolver {
             reverse,
             upstreams: Arc::new(ArcSwap::from_pointee(Vec::new())),
             tunnel_upstreams: Arc::new(ArcSwapOption::empty()),
-            ipv6_only: AtomicBool::new(false),
             overlay_forwards: DashMap::new(),
             defer_off_mesh: AtomicBool::new(false),
         }
@@ -114,7 +119,7 @@ impl Resolver {
         let addrs = addrs
             .map(|v| {
                 v.into_iter()
-                    .filter(|a| !is_loopable_upstream(a.ip()))
+                    .filter(|a| !is_own_resolver(a.ip()))
                     .collect::<Vec<_>>()
             })
             .filter(|v: &Vec<SocketAddr>| !v.is_empty());
@@ -140,13 +145,6 @@ impl Resolver {
         self.defer_off_mesh.load(Ordering::Relaxed)
     }
 
-    /// Record whether mesh IPv4 is usable on this node. Called once at daemon
-    /// start; a setter rather than a `new` parameter so the mode stays out of
-    /// every construction site.
-    pub fn set_ipv6_only(&self, on: bool) {
-        self.ipv6_only.store(on, Ordering::Relaxed);
-    }
-
     /// Replace the upstream set (bare IPv4 on port 53), dropping the magic IP to
     /// avoid a forwarding loop. The desktop capture path uses this.
     pub fn set_upstreams(&self, servers: Vec<Ipv4Addr>) {
@@ -160,7 +158,7 @@ impl Resolver {
     pub fn set_upstream_addrs(&self, addrs: impl IntoIterator<Item = SocketAddr>) {
         let v: Vec<SocketAddr> = addrs
             .into_iter()
-            .filter(|a| !is_loopable_upstream(a.ip()))
+            .filter(|a| !is_own_resolver(a.ip()))
             .collect();
         self.upstreams.store(Arc::new(v));
     }
@@ -264,8 +262,8 @@ impl Resolver {
             .then(|| query_name(query))
             .flatten();
         for up in upstreams.iter() {
-            // Skip an overlay resolver that this name has already been bounced
-            // off, and fall through to the next upstream (a real server, if the
+            // Skip another mesh's resolver once this name has been bounced off
+            // it, and fall through to the next upstream (a real server, if the
             // capture found one) rather than feeding the loop another hop.
             if is_loopable_upstream(up.ip()) && !self.loop_guard_allows(name.as_ref()) {
                 continue;
@@ -282,9 +280,9 @@ impl Resolver {
     /// Count one forward of this query's name to another mesh's resolver, and
     /// say whether it is still under [`LOOP_LIMIT`] for the current window.
     ///
-    /// Only asked about overlay upstreams, so the map hit stays off the path a
-    /// host with ordinary resolvers takes. A query we could not parse a name
-    /// out of is allowed: it is not the shape a loop has, and guessing would
+    /// Only asked about another mesh's resolver, so the map hit stays off the
+    /// path a host with ordinary resolvers takes. A query we could not parse a
+    /// name out of is allowed: it is not the shape a loop has, and guessing would
     /// drop real traffic.
     fn loop_guard_allows(&self, name: Option<&SmolStr>) -> bool {
         let Some(name) = name else {
@@ -968,5 +966,23 @@ mod tests {
             SocketAddr::from((crate::dns::MAGIC_DNS_V4, 53)),
         ]));
         assert_eq!(r.tunnel_upstreams(), None);
+    }
+
+    /// Another mesh's resolver is kept, not filtered. It is a real server that
+    /// really answers, and on a host where it is the only nameserver the capture
+    /// found, dropping it would leave off-mesh names with nowhere to go. The
+    /// loop it can form is bounded by `loop_guard_allows` instead, and that
+    /// guard is dead code the moment such an upstream cannot reach the list.
+    #[tokio::test]
+    async fn a_foreign_mesh_resolver_survives_the_filter() {
+        let r = Resolver::new(
+            crate::dns::new_hostname_table(),
+            crate::dns::new_reverse_table(),
+        );
+        let foreign = Ipv4Addr::new(100, 100, 100, 100);
+        r.set_upstreams(vec![crate::dns::MAGIC_DNS_V4, foreign]);
+        assert_eq!(r.upstreams(), vec![SocketAddr::from((foreign, 53))]);
+        assert!(is_loopable_upstream(IpAddr::V4(foreign)));
+        assert!(!is_own_resolver(IpAddr::V4(foreign)));
     }
 }

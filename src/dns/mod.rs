@@ -41,10 +41,10 @@ use crate::DNS_DOMAIN;
 /// Tailscale's 100.100.100.100 so both can coexist.
 pub const MAGIC_DNS_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 53);
 
-/// The same resolver, addressed inside our own IPv6 range, used when the data
-/// plane is IPv6-only (`AppConfig::ipv6_only`).
+/// The same resolver, addressed inside our own IPv6 range. The only address the
+/// OS is ever pointed at: the overlay carries no IPv4.
 ///
-/// The v4 address above is unusable on the hosts that mode exists for. Tailscale
+/// The v4 address above is unusable on the hosts we run on. Tailscale
 /// installs an anti-spoof rule (`-s 100.64.0.0/10 ! -i tailscale0 -j DROP`) that
 /// drops anything sourced from the CGNAT range arriving on another interface,
 /// and our reply is synthesized with the magic IP as its source and injected
@@ -531,9 +531,9 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    /// IPv6-only mode: the mesh IPv4 is not routed on this node, so an A record
-    /// would point an app at an address owned by another VPN. The name still
-    /// resolves over IPv6, and NODATA (not NXDOMAIN) is what keeps it that way.
+    /// The mesh IPv4 is not routed on any node, so an A record would point an
+    /// app at an address owned by another VPN. The name still resolves over
+    /// IPv6, and NODATA (not NXDOMAIN) is what keeps it that way.
     #[tokio::test]
     async fn ipv6_only_withholds_a_but_still_answers_aaaa() {
         use simple_dns::{CLASS as C, PacketFlag, QCLASS, Question};
@@ -607,10 +607,8 @@ mod tests {
         );
     }
 
-    /// The other half of the same rule, seen from a dual-stack node: a *peer*
-    /// running an IPv6-only data plane is held in the table with no IPv4
-    /// (`Member.ipv6_only` on the signed roster), so we withhold its A record
-    /// even though our own IPv4 works fine.
+    /// The other half of the same rule, seen from the peer's side: a peer is
+    /// held in the table with no IPv4, so we withhold its A record too.
     #[tokio::test]
     async fn peer_without_ipv4_gets_no_a_record() {
         use simple_dns::{CLASS as C, PacketFlag, QCLASS, Question};

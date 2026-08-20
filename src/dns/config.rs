@@ -13,7 +13,6 @@ use std::net::SocketAddr;
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 // Only the macOS/Linux configurators build resolver/backup file paths; Android
 // does no OS-level DNS configuration.
 #[cfg(not(target_os = "android"))]
@@ -30,29 +29,6 @@ use smol_str::SmolStr;
 use zbus::Connection;
 
 use crate::DNS_DOMAIN;
-
-/// Whether this node's data plane is IPv6-only, which decides *which* magic
-/// resolver address the OS is pointed at. Set once at daemon start, before any
-/// backend is detected; process-wide because every configurator below needs it
-/// and none of them is constructed anywhere the daemon's config is in scope.
-static IPV6_ONLY: AtomicBool = AtomicBool::new(false);
-
-/// Record the data-plane mode for the DNS backends. Called at daemon start.
-pub fn set_ipv6_only(on: bool) {
-    IPV6_ONLY.store(on, Ordering::Relaxed);
-}
-
-/// The address to hand the OS as the `.ray` nameserver.
-///
-/// IPv6-only hosts must not be given the v4 one: it lives in `100.64.0.0/10`,
-/// and the VPN that owns that range on such a host drops our reply before it
-/// reaches the stub resolver. See [`crate::dns::MAGIC_DNS_V6`].
-/// Read by the macOS configurator, which scopes its resolver to the utun in
-/// this mode; the other backends only ever need [`resolver_addr`].
-#[cfg(target_os = "macos")]
-pub(crate) fn ipv6_only() -> bool {
-    IPV6_ONLY.load(Ordering::Relaxed)
-}
 
 /// The address to hand the OS as the `.ray` nameserver. Always the v6 one: the
 /// overlay carries no IPv4, and `100.64.0.0/10` belongs to whatever other VPN
@@ -469,17 +445,16 @@ mod macos {
             .collect();
         let search_val = CFArray::from_CFTypes(&search_cfstrings);
 
-        // In IPv6-only mode, ask configd to trust this resolver, which is the
-        // only way it is ever asked for AAAA. configd computes the per-resolver
-        // "Request A / Request AAAA" flags, and for a supplemental resolver
-        // there is exactly one branch that sets them from the resolver's own
-        // service: the one guarded by an internal `__SCOPED_QUERY__` marker
-        // (configd's dns-configuration.c). Fail it and configd strips the
-        // InterfaceName below, assigns no families of its own, and falls back to
-        // merging in the flags of the *default* resolver. On a Mac with no
-        // native IPv6 that fallback is A-only, so `.ray` names resolve to
-        // nothing in the one mode where AAAA is the only answer we have, while
-        // `dig` against the same resolver answers fine.
+        // Ask configd to trust this resolver, which is the only way it is ever
+        // asked for AAAA, and AAAA is the only answer a `.ray` name has. configd
+        // computes the per-resolver "Request A / Request AAAA" flags, and for a
+        // supplemental resolver there is exactly one branch that sets them from
+        // the resolver's own service: the one guarded by an internal
+        // `__SCOPED_QUERY__` marker (configd's dns-configuration.c). Fail it and
+        // configd strips the InterfaceName below, assigns no families of its
+        // own, and falls back to merging in the flags of the *default* resolver.
+        // On a Mac with no native IPv6 that fallback is A-only, so `.ray` names
+        // resolve to nothing while `dig` against the same resolver answers fine.
         //
         // We cannot write that marker: configd rebuilds this dictionary from a
         // fixed list of keys and would drop it. It sets the marker itself for a
@@ -491,9 +466,6 @@ mod macos {
         // Trust alone only carries the flags across; [`write_service_config`] is
         // what makes there be an AAAA flag to carry.
         //
-        // Only in that mode: with the v4 magic address the fallback already
-        // gives us the one family we need.
-        //
         // Values are type-erased to `CFType` because these are strings where the
         // rest are arrays, and `from_CFType_pairs` takes one value type.
         let mut pairs: Vec<(CFString, CFType)> = vec![
@@ -501,7 +473,7 @@ mod macos {
             (match_key, match_val.as_CFType()),
             (search_key, search_val.as_CFType()),
         ];
-        if super::ipv6_only() && !tun_name.is_empty() {
+        if !tun_name.is_empty() {
             let iface_key = unsafe { CFString::wrap_under_get_rule(kSCPropInterfaceName) };
             pairs.push((iface_key, CFString::new(tun_name).as_CFType()));
             pairs.push((
@@ -519,8 +491,7 @@ mod macos {
         Ok(())
     }
 
-    /// Publish the IPv6 half of our service, plus the service's rank. Only
-    /// meaningful in IPv6-only mode, and only there is it written.
+    /// Publish the IPv6 half of our service, plus the service's rank.
     ///
     /// This is what puts the AAAA flag on the resolver written above. configd
     /// asks one question of a service before it will request a family for it:
@@ -629,8 +600,8 @@ mod macos {
         captured: Vec<std::net::Ipv4Addr>,
         /// The utun the resolver is scoped to (see [`write_dns_config`]).
         tun_name: String,
-        /// This node's mesh IPv6, published as the service's address in
-        /// IPv6-only mode (see [`write_service_config`]).
+        /// This node's mesh IPv6, published as the service's address
+        /// (see [`write_service_config`]).
         mesh_v6: Ipv6Addr,
     }
 
@@ -650,7 +621,7 @@ mod macos {
             init_store()?;
             // The service first: the DNS key is only scoped to the interface if
             // configd already knows the service has one.
-            if super::ipv6_only() && !self.tun_name.is_empty() {
+            if !self.tun_name.is_empty() {
                 write_service_config(&self.tun_name, self.mesh_v6)?;
             }
             write_dns_config(&[super::SearchDomain::root()], &self.tun_name)?;
@@ -671,8 +642,6 @@ mod macos {
             if let Some(store) = STORE.get() {
                 let store = store.lock().unwrap();
                 store.0.remove(SC_DNS_KEY);
-                // Unconditional: the mode can have changed since the write, and
-                // removing a key that was never set is a no-op.
                 store.0.remove(SC_IPV6_KEY);
                 store.0.remove(SC_SERVICE_KEY);
             }
