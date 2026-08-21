@@ -258,9 +258,12 @@ pub(crate) fn evaluate_inbound(
     // Exit-node transit: a datagram bound for a non-overlay (internet) destination
     // is not for a mesh host at all. Forward it to the TUN (where the kernel NATs
     // it out) only if we offer this sender an exit node on this network *and* the
-    // destination is one the internet could reach anyway ([`is_transitable`]: not
-    // our LAN, loopback, or link-local/metadata) *and* not one of this host's own
-    // addresses (the kernel would local-deliver those, skipping this firewall).
+    // destination is one the internet could reach anyway ([`is_transitable`]:
+    // loopback, link-local/metadata, ULA, private v4) *and* not on a network this
+    // gateway is directly attached to ([`ExitServer::is_on_link`]: an IPv6 LAN is
+    // normally a global /64, which `is_transitable` cannot recognise the way the
+    // v4 arm recognises `is_private`) *and* not one of this host's own addresses
+    // (the kernel would local-deliver those, skipping this firewall).
     // Otherwise drop it, so a non-exit node never leaks a peer's traffic and an
     // exit offer never doubles as a way into the gateway's own network or the
     // gateway host itself. `peer_id` is already the sender's user
@@ -269,6 +272,7 @@ pub(crate) fn evaluate_inbound(
     if !is_overlay_ip(info.dst_ip) {
         let permitted = exit.server.allows(network, peer_id)
             && is_transitable(info.dst_ip)
+            && !exit.server.is_on_link(info.dst_ip)
             && !exit.server.is_self_addr(info.dst_ip);
         return if permitted {
             InboundDecision::Accept
@@ -1282,6 +1286,50 @@ mod tests {
                 "test-net"
             ),
             InboundDecision::DropExit
+        ));
+    }
+
+    /// A gateway does not become a way onto its own LAN. The client is allowed
+    /// to transit, and the destination is a perfectly ordinary global address --
+    /// it is a neighbour of the gateway's, which is the only thing that stops it.
+    #[test]
+    fn an_allowed_client_still_cannot_transit_onto_the_gateways_own_lan() {
+        let peer = iroh::SecretKey::generate().public();
+        let fw = SharedFirewall::new(firewall::FirewallConfig::default());
+        let exit = no_exit();
+        exit.server
+            .reload([("test-net", vec![peer.to_string()].as_slice())]);
+        exit.server
+            .set_on_link(crate::exit_node::parse_on_link_prefixes(
+                "eth0 inet6 2001:db8:1:2::5/64 scope global",
+            ));
+        let lan_neighbour: std::net::Ipv6Addr = "2001:db8:1:2::1".parse().unwrap();
+        assert!(
+            matches!(
+                evaluate_inbound(
+                    &make_packet_to(lan_neighbour),
+                    &fw,
+                    &exit,
+                    &peer,
+                    TEST_V6,
+                    "test-net"
+                ),
+                InboundDecision::DropExit
+            ),
+            "the gateway's /64 is global, so is_transitable cannot refuse it and \
+             is_self_addr does not cover a neighbour"
+        );
+        // And the same gateway still forwards to the actual internet.
+        assert!(matches!(
+            evaluate_inbound(
+                &make_public_packet(),
+                &fw,
+                &exit,
+                &peer,
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::Accept
         ));
     }
 
