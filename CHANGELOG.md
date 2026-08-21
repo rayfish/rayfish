@@ -121,6 +121,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   updating. A reply the CLI does not recognise, which is what a `ray` binary
   and a daemon on different versions produce, exits non-zero for the same
   reason and now names the version skew as the likely cause.
+- **An exit node no longer gives its clients a route onto its own network.** A
+  gateway refused to forward traffic into private IPv4 ranges, loopback and
+  link-local, but an IPv6 LAN is normally a *global* prefix handed out by the
+  ISP, which none of those checks can recognise. A client of the exit node could
+  therefore reach every other machine on the gateway's LAN. The gateway now reads
+  the prefixes it is directly attached to and refuses transit into them, which is
+  what the IPv4 side already had for free.
+- **Security: a peer could get past the inbound firewall with a fragmented IPv6
+  packet.** The packet parser read the protocol and ports at fixed offsets, so
+  any packet carrying an IPv6 extension header (a fragment, hop-by-hop, routing
+  or destination-options header) was recorded as protocol 44 with no ports. That
+  is a single connection-tracking entry matching *every* such packet from that
+  peer, so one ordinary outbound fragment — any UDP send larger than the 1280-byte
+  tunnel MTU — opened a 30-second window in which that peer could reach any local
+  port, whatever the firewall said. Such packets are now refused outright. Traffic
+  that relied on IPv6 fragmentation over the mesh will stop rather than fall
+  through, which is the safe direction; lower your application's datagram size or
+  let TCP handle it.
 - **Taking over `/etc/resolv.conf` no longer breaks DNS on a NetworkManager
   host that runs its own resolver.** With NetworkManager in `dns=dnsmasq` mode,
   the server rayfish found in `resolv.conf` is NetworkManager's own local
@@ -130,6 +148,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to resolve anything outside `.ray`. The check now runs again afterwards: if
   nothing answers any more, rayfish hands the file back and refuses the takeover
   with the reason, which leaves the host with working DNS and no Magic DNS.
+- **macOS: `ray down` no longer leaves the machine pointed at a dead resolver.**
+  Bringing the data plane down removed rayfish's DNS configuration and then
+  immediately wrote part of it back, so the Mac was left with a resolver entry
+  naming an address that stops answering the moment the tunnel interface goes.
+  With an exit node selected it was worse: the entry it restored was the
+  catch-all one, so every name on the machine went to it, not just `.ray`.
+- **macOS: a host that both offers and uses an exit node no longer advertises
+  IPv6 it cannot carry.** Checking for an IPv6 uplink asked the routing table,
+  which by then answered with the machine's own tunnel. It published itself as
+  IPv6-capable on the strength of that, and clients that believed it got a
+  tunnel with nowhere to send their traffic.
 - **Offering an exit node no longer turns the host into an IPv4 router.**
   `ray exit-node allow` enabled IPv4 forwarding and installed an IPv4 NAT rule
   for `100.64.0.0/10` alongside the IPv6 ones. The mesh carries no IPv4, so
