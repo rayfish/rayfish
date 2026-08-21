@@ -270,9 +270,9 @@ const SPLIT_DEFAULT: [(&str, &str); 4] = [
 ///
 /// Only the halves of the families the tunnel actually carries go in
 /// (`ExitFamilies::tunnelled`: what this node's data plane routes, intersected
-/// with what the gateway says it can return). In IPv6-only mode that is `::/1` +
-/// `8000::/1`, since mesh IPv4 carries no traffic on such a host and its egress
-/// stays with whoever owns `100.64.0.0/10` there. Unlike Linux, no hole has to be
+/// with what the gateway says it can return). That is `::/1` + `8000::/1`, or
+/// nothing at all: the overlay carries no IPv4, so IPv4 egress stays with
+/// whoever owns `100.64.0.0/10` here. Unlike Linux, no hole has to be
 /// punched for that VPN's own prefixes: the split default lives in the one routing
 /// table, where its more specific routes already win.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]

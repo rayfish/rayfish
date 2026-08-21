@@ -57,22 +57,17 @@ pub enum ExitFamilies {
     /// The gateway can egress IPv4 only.
     #[serde(rename = "4")]
     V4,
-    /// The gateway can egress IPv6 only: it has an IPv6 uplink, but its own data
-    /// plane is IPv6-only, so it never routed mesh IPv4 in the first place.
-    ///
-    /// The uplink is not what is missing here, the return path is. An IPv6-only
-    /// host assigns its mesh IPv4 as a `/32` with no `100.64.0.0/10` route
-    /// (`tun::create`), so a client's tunnelled IPv4 reaches the gateway and is
-    /// masqueraded out fine, and the reply, un-NATted back to the client's mesh
-    /// `100.x`, finds no route into the TUN and leaves toward a CGNAT address on
-    /// the physical uplink. One-way, and silent from both ends.
+    /// The gateway has an IPv6 uplink to masquerade onto. The only claim a
+    /// gateway makes about itself now that the overlay carries no IPv4: there is
+    /// no second family for it to offer, so "IPv6 only" is the whole of a working
+    /// gateway rather than half of one.
     #[serde(rename = "6")]
     V6,
     /// The gateway can egress both families.
     #[serde(rename = "d")]
     Dual,
-    /// The gateway can egress neither: it is in IPv6-only mode (so its mesh IPv4
-    /// has no return path) and it has no IPv6 uplink to offer instead.
+    /// The gateway can egress neither: it has no IPv6 uplink, and the overlay
+    /// carries no IPv4 for it to offer instead.
     ///
     /// Distinct from [`Self::Unknown`], which is the absence of a claim. This is
     /// a claim, and the claim is "nothing". Every client refuses it.
