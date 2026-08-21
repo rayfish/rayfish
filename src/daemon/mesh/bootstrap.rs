@@ -49,8 +49,8 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     {
         let my_ipv6 = derive_ipv6(&daemon.transport.identity.local_identity());
         let (tun_reader, tun_writer, tun_name) = tun::create(my_ipv6)
-        .await
-        .context("failed to create TUN device")?;
+            .await
+            .context("failed to create TUN device")?;
         daemon.tun_name.store(Arc::new(tun_name));
         daemon.attach_tun(tun_reader, tun_writer).await;
     }
@@ -206,8 +206,6 @@ async fn build_daemon_inner(
 
     // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
     let mut app_config = config::load()?;
-    // IPv6-only mode: the embedder may decide it (its own settings store is the
-    // authority there); otherwise honor config. Resolved once, here, and used
     // On-demand mode: the platform (mobile embedder) may force it; otherwise honor
     // config (on by default). Computed here so it can thread into the registry.
     let on_demand = overrides.on_demand.unwrap_or(app_config.on_demand);

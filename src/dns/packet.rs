@@ -1,7 +1,7 @@
 //! Synthesis of UDP reply packets injected back into the TUN, so the in-daemon
 //! Magic DNS resolver can answer queries addressed to the magic IP without a
-//! host socket. Both families: IPv4 for [`crate::dns::MAGIC_DNS_V4`], IPv6 for
-//! [`crate::dns::MAGIC_DNS_V6`] (the IPv6-only data plane).
+//! host socket. IPv6 only: the resolver is reached at [`crate::dns::MAGIC_DNS_V6`]
+//! and nowhere else, so there is one family to synthesise for.
 
 use std::net::IpAddr;
 use std::net::Ipv6Addr;
@@ -100,10 +100,9 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-    /// The IPv6 twin, used by an IPv6-only data plane. Same swap, and a UDP
-    /// checksum that actually verifies: IPv6 has no header checksum to fall back
-    /// on and makes the UDP one mandatory, so a wrong one is a silent drop by
-    /// the receiving stack rather than a visible error.
+    /// The swap, and a UDP checksum that actually verifies: IPv6 has no header
+    /// checksum to fall back on and makes the UDP one mandatory, so a wrong one is
+    /// a silent drop by the receiving stack rather than a visible error.
     #[test]
     fn build_udp_reply_v6_swaps_and_checksums() {
         let app: Ipv6Addr = "200::5".parse().unwrap();

@@ -56,9 +56,8 @@ object NodeHolder {
     // Standby is now the default: disabling Rayfish drops the data plane (TUN,
     // VPN slot) but keeps the control plane connected, so file send and receive
     // keep working and the device stays visible in the mesh. The motivating case
-    // is running another VPN (Android allows only one VpnService at a time, and
-    // our tunnel claims the same 100.64.0.0/10 range Tailscale uses), so the
-    // tunnel goes away and only the data plane goes with it.
+    // is running another VPN (Android allows only one VpnService at a time), so
+    // the tunnel goes away and only the data plane goes with it.
     //
     // This key is an escape hatch for a user who wants disabling Rayfish to take
     // the device fully offline instead. Default false (standby). This is a NEW

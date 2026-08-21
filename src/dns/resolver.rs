@@ -351,7 +351,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 async fn forward_once(query: &[u8], up: SocketAddr, wait: Duration) -> std::io::Result<Vec<u8>> {
     // Bind the upstream's own family: a `0.0.0.0` socket cannot reach an IPv6
-    // resolver, which is the only kind a full tunnel in IPv6-only mode has.
+    // resolver, which is the only kind a full tunnel can forward to.
     let bind: SocketAddr = match up {
         SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
         SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),

@@ -84,8 +84,8 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
             } else {
                 // Either family. IPv4 entries are merged with the system-captured
                 // upstreams (`config::resolve_upstreams`); IPv6 ones are what an
-                // exit-node full tunnel in IPv6-only mode forwards to, since that
-                // tunnel carries no IPv4 for a v4 resolver to be reached over
+                // exit-node full tunnel forwards to, since that tunnel carries no
+                // IPv4 for a v4 resolver to be reached over
                 // (`exit_node::tunnel_upstreams`).
                 for e in &entries {
                     e.parse::<IpAddr>()

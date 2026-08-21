@@ -462,8 +462,7 @@ pub(crate) async fn attach_rejoined_peers(
         // The roster keys a paired peer by its user identity, while the peer table
         // is keyed on the transport (device) id, so resolve through the same map
         // the prune pass uses before looking the connection up.
-        let Some((ip, conn)) = peers.connected_device_for(&m.identity, device_user_map)
-        else {
+        let Some((ip, conn)) = peers.connected_device_for(&m.identity, device_user_map) else {
             continue;
         };
         if peers.attach_network(&ip, network_name).is_none() {
@@ -500,19 +499,15 @@ pub(crate) async fn apply_roster_to_dns(
         })
         .collect();
     route_map.sync_network(network_name, &routes);
-    // The roster is the source of truth for DNS, including which members have a
-    // usable mesh IPv4: a member running an IPv6-only data plane gets `None`, so
-    // the responder withholds its A record instead of pointing apps at an
-    // address another VPN owns on that host.
+    // The roster is the source of truth for DNS. Every member has exactly one
+    // address and it is derived, not stored, so the entry is a bare `Ipv6Addr`:
+    // there is no A record to hold back and nothing that can be missing.
     let mut entries: Vec<(String, Ipv6Addr)> = members
         .iter()
         .filter_map(|m| {
-            m.hostname.as_ref().map(|h| {
-                (
-                    h.clone(),
-                    derive_ipv6(&m.identity),
-                )
-            })
+            m.hostname
+                .as_ref()
+                .map(|h| (h.clone(), derive_ipv6(&m.identity)))
         })
         .collect();
 

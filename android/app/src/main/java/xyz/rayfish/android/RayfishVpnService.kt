@@ -215,9 +215,11 @@ class RayfishVpnService : VpnService() {
                 return START_STICKY
             }
             ACTION_RESTART_NODE -> {
-                // A start-time setting changed (IPv6-only mode). The daemon reads
-                // those once, when it is built, so the only way to apply one is to
-                // build a new daemon: stop the node and start it again.
+                // A start-time setting changed. The daemon reads those once, when
+                // it is built, so the only way to apply one is to build a new
+                // daemon: stop the node and start it again. No sender today (the
+                // IPv6-only toggle this was built for is gone with the setting);
+                // kept because the next start-time setting will want it.
                 //
                 // The tunnel has to go with it. Its addressing is decided from the
                 // same setting (see startTunnelBlocking), and Node.stop() drops the
@@ -699,8 +701,7 @@ class RayfishVpnService : VpnService() {
 
     // The IPv4 DNS servers of the underlying (non-VPN) network, deduplicated.
     // Enumerating all networks and skipping the VPN transport avoids reading our
-    // own tunnel's DNS (100.100.100.53, or 200::53 in IPv6-only mode) back, which
-    // would loop. IPv6-only resolvers are skipped: the mesh resolver forwards
+    // own tunnel's DNS (200::53) back, which would loop. IPv6-only resolvers are skipped: the mesh resolver forwards
     // over IPv4, on the app's own sockets, which are outside the tunnel.
     private fun systemDnsServers(): List<String> {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return emptyList()
@@ -982,7 +983,7 @@ class RayfishVpnService : VpnService() {
         const val ACTION_EXIT_STANDBY = "xyz.rayfish.android.EXIT_STANDBY"
 
         // Rebuild the node so it picks up a start-time setting the user just
-        // changed (today: IPv6-only mode). Sent from YouScreen.
+        // changed. Nothing sends this today; see the handler.
         const val ACTION_RESTART_NODE = "xyz.rayfish.android.RESTART_NODE"
 
         // Apps that misbehave behind a VPN (casting, RCS, local-device discovery).

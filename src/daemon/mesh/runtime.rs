@@ -112,14 +112,14 @@ impl NetworkRegistry {
         }
         if !member_list.is_member(&self.transport.identity.local_identity()) {
             member_list.add(Member {
-                    identity: self.transport.identity.local_identity(),
-                    is_coordinator: true,
-                    hostname: persisted_hostname.clone(),
-                    user_identity: None,
-                    device_cert: None,
-                    last_seen: None,
-                    exit_node: false,
-                    exit_families: ExitFamilies::Unknown,
+                identity: self.transport.identity.local_identity(),
+                is_coordinator: true,
+                hostname: persisted_hostname.clone(),
+                user_identity: None,
+                device_cert: None,
+                last_seen: None,
+                exit_node: false,
+                exit_families: ExitFamilies::Unknown,
             });
         }
         RestoredRoster {
@@ -264,12 +264,9 @@ impl NetworkRegistry {
                     .all()
                     .into_iter()
                     .filter_map(|m| {
-                        m.hostname.as_ref().map(|h| {
-                            (
-                                h.clone(),
-                                derive_ipv6(&m.identity),
-                            )
-                        })
+                        m.hostname
+                            .as_ref()
+                            .map(|h| (h.clone(), derive_ipv6(&m.identity)))
                     })
                     .collect()
             };
@@ -516,9 +513,7 @@ impl NetworkRegistry {
                 // Only close the shared connection if this was the peer's last
                 // network with us; otherwise just drop this network's route so a
                 // peer we share other networks with stays reachable there.
-                if let Some(conn) =
-                    self.peers.remove_peer_from_network(&ip, network)
-                {
+                if let Some(conn) = self.peers.remove_peer_from_network(&ip, network) {
                     conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
                 }
             }
@@ -867,8 +862,8 @@ impl Daemon {
             self.registry.device_user_map.clone(),
             self.ssh_authz.clone(),
         );
-        // IPv6-only mode carries no mesh IPv4, so binding our v4 would create a
-        // listener nothing can reach.
+        // The overlay carries no IPv4, so there is one address to bind and it is
+        // the derived mesh IPv6.
         let binds = vec![IpAddr::V6(my_v6)];
         server.spawn(binds, token);
         // Turn on the userspace port NAT so mesh `:22` reaches the listener.
@@ -891,10 +886,7 @@ impl Daemon {
     /// bring the data plane up (mark active, configure Magic DNS). On Android the
     /// packet interface + routes are the `VpnService`'s job, so those desktop
     /// route calls are skipped.
-    pub async fn activate(
-        self: &Arc<Self>,
-        hostname: Option<String>,
-    ) -> IpcMessage {
+    pub async fn activate(self: &Arc<Self>, hostname: Option<String>) -> IpcMessage {
         // Persist the personal default hostname first (before the already-active
         // short-circuit) so `ray up --hostname X` records the new default even
         // when the VPN is already up. Used as the fallback for future
@@ -993,11 +985,9 @@ impl Daemon {
             // "22/tcp" still drops it and the failure looks like a dead network
             // rather than a firewall rule. Surface it with the other `ray up`
             // warnings; we only read the ruleset, never edit it.
-            if let Some(w) = crate::hostfw::check_inbound_tcp(
-                &dns_tun_name,
-                crate::ssh::SSH_LISTEN_PORT,
-            )
-            .warning(crate::ssh::SSH_LISTEN_PORT)
+            if let Some(w) =
+                crate::hostfw::check_inbound_tcp(&dns_tun_name, crate::ssh::SSH_LISTEN_PORT)
+                    .warning(crate::ssh::SSH_LISTEN_PORT)
             {
                 tracing::warn!("{w}");
                 warnings.push(w);
@@ -1567,9 +1557,9 @@ async fn nudge_holepunch(router: &ProtocolRouter, conn: &Connection) -> bool {
 /// skipped: the relay servers are excluded separately, by name, before DNS moves
 /// into the tunnel.
 ///
-/// Both families. Which one a peer is reachable over is not ours to pick, and in
-/// IPv6-only mode the tunnel is IPv6, so an IPv6 path is precisely the one that
-/// would otherwise be swallowed by the tunnel it is carrying.
+/// Both families. Which one a peer's *underlay* is reachable over is not ours to
+/// pick, and the tunnel carries IPv6, so an IPv6 underlay path is precisely the one
+/// that would otherwise be swallowed by the tunnel it is carrying.
 #[cfg(target_os = "macos")]
 fn peer_underlay_ips(conn: &Connection) -> Vec<IpAddr> {
     let mut ips = Vec::new();

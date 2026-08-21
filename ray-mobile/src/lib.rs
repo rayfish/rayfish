@@ -322,7 +322,6 @@ impl Node {
     }
 }
 
-
 /// Build an offline status snapshot from the on-disk config, used when the node
 /// is stopped so the UI can still show the user's saved networks. Everything is
 /// reported offline: `running` is false and every peer's state is `Offline`. The
@@ -432,9 +431,7 @@ impl Node {
         // phone never came back online"). Failing is recoverable; wedging is not.
         let state = self
             .runtime
-            .block_on(async {
-                timeout(START_TIMEOUT, build_headless(true)).await
-            })
+            .block_on(async { timeout(START_TIMEOUT, build_headless(true)).await })
             .map_err(|_| {
                 tracing::error!(
                     timeout_secs = START_TIMEOUT.as_secs(),
@@ -697,7 +694,7 @@ impl Node {
 
     /// Send a file to a peer. `path` is a readable file path (the core reads its
     /// bytes and adds them to the blob store); `peer` is any identifier the core
-    /// resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+    /// resolves: a hostname, mesh address, short id, or full endpoint id.
     /// Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
     /// (or auto-accepts if it is one of the sender's own paired devices). Needs
     /// only the control plane ([`Node::start`]), not the tunnel, but the peer must

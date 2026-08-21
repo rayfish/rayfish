@@ -30,9 +30,9 @@ fn display_name(m: &Member) -> String {
 /// Two refusals, both about a gateway that would take our traffic and drop it.
 /// The first is the long-standing one: a peer that does not advertise an exit
 /// node has no allow-list entry for us and would refuse every packet. The second
-/// belongs to IPv6-only mode, whose tunnel carries IPv6 alone: a gateway with no
-/// IPv6 uplink has nothing to masquerade onto, so it would black-hole us in
-/// silence. Both are cheaper to say here than to diagnose from a dead tunnel.
+/// is the family gate: the tunnel carries IPv6 alone, so a gateway with no IPv6
+/// uplink has nothing to masquerade onto and would black-hole us in silence. Both
+/// are cheaper to say here than to diagnose from a dead tunnel.
 fn gateway_refusal(member: Option<&Member>, name: &str, network: &str) -> Option<String> {
     match member {
         None
@@ -54,11 +54,9 @@ fn gateway_refusal(member: Option<&Member>, name: &str, network: &str) -> Option
 /// it is re-checked on every re-apply as well.
 ///
 /// Refuses only when the tunnel would carry *nothing*
-/// ([`ExitFamilies::tunnelled`] is [`ExitFamilies::Neither`]). A gateway that can
-/// return one of the two families is not refused: the tunnel narrows to that
-/// family and the other leaves directly, the same trade IPv6-only mode already
-/// makes with its own data plane. Refusing there would take down a tunnel that
-/// works for the family the user has, to avoid a family it cannot carry anyway.
+/// ([`ExitFamilies::tunnelled`] is [`ExitFamilies::Neither`]). A gateway claiming
+/// IPv4 as well is not refused: the tunnel narrows to IPv6 and the host's IPv4
+/// leaves directly, which is what it did before the tunnel existed.
 ///
 /// [`ExitFamilies::Unknown`] never refuses, because `tunnelled` reads it as "can
 /// carry": it is what a coordinator on a release that predates the field leaves
@@ -293,11 +291,7 @@ impl NetworkRegistry {
     /// plane tunnels IPv6 and nothing else, so a gateway that reaches the internet
     /// over IPv4 alone would receive this node's traffic and have no uplink to
     /// masquerade it onto. Refusing here turns a silent black hole into a sentence.
-    pub(crate) async fn exit_node_use(
-        &self,
-        network: &str,
-        peer: Option<String>,
-    ) -> IpcMessage {
+    pub(crate) async fn exit_node_use(&self, network: &str, peer: Option<String>) -> IpcMessage {
         let mut app_config = match config::load() {
             Ok(c) => c,
             Err(e) => return ipc_err(format!("failed to load config: {e}")),
@@ -320,9 +314,7 @@ impl NetworkRegistry {
                 // gateway's IPv6, which is what a coordinator too old to carry the
                 // claim leaves behind. Say so once, here, rather than let a dead
                 // tunnel be the first news of it.
-                unverified = member
-                    .as_ref()
-                    .is_some_and(ipv6_gateway_unverified);
+                unverified = member.as_ref().is_some_and(ipv6_gateway_unverified);
                 if unverified {
                     tracing::warn!(
                         gateway = %name,
@@ -418,11 +410,12 @@ impl NetworkRegistry {
         let selection = selected.into_iter().find_map(|nc| {
             let id = nc.exit_node_use.as_ref()?.parse::<EndpointId>().ok()?;
             let member = self.roster_member(&nc.name, id)?;
-            // The IPv6 gate cannot live only in `exit_node_use`: a selection made
-            // while dual-stack is still in the config when the mode flips, and
-            // story. Re-checking here is what keeps the flag's promise true after
-            // boot. Only the IPv6 half, though: a peer that momentarily stops
-            // advertising `exit_node` keeps its tunnel, per the note above.
+            // The IPv6 gate cannot live only in `exit_node_use`: a gateway can
+            // republish a narrower claim with nobody touching the selection, and
+            // the selection outlives a restart. Re-checking here is what keeps the
+            // claim's promise true after boot. Only the IPv6 half, though: a peer
+            // that momentarily stops advertising `exit_node` keeps its tunnel, per
+            // the note above.
             if let Some(why) = ipv6_gateway_refusal(
                 &member,
                 member
@@ -586,8 +579,8 @@ impl NetworkRegistry {
     /// it cannot carry our family. Neither touches the config, so `ray exit-node
     /// status` keeps showing what to change. What it must not do is keep printing
     /// `using: <peer>` while the traffic leaves directly: the second case needs no
-    /// user action to arrive (the gateway republishes a claim).
-    /// `100.64.0.0/10`), so the user has no reason to suspect it.
+    /// user action to arrive (the gateway republishes a claim), so the user has no
+    /// reason to suspect it.
     fn exit_selection_problem(&self, network: &str, selected: &str) -> Option<String> {
         let resolved = self
             .exit_client
@@ -1065,9 +1058,9 @@ mod tests {
 
     /// A gateway that can carry nothing is refused by everyone.
     ///
-    /// IPv6-only mode on an ordinary IPv4 uplink is the most common shape of the
-    /// configuration this feature exists for, not a corner: its mesh IPv4 has no
-    /// return path and it has no IPv6 to offer instead. Reporting that as `V4`
+    /// A host on an ordinary IPv4-only uplink is the common shape of this, not a
+    /// corner: the overlay gives it no IPv4 to return traffic over and it has no
+    /// IPv6 to offer instead. Reporting that as `V4`
     /// makes it a positive claim to carry IPv4, which a dual-stack client
     /// accepts, and the tunnel then carries nothing in silence.
     #[test]
@@ -1086,10 +1079,7 @@ mod tests {
         {
             let refusal = super::ipv6_gateway_refusal(&gateway(true, Neither), "gw")
                 .expect("a gateway that carries nothing must be refused");
-            assert!(
-                refusal.contains("cannot carry IPv6"),
-                "{refusal}"
-            );
+            assert!(refusal.contains("cannot carry IPv6"), "{refusal}");
         }
     }
 }

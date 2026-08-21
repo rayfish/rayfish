@@ -97,9 +97,8 @@ impl Daemon {
             .map(|n| n.aliases.clone())
             .unwrap_or_default();
         let ephemeral_ttl_secs = net_cfg.as_ref().and_then(|n| n.ephemeral_ttl_secs);
-        // Resolve a mesh IPv4 back to its `.ray` hostname via the DNS snapshot.
-        // A member running an IPv6-only data plane holds no IPv4 in the table, so
-        // fall back to matching on its derived IPv6.
+        // Resolve a mesh address back to its `.ray` hostname via the DNS snapshot,
+        // matching on the address derived from the member's identity.
         let lookup_hostname = |id: EndpointId| {
             let v6 = derive_ipv6(&id);
             hostname_snapshot.and_then(|table| {
@@ -168,10 +167,7 @@ impl Daemon {
             .iter()
             .filter(|m| m.identity != my_id)
             .map(|m| {
-                let hostname = m
-                    .hostname
-                    .clone()
-                    .or_else(|| lookup_hostname(m.identity));
+                let hostname = m.hostname.clone().or_else(|| lookup_hostname(m.identity));
                 let connection = connected.get(&m.identity).map(Self::gather_conn_info);
                 let user_id = self.registry.device_user_map.resolve(&m.identity);
                 let user_identity = (user_id != m.identity).then_some(user_id);

@@ -105,8 +105,7 @@ pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
         ControlMsg::MemberSync | ControlMsg::BlobUpdated => false,
 
         // A member's statements about itself, and its departure.
-        ControlMsg::ExitNodeOffer { .. }
-        | ControlMsg::LeaveNetwork => false,
+        ControlMsg::ExitNodeOffer { .. } | ControlMsg::LeaveNetwork => false,
 
         // Connection-level: the demux handles these before it ever resolves a
         // per-network handler, so they never reach this decision. Listed rather
@@ -213,7 +212,7 @@ pub(crate) struct CoordinatorAcceptState {
 
 impl CoordinatorAcceptState {
     /// Dispatch one control frame arriving on a mesh connection this coordinator
-    /// accepts. Returns the peer's mesh IPv4 once it is a registered member on this
+    /// accepts. Returns the peer's mesh address once it is a registered member on this
     /// network (so the per-connection demux can announce our handle table to it),
     /// else `None`. Ping/Pong/`NetworkHandles` are connection-level and handled by
     /// the demux before it ever reaches here.
@@ -900,9 +899,7 @@ impl MemberAcceptState {
             // at the IP *this message* chose, writes its `.ray` name, and
             // registers its route. Same gate as `InviteShare`/`KickedFromNetwork`.
             ControlMsg::MemberApproved {
-                identity,
-                hostname,
-                ..
+                identity, hostname, ..
             } => {
                 if !sender_is_coordinator(&self.state, peer_id) {
                     tracing::warn!(peer = %peer_id.fmt_short(), "ignoring MemberApproved from non-coordinator");

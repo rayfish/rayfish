@@ -118,7 +118,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   forty-odd others reported success to whatever ran them. They now exit 1.
   Scripts that only checked the exit status were being told every command
   worked; scripts that deliberately relied on the old behaviour will need
-  updating.
+  updating. A reply the CLI does not recognise, which is what a `ray` binary
+  and a daemon on different versions produce, exits non-zero for the same
+  reason and now names the version skew as the likely cause.
+- **Taking over `/etc/resolv.conf` no longer breaks DNS on a NetworkManager
+  host that runs its own resolver.** With NetworkManager in `dns=dnsmasq` mode,
+  the server rayfish found in `resolv.conf` is NetworkManager's own local
+  forwarder, and telling NetworkManager to stop managing DNS is exactly what
+  stops it. Rayfish checked for a working upstream *before* that, took the file
+  over on the strength of a resolver it then shut down, and left the host unable
+  to resolve anything outside `.ray`. The check now runs again afterwards: if
+  nothing answers any more, rayfish hands the file back and refuses the takeover
+  with the reason, which leaves the host with working DNS and no Magic DNS.
+- **Offering an exit node no longer turns the host into an IPv4 router.**
+  `ray exit-node allow` enabled IPv4 forwarding and installed an IPv4 NAT rule
+  for `100.64.0.0/10` alongside the IPv6 ones. The mesh carries no IPv4, so
+  there was nothing of ours for either to act on. On macOS and FreeBSD the NAT
+  rule matched on the uplink rather than on the rayfish interface, so the only
+  traffic it could still have caught belonged to another VPN sharing the host.
+  Both are gone; teardown still restores the IPv4 forwarding setting, so a host
+  that enabled it under an older release is put back as before.
 - **Re-applying an exit node no longer lets traffic out around the tunnel while
   it rebuilds.** Every `ray exit-node` command, and every roster change that
   reaches a live tunnel, rebuilds the routing rules. The catch-all that sends

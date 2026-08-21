@@ -1,7 +1,8 @@
 //! Network membership management: identity, IP derivation, member/approved lists, and policies.
 //!
-//! Virtual IPs are deterministically derived from [`EndpointId`] via FNV-1a hashing
-//! into the 100.64.0.0/10 CGNAT range (22-bit host space, ~4M addresses).
+//! Mesh addresses are deterministically derived from [`EndpointId`] via blake3
+//! into `200::/7`, so they are never carried on the wire: every node computes
+//! every other node's address itself. See [`derive_ipv6`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -158,8 +159,7 @@ pub struct Member {
     #[serde(default)]
     pub exit_node: bool,
     /// Which families the exit node this member offers can egress, i.e. whether
-    /// that host has an IPv6 default route to masquerade onto, and whether its own
-    /// data plane routes the mesh IPv4 a reply comes back on. Meaningless unless
+    /// that host has an IPv6 default route to masquerade onto. Meaningless unless
     /// `exit_node`.
     ///
     /// Separate from `exit_node` because a client can only use a gateway that
@@ -169,11 +169,12 @@ pub struct Member {
     /// a silent black hole, since nothing else on the roster says which families a
     /// gateway can egress. See [`ExitFamilies`] for why it is three-valued.
     ///
-    /// **Last on purpose.** The wire is positional, and this is the only field
-    /// added to `Member` since the last release, so appending it is what makes an
-    /// older build's shorter array fail on its length rather than mis-slot: read
-    /// mid-struct, its `ipv6_only` would land here and be read as a family claim.
-    /// It errors either way today only because the two happen to differ in type.
+    /// **Last on purpose.** The wire is positional, so a field's declaration order
+    /// *is* the wire format: appending is what makes an older build's shorter array
+    /// fail on its length rather than mis-slot a value into the wrong field. Adding
+    /// one mid-struct would shift every field after it one place left, which errors
+    /// only when the two happen to differ in type and decodes clean and wrong when
+    /// they do not.
     #[serde(default)]
     pub exit_families: ExitFamilies,
 }
@@ -781,22 +782,18 @@ mod tests {
     fn test_approved_list_same_identity_is_idempotent() {
         let id = test_id(1);
         let mut approved = ApprovedList::new();
-        approved
-            .approve(
-                ApprovedEntry {
-                    identity: id,
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                });
-        approved
-            .approve(
-                ApprovedEntry {
-                    identity: id,
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                });
+        approved.approve(ApprovedEntry {
+            identity: id,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        });
+        approved.approve(ApprovedEntry {
+            identity: id,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        });
         assert_eq!(approved.all().len(), 1);
     }
 
@@ -804,14 +801,12 @@ mod tests {
     fn test_approved_list_remove() {
         let id = test_id(1);
         let mut approved = ApprovedList::new();
-        approved
-            .approve(
-                ApprovedEntry {
-                    identity: id,
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                });
+        approved.approve(ApprovedEntry {
+            identity: id,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        });
         let removed = approved.remove(&id);
         assert!(removed.is_some());
         assert!(!approved.is_approved(&id));
@@ -966,14 +961,12 @@ mod tests {
         let members = make_member_list(&[1, 2]);
         let mut approved = ApprovedList::new();
         let id3 = test_id(3);
-        approved
-            .approve(
-                ApprovedEntry {
-                    identity: id3,
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                });
+        approved.approve(ApprovedEntry {
+            identity: id3,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        });
 
         let bytes = canonical_group_bytes(
             &members,
@@ -1055,17 +1048,16 @@ mod tests {
     fn last_seen_survives_blob_roundtrip() {
         let id = test_id(7);
         let mut members = MemberList::new();
-        members
-            .add(Member {
-                identity: id,
-                is_coordinator: false,
-                hostname: None,
-                user_identity: None,
-                device_cert: None,
-                last_seen: Some(12345),
-                exit_node: false,
-                exit_families: ExitFamilies::Unknown,
-            });
+        members.add(Member {
+            identity: id,
+            is_coordinator: false,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            last_seen: Some(12345),
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        });
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
         let bytes = canonical_group_bytes(
@@ -1095,17 +1087,16 @@ mod tests {
         // decode to None with no mass eviction on upgrade.
         let id = test_id(8);
         let mut members = MemberList::new();
-        members
-            .add(Member {
-                identity: id,
-                is_coordinator: false,
-                hostname: None,
-                user_identity: None,
-                device_cert: None,
-                last_seen: None,
-                exit_node: false,
-                exit_families: ExitFamilies::Unknown,
-            });
+        members.add(Member {
+            identity: id,
+            is_coordinator: false,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        });
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
         let bytes = canonical_group_bytes(
@@ -1434,7 +1425,11 @@ mod tests {
     fn a_tunnel_carries_ipv6_or_nothing() {
         use ExitFamilies::{Dual, Neither, Unknown, V4, V6};
 
-        assert_eq!(Dual.tunnelled(), V6, "the IPv4 half has nowhere to come back");
+        assert_eq!(
+            Dual.tunnelled(),
+            V6,
+            "the IPv4 half has nowhere to come back"
+        );
         assert_eq!(V6.tunnelled(), V6);
         assert_eq!(V4.tunnelled(), Neither, "nothing left to install");
         assert_eq!(Neither.tunnelled(), Neither);
@@ -1761,6 +1756,4 @@ mod tests {
         mark_coordinator(&mut list, &id);
         assert!(list.get(&id).unwrap().is_coordinator);
     }
-
-
 }
