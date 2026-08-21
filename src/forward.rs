@@ -769,9 +769,7 @@ pub fn spawn_peer_reader(
             let datagram = datagram.slice(TAG_LEN..);
 
             let peer_user = device_user_map.resolve(&peer_id);
-            match evaluate_inbound(
-                &datagram, &firewall, &exit, &peer_user, peer_ipv6, &network,
-            ) {
+            match evaluate_inbound(&datagram, &firewall, &exit, &peer_user, peer_ipv6, &network) {
                 InboundDecision::Accept => {
                     stats.record_rx(datagram.len());
                     // SSH NAT: a packet to our mesh `:22` is rewritten to the
@@ -927,7 +925,10 @@ mod tests {
         packet[18] = 0;
         packet[19] = 3;
         let info = firewall::parse_packet_info(&packet).unwrap();
-        assert_eq!(info.dst_ip, IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 3)));
+        assert_eq!(
+            info.dst_ip,
+            IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 3))
+        );
         assert_eq!(info.protocol, 6);
     }
 
@@ -1071,25 +1072,11 @@ mod tests {
         let blocked = make_tcp_packet(22);
         let allowed = make_tcp_packet(80);
         assert!(matches!(
-            evaluate_inbound(
-                &blocked,
-                &fw,
-                &no_exit(),
-                &peer,
-                TEST_V6,
-                "test-net"
-            ),
+            evaluate_inbound(&blocked, &fw, &no_exit(), &peer, TEST_V6, "test-net"),
             InboundDecision::DropFirewall(_)
         ));
         assert!(matches!(
-            evaluate_inbound(
-                &allowed,
-                &fw,
-                &no_exit(),
-                &peer,
-                TEST_V6,
-                "test-net"
-            ),
+            evaluate_inbound(&allowed, &fw, &no_exit(), &peer, TEST_V6, "test-net"),
             InboundDecision::Accept
         ));
     }
@@ -1126,7 +1113,6 @@ mod tests {
             InboundDecision::Accept
         ));
     }
-
 
     /// TCP checksum over the IPv6 pseudo-header (RFC 2460 §8.1): src, dst,
     /// the upper-layer length as a 32-bit big-endian, three zero bytes and the
@@ -1355,14 +1341,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    evaluate_inbound(
-                        &make_packet_to(dst),
-                        &fw,
-                        &exit,
-                        &peer,
-                        TEST_V6,
-                        "test-net"
-                    ),
+                    evaluate_inbound(&make_packet_to(dst), &fw, &exit, &peer, TEST_V6, "test-net"),
                     InboundDecision::DropExit
                 ),
                 "exit node transited a packet to {dst:?}, which is not on the internet"

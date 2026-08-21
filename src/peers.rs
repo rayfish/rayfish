@@ -569,11 +569,7 @@ impl PeerTable {
     /// membership doesn't unroute a peer still reachable via `db`. Returns the
     /// peer's connection **iff** this removed its last shared network (so the
     /// caller can close the now-unused connection); `None` otherwise.
-    pub fn remove_peer_from_network(
-        &self,
-        ip: &Ipv6Addr,
-        network: &str,
-    ) -> Option<Connection> {
+    pub fn remove_peer_from_network(&self, ip: &Ipv6Addr, network: &str) -> Option<Connection> {
         let mut last_conn = None;
         let mut dropped_id = None;
         if let Some(mut e) = self.peers.get_mut(ip) {
@@ -1266,10 +1262,7 @@ mod tests {
         assert_eq!(table.lookup_v6(&ipv6).unwrap().network, "aaa");
 
         // Peer agrees on both: unchanged, and stable across lookups.
-        table.set_inbound_handles(
-            &ipv6,
-            &[(1, SmolStr::new("aaa")), (2, SmolStr::new("zzz"))],
-        );
+        table.set_inbound_handles(&ipv6, &[(1, SmolStr::new("aaa")), (2, SmolStr::new("zzz"))]);
         assert_eq!(table.lookup_v6(&ipv6).unwrap().network, "aaa");
     }
 

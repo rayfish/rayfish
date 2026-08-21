@@ -576,7 +576,13 @@ pub(crate) async fn remove_member_roster_only(
         s.members.remove(&member_id);
         s.approved.remove(&member_id);
     }
-    dns::remove_hostname_by_ip(&ctx.hostname_table, &ctx.reverse_table, network, member_ipv6).await;
+    dns::remove_hostname_by_ip(
+        &ctx.hostname_table,
+        &ctx.reverse_table,
+        network,
+        member_ipv6,
+    )
+    .await;
 }
 
 /// Republish the signed blob, broadcast a payload-free `MemberSync`, and send each

@@ -411,8 +411,7 @@ async fn connect_to_roster_peers(
                     },
                 )
                 .await?;
-                register_dialed_peer(ctx, router, conn, member.identity, network_name)
-                    .await;
+                register_dialed_peer(ctx, router, conn, member.identity, network_name).await;
                 tracing::info!(peer_ip = %derive_ipv6(&member.identity), "connected to mesh peer");
             }
             Err(e) => {
@@ -683,10 +682,7 @@ mod persist_config_tests {
         .unwrap();
 
         // Reconnect: re-persist from a blob roster that carries no exit policy.
-        let roster = vec![
-            member(2, false),
-            member(4, true),
-        ];
+        let roster = vec![member(2, false), member(4, true)];
         persist_join_config(
             "homelab",
             &roster,

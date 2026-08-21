@@ -329,7 +329,8 @@ impl MeshConnection {
                 registered = true;
                 // (Re)announce our outbound handle table so the peer can decode
                 // datagrams we tag for this (possibly newly-shared) network.
-                announce_network_handles(&self.ctx.peers, &self.conn, derive_ipv6(&self.peer_id)).await;
+                announce_network_handles(&self.ctx.peers, &self.conn, derive_ipv6(&self.peer_id))
+                    .await;
             }
         }
     }

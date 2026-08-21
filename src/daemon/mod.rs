@@ -1160,10 +1160,7 @@ impl Daemon {
                 self.reconcile_exit_node(resp).await
             }
             IpcMessage::ExitNodeUse { network, peer } => {
-                let resp = self
-                    .registry
-                    .exit_node_use(&network, peer)
-                    .await;
+                let resp = self.registry.exit_node_use(&network, peer).await;
                 self.reconcile_exit_node(resp).await
             }
             IpcMessage::ExitNodeStatus { network } => self.registry.exit_node_status(network),
@@ -1960,13 +1957,9 @@ mod absent_member_tests {
     fn self_excluded_and_reached_are_skipped() {
         let roster = vec![member(1), member(2), member(3), member(4)];
         let reached: HashSet<EndpointId> = [id(3)].into_iter().collect();
-        let got = absent_member_ips(
-            &roster,
-            id(1),
-            Some(derive_ipv6(&id(2))),
-            &reached,
-            |_| false,
-        );
+        let got = absent_member_ips(&roster, id(1), Some(derive_ipv6(&id(2))), &reached, |_| {
+            false
+        });
         assert_eq!(got, vec![derive_ipv6(&id(4))]);
     }
 
@@ -2105,11 +2098,7 @@ mod accept_handler_tests {
         let h = sample_coordinator_handler().await;
         let (state, _) = handler_parts(&h);
         let member = SecretKey::from_bytes(&[9u8; 32]).public();
-        state
-            .write()
-            .unwrap()
-            .members
-            .add(seated(member));
+        state.write().unwrap().members.add(seated(member));
         assert!(h.knows_sender(member));
     }
 
@@ -2122,14 +2111,12 @@ mod accept_handler_tests {
         let peer = SecretKey::from_bytes(&[10u8; 32]).public();
         {
             let mut s = state.write().unwrap();
-            s.approved
-                .approve(
-                    ApprovedEntry {
-                        identity: peer,
-                        hostname: None,
-                        user_identity: None,
-                        device_cert: None,
-                    });
+            s.approved.approve(ApprovedEntry {
+                identity: peer,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+            });
         }
         assert!(h.knows_sender(peer));
     }
@@ -2156,11 +2143,7 @@ mod accept_handler_tests {
         let h = sample_coordinator_handler().await;
         let (state, _) = handler_parts(&h);
         let member = SecretKey::from_bytes(&[13u8; 32]).public();
-        state
-            .write()
-            .unwrap()
-            .members
-            .add(seated(member));
+        state.write().unwrap().members.add(seated(member));
         let stranger = SecretKey::from_bytes(&[14u8; 32]).public();
         assert!(!h.knows_sender(stranger));
     }
@@ -2325,17 +2308,16 @@ mod accept_handler_tests {
             {
                 let mut s = state.write().unwrap();
                 s.network_secret_key = Some(SecretKey::from_bytes(&[1u8; 32]));
-                s.members
-                    .add(Member {
-                        identity: sender,
-                        is_coordinator: false,
-                        hostname: None,
-                        user_identity: None,
-                        device_cert: None,
-                        last_seen: None,
-                        exit_node: false,
-                        exit_families: ExitFamilies::Unknown,
-                    });
+                s.members.add(Member {
+                    identity: sender,
+                    is_coordinator: false,
+                    hostname: None,
+                    user_identity: None,
+                    device_cert: None,
+                    last_seen: None,
+                    exit_node: false,
+                    exit_families: ExitFamilies::Unknown,
+                });
             }
             registry.networks.insert(
                 "test-net".to_string(),
@@ -2435,17 +2417,16 @@ mod accept_handler_tests {
         {
             let mut s = state.write().unwrap();
             s.network_secret_key = Some(SecretKey::from_bytes(&[1u8; 32]));
-            s.members
-                .add(Member {
-                    identity: member_id,
-                    is_coordinator: false,
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                    last_seen: None,
-                    exit_node: false,
-                    exit_families: ExitFamilies::Unknown,
-                });
+            s.members.add(Member {
+                identity: member_id,
+                is_coordinator: false,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+                last_seen: None,
+                exit_node: false,
+                exit_families: ExitFamilies::Unknown,
+            });
         }
         registry.networks.insert(
             "test-net".to_string(),
@@ -2994,13 +2975,11 @@ mod headless_tests {
         // on panic, so this can't poison later tests.
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            build_headless(false),
-        )
-        .await
-        .expect("build_headless should not hang")
-        .expect("build_headless should succeed");
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
 
         // It returns a shared `Arc<DaemonState>`.
         assert!(Arc::strong_count(&daemon) >= 1);
@@ -3023,13 +3002,11 @@ mod headless_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            build_headless(false),
-        )
-        .await
-        .expect("build_headless should not hang")
-        .expect("build_headless should succeed");
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
 
         // No network saved yet: not-found, matching the old live-map check.
         let msg = daemon
@@ -3078,13 +3055,10 @@ mod headless_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let first = tokio::time::timeout(
-            Duration::from_secs(30),
-            build_headless(false),
-        )
-        .await
-        .expect("first build_headless should not hang")
-        .expect("first build_headless should succeed");
+        let first = tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+            .await
+            .expect("first build_headless should not hang")
+            .expect("first build_headless should succeed");
         tokio::time::timeout(Duration::from_secs(30), first.shutdown_and_close())
             .await
             .expect("shutdown_and_close should not hang");
@@ -3110,13 +3084,10 @@ mod headless_tests {
         let _ = reopened.shutdown().await;
 
         // And the whole rebuild works, which is what the app actually does.
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            build_headless(false),
-        )
-        .await
-        .expect("rebuild should not hang")
-        .expect("rebuilding after shutdown_and_close should succeed");
+        tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+            .await
+            .expect("rebuild should not hang")
+            .expect("rebuilding after shutdown_and_close should succeed");
     }
 
     // See `build_headless_returns_usable_state_without_ipc_socket`: `ENV_LOCK`
@@ -3128,13 +3099,11 @@ mod headless_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            build_headless(false),
-        )
-        .await
-        .expect("build_headless should not hang")
-        .expect("build_headless should succeed");
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
 
         // Nothing seen yet: the scan reply is empty and status counts nothing.
         match daemon.list_lan_peers() {
@@ -3237,13 +3206,11 @@ mod headless_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            build_headless(false),
-        )
-        .await
-        .expect("build_headless should not hang")
-        .expect("build_headless should succeed");
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
 
         use std::sync::atomic::Ordering;
 

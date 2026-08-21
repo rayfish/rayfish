@@ -568,13 +568,8 @@ impl NetworkRegistry {
         // this is the one peer the co-coordinator key grant is pinned to.
         let pre_approved_peer = pre_approve.as_ref().map(|(id, _)| *id);
 
-        let mut net_state = self.build_initial_roster(
-            &name,
-            &my_hostname,
-            mode,
-            &net_secret_key,
-            pre_approve,
-        )?;
+        let mut net_state =
+            self.build_initial_roster(&name, &my_hostname, mode, &net_secret_key, pre_approve)?;
 
         dns::update_hostname(
             &self.dns.hostname_table,
@@ -672,19 +667,18 @@ impl NetworkRegistry {
         pre_approve: Option<(EndpointId, Option<String>)>,
     ) -> Result<NetworkState> {
         let mut member_list = MemberList::new();
-        member_list
-            .add(Member {
-                identity: self.transport.identity.local_identity(),
-                is_coordinator: true,
-                hostname: Some(my_hostname.to_string()),
-                user_identity: None,
-                device_cert: None,
-                last_seen: None,
-                exit_node: false,
-                exit_families: ExitFamilies::Unknown,
-                // Our own entry starts out truthful, so the first published blob
-                // already tells peers not to use our mesh IPv4.
-            });
+        member_list.add(Member {
+            identity: self.transport.identity.local_identity(),
+            is_coordinator: true,
+            hostname: Some(my_hostname.to_string()),
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+            // Our own entry starts out truthful, so the first published blob
+            // already tells peers not to use our mesh IPv4.
+        });
 
         let mut approved = ApprovedList::new();
         if let Some((peer_id, peer_hostname)) = pre_approve {

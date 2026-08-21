@@ -15,8 +15,7 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
 
 use crate::{
-    Action, Direction, GroupMode, NetworkKey, NodeKey, Protocol, SuggestedFirewall,
-    TransportMode,
+    Action, Direction, GroupMode, NetworkKey, NodeKey, Protocol, SuggestedFirewall, TransportMode,
 };
 
 #[derive(Debug, Serialize, Deserialize)]

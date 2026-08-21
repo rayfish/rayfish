@@ -27,8 +27,8 @@ use dashmap::DashMap;
 use tokio::sync::RwLock;
 
 use simple_dns::{
-    CLASS, Name, Packet, PacketFlag, QTYPE, RCODE, ResourceRecord, rdata::AAAA,
-    rdata::OPT, rdata::RData, rdata::SOA,
+    CLASS, Name, Packet, PacketFlag, QTYPE, RCODE, ResourceRecord, rdata::AAAA, rdata::OPT,
+    rdata::RData, rdata::SOA,
 };
 
 use crate::DNS_DOMAIN;
@@ -480,27 +480,24 @@ mod tests {
             &table,
             &reverse,
             "net",
-            &[
-                ("alice".to_string(), v6(1)),
-                ("bob".to_string(), v6(2)),
-            ],
+            &[("alice".to_string(), v6(1)), ("bob".to_string(), v6(2))],
         )
         .await;
-        assert_eq!(resolve_name("alice.net.ray", SUFFIX, &table).await, Some(v6(1)));
+        assert_eq!(
+            resolve_name("alice.net.ray", SUFFIX, &table).await,
+            Some(v6(1))
+        );
         assert_eq!(
             reverse.get(&IpAddr::V6(v6(1))).map(|e| e.0.clone()),
             Some("alice".to_string())
         );
 
         // alice renames to dario; bob leaves.
-        sync_network_hostnames(
-            &table,
-            &reverse,
-            "net",
-            &[("dario".to_string(), v6(1))],
-        )
-        .await;
-        assert_eq!(resolve_name("dario.net.ray", SUFFIX, &table).await, Some(v6(1)));
+        sync_network_hostnames(&table, &reverse, "net", &[("dario".to_string(), v6(1))]).await;
+        assert_eq!(
+            resolve_name("dario.net.ray", SUFFIX, &table).await,
+            Some(v6(1))
+        );
         // Old name and departed peer no longer resolve; reverse is rebuilt.
         assert_eq!(resolve_name("alice.net.ray", SUFFIX, &table).await, None);
         assert_eq!(resolve_name("bob.net.ray", SUFFIX, &table).await, None);
@@ -631,13 +628,17 @@ mod tests {
 
         let bytes = handle_query(&query(QTYPE::TYPE(simple_dns::TYPE::A)), &table, &reverse)
             .await
-        .expect("the roster holds the name");
+            .expect("the roster holds the name");
         let resp = Packet::parse(&bytes).expect("parse response");
         assert_eq!(resp.rcode(), RCODE::NoError);
         assert!(resp.answers.is_empty());
 
-        let bytes = handle_query(&query(QTYPE::TYPE(simple_dns::TYPE::AAAA)), &table, &reverse)
-            .await
+        let bytes = handle_query(
+            &query(QTYPE::TYPE(simple_dns::TYPE::AAAA)),
+            &table,
+            &reverse,
+        )
+        .await
         .expect("the roster holds the name");
         let resp = Packet::parse(&bytes).expect("parse response");
         assert_eq!(resp.answers.len(), 1);

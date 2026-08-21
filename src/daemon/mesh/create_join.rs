@@ -555,8 +555,11 @@ impl NetworkRegistry {
                 if m.identity == me {
                     continue;
                 }
-                self.clone()
-                    .spawn_reconnect(m.identity, derive_ipv6(&m.identity), vec![net.clone()]);
+                self.clone().spawn_reconnect(
+                    m.identity,
+                    derive_ipv6(&m.identity),
+                    vec![net.clone()],
+                );
             }
         }
 
@@ -889,8 +892,7 @@ impl NetworkRegistry {
                     crate::spawn_path_logger(peer_conn.clone(), m.identity.fmt_short().to_string());
                     // Register the route, then drive the new connection's control
                     // demux (which owns the data reader) and announce our handles.
-                    let conn_changed =
-                        ctx.register_peer_conn(&peer_conn, m.identity, network_name);
+                    let conn_changed = ctx.register_peer_conn(&peer_conn, m.identity, network_name);
                     if conn_changed {
                         let router = self.protocol_router().clone();
                         let dconn = peer_conn.clone();
@@ -898,7 +900,8 @@ impl NetworkRegistry {
                             async move { router.drive_mesh_connection(dconn, true).await },
                         );
                     }
-                    announce_network_handles(&self.peers, &peer_conn, derive_ipv6(&m.identity)).await;
+                    announce_network_handles(&self.peers, &peer_conn, derive_ipv6(&m.identity))
+                        .await;
                     // Eager-connect reachability: a successful dial marks the peer
                     // reachable so `ray status` shows it active/idle, not offline.
                     self.reachability.note_ok(m.identity);
