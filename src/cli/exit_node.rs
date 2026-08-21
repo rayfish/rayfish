@@ -86,7 +86,15 @@ async fn clear_all_exit_selections() -> Result<()> {
                 print_error("exit-node", &format!("{network}: {message}"), None);
                 failed += 1;
             }
-            other => fail_unexpected(&other),
+            // Counted, not exited, for the same reason as the arm above.
+            other => {
+                print_error(
+                    "exit-node",
+                    &format!("{network}: {}", unexpected_detail(&other)),
+                    None,
+                );
+                failed += 1;
+            }
         }
     }
     anyhow::ensure!(

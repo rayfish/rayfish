@@ -53,10 +53,20 @@ pub(crate) fn fail_with(title: &str, detail: &str) -> ! {
 pub(crate) fn fail_unexpected(reply: &impl std::fmt::Debug) -> ! {
     print_error(
         "unexpected reply from the daemon",
-        &format!("{reply:?}"),
+        &unexpected_detail(reply),
         Some("the CLI and the daemon are probably different versions: sudo ray restart"),
     );
     std::process::exit(1);
+}
+
+/// The same complaint as [`fail_unexpected`] as a string, for the two callers
+/// that must not exit: they sit in loops written to attempt every item, so
+/// ending the process would abandon the rest of the work the user asked for.
+pub(crate) fn unexpected_detail(reply: &impl std::fmt::Debug) -> String {
+    format!(
+        "unexpected reply from the daemon: {reply:?}\n    \
+         the CLI and the daemon are probably different versions"
+    )
 }
 
 /// Map a daemon error message to an actionable hint, best-effort.

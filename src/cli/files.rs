@@ -73,7 +73,8 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
         // file after the first rejected one. The caller prints this with the
         // file's name and still exits non-zero at the end.
         ipc::IpcMessage::Error { message } => anyhow::bail!(message),
-        other => fail_unexpected(&other),
+        // Returned, not exited, for the same reason as the arm above.
+        other => anyhow::bail!(unexpected_detail(&other)),
     }
     Ok(())
 }
