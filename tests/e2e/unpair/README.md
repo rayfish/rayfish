@@ -33,6 +33,6 @@ needs a second device paired into U (add an `srv-d` host).
 
 ## Prerequisites & run
 
-Same as the sibling e2e tests (Scaleway infra via `provision.sh`, `scw`/`jq`,
+Same as the sibling e2e tests (droplets via `provision.sh`, `doctl`/`jq`,
 Docker for the cross build). Provision with `./provision.sh`, then `./run.sh`.
 Reads `.servers`; does not modify infra. Re-runnable.

@@ -37,7 +37,7 @@ private data class Target(
     val nodeId: String,
     val hostname: String,
     val network: String,
-    val ipv4: String,
+    val ipv6: String,
     val state: PeerConnState,
 )
 
@@ -113,7 +113,7 @@ class ShareActivity : ComponentActivity() {
     private fun dispatchSend(uris: List<Uri>, target: Target) {
         val svc = Intent(this, SendService::class.java).apply {
             putExtra(SendService.EXTRA_PEER_ID, target.nodeId)
-            putExtra(SendService.EXTRA_PEER_NAME, target.hostname.ifBlank { target.ipv4 })
+            putExtra(SendService.EXTRA_PEER_NAME, target.hostname.ifBlank { target.ipv6 })
             putParcelableArrayListExtra(SendService.EXTRA_URIS, ArrayList(uris))
             // Grant the service read access to every shared URI via ClipData.
             clipData = ClipData.newUri(contentResolver, "shared", uris.first()).apply {
@@ -167,7 +167,7 @@ class ShareActivity : ComponentActivity() {
                                     Text(t.hostname.ifEmpty { "?" }, fontFamily = Chakra,
                                         fontWeight = FontWeight.SemiBold, fontSize = 14.sp,
                                         color = if (t.state == PeerConnState.OFFLINE) Rf.Muted else Rf.Heading)
-                                    Text("${t.ipv4} · ${t.network}.ray ($note)", fontFamily = PlexMono,
+                                    Text("${t.ipv6} · ${t.network}.ray ($note)", fontFamily = PlexMono,
                                         fontSize = 10.sp, color = Rf.Faint)
                                 }
                             }
@@ -198,12 +198,12 @@ class ShareActivity : ComponentActivity() {
                 if (existing != null && rank(existing.state) <= rank(p.state)) continue
                 byId[p.nodeId] = Target(
                     nodeId = p.nodeId, hostname = p.hostname, network = net.name,
-                    ipv4 = p.ipv4, state = p.state,
+                    ipv6 = p.ipv6, state = p.state,
                 )
             }
         }
         return byId.values.sortedWith(
-            compareBy({ rank(it.state) }, { it.hostname.ifEmpty { it.ipv4 } }),
+            compareBy({ rank(it.state) }, { it.hostname.ifEmpty { it.ipv6 } }),
         )
     }
 

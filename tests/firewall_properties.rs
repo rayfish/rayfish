@@ -51,6 +51,33 @@ proptest! {
         assert_info_eq(&info, &spec.expected())?;
     }
 
+    /// The refusal the round-trip property above is filtered around. An IPv6
+    /// next header naming an extension header means byte 6 is not the
+    /// upper-layer protocol and offset 40 is not the ports, so the parser cannot
+    /// answer and must say so rather than report a protocol of 44 with no ports:
+    /// the conntrack key is built from exactly those fields.
+    #[test]
+    fn ipv6_extension_headers_are_refused(
+        nh in prop::sample::select(&rayfish::firewall::IPV6_EXTENSION_HEADERS[..]),
+        spec in packet_spec(),
+    ) {
+        let mut pkt = spec.encode();
+        // Force the packet to v6 with an extension header in the next-header slot.
+        let mut v6 = vec![0u8; 60];
+        v6[0] = 0x60;
+        v6[4..6].copy_from_slice(&20u16.to_be_bytes());
+        v6[6] = nh;
+        v6[7] = 64;
+        v6[24] = 0x02;
+        prop_assert!(parse_packet_info(&v6).is_none(), "next header {} must not parse", nh);
+        // And the IPv4 packet with the same protocol number is unaffected: these
+        // values are only extension headers in IPv6.
+        if !spec.v6 {
+            pkt[9] = nh;
+            prop_assert!(parse_packet_info(&pkt).is_some());
+        }
+    }
+
     /// The version nibble is the parser's dispatch key: anything other than 4
     /// or 6 has no defined layout and must be rejected outright.
     #[test]

@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.VpnService
+import android.system.OsConstants
 import android.os.Build
 import android.os.ParcelFileDescriptor
 // Drop-in for android.util.Log: still prints to logcat (debug and release) and
@@ -24,7 +25,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
-import uniffi.ray_mobile.Ipv6OnlyMode
 
 /**
  * Foreground [VpnService] that captures the phone's packets and hands the tunnel
@@ -215,9 +215,11 @@ class RayfishVpnService : VpnService() {
                 return START_STICKY
             }
             ACTION_RESTART_NODE -> {
-                // A start-time setting changed (IPv6-only mode). The daemon reads
-                // those once, when it is built, so the only way to apply one is to
-                // build a new daemon: stop the node and start it again.
+                // A start-time setting changed. The daemon reads those once, when
+                // it is built, so the only way to apply one is to build a new
+                // daemon: stop the node and start it again. No sender today (the
+                // IPv6-only toggle this was built for is gone with the setting);
+                // kept because the next start-time setting will want it.
                 //
                 // The tunnel has to go with it. Its addressing is decided from the
                 // same setting (see startTunnelBlocking), and Node.stop() drops the
@@ -332,46 +334,25 @@ class RayfishVpnService : VpnService() {
         }
 
         // The mesh IP is a different matter: the node is up, so a status() that
-        // fails or has no address yet (no networks joined) is not fatal. Fall
-        // back to the CGNAT base below so the tunnel still establishes.
-        val (meshIp, meshV6) = try {
-            runBlocking {
-                val snapshot = NodeHolder.get(applicationContext).status()
-                snapshot.ipv4 to snapshot.ipv6
-            }
+        // fails or has no address yet (no networks joined) is not fatal on its
+        // own; the blank check below is what refuses.
+        val meshV6 = try {
+            runBlocking { NodeHolder.get(applicationContext).status().ipv6 }
         } catch (t: Throwable) {
             Log.e(TAG, "could not read mesh IP before tunnel build", t)
-            "" to ""
+            ""
         }
-        // Fall back to the CGNAT base if we have no networks yet, so the tunnel
-        // still establishes.
-        val tunnelAddr = meshIp.ifBlank { "100.64.0.2" }
-
-        // The tunnel has to be built to match the mode the node was built in:
-        // mesh IPv6 only, with the 100.64.0.0/10 range left to whoever else is
-        // using it. Asked of the node rather than read back out of the pref,
-        // because on Auto the pref does not know the answer: the core decided it
-        // at start from the addresses on this device.
-        val ipv6Only = try {
-            NodeHolder.get(applicationContext).status().ipv6Only != Ipv6OnlyMode.OFF
-        } catch (t: Throwable) {
-            Log.e(TAG, "could not read the node's IPv6-only mode; assuming dual-stack", t)
-            false
-        }
-        if (ipv6Only && meshV6.isBlank()) {
-            // Nothing to carry traffic: the v4 address is a handle only in this
-            // mode, and it is the v6 address the route and the resolver hang off.
-            // Establishing anyway is the "connected VPN that moves no packets"
-            // failure this path exists to avoid.
-            Log.e(TAG, "no mesh IPv6 address; not building an IPv6-only tunnel")
-            handleBringUpFailure("no mesh IPv6 address for an IPv6-only tunnel", startId)
+        if (meshV6.isBlank()) {
+            // Nothing to carry traffic: the mesh address is what the route and
+            // the resolver both hang off. Establishing anyway is the "connected
+            // VPN that moves no packets" failure this path exists to avoid.
+            Log.e(TAG, "no mesh IPv6 address; not building a tunnel")
+            handleBringUpFailure("no mesh IPv6 address for the tunnel", startId)
             return
         }
-        // Where the tunnel's Magic DNS lives. IPv6-only mode moves it to
-        // 200::53, already covered by the 200::/7 route below: the v4 magic
-        // address would sit behind the /10 route this mode does not install, so
-        // .ray would resolve nowhere.
-        val magicDns = if (ipv6Only) "200::53" else "100.100.100.53"
+        // Magic DNS lives at 200::53, already covered by the 200::/7 route below,
+        // so it needs no route of its own.
+        val magicDns = "200::53"
 
         // Point the resolver at the phone's real DNS before the tunnel captures
         // all DNS on the magic address. Without this, non-.ray lookups are
@@ -413,28 +394,23 @@ class RayfishVpnService : VpnService() {
         val pfd = try {
             val builder = Builder()
                 .setSession("Rayfish")
-                // Our mesh IPv4, always assigned. In IPv6-only mode it carries no
-                // traffic, but it stays the node's internal handle (peer table,
-                // roster, status all key on it), so it is bound either way. A
-                // bound address is not a route: without the addRoute below, the
-                // only thing this claims is the address itself, which is the whole
-                // point of the mode (the desktop TUN does the same with a /32).
-                .addAddress(tunnelAddr, 32)
                 .addDnsServer(magicDns)
                 .addSearchDomain("ray")
                 .setMtu(1280)
+                // Our mesh address and the range it lives in (mirrors the desktop
+                // 200::/7 route). The blank check above guarantees we have one.
+                .addAddress(meshV6, 128)
+                .addRoute("200::", 7)
 
-            if (!ipv6Only) {
-                builder.addRoute("100.64.0.0", 10)
-            }
-
-            // Route the mesh IPv6 range through the tunnel (mirrors the desktop
-            // 200::/7 route). Skipped if we have no v6 address to bind, which
-            // IPv6-only mode has already refused to get this far without.
-            if (meshV6.isNotBlank()) {
-                builder.addAddress(meshV6, 128)
-                builder.addRoute("200::", 7)
-            }
+            // **Load-bearing.** VpnService blocks a whole address family outright
+            // when the Builder names no address, route or DNS server of it, and
+            // this tunnel names none for IPv4: the mesh has no IPv4 address, the
+            // 100.64.0.0/10 route is gone, and Magic DNS is 200::53. Without this
+            // line every app on the device loses IPv4 internet the moment the VPN
+            // comes up, while the mesh itself keeps working perfectly, so nothing
+            // in a mesh test would catch it. We route no IPv4; we are not asking
+            // to block it.
+            builder.allowFamily(OsConstants.AF_INET)
             // Exclude Rayfish itself from its own tunnel. Its sockets (the iroh
             // mesh underlay, the DnsResolver.rawQuery proxy) then use the real
             // underlying network directly, so DNS forwarding can't loop back
@@ -725,8 +701,7 @@ class RayfishVpnService : VpnService() {
 
     // The IPv4 DNS servers of the underlying (non-VPN) network, deduplicated.
     // Enumerating all networks and skipping the VPN transport avoids reading our
-    // own tunnel's DNS (100.100.100.53, or 200::53 in IPv6-only mode) back, which
-    // would loop. IPv6-only resolvers are skipped: the mesh resolver forwards
+    // own tunnel's DNS (200::53) back, which would loop. IPv6-only resolvers are skipped: the mesh resolver forwards
     // over IPv4, on the app's own sockets, which are outside the tunnel.
     private fun systemDnsServers(): List<String> {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return emptyList()
@@ -1008,7 +983,7 @@ class RayfishVpnService : VpnService() {
         const val ACTION_EXIT_STANDBY = "xyz.rayfish.android.EXIT_STANDBY"
 
         // Rebuild the node so it picks up a start-time setting the user just
-        // changed (today: IPv6-only mode). Sent from YouScreen.
+        // changed. Nothing sends this today; see the handler.
         const val ACTION_RESTART_NODE = "xyz.rayfish.android.RESTART_NODE"
 
         // Apps that misbehave behind a VPN (casting, RCS, local-device discovery).

@@ -116,8 +116,8 @@ impl MeshConnection {
                 .and_then(|s| {
                     self.ctx
                         .peers
-                        .v4_for_id(&self.peer_id)
-                        .map(|v4| v4 == s.ipv4)
+                        .ipv6_for_id(&self.peer_id)
+                        .map(|v6| v6 == s.ipv6)
                 })
                 .unwrap_or(false);
             let sleep_for = (self.ctx.registry.on_demand
@@ -319,8 +319,8 @@ impl MeshConnection {
             }
             drop(recv); // one message per stream; the reply rides `send`
             // `handle_frame` registers the peer (route) as a side effect and
-            // returns its mesh v4 once it is a member on this network.
-            if let Some(ip) = handler
+            // returns its mesh address once it is a member on this network.
+            if let Some(peer_ip) = handler
                 .handle_frame(&self.conn, send, self.peer_id, frame.msg)
                 .await
             {
@@ -328,8 +328,12 @@ impl MeshConnection {
                 // registered: a later drop must be reported.
                 registered = true;
                 // (Re)announce our outbound handle table so the peer can decode
-                // datagrams we tag for this (possibly newly-shared) network.
-                announce_network_handles(&self.ctx.peers, &self.conn, ip).await;
+                // datagrams we tag for this (possibly newly-shared) network. Look
+                // it up by the address `handle_frame` registered it under, not by
+                // one derived from the transport key: a device whose `MeshHello`
+                // claims a cert-bound identity is keyed on *that* identity's
+                // address, and a recompute would find an empty handle table.
+                announce_network_handles(&self.ctx.peers, &self.conn, peer_ip).await;
             }
         }
     }
@@ -349,23 +353,17 @@ impl MeshConnection {
     }
 
     /// Report this connection's drop to the daemon-wide supervisor. The peer's
-    /// collision-aware v4 comes from its roster entry (falling back to the index-0
-    /// derivation if it was pruned already); `conn_stable_id` lets the supervisor's
-    /// ABA guard ignore this event if the peer has since reconnected.
+    /// mesh address is derived from its identity, so it needs no roster lookup;
+    /// `conn_stable_id` lets the supervisor's ABA guard ignore this event if the
+    /// peer has since reconnected.
     async fn report_disconnect(&self, reason: forward::CloseReason) {
-        let ip = self
-            .ctx
-            .peers
-            .v4_for_id(&self.peer_id)
-            .unwrap_or_else(|| crate::membership::derive_ip(&self.peer_id));
         let ipv6 = crate::membership::derive_ipv6(&self.peer_id);
-        tracing::warn!(peer = %self.peer_id.fmt_short(), ip = %ip, reason = ?reason, "peer connection lost");
+        tracing::warn!(peer = %self.peer_id.fmt_short(), ip = %ipv6, reason = ?reason, "peer connection lost");
         let _ = self
             .ctx
             .disconnect_tx
             .send(forward::DisconnectEvent {
                 endpoint_id: self.peer_id,
-                ip,
                 ipv6,
                 reason,
                 conn_stable_id: Some(self.conn.stable_id()),

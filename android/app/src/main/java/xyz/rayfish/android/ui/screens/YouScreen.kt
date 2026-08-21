@@ -16,7 +16,6 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import uniffi.ray_mobile.Ipv6OnlyMode
 import uniffi.ray_mobile.Status
 import xyz.rayfish.android.NodeHolder
 import xyz.rayfish.android.RayfishVpnService
@@ -75,11 +74,9 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                 }
             }
             val nodeId = status?.nodeId?.takeIf { it.isNotEmpty() }
-            val ip4 = status?.ipv4?.takeIf { it.isNotEmpty() }
             val ip6 = status?.ipv6?.takeIf { it.isNotEmpty() }
             KeyValueRow("Node ID", nodeId?.let { if (it.length > 12) "${it.take(6)}…${it.takeLast(4)}" else it } ?: "-",
                 onClick = nodeId?.let { v -> { copyToClipboard(context, "Node ID", v); onToast("Copied node ID") } })
-            KeyValueRow("IPv4", ip4 ?: "-", onClick = ip4?.let { v -> { copyToClipboard(context, "IPv4", v); onToast("Copied $v") } })
             KeyValueRow("IPv6", ip6 ?: "-", onClick = ip6?.let { v -> { copyToClipboard(context, "IPv6", v); onToast("Copied $v") } })
         }
         SectionCard {
@@ -163,51 +160,6 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
                         },
                     )
                 }
-            },
-        )
-        // Start-time setting: the daemon and the tunnel both fix their addressing
-        // when they are built, so this cannot be applied to the running node. The
-        // service rebuilds it, restoring the VPN afterwards if it was on.
-        var ipv6Mode by remember { mutableStateOf(NodeHolder.ipv6OnlyMode(context)) }
-        SegmentedCard(
-            title = "IPv6-only mode",
-            // On auto the running node is the only thing that knows the answer,
-            // so the subtitle reports what it resolved to rather than repeating
-            // the setting back at the user.
-            subtitle = when (ipv6Mode) {
-                Ipv6OnlyMode.AUTO -> if (status?.ipv6Only != Ipv6OnlyMode.OFF) {
-                    "auto · on, something here already uses 100.64.x.x · reconnects"
-                } else {
-                    "auto · off, nothing else is using 100.64.x.x · reconnects"
-                }
-                Ipv6OnlyMode.ON -> "on · mesh IPv6 only, leaving 100.64.x.x alone · reconnects"
-                Ipv6OnlyMode.OFF -> "off · will not start where 100.64.x.x is taken · reconnects"
-            },
-            options = listOf(
-                Ipv6OnlyMode.AUTO to "Auto",
-                Ipv6OnlyMode.ON to "On",
-                Ipv6OnlyMode.OFF to "Off",
-            ),
-            selected = ipv6Mode,
-            onSelect = { mode ->
-                ipv6Mode = mode
-                NodeHolder.setIpv6OnlyMode(context, mode)
-                // startForegroundService, not startService: the rebuild can land
-                // with no tunnel established (the user had the VPN off), and a
-                // background start of a service that then calls startForeground is
-                // only allowed with the exemption a visible Activity carries.
-                ContextCompat.startForegroundService(
-                    context,
-                    Intent(context, RayfishVpnService::class.java).apply {
-                        action = RayfishVpnService.ACTION_RESTART_NODE
-                    },
-                )
-                val what = when (mode) {
-                    Ipv6OnlyMode.AUTO -> "automatic"
-                    Ipv6OnlyMode.ON -> "on"
-                    Ipv6OnlyMode.OFF -> "off"
-                }
-                onToast("IPv6-only mode $what, reconnecting")
             },
         )
         var autoAcceptOwn by remember { mutableStateOf(NodeHolder.isAutoAcceptOwnDevices(context)) }

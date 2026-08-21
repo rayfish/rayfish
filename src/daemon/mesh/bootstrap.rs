@@ -15,7 +15,6 @@ use iroh_blobs::provider::events::{
 };
 
 use super::super::*;
-use crate::config::Ipv6Only;
 
 /// How often the blob store sweeps untagged blobs. This is reclaim latency, not
 /// correctness: a finished transfer's bytes linger at most this long after its
@@ -24,22 +23,6 @@ use crate::config::Ipv6Only;
 const BLOB_GC_INTERVAL: Duration = Duration::from_secs(600);
 
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
-    // Settle the data plane's address families before touching anything else: on
-    // a host that shares `100.64.0.0/10` with another VPN this either switches us
-    // to IPv6-only or refuses to start, and both have to happen before the TUN
-    // exists. Read straight from disk; `build_daemon` loads the config again, but
-    // moving the scan after it would give up the early bail.
-    #[cfg(not(target_os = "android"))]
-    let overrides = {
-        let setting = crate::config::load()
-            .map(|c| c.ipv6_only)
-            .unwrap_or_default();
-        Overrides {
-            ipv6_only: Some(super::resolve_ipv6_only(setting).await?),
-            ..Overrides::default()
-        }
-    };
-    #[cfg(target_os = "android")]
     let overrides = Overrides::default();
 
     // Repair a leftover `/etc/resolv.conf` before anything reads it. A hard kill
@@ -65,13 +48,9 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     #[cfg(not(target_os = "android"))]
     {
         let my_ipv6 = derive_ipv6(&daemon.transport.identity.local_identity());
-        let (tun_reader, tun_writer, tun_name) = tun::create(
-            daemon.transport.identity.local_ip(),
-            my_ipv6,
-            daemon.ipv6_only.enabled(),
-        )
-        .await
-        .context("failed to create TUN device")?;
+        let (tun_reader, tun_writer, tun_name) = tun::create(my_ipv6)
+            .await
+            .context("failed to create TUN device")?;
         daemon.tun_name.store(Arc::new(tun_name));
         daemon.attach_tun(tun_reader, tun_writer).await;
     }
@@ -83,7 +62,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     daemon.registry.connect_all_networks().await;
     tokio::spawn(Arc::clone(&daemon.registry).run_restore_supervisor());
     daemon.spawn_exit_reapply_listener();
-    daemon.activate(None, None).await;
+    daemon.activate(None).await;
 
     // Opt-in automatic updates: a single daemon-wide task that periodically
     // checks for a newer stable release and swaps + restarts onto it. Desktop-only
@@ -145,11 +124,6 @@ fn initial_alpns(_app_config: &config::AppConfig) -> Vec<Vec<u8>> {
 struct Overrides {
     /// Force on-demand mode (mobile always forces it on; desktop honors config).
     on_demand: Option<bool>,
-    /// The resolved data-plane mode, already decided: [`Ipv6Only::Auto`] here
-    /// means the scan turned the mode on, not that anything is left to decide.
-    /// Start-time like the config setting it replaces, since the TUN's
-    /// addressing is fixed when the interface is created.
-    ipv6_only: Option<Ipv6Only>,
 }
 
 /// Construct a headless [`Daemon`] for an embedder (used by `ray-mobile`
@@ -157,36 +131,11 @@ struct Overrides {
 /// the OS TUN device and the Unix-socket IPC server: the caller supplies a
 /// packet interface via [`Daemon::attach_tun`]. The returned daemon is on
 /// standby (no data plane), with its saved networks' control plane connected.
-///
-/// `ipv6_only` is a decided mode, not a setting: this entry point never scans
-/// the host, so a caller that has already made the choice (and every test that
-/// builds a daemon) gets exactly the mode it asked for. Embedders holding the
-/// tri-state setting want [`build_headless_with_setting`] instead.
-pub async fn build_headless(on_demand: bool, ipv6_only: Ipv6Only) -> Result<Arc<Daemon>> {
-    build_headless_inner(on_demand, ipv6_only).await
-}
-
-/// [`build_headless`] from the tri-state setting, matching the desktop config
-/// key: [`Ipv6Only::On`] and [`Ipv6Only::Off`] are choices the user made in the
-/// app's own settings store, [`Ipv6Only::Auto`] is resolved here against the
-/// addresses on the device, the same way `run_daemon` resolves the config's.
-///
-/// Errors when the caller said [`Ipv6Only::Off`] on a device where mesh IPv4
-/// cannot work, which is what that setting asks for.
-pub async fn build_headless_with_setting(
-    on_demand: bool,
-    ipv6_only: Ipv6Only,
-) -> Result<Arc<Daemon>> {
-    let mode = super::resolve_ipv6_only(ipv6_only).await?;
-    build_headless_inner(on_demand, mode).await
-}
-
-async fn build_headless_inner(on_demand: bool, ipv6_only: Ipv6Only) -> Result<Arc<Daemon>> {
+pub async fn build_headless(on_demand: bool) -> Result<Arc<Daemon>> {
     let token = CancellationToken::new();
     let stats = Arc::new(ForwardMetrics::default());
     let overrides = Overrides {
         on_demand: Some(on_demand),
-        ipv6_only: Some(ipv6_only),
     };
     let daemon = build_daemon(token, stats, overrides).await?;
     // Bring the saved networks' control plane up, matching `run_daemon`.
@@ -249,33 +198,14 @@ async fn build_daemon_inner(
     if let Some(ref cert) = device_cert {
         tracing::info!(user = %cert.user_identity.fmt_short(), "loaded device certificate");
     }
-    let collision_index = identity::load_collision_index()?;
-    let identity = IrohIdentityProvider::new(public_key, collision_index);
-    let my_ip = identity.local_ip();
-    // Register our mesh addresses for the userspace SSH port NAT (mesh `:22`
+    let identity = IrohIdentityProvider::new(public_key);
+    let my_ip = identity.local_ipv6();
+    // Register our mesh address for the userspace SSH port NAT (mesh `:22`
     // <-> the embedded server's listen port). Stays inactive until `ssh on`.
-    forward::init_ssh_nat(
-        my_ip,
-        derive_ipv6(&identity.local_identity()),
-        crate::forward::SSH_LISTEN_PORT,
-    );
+    forward::init_ssh_nat(my_ip, crate::forward::SSH_LISTEN_PORT);
 
     // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
     let mut app_config = config::load()?;
-    // IPv6-only mode: the embedder may decide it (its own settings store is the
-    // authority there); otherwise honor config. Resolved once, here, and used
-    // everywhere below in place of the config field, so every consumer of the
-    // mode agrees with the one the data plane actually runs in.
-    // An absent config value means "auto", which only `run_daemon` can resolve
-    // (it needs the interface scan), so it always passes an override; anything
-    // reaching here without one falls back to dual-stack.
-    let ipv6_only = overrides.ipv6_only.unwrap_or(Ipv6Only::Off);
-    // Tell the forwarding core whether mesh IPv4 carries traffic on this node.
-    // Before any packet moves: the data plane is attached further down.
-    forward::set_ipv6_only(ipv6_only.enabled());
-    // Same for the DNS backends, which pick the magic resolver address from it.
-    // Before `activate` runs detection.
-    crate::dns::config::set_ipv6_only(ipv6_only.enabled());
     // On-demand mode: the platform (mobile embedder) may force it; otherwise honor
     // config (on by default). Computed here so it can thread into the registry.
     let on_demand = overrides.on_demand.unwrap_or(app_config.on_demand);
@@ -530,9 +460,6 @@ async fn build_daemon_inner(
         hostname_table.clone(),
         reverse_table.clone(),
     ));
-    // Withhold A records when mesh IPv4 is not routed on this node; without
-    // this, apps here would resolve peers to addresses owned by another VPN.
-    dns_resolver.set_ipv6_only(ipv6_only.enabled());
     // Built here (not in the struct literal) so NetworkRegistry can share it for
     // the leave/teardown DNS cleanup.
     let dns = Arc::new(DnsService::new(
@@ -593,7 +520,6 @@ async fn build_daemon_inner(
         disconnect_tx.clone(),
         on_demand,
         app_config.idle_timeout(),
-        ipv6_only.enabled(),
     ));
     // FileService owns file transfer + pairing. It evaluates own-device auto-accept
     // directly (no worker channel) and clears a re-paired device's nullifier by
@@ -730,7 +656,6 @@ async fn build_daemon_inner(
         dns,
         mdns_enabled,
         auto_update,
-        ipv6_only,
         tun_name,
         tun_tasks: Mutex::new(None),
         exit_reconcile: AsyncMutex::new(()),

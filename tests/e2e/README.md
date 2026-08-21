@@ -6,8 +6,8 @@ shared SSH/deploy/reset/assert plumbing lives in [`../lib/`](../lib) and is sour
 every scenario.
 
 A host is anything that answers `ssh root@<ip>`, so there are two backends: real
-Scaleway instances (the default) and local Docker containers (`E2E_BACKEND=docker`).
-See [Backends](#backends).
+DigitalOcean droplets (the default) and local Docker containers
+(`E2E_BACKEND=docker`). See [Backends](#backends).
 
 ## Scenarios
 
@@ -47,14 +47,27 @@ under [`../bench/`](../bench) (same shared `tests/lib/`).
 
 ## Backends
 
-`E2E_BACKEND` selects one; the `.servers` zone column records which backend wrote a
-fleet, and each backend refuses to touch the other's.
+`E2E_BACKEND` selects one; the `.servers` region column records which backend wrote
+a fleet, and each backend refuses to touch the other's.
 
-### `scaleway` (default)
+### `digitalocean` (default)
 
-Real instances, one fleet per scenario. Also needs `scw` authenticated
-(`scw account project list` should work) and your public key registered in the
-Scaleway account.
+Real droplets, one fleet per scenario. Needs `doctl` authenticated (`doctl auth
+init`, then `doctl account get` should work) and at least one SSH key on the
+account.
+
+Droplets are created with `--enable-ipv6`, which matters more than it looks:
+the overlay is IPv6-only and `exit-node/run.sh` **skips** its egress assertions
+on a host with no v6 internet, so a fleet without IPv6 makes that suite pass
+without testing the tunnel. IPv6 is settable only at create time, so a fleet
+provisioned without it is easier to destroy and recreate than to fix. Provision
+warns when a droplet comes up without a v6 address.
+
+Unlike some providers, DigitalOcean injects **no** SSH key unless `--ssh-keys`
+names one, so the provisioner passes every key on the account by default
+(`DO_SSH_KEYS` overrides with a comma-separated list of ids or fingerprints).
+That matches what the harness needs: `just scp` runs bare `rsync`/`ssh` with no
+`-i`, so the hosts have to accept ssh's default identity.
 
 ### `docker`
 
@@ -73,7 +86,7 @@ after deploying, so a redeployed-but-not-reactivated daemon comes back in standb
 every data-plane check fails; containers are cheap enough to just rebuild.
 `E2E_DOCKER_REUSE=1` keeps a live fleet if you want to poke at it.
 
-**Scaleway-only scenarios.** `exit-node`, `reliability` and `bench` exit early under
+**Cloud-only scenarios.** `exit-node`, `reliability` and `bench` exit early under
 this backend. All the containers share the host's public IP, and `exit-node` asserts
 the opposite by design ("srv-a and srv-b already share a public IP: the egress
 assertion would be meaningless"); `reliability` and `bench` measure the rayfish path
@@ -82,9 +95,12 @@ against a direct-public-IP baseline that on one host is the same bridge.
 **What a green docker run does not cover:**
 
 - No NAT between peers, so no hole punching and no relay fallback anywhere.
-- The nodes take the direct `/etc/resolv.conf` DNS path; Scaleway's `ubuntu_jammy`
-  runs systemd-resolved and takes the D-Bus path. The conditional takeover block in
-  `dns/run.sh` is skipped on Scaleway and exercised here — complementary, not equal.
+- The bridge is a `fd00:e2e::/64` ULA with no v6 egress, so anything that probes
+  the IPv6 internet has nothing to reach.
+- The nodes take the direct `/etc/resolv.conf` DNS path; DigitalOcean's
+  `ubuntu-22-04-x64` runs systemd-resolved and takes the D-Bus path. The conditional
+  takeover block in `dns/run.sh` is skipped on droplets and exercised here:
+  complementary, not equal.
 - `dns/run.sh`'s "no host `:53` bind" check has no positive control in a container
   with no `:53` listener at all, so it passes for free.
 - mDNS is off on the nodes (one bridge means every node hears every other one, which
@@ -94,10 +110,11 @@ against a direct-public-IP baseline that on one host is the same bridge.
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `E2E_BACKEND` | `scaleway` | `scaleway` or `docker` |
-| `ZONE` | `fr-par-1` | Scaleway zone (provision) |
-| `TYPE` | `DEV1-S` | instance type (provision) |
-| `IMAGE` | `ubuntu_jammy` | instance image label (provision) |
+| `E2E_BACKEND` | `digitalocean` | `digitalocean` or `docker` |
+| `REGION` | `fra1` | droplet region (provision) |
+| `SIZE` | `s-1vcpu-1gb` | droplet size slug (provision) |
+| `IMAGE` | `ubuntu-22-04-x64` | droplet image slug (provision) |
+| `DO_SSH_KEYS` | every key on the account | comma-separated key ids/fingerprints (provision) |
 | `SSH_KEY` | `~/.ssh/id_ed25519` | private key for `root@<ip>` |
 | `KEEP_STATE` | `0` | `1` skips the per-run rayfish state wipe |
 | `E2E_DOCKER_REUSE` | `0` | `1` keeps a live container fleet instead of recreating it |

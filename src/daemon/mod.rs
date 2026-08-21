@@ -40,7 +40,7 @@ use bytes::Bytes;
 use iroh_metrics::service::MetricsServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -105,11 +105,7 @@ pub(crate) use mesh::*;
 // `run_daemon` (the `ray daemon` entry point) stays public for the binary.
 pub use mesh::run_daemon;
 // `build_headless` is the embedder (mobile) construction entry point.
-pub use mesh::{build_headless, build_headless_with_setting};
-// The IPv6-only decision, resolved from a tri-state setting plus a scan of this
-// host. Public because the embedder (mobile) holds its own copy of the setting.
-use crate::config::Ipv6Only;
-pub use mesh::resolve_ipv6_only;
+pub use mesh::build_headless;
 
 /// Legacy name for [`Daemon`], kept so embedders (`ray-mobile`) that were
 /// written against `DaemonState` compile unchanged after the daemon refactor.
@@ -212,7 +208,6 @@ impl MeshCtx {
             exit: crate::exit_node::ExitContext {
                 server: self.registry.exit_server.clone(),
                 client: self.registry.exit_client.clone(),
-                my_v4: self.identity.local_ip(),
                 my_v6: derive_ipv6(&self.identity.local_identity()),
             },
         }
@@ -229,15 +224,14 @@ impl MeshCtx {
         &self,
         conn: &Connection,
         peer_id: EndpointId,
-        ip: Ipv4Addr,
         network: &str,
     ) -> bool {
         let ipv6 = derive_ipv6(&peer_id);
         // Keep the roster route map current with every peer we connect to, so a
         // later idle teardown can re-dial it on demand (reconverge covers the
         // roster-wide sync + removals; this is the incremental add).
-        self.route_map.sync_add(network, ip, ipv6, peer_id);
-        self.peers.add(ip, ipv6, conn.clone(), peer_id, network)
+        self.route_map.sync_add(network, ipv6, peer_id);
+        self.peers.add(ipv6, conn.clone(), peer_id, network)
     }
 }
 
@@ -249,7 +243,7 @@ impl MeshCtx {
 pub(crate) async fn announce_network_handles(
     peers: &PeerTable,
     conn: &Connection,
-    peer_ip: Ipv4Addr,
+    peer_ip: Ipv6Addr,
 ) {
     let entries: Vec<control::NetworkHandle> = peers
         .outbound_handles(&peer_ip)
@@ -288,7 +282,6 @@ pub(crate) fn to_member_entries<'a>(
         .into_iter()
         .map(|m| config::MemberEntry {
             identity: m.identity,
-            ip: m.ip,
             is_coordinator: m.is_coordinator,
             hostname: m.hostname.clone(),
         })
@@ -303,7 +296,6 @@ pub(crate) fn to_approved_entries<'a>(
         .into_iter()
         .map(|a| config::ApprovedConfigEntry {
             identity: a.identity,
-            ip: a.ip,
             hostname: a.hostname.clone(),
         })
         .collect()
@@ -461,7 +453,6 @@ pub struct NetworkHandle {
     name: String,
     network_key: EndpointId,
     role: NetworkRole,
-    my_ip: Ipv4Addr,
     state: SharedNetworkState,
     /// DHT republish trigger; `Some` only on the coordinator (the sole publisher).
     /// Lets `set_hostname` re-publish the group blob on a coordinator self-rename.
@@ -532,17 +523,6 @@ pub struct Daemon {
     /// startup; when set, `run_daemon` spawns the periodic update task. Echoed
     /// back in `ray status`.
     auto_update: bool,
-    /// The resolved data-plane mode (`ray config set ipv6-only on`), for
-    /// sharing a host with another VPN that owns `100.64.0.0/10`. Resolved once
-    /// at startup because the TUN's addressing is decided there; `ray up
-    /// --ipv6-only` persists the setting and asks for a restart rather than
-    /// pretending to apply it live.
-    ///
-    /// [`Ipv6Only::Auto`] here is not "undecided": it is the mode, on, with the
-    /// startup scan having chosen it rather than the operator, which `ray
-    /// status` reports so a mode nobody asked for still explains itself. Ask
-    /// [`Ipv6Only::enabled`] whether mesh IPv4 carries traffic.
-    pub(crate) ipv6_only: Ipv6Only,
     /// Name of the OS TUN device (desktop) or a placeholder until a packet
     /// interface is attached. Interior-mutable because on embedders (mobile) the
     /// interface is attached after construction via [`Daemon::attach_tun`],
@@ -978,7 +958,6 @@ impl Daemon {
                 | GlobalKey::DnsUpstreams
                 | GlobalKey::AutoUpdate
                 | GlobalKey::OnDemand
-                | GlobalKey::Ipv6Only
                 | GlobalKey::DownloadDir
                 | GlobalKey::DownloadUser),
             ) => k,
@@ -1117,10 +1096,7 @@ impl Daemon {
             IpcMessage::Kick { network, peer } => self.registry.kick_member(&network, &peer).await,
             IpcMessage::Status => self.status(),
             IpcMessage::Report => self.build_report(peer_cred),
-            IpcMessage::Up {
-                hostname,
-                ipv6_only,
-            } => self.activate(hostname, ipv6_only).await,
+            IpcMessage::Up { hostname } => self.activate(hostname).await,
             IpcMessage::Down => self.deactivate().await,
             IpcMessage::Shutdown => {
                 self.shutdown_token.cancel();
@@ -1184,10 +1160,7 @@ impl Daemon {
                 self.reconcile_exit_node(resp).await
             }
             IpcMessage::ExitNodeUse { network, peer } => {
-                let resp = self
-                    .registry
-                    .exit_node_use(&network, peer, self.ipv6_only.enabled())
-                    .await;
+                let resp = self.registry.exit_node_use(&network, peer).await;
                 self.reconcile_exit_node(resp).await
             }
             IpcMessage::ExitNodeStatus { network } => self.registry.exit_node_status(network),
@@ -1290,9 +1263,8 @@ impl Daemon {
             return ipc_err("invalid hostname (lowercase ASCII, 1-63 chars)".to_string());
         }
 
-        let (my_ip, is_coord, state, dht_notify) = match self.registry.networks.get(network) {
+        let (is_coord, state, dht_notify) = match self.registry.networks.get(network) {
             Some(h) => (
-                h.my_ip,
                 h.role.is_coordinator(),
                 h.state.clone(),
                 h.dht_notify.clone(),
@@ -1327,7 +1299,7 @@ impl Daemon {
             &self.dns.hostname_table,
             &self.dns.reverse_table,
             network,
-            my_ip,
+            derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
         dns::update_hostname(
@@ -1335,7 +1307,6 @@ impl Daemon {
             &self.dns.reverse_table,
             network,
             &new_hostname,
-            (!self.ipv6_only.enabled()).then_some(my_ip),
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
@@ -1361,7 +1332,7 @@ impl Daemon {
         // `BlobUpdated` trigger, and coordinators don't run the group poller. So
         // without this, a co-coordinator's rename never reached its peer
         // coordinators (roster + `.ray` DNS both stayed stale on them).
-        self.announce_rename_to_peers(network, my_identity, my_ip, &new_hostname)
+        self.announce_rename_to_peers(network, my_identity, &new_hostname)
             .await;
         if is_coord {
             // Authoritative: republish the signed blob so members reconverge from
@@ -1390,7 +1361,6 @@ impl Daemon {
         &self,
         network: &str,
         my_identity: EndpointId,
-        my_ip: Ipv4Addr,
         new_hostname: &str,
     ) {
         let peers = self.registry.peers.peers_for_network_with_conn(network);
@@ -1406,7 +1376,6 @@ impl Daemon {
             if let Ok((mut send, _recv)) = conn.open_bi().await {
                 let msg = ControlMsg::MeshHello {
                     identity: my_identity,
-                    ip: my_ip,
                     hostname: Some(new_hostname.to_string()),
                     device_cert: self.current_device_cert(),
                 };
@@ -1463,15 +1432,6 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
             format!("download-user cleared. {restart}")
         }
         GlobalKey::DownloadUser => format!("download-user set. {restart}"),
-        // Worth saying what it resolved to rather than echoing the key: `auto`
-        // is not a mode, it is a decision the next start makes.
-        GlobalKey::Ipv6Only => match cfg.ipv6_only {
-            Ipv6Only::On => format!("IPv6-only mode on. {restart}"),
-            Ipv6Only::Off => format!("IPv6-only mode off. {restart}"),
-            Ipv6Only::Auto => format!(
-                "IPv6-only mode automatic: on when another VPN holds 100.64.0.0/10. {restart}"
-            ),
-        },
         // Spelled out rather than caught by `_`, so a new global key cannot
         // inherit this generic wording (and its "Restart the daemon" claim) by
         // default. `Ssh` never reaches here (`config_apply` routes it to
@@ -1808,7 +1768,7 @@ async fn broadcast_member_sync(
     registry: &Arc<NetworkRegistry>,
     net_pubkey: EndpointId,
     network_name: &str,
-    exclude_ip: Option<Ipv4Addr>,
+    exclude_ip: Option<Ipv6Addr>,
 ) {
     let mut reached: HashSet<EndpointId> = HashSet::new();
     for (id, ip, conn) in registry.peers.peers_for_network_with_conn(network_name) {
@@ -1830,16 +1790,17 @@ async fn broadcast_member_sync(
 fn absent_member_ips(
     roster: &[Member],
     my_id: EndpointId,
-    exclude_ip: Option<Ipv4Addr>,
+    exclude_ip: Option<Ipv6Addr>,
     reached: &HashSet<EndpointId>,
     is_offline: impl Fn(&EndpointId) -> bool,
-) -> Vec<Ipv4Addr> {
+) -> Vec<Ipv6Addr> {
     roster
         .iter()
-        .filter(|m| m.identity != my_id && !reached.contains(&m.identity))
-        .filter(|m| Some(m.ip) != exclude_ip)
-        .filter(|m| !is_offline(&m.identity))
-        .map(|m| m.ip)
+        .map(|m| (m, derive_ipv6(&m.identity)))
+        .filter(|(m, _)| m.identity != my_id && !reached.contains(&m.identity))
+        .filter(|(_, v6)| Some(*v6) != exclude_ip)
+        .filter(|(m, _)| !is_offline(&m.identity))
+        .map(|(_, v6)| v6)
         .collect()
 }
 
@@ -1852,7 +1813,7 @@ fn spawn_absent_member_sync(
     registry: &Arc<NetworkRegistry>,
     net_pubkey: EndpointId,
     network_name: &str,
-    exclude_ip: Option<Ipv4Addr>,
+    exclude_ip: Option<Ipv6Addr>,
     reached: HashSet<EndpointId>,
 ) {
     let my_id = registry.transport.identity.local_identity();
@@ -1866,7 +1827,7 @@ fn spawn_absent_member_sync(
         |id| registry.reachability.is_offline(id, ABSENT_DIAL_COOLDOWN),
     )
     .into_iter()
-    .filter_map(|ip| registry.resolve_route(IpAddr::V4(ip)))
+    .filter_map(|ip| registry.resolve_route(IpAddr::V6(ip)))
     .collect();
     if absent.is_empty() {
         return;
@@ -1883,11 +1844,11 @@ fn spawn_absent_member_sync(
             if !registry.dial_target(&target).await {
                 continue;
             }
-            let Some(conn) = registry.peers.conn_for_ip(&target.ipv4) else {
+            let Some(conn) = registry.peers.conn_for_ip(&target.ipv6) else {
                 continue;
             };
             if let Err(e) = open_and_send(&conn, Some(net_pubkey), &ControlMsg::MemberSync).await {
-                tracing::debug!(peer_ip = %target.ipv4, error = %e, "failed to sync dialed member");
+                tracing::debug!(peer_ip = %target.ipv6, error = %e, "failed to sync dialed member");
             }
         }
     });
@@ -1965,19 +1926,16 @@ mod absent_member_tests {
         SecretKey::from(b).public()
     }
 
-    fn member(seed: u8, last: u8) -> Member {
+    fn member(seed: u8) -> Member {
         Member {
             identity: id(seed),
-            ip: Ipv4Addr::new(100, 64, 0, last),
             is_coordinator: false,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         }
     }
 
@@ -1986,10 +1944,10 @@ mod absent_member_tests {
     /// links while staying reachable.
     #[test]
     fn unconnected_member_is_a_dial_candidate() {
-        let roster = vec![member(1, 1), member(2, 2)];
+        let roster = vec![member(1), member(2)];
         let reached: HashSet<EndpointId> = [id(1)].into_iter().collect();
         let got = absent_member_ips(&roster, id(9), None, &reached, |_| false);
-        assert_eq!(got, vec![Ipv4Addr::new(100, 64, 0, 2)]);
+        assert_eq!(got, vec![derive_ipv6(&id(2))]);
     }
 
     /// Self, the excluded peer, and anyone already reached over a live
@@ -1997,16 +1955,12 @@ mod absent_member_tests {
     /// the peer the caller deliberately skipped, the third already got it.
     #[test]
     fn self_excluded_and_reached_are_skipped() {
-        let roster = vec![member(1, 1), member(2, 2), member(3, 3), member(4, 4)];
+        let roster = vec![member(1), member(2), member(3), member(4)];
         let reached: HashSet<EndpointId> = [id(3)].into_iter().collect();
-        let got = absent_member_ips(
-            &roster,
-            id(1),
-            Some(Ipv4Addr::new(100, 64, 0, 2)),
-            &reached,
-            |_| false,
-        );
-        assert_eq!(got, vec![Ipv4Addr::new(100, 64, 0, 4)]);
+        let got = absent_member_ips(&roster, id(1), Some(derive_ipv6(&id(2))), &reached, |_| {
+            false
+        });
+        assert_eq!(got, vec![derive_ipv6(&id(4))]);
     }
 
     /// A member whose last dial failed recently is offline for real, not
@@ -2014,10 +1968,10 @@ mod absent_member_tests {
     /// edit and teach us nothing.
     #[test]
     fn known_offline_member_is_not_redialed() {
-        let roster = vec![member(1, 1), member(2, 2)];
+        let roster = vec![member(1), member(2)];
         let offline = id(1);
         let got = absent_member_ips(&roster, id(9), None, &HashSet::new(), |i| *i == offline);
-        assert_eq!(got, vec![Ipv4Addr::new(100, 64, 0, 2)]);
+        assert_eq!(got, vec![derive_ipv6(&id(2))]);
     }
 }
 
@@ -2065,7 +2019,7 @@ mod accept_handler_tests {
         let state = make_network_state();
         let mut s = state.write().unwrap();
         let member_id = SecretKey::from_bytes(&[9u8; 32]).public();
-        s.members = MemberList::from_members(vec![seated(member_id, 1)]);
+        s.members = MemberList::from_members(vec![seated(member_id)]);
         s.refresh_snapshot();
 
         // The mismatch this exists for needs no version skew: `network_name` is
@@ -2125,19 +2079,16 @@ mod accept_handler_tests {
         }
     }
 
-    fn seated(id: EndpointId, ip: u8) -> Member {
+    fn seated(id: EndpointId) -> Member {
         Member {
             identity: id,
-            ip: Ipv4Addr::new(100, 64, 0, ip),
             is_coordinator: false,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         }
     }
 
@@ -2147,12 +2098,7 @@ mod accept_handler_tests {
         let h = sample_coordinator_handler().await;
         let (state, _) = handler_parts(&h);
         let member = SecretKey::from_bytes(&[9u8; 32]).public();
-        state
-            .write()
-            .unwrap()
-            .members
-            .add(seated(member, 2))
-            .unwrap();
+        state.write().unwrap().members.add(seated(member));
         assert!(h.knows_sender(member));
     }
 
@@ -2165,20 +2111,12 @@ mod accept_handler_tests {
         let peer = SecretKey::from_bytes(&[10u8; 32]).public();
         {
             let mut s = state.write().unwrap();
-            let members = s.members.clone();
-            s.approved
-                .approve(
-                    ApprovedEntry {
-                        identity: peer,
-                        ip: Ipv4Addr::new(100, 64, 0, 3),
-                        hostname: None,
-                        user_identity: None,
-                        device_cert: None,
-                        collision_index: 0,
-                    },
-                    &members,
-                )
-                .unwrap();
+            s.approved.approve(ApprovedEntry {
+                identity: peer,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+            });
         }
         assert!(h.knows_sender(peer));
     }
@@ -2192,7 +2130,7 @@ mod accept_handler_tests {
         let (state, ctx) = handler_parts(&h);
         let user = SecretKey::from_bytes(&[11u8; 32]).public();
         let device = SecretKey::from_bytes(&[12u8; 32]).public();
-        state.write().unwrap().members.add(seated(user, 4)).unwrap();
+        state.write().unwrap().members.add(seated(user));
         // Unmapped, the device key is a stranger.
         assert!(!h.knows_sender(device));
         ctx.device_user_map.insert(device, user);
@@ -2205,12 +2143,7 @@ mod accept_handler_tests {
         let h = sample_coordinator_handler().await;
         let (state, _) = handler_parts(&h);
         let member = SecretKey::from_bytes(&[13u8; 32]).public();
-        state
-            .write()
-            .unwrap()
-            .members
-            .add(seated(member, 5))
-            .unwrap();
+        state.write().unwrap().members.add(seated(member));
         let stranger = SecretKey::from_bytes(&[14u8; 32]).public();
         assert!(!h.knows_sender(stranger));
     }
@@ -2248,12 +2181,12 @@ mod accept_handler_tests {
         let my_id = my_key.public();
         let registry = sample_registry(
             sample_test_endpoint().await,
-            IrohIdentityProvider::new(my_id, 0),
+            IrohIdentityProvider::new(my_id),
             blob_store.clone(),
             my_id,
         );
         AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store, registry),
+            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id), blob_store, registry),
             network_name: "test-net".to_string(),
             state: make_network_state(),
             dht_notify: None,
@@ -2309,7 +2242,6 @@ mod accept_handler_tests {
             disconnect_tx,
             false,
             Duration::from_secs(config::DEFAULT_IDLE_TIMEOUT_SECS),
-            false,
         ))
     }
 
@@ -2321,13 +2253,13 @@ mod accept_handler_tests {
         let endpoint = sample_test_endpoint().await;
         let registry = sample_registry(
             endpoint.clone(),
-            IrohIdentityProvider::new(my_id, 0),
+            IrohIdentityProvider::new(my_id),
             blob_store.clone(),
             my_id,
         );
         AcceptHandler::Member(Arc::new(MemberAcceptState {
             ctx: sample_mesh_ctx(
-                IrohIdentityProvider::new(my_id, 0),
+                IrohIdentityProvider::new(my_id),
                 blob_store.clone(),
                 registry.clone(),
             ),
@@ -2362,7 +2294,7 @@ mod accept_handler_tests {
         // roles: it once reached only the Member dispatch, so a plain
         // coordinator (the one node that can record the offer on the signed
         // roster) silently discarded it and no exit node was ever advertised.
-        use crate::membership::{ExitFamilies, Member, derive_ip};
+        use crate::membership::{ExitFamilies, Member};
         for handler in [
             sample_coordinator_handler().await,
             sample_member_handler().await,
@@ -2376,21 +2308,16 @@ mod accept_handler_tests {
             {
                 let mut s = state.write().unwrap();
                 s.network_secret_key = Some(SecretKey::from_bytes(&[1u8; 32]));
-                s.members
-                    .add(Member {
-                        identity: sender,
-                        ip: derive_ip(&sender),
-                        is_coordinator: false,
-                        hostname: None,
-                        user_identity: None,
-                        device_cert: None,
-                        collision_index: 0,
-                        last_seen: None,
-                        exit_node: false,
-                        exit_families: ExitFamilies::Unknown,
-                        ipv6_only: false,
-                    })
-                    .unwrap();
+                s.members.add(Member {
+                    identity: sender,
+                    is_coordinator: false,
+                    hostname: None,
+                    user_identity: None,
+                    device_cert: None,
+                    last_seen: None,
+                    exit_node: false,
+                    exit_families: ExitFamilies::Unknown,
+                });
             }
             registry.networks.insert(
                 "test-net".to_string(),
@@ -2398,7 +2325,6 @@ mod accept_handler_tests {
                     name: "test-net".to_string(),
                     network_key: state.read().unwrap().network_public_key,
                     role: NetworkRole::Coordinator,
-                    my_ip: Ipv4Addr::new(100, 64, 0, 1),
                     state: state.clone(),
                     dht_notify: None,
                     cancel: CancellationToken::new(),
@@ -2451,7 +2377,7 @@ mod accept_handler_tests {
         // recording path and flip the member's roster `exit_node` flag. Before the
         // fix the coordinator's accept handler dropped the frame on its catch-all,
         // so nothing was recorded and no exit node was ever advertised.
-        use crate::membership::{ExitFamilies, Member, derive_ip};
+        use crate::membership::{ExitFamilies, Member};
         use iroh::endpoint::presets;
         use iroh::{Endpoint, RelayMode, SecretKey};
 
@@ -2482,7 +2408,7 @@ mod accept_handler_tests {
         let blob_store = FsStore::load(tmp.path()).await.unwrap();
         let registry = sample_registry(
             coord_ep.clone(),
-            IrohIdentityProvider::new(coord_id, 0),
+            IrohIdentityProvider::new(coord_id),
             blob_store.clone(),
             coord_id,
         );
@@ -2491,21 +2417,16 @@ mod accept_handler_tests {
         {
             let mut s = state.write().unwrap();
             s.network_secret_key = Some(SecretKey::from_bytes(&[1u8; 32]));
-            s.members
-                .add(Member {
-                    identity: member_id,
-                    ip: derive_ip(&member_id),
-                    is_coordinator: false,
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                    collision_index: 0,
-                    last_seen: None,
-                    exit_node: false,
-                    exit_families: ExitFamilies::Unknown,
-                    ipv6_only: false,
-                })
-                .unwrap();
+            s.members.add(Member {
+                identity: member_id,
+                is_coordinator: false,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+                last_seen: None,
+                exit_node: false,
+                exit_families: ExitFamilies::Unknown,
+            });
         }
         registry.networks.insert(
             "test-net".to_string(),
@@ -2513,7 +2434,6 @@ mod accept_handler_tests {
                 name: "test-net".to_string(),
                 network_key: net_pubkey,
                 role: NetworkRole::Coordinator,
-                my_ip: Ipv4Addr::new(100, 64, 0, 1),
                 state: state.clone(),
                 dht_notify: None,
                 cancel: CancellationToken::new(),
@@ -2527,7 +2447,7 @@ mod accept_handler_tests {
         let connmgr = Arc::new(ConnectionManager::new());
         connmgr.set_mesh_dispatch(MeshDispatch {
             ctx: sample_mesh_ctx(
-                IrohIdentityProvider::new(coord_id, 0),
+                IrohIdentityProvider::new(coord_id),
                 blob_store.clone(),
                 registry.clone(),
             ),
@@ -2538,7 +2458,7 @@ mod accept_handler_tests {
             net_pubkey,
             AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
                 ctx: sample_mesh_ctx(
-                    IrohIdentityProvider::new(coord_id, 0),
+                    IrohIdentityProvider::new(coord_id),
                     blob_store.clone(),
                     registry.clone(),
                 ),
@@ -2613,7 +2533,7 @@ mod accept_handler_tests {
         // ConnectionManager owns); the earlier bug dialed a throwaway connection
         // and dropped it, so the frame never flushed and the coordinator's
         // roster never changed even though the sender logged "delivered".
-        use crate::membership::{ExitFamilies, Member, derive_ip, derive_ipv6};
+        use crate::membership::{ExitFamilies, Member, derive_ipv6};
         use iroh::endpoint::presets;
         use iroh::{Endpoint, RelayMode, SecretKey};
 
@@ -2623,7 +2543,6 @@ mod accept_handler_tests {
 
         let coord_key = SecretKey::from_bytes(&[7u8; 32]);
         let coord_id = coord_key.public();
-        let coord_ip = derive_ip(&coord_id);
         let coord_ep = Endpoint::builder(presets::N0)
             .secret_key(coord_key)
             .alpns(vec![alpn.clone()])
@@ -2633,7 +2552,6 @@ mod accept_handler_tests {
             .unwrap();
         let member_key = SecretKey::from_bytes(&[8u8; 32]);
         let member_id = member_key.public();
-        let member_ip = derive_ip(&member_id);
         let member_ep = Endpoint::builder(presets::N0)
             .secret_key(member_key)
             .alpns(vec![alpn.clone()])
@@ -2647,29 +2565,23 @@ mod accept_handler_tests {
             vec![
                 Member {
                     identity: coord_id,
-                    ip: coord_ip,
                     is_coordinator: true,
                     hostname: None,
                     user_identity: None,
                     device_cert: None,
-                    collision_index: 0,
                     last_seen: None,
                     exit_node: false,
                     exit_families: ExitFamilies::Unknown,
-                    ipv6_only: false,
                 },
                 Member {
                     identity: member_id,
-                    ip: member_ip,
                     is_coordinator: false,
                     hostname: None,
                     user_identity: None,
                     device_cert: None,
-                    collision_index: 0,
                     last_seen: None,
                     exit_node: false,
                     exit_families: ExitFamilies::Unknown,
-                    ipv6_only: false,
                 },
             ]
         };
@@ -2679,7 +2591,7 @@ mod accept_handler_tests {
         let coord_blobs = FsStore::load(coord_tmp.path()).await.unwrap();
         let coord_reg = sample_registry(
             coord_ep.clone(),
-            IrohIdentityProvider::new(coord_id, 0),
+            IrohIdentityProvider::new(coord_id),
             coord_blobs.clone(),
             coord_id,
         );
@@ -2695,7 +2607,6 @@ mod accept_handler_tests {
                 name: "test-net".to_string(),
                 network_key: net_pubkey,
                 role: NetworkRole::Coordinator,
-                my_ip: coord_ip,
                 state: coord_state.clone(),
                 dht_notify: None,
                 cancel: CancellationToken::new(),
@@ -2706,7 +2617,7 @@ mod accept_handler_tests {
         let connmgr = Arc::new(ConnectionManager::new());
         connmgr.set_mesh_dispatch(MeshDispatch {
             ctx: sample_mesh_ctx(
-                IrohIdentityProvider::new(coord_id, 0),
+                IrohIdentityProvider::new(coord_id),
                 coord_blobs.clone(),
                 coord_reg.clone(),
             ),
@@ -2717,7 +2628,7 @@ mod accept_handler_tests {
             net_pubkey,
             AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
                 ctx: sample_mesh_ctx(
-                    IrohIdentityProvider::new(coord_id, 0),
+                    IrohIdentityProvider::new(coord_id),
                     coord_blobs.clone(),
                     coord_reg.clone(),
                 ),
@@ -2746,7 +2657,7 @@ mod accept_handler_tests {
         let member_blobs = FsStore::load(member_tmp.path()).await.unwrap();
         let member_reg = sample_registry(
             member_ep.clone(),
-            IrohIdentityProvider::new(member_id, 0),
+            IrohIdentityProvider::new(member_id),
             member_blobs.clone(),
             member_id,
         );
@@ -2762,7 +2673,6 @@ mod accept_handler_tests {
                 name: "test-net".to_string(),
                 network_key: net_pubkey,
                 role: NetworkRole::Member,
-                my_ip: member_ip,
                 state: member_state.clone(),
                 dht_notify: None,
                 cancel: CancellationToken::new(),
@@ -2785,7 +2695,6 @@ mod accept_handler_tests {
             .await
             .expect("member dials coordinator");
         member_reg.peers.add(
-            coord_ip,
             derive_ipv6(&coord_id),
             member_conn.clone(),
             coord_id,
@@ -2875,7 +2784,7 @@ mod accept_handler_tests {
 #[cfg(test)]
 mod coordinator_dial_order_tests {
     use super::*;
-    use crate::membership::{ExitFamilies, Member, derive_ip};
+    use crate::membership::{ExitFamilies, Member};
 
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
@@ -2889,16 +2798,13 @@ mod coordinator_dial_order_tests {
         let (a, b, c, me) = (test_id(1), test_id(2), test_id(3), test_id(9));
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         };
         let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
         // minter = b: b first, then the other coordinator a, never c (not coord), never me.
@@ -2910,16 +2816,13 @@ mod coordinator_dial_order_tests {
         let (a, b, me) = (test_id(1), test_id(2), test_id(9));
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         };
 
         // No coordinators in the roster ⇒ empty order (caller bails).
@@ -2973,16 +2876,13 @@ mod coordinator_dial_order_tests {
         let (a, b, c) = (test_id(1), test_id(2), test_id(3));
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         };
         let members = vec![mk(a, true), mk(b, false), mk(c, true)];
         let me = a;
@@ -2995,16 +2895,13 @@ mod coordinator_dial_order_tests {
         let me = test_id(1);
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         };
         // Only members are us (coordinator) and a plain member: nobody to gossip to.
         let members = vec![mk(me, true), mk(test_id(2), false)];
@@ -3078,13 +2975,11 @@ mod headless_tests {
         // on panic, so this can't poison later tests.
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            build_headless(false, Ipv6Only::Off),
-        )
-        .await
-        .expect("build_headless should not hang")
-        .expect("build_headless should succeed");
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
 
         // It returns a shared `Arc<DaemonState>`.
         assert!(Arc::strong_count(&daemon) >= 1);
@@ -3107,13 +3002,11 @@ mod headless_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            build_headless(false, Ipv6Only::Off),
-        )
-        .await
-        .expect("build_headless should not hang")
-        .expect("build_headless should succeed");
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
 
         // No network saved yet: not-found, matching the old live-map check.
         let msg = daemon
@@ -3162,13 +3055,10 @@ mod headless_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let first = tokio::time::timeout(
-            Duration::from_secs(30),
-            build_headless(false, Ipv6Only::Off),
-        )
-        .await
-        .expect("first build_headless should not hang")
-        .expect("first build_headless should succeed");
+        let first = tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+            .await
+            .expect("first build_headless should not hang")
+            .expect("first build_headless should succeed");
         tokio::time::timeout(Duration::from_secs(30), first.shutdown_and_close())
             .await
             .expect("shutdown_and_close should not hang");
@@ -3194,13 +3084,10 @@ mod headless_tests {
         let _ = reopened.shutdown().await;
 
         // And the whole rebuild works, which is what the app actually does.
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            build_headless(false, Ipv6Only::Off),
-        )
-        .await
-        .expect("rebuild should not hang")
-        .expect("rebuilding after shutdown_and_close should succeed");
+        tokio::time::timeout(Duration::from_secs(30), build_headless(false))
+            .await
+            .expect("rebuild should not hang")
+            .expect("rebuilding after shutdown_and_close should succeed");
     }
 
     // See `build_headless_returns_usable_state_without_ipc_socket`: `ENV_LOCK`
@@ -3212,13 +3099,11 @@ mod headless_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            build_headless(false, Ipv6Only::Off),
-        )
-        .await
-        .expect("build_headless should not hang")
-        .expect("build_headless should succeed");
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
 
         // Nothing seen yet: the scan reply is empty and status counts nothing.
         match daemon.list_lan_peers() {
@@ -3321,13 +3206,11 @@ mod headless_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
 
-        let daemon = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            build_headless(false, Ipv6Only::Off),
-        )
-        .await
-        .expect("build_headless should not hang")
-        .expect("build_headless should succeed");
+        let daemon =
+            tokio::time::timeout(std::time::Duration::from_secs(30), build_headless(false))
+                .await
+                .expect("build_headless should not hang")
+                .expect("build_headless should succeed");
 
         use std::sync::atomic::Ordering;
 

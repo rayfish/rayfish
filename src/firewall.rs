@@ -650,11 +650,33 @@ fn parse_ipv4(packet: &[u8]) -> Option<PacketInfo> {
     })
 }
 
+/// IPv6 next-header values that are *extension* headers rather than the
+/// upper-layer protocol: hop-by-hop, routing, fragment, authentication,
+/// destination options, mobility, HIP and shim6.
+///
+/// [`parse_ipv6`] reads the upper-layer protocol straight out of the next-header
+/// field and the ports at a fixed offset 40, so for any of these it reads the
+/// wrong protocol and no ports at all. That is not a cosmetic misparse: the
+/// conntrack `Flow` is keyed on `(proto, local_port, peer_port)`, so a fragmented
+/// TCP packet becomes `(44, 0, 0)` — a *wildcard* entry matching every fragmented
+/// packet from that peer, whatever reassembles inside it. One outbound fragment
+/// (any UDP send past the 1280 MTU) would then hold a 30-second hole through
+/// which that peer could reach any local port, which is the inbound default-deny
+/// gone.
+pub const IPV6_EXTENSION_HEADERS: [u8; 8] = [0, 43, 44, 51, 60, 135, 139, 140];
+
 fn parse_ipv6(packet: &[u8]) -> Option<PacketInfo> {
     if packet.len() < 40 {
         return None;
     }
     let protocol = packet[6]; // Next Header
+    // Fail closed. Walking the chain to the real protocol is the complete fix;
+    // until then the honest answer is that we cannot classify this packet, and
+    // `evaluate_inbound` turns `None` into `DropMalformed`. A refused fragment is
+    // a visible, diagnosable failure; a mis-keyed conntrack entry is not.
+    if IPV6_EXTENSION_HEADERS.contains(&protocol) {
+        return None;
+    }
     let mut src_octets = [0u8; 16];
     let mut dst_octets = [0u8; 16];
     src_octets.copy_from_slice(&packet[8..24]);
@@ -1021,6 +1043,67 @@ mod tests {
     fn parse_not_ip() {
         let pkt = vec![0x30; 40]; // version nibble 3
         assert!(parse_packet_info(&pkt).is_none());
+    }
+
+    /// An extension header is refused rather than read as the upper-layer
+    /// protocol. The reason is the conntrack key, not the parse: see
+    /// [`IPV6_EXTENSION_HEADERS`].
+    #[test]
+    fn an_ipv6_extension_header_is_not_read_as_a_protocol() {
+        for nh in IPV6_EXTENSION_HEADERS {
+            let mut pkt = vec![0u8; 60];
+            pkt[0] = 0x60;
+            pkt[6] = nh;
+            pkt[24] = 0x02;
+            assert!(
+                parse_packet_info(&pkt).is_none(),
+                "next header {nh} is an extension header, so byte 6 is not the protocol \
+                 and offset 40 is not the ports"
+            );
+        }
+        // The upper-layer protocols beside them still parse.
+        for nh in [6u8, 17, 58] {
+            let mut pkt = vec![0u8; 60];
+            pkt[0] = 0x60;
+            pkt[6] = nh;
+            pkt[24] = 0x02;
+            assert_eq!(parse_packet_info(&pkt).map(|i| i.protocol), Some(nh));
+        }
+    }
+
+    /// The bypass itself, end to end: one outbound fragment must not open a hole
+    /// that inbound traffic can walk through. Before the extension-header refusal
+    /// both packets parsed as `(proto 44, ports 0/0)`, which is the same `Flow`,
+    /// so `track_outbound` whitelisted every fragment the peer cared to send.
+    #[test]
+    fn an_outbound_fragment_does_not_whitelist_inbound_traffic() {
+        let fw = SharedFirewall::new(FirewallConfig::default());
+        let peer = test_id(1);
+        let frag = |src: [u8; 16], dst: [u8; 16]| {
+            let mut pkt = vec![0u8; 60];
+            pkt[0] = 0x60;
+            pkt[6] = 44; // Fragment header
+            pkt[8..24].copy_from_slice(&src);
+            pkt[24..40].copy_from_slice(&dst);
+            pkt
+        };
+        let mut us = [0u8; 16];
+        us[0] = 0x02;
+        us[15] = 1;
+        let mut them = [0u8; 16];
+        them[0] = 0x02;
+        them[15] = 2;
+
+        // Outbound: an ordinary large UDP send past the 1280 MTU looks like this.
+        let out = parse_packet_info(&frag(us, them));
+        assert!(out.is_none(), "an unclassifiable packet opens no flow");
+
+        // Inbound from the same peer: must not be rescued by conntrack.
+        let inbound = parse_packet_info(&frag(them, us));
+        assert!(inbound.is_none(), "and none is waiting to rescue this one");
+
+        // The default inbound policy is what such a packet now meets instead.
+        assert_eq!(fw.evaluate(Direction::In, 6, 22, &peer), Action::Deny);
     }
 
     #[test]

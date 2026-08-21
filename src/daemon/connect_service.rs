@@ -103,24 +103,25 @@ impl ConnectService {
     /// to look up. Otherwise the argument is a contact id and resolves through
     /// pkarr as before. Contact ids and transport endpoint ids are distinct
     /// keys, so the two cases cannot collide.
-    async fn resolve_connect_target(&self, arg: &str) -> Result<EndpointId, IpcMessage> {
+    ///
+    /// The error is the message, not a whole `IpcMessage`: every failure here is
+    /// an `ipc_err`, and the one caller is what turns it into a reply.
+    async fn resolve_connect_target(&self, arg: &str) -> Result<EndpointId, String> {
         let me = self.transport.endpoint.id();
         if let Some(peer) = self.transport.lan_peers.resolve(arg, me) {
             return Ok(peer);
         }
         let contact_pubkey = arg
             .parse::<EndpointId>()
-            .map_err(|e| ipc_err(format!("invalid contact id: {e}")))?;
+            .map_err(|e| format!("invalid contact id: {e}"))?;
         if contact_pubkey == self.transport.contact_public {
-            return Err(ipc_err("cannot connect to your own contact id".to_string()));
+            return Err("cannot connect to your own contact id".to_string());
         }
         let pkarr = dht::create_pkarr_client(&self.transport.endpoint)
-            .map_err(|e| ipc_err(format!("failed to create pkarr client: {e}")))?;
+            .map_err(|e| format!("failed to create pkarr client: {e}"))?;
         dht::resolve_contact(&pkarr, contact_pubkey)
             .await
-            .map_err(|_| {
-                ipc_err("contact offline or unknown (could not resolve contact id)".to_string())
-            })
+            .map_err(|_| "contact offline or unknown (could not resolve contact id)".to_string())
     }
 
     /// Approve a pending `ray connect` request by contact-id prefix: mint a
@@ -214,7 +215,7 @@ impl ConnectService {
     ) -> IpcMessage {
         let peer = match self.resolve_connect_target(contact_id).await {
             Ok(peer) => peer,
-            Err(e) => return e,
+            Err(message) => return ipc_err(message),
         };
         if let Some(name) = self.registry.existing_direct_network_with(&peer) {
             return IpcMessage::Ok {

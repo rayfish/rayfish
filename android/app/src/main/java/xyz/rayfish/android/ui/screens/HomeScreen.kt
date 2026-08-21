@@ -19,7 +19,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.ray_mobile.FileOffer
-import uniffi.ray_mobile.Ipv6OnlyMode
 import uniffi.ray_mobile.PendingRequest
 import uniffi.ray_mobile.QueuedSend
 import uniffi.ray_mobile.Status
@@ -207,14 +206,12 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
         StatusEyebrow(connected = vpnOn && !starting, text = banner)
         ToggleCard(
             title = "Tunnel",
-            subtitle = if (vpnOn) "running · this device ${status?.ipv4.orEmpty()}" else "stopped",
+            subtitle = if (vpnOn) "running · this device ${status?.ipv6.orEmpty()}" else "stopped",
             checked = vpnOn, onCheckedChange = { toggle(it) },
         )
         SectionCard {
             SectionLabel("This device")
-            val ip4 = status?.ipv4?.takeIf { it.isNotEmpty() }
             val ip6 = status?.ipv6?.takeIf { it.isNotEmpty() }
-            KeyValueRow("IPv4", ip4 ?: "-", onClick = ip4?.let { v -> { copyToClipboard(context, "IPv4", v); onToast("Copied $v") } })
             KeyValueRow("IPv6", ip6 ?: "-", onClick = ip6?.let { v -> { copyToClipboard(context, "IPv6", v); onToast("Copied $v") } })
             KeyValueRow("Networks", "${nets.size} · $online peers online")
         }
@@ -324,8 +321,7 @@ private fun HomePreview() {
     xyz.rayfish.android.ui.theme.RayfishTheme {
         HomeScreen(
             status = Status(
-                true, "7f3ac2e1", "100.88.0.3", "fd00::7f3a",
-                ipv6Only = Ipv6OnlyMode.OFF,
+                true, "7f3ac2e1", "200::7f3a",
                 peers = emptyList(), networks = emptyList(), pendingNetworks = emptyList(),
             ),
             starting = false, onToast = {},

@@ -13,7 +13,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import uniffi.ray_mobile.Ipv6OnlyMode
 import uniffi.ray_mobile.Node
 
 /**
@@ -57,9 +56,8 @@ object NodeHolder {
     // Standby is now the default: disabling Rayfish drops the data plane (TUN,
     // VPN slot) but keeps the control plane connected, so file send and receive
     // keep working and the device stays visible in the mesh. The motivating case
-    // is running another VPN (Android allows only one VpnService at a time, and
-    // our tunnel claims the same 100.64.0.0/10 range Tailscale uses), so the
-    // tunnel goes away and only the data plane goes with it.
+    // is running another VPN (Android allows only one VpnService at a time), so
+    // the tunnel goes away and only the data plane goes with it.
     //
     // This key is an escape hatch for a user who wants disabling Rayfish to take
     // the device fully offline instead. Default false (standby). This is a NEW
@@ -143,54 +141,6 @@ object NodeHolder {
         prefs(context).edit().putBoolean(KEY_GO_OFFLINE_WHEN_DISABLED, value).apply()
     }
 
-    // IPv6-only mode: the data plane runs over mesh IPv6 alone, so the tunnel
-    // never claims 100.64.0.0/10. For a network where something else already
-    // owns that range, which on a phone is usually the carrier handing it out as
-    // a CGNAT address.
-    //
-    // This pref, not the core's settings.toml, is the authority: the config
-    // directory is app-private, so the file is not something the user can edit,
-    // and [Node.start] takes the mode as an argument. It is start-time (the
-    // tunnel's addressing is fixed when the interface is built), so flipping it
-    // means rebuilding the node: see [RayfishVpnService.ACTION_RESTART_NODE].
-    //
-    // Three states, not two, and Auto is the default: Auto lets the core look at
-    // the device's own addresses and decide, which is what most people want, but
-    // Off has to stay sayable or there is no way to refuse being moved onto the
-    // mode. What Auto resolved to is reported back in [Node.status].
-    //
-    // A new key, because the old one holds a Boolean and reading a String off it
-    // throws. Migration maps a stored `true` to On and everything else to Auto:
-    // the old default was `false`, so treating it as Off would opt every
-    // existing install out of detection, and Auto only ever turns the mode on
-    // where it was needed anyway.
-    private const val KEY_IPV6_ONLY = "ipv6_only"
-    private const val KEY_IPV6_ONLY_MODE = "ipv6_only_mode"
-
-    fun ipv6OnlyMode(context: Context): Ipv6OnlyMode {
-        val p = prefs(context)
-        p.getString(KEY_IPV6_ONLY_MODE, null)?.let { stored ->
-            return when (stored) {
-                "on" -> Ipv6OnlyMode.ON
-                "off" -> Ipv6OnlyMode.OFF
-                else -> Ipv6OnlyMode.AUTO
-            }
-        }
-        val migrated = if (p.getBoolean(KEY_IPV6_ONLY, false)) Ipv6OnlyMode.ON else Ipv6OnlyMode.AUTO
-        setIpv6OnlyMode(context, migrated)
-        p.edit().remove(KEY_IPV6_ONLY).apply()
-        return migrated
-    }
-
-    fun setIpv6OnlyMode(context: Context, value: Ipv6OnlyMode) {
-        val stored = when (value) {
-            Ipv6OnlyMode.ON -> "on"
-            Ipv6OnlyMode.OFF -> "off"
-            Ipv6OnlyMode.AUTO -> "auto"
-        }
-        prefs(context).edit().putString(KEY_IPV6_ONLY_MODE, stored).apply()
-    }
-
     fun isCrashReportingEnabled(context: Context): Boolean =
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -260,11 +210,7 @@ object NodeHolder {
                         // Register Android's trust store before start(): building
                         // the iroh endpoint sets up TLS, which fails without it.
                         RustlsInit.ensureInitialized(context)
-                        // The mode is fixed for this daemon's lifetime, so it is
-                        // read here, at the one place a daemon is built. On Auto
-                        // the core resolves it against the device's addresses;
-                        // ask `status()` afterwards for what it decided.
-                        get(context).start(ipv6OnlyMode(context))
+                        get(context).start()
                     } catch (t: Throwable) {
                         // A node that will not start leaves the device offline in
                         // the mesh with nothing in the UI to say why, and every

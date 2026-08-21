@@ -339,8 +339,13 @@ async fn handle_conn(
     device_user_map: DeviceUserMap,
     authz: SshAuthz,
 ) {
-    let src = peer.ip();
-    let Some((peer_id, networks)) = peers.identity_and_networks(src) else {
+    // The mesh listener only ever binds our own overlay address, so a session
+    // arrives over IPv6 or it is not a mesh session at all.
+    let IpAddr::V6(src) = peer.ip() else {
+        debug!(peer = %peer.ip(), "mesh SSH: non-IPv6 source on the mesh listener, dropping");
+        return;
+    };
+    let Some((peer_id, networks)) = peers.identity_and_networks(&src) else {
         debug!(%src, "mesh SSH: connection from unknown mesh IP, dropping");
         return;
     };
@@ -354,7 +359,7 @@ async fn handle_conn(
     let server = stream
         .local_addr()
         .map(|a| SocketAddr::new(a.ip(), SSH_PORT))
-        .unwrap_or_else(|_| SocketAddr::new(src, SSH_PORT));
+        .unwrap_or_else(|_| SocketAddr::new(IpAddr::V6(src), SSH_PORT));
     let handler = SshHandler::new(
         policy,
         user_identity,

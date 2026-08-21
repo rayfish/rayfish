@@ -6,7 +6,7 @@
 #   srv-b  joins it with the room id (open net = no invite needed)
 #
 # For both directions we measure, over the public IP (DIRECT) and over the
-# rayfish 100.64.x.x TUN address (RAYFISH):
+# rayfish 200::/7 TUN address (RAYFISH):
 #   - ping RTT (latency)
 #   - iperf3 TCP throughput
 # so the delta isolates the cost rayfish (iroh QUIC datagrams, MTU 1200,
@@ -158,7 +158,7 @@ REPORT="$RESDIR/$STAMP.md"
 {
   echo "# Rayfish benchmark — $STAMP"
   echo
-  echo "Two Scaleway $(grep srv-a "$SERVERS" >/dev/null && echo DEV1-S) instances, same zone."
+  echo "Two droplets in region $(awk 'NR==1{print $4}' "$SERVERS"), same region."
   echo "iperf3 TCP, ${DURATION}s/run, mean of ${ITERATIONS} iterations; ping = mean RTT over 20 packets."
   echo "tx = client→server, rx = server→client (iperf3 -R)."
   echo

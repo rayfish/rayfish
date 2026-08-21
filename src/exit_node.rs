@@ -22,7 +22,7 @@
 
 use crate::membership::ExitFamilies;
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 #[cfg(target_os = "macos")]
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -68,10 +68,10 @@ static FULL_TUNNEL: AtomicBool = AtomicBool::new(false);
 /// Whether the live tunnel claims IPv4, i.e. it is not an IPv6-only one. Only the
 /// macOS pin reads it, and only to stay off the family it did not claim.
 ///
-/// Pinning is per-socket and per-family, so a mode that tunnels IPv6 alone must
-/// not pin the IPv4 sockets: that would bind the whole IPv4 underlay to the
+/// Pinning is per-socket and per-family, and the tunnel carries IPv6 alone, so the
+/// IPv4 sockets must not be pinned: that would bind the whole IPv4 underlay to the
 /// physical interface and carve it out of whichever co-resident VPN owns IPv4 on
-/// that Mac, which is the configuration IPv6-only mode exists to share with.
+/// that Mac.
 /// `tunnel_relevant` already applies exactly this filter to the host-route
 /// exclusions one layer up; this is the same rule for the coarser knob.
 static FULL_TUNNEL_V4: AtomicBool = AtomicBool::new(false);
@@ -193,7 +193,7 @@ pub fn clear_physical_defaults() {
 /// connection the exit node is reached over. Unpinned is strictly better.
 #[cfg(target_os = "macos")]
 fn usable_pin_iface(name: String) -> Option<String> {
-    (!name.starts_with("utun")).then_some(name)
+    (!is_tunnel_iface(&name)).then_some(name)
 }
 
 /// Pins a socket to the physical default-route interface, so its egress ignores the
@@ -370,6 +370,35 @@ pub struct ExitServer {
     /// gateway it can use from one that would take its traffic and have nowhere
     /// to send it.
     v6_uplink: Arc<AtomicBool>,
+    /// The IPv6 prefixes this host is directly attached to, refused as transit
+    /// destinations for the same reason `self_addrs` is: they are reachable from
+    /// the gateway but are not "the internet", so forwarding into them turns an
+    /// exit offer into a way onto the gateway's LAN.
+    ///
+    /// The IPv4 side of this was free: `is_transitable` refuses `is_private()`,
+    /// which is where a v4 LAN lives by definition. IPv6 has no such rule -- a
+    /// home or office LAN is normally a *global* /64 delegated by the ISP, which
+    /// `is_transitable` cannot tell from any other global address. So the answer
+    /// has to be read from the host rather than derived, which is what this is.
+    on_link: Arc<ArcSwap<Vec<Ipv6Prefix>>>,
+}
+
+/// An IPv6 prefix the gateway is directly attached to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv6Prefix {
+    addr: Ipv6Addr,
+    len: u8,
+}
+
+impl Ipv6Prefix {
+    /// Whether `ip` falls inside this prefix.
+    fn contains(&self, ip: Ipv6Addr) -> bool {
+        if self.len == 0 || self.len > 128 {
+            return false;
+        }
+        let shift = 128 - u32::from(self.len);
+        (u128::from(self.addr) >> shift) == (u128::from(ip) >> shift)
+    }
 }
 
 /// Who may route out through us on one network.
@@ -405,6 +434,23 @@ impl ExitServer {
     /// reconcile ([`apply_os`](Self::apply_os)) from the host's interfaces.
     pub fn set_self_addrs(&self, addrs: HashSet<IpAddr>) {
         self.self_addrs.store(Arc::new(addrs));
+    }
+
+    /// Whether `dst` is on a network this gateway is directly attached to (so
+    /// transit to it must be refused; see `on_link`).
+    pub fn is_on_link(&self, dst: IpAddr) -> bool {
+        let IpAddr::V6(v6) = dst else {
+            // IPv4 is not transited at all, and `is_transitable` already refuses
+            // every private v4 range, which is the same question for that family.
+            return false;
+        };
+        self.on_link.load().iter().any(|p| p.contains(v6))
+    }
+
+    /// Replace the set of directly-attached IPv6 prefixes. Refreshed alongside
+    /// [`set_self_addrs`](Self::set_self_addrs).
+    pub fn set_on_link(&self, prefixes: Vec<Ipv6Prefix>) {
+        self.on_link.store(Arc::new(prefixes));
     }
 
     /// Whether we currently offer an exit node on any network (drives whether the
@@ -486,7 +532,9 @@ impl ExitServer {
     pub fn apply_os(&self, tun_name: &str) -> Option<String> {
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         if self.is_active() {
-            self.set_self_addrs(host_addresses());
+            let host = host_interfaces();
+            self.set_self_addrs(host.addrs);
+            self.set_on_link(host.on_link);
             // Re-read rather than cache: an uplink gains or loses IPv6 with a
             // lease or a link change, and the claim we publish has to follow.
             self.v6_uplink.store(has_v6_uplink(), Ordering::Relaxed);
@@ -527,17 +575,75 @@ impl ExitServer {
 /// on failure, which only costs the self-address transit refusal its input (the
 /// LAN/loopback refusals in [`is_transitable`] do not depend on it).
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
-fn host_addresses() -> HashSet<IpAddr> {
+fn host_interfaces() -> HostInterfaces {
     #[cfg(target_os = "linux")]
     let out = Command::new("ip").args(["-o", "addr", "show"]).output();
     #[cfg(not(target_os = "linux"))]
     let out = Command::new("ifconfig").arg("-a").output();
     match out {
         Ok(out) if out.status.success() => {
-            parse_host_addresses(&String::from_utf8_lossy(&out.stdout))
+            let text = String::from_utf8_lossy(&out.stdout);
+            HostInterfaces {
+                addrs: parse_host_addresses(&text),
+                on_link: parse_on_link_prefixes(&text),
+            }
         }
-        _ => HashSet::new(),
+        _ => HostInterfaces::default(),
     }
+}
+
+/// One read of the host's interface list: what the gateway must refuse as a
+/// transit destination, in both of the forms it takes.
+#[derive(Default)]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+pub struct HostInterfaces {
+    pub addrs: HashSet<IpAddr>,
+    pub on_link: Vec<Ipv6Prefix>,
+}
+
+/// Pull the directly-attached IPv6 prefixes out of the same output
+/// [`parse_host_addresses`] reads, in either platform's spelling: Linux's
+/// `inet6 2001:db8::1/64` and the BSDs' `inet6 2001:db8::1 prefixlen 64`.
+///
+/// Only global unicast (`2000::/3`) is kept, and only `32 <= len < 128`. Everything
+/// narrower than /128 is already covered by `self_addrs`, and everything the other
+/// bounds exclude is either refused by [`is_transitable`] anyway (link-local, ULA,
+/// loopback, the overlay) or is not a prefix a host is plausibly attached to. The
+/// lower bound matters most: a misparse that yielded a short prefix would refuse
+/// transit to most of the internet and break the exit node outright, so the
+/// failure mode of this parser is bounded on the side that keeps traffic flowing.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", test))]
+pub(crate) fn parse_on_link_prefixes(out: &str) -> Vec<Ipv6Prefix> {
+    let mut found: Vec<Ipv6Prefix> = Vec::new();
+    let toks: Vec<&str> = out.split_whitespace().collect();
+    for (i, tok) in toks.iter().enumerate() {
+        if *tok != "inet6" {
+            continue;
+        }
+        let Some(raw) = toks.get(i + 1) else { break };
+        let addr_part = raw.split('%').next().unwrap_or(raw);
+        let (addr_str, inline_len) = match addr_part.split_once('/') {
+            Some((a, l)) => (a, l.parse::<u8>().ok()),
+            None => (addr_part, None),
+        };
+        let Ok(addr) = addr_str.parse::<Ipv6Addr>() else {
+            continue;
+        };
+        let len = inline_len.or_else(|| {
+            (toks.get(i + 2) == Some(&"prefixlen")).then(|| toks.get(i + 3)?.parse().ok())?
+        });
+        let Some(len) = len else { continue };
+        // Global unicast only, and wide enough to be a network rather than a host
+        // yet narrow enough not to swallow the internet. See the doc above.
+        if !(32..128).contains(&len) || (addr.segments()[0] & 0xe000) != 0x2000 {
+            continue;
+        }
+        let prefix = Ipv6Prefix { addr, len };
+        if !found.contains(&prefix) {
+            found.push(prefix);
+        }
+    }
+    found
 }
 
 /// Pull the addresses out of `ip -o addr show` or `ifconfig -a` output: any token
@@ -563,8 +669,10 @@ fn parse_host_addresses(out: &str) -> HashSet<IpAddr> {
 }
 
 /// Whether this host has an IPv6 default route, i.e. an exit node it offers can
-/// masquerade IPv6 onto something. A gateway without one is still a perfectly good
-/// IPv4 exit node, which is why this is advertised rather than refused.
+/// masquerade IPv6 onto something. A gateway without one can carry nothing at all,
+/// since the overlay routes no IPv4: it publishes [`ExitFamilies::Neither`] and
+/// every client refuses it by name. Advertised rather than refused locally so the
+/// refusal names the reason, which "does not advertise an exit node" would not.
 #[cfg(target_os = "linux")]
 fn has_v6_uplink() -> bool {
     ip_output(&["-6", "route", "show", "default"]).is_some_and(|out| !out.trim().is_empty())
@@ -572,13 +680,31 @@ fn has_v6_uplink() -> bool {
 
 /// The BSD counterpart, over the same `route -n get` the NAT rules already use to
 /// find the interface to masquerade onto.
+///
+/// A tunnel interface is not an uplink. On a host that both offers an exit node
+/// and uses one, the client tunnel's `::/1` + `8000::/1` are more specific than
+/// `::/0`, so `route -n get -inet6 default` answers with our own utun the moment
+/// they go in (the same trap [`capture_physical_defaults`] documents and filters
+/// with [`usable_pin_iface`]). Unfiltered, `refresh_v6_uplink` re-probes after
+/// the client install and publishes `ExitFamilies::V6` for an uplink that does
+/// not exist, and `enable()` then masquerades transit onto the tunnel we are
+/// ourselves carrying. A false claim is the one outcome the type exists to
+/// prevent, since `ipv6_gateway_refusal` never fires on it.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 fn has_v6_uplink() -> bool {
-    default_interface("-inet6").is_some()
+    default_interface("-inet6").is_some_and(|n| !is_tunnel_iface(&n))
+}
+
+/// Whether `name` is a tunnel interface rather than a physical uplink: `utun*` on
+/// macOS, `tun*` on FreeBSD.
+#[cfg(any(target_os = "macos", target_os = "freebsd", test))]
+fn is_tunnel_iface(name: &str) -> bool {
+    name.starts_with("utun") || name.starts_with("tun")
 }
 
 pub fn is_transitable(dst: IpAddr) -> bool {
-    if is_overlay_ip(dst) {
+    if is_overlay_ip(dst) || matches!(dst, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
+    {
         return false;
     }
     match dst {
@@ -620,8 +746,8 @@ pub struct ExitSelection {
     /// The exit peer's user identity, matched against a datagram sender to accept
     /// its return traffic. (Folds multi-device peers via the device/user map.)
     pub peer_user: EndpointId,
-    /// The exit peer's mesh IPv4, used to look up its live route and to dial it.
-    pub ipv4: Ipv4Addr,
+    /// The exit peer's mesh IPv6, used to look up its live route and to dial it.
+    pub ipv6: Ipv6Addr,
     /// The network we route through the exit peer on (so we tag the datagram with
     /// that network's handle, which its allow-list is scoped to).
     pub network: SmolStr,
@@ -663,17 +789,17 @@ impl ExitClient {
             .is_some_and(|s| &s.peer_user == peer_user)
     }
 
-    /// Whether return traffic arriving from a peer whose verified mesh IPv4 is
-    /// `peer_v4` is our own exit-node return traffic. The sender's mesh IPv4 is
-    /// resolved by the reader from our own roster (so it cannot be forged) and is
-    /// the same whatever family the reply packet is, which makes it a more robust
-    /// match than the resolved user identity (a device-vs-user-key mismatch would
-    /// wrongly reject every reply). Matches by identity *or* IPv4.
-    pub fn is_return_from(&self, peer_user: &EndpointId, peer_v4: Ipv4Addr) -> bool {
+    /// Whether return traffic arriving from a peer whose verified mesh address is
+    /// `peer_v6` is our own exit-node return traffic. The sender's address is
+    /// derived by the reader from our own roster (so it cannot be forged), which
+    /// makes it a more robust match than the resolved user identity (a
+    /// device-vs-user-key mismatch would wrongly reject every reply). Matches by
+    /// identity *or* address.
+    pub fn is_return_from(&self, peer_user: &EndpointId, peer_v6: Ipv6Addr) -> bool {
         self.inner
             .load()
             .as_ref()
-            .is_some_and(|s| &s.peer_user == peer_user || s.ipv4 == peer_v4)
+            .is_some_and(|s| &s.peer_user == peer_user || s.ipv6 == peer_v6)
     }
 
     /// Set (or with `None`, clear) the exit selection.
@@ -766,7 +892,6 @@ fn with_port(servers: Vec<Ipv6Addr>) -> Vec<SocketAddr> {
 pub struct ExitContext {
     pub server: ExitServer,
     pub client: ExitClient,
-    pub my_v4: Ipv4Addr,
     pub my_v6: Ipv6Addr,
 }
 
@@ -775,7 +900,6 @@ impl Default for ExitContext {
         Self {
             server: ExitServer::new(),
             client: ExitClient::new(),
-            my_v4: Ipv4Addr::UNSPECIFIED,
             my_v6: Ipv6Addr::UNSPECIFIED,
         }
     }
@@ -785,9 +909,8 @@ impl Default for ExitContext {
 // Kernel state, shared across the platforms that implement a gateway
 // ---------------------------------------------------------------------------
 
-/// The overlay source ranges a gateway masquerades when forwarding out its uplink.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
-const V4_OVERLAY: &str = "100.64.0.0/10";
+/// The overlay source range a gateway masquerades when forwarding out its uplink.
+/// One family, because the overlay only ever carries one.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 const V6_OVERLAY: &str = "200::/7";
 
@@ -929,25 +1052,39 @@ fn enable(tun_name: &str) -> Result<()> {
         }
         .save(&path)?;
     }
-    write_sysctl(V4_FORWARD, "1")?;
+    // IPv6 alone. The overlay routes no IPv4, so nothing can ever enter the TUN
+    // from `100.64.0.0/10` to be masqueraded, and turning on `ip_forward` would
+    // make the host a router for a family we cannot deliver. The snapshot still
+    // carries `v4` and `disable` still restores it: an older build did set it,
+    // and teardown may not assume which build turned it on.
     write_sysctl(V6_FORWARD, "1")?;
-    nft_load(&format!(
+    nft_load(&server_nft_ruleset(tun_name))?;
+    tracing::info!(tun = tun_name, "exit node forwarding + NAT enabled");
+    Ok(())
+}
+
+/// The nftables ruleset masquerading overlay traffic out of `tun_name`'s host.
+///
+/// The BSD twin's reasoning applies here too: there is no IPv4 rule because there
+/// is no mesh IPv4 to masquerade. This one was merely dead rather than dangerous
+/// (`iifname "<tun>"` scopes it to packets arriving on our own TUN, and an inbound
+/// IPv4 packet is dropped as spoofed long before it could get there), but a rule
+/// that cannot match is a rule that misleads whoever reads `nft list ruleset` next.
+#[cfg(target_os = "linux")]
+fn server_nft_ruleset(tun_name: &str) -> String {
+    format!(
         "{reset}\
          table inet {t} {{\n\
          \tchain postrouting {{\n\
          \t\ttype nat hook postrouting priority srcnat; policy accept;\n\
-         \t\tiifname \"{tun}\" ip saddr {v4} oifname != \"{tun}\" masquerade\n\
          \t\tiifname \"{tun}\" ip6 saddr {v6} oifname != \"{tun}\" masquerade\n\
          \t}}\n\
          }}\n",
         reset = drop_table(SERVER_TABLE),
         t = SERVER_TABLE,
-        v4 = V4_OVERLAY,
         v6 = V6_OVERLAY,
         tun = tun_name,
-    ))?;
-    tracing::info!(tun = tun_name, "exit node forwarding + NAT enabled");
-    Ok(())
+    )
 }
 
 /// Remove the exit-node gateway state: drop our nftables table and restore the
@@ -1008,7 +1145,9 @@ pub fn teardown_client_routing() {}
 /// that never leave the host.
 #[cfg(target_os = "linux")]
 fn is_bypass_source(addr: IpAddr) -> bool {
-    if crate::membership::is_overlay_ip(addr) {
+    if crate::membership::is_overlay_ip(addr)
+        || matches!(addr, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
+    {
         return false;
     }
     match addr {
@@ -1083,13 +1222,11 @@ fn client_nft_script(tun_name: &str) -> String {
 
 /// The `ip` family flags a client full tunnel is installed for.
 ///
-/// `carries` is [`ExitFamilies::tunnelled`], the intersection of what this node's
-/// data plane routes and what the chosen gateway says it can return. Both have to
-/// hold: an IPv6-only data plane carries no mesh IPv4 at all, so claiming the
-/// host's IPv4 egress would source transit from a `/32` it deliberately leaves
-/// unrouted and pull IPv4 out from under the very VPN the mode exists to share a
-/// host with; and a gateway that cannot return a family drops it just as
-/// completely at the other end.
+/// `carries` is [`ExitFamilies::tunnelled`], the gateway's claim narrowed to its
+/// IPv6 half. The overlay routes no IPv4, so claiming the host's IPv4 egress would
+/// source transit from a range the daemon deliberately leaves unrouted and pull
+/// IPv4 out from under whatever else shares the host; and a gateway that cannot
+/// return IPv6 has nothing left to carry, which is why `Neither` is refused.
 ///
 /// Teardown is not symmetric with this: it always sweeps both families, so a
 /// daemon restarted with a different selection still cleans up what the last one
@@ -1919,7 +2056,7 @@ fn enable(_tun_name: &str) -> Result<()> {
         snap.save(&path)?;
         snap
     };
-    write_sysctl(V4_FORWARD, "1")?;
+    // IPv6 alone; see the Linux twin for why `ip_forward` is left where it was.
     write_sysctl(V6_FORWARD, "1")?;
 
     // Enable pf before loading the anchor (an unloaded ruleset has no anchors to
@@ -1934,37 +2071,34 @@ fn enable(_tun_name: &str) -> Result<()> {
     }
     ensure_anchor_referenced()?;
 
-    let v4 = default_interface("-inet");
     let v6 = default_interface("-inet6");
-    let rules = nat_rules(v4.as_deref(), v6.as_deref())
-        .context("no default route, so there is no uplink to send an exit node's traffic out")?;
-    pf_load_anchor(&rules)?;
-    tracing::info!(v4 = ?v4, v6 = ?v6, "exit node forwarding + NAT enabled");
+    pf_load_anchor(&nat_rules(v6.as_deref()))?;
+    tracing::info!(v6 = ?v6, "exit node forwarding + NAT enabled");
     Ok(())
 }
 
-/// The pf ruleset masquerading overlay traffic out the given uplinks, or `None` if
-/// there is no uplink at all.
+/// The pf ruleset masquerading overlay traffic out the given IPv6 uplink, or an
+/// empty ruleset when there is none.
 ///
-/// NAT is scoped to the interface each family's default route leaves by, and
-/// rewrites to that interface's *current* address: the parentheses tell pf to
-/// re-resolve it, so a DHCP renewal doesn't strand the rule on a stale IP. The two
-/// families are independent, because a host with no IPv6 default route is still a
-/// perfectly good IPv4 exit node.
+/// NAT is scoped to the interface the IPv6 default route leaves by, and rewrites to
+/// that interface's *current* address: the parentheses tell pf to re-resolve it, so
+/// a DHCP renewal doesn't strand the rule on a stale IP.
+///
+/// There is no IPv4 half. `nat on <uplink> inet` matches on the *uplink*, not our
+/// TUN, so with no mesh IPv4 left the only traffic such a rule could still catch is
+/// a co-resident VPN's: it would be us claiming `100.64.0.0/10`, which is the one
+/// thing the overlay promises not to do.
+///
+/// Empty rather than `None` on a host with no IPv6 uplink: that host has nothing to
+/// masquerade, but it is not an error, and refusing here would clear the offer and
+/// leave clients reading "does not advertise an exit node" instead of the reason
+/// [`ExitFamilies::Neither`] gives them. Loading an empty anchor flushes it.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-fn nat_rules(v4: Option<&str>, v6: Option<&str>) -> Option<String> {
-    let mut rules = String::new();
-    if let Some(iface) = v4 {
-        rules.push_str(&format!(
-            "nat on {iface} inet from {V4_OVERLAY} to any -> ({iface})\n"
-        ));
+fn nat_rules(v6: Option<&str>) -> String {
+    match v6 {
+        Some(iface) => format!("nat on {iface} inet6 from {V6_OVERLAY} to any -> ({iface})\n"),
+        None => String::new(),
     }
-    if let Some(iface) = v6 {
-        rules.push_str(&format!(
-            "nat on {iface} inet6 from {V6_OVERLAY} to any -> ({iface})\n"
-        ));
-    }
-    (!rules.is_empty()).then_some(rules)
 }
 
 /// Remove the exit-node gateway state: flush our pf anchor, release our reference on
@@ -2516,19 +2650,131 @@ mod tests {
     /// gateway that comes up and quietly NATs nothing.
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
-    fn nat_rules_masquerade_each_family_out_its_own_uplink() {
-        let both = nat_rules(Some("en0"), Some("en1")).unwrap();
+    fn nat_rules_masquerade_the_overlay_out_the_v6_uplink_and_claim_no_ipv4() {
         assert_eq!(
-            both,
-            "nat on en0 inet from 100.64.0.0/10 to any -> (en0)\n\
-             nat on en1 inet6 from 200::/7 to any -> (en1)\n"
+            nat_rules(Some("en1")),
+            "nat on en1 inet6 from 200::/7 to any -> (en1)\n"
         );
-        // A host with no IPv6 default route is still an IPv4 exit node.
-        let v4_only = nat_rules(Some("en0"), None).unwrap();
-        assert!(v4_only.contains("inet from 100.64.0.0/10"));
-        assert!(!v4_only.contains("inet6"));
-        // With no uplink at all there is nothing to be a gateway for.
-        assert!(nat_rules(None, None).is_none());
+        // `nat on <uplink> inet` matches on the uplink, not our TUN, so an IPv4 half
+        // could only ever catch a co-resident VPN's traffic. There must not be one.
+        assert!(!nat_rules(Some("en1")).contains("100.64.0.0/10"));
+        assert!(!nat_rules(Some("en1")).contains(" inet from"));
+        // No IPv6 uplink is nothing to masquerade, not an error: the offer stands
+        // and the client refuses it by name.
+        assert_eq!(nat_rules(None), "");
+    }
+
+    /// A gateway's own IPv6 LAN is a *global* prefix, which is exactly why
+    /// `is_transitable` cannot catch it: the v4 arm has `is_private()` and the v6
+    /// arm has nothing equivalent. Both platforms' spellings are parsed here
+    /// because neither command runs in CI.
+    #[test]
+    fn on_link_prefixes_are_read_from_either_platforms_interface_listing() {
+        // Linux: `ip -o addr show`
+        let linux = "2: eth0    inet6 2001:db8:1:2::5/64 scope global \\       valid_lft forever\n\
+                     1: lo      inet6 ::1/128 scope host \\       valid_lft forever\n\
+                     2: eth0    inet6 fe80::1/64 scope link \\       valid_lft forever\n\
+                     3: tun0    inet6 200::5/7 scope global \\       valid_lft forever\n";
+        assert_eq!(
+            parse_on_link_prefixes(linux),
+            vec![Ipv6Prefix {
+                addr: "2001:db8:1:2::5".parse().unwrap(),
+                len: 64
+            }],
+            "only the global LAN prefix: loopback, link-local and the overlay are \
+             refused by is_transitable already, and /128 is a self address"
+        );
+
+        // BSD: `ifconfig -a`
+        let bsd = "en0: flags=8863 mtu 1500\n\
+                   \tinet6 fe80::aede:48ff:fe00:1122%en0 prefixlen 64 scopeid 0x4\n\
+                   \tinet6 2001:db8:99::7 prefixlen 64 autoconf secured\n\
+                   lo0: flags=8049 mtu 16384\n\
+                   \tinet6 ::1 prefixlen 128\n";
+        assert_eq!(
+            parse_on_link_prefixes(bsd),
+            vec![Ipv6Prefix {
+                addr: "2001:db8:99::7".parse().unwrap(),
+                len: 64
+            }]
+        );
+    }
+
+    /// The bound that matters: a misparse yielding a short prefix would refuse
+    /// transit to most of the internet, which breaks the exit node outright. The
+    /// parser fails toward keeping traffic flowing.
+    #[test]
+    fn an_implausibly_short_prefix_is_not_treated_as_on_link() {
+        let absurd = "eth0 inet6 2000::1/3 scope global\n\
+                      eth0 inet6 2001:db8::1/31 scope global\n";
+        assert!(parse_on_link_prefixes(absurd).is_empty());
+        // /32 is the documented lower bound and is kept.
+        assert_eq!(
+            parse_on_link_prefixes("eth0 inet6 2001:db8::1/32 x").len(),
+            1
+        );
+    }
+
+    /// Containment, including the boundary a `/64` draws.
+    #[test]
+    fn an_on_link_prefix_contains_its_neighbours_and_nothing_else() {
+        let server = ExitServer::new();
+        server.set_on_link(parse_on_link_prefixes(
+            "eth0 inet6 2001:db8:1:2::5/64 scope global",
+        ));
+        // The gateway's neighbours: reachable from the gateway, not "the internet".
+        for neighbour in ["2001:db8:1:2::1", "2001:db8:1:2::dead:beef"] {
+            assert!(
+                server.is_on_link(neighbour.parse::<IpAddr>().unwrap()),
+                "{neighbour} shares the gateway's /64"
+            );
+        }
+        // One bit outside the /64, and ordinary internet destinations.
+        for outside in [
+            "2001:db8:1:3::1",
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+        ] {
+            assert!(
+                !server.is_on_link(outside.parse::<IpAddr>().unwrap()),
+                "{outside} is not on the gateway's link and must still transit"
+            );
+        }
+        // IPv4 is never asked: `is_transitable` already refuses every private range.
+        assert!(!server.is_on_link("192.168.1.1".parse().unwrap()));
+        // A gateway that read nothing refuses nothing extra.
+        assert!(!ExitServer::new().is_on_link("2001:db8:1:2::1".parse().unwrap()));
+    }
+
+    /// Both `has_v6_uplink` and the socket pin ask "is this a real uplink", and
+    /// neither runs on Linux, so the shared predicate is pinned here. A gateway
+    /// that answers `utun` to `route -n get -inet6 default` is reading its own
+    /// client tunnel's `::/1` back, not an uplink it could masquerade onto.
+    #[test]
+    fn a_tunnel_interface_is_not_an_uplink() {
+        for tun in ["utun0", "utun9", "tun0", "tun42"] {
+            assert!(is_tunnel_iface(tun), "{tun} is a tunnel");
+        }
+        for phys in ["en0", "eth0", "bridge100", "wlan0", "lo0"] {
+            assert!(!is_tunnel_iface(phys), "{phys} is a real interface");
+        }
+    }
+
+    /// The Linux twin of the above, and the same argument: `nft_load` never runs in
+    /// CI either, so the ruleset text is pinned rather than exercised.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_server_nft_ruleset_masquerades_the_overlay_and_claims_no_ipv4() {
+        let rules = server_nft_ruleset("tun-rayfish");
+        assert!(
+            rules.contains(
+                "iifname \"tun-rayfish\" ip6 saddr 200::/7 oifname != \"tun-rayfish\" masquerade"
+            ),
+            "the overlay's own range is what a gateway masquerades: {rules}"
+        );
+        // The overlay routes no IPv4, so there is no `ip saddr` rule to write.
+        assert!(!rules.contains("100.64.0.0/10"), "{rules}");
+        assert!(!rules.contains("ip saddr"), "{rules}");
     }
 
     #[test]

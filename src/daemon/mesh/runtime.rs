@@ -52,7 +52,6 @@ impl NetworkRegistry {
         name: &str,
         net_public_key: EndpointId,
         net_config: Option<&config::NetworkConfig>,
-        my_ip: Ipv4Addr,
         persisted_hostname: &Option<String>,
     ) -> RestoredRoster {
         let mut member_list = MemberList::new();
@@ -69,10 +68,10 @@ impl NetworkRegistry {
                 reusable_keys = data.reusable_keys.clone();
                 nullifiers = data.nullifiers.clone();
                 for m in &data.members {
-                    let _ = member_list.add(m.clone());
+                    member_list.add(m.clone());
                 }
                 for a in &data.approved {
-                    let _ = approved_list.approve(a.clone(), &member_list);
+                    approved_list.approve(a.clone());
                 }
                 tracing::info!(
                     network = %name,
@@ -88,50 +87,40 @@ impl NetworkRegistry {
                 );
                 if let Some(nc) = net_config {
                     for entry in &nc.members {
-                        let _ = member_list.add(Member {
+                        member_list.add(Member {
                             identity: entry.identity,
-                            ip: entry.ip,
                             is_coordinator: entry.is_coordinator,
                             hostname: entry.hostname.clone(),
                             user_identity: None,
                             device_cert: None,
-                            collision_index: 0,
                             last_seen: None,
                             exit_node: false,
                             exit_families: ExitFamilies::Unknown,
-                            ipv6_only: false,
                         });
                     }
                     for entry in &nc.approved {
                         let ae = ApprovedEntry {
                             identity: entry.identity,
-                            ip: entry.ip,
                             hostname: entry.hostname.clone(),
                             user_identity: None,
                             device_cert: None,
-                            collision_index: 0,
                         };
-                        let _ = approved_list.approve(ae, &member_list);
+                        approved_list.approve(ae);
                     }
                 }
             }
         }
         if !member_list.is_member(&self.transport.identity.local_identity()) {
-            member_list
-                .add(Member {
-                    identity: self.transport.identity.local_identity(),
-                    ip: my_ip,
-                    is_coordinator: true,
-                    hostname: persisted_hostname.clone(),
-                    user_identity: None,
-                    device_cert: None,
-                    collision_index: 0,
-                    last_seen: None,
-                    exit_node: false,
-                    exit_families: ExitFamilies::Unknown,
-                    ipv6_only: self.ipv6_only,
-                })
-                .expect("self-add cannot collide");
+            member_list.add(Member {
+                identity: self.transport.identity.local_identity(),
+                is_coordinator: true,
+                hostname: persisted_hostname.clone(),
+                user_identity: None,
+                device_cert: None,
+                last_seen: None,
+                exit_node: false,
+                exit_families: ExitFamilies::Unknown,
+            });
         }
         RestoredRoster {
             members: member_list,
@@ -154,7 +143,7 @@ impl NetworkRegistry {
             }
         }
 
-        let my_ip = self.transport.identity.local_ip();
+        let my_ip = self.transport.identity.local_ipv6();
 
         // Load persisted network secret key from config
         let app_config = config::load()?;
@@ -182,7 +171,7 @@ impl NetworkRegistry {
             reusable_keys,
             nullifiers,
         } = self
-            .restore_member_roster(name, net_public_key, net_config, my_ip, &persisted_hostname)
+            .restore_member_roster(name, net_public_key, net_config, &persisted_hostname)
             .await;
 
         let mut net_state = NetworkState {
@@ -212,7 +201,6 @@ impl NetworkRegistry {
         config::save_network(&config::NetworkConfig {
             name: name.to_string(),
             group_mode: mode,
-            my_ip: Some(my_ip),
             my_hostname: persisted_hostname.clone(),
             // Coordinators publish renames directly, so they never carry a
             // pending intent.
@@ -276,23 +264,18 @@ impl NetworkRegistry {
                     .all()
                     .into_iter()
                     .filter_map(|m| {
-                        m.hostname.as_ref().map(|h| {
-                            (
-                                h.clone(),
-                                (!m.ipv6_only).then_some(m.ip),
-                                derive_ipv6(&m.identity),
-                            )
-                        })
+                        m.hostname
+                            .as_ref()
+                            .map(|h| (h.clone(), derive_ipv6(&m.identity)))
                     })
                     .collect()
             };
-            for (hostname, ip, ipv6) in members_snapshot {
+            for (hostname, ipv6) in members_snapshot {
                 dns::update_hostname(
                     &self.dns.hostname_table,
                     &self.dns.reverse_table,
                     name,
                     &hostname,
-                    ip,
                     ipv6,
                 )
                 .await;
@@ -320,7 +303,6 @@ impl NetworkRegistry {
             net_public_key,
             name,
             self.transport.identity.local_identity(),
-            my_ip,
             persisted_hostname.clone(),
         )
         .await;
@@ -334,7 +316,6 @@ impl NetworkRegistry {
             name: name.to_string(),
             network_key: net_public_key,
             role: NetworkRole::Coordinator,
-            my_ip,
             state,
             dht_notify: Some(dht_notify),
             cancel: cancel.clone(),
@@ -361,7 +342,6 @@ impl NetworkRegistry {
                     net_public_key,
                     &network_name,
                     me.transport.identity.local_identity(),
-                    my_ip,
                     persisted_hostname,
                 )
                 .await;
@@ -373,8 +353,7 @@ impl NetworkRegistry {
         Ok(IpcMessage::Created {
             name: name.to_string(),
             network_key: net_public_key,
-            my_ip,
-            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
+            my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
         })
     }
 
@@ -477,7 +456,7 @@ impl NetworkRegistry {
             }
         };
         let candidate_user = self.device_user_map.resolve(&candidate);
-        let (member_id, member_ip, is_coord, display) = {
+        let (member_id, _member_ip, is_coord, display) = {
             let s = state.read().unwrap();
             match s
                 .members
@@ -487,7 +466,7 @@ impl NetworkRegistry {
             {
                 Some(m) => (
                     m.identity,
-                    m.ip,
+                    derive_ipv6(&m.identity),
                     m.is_coordinator,
                     m.hostname
                         .clone()
@@ -519,7 +498,7 @@ impl NetworkRegistry {
             &self.dns.hostname_table,
             &self.dns.reverse_table,
             network,
-            member_ip,
+            derive_ipv6(&member_id),
         )
         .await;
         update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
@@ -534,10 +513,7 @@ impl NetworkRegistry {
                 // Only close the shared connection if this was the peer's last
                 // network with us; otherwise just drop this network's route so a
                 // peer we share other networks with stays reachable there.
-                if let Some(conn) =
-                    self.peers
-                        .remove_peer_from_network(&ip, &derive_ipv6(&pid), network)
-                {
+                if let Some(conn) = self.peers.remove_peer_from_network(&ip, network) {
                     conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
                 }
             }
@@ -590,9 +566,9 @@ impl NetworkRegistry {
                 // are told apart inside the arm rather than by pattern.
                 Ok(TryJoin::Joined(resp)) => match *resp {
                     IpcMessage::Joined {
-                        ref name, my_ip, ..
+                        ref name, my_ipv6, ..
                     } => {
-                        tracing::info!(network = %name, ip = %my_ip, attempt, "restored member network");
+                        tracing::info!(network = %name, ip = %my_ipv6, attempt, "restored member network");
                         return;
                     }
                     // Not reachable today (a reconnect handshake only ever returns
@@ -880,20 +856,15 @@ impl Daemon {
         *guard = Some(token.clone());
         drop(guard);
         self.rebuild_ssh_authz();
-        let my_v4 = self.transport.identity.local_ip();
         let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
         let server = crate::ssh::SshServer::new(
             self.registry.peers.clone(),
             self.registry.device_user_map.clone(),
             self.ssh_authz.clone(),
         );
-        // IPv6-only mode carries no mesh IPv4, so binding our v4 would create a
-        // listener nothing can reach.
-        let binds = if self.ipv6_only.enabled() {
-            vec![IpAddr::V6(my_v6)]
-        } else {
-            vec![IpAddr::V4(my_v4), IpAddr::V6(my_v6)]
-        };
+        // The overlay carries no IPv4, so there is one address to bind and it is
+        // the derived mesh IPv6.
+        let binds = vec![IpAddr::V6(my_v6)];
         server.spawn(binds, token);
         // Turn on the userspace port NAT so mesh `:22` reaches the listener.
         crate::forward::set_ssh_nat_active(true);
@@ -915,11 +886,7 @@ impl Daemon {
     /// bring the data plane up (mark active, configure Magic DNS). On Android the
     /// packet interface + routes are the `VpnService`'s job, so those desktop
     /// route calls are skipped.
-    pub async fn activate(
-        self: &Arc<Self>,
-        hostname: Option<String>,
-        ipv6_only: Option<Ipv6Only>,
-    ) -> IpcMessage {
+    pub async fn activate(self: &Arc<Self>, hostname: Option<String>) -> IpcMessage {
         // Persist the personal default hostname first (before the already-active
         // short-circuit) so `ray up --hostname X` records the new default even
         // when the VPN is already up. Used as the fallback for future
@@ -943,44 +910,9 @@ impl Daemon {
             }
         }
 
-        // Same deal for `ray up --ipv6-only`: persist before the short-circuit.
-        // The TUN's addressing is fixed when the device is created at daemon
-        // start, so this can only take effect on the next restart; say so
-        // instead of reporting a mode the data plane is not actually in.
-        // Compared against the *stored setting*, not the running mode: on `auto`
-        // the daemon may already be IPv6-only because it found another VPN, and
-        // an explicit `--ipv6-only` still has to be written down or the mode
-        // would vanish along with that VPN.
-        let restart_note = match ipv6_only {
-            Some(want) => match config::load() {
-                Ok(mut app_config) if app_config.ipv6_only != want => {
-                    app_config.ipv6_only = want;
-                    match config::save_settings(&app_config) {
-                        // Only a data plane that is not already in the requested
-                        // mode needs the restart.
-                        Ok(()) if want.enabled() != self.ipv6_only.enabled() => Some(
-                            ". IPv6-only mode set; restart the daemon for changes to take effect.",
-                        ),
-                        Ok(()) => None,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to persist ipv6-only setting");
-                            Some(". Failed to persist the IPv6-only setting, see the log.")
-                        }
-                    }
-                }
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to load config to set ipv6-only");
-                    Some(". Failed to persist the IPv6-only setting, see the log.")
-                }
-            },
-            None => None,
-        };
-        let restart_note = restart_note.unwrap_or("");
-
         if self.active.swap(true, Ordering::SeqCst) {
             return IpcMessage::Ok {
-                message: format!("already up{restart_note}"),
+                message: "already up".to_string(),
             };
         }
 
@@ -1001,7 +933,6 @@ impl Daemon {
         #[cfg(not(target_os = "android"))]
         {
             let tun_name = self.tun_name.load().as_str().to_owned();
-            let my_v4 = self.transport.identity.local_ip();
             let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
             if let Err(e) = tun::set_link_up(&tun_name) {
                 tracing::warn!(error = %e, "failed to bring TUN interface up");
@@ -1021,19 +952,11 @@ impl Daemon {
             // link-up: on Linux the kernel won't install an IPv6 connected route
             // while the link is down, so without this peer traffic leaks out the
             // default route.
-            if let Err(e) = tun::route_peer_range(&tun_name, self.ipv6_only.enabled()).await {
+            // `200::/7` also delivers `dns::MAGIC_DNS_V6`, so the resolver needs
+            // no host route of its own.
+            if let Err(e) = tun::route_peer_range(&tun_name).await {
                 tracing::warn!(error = %e, "failed to route 200::/7 into TUN");
                 warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
-            }
-
-            // IPv6-only mode answers on `dns::MAGIC_DNS_V6`, which the `200::/7`
-            // route above already delivers. Installing the v4 `/32` there would
-            // plant a dead route inside the `100.64.0.0/10` range this mode
-            // exists to hand over to another VPN.
-            if !self.ipv6_only.enabled()
-                && let Err(e) = tun::route_magic_dns(&tun_name).await
-            {
-                tracing::warn!(error = %e, "failed to route magic DNS IP into TUN");
             }
 
             // Loop our own addresses back through lo0 so self-traffic (e.g.
@@ -1041,7 +964,7 @@ impl Daemon {
             // the TUN, where the forwarding loop would drop it as "no peer for
             // dst". No-op on Linux (kernel installs the `local` route
             // automatically).
-            if let Err(e) = tun::route_self_loopback(my_v4, my_v6, self.ipv6_only.enabled()).await {
+            if let Err(e) = tun::route_self_loopback(my_v6).await {
                 tracing::warn!(error = %e, "failed to install loopback self-route");
                 warnings.push(format!("failed to install loopback self-route: {e}"));
             }
@@ -1062,12 +985,9 @@ impl Daemon {
             // "22/tcp" still drops it and the failure looks like a dead network
             // rather than a firewall rule. Surface it with the other `ray up`
             // warnings; we only read the ruleset, never edit it.
-            if let Some(w) = crate::hostfw::check_inbound_tcp(
-                &dns_tun_name,
-                crate::ssh::SSH_LISTEN_PORT,
-                self.ipv6_only.enabled(),
-            )
-            .warning(crate::ssh::SSH_LISTEN_PORT)
+            if let Some(w) =
+                crate::hostfw::check_inbound_tcp(&dns_tun_name, crate::ssh::SSH_LISTEN_PORT)
+                    .warning(crate::ssh::SSH_LISTEN_PORT)
             {
                 tracing::warn!("{w}");
                 warnings.push(w);
@@ -1084,10 +1004,10 @@ impl Daemon {
         tracing::info!("data plane activated");
         if warnings.is_empty() {
             IpcMessage::Ok {
-                message: format!("VPN up{restart_note}"),
+                message: "VPN up".to_string(),
             }
         } else {
-            let mut message = format!("VPN up{restart_note} Some things need attention:");
+            let mut message = "VPN up. Some things need attention:".to_string();
             for w in &warnings {
                 message.push_str("\n  - ");
                 message.push_str(w);
@@ -1130,7 +1050,6 @@ impl Daemon {
         // the offers, so this also withdraws a stale advertisement rather than
         // keeping clients routed into a gateway that forwards nothing.
         self.registry.sync_exit_offers().await;
-        self.registry.sync_ipv6_only().await;
         // This runs inside the IPC request, so anything slow here is time the user
         // spends staring at `ray exit-node use`. Timed per phase because a stall in
         // any of them is indistinguishable from the outside.
@@ -1372,7 +1291,7 @@ impl Daemon {
     /// blocking on, which [`warm_exit_peer`](Self::warm_exit_peer) does.
     #[cfg(target_os = "macos")]
     fn nudge_all_peers(&self) {
-        let exit_ip = self.registry.exit_client.selection().map(|s| s.ipv4);
+        let exit_ip = self.registry.exit_client.selection().map(|s| s.ipv6);
         for (ip, conn) in self.registry.peers.all_connections() {
             if Some(ip) == exit_ip {
                 continue; // warmed synchronously below
@@ -1391,17 +1310,12 @@ impl Daemon {
         // the two ends settle on different connections: we send every exit packet
         // down ours while the gateway reads its own, and nothing crosses in either
         // direction. Same gate the on-demand data path and `ray ping` use.
-        if let Some(conn) = self.registry.peers.conn_for_ip(&sel.ipv4) {
+        if let Some(conn) = self.registry.peers.conn_for_ip(&sel.ipv6) {
             return Some(conn);
         }
-        // Dial only when there is no live connection. Dialing on top of one opens a
-        // *second* QUIC connection to the same peer, and with one reader per peer
-        // the two ends settle on different connections: we send every exit packet
-        // down ours while the gateway reads its own, and nothing crosses in either
-        // direction. Same gate the on-demand data path and `ray ping` use.
-        let target = self.registry.resolve_route(IpAddr::V4(sel.ipv4))?;
+        let target = self.registry.resolve_route(IpAddr::V6(sel.ipv6))?;
         self.registry.dial_target(&target).await;
-        self.registry.peers.conn_for_ip(&sel.ipv4)
+        self.registry.peers.conn_for_ip(&sel.ipv6)
     }
 
     /// Narrow underlay addresses to the families the tunnel actually captures.
@@ -1568,7 +1482,6 @@ impl Daemon {
         // otherwise. `activate()` re-advertises. Then disable syncing, so a
         // reconverge during standby leaves the (withdrawn) flag alone.
         self.registry.sync_exit_offers().await;
-        self.registry.sync_ipv6_only().await;
         self.registry
             .exit_sync_enabled
             .store(false, Ordering::SeqCst);
@@ -1644,9 +1557,9 @@ async fn nudge_holepunch(router: &ProtocolRouter, conn: &Connection) -> bool {
 /// skipped: the relay servers are excluded separately, by name, before DNS moves
 /// into the tunnel.
 ///
-/// Both families. Which one a peer is reachable over is not ours to pick, and in
-/// IPv6-only mode the tunnel is IPv6, so an IPv6 path is precisely the one that
-/// would otherwise be swallowed by the tunnel it is carrying.
+/// Both families. Which one a peer's *underlay* is reachable over is not ours to
+/// pick, and the tunnel carries IPv6, so an IPv6 underlay path is precisely the one
+/// that would otherwise be swallowed by the tunnel it is carrying.
 #[cfg(target_os = "macos")]
 fn peer_underlay_ips(conn: &Connection) -> Vec<IpAddr> {
     let mut ips = Vec::new();

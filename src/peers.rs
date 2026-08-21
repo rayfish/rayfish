@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -51,17 +51,12 @@ pub type FastDashMap<K, V> = dashmap::DashMap<K, V, ahash::RandomState>;
 /// (shared `Arc`s), so it is handed to every per-network task by value.
 #[derive(Clone)]
 pub struct PeerTable {
-    /// IPv4 virtual address → peer.
-    v4: Arc<FastDashMap<Ipv4Addr, PeerEntry>>,
-    /// IPv6 virtual address → peer (same peers as `v4`, keyed by their `200::/7`
-    /// address so v6 packets resolve without a v4↔v6 translation step).
-    v6: Arc<FastDashMap<Ipv6Addr, PeerEntry>>,
-    /// Endpoint id → the peer's mesh IPv4 (its `v4`/`v6` key). Lets the
-    /// per-connection data reader resolve a peer's mesh addresses from the QUIC
-    /// remote id alone — the reader is spawned when the connection opens, before
-    /// the join handshake assigns the peer's (possibly collision-suffixed) roster
-    /// IP, so it can't be handed the IP up front.
-    by_id: Arc<FastDashMap<EndpointId, Ipv4Addr>>,
+    /// Mesh IPv6 → peer. The only key: a peer's `200::/7` address is
+    /// [`membership::derive_ipv6`] of its `EndpointId`, so an id resolves to its
+    /// key with a hash and no side table. That is why the per-connection data
+    /// reader needs nothing handed to it at spawn time: it knows the QUIC remote
+    /// id, which is the address.
+    peers: Arc<FastDashMap<Ipv6Addr, PeerEntry>>,
     /// Optional append-only audit log. When present, registering a peer's first
     /// connection logs a `connect` event and dropping its last shared network
     /// logs a `disconnect` event. `None` in tests.
@@ -211,9 +206,7 @@ impl PeerTable {
     /// Creates an empty table with no audit logging (used in tests).
     pub fn new() -> Self {
         Self {
-            v4: Arc::new(FastDashMap::default()),
-            v6: Arc::new(FastDashMap::default()),
-            by_id: Arc::new(FastDashMap::default()),
+            peers: Arc::new(FastDashMap::default()),
             audit: None,
             version_incompatible: Arc::new(DashSet::default()),
         }
@@ -224,9 +217,7 @@ impl PeerTable {
     /// to every per-network task (clones share the same audit handle).
     pub fn with_audit(audit: Arc<AuditLog>) -> Self {
         Self {
-            v4: Arc::new(FastDashMap::default()),
-            v6: Arc::new(FastDashMap::default()),
-            by_id: Arc::new(FastDashMap::default()),
+            peers: Arc::new(FastDashMap::default()),
             audit: Some(audit),
             version_incompatible: Arc::new(DashSet::default()),
         }
@@ -262,7 +253,6 @@ impl PeerTable {
     /// caller uses this to decide whether to (re)announce the handle table.
     pub fn add(
         &self,
-        ip: Ipv4Addr,
         ipv6: Ipv6Addr,
         conn: Connection,
         endpoint_id: EndpointId,
@@ -280,7 +270,7 @@ impl PeerTable {
         let conn_changed;
         {
             use dashmap::mapref::entry::Entry;
-            match self.v4.entry(ip) {
+            match self.peers.entry(ipv6) {
                 Entry::Occupied(mut o) => {
                     let e = o.get_mut();
                     first_ever = false;
@@ -307,44 +297,33 @@ impl PeerTable {
                 }
             }
         }
-        {
-            let mut e = self
-                .v6
-                .entry(ipv6)
-                .or_insert_with(|| first_conn_placeholder(endpoint_id, conn.clone(), net.clone()));
-            e.endpoint_id = endpoint_id;
-            e.conn = conn.clone();
-            e.networks.insert(net.clone());
-            if !e.out_handles.contains_key(&net) {
-                let h = next_free_handle(&e.out_handles);
-                e.out_handles.insert(net.clone(), h);
-            }
-        }
-        self.by_id.insert(endpoint_id, ip);
         // A live connection just formed, so any prior version-incompatibility flag
         // is stale (the peer was updated / the ALPN now matches).
         self.version_incompatible.remove(&endpoint_id);
         if first_ever && let Some(audit) = &self.audit {
-            audit.log_connect(ip, &endpoint_id.to_string());
+            audit.log_connect(ipv6, &endpoint_id.to_string());
         }
         conn_changed
     }
 
-    /// The peer's mesh IPv4, resolved from its endpoint id. Used by the
+    /// The peer's mesh IPv6, resolved from its endpoint id. Used by the
     /// per-connection data reader (which knows only the QUIC remote id) to find
-    /// the peer's routing entry. `None` until the peer is registered by the join
-    /// handshake.
-    pub fn v4_for_id(&self, peer_id: &EndpointId) -> Option<Ipv4Addr> {
-        self.by_id.get(peer_id).map(|e| *e.value())
+    /// the peer's routing entry.
+    ///
+    /// The address is a pure function of the id, so this is really a membership
+    /// test: `None` until the peer is registered by the join handshake, which is
+    /// the contract every caller relies on to tell a connected peer from a merely
+    /// nameable one.
+    pub fn ipv6_for_id(&self, peer_id: &EndpointId) -> Option<Ipv6Addr> {
+        let ip = membership::derive_ipv6(peer_id);
+        self.peers.contains_key(&ip).then_some(ip)
     }
 
     /// Record whether `peer_id` advertised idle-close support in its `MeshHello`
     /// (`features & FEATURE_IDLE_CLOSE`). Drives whether the per-connection idle
     /// timer is allowed to close this link.
     pub fn note_idle_support_by_id(&self, peer_id: &EndpointId, supported: bool) {
-        if let Some(ip) = self.by_id.get(peer_id).map(|e| *e.value())
-            && let Some(e) = self.v4.get(&ip)
-        {
+        if let Some(e) = self.peers.get(&membership::derive_ipv6(peer_id)) {
             e.supports_idle_close.store(supported, Ordering::Relaxed);
         }
     }
@@ -353,14 +332,9 @@ impl PeerTable {
     /// unknown or never advertised it, so an unregistered or pre-feature peer is
     /// never idle-closed.
     pub fn supports_idle_close(&self, peer_id: &EndpointId) -> bool {
-        self.by_id
-            .get(peer_id)
-            .map(|e| *e.value())
-            .and_then(|ip| {
-                self.v4
-                    .get(&ip)
-                    .map(|e| e.supports_idle_close.load(Ordering::Relaxed))
-            })
+        self.peers
+            .get(&membership::derive_ipv6(peer_id))
+            .map(|e| e.supports_idle_close.load(Ordering::Relaxed))
             .unwrap_or(false)
     }
 
@@ -368,10 +342,9 @@ impl PeerTable {
     /// per-connection idle timer can watch it without repeated map lookups. `None`
     /// if the peer is not registered.
     pub fn last_active_of(&self, peer_id: &EndpointId) -> Option<Arc<AtomicU64>> {
-        self.by_id
-            .get(peer_id)
-            .map(|e| *e.value())
-            .and_then(|ip| self.v4.get(&ip).map(|e| e.last_active.clone()))
+        self.peers
+            .get(&membership::derive_ipv6(peer_id))
+            .map(|e| e.last_active.clone())
     }
 
     /// Time remaining until `peer_id`'s connection has been idle for `idle`
@@ -386,7 +359,7 @@ impl PeerTable {
     }
 
     /// Resolve an inbound datagram from `peer_id` tagged with `handle` to the
-    /// peer's mesh IPv4 and its arrival network, enforcing the in-band
+    /// peer's mesh IPv6 and its arrival network, enforcing the in-band
     /// reachability wall in one lock pass: returns `Some` only when the peer is
     /// known, the handle maps to a network the peer announced, **and** our own
     /// shared-network set with this peer currently contains that network. An
@@ -396,9 +369,9 @@ impl PeerTable {
         &self,
         peer_id: &EndpointId,
         handle: u16,
-    ) -> Option<(Ipv4Addr, SmolStr)> {
-        let ip = *self.by_id.get(peer_id)?.value();
-        let e = self.v4.get(&ip)?;
+    ) -> Option<(Ipv6Addr, SmolStr)> {
+        let ip = membership::derive_ipv6(peer_id);
+        let e = self.peers.get(&ip)?;
         let network = e.in_handles.get(&handle)?;
         if !e.networks.contains(network) {
             return None;
@@ -411,25 +384,20 @@ impl PeerTable {
         Some((ip, network.clone()))
     }
 
-    /// Resolves an IPv4 destination to a [`PeerRoute`], or `None` if no peer with
-    /// that address shares a live connection with us. This is the outbound hot
-    /// path's lookup.
-    pub fn lookup_v4(&self, ip: &Ipv4Addr) -> Option<PeerRoute> {
-        self.v4.get(ip).and_then(|e| e.route())
-    }
-
-    /// IPv6 counterpart of [`lookup_v4`](Self::lookup_v4).
+    /// Resolves a mesh IPv6 destination to a [`PeerRoute`], or `None` if no peer
+    /// with that address shares a live connection with us. This is the outbound
+    /// hot path's lookup.
     pub fn lookup_v6(&self, ip: &Ipv6Addr) -> Option<PeerRoute> {
-        self.v6.get(ip).and_then(|e| e.route())
+        self.peers.get(ip).and_then(|e| e.route())
     }
 
-    /// Route to the peer holding mesh IPv4 `ip`, pinned to a specific `network`
+    /// Route to the peer holding mesh IPv6 `ip`, pinned to a specific `network`
     /// (rather than [`route`](PeerEntry::route)'s lexically-smallest shared one).
     /// Used by exit-node client routing, which must tag the datagram with the exit
     /// network's handle so the exit peer attributes it to the network whose
     /// allow-list permits us. `None` if the peer isn't connected on `network`.
-    pub fn route_on_network(&self, ip: &Ipv4Addr, network: &str) -> Option<PeerRoute> {
-        let e = self.v4.get(ip)?;
+    pub fn route_on_network(&self, ip: &Ipv6Addr, network: &str) -> Option<PeerRoute> {
+        let e = self.peers.get(ip)?;
         if !e.networks.contains(network) {
             return None;
         }
@@ -444,31 +412,24 @@ impl PeerTable {
     }
 
     /// Resolve the network an inbound datagram belongs to from the peer's mesh
-    /// IPv4 and the `u16` handle the peer stamped on it (looked up in the peer's
+    /// IPv6 and the `u16` handle the peer stamped on it (looked up in the peer's
     /// announced inbound table). `None` if the peer or handle is unknown.
-    pub fn inbound_network_v4(&self, ip: &Ipv4Addr, handle: u16) -> Option<SmolStr> {
-        self.v4
-            .get(ip)
-            .and_then(|e| e.in_handles.get(&handle).cloned())
-    }
-
-    /// IPv6 counterpart of [`inbound_network_v4`](Self::inbound_network_v4).
     pub fn inbound_network_v6(&self, ip: &Ipv6Addr, handle: u16) -> Option<SmolStr> {
-        self.v6
+        self.peers
             .get(ip)
             .and_then(|e| e.in_handles.get(&handle).cloned())
     }
 
     /// Replace a peer's inbound decode table from its announced `NetworkHandles`.
-    /// `entries` is `(handle, network)` pairs. Applied to both address maps.
+    /// `entries` is `(handle, network)` pairs.
     ///
     /// Also the one place the two views of "what we share" can be compared, so a
     /// network we still hold the peer in and the peer no longer claims is
     /// reported here, once per announcement, rather than per dropped packet. See
     /// [`PeerEntry::route`] for what the disagreement does.
-    pub fn set_inbound_handles(&self, ip: &Ipv4Addr, ipv6: &Ipv6Addr, entries: &[(u16, SmolStr)]) {
+    pub fn set_inbound_handles(&self, ip: &Ipv6Addr, entries: &[(u16, SmolStr)]) {
         let table: HashMap<u16, SmolStr> = entries.iter().cloned().collect();
-        if let Some(mut e) = self.v4.get_mut(ip) {
+        if let Some(mut e) = self.peers.get_mut(ip) {
             let stale: Vec<&str> = e
                 .networks
                 .iter()
@@ -483,9 +444,6 @@ impl PeerTable {
                      it still holds"
                 );
             }
-            e.in_handles = table.clone();
-        }
-        if let Some(mut e) = self.v6.get_mut(ipv6) {
             e.in_handles = table;
         }
     }
@@ -493,8 +451,8 @@ impl PeerTable {
     /// Our outbound handle table for a peer as `(network, handle)` pairs, to send
     /// the peer in a `NetworkHandles` announcement (the peer stores it as its
     /// inbound decode table).
-    pub fn outbound_handles(&self, ip: &Ipv4Addr) -> Vec<(SmolStr, u16)> {
-        self.v4
+    pub fn outbound_handles(&self, ip: &Ipv6Addr) -> Vec<(SmolStr, u16)> {
+        self.peers
             .get(ip)
             .map(|e| e.out_handles.iter().map(|(n, h)| (n.clone(), *h)).collect())
             .unwrap_or_default()
@@ -504,8 +462,8 @@ impl PeerTable {
     /// Used to announce a single network's handle to the peer after we start
     /// sharing it (the announcement is per-network, not a full snapshot, so
     /// networks are added to the peer's decode table incrementally).
-    pub fn out_handle(&self, ip: &Ipv4Addr, network: &str) -> Option<u16> {
-        self.v4
+    pub fn out_handle(&self, ip: &Ipv6Addr, network: &str) -> Option<u16> {
+        self.peers
             .get(ip)
             .and_then(|e| e.out_handles.get(network).copied())
     }
@@ -518,11 +476,11 @@ impl PeerTable {
         &self,
         identity: &EndpointId,
         device_user_map: &DeviceUserMap,
-    ) -> Option<(Ipv4Addr, Ipv6Addr, Connection)> {
+    ) -> Option<(Ipv6Addr, Connection)> {
         let by_id = |id: &EndpointId| {
-            let ip = *self.by_id.get(id)?.value();
-            let e = self.v4.get(&ip)?;
-            Some((ip, membership::derive_ipv6(id), e.conn.clone()))
+            let ip = membership::derive_ipv6(id);
+            let e = self.peers.get(&ip)?;
+            Some((ip, e.conn.clone()))
         };
         by_id(identity).or_else(|| {
             device_user_map
@@ -547,24 +505,15 @@ impl PeerTable {
     /// reports the peer `Idle` on it while it is plainly connected on another.
     ///
     /// [`handle_member_hello`]: crate::daemon::mesh
-    pub fn attach_network(&self, ip: &Ipv4Addr, ipv6: &Ipv6Addr, network: &str) -> Option<u16> {
+    pub fn attach_network(&self, ip: &Ipv6Addr, network: &str) -> Option<u16> {
         let net = SmolStr::new(network);
-        // The v4 entry owns handle allocation; v6 mirrors whatever it decides, so
-        // both halves stamp the same handle for the network.
-        let handle = {
-            let mut e = self.v4.get_mut(ip)?;
-            if e.networks.contains(&net) {
-                return None;
-            }
-            let h = next_free_handle(&e.out_handles);
-            e.networks.insert(net.clone());
-            e.out_handles.insert(net.clone(), h);
-            h
-        };
-        if let Some(mut e) = self.v6.get_mut(ipv6) {
-            e.networks.insert(net.clone());
-            e.out_handles.insert(net, handle);
+        let mut e = self.peers.get_mut(ip)?;
+        if e.networks.contains(&net) {
+            return None;
         }
+        let handle = next_free_handle(&e.out_handles);
+        e.networks.insert(net.clone());
+        e.out_handles.insert(net, handle);
         Some(handle)
     }
 
@@ -574,68 +523,42 @@ impl PeerTable {
     /// shared networks. A stale entry for a network we no longer share is harmless
     /// (the reachability check in `resolve_inbound_by_id` drops its datagrams).
     pub fn add_inbound_handle_by_id(&self, peer_id: &EndpointId, handle: u16, network: SmolStr) {
-        let Some(ip) = self.by_id.get(peer_id).map(|e| *e.value()) else {
-            return;
-        };
-        let ipv6 = membership::derive_ipv6(peer_id);
-        if let Some(mut e) = self.v4.get_mut(&ip) {
-            e.in_handles.insert(handle, network.clone());
-        }
-        if let Some(mut e) = self.v6.get_mut(&ipv6) {
+        if let Some(mut e) = self.peers.get_mut(&membership::derive_ipv6(peer_id)) {
             e.in_handles.insert(handle, network);
         }
     }
 
-    /// Resolve a peer by its mesh source IP (v4 or v6) to its transport identity
+    /// Resolve a peer by its mesh source IP to its transport identity
     /// and the set of networks we currently share with it. Used by the embedded
     /// mesh SSH server to authorize an incoming session: the peer is identified by
     /// which mesh IP the TCP connection came from (the ingress anti-spoof check in
     /// `forward.rs` guarantees that IP is the peer's own). Returns `None` if no
     /// peer holds that address.
-    pub fn identity_and_networks(&self, ip: IpAddr) -> Option<(EndpointId, Vec<SmolStr>)> {
-        match ip {
-            IpAddr::V4(v4) => self
-                .v4
-                .get(&v4)
-                .map(|e| (e.endpoint_id, e.networks.iter().cloned().collect())),
-            IpAddr::V6(v6) => self
-                .v6
-                .get(&v6)
-                .map(|e| (e.endpoint_id, e.networks.iter().cloned().collect())),
-        }
+    pub fn identity_and_networks(&self, ip: &Ipv6Addr) -> Option<(EndpointId, Vec<SmolStr>)> {
+        self.peers
+            .get(ip)
+            .map(|e| (e.endpoint_id, e.networks.iter().cloned().collect()))
     }
 
-    /// True if we currently share `network` with the peer at mesh IPv4 `ip`. The
+    /// True if we currently share `network` with the peer at mesh IPv6 `ip`. The
     /// in-band reachability check for inbound datagrams: a datagram tagged for a
     /// network we don't share with this peer is dropped.
-    pub fn shares_network_v4(&self, ip: &Ipv4Addr, network: &str) -> bool {
-        self.v4
-            .get(ip)
-            .map(|e| e.networks.contains(network))
-            .unwrap_or(false)
-    }
-
-    /// IPv6 counterpart of [`shares_network_v4`](Self::shares_network_v4).
     pub fn shares_network_v6(&self, ip: &Ipv6Addr, network: &str) -> bool {
-        self.v6
+        self.peers
             .get(ip)
             .map(|e| e.networks.contains(network))
             .unwrap_or(false)
     }
 
-    /// The shared connection to a peer identified by mesh IPv4, if any.
-    pub fn conn_for_ip(&self, ip: &Ipv4Addr) -> Option<Connection> {
-        self.v4.get(ip).map(|e| e.conn.clone())
+    /// The shared connection to a peer identified by mesh IPv6, if any.
+    pub fn conn_for_ip(&self, ip: &Ipv6Addr) -> Option<Connection> {
+        self.peers.get(ip).map(|e| e.conn.clone())
     }
 
     /// Removes the peer entirely (all networks + connection). Used for identity
     /// rotation and full roster removal.
-    pub fn remove(&self, ip: &Ipv4Addr, ipv6: &Ipv6Addr) {
-        let removed = self.v4.remove(ip);
-        self.v6.remove(ipv6);
-        if let Some((_, entry)) = &removed {
-            self.by_id.remove(&entry.endpoint_id);
-        }
+    pub fn remove(&self, ip: &Ipv6Addr) {
+        let removed = self.peers.remove(ip);
         if let (Some((_, entry)), Some(audit)) = (removed, &self.audit) {
             audit.log_disconnect(*ip, &entry.endpoint_id.to_string());
         }
@@ -646,15 +569,10 @@ impl PeerTable {
     /// membership doesn't unroute a peer still reachable via `db`. Returns the
     /// peer's connection **iff** this removed its last shared network (so the
     /// caller can close the now-unused connection); `None` otherwise.
-    pub fn remove_peer_from_network(
-        &self,
-        ip: &Ipv4Addr,
-        ipv6: &Ipv6Addr,
-        network: &str,
-    ) -> Option<Connection> {
+    pub fn remove_peer_from_network(&self, ip: &Ipv6Addr, network: &str) -> Option<Connection> {
         let mut last_conn = None;
         let mut dropped_id = None;
-        if let Some(mut e) = self.v4.get_mut(ip) {
+        if let Some(mut e) = self.peers.get_mut(ip) {
             e.networks.remove(network);
             e.out_handles.remove(network);
             if e.networks.is_empty() {
@@ -662,15 +580,7 @@ impl PeerTable {
                 dropped_id = Some(e.endpoint_id);
             }
         }
-        self.v4.remove_if(ip, |_, e| e.networks.is_empty());
-        if let Some(mut e) = self.v6.get_mut(ipv6) {
-            e.networks.remove(network);
-            e.out_handles.remove(network);
-        }
-        self.v6.remove_if(ipv6, |_, e| e.networks.is_empty());
-        if let Some(endpoint_id) = dropped_id {
-            self.by_id.remove(&endpoint_id);
-        }
+        self.peers.remove_if(ip, |_, e| e.networks.is_empty());
         if let (Some(endpoint_id), Some(audit)) = (dropped_id, &self.audit) {
             audit.log_disconnect(*ip, &endpoint_id.to_string());
         }
@@ -682,47 +592,13 @@ impl PeerTable {
     /// authenticated remote id but not the sender's (possibly collision-suffixed)
     /// roster IP. Same contract as [`remove_peer_from_network`]: returns the
     /// connection iff this removed the peer's last shared network (so the caller can
-    /// close the now-unused link); `None` otherwise or if the id is unknown. Keys
-    /// off the entry's stored `endpoint_id` for both maps, so no address derivation
-    /// is needed.
+    /// close the now-unused link); `None` otherwise or if the id is unknown.
     pub fn remove_peer_from_network_by_id(
         &self,
         peer_id: &EndpointId,
         network: &str,
     ) -> Option<Connection> {
-        let ip = *self.by_id.get(peer_id)?.value();
-        let mut last_conn = None;
-        let mut dropped = false;
-        if let Some(mut e) = self.v4.get_mut(&ip) {
-            e.networks.remove(network);
-            e.out_handles.remove(network);
-            if e.networks.is_empty() {
-                last_conn = Some(e.conn.clone());
-                dropped = true;
-            }
-        }
-        self.v4.remove_if(&ip, |_, e| e.networks.is_empty());
-        // The v6 entry is keyed separately (by the peer's `200::/7` address); find
-        // it by the same stored endpoint id and drop the network there too.
-        let v6_key = self
-            .v6
-            .iter()
-            .find(|e| e.endpoint_id == *peer_id)
-            .map(|e| *e.key());
-        if let Some(k) = v6_key {
-            if let Some(mut e) = self.v6.get_mut(&k) {
-                e.networks.remove(network);
-                e.out_handles.remove(network);
-            }
-            self.v6.remove_if(&k, |_, e| e.networks.is_empty());
-        }
-        if dropped {
-            self.by_id.remove(peer_id);
-            if let Some(audit) = &self.audit {
-                audit.log_disconnect(ip, &peer_id.to_string());
-            }
-        }
-        last_conn
+        self.remove_peer_from_network(&membership::derive_ipv6(peer_id), network)
     }
 
     /// Connection-aware variant of [`remove_peer_from_network`]: drops the
@@ -737,8 +613,7 @@ impl PeerTable {
     /// that already replaced it in the table after a peer re-dialed.
     pub fn remove_peer_from_network_if(
         &self,
-        ip: &Ipv4Addr,
-        ipv6: &Ipv6Addr,
+        ip: &Ipv6Addr,
         network: &str,
         stable_id: usize,
     ) -> Option<Connection> {
@@ -746,42 +621,44 @@ impl PeerTable {
         // dropped before remove_peer_from_network takes a write guard on the
         // same shard.
         let matches = self
-            .v4
+            .peers
             .get(ip)
             .map(|e| e.networks.contains(network) && e.conn.stable_id() == stable_id)
             .unwrap_or(false);
         if !matches {
             return None;
         }
-        self.remove_peer_from_network(ip, ipv6, network)
+        self.remove_peer_from_network(ip, network)
     }
 
     /// True if the stored connection for the peer at `ip` is the one identified
     /// by `stable_id`. Lets a disconnect consumer tell a live connection from a
     /// stale one before acting on a whole-peer removal.
-    pub fn conn_is_current(&self, ip: &Ipv4Addr, stable_id: usize) -> bool {
-        self.v4
+    pub fn conn_is_current(&self, ip: &Ipv6Addr, stable_id: usize) -> bool {
+        self.peers
             .get(ip)
             .map(|e| e.conn.stable_id() == stable_id)
             .unwrap_or(false)
     }
 
     /// One connection per peer, for global broadcasts.
-    pub fn all_connections(&self) -> Vec<(Ipv4Addr, Connection)> {
-        self.v4.iter().map(|e| (*e.key(), e.conn.clone())).collect()
+    pub fn all_connections(&self) -> Vec<(Ipv6Addr, Connection)> {
+        self.peers
+            .iter()
+            .map(|e| (*e.key(), e.conn.clone()))
+            .collect()
     }
 
     /// Stops sharing `network` with every peer. Returns the IPs of peers left
     /// sharing no network (fully removed), each paired with its connection so the
     /// caller can close links that are now entirely unused.
-    pub fn remove_by_network(&self, network: &str) -> Vec<(Ipv4Addr, Connection)> {
+    pub fn remove_by_network(&self, network: &str) -> Vec<(Ipv6Addr, Connection)> {
         let mut removed = Vec::new();
-        self.v4.retain(|ip, e| {
+        self.peers.retain(|ip, e| {
             e.networks.remove(network);
             e.out_handles.remove(network);
             if e.networks.is_empty() {
                 removed.push((*ip, e.conn.clone()));
-                self.by_id.remove(&e.endpoint_id);
                 // A peer losing its last shared network is a full disconnect, so
                 // audit it here too (matching `remove`/`remove_peer_from_network`);
                 // the audit contract is one `disconnect` per peer that fully drops.
@@ -793,17 +670,12 @@ impl PeerTable {
                 true
             }
         });
-        self.v6.retain(|_ip, e| {
-            e.networks.remove(network);
-            e.out_handles.remove(network);
-            !e.networks.is_empty()
-        });
         removed
     }
 
     /// The identity + IP of every peer we currently share `network` with.
-    pub fn peers_for_network(&self, network: &str) -> Vec<(EndpointId, Ipv4Addr)> {
-        self.v4
+    pub fn peers_for_network(&self, network: &str) -> Vec<(EndpointId, Ipv6Addr)> {
+        self.peers
             .iter()
             .filter(|e| e.networks.contains(network))
             .map(|e| (e.endpoint_id, *e.key()))
@@ -817,8 +689,8 @@ impl PeerTable {
     pub fn peers_for_network_with_conn(
         &self,
         network: &str,
-    ) -> Vec<(EndpointId, Ipv4Addr, Connection)> {
-        self.v4
+    ) -> Vec<(EndpointId, Ipv6Addr, Connection)> {
+        self.peers
             .iter()
             .filter(|e| e.networks.contains(network))
             .map(|e| (e.endpoint_id, *e.key(), e.conn.clone()))
@@ -826,18 +698,20 @@ impl PeerTable {
     }
 
     #[cfg(test)]
-    pub fn all_peer_ids(&self) -> Vec<(Ipv4Addr, EndpointId)> {
-        self.v4.iter().map(|e| (*e.key(), e.endpoint_id)).collect()
+    pub fn all_peer_ids(&self) -> Vec<(Ipv6Addr, EndpointId)> {
+        self.peers
+            .iter()
+            .map(|e| (*e.key(), e.endpoint_id))
+            .collect()
     }
 }
 
 /// A known roster member and the networks we share with it, resolvable by mesh IP
-/// **without** a live connection. Returned by [`RosterRouteMap::resolve_v4`] so the
+/// **without** a live connection. Returned by [`RosterRouteMap::resolve_v6`] so the
 /// forwarding loop can turn a destination IP into the peer identity to lazily dial.
 #[derive(Clone, Debug)]
 pub struct RouteTarget {
     pub endpoint_id: EndpointId,
-    pub ipv4: Ipv4Addr,
     pub ipv6: Ipv6Addr,
     /// Every network we currently share with this peer (so a lazy dial can
     /// `MeshHello` on each, like a reconnect).
@@ -850,13 +724,11 @@ pub struct RouteTarget {
 #[derive(Clone, Copy, Debug)]
 pub struct RouteMember {
     pub endpoint_id: EndpointId,
-    pub ipv4: Ipv4Addr,
     pub ipv6: Ipv6Addr,
 }
 
 struct RouteEntry {
     endpoint_id: EndpointId,
-    ipv4: Ipv4Addr,
     ipv6: Ipv6Addr,
     networks: HashSet<SmolStr>,
 }
@@ -865,7 +737,6 @@ impl RouteEntry {
     fn to_target(&self) -> RouteTarget {
         RouteTarget {
             endpoint_id: self.endpoint_id,
-            ipv4: self.ipv4,
             ipv6: self.ipv6,
             networks: self.networks.iter().cloned().collect(),
         }
@@ -885,8 +756,7 @@ impl RouteEntry {
 /// the opposite - it lists peers we could reach but currently don't.
 #[derive(Clone, Default)]
 pub struct RosterRouteMap {
-    v4: Arc<FastDashMap<Ipv4Addr, RouteEntry>>,
-    v6: Arc<FastDashMap<Ipv6Addr, RouteEntry>>,
+    peers: Arc<FastDashMap<Ipv6Addr, RouteEntry>>,
 }
 
 impl RosterRouteMap {
@@ -900,86 +770,65 @@ impl RosterRouteMap {
     /// by the caller.
     pub fn sync_network(&self, network: &str, members: &[RouteMember]) {
         let net = SmolStr::new(network);
-        let fresh: HashSet<Ipv4Addr> = members.iter().map(|m| m.ipv4).collect();
+        let fresh: HashSet<Ipv6Addr> = members.iter().map(|m| m.ipv6).collect();
         // Drop this network from peers that used to be in it but no longer are.
-        let stale: Vec<(Ipv4Addr, Ipv6Addr)> = self
-            .v4
+        let stale: Vec<Ipv6Addr> = self
+            .peers
             .iter()
             .filter(|e| e.networks.contains(&net) && !fresh.contains(e.key()))
-            .map(|e| (*e.key(), e.ipv6))
+            .map(|e| *e.key())
             .collect();
-        for (v4, v6) in stale {
-            self.drop_network(&v4, &v6, &net);
+        for v6 in stale {
+            self.drop_network(&v6, &net);
         }
         // Upsert the current members.
         for m in members {
-            self.upsert(m.ipv4, m.ipv6, m.endpoint_id, net.clone());
+            self.upsert(m.ipv6, m.endpoint_id, net.clone());
         }
     }
 
-    fn upsert(&self, ipv4: Ipv4Addr, ipv6: Ipv6Addr, endpoint_id: EndpointId, net: SmolStr) {
-        let mut v4 = self.v4.entry(ipv4).or_insert_with(|| RouteEntry {
+    fn upsert(&self, ipv6: Ipv6Addr, endpoint_id: EndpointId, net: SmolStr) {
+        let mut e = self.peers.entry(ipv6).or_insert_with(|| RouteEntry {
             endpoint_id,
-            ipv4,
             ipv6,
             networks: HashSet::new(),
         });
-        v4.endpoint_id = endpoint_id;
-        v4.ipv6 = ipv6;
-        v4.networks.insert(net.clone());
-        drop(v4);
-        let mut v6 = self.v6.entry(ipv6).or_insert_with(|| RouteEntry {
-            endpoint_id,
-            ipv4,
-            ipv6,
-            networks: HashSet::new(),
-        });
-        v6.endpoint_id = endpoint_id;
-        v6.ipv4 = ipv4;
-        v6.networks.insert(net);
+        e.endpoint_id = endpoint_id;
+        e.networks.insert(net);
     }
 
-    fn drop_network(&self, ipv4: &Ipv4Addr, ipv6: &Ipv6Addr, net: &SmolStr) {
-        if let Some(mut e) = self.v4.get_mut(ipv4) {
+    fn drop_network(&self, ipv6: &Ipv6Addr, net: &SmolStr) {
+        if let Some(mut e) = self.peers.get_mut(ipv6) {
             e.networks.remove(net);
         }
-        self.v4.remove_if(ipv4, |_, e| e.networks.is_empty());
-        if let Some(mut e) = self.v6.get_mut(ipv6) {
-            e.networks.remove(net);
-        }
-        self.v6.remove_if(ipv6, |_, e| e.networks.is_empty());
+        self.peers.remove_if(ipv6, |_, e| e.networks.is_empty());
     }
 
     /// Drop `network` entirely (all its members) from the map. Members still in
     /// another shared network keep their entry.
     pub fn remove_network(&self, network: &str) {
         let net = SmolStr::new(network);
-        let affected: Vec<(Ipv4Addr, Ipv6Addr)> = self
-            .v4
+        let affected: Vec<Ipv6Addr> = self
+            .peers
             .iter()
             .filter(|e| e.networks.contains(&net))
-            .map(|e| (*e.key(), e.ipv6))
+            .map(|e| *e.key())
             .collect();
-        for (v4, v6) in affected {
-            self.drop_network(&v4, &v6, &net);
+        for v6 in affected {
+            self.drop_network(&v6, &net);
         }
     }
 
     /// Add or refresh a single member's membership in `network` (incremental,
     /// no replace). Used when we connect to a peer, so the map tracks it for a
     /// later idle re-dial before the next full roster sync.
-    pub fn sync_add(&self, network: &str, ipv4: Ipv4Addr, ipv6: Ipv6Addr, endpoint_id: EndpointId) {
-        self.upsert(ipv4, ipv6, endpoint_id, SmolStr::new(network));
+    pub fn sync_add(&self, network: &str, ipv6: Ipv6Addr, endpoint_id: EndpointId) {
+        self.upsert(ipv6, endpoint_id, SmolStr::new(network));
     }
 
-    /// Resolve a destination mesh IPv4 to its roster target, if known.
-    pub fn resolve_v4(&self, ip: &Ipv4Addr) -> Option<RouteTarget> {
-        self.v4.get(ip).map(|e| e.to_target())
-    }
-
-    /// IPv6 counterpart of [`resolve_v4`](Self::resolve_v4).
+    /// Resolve a destination mesh IPv6 to its roster target, if known.
     pub fn resolve_v6(&self, ip: &Ipv6Addr) -> Option<RouteTarget> {
-        self.v6.get(ip).map(|e| e.to_target())
+        self.peers.get(ip).map(|e| e.to_target())
     }
 }
 
@@ -1108,7 +957,6 @@ mod tests {
     #[test]
     fn test_peer_table_empty_lookup() {
         let table = PeerTable::new();
-        assert!(table.lookup_v4(&Ipv4Addr::new(100, 64, 0, 5)).is_none());
         assert!(
             table
                 .lookup_v6(&Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 1))
@@ -1128,7 +976,6 @@ mod tests {
         let id = iroh::SecretKey::from_bytes(&[seed; 32]).public();
         RouteMember {
             endpoint_id: id,
-            ipv4: crate::membership::derive_ip(&id),
             ipv6: crate::membership::derive_ipv6(&id),
         }
     }
@@ -1140,7 +987,7 @@ mod tests {
         let b = member(2);
         map.sync_network("net", &[a, b]);
 
-        let ta = map.resolve_v4(&a.ipv4).expect("a resolvable");
+        let ta = map.resolve_v6(&a.ipv6).expect("a resolvable");
         assert_eq!(ta.endpoint_id, a.endpoint_id);
         assert_eq!(ta.networks, vec![SmolStr::new("net")]);
         assert_eq!(
@@ -1150,9 +997,9 @@ mod tests {
 
         // Re-sync with a shrunk roster: b is gone.
         map.sync_network("net", &[a]);
-        assert!(map.resolve_v4(&a.ipv4).is_some());
+        assert!(map.resolve_v6(&a.ipv6).is_some());
         assert!(
-            map.resolve_v4(&b.ipv4).is_none(),
+            map.resolve_v6(&b.ipv6).is_none(),
             "dropped member is unresolvable"
         );
         assert!(map.resolve_v6(&b.ipv6).is_none());
@@ -1164,19 +1011,19 @@ mod tests {
         let a = member(7);
         map.sync_network("dev", &[a]);
         map.sync_network("db", &[a]);
-        let t = map.resolve_v4(&a.ipv4).expect("resolvable");
+        let t = map.resolve_v6(&a.ipv6).expect("resolvable");
         let mut nets = t.networks.clone();
         nets.sort();
         assert_eq!(nets, vec![SmolStr::new("db"), SmolStr::new("dev")]);
 
         // Leaving one network keeps the peer reachable via the other.
         map.remove_network("dev");
-        let t = map.resolve_v4(&a.ipv4).expect("still resolvable via db");
+        let t = map.resolve_v6(&a.ipv6).expect("still resolvable via db");
         assert_eq!(t.networks, vec![SmolStr::new("db")]);
 
         // Leaving the last network drops it entirely.
         map.remove_network("db");
-        assert!(map.resolve_v4(&a.ipv4).is_none());
+        assert!(map.resolve_v6(&a.ipv6).is_none());
     }
 
     #[test]
@@ -1186,9 +1033,9 @@ mod tests {
         let b = member(4);
         map.sync_network("net", &[a]);
         // Incremental add of b must not drop a (unlike a full sync_network).
-        map.sync_add("net", b.ipv4, b.ipv6, b.endpoint_id);
-        assert!(map.resolve_v4(&a.ipv4).is_some());
-        assert!(map.resolve_v4(&b.ipv4).is_some());
+        map.sync_add("net", b.ipv6, b.endpoint_id);
+        assert!(map.resolve_v6(&a.ipv6).is_some());
+        assert!(map.resolve_v6(&b.ipv6).is_some());
     }
 
     #[test]
@@ -1214,7 +1061,7 @@ mod tests {
         let in_flight: HashSet<EndpointId> = HashSet::new();
         let mut in_flight = in_flight;
 
-        let t = map.resolve_v4(&a.ipv4).expect("known member resolves");
+        let t = map.resolve_v6(&a.ipv6).expect("known member resolves");
         // First packet claims the in-flight slot; a duplicate is rejected.
         assert!(in_flight.insert(t.endpoint_id));
         assert!(
@@ -1223,7 +1070,10 @@ mod tests {
         );
 
         // Unknown destination doesn't resolve, so nothing is dialed.
-        assert!(map.resolve_v4(&Ipv4Addr::new(100, 64, 9, 9)).is_none());
+        assert!(
+            map.resolve_v6(&Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 0x9999))
+                .is_none()
+        );
     }
 
     // ---- In-process real-connection tests --------------------------------
@@ -1292,22 +1142,21 @@ mod tests {
         // inbound loss.
         let (_srv, _cli, conn, _client_side) = connected_pair().await;
         let peer = conn.remote_id();
-        let ip = crate::membership::derive_ip(&peer);
         let ipv6 = crate::membership::derive_ipv6(&peer);
         let table = PeerTable::new();
 
         assert!(
-            table.add(ip, ipv6, conn.clone(), peer, "n1"),
+            table.add(ipv6, conn.clone(), peer, "n1"),
             "first add of a new peer must report the connection as new"
         );
         // Same connection, a second shared network: one reader already serves it,
         // so this must NOT report a new connection (no duplicate reader).
         assert!(
-            !table.add(ip, ipv6, conn.clone(), peer, "n2"),
+            !table.add(ipv6, conn.clone(), peer, "n2"),
             "re-adding the same connection for another network must not respawn"
         );
         // Both networks route over the one connection.
-        let route = table.lookup_v4(&ip).expect("peer routable");
+        let route = table.lookup_v6(&ipv6).expect("peer routable");
         assert_eq!(route.conn.stable_id(), conn.stable_id());
     }
 
@@ -1319,32 +1168,30 @@ mod tests {
         // it with `attach_network` once the roster names the peer.
         let (_srv, _cli, conn, _client_side) = connected_pair().await;
         let peer = conn.remote_id();
-        let ip = crate::membership::derive_ip(&peer);
         let ipv6 = crate::membership::derive_ipv6(&peer);
         let table = PeerTable::new();
-        table.add(ip, ipv6, conn.clone(), peer, "n1");
+        table.add(ipv6, conn.clone(), peer, "n1");
 
         // Before the repair the peer is invisible on n2 (this is what shows as
         // `Idle` in `ray status` while it is Active on n1).
         assert!(table.peers_for_network_with_conn("n2").is_empty());
 
         let handle = table
-            .attach_network(&ip, &ipv6, "n2")
+            .attach_network(&ipv6, "n2")
             .expect("attaching an unshared network assigns a handle");
         assert_eq!(table.peers_for_network_with_conn("n2").len(), 1);
-        assert_eq!(table.out_handle(&ip, "n2"), Some(handle));
+        assert_eq!(table.out_handle(&ipv6, "n2"), Some(handle));
         // n1 keeps its own distinct handle: the repair must not collide with or
         // clobber the networks already negotiated on this connection.
-        assert_ne!(table.out_handle(&ip, "n1"), Some(handle));
+        assert_ne!(table.out_handle(&ipv6, "n1"), Some(handle));
         assert_eq!(table.peers_for_network_with_conn("n1").len(), 1);
 
         // Idempotent: a later reconverge re-running the repair changes nothing.
-        assert_eq!(table.attach_network(&ip, &ipv6, "n2"), None);
-        assert_eq!(table.out_handle(&ip, "n2"), Some(handle));
+        assert_eq!(table.attach_network(&ipv6, "n2"), None);
+        assert_eq!(table.out_handle(&ipv6, "n2"), Some(handle));
         // A peer we hold no connection to cannot be attached.
-        let absent = "100.99.99.99".parse().unwrap();
-        let absent6 = crate::membership::derive_ipv6(&conn.remote_id());
-        assert_eq!(table.attach_network(&absent, &absent6, "n2"), None);
+        let absent = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 0x9999);
+        assert_eq!(table.attach_network(&absent, "n2"), None);
     }
 
     #[tokio::test]
@@ -1354,10 +1201,9 @@ mod tests {
         // unrepaired entry silently blackholes that network's traffic.
         let (_srv, _cli, conn, _client_side) = connected_pair().await;
         let peer = conn.remote_id();
-        let ip = crate::membership::derive_ip(&peer);
         let ipv6 = crate::membership::derive_ipv6(&peer);
         let table = PeerTable::new();
-        table.add(ip, ipv6, conn.clone(), peer, "n1");
+        table.add(ipv6, conn.clone(), peer, "n1");
         // The peer announced its handle for n2; we just never joined it to the
         // entry's shared set.
         table.add_inbound_handle_by_id(&peer, 7, SmolStr::new("n2"));
@@ -1368,10 +1214,10 @@ mod tests {
             "n2 datagrams must be dropped while the entry does not share n2"
         );
 
-        table.attach_network(&ip, &ipv6, "n2");
+        table.attach_network(&ipv6, "n2");
         assert_eq!(
             table.resolve_inbound_by_id(&peer, 7),
-            Some((ip, SmolStr::new("n2"))),
+            Some((ipv6, SmolStr::new("n2"))),
             "after the repair the same datagram must be accepted on n2"
         );
     }
@@ -1385,20 +1231,19 @@ mod tests {
     async fn route_skips_a_network_the_peer_no_longer_announces() {
         let (_srv, _cli, conn, _client_side) = connected_pair().await;
         let peer = conn.remote_id();
-        let ip = crate::membership::derive_ip(&peer);
         let ipv6 = crate::membership::derive_ipv6(&peer);
         let table = PeerTable::new();
-        table.add(ip, ipv6, conn.clone(), peer, "aaa");
-        table.add(ip, ipv6, conn.clone(), peer, "zzz");
+        table.add(ipv6, conn.clone(), peer, "aaa");
+        table.add(ipv6, conn.clone(), peer, "zzz");
 
         // The peer's announcement carries only zzz: it left aaa without us
         // hearing about it (offline, or we are aaa's coordinator so nothing else
         // ever corrects our roster).
-        table.set_inbound_handles(&ip, &ipv6, &[(1, SmolStr::new("zzz"))]);
+        table.set_inbound_handles(&ipv6, &[(1, SmolStr::new("zzz"))]);
 
-        let route = table.lookup_v4(&ip).expect("peer is reachable");
+        let route = table.lookup_v6(&ipv6).expect("peer is reachable");
         assert_eq!(route.network, "zzz");
-        assert_eq!(route.handle, table.out_handle(&ip, "zzz").unwrap());
+        assert_eq!(route.handle, table.out_handle(&ipv6, "zzz").unwrap());
         // The v6 address of the same peer routes the same way.
         assert_eq!(table.lookup_v6(&ipv6).unwrap().network, "zzz");
     }
@@ -1407,30 +1252,24 @@ mod tests {
     async fn route_keeps_the_lexical_pick_when_the_peer_agrees_or_is_silent() {
         let (_srv, _cli, conn, _client_side) = connected_pair().await;
         let peer = conn.remote_id();
-        let ip = crate::membership::derive_ip(&peer);
         let ipv6 = crate::membership::derive_ipv6(&peer);
         let table = PeerTable::new();
-        table.add(ip, ipv6, conn.clone(), peer, "aaa");
-        table.add(ip, ipv6, conn.clone(), peer, "zzz");
+        table.add(ipv6, conn.clone(), peer, "aaa");
+        table.add(ipv6, conn.clone(), peer, "zzz");
 
         // Nothing announced yet (the handshake is still in flight): the plain
         // pick stands, so a fresh connection routes from its first packet.
-        assert_eq!(table.lookup_v4(&ip).unwrap().network, "aaa");
+        assert_eq!(table.lookup_v6(&ipv6).unwrap().network, "aaa");
 
         // Peer agrees on both: unchanged, and stable across lookups.
-        table.set_inbound_handles(
-            &ip,
-            &ipv6,
-            &[(1, SmolStr::new("aaa")), (2, SmolStr::new("zzz"))],
-        );
-        assert_eq!(table.lookup_v4(&ip).unwrap().network, "aaa");
+        table.set_inbound_handles(&ipv6, &[(1, SmolStr::new("aaa")), (2, SmolStr::new("zzz"))]);
+        assert_eq!(table.lookup_v6(&ipv6).unwrap().network, "aaa");
     }
 
     #[tokio::test]
     async fn idle_support_capability_and_last_active_lookup() {
         let (_srv, _cli, conn, _client_side) = connected_pair().await;
         let peer = conn.remote_id();
-        let ip = crate::membership::derive_ip(&peer);
         let ipv6 = crate::membership::derive_ipv6(&peer);
         let table = PeerTable::new();
 
@@ -1438,7 +1277,7 @@ mod tests {
         assert!(!table.supports_idle_close(&peer));
         assert!(table.last_active_of(&peer).is_none());
 
-        assert!(table.add(ip, ipv6, conn.clone(), peer, "n1"));
+        assert!(table.add(ipv6, conn.clone(), peer, "n1"));
 
         // Registered but has not announced its capability yet: default is
         // "unsupported" so we never idle-close a peer before it advertises.
@@ -1456,7 +1295,6 @@ mod tests {
     async fn idle_remaining_tracks_activity_clock() {
         let (_srv, _cli, conn, _client_side) = connected_pair().await;
         let peer = conn.remote_id();
-        let ip = crate::membership::derive_ip(&peer);
         let ipv6 = crate::membership::derive_ipv6(&peer);
         let table = PeerTable::new();
         let window = Duration::from_secs(120);
@@ -1464,7 +1302,7 @@ mod tests {
         // Unknown peer has no activity clock to watch.
         assert!(table.idle_remaining(&peer, window).is_none());
 
-        assert!(table.add(ip, ipv6, conn.clone(), peer, "n1"));
+        assert!(table.add(ipv6, conn.clone(), peer, "n1"));
 
         // Freshly registered: nearly the whole window remains (slack for wall time).
         let rem = table.idle_remaining(&peer, window).unwrap();
@@ -1495,16 +1333,15 @@ mod tests {
         // replaced.
         let (server, client, conn1, _c1) = connected_pair().await;
         let peer = conn1.remote_id();
-        let ip = crate::membership::derive_ip(&peer);
         let ipv6 = crate::membership::derive_ipv6(&peer);
         let table = PeerTable::new();
-        assert!(table.add(ip, ipv6, conn1.clone(), peer, "n1"));
+        assert!(table.add(ipv6, conn1.clone(), peer, "n1"));
 
         // Second, distinct connection to the same server identity.
         let (conn2, _c2) = dial(&server, &client).await;
         assert_ne!(conn1.stable_id(), conn2.stable_id(), "distinct connections");
         assert!(
-            table.add(ip, ipv6, conn2.clone(), peer, "n1"),
+            table.add(ipv6, conn2.clone(), peer, "n1"),
             "a reconnect (different connection) must report the connection as new"
         );
     }
@@ -1522,13 +1359,12 @@ mod tests {
         // R receives, S sends. Establish a real connection; `conn_r` is R's side.
         let (_srv, _cli, conn_r, conn_s) = connected_pair().await;
         let s_id = conn_r.remote_id();
-        let s_ip = crate::membership::derive_ip(&s_id);
         let s_ipv6 = crate::membership::derive_ipv6(&s_id);
-        let r_ip = crate::membership::derive_ip(&conn_s.remote_id());
+        let r_ipv6 = crate::membership::derive_ipv6(&conn_s.remote_id());
 
         // Register S in R's table for "net" and teach R that S's tag 1 = "net".
         let peers = PeerTable::new();
-        peers.add(s_ip, s_ipv6, conn_r.clone(), s_id, "net");
+        peers.add(s_ipv6, conn_r.clone(), s_id, "net");
         peers.add_inbound_handle_by_id(&s_id, 1, SmolStr::new("net"));
 
         let (tun_tx, mut tun_rx) = mpsc::channel::<Bytes>(8);
@@ -1542,11 +1378,11 @@ mod tests {
         };
         spawn_peer_reader(conn_r.clone(), s_id, peers.clone(), ctx);
 
-        // S sends a tagged ICMP echo from its own mesh IP: default firewall
+        // S sends a tagged ICMPv6 echo from its own mesh IP: default firewall
         // allows inbound ICMP, and the source matches S's assigned IP so the
         // anti-spoof check passes. The reader must untag, resolve the network via
         // the handle, and write the raw IP packet (tag stripped) to the TUN.
-        let icmp = icmp_echo_packet(s_ip, r_ip);
+        let icmp = icmp6_echo_packet(s_ipv6, r_ipv6);
         conn_s
             .send_datagram(tag_datagram(1, &icmp))
             .expect("send datagram");
@@ -1562,17 +1398,18 @@ mod tests {
         );
     }
 
-    /// Minimal IPv4/ICMP echo-request packet from `src` to `dst`, enough for
-    /// `firewall::parse_packet_info` (version/IHL, protocol 1, src/dst) and the
-    /// seeded inbound `allow icmp` rule.
-    fn icmp_echo_packet(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
-        let mut p = vec![0u8; 28];
-        p[0] = 0x45; // IPv4, IHL=5
-        p[3] = 28; // total length
-        p[9] = 1; // ICMP
-        p[12..16].copy_from_slice(&src.octets());
-        p[16..20].copy_from_slice(&dst.octets());
-        p[20] = 8; // ICMP type = echo request
+    /// Minimal IPv6/ICMPv6 echo-request packet from `src` to `dst`, enough for
+    /// `firewall::parse_packet_info` (version, next header 58, src/dst) and the
+    /// seeded inbound `allow icmp` rule, which covers ICMPv6 as well as ICMPv4.
+    fn icmp6_echo_packet(src: Ipv6Addr, dst: Ipv6Addr) -> Vec<u8> {
+        let mut p = vec![0u8; 48];
+        p[0] = 0x60; // IPv6, traffic class 0
+        p[5] = 8; // payload length: the ICMPv6 header below
+        p[6] = 58; // next header = ICMPv6
+        p[7] = 64; // hop limit
+        p[8..24].copy_from_slice(&src.octets());
+        p[24..40].copy_from_slice(&dst.octets());
+        p[40] = 128; // ICMPv6 type = echo request
         p
     }
 

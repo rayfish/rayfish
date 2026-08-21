@@ -13,7 +13,6 @@ use anyhow::{Context, Result};
 use clap::{FromArgMatches, Parser, Subcommand};
 use ray_proto::settings::node_key_help;
 
-use config::Ipv6Only;
 use membership::GroupMode;
 
 // The CLI command handlers are split into the `cli` module (`src/cli/`) to keep
@@ -207,13 +206,6 @@ pub(crate) enum Command {
         /// when create/join don't specify one; doesn't rename existing networks
         #[arg(long)]
         hostname: Option<String>,
-        /// Always run the data plane over IPv6 only, so another VPN (e.g.
-        /// Tailscale) can keep 100.64.0.0/10. Only needed to make the mode
-        /// permanent: by default the daemon switches to it on its own when it
-        /// finds such a VPN. Takes effect on the next daemon restart; undo with
-        /// `ray config set ipv6-only auto` (or `off` to refuse to start instead)
-        #[arg(long)]
-        ipv6_only: bool,
     },
     /// Standby: take the data plane offline, staying connected to peers
     ///
@@ -1413,10 +1405,7 @@ async fn run() -> Result<()> {
             stats.spawn_logger(token.clone());
             daemon::run_daemon(token, stats).await
         }
-        Command::Up {
-            hostname,
-            ipv6_only,
-        } => cmd_up(hostname, ipv6_only.then_some(Ipv6Only::On)).await,
+        Command::Up { hostname } => cmd_up(hostname).await,
         Command::Down => ipc_down().await,
         Command::Stop => cmd_stop().await,
         Command::Start => cmd_start().await,
@@ -1539,11 +1528,8 @@ pub(crate) async fn ipc_mutate(msg: ipc::IpcMessage) -> Result<()> {
     ipc::send(&mut stream, msg).await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::Error { message } => {
-            print_error("error", &message, None);
-            std::process::exit(1);
-        }
-        other => eprintln!("Unexpected response: {other:?}"),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -1603,11 +1589,8 @@ async fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
                         }
                     }
                 }
-                ipc::IpcMessage::Error { message } => {
-                    print_error("error", &message, None);
-                    std::process::exit(1);
-                }
-                other => eprintln!("Unexpected response: {other:?}"),
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
+                other => fail_unexpected(&other),
             }
             Ok(())
         }
@@ -1642,10 +1625,7 @@ async fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
 fn parse_node_key(key: &str) -> ipc::NodeKey {
     match key.parse() {
         Ok(k) => k,
-        Err(e) => {
-            print_error("error", &e, None);
-            std::process::exit(1);
-        }
+        Err(e) => fail_with("error", &e),
     }
 }
 
@@ -1672,11 +1652,8 @@ async fn cmd_set_operator(user: &str) -> Result<()> {
     ipc::send(&mut stream, ipc::IpcMessage::SetOperator { uid }).await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::Error { message } => {
-            print_error("error", &message, None);
-            std::process::exit(1);
-        }
-        other => eprintln!("Unexpected response: {other:?}"),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }

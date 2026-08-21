@@ -8,7 +8,7 @@
 # Proves the parts of the TUN-intercepted Magic DNS resolver that unit tests
 # can't reach end to end, on real Linux hosts:
 #   - after `ray up` + join, a peer's `<host>.<net>.ray` resolves through the
-#     *system* resolver (getent/libc) to its VPN IPv4 — i.e. the OS was pointed
+#     *system* resolver (getent/libc) to its mesh IPv6, i.e. the OS was pointed
 #     at the magic resolver IP and the in-daemon resolver answered it;
 #   - resolution drives real reachability (ping by name);
 #   - the resolver does NOT bind host port 53 — it answers via a magic IP routed
@@ -38,10 +38,15 @@ B="$(server_ip "$SERVERS" srv-b || true)"
 [[ -n "$A" && -n "$B" ]] || { echo "missing srv-a/srv-b in $SERVERS"; exit 1; }
 
 NET=dns
-MAGIC=100.100.100.53
+MAGIC=200::53
 
-# A4 <host-ip> <name> : the IPv4 the host's *system* resolver returns for <name>
-# (libc/nsswitch path, the same one `ping` uses), or empty.
+# a6 <host-ip> <name> : the IPv6 the host's *system* resolver returns for <name>
+# (libc/nsswitch path, the same one `ping` uses), or empty. This is the one that
+# answers for `.ray`: the mesh has no IPv4, so an A query there is NODATA.
+a6(){ on "$1" "getent ahostsv6 $2 2>/dev/null | awk 'NR==1{print \$1}'"; }
+
+# a4 <host-ip> <name> : same for IPv4. Only meaningful for *public* names, which
+# is exactly what the upstream-forwarding checks below want.
 a4(){ on "$1" "getent ahostsv4 $2 2>/dev/null | awk 'NR==1{print \$1}'"; }
 
 # ---------------------------------------------------------------------------
@@ -64,7 +69,7 @@ INV_B="$(mint_invite "$A" "$NET" srv-b)"
 on "$B" "ray join $INV_B --hostname srv-b" 2>&1 | strip | sed 's/^/   b| /'
 wait_roster "$A" srv-b
 
-A_IP="$(my_ip4 "$A" "$NET")"; B_IP="$(my_ip4 "$B" "$NET")"
+A_IP="$(my_ip "$A" "$NET")"; B_IP="$(my_ip "$B" "$NET")"
 echo "   A_IP=$A_IP  B_IP=$B_IP"
 [[ -n "$A_IP" && -n "$B_IP" ]] || { fail "missing a VPN ip"; summary; }
 
@@ -74,15 +79,15 @@ step "2. Magic DNS active: <host>.<net>.ray resolves via the system resolver"
 # 'Address already in use' on :53) or the OS wasn't pointed at the magic IP,
 # the system resolver returns nothing and these fail. Roster->DNS sync + the
 # dns_config apply take a moment, so poll.
-if retry_until 60 "[[ \"\$(a4 '$A' srv-b.$NET.ray)\" == '$B_IP' ]]"; then
+if retry_until 60 "[[ \"\$(a6 '$A' srv-b.$NET.ray)\" == '$B_IP' ]]"; then
   pass "srv-a resolves srv-b.$NET.ray -> $B_IP (system resolver)"
 else
-  fail "srv-a could not resolve srv-b.$NET.ray to $B_IP (got '$(a4 "$A" srv-b.$NET.ray)')"
+  fail "srv-a could not resolve srv-b.$NET.ray to $B_IP (got '$(a6 "$A" srv-b.$NET.ray)')"
 fi
-if retry_until 60 "[[ \"\$(a4 '$B' srv-a.$NET.ray)\" == '$A_IP' ]]"; then
+if retry_until 60 "[[ \"\$(a6 '$B' srv-a.$NET.ray)\" == '$A_IP' ]]"; then
   pass "srv-b resolves srv-a.$NET.ray -> $A_IP (system resolver)"
 else
-  fail "srv-b could not resolve srv-a.$NET.ray to $A_IP (got '$(a4 "$B" srv-a.$NET.ray)')"
+  fail "srv-b could not resolve srv-a.$NET.ray to $A_IP (got '$(a6 "$B" srv-a.$NET.ray)')"
 fi
 
 # ---------------------------------------------------------------------------
@@ -134,7 +139,7 @@ fi
 # ---------------------------------------------------------------------------
 step "7. ray down reverts system DNS — .ray stops resolving"
 on "$B" 'ray down' 2>&1 | strip | sed 's/^/   b| /'
-if retry_until 30 "[[ -z \"\$(a4 '$B' srv-a.$NET.ray)\" ]]"; then
+if retry_until 30 "[[ -z \"\$(a6 '$B' srv-a.$NET.ray)\" ]]"; then
   pass "after 'ray down', srv-b no longer resolves srv-a.$NET.ray"
 else
   fail "srv-b still resolves .ray after 'ray down' (DNS not reverted)"

@@ -190,6 +190,13 @@ pub fn icmp_type_strategy() -> impl Strategy<Value = u8> {
     ]
 }
 
+/// A well-formed packet the parser is expected to accept.
+///
+/// IPv6 packets naming an extension header are filtered out rather than
+/// generated: `parse_ipv6` deliberately refuses them (byte 6 is not the
+/// upper-layer protocol and offset 40 is not the ports), so they are not
+/// "well-formed" for the purposes of the round-trip property. That refusal has
+/// its own property below.
 pub fn packet_spec() -> impl Strategy<Value = PacketSpec> {
     (
         any::<bool>(),
@@ -238,6 +245,10 @@ pub fn packet_spec() -> impl Strategy<Value = PacketSpec> {
                     icmp_id,
                 }
             },
+        )
+        .prop_filter(
+            "an IPv6 extension header is deliberately unparseable",
+            |spec| !(spec.v6 && rayfish::firewall::IPV6_EXTENSION_HEADERS.contains(&spec.protocol)),
         )
 }
 

@@ -121,11 +121,6 @@ impl ConnectionManager {
         entries: &[control::NetworkHandle],
     ) {
         let Some(mesh) = self.mesh.get() else { return };
-        let ip = mesh
-            .ctx
-            .peers
-            .v4_for_id(&peer_id)
-            .unwrap_or_else(|| mesh.ctx.identity.derive_ip(&peer_id));
         let ipv6 = derive_ipv6(&peer_id);
         // Map network pubkey → local network name via the registry.
         let mut table: Vec<(u16, SmolStr)> = Vec::new();
@@ -136,6 +131,6 @@ impl ConnectionManager {
                 table.push((e.handle, SmolStr::new(name)));
             }
         }
-        mesh.ctx.peers.set_inbound_handles(&ip, &ipv6, &table);
+        mesh.ctx.peers.set_inbound_handles(&ipv6, &table);
     }
 }

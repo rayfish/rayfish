@@ -5,15 +5,15 @@
 #   DOCKER_ACTION - provision | teardown
 #   NAMES   - array of container names (one per host)   [provision]
 #   LABELS  - array of role labels (srv-a, srv-b, …)    [provision]
-#   SERVERS - path to the .servers file (`id ip label zone` per line)
+#   SERVERS - path to the .servers file (`id ip label region` per line)
 #   NEXT    - hint printed at the end                    [provision]
 #
 # Each "host" is a container running systemd as PID 1 with sshd on 0.0.0.0:22,
 # on one user-defined bridge. That is all the scenario scripts ask for: they
 # only ever reach a host as `ssh root@<ip>` and deploy with rsync + systemctl.
-# The .servers format is identical to the Scaleway backend's, with the container
-# name as the id and `docker` as the zone — the zone column is what keeps the two
-# backends from stepping on each other's fleets.
+# The .servers format is identical to the cloud backend's, with the container
+# name as the id and `docker` in the region column. That column is the backend
+# marker, and it is what keeps the two backends off each other's fleets.
 #
 # Env: E2E_DOCKER_IMAGE / _NET / _SUBNET / _SUBNET6 override the names,
 #      E2E_DOCKER_REBUILD=1 forces an image rebuild,
@@ -22,19 +22,19 @@
 
 DOCKER_IMAGE="${E2E_DOCKER_IMAGE:-rayfish-e2e-node}"
 DOCKER_NET="${E2E_DOCKER_NET:-rayfish-e2e}"
-# Must avoid the overlay ranges (100.64.0.0/10, 200::/7) and the magic resolver
-# 100.100.100.53, or the nodes would route mesh traffic straight out the bridge.
+# Must avoid the overlay range (200::/7), which covers the magic resolver at
+# 200::53 too, or the nodes would route mesh traffic straight out the bridge.
 DOCKER_SUBNET="${E2E_DOCKER_SUBNET:-172.31.66.0/24}"
 DOCKER_SUBNET6="${E2E_DOCKER_SUBNET6:-fd00:e2e::/64}"
 DOCKER_CTX="$(cd "$(dirname "${BASH_SOURCE[0]}")/../docker" && pwd)"
 
-# servers_zone <servers-file> : echo the zone of the first row (the backend that
-# wrote the file), or nothing.
-servers_zone(){
+# servers_backend <servers-file> : echo the marker in the first row's region
+# column (the backend that wrote the file), or nothing.
+servers_backend(){
   [[ -f "$1" ]] || return 0
-  local id ip label zone
-  while read -r id ip label zone; do
-    [[ -n "${zone:-}" ]] && { echo "$zone"; return 0; }
+  local id ip label marker
+  while read -r id ip label marker; do
+    [[ -n "${marker:-}" ]] && { echo "$marker"; return 0; }
   done < "$1"
 }
 
@@ -147,9 +147,9 @@ do_provision(){
   command -v docker >/dev/null || { echo "docker not found"; exit 1; }
   [[ -c /dev/net/tun ]] || { echo "/dev/net/tun missing on this host (modprobe tun)"; exit 1; }
 
-  local zone; zone="$(servers_zone "$SERVERS")"
-  if [[ -n "$zone" && "$zone" != "docker" ]]; then
-    echo ">> $SERVERS belongs to the $zone backend — replacing it with a docker fleet"
+  local marker; marker="$(servers_backend "$SERVERS")"
+  if [[ -n "$marker" && "$marker" != "docker" ]]; then
+    echo ">> $SERVERS is a cloud fleet (region $marker), replacing it with a docker fleet"
     echo "   (tear that fleet down separately if it is still running)"
     rm -f "$SERVERS"
   fi
@@ -198,10 +198,10 @@ do_provision(){
 do_teardown(){
   [[ -f "$SERVERS" ]] || { echo "No $SERVERS — nothing to tear down."; exit 0; }
 
-  local zone; zone="$(servers_zone "$SERVERS")"
-  if [[ "$zone" != "docker" ]]; then
-    echo "Refusing: $SERVERS was written by the ${zone:-unknown} backend, not docker." >&2
-    echo "Tear it down with that backend (unset E2E_BACKEND for Scaleway)." >&2
+  local marker; marker="$(servers_backend "$SERVERS")"
+  if [[ "$marker" != "docker" ]]; then
+    echo "Refusing: $SERVERS is a cloud fleet (region ${marker:-unknown}), not docker." >&2
+    echo "Tear it down with: E2E_BACKEND=digitalocean tests/e2e.sh <scenario> teardown" >&2
     exit 1
   fi
 

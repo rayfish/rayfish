@@ -19,7 +19,6 @@ struct JoinContext<'a> {
     display_name: &'a str,
     my_hostname: &'a str,
     alpn: &'a [u8],
-    my_ip: Ipv4Addr,
     net_pubkey: EndpointId,
     /// Single-use invite secret to redeem at admission, if any. Cloned per dial
     /// attempt (a fresh join may try several coordinators).
@@ -250,7 +249,6 @@ impl NetworkRegistry {
         }
 
         let alpn = transport::mesh_alpn();
-        let my_ip = self.transport.identity.local_ip();
         // Use coordinator's network name from GroupBlob, or user alias, or truncated key as fallback
         let blob_name = data
             .name
@@ -287,7 +285,6 @@ impl NetworkRegistry {
             display_name,
             my_hostname: &my_hostname,
             alpn: &alpn,
-            my_ip,
             net_pubkey,
             invite,
             auto_accept_firewall,
@@ -558,8 +555,11 @@ impl NetworkRegistry {
                 if m.identity == me {
                     continue;
                 }
-                self.clone()
-                    .spawn_reconnect(m.identity, m.ip, vec![net.clone()]);
+                self.clone().spawn_reconnect(
+                    m.identity,
+                    derive_ipv6(&m.identity),
+                    vec![net.clone()],
+                );
             }
         }
 
@@ -625,7 +625,6 @@ impl NetworkRegistry {
         let JoinContext {
             display_name,
             my_hostname,
-            my_ip,
             net_pubkey,
             invite_lock,
             ..
@@ -715,7 +714,6 @@ impl NetworkRegistry {
             name: display_name.to_string(),
             network_key: net_pubkey,
             role: NetworkRole::Member,
-            my_ip,
             state,
             dht_notify: None,
             cancel,
@@ -731,7 +729,6 @@ impl NetworkRegistry {
             &self.dns.reverse_table,
             display_name,
             my_hostname,
-            (!self.ipv6_only).then_some(my_ip),
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
@@ -742,19 +739,17 @@ impl NetworkRegistry {
                     &self.dns.reverse_table,
                     display_name,
                     h,
-                    (!member.ipv6_only).then_some(member.ip),
                     derive_ipv6(&member.identity),
                 )
                 .await;
             }
         }
 
-        tracing::info!(network = %display_name, key = %net_pubkey, ip = %my_ip, "joined network");
+        tracing::info!(network = %display_name, key = %net_pubkey, "joined network");
 
         Ok(TryJoin::Joined(Box::new(IpcMessage::Joined {
             name: display_name.to_string(),
-            my_ip,
-            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
+            my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
         })))
     }
 
@@ -858,7 +853,6 @@ impl NetworkRegistry {
         net_pubkey: EndpointId,
         network_name: &str,
         my_identity: EndpointId,
-        my_ip: Ipv4Addr,
         my_hostname: Option<String>,
     ) {
         // Announce the current name (a pending rename or the confirmed one),
@@ -889,7 +883,6 @@ impl NetworkRegistry {
                             Some(net_pubkey),
                             &ControlMsg::MeshHello {
                                 identity: my_identity,
-                                ip: my_ip,
                                 hostname: my_hostname.clone(),
                                 device_cert: self.current_device_cert(),
                             },
@@ -899,8 +892,7 @@ impl NetworkRegistry {
                     crate::spawn_path_logger(peer_conn.clone(), m.identity.fmt_short().to_string());
                     // Register the route, then drive the new connection's control
                     // demux (which owns the data reader) and announce our handles.
-                    let conn_changed =
-                        ctx.register_peer_conn(&peer_conn, m.identity, m.ip, network_name);
+                    let conn_changed = ctx.register_peer_conn(&peer_conn, m.identity, network_name);
                     if conn_changed {
                         let router = self.protocol_router().clone();
                         let dconn = peer_conn.clone();
@@ -908,7 +900,8 @@ impl NetworkRegistry {
                             async move { router.drive_mesh_connection(dconn, true).await },
                         );
                     }
-                    announce_network_handles(&self.peers, &peer_conn, m.ip).await;
+                    announce_network_handles(&self.peers, &peer_conn, derive_ipv6(&m.identity))
+                        .await;
                     // Eager-connect reachability: a successful dial marks the peer
                     // reachable so `ray status` shows it active/idle, not offline.
                     self.reachability.note_ok(m.identity);

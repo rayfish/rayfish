@@ -115,7 +115,6 @@ pub(crate) async fn join_mesh_shared(
         initial,
     } = params;
     let my_identity = identity.local_identity();
-    let my_ip = identity.local_ip();
 
     let (members, approved, direct_key, record_ts) = match perform_join_handshake(
         &initial_conn,
@@ -124,7 +123,6 @@ pub(crate) async fn join_mesh_shared(
         &blob_store,
         &peers,
         net_pubkey,
-        my_ip,
         my_identity,
         initial,
         invite_secret,
@@ -152,7 +150,6 @@ pub(crate) async fn join_mesh_shared(
         &members,
         &approved,
         my_identity,
-        my_ip,
         net_pubkey,
         &my_hostname,
         auto_accept_firewall,
@@ -161,7 +158,6 @@ pub(crate) async fn join_mesh_shared(
     )?;
 
     let remote_id = initial_conn.remote_id();
-    let remote_ip = identity.derive_ip(&remote_id);
 
     let live_state = build_member_state(
         &members,
@@ -193,7 +189,6 @@ pub(crate) async fn join_mesh_shared(
         my_identity,
         net_pubkey,
         alpn.to_vec(),
-        my_ip,
         device_cert.clone(),
     );
 
@@ -225,7 +220,6 @@ pub(crate) async fn join_mesh_shared(
         &protocol_router,
         initial_conn,
         remote_id,
-        remote_ip,
         network_name,
     )
     .await;
@@ -235,7 +229,6 @@ pub(crate) async fn join_mesh_shared(
         network_name,
         net_pubkey,
         my_identity,
-        my_ip,
         remote_id,
         &device_cert,
         &worker_ctx,
@@ -255,16 +248,15 @@ async fn register_dialed_peer(
     router: &Arc<ProtocolRouter>,
     conn: Connection,
     peer_id: EndpointId,
-    ip: Ipv4Addr,
     network_name: &str,
 ) {
-    let conn_changed = ctx.register_peer_conn(&conn, peer_id, ip, network_name);
+    let conn_changed = ctx.register_peer_conn(&conn, peer_id, network_name);
     if conn_changed {
         let router = router.clone();
         let dconn = conn.clone();
         tokio::spawn(async move { router.drive_mesh_connection(dconn, true).await });
     }
-    announce_network_handles(&ctx.peers, &conn, ip).await;
+    announce_network_handles(&ctx.peers, &conn, derive_ipv6(&peer_id)).await;
 }
 
 /// Persist this network's membership to config after a successful handshake.
@@ -277,7 +269,6 @@ fn persist_join_config(
     members: &[crate::membership::Member],
     approved: &[ApprovedEntry],
     my_identity: EndpointId,
-    my_ip: Ipv4Addr,
     net_pubkey: EndpointId,
     my_hostname: &Option<String>,
     auto_accept_firewall: bool,
@@ -321,7 +312,6 @@ fn persist_join_config(
     config::save_network(&config::NetworkConfig {
         name: network_name.to_string(),
         group_mode: GroupMode::Restricted,
-        my_ip: Some(my_ip),
         my_hostname: persisted_hostname,
         pending_hostname,
         members: to_member_entries(members.iter()),
@@ -397,7 +387,6 @@ async fn connect_to_roster_peers(
     network_name: &str,
     net_pubkey: EndpointId,
     my_identity: EndpointId,
-    my_ip: Ipv4Addr,
     skip_id: EndpointId,
     device_cert: &Option<control::DeviceCert>,
     ctx: &MeshCtx,
@@ -417,18 +406,16 @@ async fn connect_to_roster_peers(
                     Some(net_pubkey),
                     &ControlMsg::MeshHello {
                         identity: my_identity,
-                        ip: my_ip,
                         hostname: outgoing_hostname(network_name),
                         device_cert: device_cert.clone(),
                     },
                 )
                 .await?;
-                register_dialed_peer(ctx, router, conn, member.identity, member.ip, network_name)
-                    .await;
-                tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
+                register_dialed_peer(ctx, router, conn, member.identity, network_name).await;
+                tracing::info!(peer_ip = %derive_ipv6(&member.identity), "connected to mesh peer");
             }
             Err(e) => {
-                tracing::warn!(peer_ip = %member.ip, error = %e, "mesh peer unavailable");
+                tracing::warn!(peer_ip = %derive_ipv6(&member.identity), error = %e, "mesh peer unavailable");
             }
         }
     }
@@ -451,7 +438,6 @@ async fn perform_join_handshake(
     blob_store: &FsStore,
     peers: &PeerTable,
     net_pubkey: EndpointId,
-    my_ip: Ipv4Addr,
     my_identity: EndpointId,
     initial: bool,
     invite_secret: Option<Vec<u8>>,
@@ -484,16 +470,6 @@ async fn perform_join_handshake(
                 direct_key,
             } => {
                 tracing::info!(network = %network_name, "welcomed to network");
-                if let Some(existing) = members
-                    .iter()
-                    .find(|m| m.ip == my_ip && m.identity != my_identity)
-                {
-                    anyhow::bail!(
-                        "IP collision: {} is already assigned to {}",
-                        my_ip,
-                        existing.identity
-                    );
-                }
                 // A direct-network Welcome grants us the network key (co-coordinator).
                 // Self-authenticating: adopt it only if its public half matches the
                 // network pubkey, so a forged key from a non-coordinator is dropped.
@@ -533,7 +509,6 @@ async fn perform_join_handshake(
             Some(net_pubkey),
             &ControlMsg::MeshHello {
                 identity: my_identity,
-                ip: my_ip,
                 hostname: outgoing_hostname(network_name),
                 device_cert: device_cert.clone(),
             },
@@ -583,7 +558,6 @@ fn spawn_reconverge_worker(
     my_identity_w: EndpointId,
     net_pubkey_w: EndpointId,
     alpn_w: Vec<u8>,
-    my_ip_w: Ipv4Addr,
     device_cert_w: Option<control::DeviceCert>,
 ) {
     tokio::spawn(async move {
@@ -628,7 +602,6 @@ fn spawn_reconverge_worker(
                 &live_state,
                 my_identity_w,
                 &alpn_w,
-                my_ip_w,
                 &device_cert_w,
             )
             .await;
@@ -650,19 +623,16 @@ mod persist_config_tests {
         SecretKey::from(b).public()
     }
 
-    fn member(seed: u8, ip: Ipv4Addr, coordinator: bool) -> Member {
+    fn member(seed: u8, coordinator: bool) -> Member {
         Member {
             identity: id(seed),
-            ip,
             is_coordinator: coordinator,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         }
     }
 
@@ -680,7 +650,6 @@ mod persist_config_tests {
 
         let net_pubkey = id(1);
         let me = id(2);
-        let my_ip = Ipv4Addr::new(100, 64, 0, 2);
 
         // Pre-existing config: this node offers an exit (`*`) and routes its own
         // traffic through a chosen peer. This is the state a restart must keep.
@@ -688,12 +657,10 @@ mod persist_config_tests {
         config::save_network(&NetworkConfig {
             name: "homelab".to_string(),
             group_mode: GroupMode::Restricted,
-            my_ip: Some(my_ip),
             my_hostname: Some("umbrel".to_string()),
             pending_hostname: None,
             members: vec![MemberEntry {
                 identity: me,
-                ip: my_ip,
                 is_coordinator: false,
                 hostname: Some("umbrel".to_string()),
             }],
@@ -715,16 +682,12 @@ mod persist_config_tests {
         .unwrap();
 
         // Reconnect: re-persist from a blob roster that carries no exit policy.
-        let roster = vec![
-            member(2, my_ip, false),
-            member(4, Ipv4Addr::new(100, 64, 0, 4), true),
-        ];
+        let roster = vec![member(2, false), member(4, true)];
         persist_join_config(
             "homelab",
             &roster,
             &[],
             me,
-            my_ip,
             net_pubkey,
             &Some("umbrel".to_string()),
             false,

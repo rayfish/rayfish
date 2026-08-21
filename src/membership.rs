@@ -1,10 +1,10 @@
 //! Network membership management: identity, IP derivation, member/approved lists, and policies.
 //!
-//! Virtual IPs are deterministically derived from [`EndpointId`] via FNV-1a hashing
-//! into the 100.64.0.0/10 CGNAT range (22-bit host space, ~4M addresses).
+//! Mesh addresses are deterministically derived from [`EndpointId`] via blake3
+//! into `200::/7`, so they are never carried on the wire: every node computes
+//! every other node's address itself. See [`derive_ipv6`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Result, bail};
@@ -58,22 +58,17 @@ pub enum ExitFamilies {
     /// The gateway can egress IPv4 only.
     #[serde(rename = "4")]
     V4,
-    /// The gateway can egress IPv6 only: it has an IPv6 uplink, but its own data
-    /// plane is IPv6-only, so it never routed mesh IPv4 in the first place.
-    ///
-    /// The uplink is not what is missing here, the return path is. An IPv6-only
-    /// host assigns its mesh IPv4 as a `/32` with no `100.64.0.0/10` route
-    /// (`tun::create`), so a client's tunnelled IPv4 reaches the gateway and is
-    /// masqueraded out fine, and the reply, un-NATted back to the client's mesh
-    /// `100.x`, finds no route into the TUN and leaves toward a CGNAT address on
-    /// the physical uplink. One-way, and silent from both ends.
+    /// The gateway has an IPv6 uplink to masquerade onto. The only claim a
+    /// gateway makes about itself now that the overlay carries no IPv4: there is
+    /// no second family for it to offer, so "IPv6 only" is the whole of a working
+    /// gateway rather than half of one.
     #[serde(rename = "6")]
     V6,
     /// The gateway can egress both families.
     #[serde(rename = "d")]
     Dual,
-    /// The gateway can egress neither: it is in IPv6-only mode (so its mesh IPv4
-    /// has no return path) and it has no IPv6 uplink to offer instead.
+    /// The gateway can egress neither: it has no IPv6 uplink, and the overlay
+    /// carries no IPv4 for it to offer instead.
     ///
     /// Distinct from [`Self::Unknown`], which is the absence of a claim. This is
     /// a claim, and the claim is "nothing". Every client refuses it.
@@ -101,52 +96,40 @@ impl ExitFamilies {
         matches!(self, Self::Unknown)
     }
 
-    /// What a client tunnel through this gateway actually carries, given the
-    /// client's own data plane.
+    /// What a client tunnel through this gateway actually carries.
     ///
-    /// The intersection of the two, because both ends have to hold for a family
-    /// to survive the round trip: our data plane has to route it (an IPv6-only
-    /// node never routes mesh IPv4, so it cannot source transit from it) and the
-    /// gateway has to be able to egress it and get the reply back. A family only
-    /// one side can carry is not a tunnel, it is a black hole, so it is left to
-    /// leave directly and the user is told.
+    /// Only ever [`Self::V6`] or [`Self::Neither`]: the overlay carries no IPv4,
+    /// so a client cannot source transit from a mesh IPv4 whatever the gateway
+    /// claims, and a claim of [`Self::V4`] or [`Self::Dual`] narrows to its IPv6
+    /// half. A tunnel that carries nothing is not a tunnel, so `Neither` is what
+    /// the caller refuses on.
     ///
-    /// [`Self::Unknown`] counts as "can carry", which is the same exemption the
-    /// refusal makes: the claim is absent on every network whose coordinator
-    /// predates the field, and narrowing a tunnel on the strength of nothing
-    /// would quietly stop tunnelling a family that works.
-    ///
-    /// [`Self::Neither`] out means there is nothing to install at all, which is
-    /// the only case the caller refuses on.
-    pub fn tunnelled(self, client_ipv6_only: bool) -> Self {
-        let assume = self.is_unknown();
-        let v6 = assume || self.carries_v6();
-        let v4 = !client_ipv6_only && (assume || self.carries_v4());
-        match (v4, v6) {
-            (true, true) => Self::Dual,
-            (true, false) => Self::V4,
-            (false, true) => Self::V6,
-            (false, false) => Self::Neither,
+    /// [`Self::Unknown`] counts as "can carry": the claim is absent on every
+    /// network whose coordinator predates the field, and narrowing a tunnel on
+    /// the strength of nothing would quietly stop tunnelling a family that works.
+    pub fn tunnelled(self) -> Self {
+        if self.is_unknown() || self.carries_v6() {
+            Self::V6
+        } else {
+            Self::Neither
         }
     }
 
     /// The claim a gateway makes about itself: whether it found an IPv6 default
-    /// route, and whether its own data plane carries IPv4 at all.
+    /// route to masquerade onto.
     ///
-    /// The two inputs are independent, so all four states are reachable, and
-    /// [`Self::Neither`] is not a theoretical corner: it is what an IPv6-only
-    /// host on an ordinary IPv4 uplink is, which is the most common shape of the
-    /// configuration this whole mode exists for. Folding it into [`Self::V4`]
-    /// (as an earlier draft of this did) makes it a *positive*
-    /// claim to carry IPv4 that a dual-stack client accepts, which is the silent
-    /// black hole the type exists to prevent, produced by the ordinary setup.
-    pub fn from_uplink(has_v6: bool, ipv6_only: bool) -> Self {
-        match (has_v6, ipv6_only) {
-            (true, false) => Self::Dual,
-            (true, true) => Self::V6,
-            (false, false) => Self::V4,
-            (false, true) => Self::Neither,
-        }
+    /// Only [`Self::V6`] or [`Self::Neither`] is produced. The IPv4 half of the
+    /// old claim is gone with the overlay's IPv4: a gateway assigns no mesh IPv4
+    /// and installs no `100.64.0.0/10` route, so an un-NATted IPv4 reply has no
+    /// way back into its TUN and it could never honestly claim to carry that
+    /// family. `Neither` is not a theoretical corner: it is what a host with no
+    /// IPv6 uplink is, and refusing it is the whole point of the type.
+    ///
+    /// [`Self::V4`] and [`Self::Dual`] survive as *decodable* variants because
+    /// this rides the signed roster and a claim is read as well as written;
+    /// [`Self::tunnelled`] narrows either to IPv6.
+    pub fn from_uplink(has_v6: bool) -> Self {
+        if has_v6 { Self::V6 } else { Self::Neither }
     }
 }
 
@@ -154,7 +137,6 @@ impl ExitFamilies {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
     pub identity: EndpointId,
-    pub ip: Ipv4Addr,
     pub is_coordinator: bool,
     #[serde(default)]
     pub hostname: Option<String>,
@@ -162,11 +144,6 @@ pub struct Member {
     pub user_identity: Option<EndpointId>,
     #[serde(default)]
     pub device_cert: Option<DeviceCert>,
-    /// Index used to resolve IPv4 collisions in the 22-bit CGNAT space.
-    /// 0 for most peers; incremented only when `derive_ip_with_index(identity, 0)`
-    /// collides with an already-assigned address.
-    #[serde(default)]
-    pub collision_index: u32,
     /// Unix seconds this peer was last observed going offline. `None` = never
     /// observed offline, so the ephemeral pruner never evicts it. Stamped on
     /// disconnect and seeded at admit; part of the hashed blob so it replicates
@@ -181,17 +158,8 @@ pub struct Member {
     /// makes clients dial a node that drops them.
     #[serde(default)]
     pub exit_node: bool,
-    /// This member's data plane is IPv6-only, so its `ip` is assigned but not
-    /// routed: another VPN owns `100.64.0.0/10` on that host. A self-claim, same
-    /// shape as `exit_node` and carried the same way
-    /// (`ControlMsg::Ipv6Only` -> coordinator -> signed blob). Peers use it to
-    /// withhold the member's A record, since packets sent to that address arrive
-    /// but the replies leave through the other VPN.
-    #[serde(default)]
-    pub ipv6_only: bool,
     /// Which families the exit node this member offers can egress, i.e. whether
-    /// that host has an IPv6 default route to masquerade onto, and whether its own
-    /// data plane routes the mesh IPv4 a reply comes back on. Meaningless unless
+    /// that host has an IPv6 default route to masquerade onto. Meaningless unless
     /// `exit_node`.
     ///
     /// Separate from `exit_node` because a client can only use a gateway that
@@ -201,11 +169,12 @@ pub struct Member {
     /// a silent black hole, since nothing else on the roster says which families a
     /// gateway can egress. See [`ExitFamilies`] for why it is three-valued.
     ///
-    /// **Last on purpose.** The wire is positional, and this is the only field
-    /// added to `Member` since the last release, so appending it is what makes an
-    /// older build's shorter array fail on its length rather than mis-slot: read
-    /// mid-struct, its `ipv6_only` would land here and be read as a family claim.
-    /// It errors either way today only because the two happen to differ in type.
+    /// **Last on purpose.** The wire is positional, so a field's declaration order
+    /// *is* the wire format: appending is what makes an older build's shorter array
+    /// fail on its length rather than mis-slot a value into the wrong field. Adding
+    /// one mid-struct would shift every field after it one place left, which errors
+    /// only when the two happen to differ in type and decodes clean and wrong when
+    /// they do not.
     #[serde(default)]
     pub exit_families: ExitFamilies,
 }
@@ -226,30 +195,7 @@ impl Member {
 /// existing `crate::membership::GroupMode` paths keep working.
 pub use ray_proto::GroupMode;
 
-/// Two different identities hashed to the same virtual IP (extremely rare with 22-bit space).
-#[derive(Debug)]
-pub struct IpCollision {
-    pub ip: Ipv4Addr,
-    pub existing_identity: EndpointId,
-    pub new_identity: EndpointId,
-}
-
-impl fmt::Display for IpCollision {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "IP collision: {} already assigned to {}, cannot assign to {}",
-            self.ip,
-            self.existing_identity.fmt_short(),
-            self.new_identity.fmt_short()
-        )
-    }
-}
-
-impl std::error::Error for IpCollision {}
-
-/// Active members of a network, keyed by [`EndpointId`]. Rejects additions
-/// that would create an IP collision with an existing member.
+/// Active members of a network, keyed by [`EndpointId`].
 #[derive(Debug, Clone)]
 pub struct MemberList {
     members: HashMap<EndpointId, Member>,
@@ -268,18 +214,8 @@ impl MemberList {
         }
     }
 
-    pub fn add(&mut self, member: Member) -> Result<(), IpCollision> {
-        if let Some(existing) = self.get_by_ip(member.ip)
-            && existing.identity != member.identity
-        {
-            return Err(IpCollision {
-                ip: member.ip,
-                existing_identity: existing.identity,
-                new_identity: member.identity,
-            });
-        }
+    pub fn add(&mut self, member: Member) {
         self.members.insert(member.identity, member);
-        Ok(())
     }
 
     pub fn remove(&mut self, identity: &EndpointId) -> Option<Member> {
@@ -294,10 +230,6 @@ impl MemberList {
         self.members.get_mut(identity)
     }
 
-    pub fn get_by_ip(&self, ip: Ipv4Addr) -> Option<&Member> {
-        self.members.values().find(|m| m.ip == ip)
-    }
-
     pub fn is_member(&self, identity: &EndpointId) -> bool {
         self.members.contains_key(identity)
     }
@@ -306,16 +238,22 @@ impl MemberList {
         self.members.values().collect()
     }
 
-    /// Resolve a firewall `--peer` **literal** against this roster: a mesh IPv4
+    /// Resolve a firewall `--peer` **literal** against this roster: a mesh IPv6
     /// to the member holding that address, or a full identity string to a member
     /// by its device id or its paired `user_identity`. Returns the member's
     /// **device** endpoint id (the caller normalizes to the user identity for
     /// inbound rules). Hostname and short-id-prefix forms are resolved upstream
     /// (Magic DNS / `resolve_short_id_any_network`); this is the literal-IP and
     /// full-identity fallback used by `DaemonState::resolve_peer_flexible`.
+    ///
+    /// The address is not stored, so the match derives it per member. That is the
+    /// same linear scan the old `get_by_ip` was, with one hash added per member.
     pub fn resolve_peer_literal(&self, name: &str) -> Option<EndpointId> {
-        if let Ok(v4) = name.parse::<Ipv4Addr>()
-            && let Some(m) = self.get_by_ip(v4)
+        if let Ok(v6) = name.parse::<Ipv6Addr>()
+            && let Some(m) = self
+                .members
+                .values()
+                .find(|m| derive_ipv6(&m.identity) == v6)
         {
             return Some(m.identity);
         }
@@ -330,7 +268,7 @@ impl MemberList {
     pub fn from_members(members: Vec<Member>) -> Self {
         let mut list = Self::new();
         for m in members {
-            let _ = list.add(m);
+            list.add(m);
         }
         list
     }
@@ -340,17 +278,12 @@ impl MemberList {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovedEntry {
     pub identity: EndpointId,
-    pub ip: Ipv4Addr,
     #[serde(default)]
     pub hostname: Option<String>,
     #[serde(default)]
     pub user_identity: Option<EndpointId>,
     #[serde(default)]
     pub device_cert: Option<DeviceCert>,
-    /// Index used to resolve IPv4 collisions. Mirrors `Member.collision_index`
-    /// for the same identity; defaults to 0 for backward-compatible decoding.
-    #[serde(default)]
-    pub collision_index: u32,
 }
 
 /// Pre-approved peers that the coordinator has broadcast but that haven't
@@ -373,31 +306,8 @@ impl ApprovedList {
         }
     }
 
-    pub fn approve(
-        &mut self,
-        entry: ApprovedEntry,
-        members: &MemberList,
-    ) -> Result<(), IpCollision> {
-        if let Some(existing) = members.get_by_ip(entry.ip)
-            && existing.identity != entry.identity
-        {
-            return Err(IpCollision {
-                ip: entry.ip,
-                existing_identity: existing.identity,
-                new_identity: entry.identity,
-            });
-        }
-        if let Some(existing) = self.get_by_ip(entry.ip)
-            && existing.identity != entry.identity
-        {
-            return Err(IpCollision {
-                ip: entry.ip,
-                existing_identity: existing.identity,
-                new_identity: entry.identity,
-            });
-        }
+    pub fn approve(&mut self, entry: ApprovedEntry) {
         self.entries.insert(entry.identity, entry);
-        Ok(())
     }
 
     pub fn is_approved(&self, identity: &EndpointId) -> bool {
@@ -410,10 +320,6 @@ impl ApprovedList {
 
     pub fn all(&self) -> Vec<&ApprovedEntry> {
         self.entries.values().collect()
-    }
-
-    pub fn get_by_ip(&self, ip: Ipv4Addr) -> Option<&ApprovedEntry> {
-        self.entries.values().find(|e| e.ip == ip)
     }
 
     pub fn from_entries(entries: Vec<ApprovedEntry>) -> Self {
@@ -432,72 +338,11 @@ pub fn mark_coordinator(members: &mut MemberList, identity: &EndpointId) {
     }
 }
 
-/// Abstracts identity and IP derivation so the membership system doesn't
+/// Abstracts identity and address derivation so the membership system doesn't
 /// depend directly on iroh types.
 pub trait IdentityProvider: Send + Sync {
-    fn local_ip(&self) -> Ipv4Addr;
+    fn local_ipv6(&self) -> Ipv6Addr;
     fn local_identity(&self) -> EndpointId;
-    fn derive_ip(&self, peer_identity: &EndpointId) -> Ipv4Addr;
-}
-
-/// Derives a deterministic virtual IP from an [`EndpointId`] using FNV-1a.
-/// Always produces an address in the 100.64.0.0/10 range, avoiding .0 and .1
-/// (network address and TUN gateway).
-pub fn derive_ip(identity: &EndpointId) -> Ipv4Addr {
-    derive_ip_with_index(identity, 0)
-}
-
-/// Derives a virtual IPv4 with a collision index. Index 0 produces the same
-/// result as [`derive_ip`]. Higher indices rotate the address to resolve
-/// collisions in the 22-bit space. The index is local state: each node
-/// resolves collisions independently.
-pub fn derive_ip_with_index(identity: &EndpointId, index: u32) -> Ipv4Addr {
-    let input = if index == 0 {
-        identity.to_string()
-    } else {
-        format!("{identity}{index}")
-    };
-    let mut hash: u32 = 2_166_136_261; // FNV-1a offset basis
-    for &b in input.as_bytes() {
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(16_777_619); // FNV-1a prime
-    }
-
-    let base: u32 = 0x6440_0000; // 100.64.0.0
-    let host_bits = hash & 0x003F_FFFF; // lower 22 bits
-    // Reserve 0 (network) and 1 (TUN gateway)
-    let host_bits = if host_bits <= 1 {
-        host_bits + 2
-    } else {
-        host_bits
-    };
-    Ipv4Addr::from(base | host_bits)
-}
-
-/// True if `ip` is reserved and must never be assigned to a member
-/// (currently the Magic DNS resolver address).
-fn is_reserved_ipv4(ip: Ipv4Addr) -> bool {
-    ip == crate::dns::MAGIC_DNS_V4
-}
-
-/// Finds the lowest collision index whose derived IPv4 is free in `members`.
-///
-/// An IP is considered free if no *different* identity holds it: a re-add of
-/// the same identity at its existing index is always accepted. Returns the
-/// `(ip, index)` pair that should be stored in `Member.ip` / `Member.collision_index`.
-pub fn assign_ip(members: &MemberList, identity: &EndpointId) -> (Ipv4Addr, u32) {
-    let mut index = 0u32;
-    loop {
-        let ip = derive_ip_with_index(identity, index);
-        if is_reserved_ipv4(ip) {
-            index += 1;
-            continue;
-        }
-        match members.get_by_ip(ip) {
-            Some(existing) if existing.identity != *identity => index += 1,
-            _ => return (ip, index),
-        }
-    }
 }
 
 /// Derives a stable IPv6 address from an [`EndpointId`] in the `200::/7` range.
@@ -517,27 +362,25 @@ pub fn derive_ipv6(identity: &EndpointId) -> Ipv6Addr {
 #[derive(Clone)]
 pub struct IrohIdentityProvider {
     endpoint_id: EndpointId,
-    ip: Ipv4Addr,
+    ipv6: Ipv6Addr,
 }
 
 impl IrohIdentityProvider {
-    pub fn new(endpoint_id: EndpointId, collision_index: u32) -> Self {
-        let ip = derive_ip_with_index(&endpoint_id, collision_index);
-        Self { endpoint_id, ip }
+    pub fn new(endpoint_id: EndpointId) -> Self {
+        Self {
+            endpoint_id,
+            ipv6: derive_ipv6(&endpoint_id),
+        }
     }
 }
 
 impl IdentityProvider for IrohIdentityProvider {
-    fn local_ip(&self) -> Ipv4Addr {
-        self.ip
+    fn local_ipv6(&self) -> Ipv6Addr {
+        self.ipv6
     }
 
     fn local_identity(&self) -> EndpointId {
         self.endpoint_id
-    }
-
-    fn derive_ip(&self, peer_identity: &EndpointId) -> Ipv4Addr {
-        derive_ip(peer_identity)
     }
 }
 
@@ -702,125 +545,35 @@ pub fn group_blob_hash(
     blake3::hash(&bytes)
 }
 
-/// Validates that a [`Member`]'s virtual IP is consistent with its identity and
-/// lies in the CGNAT range, excluding the reserved network (`.0`) and gateway
-/// (`.1`) addresses.
-///
-/// This is the invariant the network *should* enforce at every trust boundary
-/// (GroupBlob decode, `Welcome`/`MemberSync` application, `MeshHello.ip`). Today
-/// the daemon trusts the `ip` field carried in those messages, which permits IP
-/// hijacking (see the security audit). This helper exists so enforcement can be
-/// added at the data layer without changing the on-wire format.
-pub fn validate_member(member: &Member) -> Result<()> {
-    let expected = derive_ip_with_index(&member.identity, member.collision_index);
-    anyhow::ensure!(
-        member.ip == expected,
-        "member ip {} does not match identity-derived ip {}",
-        member.ip,
-        expected,
-    );
-    anyhow::ensure!(
-        !is_reserved_ipv4(member.ip),
-        "member IP {} is the reserved Magic DNS address",
-        member.ip
-    );
-    ensure_in_cgnat_range(member.ip)
-}
-
-/// Like [`validate_member`] but for [`ApprovedEntry`].
-pub fn validate_approved(entry: &ApprovedEntry) -> Result<()> {
-    let expected = derive_ip_with_index(&entry.identity, entry.collision_index);
-    anyhow::ensure!(
-        entry.ip == expected,
-        "approved entry ip {} does not match identity-derived ip {}",
-        entry.ip,
-        expected,
-    );
-    ensure_in_cgnat_range(entry.ip)
-}
-
-/// Returns `Err` if any two members share the same IPv4 address.
-///
-/// This enforces the roster invariant that every member has a unique IP.
-/// Call this at any trust boundary where a freshly-decoded roster is applied.
-pub fn validate_no_duplicate_ips(members: &[Member]) -> Result<()> {
-    let mut seen = std::collections::HashSet::new();
-    for m in members {
-        anyhow::ensure!(seen.insert(m.ip), "duplicate IP {} in roster", m.ip);
-    }
-    Ok(())
-}
-
-/// Resolve duplicate-IP rosters deterministically: for each clashing IP the
-/// lowest identity keeps it; others re-roll to their next free index.
-///
-/// Two coordinators can independently admit a fresh joiner at the same collision
-/// index, so a reconverged roster may carry duplicate IPs. Sorting by identity
-/// bytes and re-seating every member through [`assign_ip`] makes the resolution
-/// order independent of where the roster was assembled, so every node converges
-/// on the same address map.
-pub fn resolve_ip_tiebreak(mut members: Vec<Member>) -> Vec<Member> {
-    members.sort_by_key(|m| m.identity.as_bytes().to_owned());
-    let mut list = MemberList::new();
-    for mut m in members {
-        let (ip, idx) = assign_ip(&list, &m.identity);
-        m.ip = ip;
-        m.collision_index = idx;
-        let _ = list.add(m);
-    }
-    list.all().into_iter().cloned().collect()
-}
-
-/// Whether `ip` is a rayfish overlay address: the IPv4 CGNAT range `100.64.0.0/10`
-/// or the IPv6 `200::/7` range that mesh IPs are derived into (see
-/// [`derive_ip`]/[`derive_ipv6`]). Used to keep the overlay's own addresses out of
-/// iroh's advertised transport candidates, so the tunnel is never asked to route
-/// over itself (a self-looping path that flaps open/closed and can cascade into
-/// spurious roster evictions).
+/// Whether `ip` is a rayfish overlay address: the IPv6 `200::/7` range mesh
+/// addresses are derived into (see [`derive_ipv6`]). Used to keep the overlay's
+/// own addresses out of iroh's advertised transport candidates, so the tunnel is
+/// never asked to route over itself (a self-looping path that flaps open/closed
+/// and can cascade into spurious roster evictions).
 pub fn is_overlay_ip(ip: IpAddr) -> bool {
-    match ip {
-        // 100.64.0.0/10: first octet 100, top two bits of the second octet == 01.
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            o[0] == 100 && (o[1] & 0xC0) == 64
-        }
-        // 200::/7: the top 7 bits of the first hextet are `0000001`.
-        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0x0200,
-    }
+    // 200::/7: the top 7 bits of the first hextet are `0000001`.
+    matches!(ip, IpAddr::V6(v6) if (v6.segments()[0] & 0xfe00) == 0x0200)
 }
 
-fn ensure_in_cgnat_range(ip: Ipv4Addr) -> Result<()> {
+/// Whether `ip` is in the `100.64.0.0/10` CGNAT range.
+///
+/// **Not ours.** The overlay is IPv6-only, so this range belongs to whatever
+/// other VPN shares the host, and the callers that ask are keeping *its*
+/// addresses out of places they would do damage: iroh's advertised transport
+/// candidates ([`crate::transport::OverlayAddrFilter`]) and the daemon's own
+/// control-plane nameservers. Kept apart from [`is_overlay_ip`] because one
+/// predicate answering both questions is what made this easy to get wrong.
+pub fn is_cgnat_range(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
-    anyhow::ensure!(
-        o[0] == 100 && (o[1] & 0xC0) == 64,
-        "ip {} is outside the 100.64.0.0/10 CGNAT range",
-        ip,
-    );
-    anyhow::ensure!(
-        !(o[1] == 64 && o[2] == 0 && o[3] == 0),
-        "ip {} is the reserved network address",
-        ip,
-    );
-    anyhow::ensure!(
-        !(o[1] == 64 && o[2] == 0 && o[3] == 1),
-        "ip {} is the reserved TUN gateway address",
-        ip,
-    );
-    Ok(())
+    o[0] == 100 && (o[1] & 0xC0) == 64
 }
 
 pub fn decode_group_blob(bytes: &[u8]) -> Result<GroupBlob> {
     let blob: GroupBlob =
         rmp_serde::from_slice(bytes).map_err(|e| anyhow::anyhow!("invalid group blob: {e}"))?;
-    // Enforce the identity<->IP binding at the decode boundary. Any blob that
-    // survives this check has self-consistent members/approved entries, so a
-    // malicious or buggy publisher cannot inject a spoofed or reserved IP.
-    for m in &blob.members {
-        validate_member(m)?;
-    }
-    for a in &blob.approved {
-        validate_approved(a)?;
-    }
+    // Nothing to validate at this boundary any more: a member's mesh address is
+    // derived from its identity rather than carried, so there is no field a
+    // malicious publisher could set inconsistently.
     Ok(blob)
 }
 
@@ -864,13 +617,13 @@ mod tests {
 
     #[test]
     fn overlay_ip_covers_mesh_ranges_only() {
-        // IPv4 CGNAT 100.64.0.0/10 (the whole /10, not just Tailscale's usage).
-        assert!(is_overlay_ip("100.64.0.1".parse().unwrap()));
-        assert!(is_overlay_ip("100.127.255.255".parse().unwrap()));
-        assert!(is_overlay_ip(IpAddr::V4(derive_ip(&test_id(9)))));
-        // Just outside the /10 on either side.
-        assert!(!is_overlay_ip("100.63.255.255".parse().unwrap()));
-        assert!(!is_overlay_ip("100.128.0.0".parse().unwrap()));
+        // The CGNAT range is not ours any more: it belongs to whatever other
+        // VPN shares the host, and `is_cgnat_range` is what asks about it.
+        assert!(!is_overlay_ip("100.64.0.1".parse().unwrap()));
+        assert!(is_cgnat_range("100.64.0.1".parse().unwrap()));
+        assert!(is_cgnat_range("100.127.255.255".parse().unwrap()));
+        assert!(!is_cgnat_range("100.63.255.255".parse().unwrap()));
+        assert!(!is_cgnat_range("100.128.0.0".parse().unwrap()));
         // Ordinary underlay addresses pass through.
         assert!(!is_overlay_ip("192.168.1.104".parse().unwrap()));
         assert!(!is_overlay_ip("51.15.139.151".parse().unwrap()));
@@ -880,59 +633,6 @@ mod tests {
         assert!(is_overlay_ip("03ff::1".parse().unwrap()));
         assert!(!is_overlay_ip("2001:db8::1".parse().unwrap()));
         assert!(!is_overlay_ip("fe80::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn test_derive_ip_deterministic() {
-        let id = test_id(1);
-        let ip1 = derive_ip(&id);
-        let ip2 = derive_ip(&id);
-        assert_eq!(ip1, ip2);
-    }
-
-    #[test]
-    fn test_derive_ip_in_cgnat_range() {
-        let id = test_id(1);
-        let ip = derive_ip(&id);
-        let octets = ip.octets();
-        assert_eq!(octets[0], 100);
-        assert!(octets[1] >= 64 && octets[1] <= 127);
-    }
-
-    #[test]
-    fn test_derive_ip_different_identities_differ() {
-        let ip1 = derive_ip(&test_id(1));
-        let ip2 = derive_ip(&test_id(2));
-        assert_ne!(ip1, ip2);
-    }
-
-    #[test]
-    fn test_derive_ip_avoids_reserved() {
-        let reserved1 = Ipv4Addr::new(100, 64, 0, 0);
-        let reserved2 = Ipv4Addr::new(100, 64, 0, 1);
-        for i in 0..=255u8 {
-            let ip = derive_ip(&test_id(i));
-            assert_ne!(ip, reserved1);
-            assert_ne!(ip, reserved2);
-        }
-    }
-
-    #[test]
-    fn test_derive_ip_with_index_zero_matches_derive_ip() {
-        for i in 0..=255u8 {
-            let id = test_id(i);
-            assert_eq!(derive_ip(&id), derive_ip_with_index(&id, 0));
-        }
-    }
-
-    #[test]
-    fn test_derive_ip_with_index_rotates() {
-        let id = test_id(1);
-        let ip0 = derive_ip_with_index(&id, 0);
-        let ip1 = derive_ip_with_index(&id, 1);
-        let ip2 = derive_ip_with_index(&id, 2);
-        assert_ne!(ip0, ip1);
-        assert_ne!(ip1, ip2);
     }
 
     #[test]
@@ -961,15 +661,14 @@ mod tests {
     fn test_iroh_identity_provider() {
         let key = iroh::SecretKey::generate();
         let endpoint_id = key.public();
-        let provider = IrohIdentityProvider::new(endpoint_id, 0);
+        let provider = IrohIdentityProvider::new(endpoint_id);
 
-        let ip = provider.local_ip();
-        let octets = ip.octets();
-        assert_eq!(octets[0], 100);
-        assert!(octets[1] >= 64 && octets[1] <= 127);
-
-        let id = provider.local_identity();
-        assert_eq!(provider.derive_ip(&id), ip);
+        let ip = provider.local_ipv6();
+        // The provider hands back the identity's derived `200::/7` address,
+        // and hands back the same one every time it is asked.
+        assert_eq!(ip, derive_ipv6(&endpoint_id));
+        assert!(is_overlay_ip(IpAddr::V6(ip)));
+        assert_eq!(provider.local_ipv6(), ip);
     }
 
     #[test]
@@ -978,77 +677,17 @@ mod tests {
         let mut list = MemberList::new();
         let member = Member {
             identity: id,
-            ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         };
-        list.add(member.clone()).unwrap();
+        list.add(member.clone());
         assert!(list.is_member(&id));
         assert!(!list.is_member(&test_id(2)));
-        assert_eq!(list.get(&id).unwrap().ip, Ipv4Addr::new(100, 64, 10, 5));
-    }
-
-    #[test]
-    fn test_member_list_lookup_by_ip() {
-        let id = test_id(1);
-        let mut list = MemberList::new();
-        let member = Member {
-            identity: id,
-            ip: Ipv4Addr::new(100, 64, 10, 5),
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        };
-        list.add(member).unwrap();
-        let found = list.get_by_ip(Ipv4Addr::new(100, 64, 10, 5)).unwrap();
-        assert_eq!(found.identity, id);
-        assert!(list.get_by_ip(Ipv4Addr::new(100, 64, 10, 6)).is_none());
-    }
-
-    #[test]
-    fn test_member_list_ip_collision() {
-        let mut list = MemberList::new();
-        list.add(Member {
-            identity: test_id(1),
-            ip: Ipv4Addr::new(100, 64, 10, 5),
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        })
-        .unwrap();
-        let result = list.add(Member {
-            identity: test_id(2),
-            ip: Ipv4Addr::new(100, 64, 10, 5),
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        });
-        assert!(result.is_err());
     }
 
     #[test]
@@ -1057,32 +696,24 @@ mod tests {
         let mut list = MemberList::new();
         list.add(Member {
             identity: id,
-            ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        })
-        .unwrap();
+        });
         list.add(Member {
             identity: id,
-            ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: true,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        })
-        .unwrap();
+        });
         assert!(list.get(&id).unwrap().is_coordinator);
     }
 
@@ -1092,18 +723,14 @@ mod tests {
         let mut list = MemberList::new();
         list.add(Member {
             identity: id,
-            ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        })
-        .unwrap();
+        });
         let removed = list.remove(&id);
         assert!(removed.is_some());
         assert!(!list.is_member(&id));
@@ -1115,32 +742,24 @@ mod tests {
         let mut list = MemberList::new();
         list.add(Member {
             identity: test_id(1),
-            ip: Ipv4Addr::new(100, 64, 0, 2),
             is_coordinator: true,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        })
-        .unwrap();
+        });
         list.add(Member {
             identity: test_id(2),
-            ip: Ipv4Addr::new(100, 64, 0, 3),
             is_coordinator: false,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        })
-        .unwrap();
+        });
         assert_eq!(list.all().len(), 2);
     }
 
@@ -1150,110 +769,31 @@ mod tests {
         let mut list = ApprovedList::new();
         let entry = ApprovedEntry {
             identity: id,
-            ip: Ipv4Addr::new(100, 64, 5, 10),
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
         };
-        let members = MemberList::new();
-        list.approve(entry, &members).unwrap();
+        list.approve(entry);
         assert!(list.is_approved(&id));
         assert!(!list.is_approved(&test_id(2)));
-    }
-
-    #[test]
-    fn test_approved_list_collision_with_member() {
-        let mut approved = ApprovedList::new();
-        let mut members = MemberList::new();
-        members
-            .add(Member {
-                identity: test_id(1),
-                ip: Ipv4Addr::new(100, 64, 5, 10),
-                is_coordinator: false,
-                hostname: None,
-                user_identity: None,
-                device_cert: None,
-                collision_index: 0,
-                last_seen: None,
-                exit_node: false,
-                exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
-            })
-            .unwrap();
-        let entry = ApprovedEntry {
-            identity: test_id(2),
-            ip: Ipv4Addr::new(100, 64, 5, 10),
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-        };
-        assert!(approved.approve(entry, &members).is_err());
-    }
-
-    #[test]
-    fn test_approved_list_collision_within_approved() {
-        let mut approved = ApprovedList::new();
-        let members = MemberList::new();
-        approved
-            .approve(
-                ApprovedEntry {
-                    identity: test_id(1),
-                    ip: Ipv4Addr::new(100, 64, 5, 10),
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                    collision_index: 0,
-                },
-                &members,
-            )
-            .unwrap();
-        let result = approved.approve(
-            ApprovedEntry {
-                identity: test_id(2),
-                ip: Ipv4Addr::new(100, 64, 5, 10),
-                hostname: None,
-                user_identity: None,
-                device_cert: None,
-                collision_index: 0,
-            },
-            &members,
-        );
-        assert!(result.is_err());
     }
 
     #[test]
     fn test_approved_list_same_identity_is_idempotent() {
         let id = test_id(1);
         let mut approved = ApprovedList::new();
-        let members = MemberList::new();
-        approved
-            .approve(
-                ApprovedEntry {
-                    identity: id,
-                    ip: Ipv4Addr::new(100, 64, 5, 10),
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                    collision_index: 0,
-                },
-                &members,
-            )
-            .unwrap();
-        approved
-            .approve(
-                ApprovedEntry {
-                    identity: id,
-                    ip: Ipv4Addr::new(100, 64, 5, 10),
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                    collision_index: 0,
-                },
-                &members,
-            )
-            .unwrap();
+        approved.approve(ApprovedEntry {
+            identity: id,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        });
+        approved.approve(ApprovedEntry {
+            identity: id,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        });
         assert_eq!(approved.all().len(), 1);
     }
 
@@ -1261,20 +801,12 @@ mod tests {
     fn test_approved_list_remove() {
         let id = test_id(1);
         let mut approved = ApprovedList::new();
-        let members = MemberList::new();
-        approved
-            .approve(
-                ApprovedEntry {
-                    identity: id,
-                    ip: Ipv4Addr::new(100, 64, 5, 10),
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                    collision_index: 0,
-                },
-                &members,
-            )
-            .unwrap();
+        approved.approve(ApprovedEntry {
+            identity: id,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        });
         let removed = approved.remove(&id);
         assert!(removed.is_some());
         assert!(!approved.is_approved(&id));
@@ -1285,19 +817,15 @@ mod tests {
         let entries = vec![
             ApprovedEntry {
                 identity: test_id(1),
-                ip: Ipv4Addr::new(100, 64, 0, 2),
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
-                collision_index: 0,
             },
             ApprovedEntry {
                 identity: test_id(2),
-                ip: Ipv4Addr::new(100, 64, 0, 3),
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
-                collision_index: 0,
             },
         ];
         let list = ApprovedList::from_entries(entries);
@@ -1312,18 +840,15 @@ mod tests {
         let mut list = MemberList::new();
         for &seed in seeds {
             let id = test_id(seed);
-            let _ = list.add(Member {
+            list.add(Member {
                 identity: id,
-                ip: derive_ip(&id),
                 is_coordinator: false,
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
-                collision_index: 0,
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
             });
         }
         list
@@ -1333,24 +858,20 @@ mod tests {
     fn resolve_peer_literal_by_ip_and_identity() {
         let device = test_id(11);
         let user = test_id(22);
-        let ip = derive_ip(&device);
+        let ip = derive_ipv6(&device);
         let mut list = MemberList::new();
         list.add(Member {
             identity: device,
-            ip,
             is_coordinator: false,
             hostname: Some("alice-laptop".to_string()),
             user_identity: Some(user),
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        })
-        .unwrap();
+        });
 
-        // Mesh IPv4 literal -> the member's device id.
+        // Mesh IPv6 literal -> the member's device id.
         assert_eq!(list.resolve_peer_literal(&ip.to_string()), Some(device));
         // Full device identity -> itself.
         assert_eq!(list.resolve_peer_literal(&device.to_string()), Some(device));
@@ -1440,19 +961,12 @@ mod tests {
         let members = make_member_list(&[1, 2]);
         let mut approved = ApprovedList::new();
         let id3 = test_id(3);
-        approved
-            .approve(
-                ApprovedEntry {
-                    identity: id3,
-                    ip: derive_ip(&id3),
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                    collision_index: 0,
-                },
-                &members,
-            )
-            .unwrap();
+        approved.approve(ApprovedEntry {
+            identity: id3,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        });
 
         let bytes = canonical_group_bytes(
             &members,
@@ -1534,21 +1048,16 @@ mod tests {
     fn last_seen_survives_blob_roundtrip() {
         let id = test_id(7);
         let mut members = MemberList::new();
-        members
-            .add(Member {
-                identity: id,
-                ip: derive_ip(&id),
-                is_coordinator: false,
-                hostname: None,
-                user_identity: None,
-                device_cert: None,
-                collision_index: 0,
-                last_seen: Some(12345),
-                exit_node: false,
-                exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
-            })
-            .unwrap();
+        members.add(Member {
+            identity: id,
+            is_coordinator: false,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            last_seen: Some(12345),
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        });
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
         let bytes = canonical_group_bytes(
@@ -1578,21 +1087,16 @@ mod tests {
         // decode to None with no mass eviction on upgrade.
         let id = test_id(8);
         let mut members = MemberList::new();
-        members
-            .add(Member {
-                identity: id,
-                ip: derive_ip(&id),
-                is_coordinator: false,
-                hostname: None,
-                user_identity: None,
-                device_cert: None,
-                collision_index: 0,
-                last_seen: None,
-                exit_node: false,
-                exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
-            })
-            .unwrap();
+        members.add(Member {
+            identity: id,
+            is_coordinator: false,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        });
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
         let bytes = canonical_group_bytes(
@@ -1739,12 +1243,10 @@ mod tests {
         #[derive(Serialize)]
         struct ShorterMember {
             identity: EndpointId,
-            ip: Ipv4Addr,
             is_coordinator: bool,
             hostname: Option<String>,
             user_identity: Option<EndpointId>,
             device_cert: Option<DeviceCert>,
-            collision_index: u32,
             last_seen: Option<u64>,
             exit_node: bool,
             // `exit_families` and `ipv6_only` not yet declared.
@@ -1752,12 +1254,10 @@ mod tests {
         let id = test_id(7);
         let bytes = rmp_serde::to_vec(&ShorterMember {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: false,
             hostname: Some("box".into()),
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: true,
         })
@@ -1767,23 +1267,16 @@ mod tests {
         assert_eq!(decoded.identity, id);
         assert_eq!(decoded.hostname.as_deref(), Some("box"));
         assert!(decoded.exit_node);
-        // The two appended fields take their defaults rather than failing.
+        // The appended field takes its default rather than failing.
         assert_eq!(decoded.exit_families, ExitFamilies::Unknown);
-        assert!(!decoded.ipv6_only);
 
         // Every field is now written, claimed or not: there is no key to omit.
         // A round-trip is the property that survives, not a byte comparison.
-        for (families, ipv6_only) in [
-            (ExitFamilies::Unknown, false),
-            (ExitFamilies::V4, true),
-            (ExitFamilies::Dual, false),
-        ] {
+        for families in [ExitFamilies::Unknown, ExitFamilies::V4, ExitFamilies::Dual] {
             let mut m = decoded.clone();
             m.exit_families = families;
-            m.ipv6_only = ipv6_only;
             let round: Member = rmp_serde::from_slice(&rmp_serde::to_vec(&m).unwrap()).unwrap();
             assert_eq!(round.exit_families, families);
-            assert_eq!(round.ipv6_only, ipv6_only);
         }
     }
 
@@ -1806,7 +1299,6 @@ mod tests {
         #[derive(Serialize)]
         struct ReleasedMember {
             identity: EndpointId,
-            ip: Ipv4Addr,
             is_coordinator: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             hostname: Option<String>,
@@ -1827,27 +1319,22 @@ mod tests {
         let mut released = Vec::new();
         for i in 0..50u8 {
             let id = test_id(i);
-            let ip = derive_ip(&id);
             let hostname = Some(format!("host-{i}"));
             members.push(Member {
                 identity: id,
-                ip,
                 is_coordinator: i == 0,
                 hostname: hostname.clone(),
                 user_identity: None,
                 device_cert: None,
-                collision_index: 0,
                 last_seen: None,
                 exit_node: i == 1,
                 exit_families: match i {
                     1 => ExitFamilies::Dual,
                     _ => ExitFamilies::Unknown,
                 },
-                ipv6_only: false,
             });
             released.push(ReleasedMember {
                 identity: id,
-                ip,
                 is_coordinator: i == 0,
                 hostname,
                 exit_node: i == 1,
@@ -1898,11 +1385,9 @@ mod tests {
         #[derive(Serialize)]
         struct OldMember {
             identity: EndpointId,
-            ip: Ipv4Addr,
             is_coordinator: bool,
             hostname: Option<String>,
             exit_node: bool,
-            ipv6_only: bool,
             // No `exit_families`: a key this build knows and that one never wrote.
         }
         #[derive(Serialize)]
@@ -1914,11 +1399,9 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&OldBlob {
             members: vec![OldMember {
                 identity: id,
-                ip: derive_ip(&id),
                 is_coordinator: true,
                 hostname: Some("box".into()),
                 exit_node: true,
-                ipv6_only: true,
             }],
             approved: vec![],
         })
@@ -1927,40 +1410,33 @@ mod tests {
         let blob = decode_group_blob(&bytes).expect("a named map still decodes");
         assert_eq!(blob.members.len(), 1);
         assert!(blob.members[0].exit_node);
-        assert!(blob.members[0].ipv6_only);
         assert_eq!(blob.members[0].exit_families, ExitFamilies::Unknown);
         // And re-encoding it compactly gives different bytes, which is what makes
         // the local snapshot hash disagree with the signed one.
         assert_ne!(rmp_serde::to_vec(&blob).unwrap(), bytes);
     }
 
-    /// A tunnel carries what both ends can carry, and nothing else.
+    /// A tunnel carries IPv6 or it carries nothing.
     ///
-    /// The cases that used to be a refusal or a black hole are the mixed ones: a
-    /// dual-stack client through a gateway that can only return one family. The
-    /// family that works is tunnelled and the other leaves directly, which is
-    /// the same trade IPv6-only mode already makes with its own data plane.
+    /// The overlay routes no IPv4, so a client cannot source transit from a mesh
+    /// IPv4 whatever the gateway claims. A claim that includes IPv4 narrows to
+    /// its IPv6 half rather than being taken at face value.
     #[test]
-    fn a_tunnel_carries_the_intersection_of_both_ends() {
+    fn a_tunnel_carries_ipv6_or_nothing() {
         use ExitFamilies::{Dual, Neither, Unknown, V4, V6};
 
-        // Dual-stack client: the gateway's claim is the whole answer.
-        assert_eq!(Dual.tunnelled(false), Dual);
-        assert_eq!(V6.tunnelled(false), V6, "IPv4 would die at the gateway");
-        assert_eq!(V4.tunnelled(false), V4, "IPv6 would have nowhere to egress");
-        assert_eq!(Neither.tunnelled(false), Neither);
-
-        // IPv6-only client: never IPv4, whatever the gateway says, because this
-        // node has no routed mesh IPv4 to source transit from.
-        assert_eq!(Dual.tunnelled(true), V6);
-        assert_eq!(V6.tunnelled(true), V6);
-        assert_eq!(V4.tunnelled(true), Neither, "nothing left to install");
-        assert_eq!(Neither.tunnelled(true), Neither);
+        assert_eq!(
+            Dual.tunnelled(),
+            V6,
+            "the IPv4 half has nowhere to come back"
+        );
+        assert_eq!(V6.tunnelled(), V6);
+        assert_eq!(V4.tunnelled(), Neither, "nothing left to install");
+        assert_eq!(Neither.tunnelled(), Neither);
 
         // No claim means no narrowing: every network whose coordinator predates
-        // the field would otherwise lose a family that works.
-        assert_eq!(Unknown.tunnelled(false), Dual);
-        assert_eq!(Unknown.tunnelled(true), V6);
+        // the field would otherwise lose the one family that works.
+        assert_eq!(Unknown.tunnelled(), V6);
     }
 
     /// The default claim rides every roster entry, so its tag is sized for that.
@@ -2004,35 +1480,28 @@ mod tests {
         #[allow(dead_code)]
         struct OlderMember {
             identity: EndpointId,
-            ip: Ipv4Addr,
             is_coordinator: bool,
             hostname: Option<String>,
             user_identity: Option<EndpointId>,
             device_cert: Option<DeviceCert>,
-            collision_index: u32,
             last_seen: Option<u64>,
-            exit_node: bool,
-            // The released shape ends here. `exit_families` is appended after
-            // this, so what an older build sees is simply one element too many:
-            // every slot it does read still means what it meant. Inserted
-            // anywhere above instead, the failure would depend on the types that
-            // happened to line up, which is the thing the append rule exists to
-            // take off the table.
-            ipv6_only: bool,
+            // The older shape ends here. `exit_families` is appended after this,
+            // so what an older build sees is simply one element too many: every
+            // slot it does read still means what it meant. Inserted anywhere
+            // above instead, the failure would depend on the types that happened
+            // to line up, which is the thing the append rule exists to take off
+            // the table.
         }
         let id = test_id(11);
         let bytes = rmp_serde::to_vec(&Member {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: false,
             hostname: Some("box".into()),
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: true,
             exit_families: ExitFamilies::Dual,
-            ipv6_only: false,
         })
         .unwrap();
 
@@ -2044,55 +1513,43 @@ mod tests {
         );
     }
 
-    /// Reordering two same-typed fields silently swaps their values, and this is
-    /// the one way the compact wire fails without saying so.
+    /// Reordering two same-typed fields is the one way the compact wire fails
+    /// without saying so.
     ///
     /// A shift between differently-typed fields errors loudly ("invalid type"),
-    /// which is survivable. Between two `bool`s there is nothing to detect: the
-    /// bytes are valid, the struct decodes, and `exit_node` now holds what
-    /// `ipv6_only` meant. Declaration order *is* the wire format here, and a diff
-    /// that merely moves a line does not look like a protocol change, so this is
-    /// recorded as a test rather than left to review.
+    /// which is survivable. Between two fields of the same type there is nothing
+    /// to detect: the bytes are valid, the struct decodes, and each field now
+    /// holds what the other meant. Declaration order *is* the wire format here,
+    /// and a diff that merely moves a line does not look like a protocol change,
+    /// so this is recorded as a test rather than left to review.
+    ///
+    /// Pinned against a local pair rather than whichever `Member` fields happen
+    /// to be adjacent today: the hazard belongs to the codec, and tying the test
+    /// to one struct's current layout makes it vanish the moment that layout
+    /// changes, which is exactly when it is needed.
     #[test]
     fn reordering_same_typed_fields_silently_swaps_them() {
         #[derive(Serialize)]
-        struct Reordered {
-            identity: EndpointId,
-            ip: Ipv4Addr,
-            is_coordinator: bool,
-            hostname: Option<String>,
-            user_identity: Option<EndpointId>,
-            device_cert: Option<DeviceCert>,
-            collision_index: u32,
-            last_seen: Option<u64>,
-            // `ipv6_only` and `exit_node` swapped relative to `Member`. Both are
-            // `bool`, and they are adjacent, which is the whole hazard: a diff that
-            // moves one line past the other changes the wire and looks like
-            // nothing. `exit_families` stays last, where `Member` has it.
-            ipv6_only: bool,
-            exit_node: bool,
-            exit_families: ExitFamilies,
+        struct Written {
+            first: bool,
+            second: bool,
         }
-        let id = test_id(9);
-        let bytes = rmp_serde::to_vec(&Reordered {
-            identity: id,
-            ip: derive_ip(&id),
-            is_coordinator: false,
-            hostname: Some("box".into()),
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-            ipv6_only: true,
-            exit_node: false,
-            exit_families: ExitFamilies::Dual,
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct Read {
+            // The same two fields, declared the other way round.
+            second: bool,
+            first: bool,
+        }
+        let bytes = rmp_serde::to_vec(&Written {
+            first: true,
+            second: false,
         })
         .unwrap();
 
-        let decoded: Member = rmp_serde::from_slice(&bytes).expect("decodes without complaint");
+        let decoded: Read = rmp_serde::from_slice(&bytes).expect("decodes without complaint");
         // No error, and both booleans now say the opposite of what was sent.
-        assert!(decoded.exit_node, "ipv6_only was read as exit_node");
-        assert!(!decoded.ipv6_only, "exit_node was read as ipv6_only");
+        assert!(decoded.second, "`first` was read as `second`");
+        assert!(!decoded.first, "`second` was read as `first`");
     }
 
     // -- reusable keys --------------------------------------------------------
@@ -2283,396 +1740,20 @@ mod tests {
     // -- validate_member / validate_approved ---------------------------------
 
     #[test]
-    fn validate_member_accepts_consistent_ip() {
-        let id = test_id(7);
-        let member = Member {
-            identity: id,
-            ip: derive_ip(&id),
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        };
-        assert!(validate_member(&member).is_ok());
-    }
-
-    #[test]
-    fn validate_member_rejects_mismatched_ip() {
-        // A peer/ coordinator must not be able to assign an arbitrary IP to an
-        // identity. This is the invariant that prevents IP hijacking.
-        let id = test_id(7);
-        let member = Member {
-            identity: id,
-            ip: Ipv4Addr::new(100, 64, 10, 5), // does NOT equal derive_ip(test_id(7))
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        };
-        let err = validate_member(&member).unwrap_err().to_string();
-        assert!(err.contains("does not match"), "{err}");
-    }
-
-    #[test]
-    fn validate_member_rejects_out_of_range_ip() {
-        let id = test_id(7);
-        let member = Member {
-            identity: id,
-            ip: Ipv4Addr::new(10, 0, 0, 5),
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        };
-        assert!(validate_member(&member).is_err());
-    }
-
-    #[test]
-    fn validate_member_rejects_reserved_addresses() {
-        // .0 (network) and .1 (gateway) are reserved even if derive_ip avoids them.
-        let id = test_id(7);
-        let net = Member {
-            identity: id,
-            ip: Ipv4Addr::new(100, 64, 0, 0),
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        };
-        let gw = Member {
-            identity: id,
-            ip: Ipv4Addr::new(100, 64, 0, 1),
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        };
-        assert!(validate_member(&net).is_err());
-        assert!(validate_member(&gw).is_err());
-    }
-
-    #[test]
-    fn validate_approved_rejects_mismatched_ip() {
-        let id = test_id(9);
-        let entry = ApprovedEntry {
-            identity: id,
-            ip: Ipv4Addr::new(100, 64, 99, 99),
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-        };
-        assert!(validate_approved(&entry).is_err());
-    }
-
-    #[test]
-    fn validate_member_accepts_all_derived_ips_in_range() {
-        // Every derive_ip() output for a spread of identities must pass validation.
-        for seed in 0u8..=255 {
-            let id = test_id(seed);
-            let member = Member {
-                identity: id,
-                ip: derive_ip(&id),
-                is_coordinator: false,
-                hostname: None,
-                user_identity: None,
-                device_cert: None,
-                collision_index: 0,
-                last_seen: None,
-                exit_node: false,
-                exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
-            };
-            assert!(
-                validate_member(&member).is_ok(),
-                "seed {seed} -> {}",
-                member.ip
-            );
-        }
-    }
-
-    #[test]
-    fn decode_group_blob_rejects_mismatched_member_ip() {
-        // A tampered blob carrying a member whose IP doesn't match its identity
-        // must be rejected at the decode boundary, even if the bytes are
-        // otherwise valid msgpack.
-        let id = test_id(1);
-        let bad_member = Member {
-            identity: id,
-            ip: Ipv4Addr::new(100, 64, 10, 5), // not derive_ip(test_id(1))
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        };
-        let blob = GroupBlob {
-            members: vec![bad_member],
-            approved: vec![],
-            suggested_firewall: Default::default(),
-            name: None,
-            reusable_keys: BTreeMap::new(),
-            nullifiers: BTreeSet::new(),
-        };
-        let bytes = rmp_serde::to_vec(&blob).unwrap();
-        let err = decode_group_blob(&bytes).unwrap_err().to_string();
-        assert!(err.contains("does not match"), "{err}");
-    }
-
-    #[test]
-    fn decode_group_blob_rejects_reserved_gateway_ip() {
-        let id = test_id(2);
-        let bad_member = Member {
-            identity: id,
-            ip: Ipv4Addr::new(100, 64, 0, 1), // TUN gateway
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        };
-        let blob = GroupBlob {
-            members: vec![bad_member],
-            approved: vec![],
-            suggested_firewall: Default::default(),
-            name: None,
-            reusable_keys: BTreeMap::new(),
-            nullifiers: BTreeSet::new(),
-        };
-        let bytes = rmp_serde::to_vec(&blob).unwrap();
-        assert!(decode_group_blob(&bytes).is_err());
-    }
-
-    #[test]
     fn mark_coordinator_sets_flag_for_target() {
         let id = test_id(7);
         let mut list = MemberList::new();
         list.add(Member {
             identity: id,
-            ip: derive_ip(&id),
             is_coordinator: false,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        })
-        .unwrap();
+        });
         mark_coordinator(&mut list, &id);
         assert!(list.get(&id).unwrap().is_coordinator);
-    }
-
-    /// Brute-force (birthday approach) to find two distinct identities whose
-    /// index-0 IPv4 collides. The 22-bit space makes this likely within ~a few
-    /// thousand iterations. Bounded at 200_000 to avoid a runaway test.
-    fn find_colliding_pair() -> Option<(EndpointId, EndpointId)> {
-        let mut seen: HashMap<Ipv4Addr, EndpointId> = HashMap::new();
-        for i in 0u32..200_000 {
-            // Vary bytes across the whole 32-byte key to get good hash dispersion.
-            let mut key_bytes = [0u8; 32];
-            let b = i.to_le_bytes();
-            key_bytes[0] = b[0];
-            key_bytes[1] = b[1];
-            key_bytes[2] = b[2];
-            key_bytes[3] = b[3];
-            let id = iroh::SecretKey::from(key_bytes).public();
-            let ip = derive_ip(&id);
-            if let Some(existing) = seen.get(&ip) {
-                if *existing != id {
-                    return Some((*existing, id));
-                }
-            } else {
-                seen.insert(ip, id);
-            }
-        }
-        None
-    }
-
-    #[test]
-    fn validate_member_accepts_declared_index_rejects_mismatch() {
-        let id = test_id(5);
-        let good = Member {
-            identity: id,
-            ip: derive_ip_with_index(&id, 2),
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 2,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        };
-        assert!(validate_member(&good).is_ok());
-        let bad = Member {
-            collision_index: 1,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ..good.clone()
-        }; // ip is for index 2, claims 1
-        assert!(validate_member(&bad).is_err());
-    }
-
-    #[test]
-    fn validate_no_duplicate_ips_rejects_clash() {
-        let a = test_id(1);
-        let m = |id, ip| Member {
-            identity: id,
-            ip,
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        };
-        let dup = derive_ip(&a);
-        assert!(validate_no_duplicate_ips(&[m(a, dup), m(test_id(2), dup)]).is_err());
-    }
-
-    #[test]
-    fn assign_ip_rotates_on_collision() {
-        let (a, b) = find_colliding_pair()
-            .expect("birthday bound: should find a collision within 200k identities");
-        // Sanity: a and b both map to the same index-0 IP.
-        assert_eq!(derive_ip(&a), derive_ip(&b));
-        let ip0 = derive_ip(&a);
-
-        // Add `a` to the list at its index-0 IP.
-        let mut list = MemberList::new();
-        let (assigned_a, idx_a) = assign_ip(&list, &a);
-        assert_eq!(idx_a, 0, "first peer always gets index 0");
-        assert_eq!(assigned_a, ip0);
-        list.add(Member {
-            identity: a,
-            ip: assigned_a,
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: idx_a,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        })
-        .unwrap();
-
-        // Now assign_ip for `b` must rotate to index >= 1.
-        let (ip_b, idx_b) = assign_ip(&list, &b);
-        assert!(idx_b >= 1, "colliding identity must rotate to index >= 1");
-        assert_ne!(ip_b, ip0, "rotated IP must differ from the occupied slot");
-        assert_eq!(
-            ip_b,
-            derive_ip_with_index(&b, idx_b),
-            "assigned IP must equal derive_ip_with_index at that index"
-        );
-    }
-
-    #[test]
-    fn tiebreak_keeps_lower_identity_rerolls_other() {
-        // Order two distinct identities by their canonical byte order so the
-        // assertion ("lower identity keeps the shared ip") is deterministic
-        // regardless of how the seeds map onto public keys.
-        let (lo, hi) = {
-            let (a, b) = (test_id(1), test_id(9));
-            if a.as_bytes() <= b.as_bytes() {
-                (a, b)
-            } else {
-                (b, a)
-            }
-        };
-        let ip = derive_ip(&lo); // both initially claim this ip at index 0
-        let mk = |id| Member {
-            identity: id,
-            ip,
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            collision_index: 0,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        };
-        let resolved = resolve_ip_tiebreak(vec![mk(hi), mk(lo)]);
-        // lower identity keeps `ip`; higher re-rolls to a free index.
-        let lo_m = resolved.iter().find(|m| m.identity == lo).unwrap();
-        let hi_m = resolved.iter().find(|m| m.identity == hi).unwrap();
-        assert_eq!(lo_m.ip, ip);
-        assert_ne!(hi_m.ip, ip);
-        assert!(validate_no_duplicate_ips(&resolved).is_ok());
-    }
-
-    #[test]
-    fn is_reserved_ipv4_covers_magic_dns() {
-        // The predicate test isolates the guard: it fails if anyone removes the
-        // magic DNS IP from the reserved set, independent of IP-derivation.
-        assert!(is_reserved_ipv4(crate::dns::MAGIC_DNS_V4));
-        assert!(!is_reserved_ipv4(Ipv4Addr::new(100, 64, 0, 7)));
-    }
-
-    #[test]
-    fn validate_member_rejects_magic_dns_ip() {
-        // Behavioral guard; the predicate test above is the one that isolates it.
-        let mut kb = [0u8; 32];
-        kb[0] = 9;
-        let id = iroh::SecretKey::from(kb).public();
-        let m = Member {
-            identity: id,
-            ip: crate::dns::MAGIC_DNS_V4,
-            collision_index: 0,
-            is_coordinator: false,
-            hostname: None,
-            user_identity: None,
-            device_cert: None,
-            last_seen: None,
-            exit_node: false,
-            exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
-        };
-        assert!(validate_member(&m).is_err());
     }
 }

@@ -8,13 +8,13 @@
 //! spaces, not over examples, which is what this file covers.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 
 use proptest::prelude::*;
 use rayfish::hostname::{admission_hostname, is_valid_hostname, resolve_collision};
 use rayfish::membership::{
-    ApprovedList, ExitFamilies, Member, MemberList, assign_ip, canonical_group_bytes, derive_ip,
-    derive_ip_with_index, derive_ipv6, group_blob_hash, is_overlay_ip, resolve_ip_tiebreak,
+    ApprovedList, ExitFamilies, Member, MemberList, canonical_group_bytes, derive_ipv6,
+    group_blob_hash, is_overlay_ip,
 };
 
 use iroh::EndpointId;
@@ -27,19 +27,16 @@ fn id_from_seed(seed: u32) -> EndpointId {
     iroh::SecretKey::from(key_bytes).public()
 }
 
-fn member(identity: EndpointId, ip: Ipv4Addr, collision_index: u32) -> Member {
+fn member(identity: EndpointId) -> Member {
     Member {
         identity,
-        ip,
         is_coordinator: false,
         hostname: None,
         user_identity: None,
         device_cert: None,
-        collision_index,
         last_seen: None,
         exit_node: false,
         exit_families: ExitFamilies::Unknown,
-        ipv6_only: false,
     }
 }
 
@@ -54,15 +51,10 @@ fn roster_strategy(max: usize) -> impl Strategy<Value = Vec<Member>> {
             .filter(|s| seen.insert(*s))
             .map(|s| {
                 let id = id_from_seed(s);
-                member(id, derive_ip(&id), 0)
+                member(id)
             })
             .collect()
     })
-}
-
-fn in_cgnat(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    o[0] == 100 && (o[1] & 0xC0) == 64
 }
 
 // ---------------------------------------------------------------------------
@@ -70,19 +62,6 @@ fn in_cgnat(ip: Ipv4Addr) -> bool {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    /// Every derived IPv4, at any collision index, lands in the overlay's
-    /// CGNAT range and avoids the network address and the TUN gateway. A
-    /// derivation escaping the range would route mesh traffic off the tunnel.
-    #[test]
-    fn derived_ipv4_always_in_range(seed in any::<u32>(), index in any::<u32>()) {
-        let ip = derive_ip_with_index(&id_from_seed(seed), index);
-        prop_assert!(in_cgnat(ip), "{ip} outside 100.64.0.0/10");
-        prop_assert!(is_overlay_ip(IpAddr::V4(ip)));
-
-        let host_bits = u32::from(ip) & 0x003F_FFFF;
-        prop_assert!(host_bits >= 2, "{ip} uses a reserved host address");
-    }
-
     /// Every derived IPv6 lands in 200::/7.
     #[test]
     fn derived_ipv6_always_in_range(seed in any::<u32>()) {
@@ -90,14 +69,12 @@ proptest! {
         prop_assert!(is_overlay_ip(IpAddr::V6(ip)), "{ip} outside 200::/7");
     }
 
-    /// Derivation is a pure function of identity and index: two nodes deriving
-    /// the same peer's address must agree, or they disagree about who is who.
+    /// Derivation is a pure function of identity: two nodes deriving the same
+    /// peer's address must agree, or they disagree about who is who.
     #[test]
-    fn derivation_is_deterministic(seed in any::<u32>(), index in any::<u32>()) {
+    fn derivation_is_deterministic(seed in any::<u32>()) {
         let id = id_from_seed(seed);
-        prop_assert_eq!(derive_ip_with_index(&id, index), derive_ip_with_index(&id, index));
         prop_assert_eq!(derive_ipv6(&id), derive_ipv6(&id));
-        prop_assert_eq!(derive_ip(&id), derive_ip_with_index(&id, 0));
     }
 
     /// Distinct identities get distinct IPv6 addresses. The 120-bit space
@@ -107,117 +84,6 @@ proptest! {
     fn distinct_identities_get_distinct_ipv6(a in any::<u32>(), b in any::<u32>()) {
         prop_assume!(a != b);
         prop_assert_ne!(derive_ipv6(&id_from_seed(a)), derive_ipv6(&id_from_seed(b)));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Seating and convergence
-// ---------------------------------------------------------------------------
-
-proptest! {
-    /// `assign_ip` returns an address no *other* member holds, and one this
-    /// identity can be seated at: the returned index must reproduce it.
-    #[test]
-    fn assign_ip_never_collides(roster in roster_strategy(12), seed in 0u32..64) {
-        let mut list = MemberList::new();
-        for m in roster {
-            let _ = list.add(m);
-        }
-        let id = id_from_seed(seed);
-        let (ip, index) = assign_ip(&list, &id);
-
-        prop_assert_eq!(derive_ip_with_index(&id, index), ip);
-        prop_assert!(in_cgnat(ip));
-        if let Some(existing) = list.get_by_ip(ip) {
-            prop_assert_eq!(existing.identity, id, "assigned {} already held", ip);
-        }
-    }
-
-    /// Re-seating an identity already in the roster returns the seat it holds
-    /// rather than moving it, so a re-add (reconnect, roster merge) is stable.
-    #[test]
-    fn assign_ip_is_stable_for_existing_members(roster in roster_strategy(12)) {
-        prop_assume!(!roster.is_empty());
-        let mut list = MemberList::new();
-        for m in roster.iter().cloned() {
-            let _ = list.add(m);
-        }
-        for m in list.all().into_iter().cloned().collect::<Vec<_>>() {
-            let (ip, _) = assign_ip(&list, &m.identity);
-            prop_assert_eq!(ip, m.ip);
-        }
-    }
-
-    /// The property the whole tiebreak exists for: the resolved address map
-    /// depends only on the *set* of members, not on the order they arrived in.
-    /// Two nodes that assembled the same roster from different directions must
-    /// end up with the same seating, or they disagree about peer addresses.
-    #[test]
-    fn tiebreak_is_permutation_invariant(
-        roster in roster_strategy(10),
-        shuffle in prop::collection::vec(any::<usize>(), 0..20),
-    ) {
-        let mut permuted = roster.clone();
-        // Fisher-Yates driven by the generated indices, so the permutation is
-        // shrinkable rather than drawn from a hidden RNG.
-        if !permuted.is_empty() {
-            for (i, raw) in shuffle.iter().enumerate() {
-                let a = i % permuted.len();
-                let b = raw % permuted.len();
-                permuted.swap(a, b);
-            }
-        }
-
-        let a = resolve_ip_tiebreak(roster);
-        let b = resolve_ip_tiebreak(permuted);
-
-        let seat = |ms: Vec<Member>| {
-            ms.into_iter()
-                .map(|m| (m.identity.to_string(), (m.ip, m.collision_index)))
-                .collect::<BTreeMap<_, _>>()
-        };
-        prop_assert_eq!(seat(a), seat(b));
-    }
-
-    /// Tiebreak output contains no duplicate address, whatever went in:
-    /// that is the collision it is there to resolve.
-    #[test]
-    fn tiebreak_output_has_no_duplicate_ips(roster in roster_strategy(10)) {
-        let resolved = resolve_ip_tiebreak(roster);
-        let mut seen = BTreeSet::new();
-        for m in &resolved {
-            prop_assert!(seen.insert(m.ip), "duplicate address {} after tiebreak", m.ip);
-        }
-    }
-
-    /// Tiebreak preserves the membership set and every member's seat is one
-    /// its own identity derives, so nobody is dropped, added, or handed an
-    /// address that isn't theirs.
-    #[test]
-    fn tiebreak_preserves_members(roster in roster_strategy(10)) {
-        let before: BTreeSet<String> = roster.iter().map(|m| m.identity.to_string()).collect();
-        let resolved = resolve_ip_tiebreak(roster);
-        let after: BTreeSet<String> = resolved.iter().map(|m| m.identity.to_string()).collect();
-        prop_assert_eq!(before, after);
-
-        for m in &resolved {
-            prop_assert_eq!(derive_ip_with_index(&m.identity, m.collision_index), m.ip);
-        }
-    }
-
-    /// Tiebreak is idempotent: re-running it on its own output changes
-    /// nothing. A roster that keeps re-seating on every reconverge would
-    /// churn peer addresses forever.
-    #[test]
-    fn tiebreak_is_idempotent(roster in roster_strategy(10)) {
-        let once = resolve_ip_tiebreak(roster);
-        let twice = resolve_ip_tiebreak(once.clone());
-        let seat = |ms: &[Member]| {
-            ms.iter()
-                .map(|m| (m.identity.to_string(), (m.ip, m.collision_index)))
-                .collect::<BTreeMap<_, _>>()
-        };
-        prop_assert_eq!(seat(&once), seat(&twice));
     }
 }
 
@@ -235,7 +101,6 @@ proptest! {
         roster in roster_strategy(10),
         shuffle in prop::collection::vec(any::<usize>(), 0..20),
     ) {
-        let roster = resolve_ip_tiebreak(roster);
         let mut permuted = roster.clone();
         if !permuted.is_empty() {
             for (i, raw) in shuffle.iter().enumerate() {
@@ -248,7 +113,7 @@ proptest! {
         let build = |ms: Vec<Member>| {
             let mut list = MemberList::new();
             for m in ms {
-                let _ = list.add(m);
+                list.add(m);
             }
             list
         };
@@ -272,8 +137,8 @@ proptest! {
     #[test]
     fn blob_hash_matches_canonical_bytes(roster in roster_strategy(8)) {
         let mut list = MemberList::new();
-        for m in resolve_ip_tiebreak(roster) {
-            let _ = list.add(m);
+        for m in roster {
+            list.add(m);
         }
         let approved = ApprovedList::new();
         let firewall = Default::default();

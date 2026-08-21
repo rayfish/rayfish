@@ -201,48 +201,6 @@ fun ToggleCard(title: String, subtitle: String, checked: Boolean, onCheckedChang
     }
 }
 
-/**
- * [ToggleCard] for a setting with more than two states: same title/subtitle, a
- * row of choices underneath instead of a Switch. The subtitle carries what the
- * selected option currently means, which for a state like "auto" is the only
- * place the resolved answer can be shown.
- */
-@Composable
-fun <T> SegmentedCard(
-    title: String,
-    subtitle: String,
-    options: List<Pair<T, String>>,
-    selected: T,
-    onSelect: (T) -> Unit,
-) {
-    SectionCard {
-        Column(Modifier.fillMaxWidth()) {
-            Text(title, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-            Text(subtitle, fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Muted, modifier = Modifier.padding(top = 3.dp))
-            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(top = 10.dp)) {
-                options.forEachIndexed { index, (value, label) ->
-                    SegmentedButton(
-                        selected = value == selected,
-                        onClick = { onSelect(value) },
-                        shape = SegmentedButtonDefaults.itemShape(index = index, count = options.size),
-                        colors = SegmentedButtonDefaults.colors(
-                            activeContainerColor = Rf.Emerald,
-                            activeContentColor = Color.White,
-                            activeBorderColor = Rf.CardBorder,
-                            inactiveContainerColor = Color.Transparent,
-                            inactiveContentColor = Rf.Body,
-                            inactiveBorderColor = Rf.CardBorder,
-                        ),
-                        icon = {},
-                    ) {
-                        Text(label, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
-                    }
-                }
-            }
-        }
-    }
-}
-
 data class MenuItem(val label: String, val destructive: Boolean = false, val onClick: () -> Unit)
 
 @Composable

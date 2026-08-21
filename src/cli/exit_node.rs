@@ -36,8 +36,8 @@ pub(crate) async fn ipc_exit_node(action: ExitNodeAction) -> Result<()> {
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
         ipc::IpcMessage::ExitNodeState { networks } => render_exit_node_state(networks),
-        ipc::IpcMessage::Error { message } => print_error("exit-node", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("exit-node", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -58,35 +58,49 @@ async fn clear_all_exit_selections() -> Result<()> {
             .filter(|n| n.using.is_some())
             .map(|n| n.network)
             .collect(),
-        ipc::IpcMessage::Error { message } => {
-            print_error("exit-node", &message, None);
-            return Ok(());
-        }
-        other => {
-            eprintln!("Unexpected response: {:?}", other);
-            return Ok(());
-        }
+        ipc::IpcMessage::Error { message } => fail_with("exit-node", &message),
+        other => fail_unexpected(&other),
     };
     if active.is_empty() {
         println!("no exit node in use");
         return Ok(());
     }
+    // Every network is attempted even after one fails, and the exit code comes
+    // at the end. Stopping at the first would leave the rest still routing
+    // through their exit nodes, which is the opposite of what was asked, and
+    // would say so only about the network it got to.
+    let mut failed = 0usize;
     for network in active {
         let mut s = ipc::connect().await?;
         ipc::send(
             &mut s,
             ipc::IpcMessage::ExitNodeUse {
-                network,
+                network: network.clone(),
                 peer: None,
             },
         )
         .await?;
         match ipc::recv(&mut s).await? {
             ipc::IpcMessage::Ok { message } => println!("{message}"),
-            ipc::IpcMessage::Error { message } => print_error("exit-node", &message, None),
-            other => eprintln!("Unexpected response: {:?}", other),
+            ipc::IpcMessage::Error { message } => {
+                print_error("exit-node", &format!("{network}: {message}"), None);
+                failed += 1;
+            }
+            // Counted, not exited, for the same reason as the arm above.
+            other => {
+                print_error(
+                    "exit-node",
+                    &format!("{network}: {}", unexpected_detail(&other)),
+                    None,
+                );
+                failed += 1;
+            }
         }
     }
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} network(s) are still using an exit node"
+    );
     Ok(())
 }
 
@@ -101,7 +115,6 @@ fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>) {
                 "using": n.using,
                 "available": n.available,
                 "available_v6": n.available_v6,
-                "ipv6_only": n.ipv6_only,
                 "refused": n.refused,
                 "not_in_effect": n.not_in_effect,
                 "tunnel_v4": n.tunnel_v4,
@@ -161,7 +174,7 @@ fn render_exit_node_state(networks: Vec<ipc::ExitNodeStatusView>) {
                 .map(|peer| {
                     if n.refused.contains(peer) {
                         format!("{peer} (unusable from this node)")
-                    } else if n.ipv6_only && n.available_v6.contains(peer) {
+                    } else if n.available_v6.contains(peer) {
                         format!("{peer} (IPv6)")
                     } else {
                         peer.clone()

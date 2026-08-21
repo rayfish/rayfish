@@ -23,7 +23,7 @@ cd "$ROOT"
 # 1. provision -----------------------------------------------------------------
 if [[ ! -f "$DIR/.servers" ]]; then
   echo "== provisioning =="
-  ZONE="${ZONE:-fr-par-1}" TYPE="${TYPE:-DEV1-S}" bash "$DIR/provision.sh" || exit 1
+  bash "$ROOT/tests/e2e.sh" bench provision || exit 1
 fi
 
 latest_md(){ ls -t "$DIR"/results/*.md 2>/dev/null | head -1; }

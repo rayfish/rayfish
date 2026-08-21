@@ -105,9 +105,7 @@ pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
         ControlMsg::MemberSync | ControlMsg::BlobUpdated => false,
 
         // A member's statements about itself, and its departure.
-        ControlMsg::ExitNodeOffer { .. }
-        | ControlMsg::Ipv6Only { .. }
-        | ControlMsg::LeaveNetwork => false,
+        ControlMsg::ExitNodeOffer { .. } | ControlMsg::LeaveNetwork => false,
 
         // Connection-level: the demux handles these before it ever resolves a
         // per-network handler, so they never reach this decision. Listed rather
@@ -214,7 +212,7 @@ pub(crate) struct CoordinatorAcceptState {
 
 impl CoordinatorAcceptState {
     /// Dispatch one control frame arriving on a mesh connection this coordinator
-    /// accepts. Returns the peer's mesh IPv4 once it is a registered member on this
+    /// accepts. Returns the peer's mesh address once it is a registered member on this
     /// network (so the per-connection demux can announce our handle table to it),
     /// else `None`. Ping/Pong/`NetworkHandles` are connection-level and handled by
     /// the demux before it ever reaches here.
@@ -224,7 +222,7 @@ impl CoordinatorAcceptState {
         send: iroh::endpoint::SendStream,
         peer_id: EndpointId,
         msg: ControlMsg,
-    ) -> Option<Ipv4Addr> {
+    ) -> Option<Ipv6Addr> {
         match msg {
             ControlMsg::JoinRequest {
                 invite_secret,
@@ -289,7 +287,7 @@ impl CoordinatorAcceptState {
         invite_secret: Option<Vec<u8>>,
         hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
-    ) -> Option<Ipv4Addr> {
+    ) -> Option<Ipv6Addr> {
         // Verify a device certificate if presented, and record the transport-key →
         // user-identity binding so paired devices resolve.
         if let Some(ref cert) = device_cert {
@@ -396,17 +394,17 @@ impl CoordinatorAcceptState {
         remote_id: EndpointId,
         hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
-    ) -> Option<Ipv4Addr> {
+    ) -> Option<Ipv6Addr> {
         let peer_ip = self
             .state
             .read()
             .unwrap()
             .members
             .get(&remote_id)
-            .map(|m| m.ip)?;
+            .map(|m| derive_ipv6(&m.identity))?;
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
         self.ctx
-            .register_peer_conn(conn, remote_id, peer_ip, &self.network_name);
+            .register_peer_conn(conn, remote_id, &self.network_name);
 
         // Hand this (re)connecting member our current signed record over the mesh
         // so it converges to the live roster in ~1s instead of waiting out a stale
@@ -485,7 +483,7 @@ impl CoordinatorAcceptState {
             &self.ctx.hostname_table,
             &self.ctx.reverse_table,
             &self.network_name,
-            peer_ip,
+            derive_ipv6(&remote_id),
         )
         .await;
         dns::update_hostname(
@@ -493,7 +491,6 @@ impl CoordinatorAcceptState {
             &self.ctx.reverse_table,
             &self.network_name,
             &final_hostname,
-            Some(peer_ip),
             derive_ipv6(&remote_id),
         )
         .await;
@@ -564,7 +561,7 @@ impl CoordinatorAcceptState {
         hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
         secret: Vec<u8>,
-    ) -> Option<Ipv4Addr> {
+    ) -> Option<Ipv6Addr> {
         let redeemed = {
             let _guard = self.invite_lock.lock().await;
             match crate::invite::InviteStore::load(&self.network_name) {
@@ -678,8 +675,8 @@ impl CoordinatorAcceptState {
         // Authoritative names are rejected on collision (no silent rename), so no
         // peer can claim another's name to take its suggested firewall rules.
         authoritative: bool,
-    ) -> Option<Ipv4Addr> {
-        let (peer_ip, collision_index, final_hostname) =
+    ) -> Option<Ipv6Addr> {
+        let (peer_ip, final_hostname) =
             match self.validate_admission(remote_id, hostname, authoritative) {
                 Ok(plan) => plan,
                 Err(reason) => {
@@ -710,18 +707,15 @@ impl CoordinatorAcceptState {
                 s.approved.remove(&remote_id);
             }
             s.pending.remove(&remote_id);
-            let _ = s.members.add(Member {
+            s.members.add(Member {
                 identity: remote_id,
-                ip: peer_ip,
                 is_coordinator: grant_direct,
                 hostname: final_hostname.clone(),
                 user_identity: user_id_opt,
                 device_cert: device_cert.clone(),
-                collision_index,
                 last_seen: Some(crate::membership::now_secs()),
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
             });
             s.refresh_snapshot();
             s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
@@ -736,7 +730,6 @@ impl CoordinatorAcceptState {
                 &self.ctx.reverse_table,
                 &self.network_name,
                 h,
-                Some(peer_ip),
                 derive_ipv6(&remote_id),
             )
             .await;
@@ -749,7 +742,6 @@ impl CoordinatorAcceptState {
             &self.network_name,
             &ControlMsg::MemberApproved {
                 identity: remote_id,
-                ip: peer_ip,
                 hostname: final_hostname.clone(),
                 device_cert: device_cert.clone(),
             },
@@ -788,13 +780,13 @@ impl CoordinatorAcceptState {
         // demux already owns this connection's control loop).
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
         self.ctx
-            .register_peer_conn(conn, remote_id, peer_ip, &self.network_name);
+            .register_peer_conn(conn, remote_id, &self.network_name);
 
         broadcast_member_sync(
             &self.ctx.registry,
             net_pubkey,
             &self.network_name,
-            Some(peer_ip),
+            Some(derive_ipv6(&remote_id)),
         )
         .await;
 
@@ -824,11 +816,8 @@ impl CoordinatorAcceptState {
         remote_id: EndpointId,
         hostname: Option<String>,
         authoritative: bool,
-    ) -> std::result::Result<(Ipv4Addr, u32, Option<String>), String> {
-        let (peer_ip, collision_index) = {
-            let s = self.state.read().unwrap();
-            crate::membership::assign_ip(&s.members, &remote_id)
-        };
+    ) -> std::result::Result<(Ipv6Addr, Option<String>), String> {
+        let peer_ip = crate::membership::derive_ipv6(&remote_id);
         let final_hostname = if let Some(desired) = hostname {
             let taken = {
                 let s = self.state.read().unwrap();
@@ -851,20 +840,9 @@ impl CoordinatorAcceptState {
         } else {
             None
         };
-        let collision = {
-            let s = self.state.read().unwrap();
-            if let Some(existing) = s.members.get_by_ip(peer_ip) {
-                existing.identity != remote_id
-            } else if let Some(existing) = s.approved.get_by_ip(peer_ip) {
-                existing.identity != remote_id
-            } else {
-                false
-            }
-        };
-        if collision {
-            return Err(format!("IP collision: {peer_ip} already assigned"));
-        }
-        Ok((peer_ip, collision_index, final_hostname))
+        // No collision check: the address is blake3 of the identity, so two
+        // different members cannot claim the same one.
+        Ok((peer_ip, final_hostname))
     }
 }
 
@@ -903,15 +881,14 @@ impl MemberAcceptState {
         send: iroh::endpoint::SendStream,
         peer_id: EndpointId,
         msg: ControlMsg,
-    ) -> Option<Ipv4Addr> {
+    ) -> Option<Ipv6Addr> {
         match msg {
             ControlMsg::MeshHello {
                 identity,
-                ip,
                 hostname,
                 device_cert,
             } => {
-                self.handle_mesh_hello(conn, send, peer_id, identity, ip, hostname, device_cert)
+                self.handle_mesh_hello(conn, send, peer_id, identity, hostname, device_cert)
                     .await
             }
             // Only a coordinator admits, so only a coordinator may say who was
@@ -922,10 +899,7 @@ impl MemberAcceptState {
             // at the IP *this message* chose, writes its `.ray` name, and
             // registers its route. Same gate as `InviteShare`/`KickedFromNetwork`.
             ControlMsg::MemberApproved {
-                identity,
-                ip,
-                hostname,
-                ..
+                identity, hostname, ..
             } => {
                 if !sender_is_coordinator(&self.state, peer_id) {
                     tracing::warn!(peer = %peer_id.fmt_short(), "ignoring MemberApproved from non-coordinator");
@@ -933,15 +907,12 @@ impl MemberAcceptState {
                 }
                 let entry = ApprovedEntry {
                     identity,
-                    ip,
                     hostname,
                     user_identity: None,
                     device_cert: None,
-                    collision_index: 0,
                 };
                 let mut s = self.state.write().unwrap();
-                let members = s.members.clone();
-                let _ = s.approved.approve(entry, &members);
+                s.approved.approve(entry);
                 None
             }
             // Triggers only: the roster/firewall come exclusively from the
@@ -1089,10 +1060,9 @@ impl MemberAcceptState {
         send: iroh::endpoint::SendStream,
         transport_id: EndpointId,
         peer_identity: EndpointId,
-        ip: Ipv4Addr,
         hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
-    ) -> Option<Ipv4Addr> {
+    ) -> Option<Ipv6Addr> {
         // Verify the cert and the identity claim together, before anything is
         // recorded. See `check_hello_identity`: the binding this stores is what
         // the firewall and mesh SSH later authorize on, so it is never taken on
@@ -1138,20 +1108,11 @@ impl MemberAcceptState {
 
         if is_approved {
             return self
-                .admit_approved_member(conn, send, peer_identity, ip, final_hostname, device_cert)
+                .admit_approved_member(conn, send, peer_identity, final_hostname, device_cert)
                 .await;
         }
         if is_member {
-            // Register the member at its authoritative roster IP (not the
-            // peer-supplied `ip`), so the data reader routes it correctly.
-            let member_ip = self
-                .state
-                .read()
-                .unwrap()
-                .members
-                .get(&peer_identity)
-                .map(|m| m.ip)
-                .unwrap_or(ip);
+            let member_ip = derive_ipv6(&peer_identity);
             if let Some(h) = &final_hostname {
                 {
                     let mut s = self.state.write().unwrap();
@@ -1164,13 +1125,12 @@ impl MemberAcceptState {
                     &self.ctx.reverse_table,
                     &self.network_name,
                     h,
-                    Some(member_ip),
                     derive_ipv6(&peer_identity),
                 )
                 .await;
             }
             self.ctx
-                .register_peer_conn(conn, peer_identity, member_ip, &self.network_name);
+                .register_peer_conn(conn, peer_identity, &self.network_name);
             return Some(member_ip);
         }
         None
@@ -1185,32 +1145,26 @@ impl MemberAcceptState {
         conn: &Connection,
         mut send: iroh::endpoint::SendStream,
         peer_identity: EndpointId,
-        ip: Ipv4Addr,
         final_hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
-    ) -> Option<Ipv4Addr> {
+    ) -> Option<Ipv6Addr> {
         let (snap_bytes, member_ip) = {
             let mut s = self.state.write().unwrap();
-            let approved_entry = s.approved.remove(&peer_identity);
+            s.approved.remove(&peer_identity);
             let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
-            // Trust the authoritative IP + collision index recorded when the
-            // peer was approved, not the peer-supplied MeshHello.ip.
-            let (member_ip, member_idx) = approved_entry
-                .as_ref()
-                .map(|e| (e.ip, e.collision_index))
-                .unwrap_or((ip, 0));
-            let _ = s.members.add(Member {
+            // The address is derived from the identity that dialed, so there is
+            // nothing left for a peer to claim and nothing to cross-check it
+            // against: the approved entry and the hello agree by construction.
+            let member_ip = derive_ipv6(&peer_identity);
+            s.members.add(Member {
                 identity: peer_identity,
-                ip: member_ip,
                 is_coordinator: false,
                 hostname: final_hostname.clone(),
                 user_identity: user_id_opt,
                 device_cert: device_cert.clone(),
-                collision_index: member_idx,
                 last_seen: Some(crate::membership::now_secs()),
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
             });
             s.refresh_snapshot();
             (
@@ -1227,7 +1181,6 @@ impl MemberAcceptState {
                 &self.ctx.reverse_table,
                 &self.network_name,
                 h,
-                Some(member_ip),
                 derive_ipv6(&peer_identity),
             )
             .await;
@@ -1249,12 +1202,12 @@ impl MemberAcceptState {
         )
         .await;
         self.ctx
-            .register_peer_conn(conn, peer_identity, member_ip, &self.network_name);
+            .register_peer_conn(conn, peer_identity, &self.network_name);
         broadcast_member_sync(
             &self.ctx.registry,
             self.net_pubkey,
             &self.network_name,
-            Some(member_ip),
+            Some(derive_ipv6(&peer_identity)),
         )
         .await;
         Some(member_ip)
@@ -1386,18 +1339,6 @@ impl AcceptHandler {
                 });
                 true
             }
-            // Same shape for a member telling us its data plane is IPv6-only, so
-            // its mesh IPv4 must not be handed out in DNS answers.
-            ControlMsg::Ipv6Only { enabled } => {
-                let registry = self.registry().clone();
-                let Some(network) = self.network_name() else {
-                    return true;
-                };
-                tokio::spawn(async move {
-                    registry.record_ipv6_only(&network, peer_id, enabled).await;
-                });
-                true
-            }
             _ => false,
         }
     }
@@ -1410,7 +1351,7 @@ impl AcceptHandler {
         send: iroh::endpoint::SendStream,
         peer_id: EndpointId,
         msg: ControlMsg,
-    ) -> Option<Ipv4Addr> {
+    ) -> Option<Ipv6Addr> {
         if self.handle_common(peer_id, &msg) {
             return None;
         }
@@ -1635,7 +1576,6 @@ mod stranger_policy_tests {
             },
             ControlMsg::MeshHello {
                 identity: eid(1),
-                ip: Ipv4Addr::new(100, 64, 0, 2),
                 hostname: None,
                 device_cert: None,
             },
@@ -1654,7 +1594,6 @@ mod stranger_policy_tests {
             // Coordinator authority.
             ControlMsg::MemberApproved {
                 identity: eid(1),
-                ip: Ipv4Addr::new(100, 64, 0, 2),
                 hostname: None,
                 device_cert: None,
             },
@@ -1679,7 +1618,6 @@ mod stranger_policy_tests {
                 enabled: true,
                 exit_families: ExitFamilies::Dual,
             },
-            ControlMsg::Ipv6Only { enabled: true },
             ControlMsg::LeaveNetwork,
         ] {
             assert!(!stranger_may_send(&msg), "{msg:?} must need membership");
@@ -1703,18 +1641,14 @@ mod direct_grant_tests {
         for (i, id) in ids.iter().enumerate() {
             list.add(Member {
                 identity: *id,
-                ip: Ipv4Addr::new(100, 64, 0, (i + 2) as u8),
                 is_coordinator: i == 0,
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
-                collision_index: 0,
                 last_seen: None,
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
-                ipv6_only: false,
-            })
-            .unwrap();
+            });
         }
         Arc::new(RwLock::new(NetworkState {
             members: list,

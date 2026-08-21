@@ -71,7 +71,7 @@ fun NetworksScreen(
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
                         Text(net.name, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-                        Text("${net.hostname.ifEmpty { net.ipv4 }} · ${if (running) "${net.peers.count { it.isActive }} online" else "offline"}",
+                        Text("${net.hostname.ifEmpty { net.ipv6 }} · ${if (running) "${net.peers.count { it.isActive }} online" else "offline"}",
                             fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Muted)
                     }
                     // The device's stable .ray DNS name in this network. Prefer
@@ -85,7 +85,7 @@ fun NetworksScreen(
                                 run({ NodeHolder.get(context).invite(net.name) }, { inviteCode = it }, "Invite failed")
                             },
                             MenuItem("Copy address") {
-                                val address = dns ?: net.ipv4
+                                val address = dns ?: net.ipv6
                                 copyToClipboard(context, "address", address)
                                 onToast("Copied $address")
                             },

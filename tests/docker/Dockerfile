@@ -1,4 +1,4 @@
-# e2e node image: a container that behaves enough like a Scaleway instance for
+# e2e node image: a container that behaves enough like a cloud instance for
 # the scenario scripts to drive it unchanged — systemd as PID 1, sshd on
 # 0.0.0.0:22 with root key login, and the handful of tools the scripts shell out
 # to on the remote side.

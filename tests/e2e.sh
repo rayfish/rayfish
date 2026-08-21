@@ -25,25 +25,25 @@
 #   provision     create the hosts only (-> <dir>/.servers)
 #   teardown      destroy the hosts and remove .servers
 #
-# Backends (E2E_BACKEND, default scaleway):
-#   scaleway      real instances, one fleet per scenario (needs scw + jq)
+# Backends (E2E_BACKEND, default digitalocean):
+#   digitalocean  real droplets, one fleet per scenario (needs doctl + jq)
 #   docker        local containers on one bridge (needs docker + /dev/net/tun).
-#                 exit-node, reliability and bench are Scaleway-only: they need
-#                 hosts with distinct public IPs and a real WAN baseline.
+#                 exit-node, reliability and bench need real hosts: distinct
+#                 public IPs and a WAN baseline one bridge cannot provide.
 #
 # Each scenario's fleet (instance names + role labels) is declared in the
 # registry below; the actual run steps live in <dir>/run.sh. The shared
 # provision/teardown/assert bodies live in tests/lib/ and are sourced here.
 #
-# Env overrides: ZONE/TYPE/IMAGE (scaleway provision); E2E_DOCKER_* (docker
-# provision, see tests/lib/docker.sh); SSH_KEY, KEEP_STATE (run).
+# Env overrides: REGION/SIZE/IMAGE/DO_SSH_KEYS (droplet provision); E2E_DOCKER_*
+# (docker provision, see tests/lib/docker.sh); SSH_KEY, KEEP_STATE (run).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Exported: the `all` path re-invokes this script per scenario, and a plain shell
-# variable would silently drop back to scaleway halfway through.
-export E2E_BACKEND="${E2E_BACKEND:-scaleway}"
+# variable would silently drop back to digitalocean halfway through.
+export E2E_BACKEND="${E2E_BACKEND:-digitalocean}"
 
 usage(){ sed -n '2,33p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
 
@@ -111,7 +111,7 @@ case "$scenario" in -h|--help|help|"") usage 0 ;; esac
 if [[ "$scenario" == all ]]; then
   all_scenarios=(device-cert connect firewall closed-net apply dns ssh reliability restore-offline unpair exit-node)
   passed=(); failed=(); skipped=()
-  hint="check 'scw instance server list'"
+  hint="check 'doctl compute droplet list'"
   [[ "$E2E_BACKEND" == "docker" ]] && hint="check 'docker ps -a'"
   for s in "${all_scenarios[@]}"; do
     if ! docker_supports "$s"; then skipped+=("$s"); continue; fi

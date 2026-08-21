@@ -27,8 +27,8 @@ use dashmap::DashMap;
 use tokio::sync::RwLock;
 
 use simple_dns::{
-    CLASS, Name, Packet, PacketFlag, QTYPE, RCODE, ResourceRecord, rdata::A, rdata::AAAA,
-    rdata::OPT, rdata::RData, rdata::SOA,
+    CLASS, Name, Packet, PacketFlag, QTYPE, RCODE, ResourceRecord, rdata::AAAA, rdata::OPT,
+    rdata::RData, rdata::SOA,
 };
 
 use crate::DNS_DOMAIN;
@@ -41,10 +41,10 @@ use crate::DNS_DOMAIN;
 /// Tailscale's 100.100.100.100 so both can coexist.
 pub const MAGIC_DNS_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 53);
 
-/// The same resolver, addressed inside our own IPv6 range, used when the data
-/// plane is IPv6-only (`AppConfig::ipv6_only`).
+/// The same resolver, addressed inside our own IPv6 range. The only address the
+/// OS is ever pointed at: the overlay carries no IPv4.
 ///
-/// The v4 address above is unusable on the hosts that mode exists for. Tailscale
+/// The v4 address above is unusable on the hosts we run on. Tailscale
 /// installs an anti-spoof rule (`-s 100.64.0.0/10 ! -i tailscale0 -j DROP`) that
 /// drops anything sourced from the CGNAT range arriving on another interface,
 /// and our reply is synthesized with the magic IP as its source and injected
@@ -58,11 +58,10 @@ pub const MAGIC_DNS_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 53);
 /// [`crate::membership::derive_ipv6`] would have to hash to these exact 15 bytes.
 pub const MAGIC_DNS_V6: Ipv6Addr = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 0x53);
 
-/// Per-network hostname to (IPv4, IPv6) mapping. The IPv4 is `None` for a peer
-/// running an IPv6-only data plane (`Member.ipv6_only`): its mesh IPv4 exists on
-/// the roster but is not routed on that host, so answering with it would send
-/// packets down a path whose replies leave through another VPN.
-pub type HostnameEntry = (Option<Ipv4Addr>, Ipv6Addr);
+/// Per-network hostname to mesh IPv6 mapping. There is no second address to
+/// hold: the overlay is IPv6-only, and a peer's address is derived from its
+/// identity, so a name either resolves to one or the roster does not hold it.
+pub type HostnameEntry = Ipv6Addr;
 pub type HostnameTable = Arc<RwLock<HashMap<String, HashMap<String, HostnameEntry>>>>;
 
 /// Reverse lookup: IP → (hostname, network).
@@ -82,19 +81,12 @@ pub async fn update_hostname(
     reverse: &ReverseLookupTable,
     network: &str,
     hostname: &str,
-    ipv4: Option<Ipv4Addr>,
     ipv6: Ipv6Addr,
 ) {
     {
         let mut t = table.write().await;
         let hosts = t.entry(network.to_string()).or_default();
-        hosts.insert(hostname.to_string(), (ipv4, ipv6));
-    }
-    if let Some(ipv4) = ipv4 {
-        reverse.insert(
-            IpAddr::V4(ipv4),
-            (hostname.to_string(), network.to_string()),
-        );
+        hosts.insert(hostname.to_string(), ipv6);
     }
     reverse.insert(
         IpAddr::V6(ipv6),
@@ -107,14 +99,13 @@ pub async fn remove_hostname_by_ip(
     table: &HostnameTable,
     reverse: &ReverseLookupTable,
     network: &str,
-    ipv4: Ipv4Addr,
+    ipv6: Ipv6Addr,
 ) {
     let mut t = table.write().await;
     if let Some(hosts) = t.get_mut(network) {
-        hosts.retain(|_, (v4, v6)| {
-            if *v4 == Some(ipv4) {
-                reverse.remove(&IpAddr::V4(ipv4));
-                reverse.remove(&IpAddr::V6(*v6));
+        hosts.retain(|_, v6| {
+            if *v6 == ipv6 {
+                reverse.remove(&IpAddr::V6(ipv6));
                 false
             } else {
                 true
@@ -131,24 +122,18 @@ pub async fn sync_network_hostnames(
     table: &HostnameTable,
     reverse: &ReverseLookupTable,
     network: &str,
-    entries: &[(String, Option<Ipv4Addr>, Ipv6Addr)],
+    entries: &[(String, Ipv6Addr)],
 ) {
     let mut t = table.write().await;
     // Drop reverse entries for the network's previous set before rebuilding.
     if let Some(old) = t.get(network) {
-        for (v4, v6) in old.values() {
-            if let Some(v4) = v4 {
-                reverse.remove(&IpAddr::V4(*v4));
-            }
+        for v6 in old.values() {
             reverse.remove(&IpAddr::V6(*v6));
         }
     }
     let mut hosts = HashMap::with_capacity(entries.len());
-    for (name, v4, v6) in entries {
-        hosts.insert(name.clone(), (*v4, *v6));
-        if let Some(v4) = v4 {
-            reverse.insert(IpAddr::V4(*v4), (name.clone(), network.to_string()));
-        }
+    for (name, v6) in entries {
+        hosts.insert(name.clone(), *v6);
         reverse.insert(IpAddr::V6(*v6), (name.clone(), network.to_string()));
     }
     t.insert(network.to_string(), hosts);
@@ -158,10 +143,7 @@ pub async fn sync_network_hostnames(
 pub async fn remove_network(table: &HostnameTable, reverse: &ReverseLookupTable, network: &str) {
     let mut t = table.write().await;
     if let Some(hosts) = t.remove(network) {
-        for (_, (ipv4, ipv6)) in hosts {
-            if let Some(ipv4) = ipv4 {
-                reverse.remove(&IpAddr::V4(ipv4));
-            }
+        for (_, ipv6) in hosts {
             reverse.remove(&IpAddr::V6(ipv6));
         }
     }
@@ -179,16 +161,13 @@ pub async fn remove_network(table: &HostnameTable, reverse: &ReverseLookupTable,
 /// would put a public resolver's 86400 negative TTL on a name only we can ever
 /// resolve.
 ///
-/// `ipv6_only` is this node's data-plane mode. When set, mesh IPv4 is not routed
-/// here (another VPN owns `100.64.0.0/10`), so an A record would resolve to an
-/// address that goes nowhere: the answer becomes NODATA, and the AAAA lookup for
-/// the same name still works. NODATA rather than NXDOMAIN because the name
+/// An A query is always NODATA: the overlay carries no IPv4, so there is no
+/// record of that type to hand out. NODATA rather than NXDOMAIN because the name
 /// exists, and NXDOMAIN would fail the AAAA alongside it in most stub resolvers.
 pub(crate) async fn handle_query(
     data: &[u8],
     table: &HostnameTable,
     reverse: &ReverseLookupTable,
-    ipv6_only: bool,
 ) -> Option<Vec<u8>> {
     let packet = Packet::parse(data).ok()?;
 
@@ -203,7 +182,7 @@ pub(crate) async fn handle_query(
 
     // PTR queries for in-addr.arpa / ip6.arpa
     if is_ptr {
-        return handle_ptr_query(&packet, &name_lower, reverse, ipv6_only).await;
+        return handle_ptr_query(&packet, &name_lower, reverse).await;
     }
 
     let suffix = format!(".{DNS_DOMAIN}");
@@ -218,19 +197,16 @@ pub(crate) async fn handle_query(
         // come back NXDOMAIN carrying the root's SOA and its 86400 negative TTL.
         // Trading our own 60s SOA for that turns a roster still filling in at
         // startup into a name the OS caches as dead for a day.
-        let Some((v4, v6)) = resolve_name(&name_lower, &suffix, table).await else {
+        let Some(v6) = resolve_name(&name_lower, &suffix, table).await else {
             tracing::info!(name = %name_lower, "DNS query NXDOMAIN");
             return Some(make_nxdomain(&packet));
         };
         if is_a {
-            // No A either when we cannot use mesh IPv4 (`ipv6_only`) or when the
-            // peer itself cannot be reached over it (`v4 == None`).
-            let Some(v4) = v4.filter(|_| !ipv6_only) else {
-                tracing::debug!(name = %name_lower, "DNS A withheld (IPv6-only)");
-                return Some(make_nodata(&packet));
-            };
-            tracing::info!(name = %name_lower, ip = %v4, "DNS resolved A");
-            return Some(make_a_response(&packet, &question.qname, v4));
+            // The overlay carries no IPv4, so there is never an A record to give.
+            // NODATA and not NXDOMAIN: the name exists, and NXDOMAIN here would
+            // fail the AAAA lookup alongside it.
+            tracing::debug!(name = %name_lower, "DNS A withheld (no mesh IPv4)");
+            return Some(make_nodata(&packet));
         }
         if is_aaaa {
             tracing::info!(name = %name_lower, ip = %v6, "DNS resolved AAAA");
@@ -246,17 +222,13 @@ pub(crate) async fn handle_query(
     if !(is_a || is_aaaa) {
         return None;
     }
-    let (v4, v6) = resolve_bare_network_name(&name_lower, table).await?;
+    let v6 = resolve_bare_network_name(&name_lower, table).await?;
     if is_a {
-        // The roster holds the name, so this is ours to answer even when we are
-        // withholding the address; going upstream would resolve a mesh peer to
-        // whatever public name happens to collide with it.
-        let Some(v4) = v4.filter(|_| !ipv6_only) else {
-            tracing::debug!(name = %name_lower, "DNS A withheld (IPv6-only)");
-            return Some(make_nodata(&packet));
-        };
-        tracing::info!(name = %name_lower, ip = %v4, "DNS resolved A");
-        Some(make_a_response(&packet, &question.qname, v4))
+        // The roster holds the name, so this is ours to answer even though we
+        // have no address of that family; going upstream would resolve a mesh
+        // peer to whatever public name happens to collide with it.
+        tracing::debug!(name = %name_lower, "DNS A withheld (no mesh IPv4)");
+        Some(make_nodata(&packet))
     } else {
         tracing::info!(name = %name_lower, ip = %v6, "DNS resolved AAAA");
         Some(make_aaaa_response(&packet, &question.qname, v6))
@@ -281,7 +253,6 @@ async fn handle_ptr_query(
     packet: &Packet<'_>,
     name: &str,
     reverse: &ReverseLookupTable,
-    ipv6_only: bool,
 ) -> Option<Vec<u8>> {
     let ip = parse_ptr_name(name)?;
 
@@ -292,22 +263,13 @@ async fn handle_ptr_query(
         return Some(make_ptr_response(packet, &packet.questions[0].qname, &fqdn));
     }
 
-    // If IP is in our range but not found, NXDOMAIN
+    // If IP is in our range but not found, NXDOMAIN. `100.64.0.0/10` is not ours
+    // to speak for: it belongs to whichever VPN we are sharing the host with, and
+    // answering an authoritative NXDOMAIN would break reverse lookups for its
+    // nodes. Only reachable when we are the system-wide resolver; with split DNS,
+    // `in-addr.arpa` is not routed to us at all.
     match ip {
-        // In IPv6-only mode `100.64.0.0/10` is not ours to speak for: it belongs
-        // to whichever VPN we are sharing the host with, and answering an
-        // authoritative NXDOMAIN would break reverse lookups for its nodes.
-        // Only reachable when we are the system-wide resolver; with split DNS,
-        // `in-addr.arpa` is not routed to us at all.
-        IpAddr::V4(_) if ipv6_only => {}
-        IpAddr::V4(v4) => {
-            let octets = v4.octets();
-            // 100.64.0.0/10
-            if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
-                tracing::info!(ip = %ip, "DNS PTR NXDOMAIN (our range)");
-                return Some(make_nxdomain(packet));
-            }
-        }
+        IpAddr::V4(_) => {}
         IpAddr::V6(v6) => {
             let segments = v6.segments();
             // 200::/7
@@ -406,22 +368,6 @@ fn finalize_response(response: &mut Packet, query: &Packet) {
     }
 }
 
-fn make_a_response(query: &Packet, qname: &Name, ip: Ipv4Addr) -> Vec<u8> {
-    let mut response = Packet::new_reply(query.id());
-    response.set_flags(PacketFlag::RESPONSE | PacketFlag::AUTHORITATIVE_ANSWER);
-    response.questions = query.questions.clone();
-    response.answers.push(ResourceRecord::new(
-        qname.clone(),
-        CLASS::IN,
-        60,
-        RData::A(A {
-            address: u32::from(ip),
-        }),
-    ));
-    finalize_response(&mut response, query);
-    response.build_bytes_vec().unwrap_or_default()
-}
-
 fn make_aaaa_response(query: &Packet, qname: &Name, ip: Ipv6Addr) -> Vec<u8> {
     let mut response = Packet::new_reply(query.id());
     response.set_flags(PacketFlag::RESPONSE | PacketFlag::AUTHORITATIVE_ANSWER);
@@ -501,9 +447,13 @@ mod tests {
 
     const SUFFIX: &str = ".ray";
 
-    fn entry(v4: Ipv4Addr) -> HostnameEntry {
-        let v6 = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 1);
-        (Some(v4), v6)
+    /// A mesh address in `200::/7`, distinct per `n`.
+    fn v6(n: u16) -> Ipv6Addr {
+        Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, n)
+    }
+
+    fn entry(v6: Ipv6Addr) -> HostnameEntry {
+        v6
     }
 
     #[tokio::test]
@@ -512,14 +462,11 @@ mod tests {
         {
             let mut t = table.write().await;
             let mut hosts = HashMap::new();
-            hosts.insert("alice".to_string(), entry(Ipv4Addr::new(100, 64, 10, 5)));
+            hosts.insert("alice".to_string(), entry(v6(5)));
             t.insert("gaming".to_string(), hosts);
         }
         let result = resolve_name("alice.gaming.ray", SUFFIX, &table).await;
-        assert_eq!(
-            result.map(|(v4, _)| v4),
-            Some(Some(Ipv4Addr::new(100, 64, 10, 5)))
-        );
+        assert_eq!(result, Some(v6(5)));
     }
 
     #[tokio::test]
@@ -527,51 +474,36 @@ mod tests {
         let table = new_hostname_table();
         let reverse = new_reverse_table();
         let v6 = |n: u16| Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, n);
-        let alice_v4 = Ipv4Addr::new(100, 64, 10, 5);
-        let bob_v4 = Ipv4Addr::new(100, 64, 10, 6);
 
         // Initial roster: alice + bob.
         sync_network_hostnames(
             &table,
             &reverse,
             "net",
-            &[
-                ("alice".to_string(), Some(alice_v4), v6(1)),
-                ("bob".to_string(), Some(bob_v4), v6(2)),
-            ],
+            &[("alice".to_string(), v6(1)), ("bob".to_string(), v6(2))],
         )
         .await;
         assert_eq!(
-            resolve_name("alice.net.ray", SUFFIX, &table)
-                .await
-                .map(|(v4, _)| v4),
-            Some(Some(alice_v4))
+            resolve_name("alice.net.ray", SUFFIX, &table).await,
+            Some(v6(1))
         );
         assert_eq!(
-            reverse.get(&IpAddr::V4(alice_v4)).map(|e| e.0.clone()),
+            reverse.get(&IpAddr::V6(v6(1))).map(|e| e.0.clone()),
             Some("alice".to_string())
         );
 
         // alice renames to dario; bob leaves.
-        sync_network_hostnames(
-            &table,
-            &reverse,
-            "net",
-            &[("dario".to_string(), Some(alice_v4), v6(1))],
-        )
-        .await;
+        sync_network_hostnames(&table, &reverse, "net", &[("dario".to_string(), v6(1))]).await;
         assert_eq!(
-            resolve_name("dario.net.ray", SUFFIX, &table)
-                .await
-                .map(|(v4, _)| v4),
-            Some(Some(alice_v4))
+            resolve_name("dario.net.ray", SUFFIX, &table).await,
+            Some(v6(1))
         );
         // Old name and departed peer no longer resolve; reverse is rebuilt.
         assert_eq!(resolve_name("alice.net.ray", SUFFIX, &table).await, None);
         assert_eq!(resolve_name("bob.net.ray", SUFFIX, &table).await, None);
-        assert_eq!(reverse.get(&IpAddr::V4(bob_v4)).map(|e| e.0.clone()), None);
+        assert_eq!(reverse.get(&IpAddr::V6(v6(2))).map(|e| e.0.clone()), None);
         assert_eq!(
-            reverse.get(&IpAddr::V4(alice_v4)).map(|e| e.0.clone()),
+            reverse.get(&IpAddr::V6(v6(1))).map(|e| e.0.clone()),
             Some("dario".to_string())
         );
     }
@@ -582,14 +514,11 @@ mod tests {
         {
             let mut t = table.write().await;
             let mut hosts = HashMap::new();
-            hosts.insert("bob".to_string(), entry(Ipv4Addr::new(100, 64, 20, 3)));
+            hosts.insert("bob".to_string(), entry(v6(3)));
             t.insert("work".to_string(), hosts);
         }
         let result = resolve_name("bob.ray", SUFFIX, &table).await;
-        assert_eq!(
-            result.map(|(v4, _)| v4),
-            Some(Some(Ipv4Addr::new(100, 64, 20, 3)))
-        );
+        assert_eq!(result, Some(v6(3)));
     }
 
     #[tokio::test]
@@ -599,18 +528,16 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    /// IPv6-only mode: the mesh IPv4 is not routed on this node, so an A record
-    /// would point an app at an address owned by another VPN. The name still
-    /// resolves over IPv6, and NODATA (not NXDOMAIN) is what keeps it that way.
+    /// The mesh IPv4 is not routed on any node, so an A record would point an
+    /// app at an address owned by another VPN. The name still resolves over
+    /// IPv6, and NODATA (not NXDOMAIN) is what keeps it that way.
     #[tokio::test]
     async fn ipv6_only_withholds_a_but_still_answers_aaaa() {
         use simple_dns::{CLASS as C, PacketFlag, QCLASS, Question};
 
         let table = new_hostname_table();
         let reverse = new_reverse_table();
-        let v4 = Ipv4Addr::new(100, 64, 10, 5);
-        let v6 = entry(v4).1;
-        update_hostname(&table, &reverse, "dev", "box", Some(v4), v6).await;
+        update_hostname(&table, &reverse, "dev", "box", v6(5)).await;
 
         let query = |name: &str, qtype: QTYPE| {
             let mut pkt = Packet::new_query(1);
@@ -626,7 +553,7 @@ mod tests {
         let a = QTYPE::TYPE(simple_dns::TYPE::A);
         let aaaa = QTYPE::TYPE(simple_dns::TYPE::AAAA);
         let ask = async |name: &str, qtype| {
-            handle_query(&query(name, qtype), &table, &reverse, true)
+            handle_query(&query(name, qtype), &table, &reverse)
                 .await
                 .expect("the roster holds this name, so it is ours to answer")
         };
@@ -645,7 +572,7 @@ mod tests {
         let resp = Packet::parse(&bytes).expect("parse response");
         assert_eq!(resp.answers.len(), 1);
         assert!(
-            matches!(resp.answers[0].rdata, RData::AAAA(ref got) if Ipv6Addr::from(got.address) == v6)
+            matches!(resp.answers[0].rdata, RData::AAAA(ref got) if Ipv6Addr::from(got.address) == v6(5))
         );
 
         // A PTR for the CGNAT range belongs to whichever VPN owns it here, so we
@@ -658,7 +585,6 @@ mod tests {
                 ),
                 &table,
                 &reverse,
-                true,
             )
             .await
             .is_none()
@@ -672,25 +598,21 @@ mod tests {
                 ),
                 &table,
                 &reverse,
-                true,
             )
             .await
             .is_some()
         );
     }
 
-    /// The other half of the same rule, seen from a dual-stack node: a *peer*
-    /// running an IPv6-only data plane is held in the table with no IPv4
-    /// (`Member.ipv6_only` on the signed roster), so we withhold its A record
-    /// even though our own IPv4 works fine.
+    /// The other half of the same rule, seen from the peer's side: a peer is
+    /// held in the table with no IPv4, so we withhold its A record too.
     #[tokio::test]
     async fn peer_without_ipv4_gets_no_a_record() {
         use simple_dns::{CLASS as C, PacketFlag, QCLASS, Question};
 
         let table = new_hostname_table();
         let reverse = new_reverse_table();
-        let v6 = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 9);
-        update_hostname(&table, &reverse, "dev", "box", None, v6).await;
+        update_hostname(&table, &reverse, "dev", "box", v6(9)).await;
 
         let query = |qtype: QTYPE| {
             let mut pkt = Packet::new_query(1);
@@ -704,15 +626,9 @@ mod tests {
             pkt.build_bytes_vec().expect("build query")
         };
 
-        // We are dual-stack (`ipv6_only = false`) and still answer NODATA.
-        let bytes = handle_query(
-            &query(QTYPE::TYPE(simple_dns::TYPE::A)),
-            &table,
-            &reverse,
-            false,
-        )
-        .await
-        .expect("the roster holds the name");
+        let bytes = handle_query(&query(QTYPE::TYPE(simple_dns::TYPE::A)), &table, &reverse)
+            .await
+            .expect("the roster holds the name");
         let resp = Packet::parse(&bytes).expect("parse response");
         assert_eq!(resp.rcode(), RCODE::NoError);
         assert!(resp.answers.is_empty());
@@ -721,7 +637,6 @@ mod tests {
             &query(QTYPE::TYPE(simple_dns::TYPE::AAAA)),
             &table,
             &reverse,
-            false,
         )
         .await
         .expect("the roster holds the name");
@@ -740,8 +655,7 @@ mod tests {
 
         let table = new_hostname_table();
         let reverse = new_reverse_table();
-        let v4 = Ipv4Addr::new(100, 64, 10, 5);
-        update_hostname(&table, &reverse, "dev", "box", Some(v4), entry(v4).1).await;
+        update_hostname(&table, &reverse, "dev", "box", v6(5)).await;
 
         let query = |name: &str, qtype: QTYPE| {
             let mut pkt = Packet::new_query(1);
@@ -758,7 +672,7 @@ mod tests {
         let declined = |name: &'static str, qtype| {
             let (table, reverse) = (table.clone(), reverse.clone());
             async move {
-                handle_query(&query(name, qtype), &table, &reverse, false)
+                handle_query(&query(name, qtype), &table, &reverse)
                     .await
                     .is_none()
             }
@@ -780,10 +694,20 @@ mod tests {
             )
             .await
         );
-        // ...but a PTR inside our range is ours to answer, hit or miss.
+        // A PTR inside `100.64.0.0/10` also goes upstream: that range is not ours
+        // any more, and answering an authoritative NXDOMAIN would break reverse
+        // lookups for the nodes of whatever VPN owns it here.
+        assert!(
+            declined(
+                "9.0.64.100.in-addr.arpa",
+                QTYPE::TYPE(simple_dns::TYPE::PTR)
+            )
+            .await
+        );
+        // ...but a PTR inside `200::/7` is ours to answer, hit or miss.
         assert!(
             !declined(
-                "9.0.64.100.in-addr.arpa",
+                "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0.ip6.arpa",
                 QTYPE::TYPE(simple_dns::TYPE::PTR)
             )
             .await
@@ -812,7 +736,7 @@ mod tests {
         ));
         let query = pkt.build_bytes_vec().expect("build query");
 
-        let resp = handle_query(&query, &table, &reverse, false)
+        let resp = handle_query(&query, &table, &reverse)
             .await
             .expect("an empty roster still answers inside our own zone");
         let resp = Packet::parse(&resp).expect("parse NXDOMAIN");
@@ -856,18 +780,15 @@ mod tests {
     async fn test_update_and_reverse_lookup() {
         let table = new_hostname_table();
         let reverse = new_reverse_table();
-        let v4 = Ipv4Addr::new(100, 64, 10, 5);
         let v6 = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 1);
 
-        update_hostname(&table, &reverse, "gaming", "alice", Some(v4), v6).await;
+        update_hostname(&table, &reverse, "gaming", "alice", v6).await;
 
         // Forward lookup works
         let result = resolve_name("alice.gaming.ray", SUFFIX, &table).await;
-        assert_eq!(result, Some((Some(v4), v6)));
+        assert_eq!(result, Some(v6));
 
         // Reverse lookup works
-        let rev4 = reverse.get(&IpAddr::V4(v4)).map(|e| e.value().clone());
-        assert_eq!(rev4, Some(("alice".to_string(), "gaming".to_string())));
         let rev6 = reverse.get(&IpAddr::V6(v6)).map(|e| e.value().clone());
         assert_eq!(rev6, Some(("alice".to_string(), "gaming".to_string())));
     }

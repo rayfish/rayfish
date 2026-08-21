@@ -1,11 +1,10 @@
 //! OS-level DNS resolver configuration for Magic DNS.
 //!
-//! Configures the system to route `.ray` queries to our local resolver at 100.100.100.53:53.
+//! Configures the system to route `.ray` queries to our local resolver at
+//! `[200::53]:53`.
 //! macOS: SCDynamicStore with session keys (auto-cleanup on process exit).
 //! Linux: systemd-resolved / resolvconf / direct /etc/resolv.conf.
 
-#[cfg(target_os = "linux")]
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 #[cfg(target_os = "linux")]
@@ -14,7 +13,8 @@ use std::net::SocketAddr;
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 // Only the macOS/Linux configurators build resolver/backup file paths; Android
 // does no OS-level DNS configuration.
 #[cfg(not(target_os = "android"))]
@@ -29,40 +29,14 @@ use async_trait::async_trait;
 use smol_str::SmolStr;
 #[cfg(target_os = "linux")]
 use zbus::Connection;
-#[cfg(target_os = "linux")]
-use zbus::zvariant::Value;
 
 use crate::DNS_DOMAIN;
 
-/// Whether this node's data plane is IPv6-only, which decides *which* magic
-/// resolver address the OS is pointed at. Set once at daemon start, before any
-/// backend is detected; process-wide because every configurator below needs it
-/// and none of them is constructed anywhere the daemon's config is in scope.
-static IPV6_ONLY: AtomicBool = AtomicBool::new(false);
-
-/// Record the data-plane mode for the DNS backends. Called at daemon start.
-pub fn set_ipv6_only(on: bool) {
-    IPV6_ONLY.store(on, Ordering::Relaxed);
-}
-
-/// The address to hand the OS as the `.ray` nameserver.
-///
-/// IPv6-only hosts must not be given the v4 one: it lives in `100.64.0.0/10`,
-/// and the VPN that owns that range on such a host drops our reply before it
-/// reaches the stub resolver. See [`crate::dns::MAGIC_DNS_V6`].
-/// Read by the macOS configurator, which scopes its resolver to the utun in
-/// this mode; the other backends only ever need [`resolver_addr`].
-#[cfg(target_os = "macos")]
-pub(crate) fn ipv6_only() -> bool {
-    IPV6_ONLY.load(Ordering::Relaxed)
-}
-
+/// The address to hand the OS as the `.ray` nameserver. Always the v6 one: the
+/// overlay carries no IPv4, and `100.64.0.0/10` belongs to whatever other VPN
+/// shares the host, which would drop our reply before it reached the stub.
 pub fn resolver_addr() -> IpAddr {
-    if IPV6_ONLY.load(Ordering::Relaxed) {
-        IpAddr::V6(crate::dns::MAGIC_DNS_V6)
-    } else {
-        IpAddr::V4(crate::dns::MAGIC_DNS_V4)
-    }
+    IpAddr::V6(crate::dns::MAGIC_DNS_V6)
 }
 
 /// A DNS search domain: a suffix the resolver appends to a bare name before
@@ -240,10 +214,10 @@ pub async fn detect_and_configure(
             c.apply().await?;
             return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
         }
-        if let Some(c) = try_networkmanager_dbus(tun_name).await {
-            c.apply().await?;
-            return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
-        }
+        // NetworkManager is deliberately not a rung: it sets nameservers through
+        // `IP4Config.Nameservers`, a `u32` array that cannot carry the IPv6
+        // address the mesh resolver answers on. The ladder falls through to
+        // resolvconf or a direct `resolv.conf`, both of which take either family.
         if resolved_in_path && let Some(c) = try_systemd_resolved_cli(tun_name) {
             c.apply().await?;
             return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
@@ -349,6 +323,20 @@ pub fn search_domains_for(network_names: &[String]) -> Vec<SearchDomain> {
 /// domains by undoing the file: direct mode restores the backup, resolvconf
 /// withdraws the whole stanza.
 pub async fn clear_search_domains(tun_name: &str) {
+    // macOS clears by *removing* the keys, not by writing an empty search list.
+    // The only caller is `DnsService::revert`, which has already run the
+    // backend's own revert, and on macOS the sole way to set search domains is
+    // `write_dns_config`, which rewrites `ServerAddresses` and (while the tunnel
+    // flag is still up, which it is at this point in `deactivate`) the empty
+    // catch-all match domain. Routing a *clear* through the *set* path therefore
+    // re-armed the whole host's resolver, pointed at a `200::53` that stops
+    // answering the moment the TUN goes down.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = tun_name;
+        macos::remove_dns_config();
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Err(e) = set_manager_search_domains(&[], tun_name).await {
         tracing::warn!(error = %e, "failed to clear search domains");
     }
@@ -405,8 +393,8 @@ mod macos {
     use super::{DNS_DOMAIN, DnsConfigurator};
 
     const SC_DNS_KEY: &str = "State:/Network/Service/rayfish/DNS";
-    /// The IPv6 half of the same service. Written alongside the DNS key in
-    /// IPv6-only mode; see [`write_service_config`].
+    /// The IPv6 half of the same service, written alongside the DNS key; see
+    /// [`write_service_config`].
     const SC_IPV6_KEY: &str = "State:/Network/Service/rayfish/IPv6";
     /// The service itself, carrying only its rank. See [`write_service_config`].
     const SC_SERVICE_KEY: &str = "State:/Network/Service/rayfish";
@@ -442,6 +430,17 @@ mod macos {
         Ok(STORE.get().unwrap())
     }
 
+    /// Drop every key this backend owns. Idempotent, and safe with no store.
+    pub fn remove_dns_config() {
+        if let Some(store) = STORE.get() {
+            let store = store.lock().unwrap();
+            store.0.remove(SC_DNS_KEY);
+            store.0.remove(SC_IPV6_KEY);
+            store.0.remove(SC_SERVICE_KEY);
+        }
+        tracing::info!("removed SCDynamicStore DNS configuration");
+    }
+
     pub fn write_dns_config(search_domains: &[super::SearchDomain], tun_name: &str) -> Result<()> {
         let store = get_or_init_store()?;
         let store = store.lock().unwrap();
@@ -473,17 +472,16 @@ mod macos {
             .collect();
         let search_val = CFArray::from_CFTypes(&search_cfstrings);
 
-        // In IPv6-only mode, ask configd to trust this resolver, which is the
-        // only way it is ever asked for AAAA. configd computes the per-resolver
-        // "Request A / Request AAAA" flags, and for a supplemental resolver
-        // there is exactly one branch that sets them from the resolver's own
-        // service: the one guarded by an internal `__SCOPED_QUERY__` marker
-        // (configd's dns-configuration.c). Fail it and configd strips the
-        // InterfaceName below, assigns no families of its own, and falls back to
-        // merging in the flags of the *default* resolver. On a Mac with no
-        // native IPv6 that fallback is A-only, so `.ray` names resolve to
-        // nothing in the one mode where AAAA is the only answer we have, while
-        // `dig` against the same resolver answers fine.
+        // Ask configd to trust this resolver, which is the only way it is ever
+        // asked for AAAA, and AAAA is the only answer a `.ray` name has. configd
+        // computes the per-resolver "Request A / Request AAAA" flags, and for a
+        // supplemental resolver there is exactly one branch that sets them from
+        // the resolver's own service: the one guarded by an internal
+        // `__SCOPED_QUERY__` marker (configd's dns-configuration.c). Fail it and
+        // configd strips the InterfaceName below, assigns no families of its
+        // own, and falls back to merging in the flags of the *default* resolver.
+        // On a Mac with no native IPv6 that fallback is A-only, so `.ray` names
+        // resolve to nothing while `dig` against the same resolver answers fine.
         //
         // We cannot write that marker: configd rebuilds this dictionary from a
         // fixed list of keys and would drop it. It sets the marker itself for a
@@ -495,9 +493,6 @@ mod macos {
         // Trust alone only carries the flags across; [`write_service_config`] is
         // what makes there be an AAAA flag to carry.
         //
-        // Only in that mode: with the v4 magic address the fallback already
-        // gives us the one family we need.
-        //
         // Values are type-erased to `CFType` because these are strings where the
         // rest are arrays, and `from_CFType_pairs` takes one value type.
         let mut pairs: Vec<(CFString, CFType)> = vec![
@@ -505,7 +500,7 @@ mod macos {
             (match_key, match_val.as_CFType()),
             (search_key, search_val.as_CFType()),
         ];
-        if super::ipv6_only() && !tun_name.is_empty() {
+        if !tun_name.is_empty() {
             let iface_key = unsafe { CFString::wrap_under_get_rule(kSCPropInterfaceName) };
             pairs.push((iface_key, CFString::new(tun_name).as_CFType()));
             pairs.push((
@@ -523,8 +518,7 @@ mod macos {
         Ok(())
     }
 
-    /// Publish the IPv6 half of our service, plus the service's rank. Only
-    /// meaningful in IPv6-only mode, and only there is it written.
+    /// Publish the IPv6 half of our service, plus the service's rank.
     ///
     /// This is what puts the AAAA flag on the resolver written above. configd
     /// asks one question of a service before it will request a family for it:
@@ -633,8 +627,8 @@ mod macos {
         captured: Vec<std::net::Ipv4Addr>,
         /// The utun the resolver is scoped to (see [`write_dns_config`]).
         tun_name: String,
-        /// This node's mesh IPv6, published as the service's address in
-        /// IPv6-only mode (see [`write_service_config`]).
+        /// This node's mesh IPv6, published as the service's address
+        /// (see [`write_service_config`]).
         mesh_v6: Ipv6Addr,
     }
 
@@ -654,7 +648,7 @@ mod macos {
             init_store()?;
             // The service first: the DNS key is only scoped to the interface if
             // configd already knows the service has one.
-            if super::ipv6_only() && !self.tun_name.is_empty() {
+            if !self.tun_name.is_empty() {
                 write_service_config(&self.tun_name, self.mesh_v6)?;
             }
             write_dns_config(&[super::SearchDomain::root()], &self.tun_name)?;
@@ -672,15 +666,7 @@ mod macos {
         }
 
         async fn revert(&self) -> Result<()> {
-            if let Some(store) = STORE.get() {
-                let store = store.lock().unwrap();
-                store.0.remove(SC_DNS_KEY);
-                // Unconditional: the mode can have changed since the write, and
-                // removing a key that was never set is a no-op.
-                store.0.remove(SC_IPV6_KEY);
-                store.0.remove(SC_SERVICE_KEY);
-            }
-            tracing::info!("removed SCDynamicStore DNS configuration");
+            remove_dns_config();
             Ok(())
         }
 
@@ -919,175 +905,6 @@ impl DnsConfigurator for SystemdResolvedDBus {
 // ---------------------------------------------------------------------------
 // Linux: NetworkManager via D-Bus
 // ---------------------------------------------------------------------------
-
-#[cfg(target_os = "linux")]
-struct NetworkManagerDns {
-    tun_iface: String,
-}
-
-/// Returns true only for NM DNS modes that support per-domain split-DNS.
-/// `"dnsmasq"` routes specific domains to specific resolvers (what we need).
-/// `"systemd-resolved"` also supports split-DNS but is handled by its own
-/// configurator earlier in the detection chain, so including it here is
-/// harmless (the call site already returns `None` for it first).
-#[cfg(target_os = "linux")]
-fn nm_supports_split_dns(mode: &str) -> bool {
-    matches!(mode, "dnsmasq" | "systemd-resolved")
-}
-
-#[cfg(target_os = "linux")]
-async fn try_networkmanager_dbus(tun_name: &str) -> Option<NetworkManagerDns> {
-    // This backend sets nameservers through NM's `IP4Config.Nameservers`, which
-    // is typed as an array of u32 and so cannot carry the IPv6 resolver an
-    // IPv6-only data plane needs. Decline the rung rather than install a v4
-    // address that gets dropped on such a host; the ladder falls through to
-    // resolvconf or direct resolv.conf, both of which take either family.
-    if IPV6_ONLY.load(Ordering::Relaxed) {
-        tracing::info!(
-            "skipping the NetworkManager DNS backend: it can only carry an IPv4 \
-             nameserver, and this node's data plane is IPv6-only"
-        );
-        return None;
-    }
-    let conn = Connection::system().await.ok()?;
-
-    // Check that NetworkManager is on the bus
-    conn.call_method(
-        Some("org.freedesktop.NetworkManager"),
-        "/org/freedesktop/NetworkManager",
-        Some("org.freedesktop.DBus.Peer"),
-        "Ping",
-        &(),
-    )
-    .await
-    .ok()?;
-
-    // Check NM DNS mode: if "systemd-resolved" or "none", skip (resolved handles it)
-    let dns_reply = conn
-        .call_method(
-            Some("org.freedesktop.NetworkManager"),
-            "/org/freedesktop/NetworkManager/DnsManager",
-            Some("org.freedesktop.DBus.Properties"),
-            "Get",
-            &("org.freedesktop.NetworkManager.DnsManager", "Mode"),
-        )
-        .await
-        .ok()?;
-
-    // Extract the mode string. If we can't read it at all, conservatively
-    // return None - safer to fall through to direct /etc/resolv.conf than
-    // to claim NM supports split-DNS when we can't confirm it.
-    let body = dns_reply.body();
-    let mode_val = body.deserialize::<Value>().ok()?;
-    let mode = mode_val.downcast_ref::<String>().ok()?.to_string();
-
-    // If NM delegates to systemd-resolved, skip: the resolved D-Bus path handles it.
-    // If NM DNS is "none", it's not managing DNS at all.
-    if mode == "systemd-resolved" || mode == "none" {
-        return None;
-    }
-
-    // Only proceed if this mode supports per-domain split-DNS.
-    // "default" and "unbound" modes do not, so fall through to direct mode.
-    if !nm_supports_split_dns(&mode) {
-        return None;
-    }
-
-    // NM is managing DNS in a split-DNS-capable mode (dnsmasq).
-    Some(NetworkManagerDns {
-        tun_iface: tun_name.to_string(),
-    })
-}
-
-#[cfg(target_os = "linux")]
-impl NetworkManagerDns {
-    async fn get_device_path(&self, conn: &Connection) -> Result<zbus::zvariant::OwnedObjectPath> {
-        let reply = conn
-            .call_method(
-                Some("org.freedesktop.NetworkManager"),
-                "/org/freedesktop/NetworkManager",
-                Some("org.freedesktop.NetworkManager"),
-                "GetDeviceByIpIface",
-                &(&*self.tun_iface,),
-            )
-            .await
-            .context("GetDeviceByIpIface")?;
-        reply
-            .body()
-            .deserialize()
-            .context("deserialize device path")
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[async_trait]
-impl DnsConfigurator for NetworkManagerDns {
-    async fn apply(&self) -> Result<()> {
-        let conn = Connection::system().await.context("D-Bus system bus")?;
-
-        let device_path = self.get_device_path(&conn).await?;
-
-        // Get the Ip4Config object path for this device
-        let reply = conn
-            .call_method(
-                Some("org.freedesktop.NetworkManager"),
-                device_path.as_str(),
-                Some("org.freedesktop.DBus.Properties"),
-                "Get",
-                &("org.freedesktop.NetworkManager.Device", "Ip4Config"),
-            )
-            .await
-            .context("get Ip4Config")?;
-
-        let config_val: zbus::zvariant::OwnedValue = reply
-            .body()
-            .deserialize()
-            .context("deserialize Ip4Config")?;
-
-        if let Ok(config_path) = <&zbus::zvariant::ObjectPath>::try_from(&*config_val)
-            && config_path.as_str() != "/"
-        {
-            // Set DNS nameservers via D-Bus Properties: magic DNS IP as u32 (NM host u32 of network-order bytes)
-            let dns_servers: Vec<u32> = vec![u32::from_le_bytes(crate::dns::MAGIC_DNS_V4.octets())]; // NM wants the address as a host u32 of its network-order bytes
-            let _ = conn
-                .call_method(
-                    Some("org.freedesktop.NetworkManager"),
-                    config_path.as_str(),
-                    Some("org.freedesktop.DBus.Properties"),
-                    "Set",
-                    &(
-                        "org.freedesktop.NetworkManager.IP4Config",
-                        "Nameservers",
-                        Value::from(dns_servers),
-                    ),
-                )
-                .await;
-        }
-
-        // Also set DNS search domain on the device connection settings
-        let _ = conn
-            .call_method(
-                Some("org.freedesktop.NetworkManager"),
-                device_path.as_str(),
-                Some("org.freedesktop.NetworkManager.Device"),
-                "Reapply",
-                &(HashMap::<String, HashMap<String, Value>>::new(), 0u64, 0u32),
-            )
-            .await;
-
-        tracing::info!("configured NetworkManager DNS via D-Bus for .{DNS_DOMAIN}");
-        Ok(())
-    }
-
-    async fn revert(&self) -> Result<()> {
-        tracing::info!("NetworkManager DNS reverts on interface removal");
-        Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "networkmanager-dbus"
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Linux: systemd-resolved via resolvectl CLI (fallback)
@@ -1366,7 +1183,7 @@ pub(crate) fn system_nameservers() -> Option<Vec<Ipv4Addr>> {
     Some(
         found?
             .into_iter()
-            .filter(|ip| !crate::membership::is_overlay_ip(IpAddr::V4(*ip)))
+            .filter(|ip| !crate::membership::is_cgnat_range(*ip))
             .collect(),
     )
 }
@@ -1518,7 +1335,7 @@ pub async fn run_resolv_reassert(
     let merged_with = fallbacks
         .iter()
         .copied()
-        .find(|ip| crate::membership::is_overlay_ip(IpAddr::V4(*ip)));
+        .find(|ip| crate::membership::is_cgnat_range(*ip));
     // Consecutive liveness failures for `merged_with`. Two, so one lost packet
     // or a restart does not hand the file back.
     let mut shared_misses = 0u32;
@@ -1553,6 +1370,7 @@ pub async fn run_resolv_reassert(
     // Re-assert immediately on entry: covers any trample between apply() and our
     // arrival. Thereafter a pass runs on a relevant inotify event or the tick.
     let mut check = true;
+    let mut next_tick = tokio::time::Instant::now() + REASSERT_TICK;
     loop {
         if check {
             match pass(&search, &fallbacks, merged_with).await {
@@ -1596,7 +1414,8 @@ pub async fn run_resolv_reassert(
                     None => { stream = None; false } // stream ended; rely on the tick
                 };
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            _ = tokio::time::sleep_until(next_tick) => {
+                next_tick = tokio::time::Instant::now() + REASSERT_TICK;
                 check = true;
                 // A VPN that leaves while we hold the file changes nothing about
                 // the file: it will not restore a backup over one it does not
@@ -1657,6 +1476,18 @@ pub enum Recapture {
 #[cfg(target_os = "linux")]
 const MERGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How often the re-assert pass runs regardless of inotify.
+///
+/// A *deadline*, not a delay: the `/etc` watch is broad (the name filter decides
+/// whether to re-assert, it does not stop the arm from completing), so a
+/// per-iteration `sleep` was restarted by every unrelated write under `/etc` and
+/// never elapsed on a busy host. That is the tick that probes the resolver we
+/// share the file with, so losing it means `SharedResolverGone` never fires and
+/// the daemon keeps declining off-mesh names while pointing the stub at an
+/// address that stopped answering.
+#[cfg(target_os = "linux")]
+const REASSERT_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// One re-assert pass, reporting only the outcomes the loop acts on. Errors are
 /// logged and treated as "keep watching" (the next tick retries).
 #[cfg(target_os = "linux")]
@@ -1682,7 +1513,7 @@ async fn pass(
 // When we fall to the direct /etc/resolv.conf takeover it's because no
 // split-DNS backend was found: on an NM host that means NM is in plain
 // `default` mode and owns resolv.conf, regenerating it on every connection /
-// DHCP-lease event and trampling our `nameserver 100.100.100.53`. Dropping a
+// DHCP-lease event and trampling our `nameserver 200::53`. Dropping a
 // `dns=none` config snippet makes NM leave resolv.conf entirely to us
 // (Tailscale takes the same "stop the fight" stance over re-asserting forever).
 // Reversible: removed + reloaded on revert. The inotify re-assert remains the
@@ -1883,8 +1714,8 @@ async fn restore_file(path: &Path) -> Result<()> {
 /// the host's DNS with it.
 #[cfg(any(target_os = "linux", test))]
 fn strip_our_resolv_entries(contents: &str) -> String {
-    // Both families: a file written before a switch to (or from) IPv6-only mode
-    // names the other address, and leaving it behind would point the host at a
+    // Both families: a file written by a build that answered on the IPv4 magic
+    // address still names it, and leaving it behind would point the host at a
     // resolver that is no longer listening.
     let magic_v4 = crate::dns::MAGIC_DNS_V4.to_string();
     let magic_v6 = crate::dns::MAGIC_DNS_V6.to_string();
@@ -1966,7 +1797,10 @@ pub fn emergency_restore_resolv_conf() {}
 
 #[cfg(target_os = "linux")]
 struct DirectResolvConf {
-    captured_upstreams: Vec<Ipv4Addr>,
+    /// Swapped rather than owned so [`Self::apply`] can narrow it: quieting
+    /// NetworkManager can kill a server that answered at capture time, and both
+    /// the file we render and the forwarder we seed read this afterwards.
+    captured_upstreams: Arc<ArcSwap<Vec<Ipv4Addr>>>,
     /// The search domains the file already had. Kept separately from the live
     /// list so a later join/leave re-merges against the host's own domains
     /// instead of accumulating ours on top of the previous render.
@@ -2036,7 +1870,7 @@ fn other_overlay_resolver(contents: &str) -> Option<Ipv4Addr> {
     // `parse_resolv_nameservers` already drops our own magic IP.
     parse_resolv_nameservers(contents)
         .into_iter()
-        .find(|ip| crate::membership::is_overlay_ip(IpAddr::V4(*ip)))
+        .find(|ip| crate::membership::is_cgnat_range(*ip))
 }
 
 /// The first `nameserver` in `contents`, whatever its family.
@@ -2093,7 +1927,7 @@ impl DirectResolvConf {
             );
         }
         Self {
-            captured_upstreams: live,
+            captured_upstreams: Arc::new(ArcSwap::from_pointee(live)),
             search: Arc::new(ArcSwap::from_pointee(search.clone())),
             captured_search: search,
             operator_upstreams: crate::config::load()
@@ -2105,8 +1939,8 @@ impl DirectResolvConf {
 
     /// The upstream written into resolv.conf as the second nameserver, so the
     /// host keeps resolving if our resolver stops answering.
-    fn fallbacks(&self) -> &[Ipv4Addr] {
-        &self.captured_upstreams
+    fn fallbacks(&self) -> Vec<Ipv4Addr> {
+        self.captured_upstreams.load().as_ref().clone()
     }
 }
 
@@ -2155,6 +1989,67 @@ fn merge_search_domains(captured: &[SearchDomain], rayfish: &[SearchDomain]) -> 
     out
 }
 
+/// Set once [`NmQuietOutcome::Abort`] has been reached, so the retry loop stops
+/// re-running the experiment.
+///
+/// The verdict is about NetworkManager's *static* configuration: it runs a local
+/// forwarder, and quieting it takes that forwarder away. Nothing the daemon does
+/// changes that, so a retry can only reach the same answer, and reaching it costs
+/// two `nmcli general reload`s and the DNS gap between them. `DnsService`'s retry
+/// backs off to a 60s ceiling and never gives up, so without this the host pays
+/// that twice a minute for as long as the daemon runs.
+///
+/// Deliberately never cleared: an operator who changes NetworkManager's DNS mode
+/// in response to the message restarts the daemon, and the ladder re-runs from the
+/// top when they do.
+#[cfg(target_os = "linux")]
+static NM_TAKEOVER_UNSAFE: AtomicBool = AtomicBool::new(false);
+
+/// What quieting NetworkManager did to the upstreams we captured before it.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum NmQuietOutcome {
+    /// Everything we captured still answers.
+    Proceed,
+    /// Some died, or all of them did while the operator's own `dns_upstreams`
+    /// still give the forwarder somewhere to go. Not a black hole, so the
+    /// takeover stands; the dead entries are named because they stay in the
+    /// file we are about to write and cost a timeout each.
+    Degraded(Vec<Ipv4Addr>),
+    /// Nothing we captured answers any more and the operator named nothing.
+    /// Taking the file over now would own DNS for the host with no way to
+    /// resolve anything outside `.ray`.
+    Abort,
+}
+
+/// Classify the upstream set after [`nm_quiet_install`], given what it was before.
+///
+/// Split out from `apply` because the ordering it guards is not otherwise
+/// observable: the capture happens in `new`, the kill happens in `apply`, and
+/// between them sits an `ensure!` that reads a set which was true when it was
+/// taken. The operator's own `dns_upstreams` waives the abort for the same reason
+/// it waives the `ensure!`: the forwarder gets somewhere to send queries either way.
+#[cfg(any(target_os = "linux", test))]
+fn nm_quiet_outcome(
+    before: &[Ipv4Addr],
+    after: &[Ipv4Addr],
+    operator_upstreams: bool,
+) -> NmQuietOutcome {
+    if after.len() == before.len() {
+        return NmQuietOutcome::Proceed;
+    }
+    if after.is_empty() && !operator_upstreams {
+        return NmQuietOutcome::Abort;
+    }
+    NmQuietOutcome::Degraded(
+        before
+            .iter()
+            .filter(|ip| !after.contains(ip))
+            .copied()
+            .collect(),
+    )
+}
+
 #[cfg(target_os = "linux")]
 #[async_trait]
 impl DnsConfigurator for DirectResolvConf {
@@ -2166,10 +2061,19 @@ impl DnsConfigurator for DirectResolvConf {
         // working DNS and no Magic DNS is the better failure. Bail before
         // touching anything so there is nothing to undo.
         anyhow::ensure!(
-            !self.captured_upstreams.is_empty() || self.operator_upstreams,
+            !self.captured_upstreams.load().is_empty() || self.operator_upstreams,
             "no working DNS server found in /etc/resolv.conf, so taking it over would leave \
              this host unable to resolve anything; set `dns_upstreams` in the config to \
              name one explicitly"
+        );
+        // Before `backup_file`, so this bails without touching anything, exactly
+        // as the guard above does. See [`NM_TAKEOVER_UNSAFE`].
+        anyhow::ensure!(
+            !NM_TAKEOVER_UNSAFE.load(AtomicOrdering::Relaxed),
+            "taking over /etc/resolv.conf on this host would stop the resolver it names \
+             (NetworkManager runs it, and rayfish has to tell NetworkManager to stop \
+             managing DNS); set `dns_upstreams` in the config to name a server directly, \
+             or switch NetworkManager off its built-in resolver, then restart rayfish"
         );
         // Another overlay already owns this file. We take it, but additively:
         // their resolver was captured above and is rendered as the nameserver
@@ -2180,22 +2084,11 @@ impl DnsConfigurator for DirectResolvConf {
         // answers); behind us they keep resolving exactly what they did before.
         if let Some(ip) = self.foreign_resolver {
             // Going first in the file is only worth anything if we can be
-            // reached there. A v4 magic address sits inside `100.64.0.0/10`,
-            // which is the range this other VPN owns and filters, so our reply
-            // is dropped before the stub sees it: we would be an unanswering
-            // first nameserver and every lookup on the host would eat the
-            // resolver timeout before falling through to them. That is worse
-            // than not taking the file, which is what the IPv6-only mode exists
-            // to avoid; a host that opted out of it (`ipv6-only = off`) keeps
-            // its DNS instead of Magic DNS.
-            anyhow::ensure!(
-                resolver_addr().is_ipv6(),
-                "/etc/resolv.conf is shared with another VPN (nameserver {ip}) that filters \
-                 {}, so our resolver could not answer from there; set `ipv6-only` to auto or \
-                 on so Magic DNS moves to {}",
-                "100.64.0.0/10",
-                crate::dns::MAGIC_DNS_V6
-            );
+            // reached there, and we can: [`resolver_addr`] is in `200::/7`, not
+            // in the `100.64.0.0/10` this other VPN owns and filters. A v4 magic
+            // address there would have been an unanswering first nameserver, and
+            // every lookup on the host would have eaten the resolver timeout
+            // before falling through to them.
             tracing::info!(
                 resolver = %ip,
                 "/etc/resolv.conf names another VPN's resolver; merging ours in ahead of it \
@@ -2208,12 +2101,51 @@ impl DnsConfigurator for DirectResolvConf {
         // Quiet NM first so it doesn't regenerate the file out from under the
         // write we're about to make (the inotify re-assert covers any residual).
         nm_quiet_install().await;
-        let new_content = render_direct_resolv_conf(&self.search.load(), self.fallbacks());
+        // The `ensure!` above can pass on the strength of a server we are about
+        // to kill. NetworkManager in `dns=dnsmasq` mode answers at a loopback
+        // address of its own and writes *that* into resolv.conf, and the
+        // `dns=none` drop-in just installed is precisely what stops it. The
+        // capture in `new` probed it while it was still alive, so re-probe now
+        // that it is not: this is the same black hole the guard exists to
+        // refuse, reached by ordering rather than by an empty capture.
+        let before = self.captured_upstreams.load().as_ref().clone();
+        let after = crate::dns::resolver::live_upstreams(&before).await;
+        match nm_quiet_outcome(&before, &after, self.operator_upstreams) {
+            NmQuietOutcome::Proceed => {}
+            // Narrowed, not just reported: this set is what `fallbacks` renders
+            // into the file and what `adopt_configurator` seeds the forwarder
+            // with, and a dead server in either costs a full lookup timeout per
+            // off-mesh name. The capture in `new` probed for exactly this reason;
+            // quieting NM is simply a second chance to be wrong.
+            NmQuietOutcome::Degraded(dead) => {
+                tracing::warn!(
+                    ?dead,
+                    "some DNS servers stopped answering once NetworkManager was quieted; \
+                     dropping them from the upstreams and from the file"
+                );
+                self.captured_upstreams.store(Arc::new(after));
+            }
+            NmQuietOutcome::Abort => {
+                restore_file(path).await?;
+                nm_quiet_remove().await;
+                // The retry loop would otherwise re-run this every 60s, and each
+                // run stops and restarts NetworkManager's resolver.
+                NM_TAKEOVER_UNSAFE.store(true, AtomicOrdering::Relaxed);
+                anyhow::bail!(
+                    "every DNS server /etc/resolv.conf named stopped answering once \
+                     NetworkManager was told to stop managing DNS (`dns=none`), which is how \
+                     its built-in resolver is run; taking the file over would leave this host \
+                     unable to resolve anything. Set `dns_upstreams` in the config to name a \
+                     server directly."
+                );
+            }
+        }
+        let new_content = render_direct_resolv_conf(&self.search.load(), &self.fallbacks());
         tokio::fs::write(path, new_content)
             .await
             .context("writing /etc/resolv.conf")?;
         tracing::info!(
-            upstreams = ?self.captured_upstreams,
+            upstreams = ?self.captured_upstreams.load(),
             "configured /etc/resolv.conf directly (fallback); verified upstream resolvers"
         );
         Ok(())
@@ -2233,7 +2165,7 @@ impl DnsConfigurator for DirectResolvConf {
     }
 
     fn captured_upstreams(&self) -> Vec<Ipv4Addr> {
-        self.captured_upstreams.clone()
+        self.captured_upstreams.load().as_ref().clone()
     }
 
     /// We own the file, so the domains go in it. Nothing else would put them
@@ -2256,7 +2188,7 @@ impl DnsConfigurator for DirectResolvConf {
         }
         tokio::fs::write(
             path,
-            render_direct_resolv_conf(&self.search.load(), self.fallbacks()),
+            render_direct_resolv_conf(&self.search.load(), &self.fallbacks()),
         )
         .await
         .context("writing search domains to /etc/resolv.conf")
@@ -2267,7 +2199,7 @@ impl DnsConfigurator for DirectResolvConf {
     }
 
     fn fallback_upstreams(&self) -> Vec<Ipv4Addr> {
-        self.captured_upstreams.clone()
+        self.captured_upstreams.load().as_ref().clone()
     }
 
     fn shared_resolver(&self) -> Option<Ipv4Addr> {
@@ -2280,11 +2212,11 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::{
-        MAX_NAMESERVERS, Reassert, SearchDomain, first_nameserver, foreign_mesh_resolver,
-        join_domains, merge_search_domains, nm_dns_none_dropin, other_overlay_resolver,
-        parse_resolv_nameservers, reassert_decision, render_direct_resolv_conf,
-        render_direct_resolv_conf_with, resolv_conf_is_ours, search_domains_for,
-        strip_our_resolv_entries,
+        MAX_NAMESERVERS, NmQuietOutcome, Reassert, SearchDomain, first_nameserver,
+        foreign_mesh_resolver, join_domains, merge_search_domains, nm_dns_none_dropin,
+        nm_quiet_outcome, other_overlay_resolver, parse_resolv_nameservers, reassert_decision,
+        render_direct_resolv_conf, render_direct_resolv_conf_with, resolv_conf_is_ours,
+        search_domains_for, strip_our_resolv_entries,
     };
 
     /// Domains as the host had them, i.e. read back from its own config.
@@ -2301,7 +2233,7 @@ mod tests {
     #[test]
     fn resolv_conf_is_ours_detects_marker() {
         assert!(resolv_conf_is_ours(
-            "# Added by rayfish - do not edit\nnameserver 100.100.100.53\n"
+            "# Added by rayfish - do not edit\nnameserver 200::53\n"
         ));
         assert!(!resolv_conf_is_ours(
             "# Generated by NetworkManager\nnameserver 192.168.1.1\n"
@@ -2325,12 +2257,12 @@ mod tests {
         // Ours is not foreign, whether we look at the marker or the address.
         assert_eq!(
             foreign_mesh_resolver(
-                "# Added by rayfish - do not edit\nnameserver 100.100.100.53\nnameserver 1.1.1.1\n"
+                "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 1.1.1.1\n"
             ),
             None
         );
         assert_eq!(
-            foreign_mesh_resolver("nameserver 100.100.100.53\nnameserver 1.1.1.1\n"),
+            foreign_mesh_resolver("nameserver 200::53\nnameserver 1.1.1.1\n"),
             None
         );
         // resolv.conf(5) separates the keyword from its value by any run of
@@ -2348,7 +2280,7 @@ mod tests {
         // Ours: nothing to do.
         assert_eq!(
             reassert_decision(
-                "# Added by rayfish - do not edit\nnameserver 100.100.100.53\n",
+                "# Added by rayfish - do not edit\nnameserver 200::53\n",
                 None
             ),
             Reassert::Held
@@ -2389,7 +2321,7 @@ mod tests {
     /// marker, our nameserver, and our search domains gone, theirs untouched.
     #[test]
     fn stripping_our_entries_leaves_the_other_vpn_theirs() {
-        let merged = "# Added by rayfish - do not edit\nnameserver 100.100.100.53\nnameserver 100.100.100.100\nsearch tailnet.ts.net homelab.ray ray\n";
+        let merged = "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 100.100.100.100\nsearch tailnet.ts.net homelab.ray ray\n";
         assert_eq!(
             strip_our_resolv_entries(merged),
             "nameserver 100.100.100.100\nsearch tailnet.ts.net\n"
@@ -2412,7 +2344,8 @@ mod tests {
     /// the file is ours precisely because we merged theirs into it.
     #[test]
     fn other_overlay_resolver_sees_through_our_own_marker() {
-        let merged = "# Added by rayfish - do not edit\nnameserver 100.100.100.53\nnameserver 100.100.100.100\n";
+        let merged =
+            "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 100.100.100.100\n";
         assert_eq!(foreign_mesh_resolver(merged), None);
         assert_eq!(
             other_overlay_resolver(merged),
@@ -2420,14 +2353,14 @@ mod tests {
         );
         // Ours alone is not another overlay, or every revert would think it was
         // merged and leave the file behind.
-        let plain = "# Added by rayfish - do not edit\nnameserver 100.100.100.53\n";
+        let plain = "# Added by rayfish - do not edit\nnameserver 200::53\n";
         assert_eq!(other_overlay_resolver(plain), None);
     }
 
     #[test]
     fn first_nameserver_is_the_one_glibc_asks() {
         // A file resolvconf merged from two stanzas: only the first is queried.
-        let merged = "# Dynamic resolv.conf\nnameserver 100.100.100.100\nnameserver 100.100.100.53\nsearch ts.net ray\n";
+        let merged = "# Dynamic resolv.conf\nnameserver 100.100.100.100\nnameserver 200::53\nsearch ts.net ray\n";
         assert_eq!(
             first_nameserver(merged),
             Some("100.100.100.100".parse().unwrap())
@@ -2496,23 +2429,98 @@ mod tests {
         );
     }
 
+    /// NetworkManager in `dns=dnsmasq` mode is the case this exists for: it puts
+    /// its own loopback forwarder in `resolv.conf`, we capture it while it is
+    /// alive, and then `dns=none` stops it. The pre-quiet capture is not evidence
+    /// about the post-quiet host, and taking the file over on the strength of it
+    /// owns DNS for the machine with nothing behind us.
+    #[test]
+    fn quieting_networkmanager_can_invalidate_the_capture_that_allowed_the_takeover() {
+        let nm = "127.0.0.1".parse::<Ipv4Addr>().unwrap();
+        let router = "192.168.1.1".parse::<Ipv4Addr>().unwrap();
+
+        // The regression: NM's dnsmasq was the only thing we captured, and
+        // quieting NM killed it. Refuse, rather than install the black hole.
+        assert_eq!(
+            nm_quiet_outcome(&[nm], &[], false),
+            NmQuietOutcome::Abort,
+            "the last surviving upstream died with NM's dnsmasq"
+        );
+        // The operator named their own servers, so there is still somewhere to
+        // forward: the same waiver the `ensure!` gives. Still degraded, not
+        // clean -- the dead entry is in the file we are about to write.
+        assert_eq!(
+            nm_quiet_outcome(&[nm], &[], true),
+            NmQuietOutcome::Degraded(vec![nm])
+        );
+        // A real router alongside NM's forwarder: degraded, not fatal. The dead
+        // entry is named so it can be seen rather than silently costing timeouts.
+        assert_eq!(
+            nm_quiet_outcome(&[nm, router], &[router], false),
+            NmQuietOutcome::Degraded(vec![nm])
+        );
+        // Nothing died (NM absent, or not running a local forwarder).
+        assert_eq!(
+            nm_quiet_outcome(&[router], &[router], false),
+            NmQuietOutcome::Proceed
+        );
+        assert_eq!(nm_quiet_outcome(&[], &[], true), NmQuietOutcome::Proceed);
+    }
+
+    /// `Degraded` is not just a warning: the surviving set is what gets rendered
+    /// into the file and seeded into the forwarder, and a dead entry in either
+    /// costs a full lookup timeout on every off-mesh name.
+    #[test]
+    fn a_degraded_verdict_names_exactly_the_servers_that_died() {
+        let nm = "127.0.0.1".parse::<Ipv4Addr>().unwrap();
+        let router = "192.168.1.1".parse::<Ipv4Addr>().unwrap();
+        let public = "9.9.9.9".parse::<Ipv4Addr>().unwrap();
+        // What survives is `after`, so the caller can store it directly; what is
+        // reported is the complement, so the operator can see what it cost.
+        assert_eq!(
+            nm_quiet_outcome(&[nm, router, public], &[router, public], false),
+            NmQuietOutcome::Degraded(vec![nm])
+        );
+        assert_eq!(
+            nm_quiet_outcome(&[nm, router, public], &[public], false),
+            NmQuietOutcome::Degraded(vec![nm, router])
+        );
+    }
+
+    /// The scenario above is only reachable because a loopback nameserver is
+    /// captured like any other. If this ever starts filtering them, the guard
+    /// above becomes dead code rather than wrong.
+    #[test]
+    fn a_loopback_nameserver_is_captured_like_any_other() {
+        let c = "# Generated by NetworkManager\nnameserver 127.0.0.1\n";
+        assert_eq!(
+            parse_resolv_nameservers(c),
+            vec!["127.0.0.1".parse::<Ipv4Addr>().unwrap()]
+        );
+    }
+
     #[test]
     fn parse_resolv_nameservers_extracts_ipv4_excluding_magic() {
-        let c = "# Generated by NetworkManager\nsearch home\nnameserver 192.168.1.1\nnameserver 8.8.8.8\nnameserver 100.100.100.53\n";
+        // Both magic addresses are dropped, by different mechanisms: the v6 one
+        // fails the `Ipv4Addr` parse, the v4 one is filtered by name. Only the
+        // second is a rule this function has to carry, so it has to be present or
+        // the filter could be deleted with every test still passing.
+        let c = "# Generated by NetworkManager\nsearch home\nnameserver 192.168.1.1\n\
+                 nameserver 100.100.100.53\nnameserver 8.8.8.8\nnameserver 200::53\n";
         assert_eq!(
             parse_resolv_nameservers(c),
             vec![
                 "192.168.1.1".parse::<Ipv4Addr>().unwrap(),
                 "8.8.8.8".parse::<Ipv4Addr>().unwrap()
             ]
-        ); // 100.100.100.53 (magic) excluded
+        );
     }
 
     #[test]
     fn render_direct_resolv_conf_points_at_magic_ip() {
         let out = render_direct_resolv_conf(&search_domains_for(&networks(&["homelab"])), &[]);
         assert!(out.starts_with("# Added by rayfish"));
-        assert!(out.contains("nameserver 100.100.100.53"));
+        assert!(out.contains("nameserver 200::53"));
         assert!(out.contains("search homelab.ray ray"));
     }
 
@@ -2534,15 +2542,20 @@ mod tests {
     }
 
     /// Whichever address we installed, a revert has to take it back out. A
-    /// switch into or out of IPv6-only mode leaves the other one in the file.
+    /// upgrade leaves the IPv4 one sitting in a file we are the ones to clean up.
     #[test]
     #[cfg(target_os = "linux")]
     fn strip_removes_either_magic_address() {
         let v6 = "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 9.9.9.9\n";
         assert_eq!(strip_our_resolv_entries(v6), "nameserver 9.9.9.9\n");
+        // The v4 half is the whole reason `MAGIC_DNS_V4` still exists as a
+        // constant, so it has to be the address an older build actually wrote.
         let v4 =
             "# Added by rayfish - do not edit\nnameserver 100.100.100.53\nnameserver 9.9.9.9\n";
         assert_eq!(strip_our_resolv_entries(v4), "nameserver 9.9.9.9\n");
+        // And both at once: a file written across the upgrade names each.
+        let both = "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 100.100.100.53\nnameserver 9.9.9.9\n";
+        assert_eq!(strip_our_resolv_entries(both), "nameserver 9.9.9.9\n");
     }
 
     #[test]
@@ -2551,14 +2564,15 @@ mod tests {
         // Verbatim from a host running direct mode. A revert with no backup used
         // to delete this file outright, leaving the machine with no resolver at
         // all; it must come back as the upstream it had before we prepended ours.
-        let ours = "# Added by rayfish - do not edit\nnameserver 100.100.100.53\nnameserver 108.61.10.10\n";
+        let ours =
+            "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 108.61.10.10\n";
         assert_eq!(strip_our_resolv_entries(ours), "nameserver 108.61.10.10\n");
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn backup_less_revert_preserves_search_domains_and_options() {
-        let ours = "# Added by rayfish - do not edit\nsearch home lan\nnameserver 100.100.100.53\nnameserver 1.1.1.1\noptions ndots:2\n";
+        let ours = "# Added by rayfish - do not edit\nsearch home lan\nnameserver 200::53\nnameserver 1.1.1.1\noptions ndots:2\n";
         let out = strip_our_resolv_entries(ours);
         assert!(out.contains("search home lan"));
         assert!(out.contains("nameserver 1.1.1.1"));
@@ -2571,7 +2585,7 @@ mod tests {
     fn backup_less_revert_can_empty_the_server_list_without_losing_the_file() {
         // Our resolver was the only entry. The result is a file with no servers,
         // which lets NetworkManager/resolvconf regenerate one. Still not a delete.
-        let ours = "# Added by rayfish - do not edit\nnameserver 100.100.100.53\n";
+        let ours = "# Added by rayfish - do not edit\nnameserver 200::53\n";
         assert_eq!(strip_our_resolv_entries(ours), "\n");
     }
 
@@ -2610,7 +2624,7 @@ mod tests {
     #[test]
     fn render_direct_resolv_conf_no_search_line_when_empty() {
         let out = render_direct_resolv_conf(&[], &[]);
-        assert!(out.contains("nameserver 100.100.100.53"));
+        assert!(out.contains("nameserver 200::53"));
         assert!(!out.contains("search "));
     }
 
@@ -2619,7 +2633,7 @@ mod tests {
         let out = render_direct_resolv_conf(&[], &["192.168.1.1".parse().unwrap()]);
         // Order is load-bearing: the resolver library tries entries top-down, so
         // ours must come first or `.ray` names go to the upstream and NXDOMAIN.
-        let magic = out.find("nameserver 100.100.100.53").unwrap();
+        let magic = out.find("nameserver 200::53").unwrap();
         let fallback = out.find("nameserver 192.168.1.1").unwrap();
         assert!(magic < fallback, "magic IP must be listed first:\n{out}");
     }
@@ -2675,16 +2689,5 @@ mod tests {
         assert!(resolv_conf_is_ours(&out));
         assert!(out.contains("[main]"));
         assert!(out.contains("dns=none"));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn nm_split_dns_only_for_capable_modes() {
-        use super::nm_supports_split_dns;
-        assert!(nm_supports_split_dns("dnsmasq"));
-        assert!(nm_supports_split_dns("systemd-resolved"));
-        assert!(!nm_supports_split_dns("default"));
-        assert!(!nm_supports_split_dns("unbound"));
-        assert!(!nm_supports_split_dns(""));
     }
 }

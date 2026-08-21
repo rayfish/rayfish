@@ -78,7 +78,7 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// Compact gave that up. Bump for anything that changes a struct's shape, and
 /// for anything an old peer would *misinterpret* (removed or repurposed fields
 /// and variants, changed semantics of existing ones).
-pub const MESH_PROTOCOL_VERSION: u32 = 3;
+pub const MESH_PROTOCOL_VERSION: u32 = 4;
 
 /// Capability bits a peer advertises in its `MeshHello.features`. These are
 /// negotiated *inside* the single mesh ALPN, so adding one needs no version bump:
@@ -139,7 +139,7 @@ fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<Ipv4Addr>>) 
         out.extend(PUBLIC_FALLBACK_DNS);
     }
     let mut seen = std::collections::HashSet::new();
-    out.retain(|ip| !crate::membership::is_overlay_ip(IpAddr::V4(*ip)) && seen.insert(*ip));
+    out.retain(|ip| !crate::membership::is_cgnat_range(*ip) && seen.insert(*ip));
     out.truncate(MAX_CONTROL_PLANE_NAMESERVERS);
     out
 }
@@ -344,7 +344,9 @@ struct OverlayAddrFilter;
 
 impl DirectAddrFilter for OverlayAddrFilter {
     fn keeps(&self, ip: std::net::IpAddr) -> bool {
-        !crate::membership::is_overlay_ip(ip) && !is_foreign_overlay_ip(ip)
+        !crate::membership::is_overlay_ip(ip)
+            && !matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
+            && !is_foreign_overlay_ip(ip)
     }
 }
 

@@ -12,6 +12,13 @@ SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
 FAILS=0
 pass(){ printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 fail(){ printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILS=$((FAILS+1)); }
+# Same complaint, on stderr and without the tally. For helpers whose every caller
+# reads them through `$(...)`: on stdout the message is captured into the command
+# line the caller is building instead of leaving it empty, so the caller's own
+# `[[ -n ... ]]` guard passes and every probe below runs against garbage. The
+# increment is dropped for the same reason (it would happen in the subshell), so
+# these helpers `return 1` and the caller counts the failure.
+fail_out(){ printf '  \033[31mFAIL\033[0m %s\n' "$*" >&2; }
 step(){ printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 
 # summary : print the final tally and exit non-zero if any check failed.
@@ -37,14 +44,24 @@ on(){ local ip="$1"; shift
 # strip : remove ANSI colour codes from rayfish CLI output (stdin -> stdout).
 strip(){ sed -r 's/\x1B\[[0-9;]*[mGKH]//g'; }
 
-# own_ip <status-text> : extract a node's own VPN IPv4 (100.64.0.0/10 CGNAT range).
-own_ip(){ echo "$1" | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
+# own_ip <status-text> : extract a node's own mesh IPv6 (the 200::/7 range).
+# The prefix is /7, so only the first seven bits are fixed and the leading hextet
+# runs from 200 to 2ff: matching a literal `200:` finds 1 address in 256, which is
+# how this read as "no mesh IPv6" against real output.
+# Loud when there is none: every caller uses the result as a ping/ssh target, and
+# an empty string there turns a real failure into a test that passes. See
+# `fail_out` for why the complaint goes to stderr.
+own_ip(){
+  local ip; ip="$(echo "$1" | grep -oE '\b2[0-9a-f]{2}:[0-9a-f:]+' | head -1)"
+  [[ -n "$ip" ]] || { fail_out "own_ip: no mesh IPv6 in status output"; return 1; }
+  echo "$ip"
+}
 
 # peer_host <status-text> : first peer row's `<host>.<net>.ray` hostname label.
 # peer_host <status-text> : the first peer row's hostname. Peer rows carry a
 # status dot (●/○) and a mesh IP; the hostname is the token right after the dot.
 # (The status peer row prints the bare hostname, not the `.ray` FQDN.)
-peer_host(){ echo "$1" | sed 's/\x1b\[[0-9;]*m//g' | awk '/[●○]/ && /(100\.|200:)/ {for(i=1;i<=NF;i++) if($i=="●"||$i=="○"){print $(i+1); exit}}'; }
+peer_host(){ echo "$1" | sed 's/\x1b\[[0-9;]*m//g' | awk '/[●○]/ && /2[0-9a-f][0-9a-f]:/ {for(i=1;i<=NF;i++) if($i=="●"||$i=="○"){print $(i+1); exit}}'; }
 
 # ping_loss <from-ip> <target-ip> : echo the packet-loss percentage (number only).
 ping_loss(){ on "$1" "ping -c 3 -W 2 $2" 2>&1 | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+'; }
@@ -127,23 +144,27 @@ wait_daemons(){
 # status_json <ip> : echo `ray status --json` from a host (raw JSON).
 status_json(){ on "$1" 'ray status --json' 2>/dev/null; }
 
-# my_ip4 <ip> [net] : this node's own VPN IPv4 — for the named network, or the
-# first network if omitted. Empty if none.
-my_ip4(){
-  status_json "$1" | jq -r --arg n "${2:-}" '
+# my_ip <ip> [net] : this node's own mesh IPv6, for the named network or the
+# first if omitted. Fatal when absent, for the same reason as `own_ip`.
+my_ip(){
+  local ip
+  ip="$(status_json "$1" | jq -r --arg n "${2:-}" '
     (.networks // [])
     | (if $n == "" then .[0] else (map(select(.name == $n)) | .[0]) end)
-    | .my_ip // empty'
+    | .my_ipv6 // empty')"
+  [[ -n "$ip" ]] || { fail_out "my_ip: $1 reports no mesh IPv6 for network '${2:-<first>}'"; return 1; }
+  echo "$ip"
 }
 
-# peer_ip4 <ip> <peer-hostname> [net] : a specific peer's VPN IPv4 as seen by
-# <ip>. Searches the named network, or all networks if net omitted. Empty if the
-# peer isn't present.
-peer_ip4(){
+# peer_ip <ip> <peer-hostname> [net] : a specific peer's mesh IPv6 as seen by
+# <ip>. Searches the named network, or all networks if net omitted. Empty when
+# the peer is genuinely absent, which several callers test for, so this one does
+# not fail on empty.
+peer_ip(){
   status_json "$1" | jq -r --arg h "$2" --arg n "${3:-}" '
     (.networks // [])
     | (if $n == "" then . else map(select(.name == $n)) end)
-    | [ .[].peers[] | select((.hostname // "") == $h) ] | .[0].ip // empty'
+    | [ .[].peers[] | select((.hostname // "") == $h) ] | .[0].ipv6 // empty'
 }
 
 # peer_online <ip> <peer-hostname> [net] : echo 1 if that peer has a live
@@ -219,9 +240,16 @@ tcp_probe(){
 }
 
 # start_tcp_listener <ip> <port> / stop_tcp_listener <ip> <port> : a detached
-# HTTP server bound to 0.0.0.0 (incl. the TUN ip) on the host, and its teardown.
+# HTTP server on the host, and its teardown.
+#
+# Binds `::`, not `0.0.0.0`. The overlay is IPv6-only, so a socket on the IPv4
+# wildcard has no presence on the TUN at all and every probe against it reads
+# CLOSED whatever the firewall says: the deny assertions would pass for the wrong
+# reason and the allow assertions could never pass. `::` accepts both families
+# on Linux (net.ipv6.bindv6only defaults to 0), which is the same fix a user hits
+# when a service of theirs stops answering over the mesh.
 start_tcp_listener(){
-  on "$1" "setsid python3 -m http.server $2 --bind 0.0.0.0 >/tmp/lst_$2.log 2>&1 </dev/null & sleep 1" \
+  on "$1" "setsid python3 -m http.server $2 --bind :: >/tmp/lst_$2.log 2>&1 </dev/null & sleep 1" \
     >/dev/null 2>&1 || true
 }
 stop_tcp_listener(){ on "$1" "pkill -f 'http.server $2'" >/dev/null 2>&1 || true; }
@@ -234,11 +262,13 @@ stop_tcp_listener(){ on "$1" "pkill -f 'http.server $2'" >/dev/null 2>&1 || true
 # A one-shot python receiver on the destination drops a marker on first packet.
 udp_probe(){
   local from_pub="$1" dst_pub="$2" dst_vpn="$3" port="$4"
-  on "$dst_pub" "rm -f /tmp/udp_got_$port; setsid python3 -c 'import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(8); s.bind((\"0.0.0.0\",$port));
+  # AF_INET6 on both ends: <dst-vpn-ip> is a mesh address and there is no other
+  # family to fall back to, so an AF_INET socket here never sees the datagram.
+  on "$dst_pub" "rm -f /tmp/udp_got_$port; setsid python3 -c 'import socket; s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM); s.settimeout(8); s.bind((\"::\",$port));
 try:
  s.recvfrom(64); open(\"/tmp/udp_got_$port\",\"w\").write(\"1\")
 except Exception: pass' >/dev/null 2>&1 </dev/null & sleep 1" >/dev/null 2>&1 || true
-  on "$from_pub" "python3 -c 'import socket; socket.socket(socket.AF_INET,socket.SOCK_DGRAM).sendto(b\"x\",(\"$dst_vpn\",$port))'" >/dev/null 2>&1 || true
+  on "$from_pub" "python3 -c 'import socket; socket.socket(socket.AF_INET6,socket.SOCK_DGRAM).sendto(b\"x\",(\"$dst_vpn\",$port))'" >/dev/null 2>&1 || true
   sleep 2
   on "$dst_pub" "[ -f /tmp/udp_got_$port ] && echo OPEN || echo CLOSED" 2>/dev/null | strip | tr -d '[:space:]'
 }

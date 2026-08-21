@@ -1,5 +1,10 @@
 target := "x86_64-unknown-linux-gnu"
 musl_target := "x86_64-unknown-linux-musl"
+# Cross builds keep their own target dir, for the same reason `android-check`
+# does: the cross image (Ubuntu 22.04) cannot execute build scripts a modern
+# host compiled, so sharing `target/` fails on a glibc version mismatch the
+# moment anyone runs a native `just release` first.
+cross_dir := "target/cross"
 binary := "ray"
 user := "root"
 
@@ -58,12 +63,12 @@ fmt-changed:
     rustfmt --edition 2024 $files
 
 cross:
-    cross -q build --release --target {{target}}
+    CARGO_TARGET_DIR={{cross_dir}} cross -q build --release --target {{target}}
 
 # Static musl build: one binary that runs on any Linux regardless of glibc
 # version (deps are musl-clean: ring + hickory, no C/dlopen dependencies).
 cross-musl:
-    cross -q build --release --target {{musl_target}}
+    CARGO_TARGET_DIR={{cross_dir}} cross -q build --release --target {{musl_target}}
 
 # Build both the glibc and static-musl release binaries.
 cross-all: cross cross-musl
@@ -82,23 +87,23 @@ local-dev *args:
     @echo "Installed /usr/local/bin/{{binary}} and restarted the local daemon"
 
 deploy ip:
-    cross -q build --release --target {{target}}
+    CARGO_TARGET_DIR={{cross_dir}} cross -q build --release --target {{target}}
     just scp {{ip}}
 
 # Copy an already-built release binary to a host + (re)start the daemon. No build.
 # Use after `just cross` when deploying the same binary to several hosts.
 scp ip:
-    rsync -az --progress target/{{target}}/release/{{binary}} {{user}}@{{ip}}:/tmp/
+    rsync -az --progress {{cross_dir}}/{{target}}/release/{{binary}} {{user}}@{{ip}}:/tmp/
     ssh {{user}}@{{ip}} "getent group rayfish >/dev/null || groupadd rayfish && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && (systemctl restart rayfish 2>/dev/null || {{binary}} up)"
     @echo "Deployed and installed daemon on {{ip}}"
 
 deploy-dev ip:
-    cross -q build --target {{target}}
+    CARGO_TARGET_DIR={{cross_dir}} cross -q build --target {{target}}
     just scp-dev {{ip}}
 
 # Debug counterpart of `scp`: copy an already-built debug binary, no build.
 scp-dev ip:
-    rsync -az --progress target/{{target}}/debug/{{binary}} {{user}}@{{ip}}:/tmp/
+    rsync -az --progress {{cross_dir}}/{{target}}/debug/{{binary}} {{user}}@{{ip}}:/tmp/
     ssh {{user}}@{{ip}} "getent group rayfish >/dev/null || groupadd rayfish && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && (systemctl restart rayfish 2>/dev/null || {{binary}} up)"
     @echo "Deployed and installed daemon on {{ip}} (debug build)"
 

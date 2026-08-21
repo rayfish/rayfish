@@ -1,6 +1,6 @@
 # Reliability (packet-loss) e2e test
 
-Four Scaleway instances form an **open**-network full mesh; the test probes every
+Four droplets form an **open**-network full mesh; the test probes every
 pair in both directions for packet loss over the rayfish tunnel, with the raw
 public-IP link as the baseline.
 
@@ -30,7 +30,7 @@ more than `MARGIN` percentage points (default `0.5`), so genuine internet drops
 on the underlying link aren't blamed on rayfish. Direct loss is always reported.
 A per-run markdown table is saved under `results/`.
 
-## First-run findings (4× DEV1-S, fr-par-1)
+## First-run findings (4× DEV1-S in fr-par-1, the fleet this suite ran on then)
 
 - **ICMP burst and flood: 0% loss over the rayfish tunnel on every directed pair**
   (12/12), matching the direct baseline. The datagram data path holds up under
@@ -53,5 +53,5 @@ A per-run markdown table is saved under `results/`.
 | `FLOOD_COUNT` | `10000` | ICMP flood packets |
 | `MARGIN` | `0.5` | rayfish loss may exceed direct by this many pp before failing |
 
-Plus the shared `ZONE`/`TYPE`/`IMAGE`/`SSH_KEY`/`KEEP_STATE` overrides (see
+Plus the shared `REGION`/`SIZE`/`IMAGE`/`SSH_KEY`/`KEEP_STATE` overrides (see
 [`../README.md`](../README.md)).

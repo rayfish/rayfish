@@ -181,7 +181,7 @@ step "8b. firewall — unsolicited inbound TCP is denied by the secure default"
 # the result.
 FWPORT=18080
 if [[ -n "$A_IP" && -n "$B_IP" ]]; then
-  # Listener on srv-b (binds 0.0.0.0, including the TUN IP); helpers in common.sh.
+  # Listener on srv-b (binds ::, so it answers on the TUN); helpers in common.sh.
   start_tcp_listener "$B" "$FWPORT"
   # No prior outbound from srv-b, so conntrack never masks the default-deny.
   fw_denies "$A" "$B_IP" "$FWPORT" "unsolicited inbound is denied by default"
