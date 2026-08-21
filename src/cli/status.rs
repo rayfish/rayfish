@@ -43,6 +43,22 @@ pub(crate) fn fail_with(title: &str, detail: &str) -> ! {
     std::process::exit(1);
 }
 
+/// [`fail_with`] for a reply the command does not know how to read.
+///
+/// Reaching this arm means the CLI and the daemon disagree about the protocol,
+/// and IPC has no version negotiation to catch it: the binary is swapped before
+/// the service restarts, so the window is routine rather than exotic. Printing to
+/// stderr and returning 0 told the caller the command worked, which is the same
+/// failure [`fail_with`] exists to stop, one match arm over.
+pub(crate) fn fail_unexpected(reply: &impl std::fmt::Debug) -> ! {
+    print_error(
+        "unexpected reply from the daemon",
+        &format!("{reply:?}"),
+        Some("the CLI and the daemon are probably different versions: sudo ray restart"),
+    );
+    std::process::exit(1);
+}
+
 /// Map a daemon error message to an actionable hint, best-effort.
 pub(crate) fn infer_hint(message: &str) -> Option<String> {
     let m = message.to_lowercase();
@@ -297,7 +313,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
             println!();
         }
         ipc::IpcMessage::Error { message } => fail_with("status failed", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -791,7 +807,7 @@ pub(crate) async fn ipc_down() -> Result<()> {
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -831,7 +847,7 @@ pub(crate) async fn ipc_report() -> Result<()> {
             }
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -865,7 +881,7 @@ pub(crate) async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }

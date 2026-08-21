@@ -1405,9 +1405,7 @@ async fn run() -> Result<()> {
             stats.spawn_logger(token.clone());
             daemon::run_daemon(token, stats).await
         }
-        Command::Up {
-            hostname,
-        } => cmd_up(hostname).await,
+        Command::Up { hostname } => cmd_up(hostname).await,
         Command::Down => ipc_down().await,
         Command::Stop => cmd_stop().await,
         Command::Start => cmd_start().await,
@@ -1531,7 +1529,7 @@ pub(crate) async fn ipc_mutate(msg: ipc::IpcMessage) -> Result<()> {
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {other:?}"),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -1592,7 +1590,7 @@ async fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
                     }
                 }
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
-                other => eprintln!("Unexpected response: {other:?}"),
+                other => fail_unexpected(&other),
             }
             Ok(())
         }
@@ -1655,7 +1653,7 @@ async fn cmd_set_operator(user: &str) -> Result<()> {
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {other:?}"),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }

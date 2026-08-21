@@ -73,7 +73,7 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
         // file after the first rejected one. The caller prints this with the
         // file's name and still exits non-zero at the end.
         ipc::IpcMessage::Error { message } => anyhow::bail!(message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -88,10 +88,7 @@ async fn config_row(key: NodeKey) -> Result<Option<String>> {
             rows.into_iter().next().map(|(_, v)| v).unwrap_or_default(),
         )),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => {
-            eprintln!("Unexpected response: {other:?}");
-            Ok(None)
-        }
+        other => fail_unexpected(&other),
     }
 }
 
@@ -250,7 +247,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                     }
                 }
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
-                other => eprintln!("Unexpected response: {:?}", other),
+                other => fail_unexpected(&other),
             }
         }
         Some(FilesAction::Accept { id, output }) => {
@@ -270,7 +267,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                     println!("  {} {}", style::check(), style::value(&message));
                 }
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
-                other => eprintln!("Unexpected response: {:?}", other),
+                other => fail_unexpected(&other),
             }
         }
         Some(FilesAction::Cancel { id }) => {
@@ -280,7 +277,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                     println!("  {} {}", style::check(), style::value(&message));
                 }
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
-                other => eprintln!("Unexpected response: {:?}", other),
+                other => fail_unexpected(&other),
             }
         }
         Some(FilesAction::AutoAccept { network, state }) => {
@@ -300,7 +297,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                     println!("  {} {}", style::check(), style::value(&message));
                 }
                 ipc::IpcMessage::Error { message } => fail_with("error", &message),
-                other => eprintln!("Unexpected response: {:?}", other),
+                other => fail_unexpected(&other),
             }
         }
         // Config-only subcommands are handled above and return early.

@@ -60,7 +60,7 @@ pub(crate) async fn ipc_create(
             println!();
         }
         ipc::IpcMessage::Error { message } => fail_with("create failed", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -132,7 +132,7 @@ pub(crate) async fn ipc_join(
             println!();
         }
         ipc::IpcMessage::Error { message } => fail_with("join failed", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -151,7 +151,7 @@ pub(crate) async fn ipc_nuke(name: &str, force: bool) -> Result<()> {
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -170,7 +170,7 @@ pub(crate) async fn ipc_kick(network: &str, peer: &str) -> Result<()> {
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -188,7 +188,7 @@ pub(crate) async fn ipc_leave(name: &str) -> Result<()> {
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -232,7 +232,7 @@ pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
                 }
             }
             ipc::IpcMessage::Error { message } => fail_with("error", &message),
-            other => eprintln!("Unexpected response: {:?}", other),
+            other => fail_unexpected(&other),
         }
         return Ok(());
     }
@@ -260,7 +260,7 @@ pub(crate) async fn ipc_ephemeral(network: &str, arg: &str) -> Result<()> {
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }

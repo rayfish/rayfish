@@ -56,7 +56,7 @@ async fn alias_set(network: &str, key: &str, alias: &str) -> Result<()> {
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -74,7 +74,7 @@ async fn alias_remove(network: &str, alias: &str) -> Result<()> {
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -110,7 +110,7 @@ async fn alias_list(network: &str, json: bool) -> Result<()> {
             }
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }

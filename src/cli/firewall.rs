@@ -53,7 +53,7 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
             }
         }
         ipc::IpcMessage::Error { message } => fail_with("firewall", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -188,7 +188,7 @@ async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
             render_ssh_state(enabled, networks, filter.as_deref())
         }
         ipc::IpcMessage::Error { message } => fail_with("firewall ssh", &message),
-        other => eprintln!("Unexpected response: {other:?}"),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -372,10 +372,7 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
     let rules = match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::FirewallPendingResponse { rules, .. } => rules,
         ipc::IpcMessage::Error { message } => fail_with("firewall pending", &message),
-        other => {
-            eprintln!("Unexpected response: {other:?}");
-            return Ok(());
-        }
+        other => fail_unexpected(&other),
     };
 
     if json_enabled() {
@@ -416,7 +413,7 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
             println!("  {} {}", style::check(), style::value(&message));
         }
         ipc::IpcMessage::Error { message } => fail_with("firewall pending", &message),
-        other => eprintln!("Unexpected response: {other:?}"),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -472,10 +469,7 @@ pub(crate) async fn ipc_firewall_suggest(
     let mut suggestions = match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::FirewallSuggestionsResponse { suggestions } => suggestions,
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => {
-            eprintln!("Unexpected response: {other:?}");
-            std::process::exit(1);
-        }
+        other => fail_unexpected(&other),
     };
 
     let entry = suggestions.entry(subject.to_string()).or_default();
@@ -504,7 +498,7 @@ pub(crate) async fn ipc_firewall_suggest(
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {other:?}"),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }

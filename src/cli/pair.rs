@@ -53,7 +53,7 @@ pub(crate) async fn ipc_pair_start() -> Result<()> {
             // For now, just tell the user it's ready.
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -81,7 +81,7 @@ pub(crate) async fn ipc_pair_accept(ticket: &str) -> Result<()> {
             println!("This device will present its certificate when joining networks.");
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -131,7 +131,7 @@ pub(crate) async fn ipc_pair_list() -> Result<()> {
             }
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -148,7 +148,7 @@ pub(crate) async fn ipc_unpair(device: &str) -> Result<()> {
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }

@@ -23,7 +23,7 @@ pub(crate) async fn ipc_connect(contact_id: &str, hostname: Option<String>) -> R
             );
         }
         ipc::IpcMessage::Error { message } => fail_with("connect failed", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -71,7 +71,7 @@ pub(crate) async fn ipc_connections_list() -> Result<()> {
             }
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -86,7 +86,7 @@ pub(crate) async fn ipc_connections_approve(id: &str) -> Result<()> {
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -162,7 +162,7 @@ pub(crate) async fn ipc_lan_peers() -> Result<()> {
             }
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -191,7 +191,7 @@ pub(crate) async fn ipc_contact(action: Option<ContactAction>) -> Result<()> {
             }
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -285,7 +285,7 @@ pub(crate) async fn ipc_ping(peer: &str, count: u32, interval: u64) -> Result<()
             }
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -357,7 +357,7 @@ pub(crate) async fn ipc_netcheck() -> Result<()> {
             );
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -406,7 +406,7 @@ pub(crate) async fn ipc_admin(network: &str, action: AdminAction) -> Result<()> 
             }
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
-        other => eprintln!("Unexpected response: {:?}", other),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }

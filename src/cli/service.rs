@@ -88,15 +88,11 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
 /// service, which requires root.
 pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
     if let Ok(mut stream) = ipc::connect().await {
-        ipc::send(
-            &mut stream,
-            ipc::IpcMessage::Up { hostname },
-        )
-        .await?;
+        ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
         match ipc::recv(&mut stream).await? {
             ipc::IpcMessage::Ok { message } => println!("{message}"),
             ipc::IpcMessage::Error { message } => fail_with("error", &message),
-            other => eprintln!("Unexpected response: {other:?}"),
+            other => fail_unexpected(&other),
         }
         return Ok(());
     }
@@ -119,9 +115,7 @@ pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
 /// it never comes up (e.g. it crashed on a port/route conflict with another
 /// VPN), we surface the tail of its log so the user knows what went wrong
 /// instead of seeing a cheerful "started" followed by a dead `ray status`.
-pub(crate) async fn install_and_start_service(
-    hostname: Option<String>,
-) -> Result<()> {
+pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Result<()> {
     ensure_service_installed()?;
     // We are root here, which is what it takes to write into the directories
     // the shells already search. Doing it from the service installer is what
@@ -163,11 +157,7 @@ pub(crate) async fn install_and_start_service(
     spinner.finish_and_clear();
     match daemon {
         Some(mut stream) => {
-            ipc::send(
-                &mut stream,
-                ipc::IpcMessage::Up { hostname },
-            )
-            .await?;
+            ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
             // A failed `up` still exits non-zero, but not before the grant below:
             // the service is installed and running by this point, and the user's
             // next move is to retry `ray up` without sudo. Taking that away as
@@ -178,10 +168,13 @@ pub(crate) async fn install_and_start_service(
                     None
                 }
                 ipc::IpcMessage::Error { message } => Some(message),
-                other => {
-                    eprintln!("Unexpected response: {other:?}");
-                    None
-                }
+                // Not `fail_unexpected`: exiting here would skip the grant below,
+                // and the ordering above is the whole point. Same treatment as a
+                // daemon-side error, so it exits non-zero after the grant.
+                other => Some(format!(
+                    "unexpected reply from the daemon: {other:?}\n    \
+                     the CLI and the daemon are probably different versions"
+                )),
             };
             // We're root here (installing the service). Grant the invoking user
             // operator access so they can run `ray` without sudo from now on,
@@ -195,8 +188,8 @@ pub(crate) async fn install_and_start_service(
         None => {
             eprintln!(
                 "rayfish service was started but the daemon never became reachable.\n\
-                 It likely crashed on startup — a common cause is another VPN (e.g. Tailscale)\n\
-                 already using the 100.64.0.0/10 range, DNS port 53, or a conflicting route."
+                 It likely crashed on startup. Common causes are DNS port 53 already in\n\
+                 use, a conflicting route, or no permission to create the TUN device."
             );
             print_daemon_log_tail();
             std::process::exit(1);
