@@ -23,9 +23,9 @@ use tokio::sync::Notify;
 /// the peer is marked unreachable until a later packet retries the dial.
 const LAZY_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One network to (re)handshake when dialing a peer: its name, the per-network
-/// public key that signs the `MeshHello`, and our mesh IPv4 on it. A peer's single
-/// connection carries every shared network, so a dial takes a slice of these.
+/// One network to (re)handshake when dialing a peer: its name and the per-network
+/// public key that signs the `MeshHello`. A peer's single connection carries every
+/// shared network, so a dial takes a slice of these.
 #[derive(Clone)]
 pub(crate) struct DialTarget {
     pub network: String,
@@ -675,9 +675,9 @@ impl NetworkRegistry {
             device_cert: None,
             last_seen: None,
             exit_node: false,
+            // `Unknown` until the data plane probes the uplink: an offer we have
+            // not verified is not a claim to publish.
             exit_families: ExitFamilies::Unknown,
-            // Our own entry starts out truthful, so the first published blob
-            // already tells peers not to use our mesh IPv4.
         });
 
         let mut approved = ApprovedList::new();
@@ -856,7 +856,7 @@ impl NetworkRegistry {
         Some(packet.as_bytes().to_vec())
     }
 
-    /// Resolve a peer name (hostname, `host.net.ray`, or mesh IPv4) to its
+    /// Resolve a peer name (hostname, `host.net.ray`, or mesh address) to its
     /// endpoint id: Magic DNS + connected-peer route first, then the member
     /// roster (offline peers / self), then a short-id / endpoint-id prefix scan.
     pub(crate) async fn resolve_peer_name(&self, name: &str) -> Option<EndpointId> {
@@ -886,8 +886,8 @@ impl NetworkRegistry {
     }
 
     /// Resolve a firewall `--peer` argument to a peer's **device** endpoint id,
-    /// accepting more forms than [`Self::resolve_peer_name`]: hostname, mesh IPv4
-    /// (incl. offline members from the roster), mesh IPv6 (connected peers only),
+    /// accepting more forms than [`Self::resolve_peer_name`]: hostname, mesh address
+    /// (incl. offline members, since it derives from the roster's identities),
     /// short / full endpoint id, or a paired user identity.
     pub(crate) async fn resolve_peer_flexible(&self, name: &str) -> Option<EndpointId> {
         if let Some(id) = self.resolve_peer_name(name).await {
