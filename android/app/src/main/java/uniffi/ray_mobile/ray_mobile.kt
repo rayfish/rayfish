@@ -1226,7 +1226,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_log_snapshot() != 20955.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_network_changed() != 41989.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_network_changed() != 59345.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_pair() != 22172.toShort()) {
@@ -1815,7 +1815,7 @@ public interface NodeInterface {
     /**
      * Send a file to a peer. `path` is a readable file path (the core reads its
      * bytes and adds them to the blob store); `peer` is any identifier the core
-     * resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+     * resolves: a hostname, mesh address, short id, or full endpoint id.
      * Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
      * (or auto-accepts if it is one of the sender's own paired devices). Needs
      * only the control plane ([`Node::start`]), not the tunnel, but the peer must
@@ -2437,7 +2437,7 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     /**
      * Send a file to a peer. `path` is a readable file path (the core reads its
      * bytes and adds them to the blob store); `peer` is any identifier the core
-     * resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+     * resolves: a hostname, mesh address, short id, or full endpoint id.
      * Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
      * (or auto-accepts if it is one of the sender's own paired devices). Needs
      * only the control plane ([`Node::start`]), not the tunnel, but the peer must
