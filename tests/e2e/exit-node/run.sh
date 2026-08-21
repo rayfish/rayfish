@@ -91,9 +91,8 @@ clean_kernel(){
     for f in -4 -6; do
       # 99 holds one rule per physical address, so a single `del` leaves the rest
       # behind. 98 and 102 are one rule each, but both read back as
-      # `lookup 29793`, and a leftover breaks a later run outright: step 9's "no
-      # IPv4 tunnel rule in IPv6-only mode" grep would match state this run never
-      # installed.
+      # `lookup 29793`, and a leftover breaks a later run outright: step 4's "no
+      # IPv4 tunnel rule" grep would match state this run never installed.
       for p in 98 99 100 101 102; do
         for _ in $(seq 1 64); do
           on "$h" "ip $f rule del pref $p" >/dev/null 2>&1 || break
@@ -101,6 +100,13 @@ clean_kernel(){
       done
       on "$h" "ip $f route flush table $TABLE" >/dev/null 2>&1
     done
+    # The stand-in co-resident VPN step 4 installs (table 52 at pref 5250, in
+    # Tailscale's range). Left behind it would make the next run's mirror
+    # assertions pass on state this run never installed.
+    for _ in $(seq 1 8); do
+      on "$h" "ip -6 rule del pref 5250" >/dev/null 2>&1 || break
+    done
+    on "$h" "ip -6 route flush table 52" >/dev/null 2>&1
     on "$h" "sysctl -qw net.ipv4.ip_forward=0 net.ipv6.conf.all.forwarding=0" >/dev/null 2>&1
     on "$h" "rm -f /tmp/exit-disarm" >/dev/null 2>&1
     echo "   cleaned $h"
@@ -161,14 +167,16 @@ echo "   public IPv6: a=${A_PUB_V6:-<none>}  b=${B_PUB_V6:-<none>}  c=${C_PUB_V6
 
 # ---------------------------------------------------------------------------
 step "2. srv-a becomes an exit node (allow srv-b only)"
+# Captured before the allow: the gateway must not turn IPv4 forwarding on, so the
+# assertion is "unchanged", not "off". A box with Docker on it already has this at
+# 1 for its own reasons and that is none of our business either way.
+A_IP4FWD_BEFORE="$(on "$A" 'cat /proc/sys/net/ipv4/ip_forward')"
 on "$A" "ray exit-node allow $NET srv-b" 2>&1 | strip | sed 's/^/   a| /'
 [[ "$(exit_json "$A" | jq -r --arg n "$NET" '.networks[] | select(.network==$n) | .offering')" == "true" ]] \
   && pass "srv-a reports offering: yes" || fail "srv-a does not report an exit-node offer"
 
 # The gateway's kernel state must be live (it is already `up`, so the allow
 # reconciles it immediately rather than waiting for the next `ray up`).
-[[ "$(on "$A" 'cat /proc/sys/net/ipv4/ip_forward')" == "1" ]] \
-  && pass "srv-a: IPv4 forwarding enabled" || fail "srv-a: ip_forward not enabled"
 [[ "$(on "$A" 'cat /proc/sys/net/ipv6/conf/all/forwarding')" == "1" ]] \
   && pass "srv-a: IPv6 forwarding enabled" || fail "srv-a: ipv6 forwarding not enabled"
 if on "$A" 'nft list table inet rayfish_exit 2>/dev/null | grep -q masquerade'; then
@@ -176,6 +184,17 @@ if on "$A" 'nft list table inet rayfish_exit 2>/dev/null | grep -q masquerade'; 
 else
   fail "srv-a: no nft masquerade table (traffic would forward but never come back)"
 fi
+# The half that must NOT happen, and the gateway twin of step 4's client check.
+# The overlay routes no IPv4, so nothing can enter the TUN from 100.64.0.0/10 to
+# be masqueraded: a v4 masquerade rule could only ever catch a co-resident VPN's
+# traffic, and turning ip_forward on would make the host a router for a family we
+# cannot deliver. Both are ours to not do.
+[[ "$(on "$A" 'cat /proc/sys/net/ipv4/ip_forward')" == "$A_IP4FWD_BEFORE" ]] \
+  && pass "srv-a: IPv4 forwarding left as it was ($A_IP4FWD_BEFORE)" \
+  || fail "srv-a: offering an exit node changed ip_forward to $(on "$A" 'cat /proc/sys/net/ipv4/ip_forward') (it carries no IPv4)"
+on "$A" 'nft list table inet rayfish_exit 2>/dev/null | grep -q "ip saddr"' \
+  && fail "srv-a installed an IPv4 masquerade rule: it claims a range that is not ours" \
+  || pass "srv-a: no IPv4 masquerade rule (100.64.0.0/10 is left to whoever owns it)"
 
 # ---------------------------------------------------------------------------
 step "3. the offer rides the signed roster: srv-b and srv-c discover it"
@@ -199,10 +218,41 @@ on "$B" "ray status" | strip | grep -q 'srv-a.*offers' \
 # can: with no IPv6 uplink on srv-a the selection is refused and there is nothing
 # to measure. Skipped rather than fatal, the same way step 6 treats it, so a fleet
 # without IPv6 still runs the steps that never needed it (7 and 8).
+b_v6_available(){
+  exit_json "$B" | jq -r --arg n "$NET" \
+    '.networks[] | select(.network==$n) | .available_v6[]' 2>/dev/null | grep -c srv-a
+}
 if [[ -z "$A_PUB_V6" ]]; then
-  step "4-5. tunnel install and revert (skipped)"
-  echo "   (srv-a has no IPv6 egress: it cannot carry a tunnel, so there is none to test)"
+  # Not a skip: this is the *other* branch of `Member.exit_families`, and it has
+  # assertions of its own. A gateway with no IPv6 uplink can carry nothing at all
+  # now that the overlay routes no IPv4, so it must say so on the roster and the
+  # client must refuse it by name rather than install a tunnel with nowhere to send.
+  step "4-5. srv-a has no IPv6 uplink: the selection must be refused, with the reason"
+  retry_until 90 "[[ \"\$(b_v6_available)\" == '0' ]]" \
+    && pass "srv-a is not listed as carrying IPv6 (it has no v6 uplink)" \
+    || fail "srv-a claims IPv6 egress it does not have"
+  REFUSE_OUT="$(on "$B" "ray exit-node use $NET srv-a" 2>&1)"; REFUSE_RC=$?
+  printf '%s\n' "$REFUSE_OUT" | strip | sed 's/^/   b| /'
+  # The whole point of the field: name the reason now, rather than install a
+  # tunnel whose traffic the gateway has nowhere to send.
+  printf '%s\n' "$REFUSE_OUT" | grep -q 'cannot carry IPv6' \
+    && pass "selecting a gateway with no IPv6 uplink is refused, with the reason" \
+    || fail "srv-b accepted a gateway that cannot carry its only family"
+  [[ $REFUSE_RC -ne 0 && $REFUSE_RC -ne 255 ]] \
+    && pass "the refusal exits non-zero (rc=$REFUSE_RC)" \
+    || fail "\`exit-node use\` reported success (rc=$REFUSE_RC) on a gateway it refused"
+  on "$B" "ray exit-node none $NET" >/dev/null 2>&1
 else
+  retry_until 90 "[[ \"\$(b_v6_available)\" == '1' ]]" \
+    && pass "srv-a is listed as carrying IPv6 in srv-b's exit-node status" \
+    || fail "srv-a has an IPv6 uplink but is not advertised as carrying IPv6"
+  # Stand in for a co-resident VPN: a route in a table of its own, reached by a
+  # rule far below ours. Our catch-all would swallow it (PREF_MAIN's
+  # suppress_prefixlength only rescues routes in `main`), so the install has to
+  # copy it into the tunnel table first or that VPN goes dark. Set up before the
+  # selection, because the copy happens at install time.
+  FOREIGN_NET="fd7a:115c:a1e0::/48"
+  on "$B" "ip -6 route replace $FOREIGN_NET dev lo table 52; ip -6 rule add pref 5250 table 52" >/dev/null 2>&1
   step "4. srv-b tunnels IPv6 through srv-a and leaves its IPv4 egress alone"
   arm_failsafe "$B" 240
   use_started=$SECONDS
@@ -281,6 +331,40 @@ else
   on "$B" 'nft list table inet rayfish_exit_client 2>/dev/null | grep -q "ct mark"' \
     && pass "srv-b installed the conntrack-mark table (inbound connections bypass the tunnel)" \
     || fail "srv-b has no conntrack-mark table: inbound connections would be swallowed"
+  # The co-resident VPN's routes survive the tunnel. Our default is a catch-all far
+  # above that VPN's own preferences, so without the copy its prefixes go dark.
+  on "$B" "ip -6 route show table $TABLE" 2>/dev/null | grep -q "$FOREIGN_NET" \
+    && pass "the co-resident VPN's route was mirrored into the tunnel table" \
+    || fail "the co-resident VPN's route was not mirrored: our catch-all black-holes it"
+  # The mirror is only half of it. PREF_SRC and PREF_BYPASS sit above the catch-all
+  # and both look up `main`, where a policy-routing VPN keeps nothing, so traffic
+  # sourced from its address still misses. One rule covers every mirrored prefix:
+  # `suppress_prefixlength 0` matches the copies and suppresses our own default, so
+  # the lookup is its own selector and cannot drift with that VPN's route count.
+  on "$B" "ip -6 rule show" 2>/dev/null | grep -q "lookup $TABLE suppress_prefixlength 0" \
+    && pass "the co-resident VPN's destinations are routed to the mirrored copy" \
+    || fail "no pref-98 rule: traffic sourced from that VPN's own address is black-holed"
+  # Sourced from the foreign address, which is the case the mirror alone misses:
+  # this is what an inbound session's replies look like.
+  B_FOREIGN_SRC="$(on "$B" "ip -6 addr show scope global | awk '/inet6/{print \$2}' | cut -d/ -f1 | head -1")"
+  if [[ -n "$B_FOREIGN_SRC" ]]; then
+    on "$B" "ip -6 route get ${FOREIGN_NET%%/*}1 from $B_FOREIGN_SRC" 2>/dev/null | grep -q "table $TABLE\|dev lo" \
+      && pass "traffic sourced from the co-resident VPN's address still reaches it" \
+      || fail "traffic sourced from that VPN's address takes the physical default (an inbound session over it would die)"
+  else
+    fail "could not read srv-b's global IPv6: the foreign-source route check did not run"
+  fi
+  # DNS still resolves under the tunnel. Deliberately not asserting *where* the
+  # query went: on a split-DNS backend only `.ray` reaches our forwarder, so
+  # non-mesh lookups leave over the host's own IPv4 by design (the daemon warns
+  # about it on Linux). What must not happen is losing name resolution.
+  on "$B" "getent hosts example.com" >/dev/null 2>&1 \
+    && pass "non-mesh DNS still resolves under the tunnel" \
+    || fail "DNS broke under the tunnel"
+  # `.ray` is the half that does go through our resolver in every backend.
+  on "$B" "getent hosts srv-a.ray" >/dev/null 2>&1 \
+    && pass "'.ray' names still resolve under the tunnel" \
+    || fail "'.ray' resolution broke under the tunnel"
   # The exit column now names srv-a as the peer carrying our traffic, not just one
   # offering to (it read `offers` in step 3, before we selected it).
   on "$B" "ray status" | strip | grep -q 'srv-a.*in use' \
@@ -344,7 +428,21 @@ if [[ -z "$A_PUB_V6" || -z "$C_PUB_V6" ]]; then
   echo "   (no IPv6 egress on $WHO: the deny path has nothing to carry, skipping)"
 else
   arm_failsafe "$C" 180
-  on "$C" "ray exit-node use $NET srv-a" 2>&1 | strip | sed 's/^/   c| /'
+  # Same as step 4: `ray exit-node use` exits non-zero on a refusal, and a refused
+  # selection installs no tunnel. Reading the probe below without checking this
+  # reports srv-c's untouched direct egress as a LEAK, which is a security-shaped
+  # message for a test that never ran. srv-a can narrow its claim between step 4
+  # and here without anybody touching the selection.
+  C_USE_OUT="$(on "$C" "ray exit-node use $NET srv-a" 2>&1)"; C_USE_RC=$?
+  printf '%s\n' "$C_USE_OUT" | strip | sed 's/^/   c| /'
+  if [[ $C_USE_RC -ne 0 ]]; then
+    on "$C" "ray exit-node none $NET" >/dev/null 2>&1
+    disarm_failsafe "$C"
+    [[ $C_USE_RC -eq 255 ]] \
+      && fail "lost ssh to srv-c running \`exit-node use\` (rc=255): cannot tell what happened" \
+      || fail "srv-c's \`exit-node use\` was refused (rc=$C_USE_RC): the deny path never ran"
+    summary
+  fi
   sleep 5
   C_VIA_EXIT="$(pub6 "$C")"
   on "$C" "ray exit-node none $NET" >/dev/null 2>&1
@@ -365,9 +463,15 @@ sleep 3
 on "$A" 'nft list table inet rayfish_exit' >/dev/null 2>&1 \
   && fail "srv-a's nft masquerade table survived 'ray down'" \
   || pass "srv-a's nft masquerade table was removed on 'ray down'"
-[[ "$(on "$A" 'cat /proc/sys/net/ipv4/ip_forward')" == "0" ]] \
-  && pass "srv-a's IPv4 forwarding sysctl was restored" \
-  || fail "srv-a left IPv4 forwarding enabled after 'ray down' (host stays a router)"
+[[ "$(on "$A" 'cat /proc/sys/net/ipv6/conf/all/forwarding')" == "0" ]] \
+  && pass "srv-a's IPv6 forwarding sysctl was restored" \
+  || fail "srv-a left IPv6 forwarding enabled after 'ray down' (host stays a router)"
+# Never touched on the way in, so it must read the same on the way out. Teardown
+# still *restores* it from the snapshot, though, because an older build did set it
+# and teardown may not assume which build turned it on.
+[[ "$(on "$A" 'cat /proc/sys/net/ipv4/ip_forward')" == "$A_IP4FWD_BEFORE" ]] \
+  && pass "srv-a's IPv4 forwarding is still where the run found it" \
+  || fail "srv-a's ip_forward changed across the exit-node lifecycle"
 # Restore for re-runs / a clean end state.
 on "$A" 'ray up' >/dev/null 2>&1 || true
 sleep 3

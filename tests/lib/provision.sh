@@ -58,7 +58,13 @@ do_provision(){
   fi
 
   local tmp; tmp="$(mktemp)"
-  trap 'rm -f "$tmp"' EXIT
+  # Every droplet already created is billed, and $tmp is the only record of it
+  # until the `mv` below. So the trap keeps the partial fleet rather than
+  # discarding it: `teardown` needs the ids, and "No .servers, nothing to tear
+  # down" on a fleet that is running costs real money. See tests/lib/teardown.sh.
+  trap 'if [[ -s "$tmp" ]]; then mv "$tmp" "$SERVERS"; \
+          echo "   kept the partial fleet in $SERVERS; run teardown to remove it" >&2; \
+        else rm -f "$tmp"; fi' EXIT
 
   local i name label json id ip ip6 no_v6=0
   for i in "${!NAMES[@]}"; do
@@ -81,7 +87,14 @@ do_provision(){
       [[ -n "$ip"  ]] || ip="$(echo  "$json" | jq -r '[.[0].networks.v4[]? | select(.type=="public") | .ip_address] | first // empty')"
       [[ -n "$ip6" ]] || ip6="$(echo "$json" | jq -r '[.[0].networks.v6[]? | .ip_address] | first // empty')"
     fi
-    [[ -n "$ip" ]] || { echo "   no public IPv4 for $name" >&2; exit 1; }
+    # The droplet exists and is billed even with no address on it, so record it
+    # before bailing or teardown has no id to destroy. `-` keeps the column
+    # count; teardown only needs the id.
+    [[ -n "$ip" ]] || {
+      echo "$id - $label $REGION" >> "$tmp"
+      echo "   no public IPv4 for $name" >&2
+      exit 1
+    }
     echo "   id=$id  ip=$ip  ipv6=${ip6:-<none>}"
     [[ -n "$ip6" ]] || no_v6=1
     echo "$id $ip $label $REGION" >> "$tmp"
