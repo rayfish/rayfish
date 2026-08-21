@@ -320,7 +320,7 @@ impl MeshConnection {
             drop(recv); // one message per stream; the reply rides `send`
             // `handle_frame` registers the peer (route) as a side effect and
             // returns its mesh address once it is a member on this network.
-            if let Some(_ip) = handler
+            if let Some(peer_ip) = handler
                 .handle_frame(&self.conn, send, self.peer_id, frame.msg)
                 .await
             {
@@ -328,9 +328,12 @@ impl MeshConnection {
                 // registered: a later drop must be reported.
                 registered = true;
                 // (Re)announce our outbound handle table so the peer can decode
-                // datagrams we tag for this (possibly newly-shared) network.
-                announce_network_handles(&self.ctx.peers, &self.conn, derive_ipv6(&self.peer_id))
-                    .await;
+                // datagrams we tag for this (possibly newly-shared) network. Look
+                // it up by the address `handle_frame` registered it under, not by
+                // one derived from the transport key: a device whose `MeshHello`
+                // claims a cert-bound identity is keyed on *that* identity's
+                // address, and a recompute would find an empty handle table.
+                announce_network_handles(&self.ctx.peers, &self.conn, peer_ip).await;
             }
         }
     }
