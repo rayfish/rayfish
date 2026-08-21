@@ -138,7 +138,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   port, whatever the firewall said. Such packets are now refused outright. Traffic
   that relied on IPv6 fragmentation over the mesh will stop rather than fall
   through, which is the safe direction; lower your application's datagram size or
-  let TCP handle it.
+  let TCP handle it. Both directions are counted as `malformed` drops in `ray
+  status`, so traffic that stops this way is visible rather than silent.
 - **Taking over `/etc/resolv.conf` no longer breaks DNS on a NetworkManager
   host that runs its own resolver.** With NetworkManager in `dns=dnsmasq` mode,
   the server rayfish found in `resolv.conf` is NetworkManager's own local

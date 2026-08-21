@@ -476,7 +476,12 @@ pub(crate) async fn run_mesh<R: crate::tun::TunRead>(
         let pkt = pool.split_to(n).freeze();
         tracing::debug!(len = n, first_byte = pkt[0], "TUN read");
         let Some(info) = firewall::parse_packet_info(&pkt) else {
-            tracing::debug!(len = n, "not IP, dropping");
+            // Not IP, truncated, or IPv6 carrying an extension header we refuse
+            // to misparse (`IPV6_EXTENSION_HEADERS`). Counted rather than merely
+            // logged: a UDP send past the TUN MTU arrives here as kernel-made
+            // fragments, and a silent drop reads as the link going quiet.
+            tracing::debug!(len = n, "outbound packet not classifiable, dropping");
+            stats.record_drop(DropReason::Malformed);
             continue;
         };
         if is_magic_dns(&info) {
@@ -577,6 +582,7 @@ async fn flush_or_drop(
 
     for pkt in pkts {
         let Some(info) = firewall::parse_packet_info(&pkt) else {
+            stats.record_drop(DropReason::Malformed);
             continue;
         };
 
