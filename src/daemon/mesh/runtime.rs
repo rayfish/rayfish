@@ -1301,7 +1301,7 @@ impl Daemon {
     /// blocking on, which [`warm_exit_peer`](Self::warm_exit_peer) does.
     #[cfg(target_os = "macos")]
     fn nudge_all_peers(&self) {
-        let exit_ip = self.registry.exit_client.selection().map(|s| s.ipv4);
+        let exit_ip = self.registry.exit_client.selection().map(|s| s.ipv6);
         for (ip, conn) in self.registry.peers.all_connections() {
             if Some(ip) == exit_ip {
                 continue; // warmed synchronously below
@@ -1320,17 +1320,12 @@ impl Daemon {
         // the two ends settle on different connections: we send every exit packet
         // down ours while the gateway reads its own, and nothing crosses in either
         // direction. Same gate the on-demand data path and `ray ping` use.
-        if let Some(conn) = self.registry.peers.conn_for_ip(&sel.ipv4) {
+        if let Some(conn) = self.registry.peers.conn_for_ip(&sel.ipv6) {
             return Some(conn);
         }
-        // Dial only when there is no live connection. Dialing on top of one opens a
-        // *second* QUIC connection to the same peer, and with one reader per peer
-        // the two ends settle on different connections: we send every exit packet
-        // down ours while the gateway reads its own, and nothing crosses in either
-        // direction. Same gate the on-demand data path and `ray ping` use.
-        let target = self.registry.resolve_route(IpAddr::V4(sel.ipv4))?;
+        let target = self.registry.resolve_route(IpAddr::V6(sel.ipv6))?;
         self.registry.dial_target(&target).await;
-        self.registry.peers.conn_for_ip(&sel.ipv4)
+        self.registry.peers.conn_for_ip(&sel.ipv6)
     }
 
     /// Narrow underlay addresses to the families the tunnel actually captures.
