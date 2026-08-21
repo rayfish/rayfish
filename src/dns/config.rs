@@ -377,8 +377,8 @@ mod macos {
     use super::{DNS_DOMAIN, DnsConfigurator};
 
     const SC_DNS_KEY: &str = "State:/Network/Service/rayfish/DNS";
-    /// The IPv6 half of the same service. Written alongside the DNS key in
-    /// IPv6-only mode; see [`write_service_config`].
+    /// The IPv6 half of the same service, written alongside the DNS key; see
+    /// [`write_service_config`].
     const SC_IPV6_KEY: &str = "State:/Network/Service/rayfish/IPv6";
     /// The service itself, carrying only its rank. See [`write_service_config`].
     const SC_SERVICE_KEY: &str = "State:/Network/Service/rayfish";
@@ -1679,8 +1679,8 @@ async fn restore_file(path: &Path) -> Result<()> {
 /// the host's DNS with it.
 #[cfg(any(target_os = "linux", test))]
 fn strip_our_resolv_entries(contents: &str) -> String {
-    // Both families: a file written before a switch to (or from) IPv6-only mode
-    // names the other address, and leaving it behind would point the host at a
+    // Both families: a file written by a build that answered on the IPv4 magic
+    // address still names it, and leaving it behind would point the host at a
     // resolver that is no longer listening.
     let magic_v4 = crate::dns::MAGIC_DNS_V4.to_string();
     let magic_v6 = crate::dns::MAGIC_DNS_V6.to_string();
@@ -1952,6 +1952,51 @@ fn merge_search_domains(captured: &[SearchDomain], rayfish: &[SearchDomain]) -> 
 }
 
 #[cfg(target_os = "linux")]
+/// What quieting NetworkManager did to the upstreams we captured before it.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum NmQuietOutcome {
+    /// Everything we captured still answers.
+    Proceed,
+    /// Some died, or all of them did while the operator's own `dns_upstreams`
+    /// still give the forwarder somewhere to go. Not a black hole, so the
+    /// takeover stands; the dead entries are named because they stay in the
+    /// file we are about to write and cost a timeout each.
+    Degraded(Vec<Ipv4Addr>),
+    /// Nothing we captured answers any more and the operator named nothing.
+    /// Taking the file over now would own DNS for the host with no way to
+    /// resolve anything outside `.ray`.
+    Abort,
+}
+
+/// Classify the upstream set after [`nm_quiet_install`], given what it was before.
+///
+/// Split out from `apply` because the ordering it guards is not otherwise
+/// observable: the capture happens in `new`, the kill happens in `apply`, and
+/// between them sits an `ensure!` that reads a set which was true when it was
+/// taken. The operator's own `dns_upstreams` waives the abort for the same reason
+/// it waives the `ensure!`: the forwarder gets somewhere to send queries either way.
+#[cfg(any(target_os = "linux", test))]
+fn nm_quiet_outcome(
+    before: &[Ipv4Addr],
+    after: &[Ipv4Addr],
+    operator_upstreams: bool,
+) -> NmQuietOutcome {
+    if after.len() == before.len() {
+        return NmQuietOutcome::Proceed;
+    }
+    if after.is_empty() && !operator_upstreams {
+        return NmQuietOutcome::Abort;
+    }
+    NmQuietOutcome::Degraded(
+        before
+            .iter()
+            .filter(|ip| !after.contains(ip))
+            .copied()
+            .collect(),
+    )
+}
+
 #[async_trait]
 impl DnsConfigurator for DirectResolvConf {
     async fn apply(&self) -> Result<()> {
@@ -1993,6 +2038,36 @@ impl DnsConfigurator for DirectResolvConf {
         // Quiet NM first so it doesn't regenerate the file out from under the
         // write we're about to make (the inotify re-assert covers any residual).
         nm_quiet_install().await;
+        // The `ensure!` above can pass on the strength of a server we are about
+        // to kill. NetworkManager in `dns=dnsmasq` mode answers at a loopback
+        // address of its own and writes *that* into resolv.conf, and the
+        // `dns=none` drop-in just installed is precisely what stops it. The
+        // capture in `new` probed it while it was still alive, so re-probe now
+        // that it is not: this is the same black hole the guard exists to
+        // refuse, reached by ordering rather than by an empty capture.
+        match nm_quiet_outcome(
+            &self.captured_upstreams,
+            &crate::dns::resolver::live_upstreams(&self.captured_upstreams).await,
+            self.operator_upstreams,
+        ) {
+            NmQuietOutcome::Proceed => {}
+            NmQuietOutcome::Degraded(dead) => tracing::warn!(
+                ?dead,
+                "some DNS servers stopped answering once NetworkManager was quieted; \
+                 they stay in the file behind ours and will cost a timeout each"
+            ),
+            NmQuietOutcome::Abort => {
+                restore_file(path).await?;
+                nm_quiet_remove().await;
+                anyhow::bail!(
+                    "every DNS server /etc/resolv.conf named stopped answering once \
+                     NetworkManager was told to stop managing DNS (`dns=none`), which is how \
+                     its built-in resolver is run; taking the file over would leave this host \
+                     unable to resolve anything. Set `dns_upstreams` in the config to name a \
+                     server directly."
+                );
+            }
+        }
         let new_content = render_direct_resolv_conf(&self.search.load(), self.fallbacks());
         tokio::fs::write(path, new_content)
             .await
@@ -2065,11 +2140,11 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::{
-        MAX_NAMESERVERS, Reassert, SearchDomain, first_nameserver, foreign_mesh_resolver,
-        join_domains, merge_search_domains, nm_dns_none_dropin, other_overlay_resolver,
-        parse_resolv_nameservers, reassert_decision, render_direct_resolv_conf,
-        render_direct_resolv_conf_with, resolv_conf_is_ours, search_domains_for,
-        strip_our_resolv_entries,
+        MAX_NAMESERVERS, NmQuietOutcome, Reassert, SearchDomain, first_nameserver,
+        foreign_mesh_resolver, join_domains, merge_search_domains, nm_dns_none_dropin,
+        nm_quiet_outcome, other_overlay_resolver, parse_resolv_nameservers, reassert_decision,
+        render_direct_resolv_conf, render_direct_resolv_conf_with, resolv_conf_is_ours,
+        search_domains_for, strip_our_resolv_entries,
     };
 
     /// Domains as the host had them, i.e. read back from its own config.
@@ -2197,7 +2272,8 @@ mod tests {
     /// the file is ours precisely because we merged theirs into it.
     #[test]
     fn other_overlay_resolver_sees_through_our_own_marker() {
-        let merged = "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 100.100.100.100\n";
+        let merged =
+            "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 100.100.100.100\n";
         assert_eq!(foreign_mesh_resolver(merged), None);
         assert_eq!(
             other_overlay_resolver(merged),
@@ -2281,6 +2357,56 @@ mod tests {
         );
     }
 
+    /// NetworkManager in `dns=dnsmasq` mode is the case this exists for: it puts
+    /// its own loopback forwarder in `resolv.conf`, we capture it while it is
+    /// alive, and then `dns=none` stops it. The pre-quiet capture is not evidence
+    /// about the post-quiet host, and taking the file over on the strength of it
+    /// owns DNS for the machine with nothing behind us.
+    #[test]
+    fn quieting_networkmanager_can_invalidate_the_capture_that_allowed_the_takeover() {
+        let nm = "127.0.0.1".parse::<Ipv4Addr>().unwrap();
+        let router = "192.168.1.1".parse::<Ipv4Addr>().unwrap();
+
+        // The regression: NM's dnsmasq was the only thing we captured, and
+        // quieting NM killed it. Refuse, rather than install the black hole.
+        assert_eq!(
+            nm_quiet_outcome(&[nm], &[], false),
+            NmQuietOutcome::Abort,
+            "the last surviving upstream died with NM's dnsmasq"
+        );
+        // The operator named their own servers, so there is still somewhere to
+        // forward: the same waiver the `ensure!` gives. Still degraded, not
+        // clean -- the dead entry is in the file we are about to write.
+        assert_eq!(
+            nm_quiet_outcome(&[nm], &[], true),
+            NmQuietOutcome::Degraded(vec![nm])
+        );
+        // A real router alongside NM's forwarder: degraded, not fatal. The dead
+        // entry is named so it can be seen rather than silently costing timeouts.
+        assert_eq!(
+            nm_quiet_outcome(&[nm, router], &[router], false),
+            NmQuietOutcome::Degraded(vec![nm])
+        );
+        // Nothing died (NM absent, or not running a local forwarder).
+        assert_eq!(
+            nm_quiet_outcome(&[router], &[router], false),
+            NmQuietOutcome::Proceed
+        );
+        assert_eq!(nm_quiet_outcome(&[], &[], true), NmQuietOutcome::Proceed);
+    }
+
+    /// The scenario above is only reachable because a loopback nameserver is
+    /// captured like any other. If this ever starts filtering them, the guard
+    /// above becomes dead code rather than wrong.
+    #[test]
+    fn a_loopback_nameserver_is_captured_like_any_other() {
+        let c = "# Generated by NetworkManager\nnameserver 127.0.0.1\n";
+        assert_eq!(
+            parse_resolv_nameservers(c),
+            vec!["127.0.0.1".parse::<Ipv4Addr>().unwrap()]
+        );
+    }
+
     #[test]
     fn parse_resolv_nameservers_extracts_ipv4_excluding_magic() {
         let c = "# Generated by NetworkManager\nsearch home\nnameserver 192.168.1.1\nnameserver 8.8.8.8\nnameserver 200::53\n";
@@ -2325,8 +2451,7 @@ mod tests {
     fn strip_removes_either_magic_address() {
         let v6 = "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 9.9.9.9\n";
         assert_eq!(strip_our_resolv_entries(v6), "nameserver 9.9.9.9\n");
-        let v4 =
-            "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 9.9.9.9\n";
+        let v4 = "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 9.9.9.9\n";
         assert_eq!(strip_our_resolv_entries(v4), "nameserver 9.9.9.9\n");
     }
 
@@ -2336,7 +2461,8 @@ mod tests {
         // Verbatim from a host running direct mode. A revert with no backup used
         // to delete this file outright, leaving the machine with no resolver at
         // all; it must come back as the upstream it had before we prepended ours.
-        let ours = "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 108.61.10.10\n";
+        let ours =
+            "# Added by rayfish - do not edit\nnameserver 200::53\nnameserver 108.61.10.10\n";
         assert_eq!(strip_our_resolv_entries(ours), "nameserver 108.61.10.10\n");
     }
 
@@ -2461,5 +2587,4 @@ mod tests {
         assert!(out.contains("[main]"));
         assert!(out.contains("dns=none"));
     }
-
 }
