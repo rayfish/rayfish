@@ -323,6 +323,20 @@ pub fn search_domains_for(network_names: &[String]) -> Vec<SearchDomain> {
 /// domains by undoing the file: direct mode restores the backup, resolvconf
 /// withdraws the whole stanza.
 pub async fn clear_search_domains(tun_name: &str) {
+    // macOS clears by *removing* the keys, not by writing an empty search list.
+    // The only caller is `DnsService::revert`, which has already run the
+    // backend's own revert, and on macOS the sole way to set search domains is
+    // `write_dns_config`, which rewrites `ServerAddresses` and (while the tunnel
+    // flag is still up, which it is at this point in `deactivate`) the empty
+    // catch-all match domain. Routing a *clear* through the *set* path therefore
+    // re-armed the whole host's resolver, pointed at a `200::53` that stops
+    // answering the moment the TUN goes down.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = tun_name;
+        macos::remove_dns_config();
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Err(e) = set_manager_search_domains(&[], tun_name).await {
         tracing::warn!(error = %e, "failed to clear search domains");
     }
@@ -414,6 +428,17 @@ mod macos {
             .context("failed to create SCDynamicStore session")?;
         let _ = STORE.set(Mutex::new(SendSyncStore(store)));
         Ok(STORE.get().unwrap())
+    }
+
+    /// Drop every key this backend owns. Idempotent, and safe with no store.
+    pub fn remove_dns_config() {
+        if let Some(store) = STORE.get() {
+            let store = store.lock().unwrap();
+            store.0.remove(SC_DNS_KEY);
+            store.0.remove(SC_IPV6_KEY);
+            store.0.remove(SC_SERVICE_KEY);
+        }
+        tracing::info!("removed SCDynamicStore DNS configuration");
     }
 
     pub fn write_dns_config(search_domains: &[super::SearchDomain], tun_name: &str) -> Result<()> {
@@ -641,13 +666,7 @@ mod macos {
         }
 
         async fn revert(&self) -> Result<()> {
-            if let Some(store) = STORE.get() {
-                let store = store.lock().unwrap();
-                store.0.remove(SC_DNS_KEY);
-                store.0.remove(SC_IPV6_KEY);
-                store.0.remove(SC_SERVICE_KEY);
-            }
-            tracing::info!("removed SCDynamicStore DNS configuration");
+            remove_dns_config();
             Ok(())
         }
 
@@ -1351,6 +1370,7 @@ pub async fn run_resolv_reassert(
     // Re-assert immediately on entry: covers any trample between apply() and our
     // arrival. Thereafter a pass runs on a relevant inotify event or the tick.
     let mut check = true;
+    let mut next_tick = tokio::time::Instant::now() + REASSERT_TICK;
     loop {
         if check {
             match pass(&search, &fallbacks, merged_with).await {
@@ -1394,7 +1414,8 @@ pub async fn run_resolv_reassert(
                     None => { stream = None; false } // stream ended; rely on the tick
                 };
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            _ = tokio::time::sleep_until(next_tick) => {
+                next_tick = tokio::time::Instant::now() + REASSERT_TICK;
                 check = true;
                 // A VPN that leaves while we hold the file changes nothing about
                 // the file: it will not restore a backup over one it does not
@@ -1454,6 +1475,18 @@ pub enum Recapture {
 /// `.ray` resolves through the stub a minute late.
 #[cfg(target_os = "linux")]
 const MERGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often the re-assert pass runs regardless of inotify.
+///
+/// A *deadline*, not a delay: the `/etc` watch is broad (the name filter decides
+/// whether to re-assert, it does not stop the arm from completing), so a
+/// per-iteration `sleep` was restarted by every unrelated write under `/etc` and
+/// never elapsed on a busy host. That is the tick that probes the resolver we
+/// share the file with, so losing it means `SharedResolverGone` never fires and
+/// the daemon keeps declining off-mesh names while pointing the stub at an
+/// address that stopped answering.
+#[cfg(target_os = "linux")]
+const REASSERT_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One re-assert pass, reporting only the outcomes the loop acts on. Errors are
 /// logged and treated as "keep watching" (the next tick retries).
@@ -1764,7 +1797,10 @@ pub fn emergency_restore_resolv_conf() {}
 
 #[cfg(target_os = "linux")]
 struct DirectResolvConf {
-    captured_upstreams: Vec<Ipv4Addr>,
+    /// Swapped rather than owned so [`Self::apply`] can narrow it: quieting
+    /// NetworkManager can kill a server that answered at capture time, and both
+    /// the file we render and the forwarder we seed read this afterwards.
+    captured_upstreams: Arc<ArcSwap<Vec<Ipv4Addr>>>,
     /// The search domains the file already had. Kept separately from the live
     /// list so a later join/leave re-merges against the host's own domains
     /// instead of accumulating ours on top of the previous render.
@@ -1891,7 +1927,7 @@ impl DirectResolvConf {
             );
         }
         Self {
-            captured_upstreams: live,
+            captured_upstreams: Arc::new(ArcSwap::from_pointee(live)),
             search: Arc::new(ArcSwap::from_pointee(search.clone())),
             captured_search: search,
             operator_upstreams: crate::config::load()
@@ -1903,8 +1939,8 @@ impl DirectResolvConf {
 
     /// The upstream written into resolv.conf as the second nameserver, so the
     /// host keeps resolving if our resolver stops answering.
-    fn fallbacks(&self) -> &[Ipv4Addr] {
-        &self.captured_upstreams
+    fn fallbacks(&self) -> Vec<Ipv4Addr> {
+        self.captured_upstreams.load().as_ref().clone()
     }
 }
 
@@ -2025,7 +2061,7 @@ impl DnsConfigurator for DirectResolvConf {
         // working DNS and no Magic DNS is the better failure. Bail before
         // touching anything so there is nothing to undo.
         anyhow::ensure!(
-            !self.captured_upstreams.is_empty() || self.operator_upstreams,
+            !self.captured_upstreams.load().is_empty() || self.operator_upstreams,
             "no working DNS server found in /etc/resolv.conf, so taking it over would leave \
              this host unable to resolve anything; set `dns_upstreams` in the config to \
              name one explicitly"
@@ -2072,17 +2108,23 @@ impl DnsConfigurator for DirectResolvConf {
         // capture in `new` probed it while it was still alive, so re-probe now
         // that it is not: this is the same black hole the guard exists to
         // refuse, reached by ordering rather than by an empty capture.
-        match nm_quiet_outcome(
-            &self.captured_upstreams,
-            &crate::dns::resolver::live_upstreams(&self.captured_upstreams).await,
-            self.operator_upstreams,
-        ) {
+        let before = self.captured_upstreams.load().as_ref().clone();
+        let after = crate::dns::resolver::live_upstreams(&before).await;
+        match nm_quiet_outcome(&before, &after, self.operator_upstreams) {
             NmQuietOutcome::Proceed => {}
-            NmQuietOutcome::Degraded(dead) => tracing::warn!(
-                ?dead,
-                "some DNS servers stopped answering once NetworkManager was quieted; \
-                 they stay in the file behind ours and will cost a timeout each"
-            ),
+            // Narrowed, not just reported: this set is what `fallbacks` renders
+            // into the file and what `adopt_configurator` seeds the forwarder
+            // with, and a dead server in either costs a full lookup timeout per
+            // off-mesh name. The capture in `new` probed for exactly this reason;
+            // quieting NM is simply a second chance to be wrong.
+            NmQuietOutcome::Degraded(dead) => {
+                tracing::warn!(
+                    ?dead,
+                    "some DNS servers stopped answering once NetworkManager was quieted; \
+                     dropping them from the upstreams and from the file"
+                );
+                self.captured_upstreams.store(Arc::new(after));
+            }
             NmQuietOutcome::Abort => {
                 restore_file(path).await?;
                 nm_quiet_remove().await;
@@ -2098,12 +2140,12 @@ impl DnsConfigurator for DirectResolvConf {
                 );
             }
         }
-        let new_content = render_direct_resolv_conf(&self.search.load(), self.fallbacks());
+        let new_content = render_direct_resolv_conf(&self.search.load(), &self.fallbacks());
         tokio::fs::write(path, new_content)
             .await
             .context("writing /etc/resolv.conf")?;
         tracing::info!(
-            upstreams = ?self.captured_upstreams,
+            upstreams = ?self.captured_upstreams.load(),
             "configured /etc/resolv.conf directly (fallback); verified upstream resolvers"
         );
         Ok(())
@@ -2123,7 +2165,7 @@ impl DnsConfigurator for DirectResolvConf {
     }
 
     fn captured_upstreams(&self) -> Vec<Ipv4Addr> {
-        self.captured_upstreams.clone()
+        self.captured_upstreams.load().as_ref().clone()
     }
 
     /// We own the file, so the domains go in it. Nothing else would put them
@@ -2146,7 +2188,7 @@ impl DnsConfigurator for DirectResolvConf {
         }
         tokio::fs::write(
             path,
-            render_direct_resolv_conf(&self.search.load(), self.fallbacks()),
+            render_direct_resolv_conf(&self.search.load(), &self.fallbacks()),
         )
         .await
         .context("writing search domains to /etc/resolv.conf")
@@ -2157,7 +2199,7 @@ impl DnsConfigurator for DirectResolvConf {
     }
 
     fn fallback_upstreams(&self) -> Vec<Ipv4Addr> {
-        self.captured_upstreams.clone()
+        self.captured_upstreams.load().as_ref().clone()
     }
 
     fn shared_resolver(&self) -> Option<Ipv4Addr> {
@@ -2423,6 +2465,26 @@ mod tests {
             NmQuietOutcome::Proceed
         );
         assert_eq!(nm_quiet_outcome(&[], &[], true), NmQuietOutcome::Proceed);
+    }
+
+    /// `Degraded` is not just a warning: the surviving set is what gets rendered
+    /// into the file and seeded into the forwarder, and a dead entry in either
+    /// costs a full lookup timeout on every off-mesh name.
+    #[test]
+    fn a_degraded_verdict_names_exactly_the_servers_that_died() {
+        let nm = "127.0.0.1".parse::<Ipv4Addr>().unwrap();
+        let router = "192.168.1.1".parse::<Ipv4Addr>().unwrap();
+        let public = "9.9.9.9".parse::<Ipv4Addr>().unwrap();
+        // What survives is `after`, so the caller can store it directly; what is
+        // reported is the complement, so the operator can see what it cost.
+        assert_eq!(
+            nm_quiet_outcome(&[nm, router, public], &[router, public], false),
+            NmQuietOutcome::Degraded(vec![nm])
+        );
+        assert_eq!(
+            nm_quiet_outcome(&[nm, router, public], &[public], false),
+            NmQuietOutcome::Degraded(vec![nm, router])
+        );
     }
 
     /// The scenario above is only reachable because a loopback nameserver is
