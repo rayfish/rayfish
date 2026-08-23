@@ -79,15 +79,17 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     Ok(())
 }
 
-/// Read one global settings key from the daemon. Returns the rendered value; a
-/// daemon-side error ends the command.
-async fn config_row(key: NodeKey) -> Result<Option<String>> {
+/// Read one global settings key from the daemon. A daemon-side error ends the
+/// command, so there is no "no value" case left for the caller to handle: an
+/// absent row renders as the empty string, which is how every settings key
+/// spells unset.
+async fn config_row(key: NodeKey) -> Result<String> {
     let mut stream = ipc::connect().await?;
     ipc::send(&mut stream, ipc::IpcMessage::ConfigGet { key: Some(key) }).await?;
     match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::ConfigValues { rows } => Ok(Some(
-            rows.into_iter().next().map(|(_, v)| v).unwrap_or_default(),
-        )),
+        ipc::IpcMessage::ConfigValues { rows } => {
+            Ok(rows.into_iter().next().map(|(_, v)| v).unwrap_or_default())
+        }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
     }
@@ -119,12 +121,11 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 })
                 .await;
             }
-            if let Some(dir) = config_row(NodeKey::Global(GlobalKey::DownloadDir)).await? {
-                println!(
-                    "download-dir = {}",
-                    if dir.is_empty() { "<unset>" } else { &dir }
-                );
-            }
+            let dir = config_row(NodeKey::Global(GlobalKey::DownloadDir)).await?;
+            println!(
+                "download-dir = {}",
+                if dir.is_empty() { "<unset>" } else { &dir }
+            );
             return Ok(());
         }
         Some(FilesAction::DownloadUser { user, clear }) => {
@@ -146,12 +147,11 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 })
                 .await;
             }
-            if let Some(uid) = config_row(NodeKey::Global(GlobalKey::DownloadUser)).await? {
-                if uid.is_empty() {
-                    println!("download-user = <unset>");
-                } else {
-                    println!("download-user = uid {uid}");
-                }
+            let uid = config_row(NodeKey::Global(GlobalKey::DownloadUser)).await?;
+            if uid.is_empty() {
+                println!("download-user = <unset>");
+            } else {
+                println!("download-user = uid {uid}");
             }
             return Ok(());
         }
