@@ -555,11 +555,7 @@ impl NetworkRegistry {
                 if m.identity == me {
                     continue;
                 }
-                self.clone().spawn_reconnect(
-                    m.identity,
-                    derive_ipv6(&m.identity),
-                    vec![net.clone()],
-                );
+                self.clone().spawn_reconnect(m.identity, vec![net.clone()]);
             }
         }
 

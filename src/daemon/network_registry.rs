@@ -259,11 +259,8 @@ impl NetworkRegistry {
         // `dial_peer_once` stamps reachability (ok/fail) itself, so the timeout arm
         // is the only failure this path must record separately.
         let ok = !targets.is_empty()
-            && match tokio::time::timeout(
-                LAZY_DIAL_TIMEOUT,
-                self.dial_peer_once(id, target.ipv6, &targets),
-            )
-            .await
+            && match tokio::time::timeout(LAZY_DIAL_TIMEOUT, self.dial_peer_once(id, &targets))
+                .await
             {
                 Ok(established) => established,
                 Err(_elapsed) => {

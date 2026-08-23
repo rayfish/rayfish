@@ -94,8 +94,7 @@ impl NetworkRegistry {
             // above) is allowed to leave a peer disconnected. The idle timer will
             // close the healed link again if it stays quiet.
             if !reconnect_nets.is_empty() {
-                self.clone()
-                    .spawn_reconnect(ev.endpoint_id, ev.ipv6, reconnect_nets);
+                self.clone().spawn_reconnect(ev.endpoint_id, reconnect_nets);
             }
             return;
         }
@@ -118,7 +117,7 @@ impl NetworkRegistry {
             }
         }
 
-        self.spawn_reconnect(ev.endpoint_id, ev.ipv6, nets);
+        self.spawn_reconnect(ev.endpoint_id, nets);
     }
 
     /// Confirm a coordinator's `ControlMsg::KickedFromNetwork` against `network`'s
@@ -302,28 +301,22 @@ impl NetworkRegistry {
         // nullifier set + drop it from the roster), republish, and sever links.
         for (net, state, dht_notify, has_key) in nets {
             if has_key {
-                let member_ip = {
+                {
                     let mut s = state.write().unwrap();
                     s.nullifiers.insert(target);
-                    let ip = s
-                        .members
-                        .all()
-                        .iter()
-                        .find(|m| m.identity == target)
-                        .map(|m| derive_ipv6(&m.identity));
                     s.members.remove(&target);
                     s.approved.remove(&target);
-                    ip
-                };
-                if member_ip.is_some() {
-                    dns::remove_hostname_by_ip(
-                        &self.dns.hostname_table,
-                        &self.dns.reverse_table,
-                        &net,
-                        derive_ipv6(&target),
-                    )
-                    .await;
                 }
+                // Unconditional: the address derives from the identity, so there
+                // is nothing to look up first, and the prune is a `retain` that
+                // costs nothing when the name was never in the table.
+                dns::remove_hostname_by_ip(
+                    &self.dns.hostname_table,
+                    &self.dns.reverse_table,
+                    &net,
+                    derive_ipv6(&target),
+                )
+                .await;
                 update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
                 let net_pubkey = state.read().unwrap().network_public_key;
                 broadcast_member_sync(self, net_pubkey, &net, None).await;
@@ -349,9 +342,12 @@ impl NetworkRegistry {
     pub(crate) async fn dial_peer_once(
         self: &Arc<Self>,
         peer_id: EndpointId,
-        peer_ip: Ipv6Addr,
         targets: &[DialTarget],
     ) -> bool {
+        // Derived rather than passed: every caller had it from the same identity,
+        // and a parameter that can only ever hold one value is a parameter that
+        // can be handed the wrong one.
+        let peer_ip = derive_ipv6(&peer_id);
         let my_identity = self.transport.identity.local_identity();
         let device_cert = self.current_device_cert();
         let conn = match transport::connect_to_peer_with_alpn(
@@ -421,12 +417,7 @@ impl NetworkRegistry {
     /// peer per network and drives the new connection's control demux. Also used
     /// by cold restore (coordinator offline at boot) to dial members from the
     /// verified blob before any live connection exists.
-    pub(crate) fn spawn_reconnect(
-        self: Arc<Self>,
-        peer_id: EndpointId,
-        peer_ip: Ipv6Addr,
-        nets: Vec<SmolStr>,
-    ) {
+    pub(crate) fn spawn_reconnect(self: Arc<Self>, peer_id: EndpointId, nets: Vec<SmolStr>) {
         // Networks to re-handshake: those we haven't pruned this peer from
         // (kick/departure records a one-shot suppression here).
         let mut candidate_nets: Vec<SmolStr> = Vec::new();
@@ -487,7 +478,7 @@ impl NetworkRegistry {
                         continue;
                     }
 
-                    if this.dial_peer_once(peer_id, peer_ip, &targets).await {
+                    if this.dial_peer_once(peer_id, &targets).await {
                         return;
                     }
                     // Dial failed; back off and retry.
@@ -662,7 +653,9 @@ pub(crate) fn spawn_stale_member_pruner(
                 .into_iter()
                 .map(|(eid, _, _)| eid)
                 .collect();
-            let victims: Vec<(EndpointId, Ipv6Addr)> = {
+            // Identities alone: the address they are pruned at derives from each
+            // one, so carrying it alongside would be two names for the same fact.
+            let victims: Vec<EndpointId> = {
                 let s = state.read().unwrap();
                 s.members
                     .all()
@@ -676,18 +669,17 @@ pub(crate) fn spawn_stale_member_pruner(
                             now,
                         )
                     })
-                    .map(|m| (m.identity, derive_ipv6(&m.identity)))
+                    .map(|m| m.identity)
                     .collect()
             };
             if victims.is_empty() {
                 continue;
             }
-            for (id, _) in &victims {
+            for id in &victims {
                 remove_member_roster_only(&ctx, &network, &state, *id, derive_ipv6(id)).await;
                 tracing::info!(peer = %id.fmt_short(), network = %network, ttl_secs = ttl, "auto-kicked stale member (ephemeral TTL)");
             }
-            let ids: Vec<EndpointId> = victims.iter().map(|(id, _)| *id).collect();
-            finalize_removal(&ctx, &network, &state, &dht_notify, &ids).await;
+            finalize_removal(&ctx, &network, &state, &dht_notify, &victims).await;
         }
     })
 }
