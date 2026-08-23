@@ -25,6 +25,9 @@ apk:
     cd android && ./gradlew :app:assembleDebug
     @echo "APK: android/app/build/outputs/apk/debug/app-debug.apk"
 
+# The sibling repos in this tree name this recipe `android`, so accept both.
+alias android := apk
+
 # Compile the Android core for both APK ABIs without an NDK on this machine:
 # cross builds it in a container (see cross/Dockerfile.android). Catches the
 # `#[cfg(target_os = "android")]` code that no desktop build ever sees. `just
