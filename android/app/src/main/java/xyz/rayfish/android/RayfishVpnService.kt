@@ -877,14 +877,12 @@ class RayfishVpnService : VpnService() {
      */
     private fun startForegroundNotification(standby: Boolean = false): Boolean {
         val nm = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "Rayfish VPN",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply { description = "Rayfish mesh tunnel status" }
-            nm.createNotificationChannel(channel)
-        }
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "Rayfish VPN",
+            NotificationManager.IMPORTANCE_LOW,
+        ).apply { description = "Rayfish mesh tunnel status" }
+        nm.createNotificationChannel(channel)
 
         val openIntent = PendingIntent.getActivity(
             this,
