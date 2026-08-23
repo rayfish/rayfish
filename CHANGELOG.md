@@ -601,7 +601,7 @@ this build cannot be redeemed by a peer still on 0.2.x.
   the leftover network fixed it instantly. Traffic is now attributed to a
   network the peer agrees you share, and the log names the one that fell away.
 
-- **`.ray` names now resolve on macOS in IPv6-only mode.** `ssh dev.box.ray`
+- **`.ray` names now resolve on macOS in IPv6-only mode.** `ssh <host>.<net>.ray`
   failed with "nodename nor servname provided" on a Mac sharing the host with
   another VPN, while `dig` against the same resolver answered instantly: macOS
   was never asking us for AAAA records, and AAAA is the only answer that mode
