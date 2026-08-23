@@ -14,6 +14,8 @@
 #   reliability   4-peer full-mesh packet-loss test (ping + iperf3 UDP) (tests/e2e/reliability)
 #   restore-offline 3-peer member-restore-with-coordinator-offline test (tests/e2e/restore-offline)
 #   unpair        3-peer `ray unpair` device-cert revocation test (tests/e2e/unpair)
+#   churn         4-peer churn test: repeated flap, kick + nuke delivered while a
+#                 member is offline, health sweep (tests/e2e/churn)
 #   exit-node     3-peer internet-gateway test: forwarding/NAT, full-tunnel egress,
 #                 SO_MARK loop prevention, deny path (tests/e2e/exit-node)
 #   bench         throughput / latency benchmark        (tests/bench)
@@ -45,7 +47,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # variable would silently drop back to digitalocean halfway through.
 export E2E_BACKEND="${E2E_BACKEND:-digitalocean}"
 
-usage(){ sed -n '2,33p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
+usage(){ sed -n '2,35p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-0}"; }
 
 # Scenarios the docker backend cannot run faithfully (see tests/e2e/README.md).
 DOCKER_UNSUPPORTED=(exit-node reliability bench)
@@ -91,6 +93,9 @@ scenario_meta(){
     unpair)      DIR="$ROOT/tests/e2e/unpair"
                  NAMES=(rayfish-unpair-a rayfish-unpair-b rayfish-unpair-c)
                  LABELS=(srv-a srv-b srv-c) ;;
+    churn)       DIR="$ROOT/tests/e2e/churn"
+                 NAMES=(rayfish-churn-a rayfish-churn-b rayfish-churn-c rayfish-churn-d)
+                 LABELS=(srv-a srv-b srv-c srv-d) ;;
     exit-node)   DIR="$ROOT/tests/e2e/exit-node"
                  NAMES=(rayfish-exit-a rayfish-exit-b rayfish-exit-c)
                  LABELS=(srv-a srv-b srv-c) ;;
@@ -109,7 +114,7 @@ case "$scenario" in -h|--help|help|"") usage 0 ;; esac
 # dispatcher per scenario (provision-if-needed + run, then teardown). Prints a
 # pass/fail summary and exits non-zero if any scenario failed.
 if [[ "$scenario" == all ]]; then
-  all_scenarios=(device-cert connect firewall closed-net apply dns ssh reliability restore-offline unpair exit-node)
+  all_scenarios=(device-cert connect firewall closed-net apply dns ssh reliability restore-offline unpair churn exit-node)
   passed=(); failed=(); skipped=()
   hint="check 'doctl compute droplet list'"
   [[ "$E2E_BACKEND" == "docker" ]] && hint="check 'docker ps -a'"

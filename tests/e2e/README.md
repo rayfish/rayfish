@@ -19,7 +19,12 @@ DigitalOcean droplets (the default) and local Docker containers
 | [`closed-net/`](closed-net) | 3 | Closed-net admission + lifecycle commands: live approval (`requests`/`accept`/`deny`), co-coordinator (`admin add`) gatekeeper resilience with a reusable key, `ray hostname` + magic-DNS, `ray leave`/`nuke`, and a `ray apply` smoke. |
 | [`apply/`](apply) | 3 | Declarative `ray apply` deploy end to end: create-if-absent + membership-gap diff, `--invite-missing`, `ray identityof`, alias/group expansion (`--dry-run`), real suggestion publish + data-plane enforcement, and `--prune`. |
 | [`dns/`](dns) | 2 | Magic DNS resolution over a real TUN: `<host>.<net>.ray` resolves via the system resolver, drives reachability, no host `:53` bind, non-`.ray` passthrough, and `ray down` revert. |
+| [`ssh/`](ssh) | 2 | Mesh SSH (`ray firewall ssh`): the allow/deny matrix over the TUN, so an SSH grant is a firewall rule and not a separate door. |
 | [`reliability/`](reliability) | 4 | Full-mesh packet-loss test: every pair probed both ways with `ping -c 1000 -i 0.01`, ICMP flood, and iperf3 UDP, over the rayfish tunnel vs the direct public-IP baseline. Fails when rayfish adds loss over the raw link. |
+| [`restore-offline/`](restore-offline) | 3 | A member whose daemon restarts while its coordinator is offline keeps the network and re-meshes with the *other* member, rather than dropping the network until the coordinator returns. |
+| [`unpair/`](unpair) | 3 | `ray unpair` revokes a device cert: the nullifier rides the signed blob, a third peer drops the unpaired device, and the device cannot re-join. |
+| [`churn/`](churn) | 4 | Lifecycle events under churn: repeated hard flap, simultaneous flap, `ray down`/`up` cycles, and a `kick`/`nuke` delivered while a member is offline (which must still converge from the signed blob). Ends with a no-panic/no-crash-restart sweep. |
+| [`exit-node/`](exit-node) | 3 | The internet-gateway path: `allow`/`use` forwarding + NAT, full-tunnel egress, `SO_MARK` loop prevention, the IPv6-only tunnel gate, and the deny path. |
 
 Everything runs through one dispatcher, [`../e2e.sh`](../e2e.sh):
 
@@ -30,7 +35,8 @@ tests/e2e.sh <scenario> teardown    # destroy the instances (manual)
 ```
 
 where `<scenario>` is `device-cert`, `connect`, `firewall`, `closed-net`,
-`apply`, `dns`, `reliability`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
+`apply`, `dns`, `ssh`, `reliability`, `restore-offline`, `unpair`, `churn`,
+`exit-node`, `all`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
 (still runnable directly once `.servers` exists); the fleet definitions and the
 provision/teardown/assert bodies are shared in [`../lib/`](../lib).
 
