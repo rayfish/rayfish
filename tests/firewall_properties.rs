@@ -51,8 +51,8 @@ proptest! {
         assert_info_eq(&info, &spec.expected())?;
     }
 
-    /// An extension-header chain is transparent: the parser walks it and reports
-    /// the same protocol, ports and flags it would have without one.
+    /// A fragment-free extension-header chain is transparent: the parser walks it
+    /// and reports the same protocol, ports and flags it would have without one.
     ///
     /// This is the property the conntrack key depends on. Reading byte 6 as the
     /// protocol instead made every chained packet `(44, 0, 0)`, a single wildcard
@@ -70,31 +70,36 @@ proptest! {
         assert_info_eq(&info, &spec.expected())?;
     }
 
-    /// A non-first fragment is the one case that stays refused: the L4 header is
-    /// in a different packet, so there are no ports to key on and guessing zero
-    /// is what rebuilt the wildcard entry. The first fragment of the same
-    /// datagram does carry them and must still parse.
+    /// A fragment is refused at every offset, including the first, and wherever
+    /// in the chain it sits.
+    ///
+    /// The later ones have no ports to read, and guessing zero is what rebuilt
+    /// the wildcard entry. The first one does carry them, but the datagram it
+    /// starts cannot be delivered while its siblings are refused, so classifying
+    /// it only earns the right to put an uncompletable packet on the wire and
+    /// open a conntrack entry for it.
     #[test]
-    fn a_non_first_ipv6_fragment_is_refused(
+    fn a_fragmented_packet_is_refused(
         spec in packet_spec(),
-        offset in 1u16..8192,
+        links in common::ext_chain_strategy(),
+        at in 0usize..4,
+        offset in 0u16..8192,
     ) {
-        const FRAGMENT: u8 = 44;
-        let Some(first) = spec.encode_behind(&[FRAGMENT]) else {
+        let mut chain = links;
+        let at = at.min(chain.len());
+        chain.insert(at, common::IPV6_FRAGMENT);
+        let Some(mut pkt) = spec.encode_behind(&chain) else {
             return Ok(());
         };
+        // Every link this strategy emits is 8 octets, so the fragment header's
+        // own offset field is at 40 + 8*at, plus 2 for the offset/flags word.
+        let fo = 40 + 8 * at + 2;
+        pkt[fo..fo + 2].copy_from_slice(&(offset << 3).to_be_bytes());
         prop_assert!(
-            parse_packet_info(&first).is_some(),
-            "the first fragment carries the L4 header",
-        );
-
-        // The fragment offset is the top 13 bits of the 16 at 42.
-        let mut later = first;
-        later[42..44].copy_from_slice(&(offset << 3).to_be_bytes());
-        prop_assert!(
-            parse_packet_info(&later).is_none(),
-            "a fragment at offset {} has no ports to read",
+            parse_packet_info(&pkt).is_none(),
+            "a fragment at offset {} in chain position {} must be refused",
             offset,
+            at,
         );
     }
 

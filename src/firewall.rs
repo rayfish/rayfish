@@ -672,7 +672,8 @@ fn parse_ipv4(packet: &[u8]) -> Option<PacketInfo> {
 /// the 1280 MTU) then held a 30-second hole through which that peer could reach
 /// any local port, which is the inbound default-deny gone.
 ///
-/// [`ipv6_upper_layer`] walks past them to the header that really is the protocol.
+/// [`ipv6_upper_layer`] walks past them to the header that really is the protocol,
+/// except the fragment header, which it refuses outright: see its doc comment.
 /// The list stays public because it is what tells a caller which values are chain
 /// links rather than protocols, which the property tests generate against.
 pub const IPV6_EXTENSION_HEADERS: [u8; 8] = [0, 43, 44, 51, 60, 135, 139, 140];
@@ -694,11 +695,14 @@ const IPV6_FRAGMENT: u8 = 44;
 /// `None` when the packet carries no upper-layer header this can read, which is
 /// the case that must stay refused rather than guessed at:
 ///
-/// - a **non-first fragment**, where the L4 header is in a different packet
-///   entirely. It cannot be classified here, and a fragmented datagram therefore
-///   still does not cross the mesh; what changes is that the *first* fragment is
-///   now keyed on its real protocol and ports instead of collapsing into the
-///   wildcard entry described on [`IPV6_EXTENSION_HEADERS`].
+/// - **any fragment**, first or not. A non-first one has its L4 header in a
+///   different packet and cannot be classified at all. The first one can be, but
+///   classifying it only earns the right to forward a fragment whose siblings are
+///   refused: the peer holds an incomplete reassembly until it times out, and on
+///   the outbound side we would have put a datagram on the wire that can never
+///   complete while opening a conntrack entry for it. Refusing the whole datagram
+///   is what the mesh already promises (lower the application's datagram size, or
+///   let TCP handle it), so the promise is kept here rather than half-kept.
 /// - a truncated chain, or one longer than `MAX_HEADERS`. Eight is already more
 ///   than RFC 8200 §4.1's recommended order allows; a chain longer than that is a
 ///   crafted packet, not traffic.
@@ -713,16 +717,11 @@ fn ipv6_upper_layer(packet: &[u8]) -> Option<(u8, usize)> {
     let mut off = 40;
     for _ in 0..MAX_HEADERS {
         let len = match next {
-            IPV6_FRAGMENT => {
-                // The fragment offset is the top 13 bits of the 16 at `off + 2`.
-                // Non-zero means the L4 header sits in the first fragment, so
-                // there is nothing in *this* packet to classify.
-                let fo = u16::from_be_bytes([*packet.get(off + 2)?, *packet.get(off + 3)?]) >> 3;
-                if fo != 0 {
-                    return None;
-                }
-                8
-            }
+            // Refused whatever the fragment offset says: see the doc comment.
+            // Reading the offset to let the first one through classified an
+            // otherwise-undeliverable packet, since every other fragment of the
+            // same datagram is refused either way.
+            IPV6_FRAGMENT => return None,
             // The one header measured in 4-octet units, and minus 2 rather than
             // plus 1 (RFC 4302 §2.2). Getting this wrong walks into the middle of
             // the payload, so it is pinned by a test.
@@ -1169,21 +1168,51 @@ mod tests {
         );
     }
 
-    /// The case that stays refused, and the one that no longer is.
+    /// A TLV link is not always 8 octets, and every other test here happens to
+    /// use one that is.
     ///
-    /// A non-first fragment carries no L4 header at all, so it cannot be keyed and
-    /// must not be guessed at. The *first* fragment does carry one, and reading it
-    /// is what stops every fragment from collapsing into the one wildcard entry.
+    /// `hdr_ext_len` counts 8-octet units *after* the first 8, so it is zero on
+    /// the minimum-size header a fixture reaches for by default. Treating the
+    /// length as the constant 8 therefore passes every one of those and still
+    /// reads the ports out of the middle of a hop-by-hop header carrying a single
+    /// option, which is ordinary traffic (a jumbogram, an MLD router alert).
     #[test]
-    fn a_first_fragment_is_classified_and_a_later_one_is_refused() {
+    fn a_tlv_links_length_is_read_and_not_assumed() {
+        // Hop-by-hop with `hdr_ext_len` 2, so (2 + 1) * 8 = 24 octets and TCP
+        // starts at 64. Assuming 8 would look at 48, inside the option data.
+        let pkt = ipv6_tcp(&[(0u8, 2u8)], 64);
+        assert_eq!(
+            parse_packet_info(&pkt).map(|i| (i.protocol, i.dst_port)),
+            Some((6, 443))
+        );
+
+        // The same, one link further in: a destination-options header behind it,
+        // so a chain of two differently-sized TLVs has to be walked, not counted.
+        let pkt = ipv6_tcp(&[(0u8, 2u8), (60u8, 1u8)], 80);
+        assert_eq!(
+            parse_packet_info(&pkt).map(|i| (i.protocol, i.dst_port)),
+            Some((6, 443))
+        );
+    }
+
+    /// Every fragment is refused, whichever end of the datagram it is.
+    ///
+    /// The later ones have to be: they carry no L4 header, so keying them meant
+    /// inventing `(44, 0, 0)`, which is the wildcard this whole walk exists to
+    /// stop. The first one is refused for a different reason. It *can* be
+    /// classified, but the only thing that buys is permission to forward one
+    /// fragment of a datagram whose remaining fragments are dropped: the peer
+    /// holds an incomplete reassembly until it times out, and outbound we would
+    /// have opened a conntrack entry for a datagram that can never complete.
+    #[test]
+    fn every_fragment_of_a_datagram_is_refused() {
         // Fragment header (8 octets), then TCP at 48. Offset 0, more-fragments
         // set: the first fragment of a large datagram.
         let mut first = ipv6_tcp(&[(IPV6_FRAGMENT, 0u8)], 48);
         first[42..44].copy_from_slice(&1u16.to_be_bytes()); // offset 0, M = 1
-        assert_eq!(
-            parse_packet_info(&first).map(|i| (i.protocol, i.dst_port)),
-            Some((6, 443)),
-            "the first fragment holds the L4 header, so it keys on its real ports"
+        assert!(
+            parse_packet_info(&first).is_none(),
+            "a first fragment is deliverable only if its siblings are, and they are not"
         );
 
         // The same datagram's second fragment: offset 185 (1480 octets in).
@@ -1192,6 +1221,14 @@ mod tests {
         assert!(
             parse_packet_info(&later).is_none(),
             "a non-first fragment has no ports to read, so it cannot be classified"
+        );
+
+        // The same packet without the fragment header still parses: it is the
+        // fragmentation that is refused, not the traffic.
+        let whole = ipv6_tcp(&[], 40);
+        assert_eq!(
+            parse_packet_info(&whole).map(|i| (i.protocol, i.dst_port)),
+            Some((6, 443))
         );
     }
 
@@ -1228,13 +1265,24 @@ mod tests {
         // The default inbound policy is what such a packet now meets instead.
         assert_eq!(fw.evaluate(Direction::In, 6, 22, &peer), Action::Deny);
 
-        // And the first fragment, which *is* classifiable, keys on its own port
-        // rather than on a wildcard: a flow opened to :443 does not admit :22.
+        // Nor does the first fragment open one. It could be classified, but the
+        // datagram behind it cannot be delivered, so forwarding it would open a
+        // conntrack entry on the strength of a send that never completes.
         let mut first = ipv6_tcp(&[(IPV6_FRAGMENT, 0u8)], 48);
         first[42..44].copy_from_slice(&1u16.to_be_bytes());
         first[8..24].copy_from_slice(&us);
         first[24..40].copy_from_slice(&them);
-        let info = parse_packet_info(&first).expect("a first fragment is classifiable");
+        assert!(
+            parse_packet_info(&first).is_none(),
+            "a first fragment opens no flow either"
+        );
+
+        // The same send under the MTU is unaffected: it is fragmentation that is
+        // refused, and it keys on its own port, so a flow to :443 never admits :22.
+        let mut whole = ipv6_tcp(&[], 40);
+        whole[8..24].copy_from_slice(&us);
+        whole[24..40].copy_from_slice(&them);
+        let info = parse_packet_info(&whole).expect("an unfragmented send is classifiable");
         assert_eq!((info.protocol, info.dst_port), (6, 443));
     }
 

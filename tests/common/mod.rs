@@ -289,12 +289,22 @@ pub fn packet_spec() -> impl Strategy<Value = PacketSpec> {
         )
 }
 
+/// The fragment header, which the parser refuses rather than walks.
+pub const IPV6_FRAGMENT: u8 = 44;
+
 /// One to three extension-header kinds, for [`PacketSpec::encode_behind`].
+///
+/// Fragment-free: a chain carrying one is refused whatever else is in it, so it
+/// has no transparency to assert. `a_fragmented_packet_is_refused` covers that
+/// half, generating the fragment's position within the chain rather than
+/// leaving it to chance here.
 pub fn ext_chain_strategy() -> impl Strategy<Value = Vec<u8>> {
-    prop::collection::vec(
-        prop::sample::select(&rayfish::firewall::IPV6_EXTENSION_HEADERS[..]),
-        1..=3,
-    )
+    let walkable: Vec<u8> = rayfish::firewall::IPV6_EXTENSION_HEADERS
+        .iter()
+        .copied()
+        .filter(|h| *h != IPV6_FRAGMENT)
+        .collect();
+    prop::collection::vec(prop::sample::select(walkable), 1..=3)
 }
 
 // ---------------------------------------------------------------------------

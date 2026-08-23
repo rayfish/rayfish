@@ -30,3 +30,6 @@ secrets/
 # Android Studio / IntelliJ project settings
 android/.idea/
 *.iml
+
+# proptest failure seeds: generated locally, none are tracked here
+*.proptest-regressions
