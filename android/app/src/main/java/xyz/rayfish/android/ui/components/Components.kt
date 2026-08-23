@@ -86,9 +86,15 @@ fun KeyValueRow(key: String, value: String, onClick: (() -> Unit)? = null) {
     Row(rowMod, verticalAlignment = Alignment.CenterVertically) {
         Text(key, fontFamily = Chakra, fontSize = 12.sp, color = Rf.Muted)
         Spacer(Modifier.width(12.dp))
+        // Two lines, not one. The only address a node has now is a full mesh
+        // IPv6, up to 39 characters of mono at 12sp, which does not fit beside a
+        // label on a phone: at one line it ellipsised in the middle, so the row
+        // showed an address nobody could read or check against `ray status`.
+        // Wrapping costs a line on the few rows that need it; truncating cost
+        // the value itself.
         Text(
             value, fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Body,
-            maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.End,
+            maxLines = 2, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.End,
             modifier = Modifier.weight(1f),
         )
         if (onClick != null) {
@@ -201,48 +207,6 @@ fun ToggleCard(title: String, subtitle: String, checked: Boolean, onCheckedChang
     }
 }
 
-/**
- * [ToggleCard] for a setting with more than two states: same title/subtitle, a
- * row of choices underneath instead of a Switch. The subtitle carries what the
- * selected option currently means, which for a state like "auto" is the only
- * place the resolved answer can be shown.
- */
-@Composable
-fun <T> SegmentedCard(
-    title: String,
-    subtitle: String,
-    options: List<Pair<T, String>>,
-    selected: T,
-    onSelect: (T) -> Unit,
-) {
-    SectionCard {
-        Column(Modifier.fillMaxWidth()) {
-            Text(title, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading)
-            Text(subtitle, fontFamily = PlexMono, fontSize = 10.sp, color = Rf.Muted, modifier = Modifier.padding(top = 3.dp))
-            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(top = 10.dp)) {
-                options.forEachIndexed { index, (value, label) ->
-                    SegmentedButton(
-                        selected = value == selected,
-                        onClick = { onSelect(value) },
-                        shape = SegmentedButtonDefaults.itemShape(index = index, count = options.size),
-                        colors = SegmentedButtonDefaults.colors(
-                            activeContainerColor = Rf.Emerald,
-                            activeContentColor = Color.White,
-                            activeBorderColor = Rf.CardBorder,
-                            inactiveContainerColor = Color.Transparent,
-                            inactiveContentColor = Rf.Body,
-                            inactiveBorderColor = Rf.CardBorder,
-                        ),
-                        icon = {},
-                    ) {
-                        Text(label, fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
-                    }
-                }
-            }
-        }
-    }
-}
-
 data class MenuItem(val label: String, val destructive: Boolean = false, val onClick: () -> Unit)
 
 @Composable
@@ -277,8 +241,8 @@ private fun ComponentsPreview() {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             BrandHeader()
             StatusEyebrow(connected = true, text = "Connected · 3 networks")
-            ToggleCard("Tunnel", "running · 100.88.0.3", checked = true, onCheckedChange = {})
-            SectionCard { SectionLabel("Status"); KeyValueRow("IPv4", "100.88.0.3") }
+            ToggleCard("Tunnel", "running · 3 networks", checked = true, onCheckedChange = {})
+            SectionCard { SectionLabel("Status"); KeyValueRow("IPv6", "2a1:4f0c:9b3e:7d21:5c68:e04a:12bf:9d") }
             PillButton("Create network", onClick = {}, modifier = Modifier.fillMaxWidth())
             OutlinePillButton("Join", onClick = {}, modifier = Modifier.fillMaxWidth())
         }

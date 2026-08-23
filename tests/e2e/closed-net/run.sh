@@ -110,7 +110,7 @@ on "$A" 'ray up' >/dev/null 2>&1 || true     # bring the coordinator back
 step "6. hostname change propagates to roster + magic DNS"
 on "$B" "ray hostname $NET srv-bb" 2>&1 | strip | sed 's/^/   b| /'
 # srv-a learns the new name on reconverge (MemberSync trigger or 60s poller).
-if retry_until 90 "[[ -n \"\$(peer_ip4 '$A' srv-bb '$NET')\" ]]"; then
+if retry_until 90 "[[ -n \"\$(peer_ip '$A' srv-bb '$NET')\" ]]"; then
   pass "rename propagated — srv-a's roster shows srv-bb"
 else
   fail "rename did not propagate to srv-a's roster"
@@ -120,7 +120,7 @@ fi
 if retry_until 60 "[[ \"\$(on '$C' 'ping -c1 -W2 srv-bb.$NET.ray >/dev/null 2>&1 && echo ok || echo no')\" == ok ]]"; then
   pass "srv-bb.$NET.ray resolves + answers from srv-c"
 else
-  fail "srv-bb.$NET.ray did not resolve/answer from srv-c (ip=$(peer_ip4 "$C" srv-bb "$NET" 2>/dev/null))"
+  fail "srv-bb.$NET.ray did not resolve/answer from srv-c (ip=$(peer_ip "$C" srv-bb "$NET" 2>/dev/null))"
 fi
 
 # ---------------------------------------------------------------------------

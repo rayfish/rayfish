@@ -571,10 +571,10 @@
           return `<div class="peer-row">
             <span class="dot ${kind}"></span>
             <span class="host">${esc(p.hostname || "?")}${tags.map(x => `<span class="tag">${x}</span>`).join("")}</span>
-            <span class="ip" data-copy="${esc(p.ip || "")}" title="Copy IP">${esc(p.ip || "")}</span>
+            <span class="ip" data-copy="${esc(p.ipv6 || "")}" title="Copy IP">${esc(p.ipv6 || "")}</span>
             <span class="conn ${kind}">${esc(connText)}</span>
             <span class="acts">
-              <button class="small" data-ping="${esc(p.hostname || p.ip || "")}">ping</button>
+              <button class="small" data-ping="${esc(p.hostname || p.ipv6 || "")}">ping</button>
               ${isCoord && !p.is_own_device ? `<button class="small danger" data-kick="${esc(p.hostname || "")}" data-net="${esc(n.name)}">kick</button>` : ""}
             </span>
           </div>`;
@@ -583,7 +583,7 @@
           <div class="net-head">
             <strong>${esc(n.name)}</strong>
             <span class="role ${isCoord ? "coordinator" : ""}">${esc(role)}</span>
-            <span class="self">you: ${esc(n.my_hostname || "?")} · <span class="copyable" data-copy="${esc(n.my_ip || "")}" title="Copy IP">${esc(n.my_ip || "")}</span> · ${n.member_count ?? "?"} members</span>
+            <span class="self">you: ${esc(n.my_hostname || "?")} · <span class="copyable" data-copy="${esc(n.my_ipv6 || "")}" title="Copy IP">${esc(n.my_ipv6 || "")}</span> · ${n.member_count ?? "?"} members</span>
             <span class="net-actions">
               ${shareRuleIndex(n.name) >= 0
                 ? `<button class="small on" data-share="${esc(n.name)}" title="Peers can reach every TCP service on this machine. Click to stop sharing.">Sharing services</button>`

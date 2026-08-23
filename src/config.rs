@@ -14,8 +14,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::membership::GroupMode;
 
-/// The `ipv6-only` tri-state, also the shape `ray status` reports it in.
-pub use ray_proto::Ipv6Only;
 /// Per-network transport preference. Defined in `ray-proto` (shared with GUI
 /// frontends); re-exported here so existing `crate::config::TransportMode` paths work.
 pub use ray_proto::TransportMode;
@@ -69,7 +67,6 @@ mod option_secret_key_hex {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberEntry {
     pub identity: EndpointId,
-    pub ip: Ipv4Addr,
     #[serde(default)]
     pub is_coordinator: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,7 +77,6 @@ pub struct MemberEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovedConfigEntry {
     pub identity: EndpointId,
-    pub ip: Ipv4Addr,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
 }
@@ -96,8 +92,6 @@ pub struct NetworkConfig {
     /// Membership mode: open or restricted.
     #[serde(default)]
     pub group_mode: GroupMode,
-    /// Our assigned IP in this network (None if coordinator, Some if member).
-    pub my_ip: Option<Ipv4Addr>,
     /// Our hostname in this network (persisted so it survives daemon restarts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub my_hostname: Option<String>,
@@ -346,7 +340,6 @@ pub(crate) fn empty_network_config(name: &str) -> NetworkConfig {
     NetworkConfig {
         name: name.to_string(),
         group_mode: GroupMode::Open,
-        my_ip: None,
         my_hostname: None,
         pending_hostname: None,
         members: vec![],
@@ -455,22 +448,6 @@ pub struct AppConfig {
     /// it off (`ray config set on-demand off`) to stay eagerly connected.
     #[serde(default = "default_true")]
     pub on_demand: bool,
-    /// IPv6-only data plane, for hosts that share the box with another VPN
-    /// claiming `100.64.0.0/10` (Tailscale). The `/10` connected route is not
-    /// installed, mesh IPv4 carries no traffic, and the responder answers AAAA
-    /// only. The TUN keeps its own derived IPv4 as a `/32`, not for Magic DNS
-    /// (that moves to [`crate::dns::MAGIC_DNS_V6`]) but because the address is
-    /// still this node's internal handle: peer table, roster, and `ray status`
-    /// all key on it. Read once at daemon start (the TUN is built there), so a
-    /// change needs a restart.
-    ///
-    /// [`Ipv6Only::Auto`] (the key absent, the default) starts the daemon in
-    /// this mode when the startup scan finds another VPN already on
-    /// `100.64.0.0/10`. An auto decision is never written back, so the mode
-    /// follows the host and stops when the other VPN does; [`Ipv6Only::Off`] is
-    /// a standing instruction to refuse to start on such a host instead.
-    #[serde(default, skip_serializing_if = "Ipv6Only::is_auto")]
-    pub ipv6_only: Ipv6Only,
     /// Seconds of no traffic before an on-demand node closes a peer connection.
     /// `None` uses [`DEFAULT_IDLE_TIMEOUT_SECS`]. Only consulted when `on_demand`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -529,7 +506,6 @@ impl Default for AppConfig {
             dns_upstreams: ServerOverride::default(),
             ssh_enabled: false,
             on_demand: true,
-            ipv6_only: Ipv6Only::default(),
             idle_timeout_secs: None,
             auto_update: false,
             auto_update_last_target: None,
@@ -630,8 +606,6 @@ struct Settings {
     ssh_enabled: bool,
     #[serde(default = "default_true")]
     on_demand: bool,
-    #[serde(default, skip_serializing_if = "Ipv6Only::is_auto")]
-    ipv6_only: Ipv6Only,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     idle_timeout_secs: Option<u64>,
     #[serde(default)]
@@ -943,7 +917,6 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         dns_upstreams: settings.dns_upstreams,
         ssh_enabled: settings.ssh_enabled,
         on_demand: settings.on_demand,
-        ipv6_only: settings.ipv6_only,
         idle_timeout_secs: settings.idle_timeout_secs,
         auto_update: settings.auto_update,
         auto_update_last_target: settings.auto_update_last_target,
@@ -973,7 +946,6 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         dns_upstreams: config.dns_upstreams.clone(),
         ssh_enabled: config.ssh_enabled,
         on_demand: config.on_demand,
-        ipv6_only: config.ipv6_only,
         idle_timeout_secs: config.idle_timeout_secs,
         auto_update: config.auto_update,
         auto_update_last_target: config.auto_update_last_target.clone(),
@@ -1142,17 +1114,14 @@ mod tests {
                 NetworkConfig {
                     name: "gaming".to_string(),
                     group_mode: GroupMode::Open,
-                    my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
                     members: vec![
                         MemberEntry {
                             identity: test_id(2),
-                            ip: Ipv4Addr::new(100, 64, 5, 3),
                             is_coordinator: true,
                             hostname: None,
                         },
                         MemberEntry {
                             identity: test_id(3),
-                            ip: Ipv4Addr::new(100, 64, 10, 5),
                             is_coordinator: false,
                             hostname: None,
                         },
@@ -1177,7 +1146,6 @@ mod tests {
                 NetworkConfig {
                     name: "work".to_string(),
                     group_mode: GroupMode::Restricted,
-                    my_ip: None,
                     members: vec![],
                     approved: vec![],
                     network_secret_key: None,
@@ -1220,7 +1188,6 @@ mod tests {
         let net = NetworkConfig {
             name: "test".to_string(),
             group_mode: GroupMode::Open,
-            my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
             members: vec![],
             approved: vec![],
             network_secret_key: None,
@@ -1251,7 +1218,6 @@ mod tests {
             networks: vec![NetworkConfig {
                 name: "test".to_string(),
                 group_mode: GroupMode::Restricted,
-                my_ip: None,
                 members: vec![],
                 approved: vec![],
                 network_secret_key: None,
@@ -1275,7 +1241,6 @@ mod tests {
         let updated = NetworkConfig {
             name: "test".to_string(),
             group_mode: GroupMode::Open,
-            my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
             members: vec![],
             approved: vec![],
             network_secret_key: None,
@@ -1297,10 +1262,6 @@ mod tests {
         upsert_network(&mut config, updated.clone());
         assert_eq!(config.networks.len(), 1);
         assert_eq!(config.networks[0].group_mode, GroupMode::Open);
-        assert_eq!(
-            config.networks[0].my_ip,
-            Some(Ipv4Addr::new(100, 64, 10, 5))
-        );
     }
 
     #[test]
@@ -1310,7 +1271,6 @@ mod tests {
                 NetworkConfig {
                     name: "keep".to_string(),
                     group_mode: GroupMode::Restricted,
-                    my_ip: None,
                     members: vec![],
                     approved: vec![],
                     network_secret_key: None,
@@ -1332,7 +1292,6 @@ mod tests {
                 NetworkConfig {
                     name: "remove-me".to_string(),
                     group_mode: GroupMode::Restricted,
-                    my_ip: None,
                     members: vec![],
                     approved: vec![],
                     network_secret_key: None,
@@ -1373,16 +1332,13 @@ mod tests {
             networks: vec![NetworkConfig {
                 name: "gaming".to_string(),
                 group_mode: GroupMode::Restricted,
-                my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
                 members: vec![MemberEntry {
                     identity: id1,
-                    ip: Ipv4Addr::new(100, 64, 5, 3),
                     is_coordinator: true,
                     hostname: None,
                 }],
                 approved: vec![ApprovedConfigEntry {
                     identity: id2,
-                    ip: Ipv4Addr::new(100, 64, 12, 34),
                     hostname: None,
                 }],
                 network_secret_key: None,
@@ -1417,7 +1373,6 @@ mod tests {
             networks: vec![NetworkConfig {
                 name: "gaming".to_string(),
                 group_mode: GroupMode::Restricted,
-                my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
                 members: vec![],
                 approved: vec![],
                 network_secret_key: Some(secret.clone()),
@@ -1468,7 +1423,7 @@ mod tests {
     fn test_direct_flag_default_false() {
         let toml_str = r#"
 [[networks]]
-name = "dario-alice"
+name = "team-alice"
 "#;
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.networks[0].direct);
@@ -1506,7 +1461,6 @@ name = "test"
         NetworkConfig {
             name: name.to_string(),
             group_mode: GroupMode::Restricted,
-            my_ip: None,
             my_hostname: None,
             pending_hostname: None,
             members: vec![],
@@ -1537,7 +1491,7 @@ name = "test"
         save_settings_in(
             dir,
             &AppConfig {
-                default_hostname: Some("dario".into()),
+                default_hostname: Some("laptop".into()),
                 ..Default::default()
             },
         )
@@ -1545,7 +1499,7 @@ name = "test"
 
         let loaded = load_in(dir).unwrap();
         assert_eq!(loaded.networks.len(), 2);
-        assert_eq!(loaded.default_hostname.as_deref(), Some("dario"));
+        assert_eq!(loaded.default_hostname.as_deref(), Some("laptop"));
 
         // Single-network load.
         assert!(load_network_in(dir, "homelab").unwrap().is_some());
@@ -1573,6 +1527,23 @@ name = "test"
         let loaded = load_in(dir).unwrap();
         assert_eq!(loaded.download_dir.as_deref(), Some("/srv/incoming"));
         assert_eq!(loaded.download_user, Some(1000));
+    }
+
+    /// The IPv6-only cutover deleted the `ipv6-only` setting, and the release
+    /// notes promise a `settings.toml` still carrying it upgrades rather than
+    /// failing to parse. Nothing in `Settings` names the key any more, so what
+    /// keeps that promise is the absence of `deny_unknown_fields`, which is
+    /// exactly the kind of thing a later tidy-up adds without noticing.
+    #[test]
+    fn a_stale_ipv6_only_key_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(SETTINGS_FILE),
+            "mdns_enabled = false\nipv6_only = true\n",
+        )
+        .unwrap();
+        let loaded = load_in(tmp.path()).expect("a settings.toml from an older build still loads");
+        assert!(!loaded.mdns_enabled, "the keys we do know are still read");
     }
 
     #[test]
@@ -1790,48 +1761,6 @@ name = "test"
         assert!(cfg.relay.is_unset());
     }
 
-    /// `ipv6_only` has to survive the settings.toml round trip, or the daemon
-    /// would come back dual-stack after the restart the mode requires.
-    #[test]
-    fn ipv6_only_persists_through_settings() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = AppConfig::default();
-        config_set(&mut cfg, settings::GlobalKey::Ipv6Only, "on", false).unwrap();
-        save_settings_in(dir.path(), &cfg).unwrap();
-        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Ipv6Only::On);
-    }
-
-    /// `auto` is the absence of the key, so it must not be written: an older
-    /// daemon reading the file would reject a non-boolean value, and a written
-    /// `false` would silently mean "refuse to start next to another VPN".
-    #[test]
-    fn auto_ipv6_only_is_not_written_to_settings() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = AppConfig::default();
-        config_set(&mut cfg, settings::GlobalKey::Ipv6Only, "auto", false).unwrap();
-        save_settings_in(dir.path(), &cfg).unwrap();
-
-        let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
-        assert!(!raw.contains("ipv6_only"), "auto wrote a value: {raw}");
-        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Ipv6Only::Auto);
-    }
-
-    /// A settings.toml written before the tri-state names a bare boolean, and it
-    /// still has to mean what it meant then.
-    #[test]
-    fn a_stored_boolean_still_parses() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(SETTINGS_FILE), "ipv6_only = true\n").unwrap();
-        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Ipv6Only::On);
-
-        std::fs::write(dir.path().join(SETTINGS_FILE), "ipv6_only = false\n").unwrap();
-        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Ipv6Only::Off);
-
-        // And the string form every write since produces.
-        std::fs::write(dir.path().join(SETTINGS_FILE), "ipv6_only = \"on\"\n").unwrap();
-        assert_eq!(load_in(dir.path()).unwrap().ipv6_only, Ipv6Only::On);
-    }
-
     #[test]
     fn config_set_dns_upstreams_rejects_non_ip() {
         let mut cfg = AppConfig::default();
@@ -1898,7 +1827,7 @@ name = "test"
 
         // Write a legacy single-file config (the pre-shard format).
         let legacy = AppConfig {
-            default_hostname: Some("dario".into()),
+            default_hostname: Some("laptop".into()),
             networks: vec![net("homelab"), net("genesis")],
             ..Default::default()
         };
@@ -1917,7 +1846,7 @@ name = "test"
         // Both networks + globals are now in the sharded layout.
         let loaded = load_in(dir).unwrap();
         assert_eq!(loaded.networks.len(), 2);
-        assert_eq!(loaded.default_hostname.as_deref(), Some("dario"));
+        assert_eq!(loaded.default_hostname.as_deref(), Some("laptop"));
 
         // Idempotent: a second migrate (no legacy file) is a no-op.
         migrate_legacy(dir).unwrap();

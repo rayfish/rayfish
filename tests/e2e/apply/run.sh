@@ -147,7 +147,7 @@ fi
 
 # ---------------------------------------------------------------------------
 step "6. the resolved allow actually opens the port over the TUN"
-A_VPN="$(peer_ip4 "$B" srv-a "$NET")"
+A_VPN="$(peer_ip "$B" srv-a "$NET")"
 [[ -n "$A_VPN" ]] && pass "srv-b sees srv-a at $A_VPN" || { fail "srv-b cannot see srv-a's VPN ip"; summary; }
 start_tcp_listener "$A" 8080   # a port the spec does NOT allow (default-deny covers it)
 # tcp:22 is sshd (always listening) and is the allowed port; 8080 is denied.

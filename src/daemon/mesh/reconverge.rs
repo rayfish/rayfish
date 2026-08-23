@@ -214,7 +214,6 @@ pub(crate) async fn reconverge_and_apply(
     state: &SharedNetworkState,
     my_identity: EndpointId,
     alpn: &[u8],
-    my_ip: Ipv4Addr,
     device_cert: &Option<control::DeviceCert>,
 ) {
     let MeshCtx {
@@ -260,7 +259,6 @@ pub(crate) async fn reconverge_and_apply(
             alpn,
             network_name,
             my_identity,
-            my_ip,
             device_cert,
         )
         .await;
@@ -270,7 +268,6 @@ pub(crate) async fn reconverge_and_apply(
         // so the apply path below would never run and the offer would stay
         // invisible forever. Quiet no-op when the flag already matches.
         registry.sync_exit_offers().await;
-        registry.sync_ipv6_only().await;
         return;
     }
     // The record names a different blob than we hold. Take it only if it was
@@ -311,17 +308,11 @@ pub(crate) async fn reconverge_and_apply(
         });
         return;
     }
-    // Two coordinators can independently admit a fresh joiner at the same
-    // collision index, producing a roster with duplicate IPs. Resolve it
-    // deterministically (lowest identity keeps the slot, others re-roll) before
-    // it reaches the PeerTable/DNS so every node converges on the same map.
-    let tiebroken = crate::membership::resolve_ip_tiebreak(data.members.clone());
-    if let Err(e) = crate::membership::validate_no_duplicate_ips(&tiebroken) {
-        tracing::warn!(network = %network_name, error = %e, "roster still has duplicate IPs after tiebreak; applying tiebroken version");
-    }
+    // No tiebreak: an address is blake3 of the identity, so two coordinators
+    // admitting concurrently cannot produce a roster with duplicate addresses.
     let roster = {
         let mut s = state.write().unwrap();
-        s.members = MemberList::from_members(tiebroken);
+        s.members = MemberList::from_members(data.members.clone());
         s.approved = ApprovedList::from_entries(data.approved.clone());
         s.suggested_firewall = data.suggested_firewall.clone();
         s.nullifiers = data.nullifiers.clone();
@@ -366,7 +357,6 @@ pub(crate) async fn reconverge_and_apply(
         alpn,
         network_name,
         my_identity,
-        my_ip,
         device_cert,
     )
     .await;
@@ -377,7 +367,6 @@ pub(crate) async fn reconverge_and_apply(
     // the activation-time one, which can fire before any network is connected
     // and go to zero peers. Quiet no-op when the flag already matches.
     registry.sync_exit_offers().await;
-    registry.sync_ipv6_only().await;
     registry.nudge_exit_reapply();
     tracing::info!(network = %network_name, "reconverged from signed record");
 }
@@ -414,7 +403,7 @@ pub(crate) fn prune_departed_peers(
 ) {
     // Device keys nullified on this network (`ray unpair`), read once.
     let nullifiers = state.read().unwrap().nullifiers.clone();
-    for (peer_id, ip, _conn) in peers.peers_for_network_with_conn(network_name) {
+    for (peer_id, _ip, _conn) in peers.peers_for_network_with_conn(network_name) {
         // Membership is by roster identity, which for a paired peer is its user
         // identity, not the transport id the PeerTable is keyed on. Check both.
         let user_id = device_user_map.resolve(&peer_id);
@@ -436,9 +425,7 @@ pub(crate) fn prune_departed_peers(
         // was the peer's last network with us; otherwise just drop this network's
         // route and leave the peer reachable on the others (`remove_peer_from_network`
         // returns the connection iff its network set emptied).
-        if let Some(conn) =
-            peers.remove_peer_from_network(&ip, &derive_ipv6(&peer_id), network_name)
-        {
+        if let Some(conn) = peers.remove_peer_from_network(&derive_ipv6(&peer_id), network_name) {
             conn.close(
                 VarInt::from_u32(forward::KICK_CODE),
                 b"removed from network",
@@ -475,11 +462,10 @@ pub(crate) async fn attach_rejoined_peers(
         // The roster keys a paired peer by its user identity, while the peer table
         // is keyed on the transport (device) id, so resolve through the same map
         // the prune pass uses before looking the connection up.
-        let Some((ip, ipv6, conn)) = peers.connected_device_for(&m.identity, device_user_map)
-        else {
+        let Some((ip, conn)) = peers.connected_device_for(&m.identity, device_user_map) else {
             continue;
         };
-        if peers.attach_network(&ip, &ipv6, network_name).is_none() {
+        if peers.attach_network(&ip, network_name).is_none() {
             continue;
         }
         tracing::info!(
@@ -509,25 +495,19 @@ pub(crate) async fn apply_roster_to_dns(
         .filter(|m| m.identity != my_identity)
         .map(|m| peers::RouteMember {
             endpoint_id: m.identity,
-            ipv4: m.ip,
             ipv6: derive_ipv6(&m.identity),
         })
         .collect();
     route_map.sync_network(network_name, &routes);
-    // The roster is the source of truth for DNS, including which members have a
-    // usable mesh IPv4: a member running an IPv6-only data plane gets `None`, so
-    // the responder withholds its A record instead of pointing apps at an
-    // address another VPN owns on that host.
-    let mut entries: Vec<(String, Option<Ipv4Addr>, Ipv6Addr)> = members
+    // The roster is the source of truth for DNS. Every member has exactly one
+    // address and it is derived, not stored, so the entry is a bare `Ipv6Addr`:
+    // there is no A record to hold back and nothing that can be missing.
+    let mut entries: Vec<(String, Ipv6Addr)> = members
         .iter()
         .filter_map(|m| {
-            m.hostname.as_ref().map(|h| {
-                (
-                    h.clone(),
-                    (!m.ipv6_only).then_some(m.ip),
-                    derive_ipv6(&m.identity),
-                )
-            })
+            m.hostname
+                .as_ref()
+                .map(|h| (h.clone(), derive_ipv6(&m.identity)))
         })
         .collect();
 
@@ -553,8 +533,8 @@ pub(crate) async fn apply_roster_to_dns(
                     // Override our own DNS entry so `.ray` resolution and
                     // `ray status` reflect the pending name immediately.
                     let v6 = derive_ipv6(&my_identity);
-                    entries.retain(|(_, v4, _)| *v4 != Some(me.ip));
-                    entries.push((pending.clone(), (!me.ipv6_only).then_some(me.ip), v6));
+                    entries.retain(|(_, addr)| *addr != derive_ipv6(&me.identity));
+                    entries.push((pending.clone(), v6));
                 }
                 if net.my_hostname.as_deref() != Some(pending.as_str()) {
                     net.my_hostname = Some(pending);
@@ -634,7 +614,6 @@ pub(crate) fn spawn_group_poller(
             // blob, so no reconverge trigger would ever heal it. Quiet local
             // no-op when the flag already matches.
             registry.sync_exit_offers().await;
-            registry.sync_ipv6_only().await;
 
             let (remote_hash, seed_peers) = match dht::resolve_network(&client, net_pubkey).await {
                 Ok(r) => r,
@@ -760,8 +739,8 @@ pub(crate) async fn fetch_and_apply_blob(
     for old_id in &old_members {
         if !new_member_ids.contains(old_id) {
             let s = state.read().unwrap();
-            if let Some(member) = s.members.get(old_id) {
-                peers.remove(&member.ip, &derive_ipv6(old_id));
+            if s.members.get(old_id).is_some() {
+                peers.remove(&derive_ipv6(old_id));
                 tracing::info!(peer = %old_id.fmt_short(), "removed kicked peer");
             }
         }
@@ -796,7 +775,6 @@ pub(crate) async fn fetch_and_apply_blob(
     // nudge the daemon to re-run the exit reconcile rather than leaking traffic
     // until the next `ray up`. All cheap no-ops otherwise.
     registry.sync_exit_offers().await;
-    registry.sync_ipv6_only().await;
     registry.nudge_exit_reapply();
     ReconvergeOutcome::Applied
 }
@@ -818,16 +796,13 @@ mod self_nullified_tests {
     fn member(identity: EndpointId, is_coordinator: bool) -> Member {
         Member {
             identity,
-            ip: std::net::Ipv4Addr::new(100, 64, 0, 2),
             is_coordinator,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
             exit_families: ExitFamilies::Unknown,
-            ipv6_only: false,
         }
     }
 

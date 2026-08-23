@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -24,15 +24,15 @@ impl AuditLog {
         })
     }
 
-    pub fn log_connect(&self, peer_ip: Ipv4Addr, endpoint_id: &str) {
+    pub fn log_connect(&self, peer_ip: Ipv6Addr, endpoint_id: &str) {
         self.write_entry("connect", peer_ip, endpoint_id);
     }
 
-    pub fn log_disconnect(&self, peer_ip: Ipv4Addr, endpoint_id: &str) {
+    pub fn log_disconnect(&self, peer_ip: Ipv6Addr, endpoint_id: &str) {
         self.write_entry("disconnect", peer_ip, endpoint_id);
     }
 
-    fn write_entry(&self, event: &str, peer_ip: Ipv4Addr, endpoint_id: &str) {
+    fn write_entry(&self, event: &str, peer_ip: Ipv6Addr, endpoint_id: &str) {
         use std::io::Write;
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

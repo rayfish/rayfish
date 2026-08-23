@@ -5,7 +5,6 @@ use std::collections::HashMap;
 
 use iroh::EndpointId;
 
-use crate::config::Ipv6Only;
 use crate::*;
 
 /// Human-readable byte size (GiB/MiB/KiB/B) for traffic and transfer counters.
@@ -29,6 +28,45 @@ pub(crate) fn print_error(title: &str, detail: &str, hint: Option<&str>) {
     if let Some(h) = hint {
         eprintln!("    {}  {}", style::label("hint"), style::faint(&h));
     }
+}
+
+/// [`print_error`] for a daemon-side `IpcMessage::Error`, which ends the command
+/// non-zero.
+///
+/// The daemon rejecting a request is a failed command, and a CLI that says so on
+/// stderr alone is one no script can check: `ray join` on a spent invite, or
+/// `ray exit-node use` on a gateway that cannot carry IPv6, printed the reason
+/// and exited 0 exactly like a success. Returns `!`, so it drops into a match arm
+/// of any type.
+pub(crate) fn fail_with(title: &str, detail: &str) -> ! {
+    print_error(title, detail, None);
+    std::process::exit(1);
+}
+
+/// [`fail_with`] for a reply the command does not know how to read.
+///
+/// Reaching this arm means the CLI and the daemon disagree about the protocol,
+/// and IPC has no version negotiation to catch it: the binary is swapped before
+/// the service restarts, so the window is routine rather than exotic. Printing to
+/// stderr and returning 0 told the caller the command worked, which is the same
+/// failure [`fail_with`] exists to stop, one match arm over.
+pub(crate) fn fail_unexpected(reply: &impl std::fmt::Debug) -> ! {
+    print_error(
+        "unexpected reply from the daemon",
+        &unexpected_detail(reply),
+        Some("the CLI and the daemon are probably different versions: sudo ray restart"),
+    );
+    std::process::exit(1);
+}
+
+/// The same complaint as [`fail_unexpected`] as a string, for the two callers
+/// that must not exit: they sit in loops written to attempt every item, so
+/// ending the process would abandon the rest of the work the user asked for.
+pub(crate) fn unexpected_detail(reply: &impl std::fmt::Debug) -> String {
+    format!(
+        "unexpected reply from the daemon: {reply:?}\n    \
+         the CLI and the daemon are probably different versions"
+    )
 }
 
 /// Map a daemon error message to an actionable hint, best-effort.
@@ -116,14 +154,13 @@ pub(crate) async fn ipc_status() -> Result<()> {
         }
         println!("  {}", style::faint("saved networks:"));
         for net in &app_config.networks {
-            let ip_str = net
-                .my_ip
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "?".to_string());
+            // No address here: it derives from our identity, which this path
+            // deliberately does not load (the daemon is down and the config is
+            // all we have). The name and member count are what the listing is
+            // for; `ray status` with the daemon up prints the address.
             println!(
-                "    {} {}  {}",
+                "    {}  {}",
                 style::value(&net.name),
-                style::faint(&format!("({ip_str})")),
                 style::faint(&format!("{} members", net.members.len()))
             );
         }
@@ -138,7 +175,6 @@ pub(crate) async fn ipc_status() -> Result<()> {
             endpoint_id,
             mdns_enabled,
             auto_update,
-            ipv6_only,
             active,
             contact_id,
             daemon_version,
@@ -166,8 +202,6 @@ pub(crate) async fn ipc_status() -> Result<()> {
                         }))
                         .collect::<Vec<_>>(),
                     "auto_update": auto_update,
-                    // "on", "off", or "auto" (on, chosen by the daemon).
-                    "ipv6_only": ipv6_only,
                     "active": active,
                     "contact_id": contact_id,
                     "daemon_version": daemon_version,
@@ -206,30 +240,13 @@ pub(crate) async fn ipc_status() -> Result<()> {
             } else {
                 String::new()
             };
-            // Same treatment for IPv6-only: off is the default, so only say
-            // something when the data plane is actually running without IPv4.
-            // `(auto)` marks a mode the daemon chose on finding another VPN on
-            // `100.64.0.0/10`, which nobody would otherwise know to expect.
-            let v6only = match ipv6_only {
-                Ipv6Only::Off => String::new(),
-                mode => {
-                    let how = match mode {
-                        Ipv6Only::Auto => {
-                            format!("{} {}", style::green("on"), style::faint("(auto)"))
-                        }
-                        _ => style::green("on").to_string(),
-                    };
-                    format!("      {} {how}", style::label("ipv6-only"))
-                }
-            };
             println!();
             println!(
-                "  {}  {}      {}{}{}      {} {}",
+                "  {}  {}      {}{}      {} {}",
                 style::bold("rayfish"),
                 state,
                 mdns,
                 auto,
-                v6only,
                 style::label("endpoint"),
                 style::value(&endpoint_id.fmt_short().to_string()),
             );
@@ -245,7 +262,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 println!("  {}", style::faint("no active networks"));
             } else {
                 for net in &networks {
-                    print_network(net, ipv6_only.enabled());
+                    print_network(net);
                 }
             }
 
@@ -305,8 +322,8 @@ pub(crate) async fn ipc_status() -> Result<()> {
             }
             println!();
         }
-        ipc::IpcMessage::Error { message } => print_error("status failed", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("status failed", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -364,7 +381,7 @@ fn print_nearby(peers: &[ipc::LanPeerInfo]) {
 /// Render one network block: header (name · role · dns · ip · member count),
 /// the aligned peer table, and the shareable join code (suppressed for direct
 /// `ray connect` networks).
-fn print_network(net: &ipc::NetworkStatus, ipv6_only: bool) {
+fn print_network(net: &ipc::NetworkStatus) {
     let role = net.role.to_string();
     // Just the hostname: the network name is already the block header, so the
     // `.{network}.ray` suffix would only repeat it.
@@ -378,12 +395,7 @@ fn print_network(net: &ipc::NetworkStatus, ipv6_only: bool) {
     if let Some(ref dns) = dns_name {
         print!("   {}", style::value(dns));
     }
-    // In IPv6-only mode the mesh IPv4 carries no traffic, so showing it would
-    // hand out an address that goes nowhere. Show the address actually in use.
-    let my_addr = match (ipv6_only, net.my_ipv6) {
-        (true, Some(v6)) => v6.to_string(),
-        _ => net.my_ip.to_string(),
-    };
+    let my_addr = net.my_ipv6.to_string();
     print!("   {}", style::faint(&my_addr));
     print!(
         "   {} {}",
@@ -428,7 +440,7 @@ fn print_network(net: &ipc::NetworkStatus, ipv6_only: bool) {
     };
     let up_w = counter_width(|c| c.bytes_tx);
     let down_w = counter_width(|c| c.bytes_rx);
-    let rows = grouped_peer_rows(net, &alias_by_identity, up_w, down_w, ipv6_only);
+    let rows = grouped_peer_rows(net, &alias_by_identity, up_w, down_w);
     if rows.is_empty() {
         println!("    {}", style::faint("(no other members)"));
     } else {
@@ -468,7 +480,6 @@ fn grouped_peer_rows(
     alias_by_identity: &HashMap<&str, &str>,
     up_w: usize,
     down_w: usize,
-    ipv6_only: bool,
 ) -> Vec<Vec<layout::Cell>> {
     let mut rows = Vec::new();
     let mut emitted: std::collections::HashSet<EndpointId> = std::collections::HashSet::new();
@@ -492,7 +503,6 @@ fn grouped_peer_rows(
                 "",
                 up_w,
                 down_w,
-                ipv6_only,
             ));
             continue;
         }
@@ -524,7 +534,6 @@ fn grouped_peer_rows(
                     "",
                     up_w,
                     down_w,
-                    ipv6_only,
                 ));
                 for (i, d) in secondaries.iter().enumerate() {
                     let branch = if i + 1 == secondaries.len() {
@@ -532,7 +541,7 @@ fn grouped_peer_rows(
                     } else {
                         "   ├─ "
                     };
-                    rows.push(device_row(d, None, branch, up_w, down_w, ipv6_only));
+                    rows.push(device_row(d, None, branch, up_w, down_w));
                 }
             }
             // The primary is not visible here (e.g. it is us, filtered out of our
@@ -546,7 +555,7 @@ fn grouped_peer_rows(
                     } else {
                         "   ├─ "
                     };
-                    rows.push(device_row(d, None, branch, up_w, down_w, ipv6_only));
+                    rows.push(device_row(d, None, branch, up_w, down_w));
                 }
             }
         }
@@ -639,16 +648,12 @@ fn device_row(
     prefix: &str,
     up_w: usize,
     down_w: usize,
-    ipv6_only: bool,
 ) -> Vec<layout::Cell> {
-    // The address column carries whatever this node can actually reach the peer
-    // on, matching the network header: in IPv6-only mode the peer's mesh IPv4 is
-    // an address nothing here can send to, and it is the column people copy into
-    // `ssh` and `ping`. Wider rows are the price; a wrong address is not.
-    let addr = match (ipv6_only, peer.ipv6) {
-        (true, Some(v6)) => v6.to_string(),
-        _ => peer.ip.to_string(),
-    };
+    // The address column is the peer's mesh IPv6, which is the only address it
+    // can be reached on and the one people copy into `ssh` and `ping`. It is
+    // three times the width of the dotted quad it replaces: wider rows are the
+    // price, a wrong address is not.
+    let addr = peer.ipv6.to_string();
     let base = peer.hostname.clone().unwrap_or_else(|| addr.clone());
     let host = match alias {
         Some(a) => format!("{base} [{a}]"),
@@ -810,8 +815,8 @@ pub(crate) async fn ipc_down() -> Result<()> {
     let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -850,8 +855,8 @@ pub(crate) async fn ipc_report() -> Result<()> {
                 println!("\nCouldn't open a browser. Open this URL manually:\n{url}");
             }
         }
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -884,15 +889,14 @@ pub(crate) async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()
     let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod grouping_tests {
-    use std::net::Ipv4Addr;
 
     use super::*;
 
@@ -918,8 +922,7 @@ mod grouping_tests {
     ) -> ipc::PeerStatus {
         ipc::PeerStatus {
             endpoint_id: iroh::SecretKey::generate().public(),
-            ip: Ipv4Addr::new(100, 64, 0, 2),
-            ipv6: None,
+            ipv6: "200::2".parse().unwrap(),
             hostname: Some(host.to_string()),
             user_identity: user,
             is_own_device: own,
@@ -942,8 +945,7 @@ mod grouping_tests {
         ipc::NetworkStatus {
             name: "n".to_string(),
             role: ipc::NetworkRole::Coordinator,
-            my_ip: Ipv4Addr::new(100, 64, 0, 1),
-            my_ipv6: None,
+            my_ipv6: "200::1".parse().unwrap(),
             my_hostname: Some(my_hostname.to_string()),
             network_key: None,
             member_count: peers.len(),
@@ -958,11 +960,7 @@ mod grouping_tests {
     }
 
     fn render(net: &ipc::NetworkStatus) -> String {
-        render_in(net, false)
-    }
-
-    fn render_in(net: &ipc::NetworkStatus, ipv6_only: bool) -> String {
-        layout::columns(&grouped_peer_rows(net, &HashMap::new(), 0, 0, ipv6_only), 3)
+        layout::columns(&grouped_peer_rows(net, &HashMap::new(), 0, 0), 3)
     }
 
     #[test]
@@ -970,7 +968,7 @@ mod grouping_tests {
         let me = iroh::SecretKey::generate().public();
         // Two of my devices (one online, one offline) plus a standalone member.
         let net = net(
-            "dario",
+            "laptop",
             vec![
                 peer("phone", Some(me), true, true, false),
                 peer("tablet", Some(me), true, false, false),
@@ -979,42 +977,29 @@ mod grouping_tests {
         );
         let out = render(&net);
         // Parent row labelled by my hostname with a rollup, and a tree branch.
-        assert!(out.contains("dario"), "{out}");
+        assert!(out.contains("laptop"), "{out}");
         assert!(out.contains("2 devices, 1 online"), "{out}");
         assert!(out.contains("└─"), "{out}");
         // Parent sits before its devices; connected device before the offline one.
         let at = |s: &str| out.find(s).unwrap();
-        assert!(at("dario") < at("phone"));
+        assert!(at("laptop") < at("phone"));
         assert!(at("phone") < at("tablet"));
         // Standalone member still renders flat.
         assert!(out.contains("server"));
     }
 
-    /// The address column has to be one this node can send to. In IPv6-only mode
-    /// the peer's mesh IPv4 is not routed here (another VPN owns the range), so
-    /// printing it would hand out an address that goes nowhere, and this column
-    /// is what people copy into `ssh`.
+    /// The address column has to be one this node can send to, and the mesh
+    /// IPv6 is the only one there is. It is also the column people copy into
+    /// `ssh`, so a stale IPv4 here would be worse than a wide row.
     #[test]
     fn peer_rows_carry_the_reachable_address() {
         let mut p = peer("dev", None, false, true, false);
-        p.ipv6 = Some("200::9".parse().unwrap());
-        let net = net("dario", vec![p]);
+        p.ipv6 = "200::9".parse().unwrap();
+        let net = net("laptop", vec![p]);
 
-        let dual = render_in(&net, false);
-        assert!(dual.contains("100.64.0.2"), "{dual}");
-        assert!(!dual.contains("200::9"), "{dual}");
-
-        let v6_only = render_in(&net, true);
-        assert!(v6_only.contains("200::9"), "{v6_only}");
-        assert!(!v6_only.contains("100.64.0.2"), "{v6_only}");
-    }
-
-    /// A peer whose roster entry predates the v6 address still has to render:
-    /// falling back to its mesh IPv4 beats an empty column.
-    #[test]
-    fn peer_without_ipv6_falls_back_to_its_ipv4() {
-        let net = net("dario", vec![peer("dev", None, false, true, false)]);
-        assert!(render_in(&net, true).contains("100.64.0.2"));
+        let out = render(&net);
+        assert!(out.contains("200::9"), "{out}");
+        assert!(!out.contains("100.64."), "{out}");
     }
 
     #[test]
@@ -1022,13 +1007,12 @@ mod grouping_tests {
         // Viewing a *foreign* user whose primary device is itself a visible member
         // (endpoint id == user identity) plus one paired secondary. The primary
         // must anchor the group on its own row, not appear once flat and once as a
-        // separate rollup header (the `dario ... / dario ...` duplication bug).
-        let dario = iroh::SecretKey::generate().public();
+        // separate rollup header (the `laptop ... / laptop ...` duplication bug).
+        let laptop = iroh::SecretKey::generate().public();
         let primary = ipc::PeerStatus {
-            endpoint_id: dario,
-            ip: Ipv4Addr::new(100, 64, 0, 3),
-            ipv6: None,
-            hostname: Some("dario".to_string()),
+            endpoint_id: laptop,
+            ipv6: "200::3".parse().unwrap(),
+            hostname: Some("laptop".to_string()),
             user_identity: None,
             is_own_device: false,
             incompatible: false,
@@ -1037,17 +1021,17 @@ mod grouping_tests {
             exit_node: false,
             exit_in_use: false,
         };
-        let secondary = peer("sm-f966b", Some(dario), false, false, false);
+        let secondary = peer("sm-f966b", Some(laptop), false, false, false);
         let net = net("umbrel", vec![primary, secondary]);
         let out = render(&net);
 
-        // "dario" is named exactly once, and there is no synthetic rollup header.
-        assert_eq!(out.matches("dario").count(), 1, "{out}");
+        // "laptop" is named exactly once, and there is no synthetic rollup header.
+        assert_eq!(out.matches("laptop").count(), 1, "{out}");
         assert!(!out.contains("device"), "unexpected rollup header:\n{out}");
         // The secondary nests under the primary's row.
         assert!(out.contains("└─"), "{out}");
         let at = |s: &str| out.find(s).unwrap();
-        assert!(at("dario") < at("sm-f966b"), "{out}");
+        assert!(at("laptop") < at("sm-f966b"), "{out}");
     }
 
     #[test]
@@ -1061,7 +1045,7 @@ mod grouping_tests {
         in_use.exit_node = true;
         in_use.exit_in_use = true;
         let plain = peer("srv", None, false, true, false);
-        let out = render(&net("dario", vec![offering, in_use, plain]));
+        let out = render(&net("laptop", vec![offering, in_use, plain]));
         let row = |host: &str| {
             out.lines()
                 .find(|l| l.contains(host))
@@ -1080,7 +1064,7 @@ mod grouping_tests {
 
     #[test]
     fn flags_incompatible_offline_peer() {
-        let net = net("dario", vec![peer("oldbox", None, false, false, true)]);
+        let net = net("laptop", vec![peer("oldbox", None, false, false, true)]);
         let out = render(&net);
         assert!(out.contains("oldbox"));
         assert!(out.contains("incompatible"), "{out}");
@@ -1091,7 +1075,7 @@ mod grouping_tests {
     #[test]
     fn single_device_group_reads_singular() {
         let me = iroh::SecretKey::generate().public();
-        let net = net("dario", vec![peer("phone", Some(me), true, true, false)]);
+        let net = net("laptop", vec![peer("phone", Some(me), true, true, false)]);
         let out = render(&net);
         assert!(out.contains("1 device, 1 online"), "{out}");
     }

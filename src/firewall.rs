@@ -625,6 +625,16 @@ fn parse_ipv4(packet: &[u8]) -> Option<PacketInfo> {
     if packet.len() < header_len {
         return None;
     }
+    // A non-first fragment carries no L4 header, so the "ports" at `header_len`
+    // are payload bytes. The IPv6 twin of this is `ipv6_upper_layer`, and the
+    // reason is the same: a mis-keyed conntrack entry is a hole, not a misparse.
+    // Nothing on the mesh produces IPv4 any more (the TUN has no IPv4 address and
+    // inbound IPv4 dies at the anti-spoof check), so this guards a path rather
+    // than fixing a live bug.
+    let frag_offset = u16::from_be_bytes([packet[6], packet[7]]) & 0x1FFF;
+    if frag_offset != 0 {
+        return None;
+    }
 
     let protocol = packet[9];
     let src_ip = IpAddr::V4(Ipv4Addr::new(
@@ -650,11 +660,96 @@ fn parse_ipv4(packet: &[u8]) -> Option<PacketInfo> {
     })
 }
 
+/// IPv6 next-header values that are *extension* headers rather than the
+/// upper-layer protocol: hop-by-hop, routing, fragment, authentication,
+/// destination options, mobility, HIP and shim6.
+///
+/// Reading byte 6 as the protocol and the ports at a fixed offset 40 is wrong for
+/// every one of these, and not cosmetically: the conntrack `Flow` is keyed on
+/// `(proto, local_port, peer_port)`, so a fragmented TCP packet became
+/// `(44, 0, 0)`, a *wildcard* entry matching every fragmented packet from that
+/// peer whatever reassembled inside it. One outbound fragment (any UDP send past
+/// the 1280 MTU) then held a 30-second hole through which that peer could reach
+/// any local port, which is the inbound default-deny gone.
+///
+/// [`ipv6_upper_layer`] walks past them to the header that really is the protocol,
+/// except the fragment header, which it refuses outright: see its doc comment.
+/// The list stays public because it is what tells a caller which values are chain
+/// links rather than protocols, which the property tests generate against.
+pub const IPV6_EXTENSION_HEADERS: [u8; 8] = [0, 43, 44, 51, 60, 135, 139, 140];
+
+/// The subset of [`IPV6_EXTENSION_HEADERS`] whose first two octets are
+/// `(next_header, hdr_ext_len)`, the length in 8-octet units not counting the
+/// first 8. Authentication and Fragment are the two that are not: see
+/// [`ipv6_upper_layer`].
+const IPV6_TLV_EXT_HEADERS: [u8; 6] = [0, 43, 60, 135, 139, 140];
+
+/// Authentication Header (RFC 4302).
+const IPV6_AH: u8 = 51;
+/// Fragment header (RFC 8200 §4.5).
+const IPV6_FRAGMENT: u8 = 44;
+
+/// Walk an IPv6 extension-header chain to the upper-layer protocol, returning it
+/// and the offset it starts at.
+///
+/// `None` when the packet carries no upper-layer header this can read, which is
+/// the case that must stay refused rather than guessed at:
+///
+/// - **any fragment**, first or not. A non-first one has its L4 header in a
+///   different packet and cannot be classified at all. The first one can be, but
+///   classifying it only earns the right to forward a fragment whose siblings are
+///   refused: the peer holds an incomplete reassembly until it times out, and on
+///   the outbound side we would have put a datagram on the wire that can never
+///   complete while opening a conntrack entry for it. Refusing the whole datagram
+///   is what the mesh already promises (lower the application's datagram size, or
+///   let TCP handle it), so the promise is kept here rather than half-kept.
+/// - a truncated chain, or one longer than `MAX_HEADERS`. Eight is already more
+///   than RFC 8200 §4.1's recommended order allows; a chain longer than that is a
+///   crafted packet, not traffic.
+///
+/// ESP (50) and `No Next Header` (59) are *not* refused. Neither has ports to
+/// read, but both are protocol numbers rather than chain links, and the
+/// extractors give them `(proto, 0, 0)`: a per-protocol key, not the
+/// cross-protocol wildcard this exists to prevent.
+fn ipv6_upper_layer(packet: &[u8]) -> Option<(u8, usize)> {
+    const MAX_HEADERS: usize = 8;
+    let mut next = packet[6];
+    let mut off = 40;
+    for _ in 0..MAX_HEADERS {
+        let len = match next {
+            // Refused whatever the fragment offset says: see the doc comment.
+            // Reading the offset to let the first one through classified an
+            // otherwise-undeliverable packet, since every other fragment of the
+            // same datagram is refused either way.
+            IPV6_FRAGMENT => return None,
+            // The one header measured in 4-octet units, and minus 2 rather than
+            // plus 1 (RFC 4302 §2.2). Getting this wrong walks into the middle of
+            // the payload, so it is pinned by a test.
+            IPV6_AH => (usize::from(*packet.get(off + 1)?) + 2) * 4,
+            h if IPV6_TLV_EXT_HEADERS.contains(&h) => (usize::from(*packet.get(off + 1)?) + 1) * 8,
+            // An upper-layer protocol: the walk ends here.
+            h => return Some((h, off)),
+        };
+        next = *packet.get(off)?;
+        off = off.checked_add(len)?;
+        if off >= packet.len() {
+            return None;
+        }
+    }
+    None
+}
+
 fn parse_ipv6(packet: &[u8]) -> Option<PacketInfo> {
     if packet.len() < 40 {
         return None;
     }
-    let protocol = packet[6]; // Next Header
+    let (protocol, header_len) = ipv6_upper_layer(packet)?;
+    // A port-bearing protocol with no room for its ports would extract `(0, 0)`,
+    // which is the wildcard conntrack key the walk above exists to stop. Refuse
+    // instead, the same answer a non-first fragment gets.
+    if matches!(protocol, 6 | 17) && packet.len() < header_len + 4 {
+        return None;
+    }
     let mut src_octets = [0u8; 16];
     let mut dst_octets = [0u8; 16];
     src_octets.copy_from_slice(&packet[8..24]);
@@ -662,7 +757,6 @@ fn parse_ipv6(packet: &[u8]) -> Option<PacketInfo> {
     let src_ip = IpAddr::V6(Ipv6Addr::from(src_octets));
     let dst_ip = IpAddr::V6(Ipv6Addr::from(dst_octets));
 
-    let header_len = 40; // fixed IPv6 header (extension headers not yet supported)
     let (src_port, dst_port) = extract_ports(protocol, packet, header_len);
     let tcp_flags = extract_tcp_flags(protocol, packet, header_len);
     let (icmp_type, icmp_id) = extract_icmp(protocol, packet, header_len);
@@ -1008,19 +1102,269 @@ mod tests {
 
     #[test]
     fn parse_ipv6_basic() {
-        let mut pkt = vec![0u8; 40];
+        // 48 bytes, not 40: a UDP packet carries a UDP header, and one that does
+        // not has no ports to key a conntrack entry on. See `parse_ipv6`.
+        let mut pkt = vec![0u8; 48];
         pkt[0] = 0x60; // IPv6
         pkt[6] = 17; // UDP next header
         pkt[24] = 0x02; // dst starts with 0x02 (200::/7)
         let info = parse_packet_info(&pkt).unwrap();
         assert!(info.dst_ip.is_ipv6());
         assert_eq!(info.protocol, 17);
+
+        // The header alone is refused rather than reported with ports of zero.
+        assert!(parse_packet_info(&pkt[..40]).is_none());
     }
 
     #[test]
     fn parse_not_ip() {
         let pkt = vec![0x30; 40]; // version nibble 3
         assert!(parse_packet_info(&pkt).is_none());
+    }
+
+    /// An extension header is refused rather than read as the upper-layer
+    /// protocol. The reason is the conntrack key, not the parse: see
+    /// [`IPV6_EXTENSION_HEADERS`].
+    #[test]
+    fn an_ipv6_extension_header_is_walked_past_to_the_real_protocol() {
+        // Hop-by-hop, then TCP. The `hdr_ext_len` of 0 means 8 octets, so the
+        // TCP header starts at 48 and its ports are there, not at 40.
+        let mut pkt = ipv6_tcp(&[(0u8, 0u8)], 48);
+        assert_eq!(
+            parse_packet_info(&pkt).map(|i| (i.protocol, i.src_port, i.dst_port)),
+            Some((6, 4444, 443)),
+            "byte 6 is the chain's first link, not the protocol"
+        );
+
+        // Two links deep: hop-by-hop, destination options, then TCP at 56.
+        pkt = ipv6_tcp(&[(0u8, 0u8), (60u8, 0u8)], 56);
+        assert_eq!(
+            parse_packet_info(&pkt).map(|i| (i.protocol, i.dst_port)),
+            Some((6, 443))
+        );
+
+        // The upper-layer protocols with no chain at all still parse.
+        for nh in [6u8, 17, 58] {
+            let mut pkt = vec![0u8; 60];
+            pkt[0] = 0x60;
+            pkt[6] = nh;
+            pkt[24] = 0x02;
+            assert_eq!(parse_packet_info(&pkt).map(|i| i.protocol), Some(nh));
+        }
+    }
+
+    /// The Authentication Header is the one link measured in 4-octet units, and
+    /// minus 2 rather than plus 1 (RFC 4302 §2.2). Applying the ordinary formula
+    /// walks into the middle of the payload and reads two arbitrary bytes as the
+    /// ports, so the arithmetic is pinned rather than left to review.
+    #[test]
+    fn the_authentication_headers_length_is_in_its_own_units() {
+        // `hdr_ext_len` 4 means (4 + 2) * 4 = 24 octets, so TCP starts at 64.
+        // The TLV formula would say (4 + 1) * 8 = 40 and look at 80.
+        let pkt = ipv6_tcp(&[(IPV6_AH, 4u8)], 64);
+        assert_eq!(
+            parse_packet_info(&pkt).map(|i| (i.protocol, i.dst_port)),
+            Some((6, 443))
+        );
+    }
+
+    /// A TLV link is not always 8 octets, and every other test here happens to
+    /// use one that is.
+    ///
+    /// `hdr_ext_len` counts 8-octet units *after* the first 8, so it is zero on
+    /// the minimum-size header a fixture reaches for by default. Treating the
+    /// length as the constant 8 therefore passes every one of those and still
+    /// reads the ports out of the middle of a hop-by-hop header carrying a single
+    /// option, which is ordinary traffic (a jumbogram, an MLD router alert).
+    #[test]
+    fn a_tlv_links_length_is_read_and_not_assumed() {
+        // Hop-by-hop with `hdr_ext_len` 2, so (2 + 1) * 8 = 24 octets and TCP
+        // starts at 64. Assuming 8 would look at 48, inside the option data.
+        let pkt = ipv6_tcp(&[(0u8, 2u8)], 64);
+        assert_eq!(
+            parse_packet_info(&pkt).map(|i| (i.protocol, i.dst_port)),
+            Some((6, 443))
+        );
+
+        // The same, one link further in: a destination-options header behind it,
+        // so a chain of two differently-sized TLVs has to be walked, not counted.
+        let pkt = ipv6_tcp(&[(0u8, 2u8), (60u8, 1u8)], 80);
+        assert_eq!(
+            parse_packet_info(&pkt).map(|i| (i.protocol, i.dst_port)),
+            Some((6, 443))
+        );
+    }
+
+    /// Every fragment is refused, whichever end of the datagram it is.
+    ///
+    /// The later ones have to be: they carry no L4 header, so keying them meant
+    /// inventing `(44, 0, 0)`, which is the wildcard this whole walk exists to
+    /// stop. The first one is refused for a different reason. It *can* be
+    /// classified, but the only thing that buys is permission to forward one
+    /// fragment of a datagram whose remaining fragments are dropped: the peer
+    /// holds an incomplete reassembly until it times out, and outbound we would
+    /// have opened a conntrack entry for a datagram that can never complete.
+    #[test]
+    fn every_fragment_of_a_datagram_is_refused() {
+        // Fragment header (8 octets), then TCP at 48. Offset 0, more-fragments
+        // set: the first fragment of a large datagram.
+        let mut first = ipv6_tcp(&[(IPV6_FRAGMENT, 0u8)], 48);
+        first[42..44].copy_from_slice(&1u16.to_be_bytes()); // offset 0, M = 1
+        assert!(
+            parse_packet_info(&first).is_none(),
+            "a first fragment is deliverable only if its siblings are, and they are not"
+        );
+
+        // The same datagram's second fragment: offset 185 (1480 octets in).
+        let mut later = first.clone();
+        later[42..44].copy_from_slice(&(185u16 << 3).to_be_bytes());
+        assert!(
+            parse_packet_info(&later).is_none(),
+            "a non-first fragment has no ports to read, so it cannot be classified"
+        );
+
+        // The same packet without the fragment header still parses: it is the
+        // fragmentation that is refused, not the traffic.
+        let whole = ipv6_tcp(&[], 40);
+        assert_eq!(
+            parse_packet_info(&whole).map(|i| (i.protocol, i.dst_port)),
+            Some((6, 443))
+        );
+    }
+
+    /// The bypass itself, end to end: one outbound fragment must not open a hole
+    /// that inbound traffic can walk through. Before the chain walk both packets
+    /// parsed as `(proto 44, ports 0/0)`, which is the same `Flow`, so
+    /// `track_outbound` whitelisted every fragment the peer cared to send.
+    #[test]
+    fn an_outbound_fragment_does_not_whitelist_inbound_traffic() {
+        let fw = SharedFirewall::new(FirewallConfig::default());
+        let peer = test_id(1);
+        let mut us = [0u8; 16];
+        us[0] = 0x02;
+        us[15] = 1;
+        let mut them = [0u8; 16];
+        them[0] = 0x02;
+        them[15] = 2;
+        // A later fragment of a large UDP send, in each direction.
+        let frag = |src: [u8; 16], dst: [u8; 16]| {
+            let mut pkt = ipv6_tcp(&[(IPV6_FRAGMENT, 0u8)], 48);
+            pkt[42..44].copy_from_slice(&(185u16 << 3).to_be_bytes());
+            pkt[8..24].copy_from_slice(&src);
+            pkt[24..40].copy_from_slice(&dst);
+            pkt
+        };
+
+        let out = parse_packet_info(&frag(us, them));
+        assert!(out.is_none(), "an unclassifiable packet opens no flow");
+
+        // Inbound from the same peer: must not be rescued by conntrack.
+        let inbound = parse_packet_info(&frag(them, us));
+        assert!(inbound.is_none(), "and none is waiting to rescue this one");
+
+        // The default inbound policy is what such a packet now meets instead.
+        assert_eq!(fw.evaluate(Direction::In, 6, 22, &peer), Action::Deny);
+
+        // Nor does the first fragment open one. It could be classified, but the
+        // datagram behind it cannot be delivered, so forwarding it would open a
+        // conntrack entry on the strength of a send that never completes.
+        let mut first = ipv6_tcp(&[(IPV6_FRAGMENT, 0u8)], 48);
+        first[42..44].copy_from_slice(&1u16.to_be_bytes());
+        first[8..24].copy_from_slice(&us);
+        first[24..40].copy_from_slice(&them);
+        assert!(
+            parse_packet_info(&first).is_none(),
+            "a first fragment opens no flow either"
+        );
+
+        // The same send under the MTU is unaffected: it is fragmentation that is
+        // refused, and it keys on its own port, so a flow to :443 never admits :22.
+        let mut whole = ipv6_tcp(&[], 40);
+        whole[8..24].copy_from_slice(&us);
+        whole[24..40].copy_from_slice(&them);
+        let info = parse_packet_info(&whole).expect("an unfragmented send is classifiable");
+        assert_eq!((info.protocol, info.dst_port), (6, 443));
+    }
+
+    /// A chain that never reaches a protocol must not be walked forever, and a
+    /// chain that runs off the end of the packet must not be read past it.
+    #[test]
+    fn a_chain_that_goes_nowhere_is_refused_rather_than_followed() {
+        // Every link says "hop-by-hop next", so the walk never terminates.
+        let mut pkt = vec![0u8; 200];
+        pkt[0] = 0x60;
+        pkt[6] = 0;
+        pkt[24] = 0x02;
+        assert!(parse_packet_info(&pkt).is_none(), "the depth cap must hold");
+
+        // A length that points past the last byte.
+        let mut pkt = vec![0u8; 60];
+        pkt[0] = 0x60;
+        pkt[6] = 0;
+        pkt[24] = 0x02;
+        pkt[40] = 6; // next = TCP
+        pkt[41] = 200; // ... 1608 octets away, which is not in this packet
+        assert!(parse_packet_info(&pkt).is_none());
+
+        // `No Next Header` (59) ends the chain, but it is a protocol number
+        // rather than a link: it keys as `(59, 0, 0)`, which is per-protocol and
+        // not the cross-protocol wildcard the walk exists to stop.
+        let mut pkt = ipv6_tcp(&[(0u8, 0u8)], 48);
+        pkt[40] = 59;
+        assert_eq!(
+            parse_packet_info(&pkt).map(|i| (i.protocol, i.src_port, i.dst_port)),
+            Some((59, 0, 0))
+        );
+    }
+
+    /// A non-first IPv4 fragment has the same missing L4 header as its IPv6 twin.
+    /// Nothing on the mesh produces IPv4 any more, so this guards the path rather
+    /// than fixing a live bug, and it costs one comparison to keep it guarded.
+    #[test]
+    fn a_non_first_ipv4_fragment_is_refused() {
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x45;
+        pkt[9] = 6; // TCP
+        pkt[12..16].copy_from_slice(&[100, 64, 0, 5]);
+        pkt[16..20].copy_from_slice(&[100, 64, 0, 9]);
+        pkt[22] = 1;
+        pkt[23] = 0xbb; // "dst port" 443, which is payload on a later fragment
+        assert!(parse_packet_info(&pkt).is_some(), "offset 0 parses");
+
+        // Fragment offset 185, i.e. 1480 octets into the datagram.
+        pkt[6..8].copy_from_slice(&185u16.to_be_bytes());
+        assert!(parse_packet_info(&pkt).is_none());
+    }
+
+    /// An IPv6 packet whose extension chain is `links` in wire order, each
+    /// `(kind, hdr_ext_len)`, followed by a TCP header at `tcp_off`. Ports are
+    /// 4444 and 443, so a walk that lands anywhere else reads zeros and the
+    /// caller's assertion fails rather than passing on a coincidence.
+    ///
+    /// `tcp_off` is passed rather than returned so the fixture and the test agree
+    /// on where the header should be; a mismatch is the fixture's own bug and is
+    /// asserted here.
+    fn ipv6_tcp(links: &[(u8, u8)], tcp_off: usize) -> Vec<u8> {
+        let mut pkt = vec![0u8; tcp_off + 20];
+        pkt[0] = 0x60;
+        pkt[24] = 0x02; // an overlay destination, so callers take the firewall path
+        pkt[6] = links.first().map(|(kind, _)| *kind).unwrap_or(6);
+        let mut off = 40;
+        for (i, (kind, len)) in links.iter().enumerate() {
+            // The next link, or the upper-layer protocol once the chain runs out.
+            pkt[off] = links.get(i + 1).map(|(k, _)| *k).unwrap_or(6);
+            // Reserved on a Fragment header, a length everywhere else.
+            pkt[off + 1] = *len;
+            off += match *kind {
+                IPV6_FRAGMENT => 8,
+                IPV6_AH => (usize::from(*len) + 2) * 4,
+                _ => (usize::from(*len) + 1) * 8,
+            };
+        }
+        assert_eq!(off, tcp_off, "the fixture disagrees with its own tcp_off");
+        pkt[tcp_off..tcp_off + 2].copy_from_slice(&4444u16.to_be_bytes());
+        pkt[tcp_off + 2..tcp_off + 4].copy_from_slice(&443u16.to_be_bytes());
+        pkt
     }
 
     #[test]

@@ -52,8 +52,8 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
                 );
             }
         }
-        ipc::IpcMessage::Error { message } => print_error("firewall", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("firewall", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -187,8 +187,8 @@ async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
         ipc::IpcMessage::FirewallSshState { enabled, networks } => {
             render_ssh_state(enabled, networks, filter.as_deref())
         }
-        ipc::IpcMessage::Error { message } => print_error("firewall ssh", &message, None),
-        other => eprintln!("Unexpected response: {other:?}"),
+        ipc::IpcMessage::Error { message } => fail_with("firewall ssh", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -371,14 +371,8 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
     .await?;
     let rules = match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::FirewallPendingResponse { rules, .. } => rules,
-        ipc::IpcMessage::Error { message } => {
-            print_error("firewall pending", &message, None);
-            return Ok(());
-        }
-        other => {
-            eprintln!("Unexpected response: {other:?}");
-            return Ok(());
-        }
+        ipc::IpcMessage::Error { message } => fail_with("firewall pending", &message),
+        other => fail_unexpected(&other),
     };
 
     if json_enabled() {
@@ -418,8 +412,8 @@ pub(crate) async fn ipc_firewall_pending(network: &str) -> Result<()> {
         ipc::IpcMessage::Ok { message } => {
             println!("  {} {}", style::check(), style::value(&message));
         }
-        ipc::IpcMessage::Error { message } => print_error("firewall pending", &message, None),
-        other => eprintln!("Unexpected response: {other:?}"),
+        ipc::IpcMessage::Error { message } => fail_with("firewall pending", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -474,14 +468,8 @@ pub(crate) async fn ipc_firewall_suggest(
     .await?;
     let mut suggestions = match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::FirewallSuggestionsResponse { suggestions } => suggestions,
-        ipc::IpcMessage::Error { message } => {
-            print_error("error", &message, None);
-            std::process::exit(1);
-        }
-        other => {
-            eprintln!("Unexpected response: {other:?}");
-            std::process::exit(1);
-        }
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     };
 
     let entry = suggestions.entry(subject.to_string()).or_default();
@@ -509,8 +497,8 @@ pub(crate) async fn ipc_firewall_suggest(
     .await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{message}"),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {other:?}"),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -905,7 +893,6 @@ pub(crate) async fn ipc_invite_mint(network: &str, hostname: Option<String>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
 
     /// `IpcMessage` has no `PartialEq` (it carries wire types that don't want
     /// one), so compare the settings-key mapping as a tuple.
@@ -1017,8 +1004,7 @@ mod tests {
     fn peer(hostname: &str, user: Option<iroh::EndpointId>) -> ipc::PeerStatus {
         ipc::PeerStatus {
             endpoint_id: iroh::SecretKey::generate().public(),
-            ip: Ipv4Addr::new(100, 64, 0, 2),
-            ipv6: None,
+            ipv6: "200::2".parse().unwrap(),
             hostname: Some(hostname.to_string()),
             user_identity: user,
             is_own_device: false,
@@ -1034,8 +1020,7 @@ mod tests {
         ipc::NetworkStatus {
             name: "n".to_string(),
             role: ipc::NetworkRole::Member,
-            my_ip: Ipv4Addr::new(100, 64, 0, 1),
-            my_ipv6: None,
+            my_ipv6: "200::1".parse().unwrap(),
             my_hostname: my_hostname.map(|s| s.to_string()),
             network_key: None,
             member_count: 0,

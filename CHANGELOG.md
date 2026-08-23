@@ -8,58 +8,106 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Exit nodes work in IPv6-only mode.** `ray exit-node use` was refused on a
-  host sharing the box with another VPN, which is where the feature is most
-  useful. It now works, tunnelling IPv6: mesh IPv4 carries no traffic in that
-  mode, so your IPv4 internet traffic keeps leaving directly, and both
-  `ray exit-node use` and `ray exit-node status` say so rather than leaving you
-  to find out. Offering an exit node was never affected by the mode.
-- **A tunnel carries only what both ends can carry, and says which.** A gateway
-  reports whether it can return IPv4, IPv6 or both, and the tunnel takes the
-  families your node and that gateway have in common. A gateway that can return
-  only one of them narrows the tunnel to it: that family goes through the exit,
-  the other keeps leaving this host directly, and `ray exit-node use` and
-  `ray exit-node status` both name which is which. This covers a gateway running
-  IPv6-only mode itself (it never routes the mesh IPv4 your reply would come back
-  on) and a gateway with no IPv6 uplink, whose tunnelled IPv6 used to vanish at
-  the far end with nothing said. Only a gateway that can return neither family is
-  refused, and that check runs on every re-apply rather than only when you pick,
-  so a gateway that loses its uplink (or a node whose IPv6-only mode turns itself
-  on) stops tunnelling with a message instead of silently carrying nothing, and
-  picks the tunnel back up by itself when the gateway reports an uplink again.
-  Gateways that report IPv6 are marked `(IPv6)` in `ray exit-node status`. A
-  gateway on a network whose coordinator predates this feature reports nothing
-  either way: it stays selectable and narrows nothing, since refusing would rule
-  out every gateway on such a network, and `ray exit-node use` tells you the
-  claim is unverified.
-- **DNS follows the tunnel when the tunnel is the only way out.** While a tunnel
-  carries IPv6 and not IPv4, the daemon's own DNS forwarder is pointed at an IPv6
-  resolver, so its lookups go through the exit rather than around it. On Linux
-  hosts using systemd-resolved, NetworkManager or resolvconf, applications'
-  non-`.ray` lookups still leave directly, and the daemon logs a warning saying
-  so. If you pinned your own resolvers with `ray config set dns-upstreams …
-  --replace` and none of them are IPv6, yours are kept rather than swapped for
-  public ones: they stay reachable over the IPv4 such a tunnel leaves direct, so
-  those lookups go around the exit instead of to a resolver you did not choose.
-- **`ray config set dns-upstreams` takes IPv6 addresses.** Used by an exit-node
-  tunnel in IPv6-only mode, which has no IPv4 to reach a v4 resolver over. Naming
-  only IPv6 servers no longer lets rayfish take over `/etc/resolv.conf` on a host
-  where it found no working one of its own: those entries are reachable only
-  through the tunnel, so counting them would have taken the file and left the
-  machine unable to resolve anything.
+- **Exit nodes tunnel IPv6.** `ray exit-node use` routes your IPv6 internet
+  traffic through the gateway and leaves your IPv4 traffic leaving directly,
+  which both `ray exit-node use` and `ray exit-node status` say out loud rather
+  than leaving you to find out from a leak test. The mesh carries no IPv4, so
+  there is no IPv4 for a tunnel to source transit from; claiming your IPv4
+  default would take it from whatever else is using the box and send it into a
+  hole. Offering an exit node is unaffected.
+- **A gateway that cannot carry IPv6 is refused, with a reason.** Gateways report
+  whether they have an IPv6 uplink, and ones that do are marked `(IPv6)` in
+  `ray exit-node status`. Picking one that reports otherwise is refused rather
+  than left to time out. The check runs on every re-apply, not only when you
+  pick, so a gateway that loses its uplink stops tunnelling with a message
+  instead of silently carrying nothing, and picks the tunnel back up by itself
+  when it reports one again. A gateway on a network whose coordinator predates
+  this feature reports nothing either way: it stays selectable, since refusing
+  would rule out every gateway on such a network, and `ray exit-node use` tells
+  you the claim is unverified.
+- **DNS follows the tunnel.** While a tunnel is up, the daemon's own DNS
+  forwarder is pointed at an IPv6 resolver, so its lookups go through the exit
+  rather than around it. On Linux hosts using systemd-resolved or resolvconf,
+  applications' non-`.ray` lookups still leave directly, and the daemon logs a
+  warning saying so. If you pinned your own resolvers with `ray config set
+  dns-upstreams … --replace` and none of them are IPv6, yours are kept rather
+  than swapped for public ones: they stay reachable over the IPv4 a tunnel
+  leaves direct, so those lookups go around the exit instead of to a resolver
+  you did not choose.
+- **`ray config set dns-upstreams` takes IPv6 addresses.** Naming only IPv6
+  servers no longer lets rayfish take over `/etc/resolv.conf` on a host where it
+  found no working resolver of its own: those entries are reachable only through
+  the tunnel, so counting them would have taken the file and left the machine
+  unable to resolve anything.
+- **Android notifies you when someone sends you a file.** An incoming file from
+  another peer used to arrive in silence: notifications only covered transfers
+  that were already under way, and a file waiting on your decision has no
+  transfer behind it yet, so the only place it appeared was the app's own list.
+  Sent while the app was closed, it sat there unannounced until you next opened
+  it. There is now a notification naming the file, who sent it and how big it
+  is, with Save and Reject on it so you can take the file without opening the
+  app at all. Files from your own paired devices are unaffected: those are still
+  saved automatically and reported as they download.
+- **`ray logs`: read the daemon's log without hunting for the files.** The logs
+  are root-owned under `/var/log/rayfish` (`/Library/Logs/rayfish` on macOS),
+  so until now looking at them meant `sudo cat` and knowing which file, or
+  `ray report`, which bundles a week of them into a tarball meant for sharing.
+  `ray logs` prints today's, from the daemon over IPC, so it needs no root:
+
+  ```bash
+  ray logs                 # everything since the last daily rotation
+  ray logs --since 2h30m   # only the last two and a half hours
+  ray logs -f              # keep streaming new lines, like tail -f
+  ray logs --since 5m -f   # the last five minutes, then keep streaming
+  ```
+
+  Output goes through `$PAGER` (`less`) on a terminal and straight through
+  when piped or following, so `ray logs | grep peer` and `ray logs -f` both
+  behave the way you would expect.
 
 ### Changed
 
-- **The mesh protocol version is now 3, and every peer must be on it.** Control
-  frames, pairing, `ray connect`, file transfer and the signed roster are now
-  encoded more compactly, which takes a bit under 30% off the largest thing on
-  the wire (a 50-member roster drops from 5194 to 3764 bytes, and about 30% when
-  every member is a paired device). The encoding is not
-  backward compatible, and peers on different protocol versions cannot connect
-  at all, so a mesh has to upgrade together: a node left on 0.3.x will stop
-  seeing the rest of the network rather than degrading. Nothing on disk changes,
-  so upgrading in place keeps your networks, identity and pairings.
+- **Rayfish is IPv6-only. Mesh IPv4 is gone.** Every peer had two mesh addresses:
+  an IPv4 in `100.64.0.0/10` and an IPv6 in `200::/7`. Only the IPv6 remains.
+  It is blake3 of the peer's identity, so it is collision-free, never rotates,
+  and is derived locally by every node rather than carried on the wire. `ray
+  status`, `ray ping`, Magic DNS, the exit node and the Android app all use it.
+  A `.ray` name answers AAAA only; an A query returns NODATA, because there is
+  no IPv4 address to give.
 
+  Two consequences worth knowing before you upgrade:
+
+  - **Every node must upgrade together.** The mesh protocol goes to 4 and peers
+    on different versions cannot connect at all, so a node left behind stops
+    seeing the network rather than degrading. `ray status` marks such a peer
+    incompatible, and a join against a network on another version fails naming
+    both.
+  - **Check what your services listen on.** `0.0.0.0` is the IPv4 wildcard, not
+    "any address", so a service bound there has no IPv6 socket and peers can no
+    longer reach it. Bind `::` instead, which accepts both families on Linux.
+    Go and Node already do this; nginx needs `listen [::]:80;` adding, and
+    `--bind 0.0.0.0` defaults and Docker published ports need the flag changed.
+    `ss -tlnp` shows which is which: `0.0.0.0:port` is affected, `[::]:port` is
+    not.
+
+- **`ipv6-only` is gone as a setting.** `ray config set ipv6-only` and `ray up
+  --ipv6-only` no longer exist, and neither does the startup scan behind them.
+  There is nothing left to choose: the overlay never claims `100.64.0.0/10`, so
+  sharing a host with Tailscale needs no mode and no configuration. A stale
+  `ipv6_only` key in `settings.toml` is ignored rather than an error.
+- **Magic DNS answers at `200::53` only.** The old `100.100.100.53` is not used;
+  an upgrade strips it from `/etc/resolv.conf` on the way through. Use
+  `dig @200::53 <host>.ray`.
+- **NetworkManager is no longer used to configure DNS.** Its D-Bus interface can
+  only carry an IPv4 nameserver, so it cannot point the system at an IPv6
+  resolver. The detection ladder falls through to resolvconf or a direct
+  `/etc/resolv.conf`, both of which take either family.
+- **The wire is more compact.** Control frames, pairing, `ray connect`, file
+  transfer and the signed roster are array-encoded, taking a bit under 30% off
+  the largest thing on the wire (a 50-member roster drops from 5194 to 3764
+  bytes). Dropping the mesh IPv4 and its collision index takes more off again.
+  This is part of what the protocol bump above covers. Nothing on disk changes,
+  so upgrading in place keeps your networks, identity and pairings.
 
 - **`ray firewall --help` is grouped, and every help page reads in one pass.**
   The firewall's 13 actions are now listed under Rules, Mode, Coordinator
@@ -78,6 +126,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   existing scripts are unaffected; they no longer appear in `ray --help` or in
   tab completion. `ray open` (the `rayfish://` link handler, which nobody types)
   is hidden for the same reason.
+- **Android 8.0 (API 26) is now the minimum.** Every notification the app posts
+  goes through a notification channel, which is an 8.0 API, so on 7.x the calls
+  threw and were swallowed: transfers and incoming files were announced by
+  nothing at all, on a build that otherwise looked like it worked. Rather than
+  keep a tier where the app is quietly half-functional, 7.x is dropped. Android
+  8.0 and later are unaffected.
+- **The address on the mobile app's rows is readable again.** A node's only
+  address is now a full mesh IPv6, which did not fit on one line beside its
+  label, so it was ellipsised in the middle: unreadable, and impossible to check
+  against `ray status`. Those rows wrap to a second line instead.
 - **The mobile app stops waking the radio every minute.** Every node used to
   re-resolve each network's signed record once a minute, whether or not
   anything had changed, which on a phone is a wakeup per network per minute for
@@ -89,6 +147,59 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A kicked member now actually leaves the network.** `ray kick` removed the
+  member from the roster and cut its connection, but never told it *which*
+  network it had been removed from: a connection close code cannot name one. The
+  kicked node fell back to noticing at its next group poll, and all that does is
+  stop polling, so the network stayed in `ray status` and on disk with the roster
+  frozen at the moment of the kick: joined-looking, carrying no traffic, and
+  needing a manual `ray leave` to clear. It now receives the same in-band,
+  network-scoped notice the automatic (`ray ephemeral`) removal has always sent,
+  confirms it against the signed record, and leaves that one network on its own.
+  Other members were never affected: they reconverge from the published roster.
+
+- **`ray` exits non-zero when a command fails.** Every command that talks to the
+  daemon printed a rejection to stderr and then exited 0, so `ray join` on a
+  spent invite, `ray exit-node use` on a gateway that cannot carry IPv6, and
+  forty-odd others reported success to whatever ran them. They now exit 1.
+  Scripts that only checked the exit status were being told every command
+  worked; scripts that deliberately relied on the old behaviour will need
+  updating. A reply the CLI does not recognise, which is what a `ray` binary
+  and a daemon on different versions produce, exits non-zero for the same
+  reason and now names the version skew as the likely cause.
+- **Taking over `/etc/resolv.conf` no longer breaks DNS on a NetworkManager
+  host that runs its own resolver.** With NetworkManager in `dns=dnsmasq` mode,
+  the server rayfish found in `resolv.conf` is NetworkManager's own local
+  forwarder, and telling NetworkManager to stop managing DNS is exactly what
+  stops it. Rayfish checked for a working upstream *before* that, took the file
+  over on the strength of a resolver it then shut down, and left the host unable
+  to resolve anything outside `.ray`. The check now runs on both sides of that
+  step, and the difference between them is the verdict: if servers that were
+  answering a moment earlier stop, rayfish hands the file back and refuses the
+  takeover with the reason, leaving the host with working DNS and no Magic DNS.
+  A host with no working DNS to begin with (mid-boot, a link still associating)
+  is an ordinary retry rather than that verdict, and the verdict itself has to
+  hold twice before rayfish stops trying, so a passing failure no longer costs
+  you Magic DNS until the next restart.
+- **macOS: `ray down` no longer leaves the machine pointed at a dead resolver.**
+  Bringing the data plane down removed rayfish's DNS configuration and then
+  immediately wrote part of it back, so the Mac was left with a resolver entry
+  naming an address that stops answering the moment the tunnel interface goes.
+  With an exit node selected it was worse: the entry it restored was the
+  catch-all one, so every name on the machine went to it, not just `.ray`.
+- **macOS: a host that both offers and uses an exit node no longer advertises
+  IPv6 it cannot carry.** Checking for an IPv6 uplink asked the routing table,
+  which by then answered with the machine's own tunnel. It published itself as
+  IPv6-capable on the strength of that, and clients that believed it got a
+  tunnel with nowhere to send their traffic.
+- **Offering an exit node no longer turns the host into an IPv4 router.**
+  `ray exit-node allow` enabled IPv4 forwarding and installed an IPv4 NAT rule
+  for `100.64.0.0/10` alongside the IPv6 ones. The mesh carries no IPv4, so
+  there was nothing of ours for either to act on. On macOS and FreeBSD the NAT
+  rule matched on the uplink rather than on the rayfish interface, so the only
+  traffic it could still have caught belonged to another VPN sharing the host.
+  Both are gone; teardown still restores the IPv4 forwarding setting, so a host
+  that enabled it under an older release is put back as before.
 - **Re-applying an exit node no longer lets traffic out around the tunnel while
   it rebuilds.** Every `ray exit-node` command, and every roster change that
   reaches a live tunnel, rebuilds the routing rules. The catch-all that sends
@@ -175,6 +286,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **A peer could get past the inbound firewall with a fragmented IPv6 packet.**
+  The packet parser read the protocol and ports at fixed offsets, so any packet
+  carrying an IPv6 extension header (a fragment, hop-by-hop, routing or
+  destination-options header) was recorded as protocol 44 with no ports. That is
+  a single connection-tracking entry matching *every* such packet from that peer,
+  so one ordinary outbound fragment (any UDP send larger than the 1280-byte
+  tunnel MTU) opened a 30-second window in which that peer could reach any local
+  port, whatever the firewall said. The parser now walks the header chain to the
+  real protocol, so a chained packet is classified on its own ports. Fragments
+  are refused outright, first one included: a fragment after the first carries no
+  transport header to classify, and forwarding the first one alone would only put
+  a datagram on the wire that the peer can never reassemble. So a datagram large
+  enough to be fragmented does not cross the mesh. Lower your application's
+  datagram size or let TCP
+  handle it. Refusals are counted as `malformed` drops in `ray status`, so
+  traffic that stops this way is visible rather than silent.
+- **An exit node no longer gives its clients a route onto its own network.** A
+  gateway refused to forward traffic into private IPv4 ranges, loopback and
+  link-local, but an IPv6 LAN is normally a *global* prefix handed out by the
+  ISP, which none of those checks can recognise. A client of the exit node could
+  therefore reach every other machine on the gateway's LAN. The gateway now reads
+  the prefixes it is directly attached to and refuses transit into them, which is
+  what the IPv4 side already had for free.
 - **Knowing a network's room id no longer lets a stranger talk to it.** A mesh
   control message is addressed to a network by its public key, and that key is
   a discovery key by design: it is in every invite code and it is the address
@@ -227,25 +361,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still made a coordinator re-sign and republish its membership record and
   notify every member, each of whom answered with a lookup of their own. It is
   now ignored.
-
-### Added
-
-- **`ray logs`: read the daemon's log without hunting for the files.** The logs
-  are root-owned under `/var/log/rayfish` (`/Library/Logs/rayfish` on macOS),
-  so until now looking at them meant `sudo cat` and knowing which file, or
-  `ray report`, which bundles a week of them into a tarball meant for sharing.
-  `ray logs` prints today's, from the daemon over IPC, so it needs no root:
-
-  ```bash
-  ray logs                 # everything since the last daily rotation
-  ray logs --since 2h30m   # only the last two and a half hours
-  ray logs -f              # keep streaming new lines, like tail -f
-  ray logs --since 5m -f   # the last five minutes, then keep streaming
-  ```
-
-  Output goes through `$PAGER` (`less`) on a terminal and straight through
-  when piped or following, so `ray logs | grep peer` and `ray logs -f` both
-  behave the way you would expect.
 
 ## [0.3.0] - 2026-08-15
 
@@ -504,7 +619,7 @@ this build cannot be redeemed by a peer still on 0.2.x.
   the leftover network fixed it instantly. Traffic is now attributed to a
   network the peer agrees you share, and the log names the one that fell away.
 
-- **`.ray` names now resolve on macOS in IPv6-only mode.** `ssh dev.box.ray`
+- **`.ray` names now resolve on macOS in IPv6-only mode.** `ssh <host>.<net>.ray`
   failed with "nodename nor servname provided" on a Mac sharing the host with
   another VPN, while `dig` against the same resolver answered instantly: macOS
   was never asking us for AAAA records, and AAAA is the only answer that mode

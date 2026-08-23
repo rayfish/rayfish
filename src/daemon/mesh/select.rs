@@ -51,16 +51,13 @@ pub(crate) fn persisted_roster(network_name: &str) -> Vec<Member> {
                 .into_iter()
                 .map(|m| Member {
                     identity: m.identity,
-                    ip: m.ip,
                     is_coordinator: m.is_coordinator,
                     hostname: m.hostname,
                     user_identity: None,
                     device_cert: None,
-                    collision_index: 0,
                     last_seen: None,
                     exit_node: false,
                     exit_families: ExitFamilies::Unknown,
-                    ipv6_only: false,
                 })
                 .collect()
         })

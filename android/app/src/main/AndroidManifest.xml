@@ -107,6 +107,14 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- Takes or declines an incoming file offer from its notification's Save
+             and Reject actions. Not exported: the only thing that starts it is our
+             own PendingIntent, which carries our identity, not the shade's. -->
+        <service
+            android:name=".ReceiveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <service
             android:name=".RayfishVpnService"
             android:exported="false"
