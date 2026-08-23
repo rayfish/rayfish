@@ -127,9 +127,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   forwarder, and telling NetworkManager to stop managing DNS is exactly what
   stops it. Rayfish checked for a working upstream *before* that, took the file
   over on the strength of a resolver it then shut down, and left the host unable
-  to resolve anything outside `.ray`. The check now runs again afterwards: if
-  nothing answers any more, rayfish hands the file back and refuses the takeover
-  with the reason, which leaves the host with working DNS and no Magic DNS.
+  to resolve anything outside `.ray`. The check now runs on both sides of that
+  step, and the difference between them is the verdict: if servers that were
+  answering a moment earlier stop, rayfish hands the file back and refuses the
+  takeover with the reason, leaving the host with working DNS and no Magic DNS.
+  A host with no working DNS to begin with (mid-boot, a link still associating)
+  is an ordinary retry rather than that verdict, and the verdict itself has to
+  hold twice before rayfish stops trying, so a passing failure no longer costs
+  you Magic DNS until the next restart.
 - **macOS: `ray down` no longer leaves the machine pointed at a dead resolver.**
   Bringing the data plane down removed rayfish's DNS configuration and then
   immediately wrote part of it back, so the Mac was left with a resolver entry

@@ -14,7 +14,7 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering};
 // Only the macOS/Linux configurators build resolver/backup file paths; Android
 // does no OS-level DNS configuration.
 #[cfg(not(target_os = "android"))]
@@ -2005,6 +2005,17 @@ fn merge_search_domains(captured: &[SearchDomain], rayfish: &[SearchDomain]) -> 
 #[cfg(target_os = "linux")]
 static NM_TAKEOVER_UNSAFE: AtomicBool = AtomicBool::new(false);
 
+/// Consecutive [`NmQuietOutcome::Abort`] verdicts. Two before [`NM_TAKEOVER_UNSAFE`]
+/// is set, mirroring the two strikes `run_resolv_reassert` gives the resolver it
+/// shares the file with.
+///
+/// The verdict is inferred from a pair of liveness probes either side of a
+/// NetworkManager reload, and both halves of that pair are network measurements
+/// that can be wrong once. A permanent decision deserves better evidence than a
+/// single pair, and the only thing a second look costs is one retry cycle.
+#[cfg(target_os = "linux")]
+static NM_ABORTS: AtomicU32 = AtomicU32::new(0);
+
 /// What quieting NetworkManager did to the upstreams we captured before it.
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, PartialEq, Eq)]
@@ -2024,11 +2035,16 @@ enum NmQuietOutcome {
 
 /// Classify the upstream set after [`nm_quiet_install`], given what it was before.
 ///
+/// Both sets are live probes taken either side of the quiet, so the difference
+/// between them is attributable to the quiet and to nothing else. `apply` refuses
+/// an empty `before` on its own, before it touches anything, which is why an
+/// empty pair reads as [`NmQuietOutcome::Proceed`] here rather than as an abort:
+/// "there was nothing to lose" is not a verdict about NetworkManager.
+///
 /// Split out from `apply` because the ordering it guards is not otherwise
-/// observable: the capture happens in `new`, the kill happens in `apply`, and
-/// between them sits an `ensure!` that reads a set which was true when it was
-/// taken. The operator's own `dns_upstreams` waives the abort for the same reason
-/// it waives the `ensure!`: the forwarder gets somewhere to send queries either way.
+/// observable. The operator's own `dns_upstreams` waives the abort for the same
+/// reason it waives the `ensure!`: the forwarder gets somewhere to send queries
+/// either way.
 #[cfg(any(target_os = "linux", test))]
 fn nm_quiet_outcome(
     before: &[Ipv4Addr],
@@ -2096,28 +2112,54 @@ impl DnsConfigurator for DirectResolvConf {
             );
         }
 
-        let path = Path::new("/etc/resolv.conf");
-        backup_file(path).await?;
-        // Quiet NM first so it doesn't regenerate the file out from under the
-        // write we're about to make (the inotify re-assert covers any residual).
-        nm_quiet_install().await;
         // The `ensure!` above can pass on the strength of a server we are about
         // to kill. NetworkManager in `dns=dnsmasq` mode answers at a loopback
         // address of its own and writes *that* into resolv.conf, and the
-        // `dns=none` drop-in just installed is precisely what stops it. The
-        // capture in `new` probed it while it was still alive, so re-probe now
-        // that it is not: this is the same black hole the guard exists to
-        // refuse, reached by ordering rather than by an empty capture.
-        let before = self.captured_upstreams.load().as_ref().clone();
+        // `dns=none` drop-in below is precisely what stops it. So the capture is
+        // re-probed on both sides of the kill, and the verdict is the difference
+        // between them.
+        //
+        // Probing *before* is what makes it a verdict about NetworkManager rather
+        // than about the clock. The capture in `new` may be minutes old, and a
+        // host that lost its DNS in the meantime (a boot, a reassociating link)
+        // presents exactly the evidence an NM forwarder does: everything answered
+        // then, nothing answers now. Attributing that to the quiet is what latched
+        // Magic DNS off for the daemon's lifetime on a passing blip.
+        let captured = self.captured_upstreams.load().as_ref().clone();
+        let before = crate::dns::resolver::live_upstreams(&captured).await;
+        anyhow::ensure!(
+            !before.is_empty() || self.operator_upstreams,
+            "no DNS server named in /etc/resolv.conf is answering right now, so taking it \
+             over would leave this host unable to resolve anything; this is a plain retry, \
+             not a verdict about NetworkManager"
+        );
+        // Keep what the probe just learned, for the same reason the `Degraded`
+        // arm below does: this set is what `fallbacks` renders into the file and
+        // what `adopt_configurator` seeds the forwarder with, and a server that
+        // has stopped answering costs a full lookup timeout in either.
+        if before.len() != captured.len() {
+            self.captured_upstreams.store(Arc::new(before.clone()));
+        }
+
+        let path = Path::new("/etc/resolv.conf");
+        backup_file(path).await?;
+        // Quiet NM so it doesn't regenerate the file out from under the write
+        // we're about to make (the inotify re-assert covers any residual).
+        nm_quiet_install().await;
+        // `before`, not `captured`: comparing like with like, so a server that was
+        // already dead cannot be counted against the quiet.
         let after = crate::dns::resolver::live_upstreams(&before).await;
         match nm_quiet_outcome(&before, &after, self.operator_upstreams) {
-            NmQuietOutcome::Proceed => {}
+            NmQuietOutcome::Proceed => {
+                NM_ABORTS.store(0, AtomicOrdering::Relaxed);
+            }
             // Narrowed, not just reported: this set is what `fallbacks` renders
             // into the file and what `adopt_configurator` seeds the forwarder
             // with, and a dead server in either costs a full lookup timeout per
             // off-mesh name. The capture in `new` probed for exactly this reason;
             // quieting NM is simply a second chance to be wrong.
             NmQuietOutcome::Degraded(dead) => {
+                NM_ABORTS.store(0, AtomicOrdering::Relaxed);
                 tracing::warn!(
                     ?dead,
                     "some DNS servers stopped answering once NetworkManager was quieted; \
@@ -2128,9 +2170,17 @@ impl DnsConfigurator for DirectResolvConf {
             NmQuietOutcome::Abort => {
                 restore_file(path).await?;
                 nm_quiet_remove().await;
-                // The retry loop would otherwise re-run this every 60s, and each
-                // run stops and restarts NetworkManager's resolver.
-                NM_TAKEOVER_UNSAFE.store(true, AtomicOrdering::Relaxed);
+                // Two verdicts before the latch, the same two strikes
+                // `run_resolv_reassert` gives the resolver it shares the file
+                // with, and for the same reason: one lost packet or one
+                // badly-timed reload should not decide this permanently. The
+                // retry loop backs off to 60s, so the cost of a second look is
+                // one cycle; the cost of latching wrongly is Magic DNS for the
+                // life of the daemon.
+                let aborts = NM_ABORTS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                if aborts >= 2 {
+                    NM_TAKEOVER_UNSAFE.store(true, AtomicOrdering::Relaxed);
+                }
                 anyhow::bail!(
                     "every DNS server /etc/resolv.conf named stopped answering once \
                      NetworkManager was told to stop managing DNS (`dns=none`), which is how \
@@ -2465,6 +2515,22 @@ mod tests {
             NmQuietOutcome::Proceed
         );
         assert_eq!(nm_quiet_outcome(&[], &[], true), NmQuietOutcome::Proceed);
+    }
+
+    /// A host that had no working DNS *before* the quiet is not evidence about
+    /// NetworkManager, whatever it looks like afterwards.
+    ///
+    /// This is the shape a passing blip takes: a boot, a reassociating link, a
+    /// capture minutes old. `apply` refuses it ahead of `backup_file` with an
+    /// ordinary error the retry loop retries, so it must not reach the abort that
+    /// latches the takeover off for the life of the daemon.
+    #[test]
+    fn nothing_answering_before_the_quiet_is_not_a_verdict_about_networkmanager() {
+        assert_eq!(nm_quiet_outcome(&[], &[], false), NmQuietOutcome::Proceed);
+        // And the abort still fires when something *was* answering and stopped,
+        // which is the case it exists for.
+        let nm = "127.0.0.1".parse::<Ipv4Addr>().unwrap();
+        assert_eq!(nm_quiet_outcome(&[nm], &[], false), NmQuietOutcome::Abort);
     }
 
     /// `Degraded` is not just a warning: the surviving set is what gets rendered
