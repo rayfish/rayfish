@@ -40,10 +40,19 @@ class ReceiveService : Service() {
             // Nothing to do, but a service started with startForegroundService
             // must still go foreground before it is allowed to stop, or the
             // system kills the process with a ForegroundServiceDidNotStartInTime
-            // ANR. Post, then stop.
-            startForegroundNotification("Rayfish", "Working")
-            stopForegroundCompat()
-            stopSelf(startId)
+            // ANR. Post, then stop -- but under the same lock and the same
+            // in-flight check as a finishing worker, or this no-op command would
+            // drop a running accept out of the foreground and stop the service
+            // out from under it.
+            synchronized(lifecycle) {
+                startForegroundNotification("Rayfish", "Working")
+                if (inFlight.get() == 0) {
+                    stopForegroundCompat()
+                    stopSelf(startId)
+                } else {
+                    lastStartId = startId
+                }
+            }
             return START_NOT_STICKY
         }
         val offerId = id.toULong()
@@ -60,16 +69,23 @@ class ReceiveService : Service() {
         OfferNotifier.markActedOn(applicationContext, offerId)
 
         val accepting = action == ACTION_ACCEPT
-        startForegroundNotification(
-            if (accepting) "Saving $filename" else "Rayfish",
-            if (accepting) "From $peer" else "Declining $filename",
-        )
+        // Counted *before* going foreground, and under the lock a finishing
+        // worker also takes. A worker whose `finally` lands between the two
+        // would otherwise see the count reach zero and leave the foreground
+        // again, dropping this command's transfer to a background service.
+        synchronized(lifecycle) {
+            inFlight.incrementAndGet()
+            lastStartId = startId
+            startForegroundNotification(
+                if (accepting) "Saving $filename" else "Rayfish",
+                if (accepting) "From $peer" else "Declining $filename",
+            )
+        }
 
         // Blocking FFI work off the main thread. The cleanup is not best-effort:
         // anything thrown here used to be able to kill the thread before it left
         // the foreground, stranding an ongoing notification with no service
         // behind it to ever clear it.
-        inFlight.incrementAndGet()
         thread(name = "rayfish-receive-$startId") {
             try {
                 if (accepting) accept(offerId, filename, peer, size, mime) else reject(offerId, filename)
@@ -81,14 +97,26 @@ class ReceiveService : Service() {
                 // with no way left to answer it.
                 OfferNotifier.clearActedOn(offerId)
             } finally {
-                // Only the last one out leaves the foreground. startForeground and
+                // Only the last one out tears anything down. startForeground and
                 // stopForeground are service-wide, not per start command, so a
                 // short reject finishing while a long accept is still downloading
                 // would otherwise drop that download to a background service and
-                // strand its notification. stopSelf(startId) needs no such guard:
-                // it is already a no-op unless this is the most recent start.
-                if (inFlight.decrementAndGet() == 0) stopForegroundCompat()
-                stopSelf(startId)
+                // strand its notification.
+                //
+                // stopSelf needs the same guard, which is the opposite of what it
+                // looks like: it stops the service when the id *is* the most
+                // recent start, so in exactly that reject-over-accept case the
+                // reject's own `stopSelf(2)` destroyed the service while the
+                // accept was still downloading. It also has to name the newest
+                // start rather than ours, or the accept finishing second would
+                // call `stopSelf(1)` while 2 is the most recent, which is a no-op
+                // and leaves the service up for good.
+                synchronized(lifecycle) {
+                    if (inFlight.decrementAndGet() == 0) {
+                        stopForegroundCompat()
+                        stopSelf(lastStartId)
+                    }
+                }
             }
         }
         return START_NOT_STICKY
@@ -144,12 +172,7 @@ class ReceiveService : Service() {
     }
 
     private fun stopForegroundCompat() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-        } else {
-            @Suppress("DEPRECATION")
-            stopForeground(true)
-        }
+        stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
     companion object {
@@ -160,8 +183,17 @@ class ReceiveService : Service() {
         // foreground notification, and the last stopSelf(startId) takes it down.
         private const val NOTIF_ONGOING = 3
 
+        /** Serializes going foreground against leaving it. Both the count and
+         * the foreground state are service-wide, so incrementing and posting must
+         * not interleave with a worker decrementing and tearing down. */
+        private val lifecycle = Any()
+
         /** Start commands whose worker thread has not finished yet. */
         private val inFlight = AtomicInteger(0)
+
+        /** The most recent start command, which is the only id `stopSelf` acts
+         * on. Guarded by [lifecycle]. */
+        private var lastStartId = 0
 
         const val ACTION_ACCEPT = "xyz.rayfish.android.ACCEPT_OFFER"
         const val ACTION_REJECT = "xyz.rayfish.android.REJECT_OFFER"

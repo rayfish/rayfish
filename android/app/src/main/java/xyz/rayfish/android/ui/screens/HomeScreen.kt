@@ -146,10 +146,14 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
         }
     }
 
-    fun act(block: suspend () -> Unit) {
+    // `onFailure` is how a caller undoes what it staged before the call. A reject
+    // that throws leaves the offer still pending core-side, so the notification
+    // suppression taken out ahead of it has to come back off or that offer is
+    // never announced again.
+    fun act(onFailure: () -> Unit = {}, block: suspend () -> Unit) {
         scope.launch {
             try { withContext(Dispatchers.IO) { block() }; reloadNotifs() }
-            catch (t: Throwable) { onToast("Failed: ${t.message}") }
+            catch (t: Throwable) { onFailure(); onToast("Failed: ${t.message}") }
         }
     }
     // The core writes into this app-private staging dir; we then move the file to
@@ -200,6 +204,9 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                 // already happened.
                 DownloadsOutcome.clearPending(key)
                 accepting.remove(f.id)
+                // Same reason as the reject path: the offer may still be pending,
+                // so stop suppressing its notification.
+                OfferNotifier.clearActedOn(f.id)
                 onToast("Failed: ${t.message}")
             }
         }
@@ -237,7 +244,9 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                             acceptLabel = "Save", onAccept = { acceptFile(f) },
                             onReject = {
                                 OfferNotifier.markActedOn(context, f.id)
-                                act { NodeHolder.get(context).rejectFileOffer(f.id) }
+                                act(onFailure = { OfferNotifier.clearActedOn(f.id) }) {
+                                    NodeHolder.get(context).rejectFileOffer(f.id)
+                                }
                             },
                         )
                     }

@@ -7,7 +7,6 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.graphics.drawable.Icon
-import android.os.Build
 import io.sentry.android.core.SentryLogcatAdapter as Log
 import uniffi.ray_mobile.FileOffer
 
@@ -109,7 +108,6 @@ object OfferNotifier {
      * called once per process, before we have posted anything, so it can only
      * ever reach notifications left behind by a previous process. */
     private fun cancelStaleNotifications(context: Context) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val nm = context.getSystemService(NotificationManager::class.java)
         runCatching {
             for (sbn in nm.activeNotifications) {
@@ -197,10 +195,6 @@ object OfferNotifier {
                     android.R.drawable.ic_menu_close_clear_cancel,
                 ),
             )
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            @Suppress("DEPRECATION")
-            builder.setPriority(Notification.PRIORITY_DEFAULT)
-        }
         context.getSystemService(NotificationManager::class.java)
             .notify(notifId(f.id), builder.build())
         Log.i("RayfishFiles", "offer ${f.id} from ${f.from} (${f.filename}) notified")
@@ -225,11 +219,16 @@ object OfferNotifier {
         // A foreground service cannot normally be started from the background,
         // but tapping a notification action puts the app on the system's
         // temporary allowlist, which is exactly what this exemption is for.
-        val pending = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            PendingIntent.getForegroundService(context, code, intent, PendingIntent.FLAG_IMMUTABLE)
-        } else {
-            PendingIntent.getService(context, code, intent, PendingIntent.FLAG_IMMUTABLE)
-        }
+        //
+        // FLAG_UPDATE_CURRENT is load-bearing, not tidiness. A PendingIntent is
+        // matched on package, request code and `Intent.filterEquals`, which
+        // deliberately ignores extras, and the request code here comes from the
+        // offer id -- a counter that restarts at 1 in every process. Without the
+        // flag, offer 1 of this run reuses the record left in system_server by
+        // offer 1 of the last one, so the button says one filename and hands
+        // ReceiveService the previous file's name, peer and size.
+        val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        val pending = PendingIntent.getForegroundService(context, code, intent, flags)
         val icon = Icon.createWithResource(context, iconRes)
         return Notification.Action.Builder(icon, label, pending).build()
     }
@@ -239,10 +238,6 @@ object OfferNotifier {
      * the channel or a notify() racing it would be dropped in silence. */
     internal fun ensureChannel(context: Context) {
         if (channelEnsured) return
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            channelEnsured = true
-            return
-        }
         val channel = NotificationChannel(
             CHANNEL_ID,
             "Incoming files",
