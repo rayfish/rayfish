@@ -487,37 +487,20 @@ impl NetworkRegistry {
             ));
         }
 
-        // Prune the roster + approved list, then republish the signed blob so the
-        // removal is authoritative, and drop the target's DNS entries.
-        {
-            let mut s = state.write().unwrap();
-            s.members.remove(&member_id);
-            s.approved.remove(&member_id);
-        }
-        dns::remove_hostname_by_ip(
-            &self.dns.hostname_table,
-            &self.dns.reverse_table,
-            network,
-            derive_ipv6(&member_id),
-        )
-        .await;
-        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
-        let net_pubkey = state.read().unwrap().network_public_key;
-        broadcast_member_sync(self, net_pubkey, network, None).await;
-
-        // Sever our own link(s) to the target now, rather than waiting for it to
-        // time out. Other members drop it when they reconverge from the freshly
-        // published record (`prune_departed_peers`).
-        for (pid, ip, _conn) in self.peers.peers_for_network_with_conn(network) {
-            if pid == member_id || self.device_user_map.resolve(&pid) == member_id {
-                // Only close the shared connection if this was the peer's last
-                // network with us; otherwise just drop this network's route so a
-                // peer we share other networks with stays reachable there.
-                if let Some(conn) = self.peers.remove_peer_from_network(&ip, network) {
-                    conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
-                }
-            }
-        }
+        // The two calls the ephemeral pruner makes, which is what
+        // `remove_member_roster_only`'s doc has always claimed the manual kick
+        // shared with it. It did not: this path closed the victim's connection
+        // with `KICK_CODE` instead, and a close code cannot name a network, so it
+        // is not a kick the victim can act on. `confirm_kick_and_leave` runs off
+        // the in-band, network-scoped `ControlMsg::KickedFromNetwork`, which only
+        // `finalize_removal` sends; without it the victim learned of its own
+        // removal from the group poll, whose `Departed` outcome does nothing but
+        // stop polling, leaving the network in `ray status` with a roster frozen
+        // at the kick. `finalize_removal` also deliberately leaves the connection
+        // open, so the message cannot lose a race with its own teardown.
+        let ctx = self.mesh_ctx();
+        remove_member_roster_only(&ctx, network, &state, member_id, derive_ipv6(&member_id)).await;
+        finalize_removal(&ctx, network, &state, &dht_notify, &[member_id]).await;
 
         tracing::info!(peer = %member_id.fmt_short(), network = %network, "kicked member");
         IpcMessage::Ok {

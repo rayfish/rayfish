@@ -112,6 +112,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A kicked member now actually leaves the network.** `ray kick` removed the
+  member from the roster and cut its connection, but never told it *which*
+  network it had been removed from: a connection close code cannot name one. The
+  kicked node fell back to noticing at its next group poll, and all that does is
+  stop polling, so the network stayed in `ray status` and on disk with the roster
+  frozen at the moment of the kick: joined-looking, carrying no traffic, and
+  needing a manual `ray leave` to clear. It now receives the same in-band,
+  network-scoped notice the automatic (`ray ephemeral`) removal has always sent,
+  confirms it against the signed record, and leaves that one network on its own.
+  Other members were never affected: they reconverge from the published roster.
+
 - **`ray` exits non-zero when a command fails.** Every command that talks to the
   daemon printed a rejection to stderr and then exited 0, so `ray join` on a
   spent invite, `ray exit-node use` on a gateway that cannot carry IPv6, and
