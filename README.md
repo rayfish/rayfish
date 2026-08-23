@@ -492,10 +492,10 @@ ray config unset relay                        # back to defaults
 
 Keys: `relay`, `discovery-dns`, `dns-upstreams`. Values are a comma list of
 presets (`rayfish`, `n0`), URLs, or IP addresses (`dns-upstreams` takes IPv6 ones
-too, used by an exit-node tunnel in IPv6-only mode). By default custom servers are
-added alongside the defaults; `--replace` swaps them out (a bad custom server
-with no fallback can isolate the node). Settings are saved to `settings.toml` and
-take effect on `sudo ray restart`.
+too, which is what an exit-node tunnel forwards through). By default custom
+servers are added alongside the defaults; `--replace` swaps them out (a bad
+custom server with no fallback can isolate the node). Settings are saved to
+`settings.toml` and take effect on `sudo ray restart`.
 
 ## Running alongside another VPN
 

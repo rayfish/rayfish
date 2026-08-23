@@ -492,10 +492,10 @@ mod tests {
             Some("alice".to_string())
         );
 
-        // alice renames to dario; bob leaves.
-        sync_network_hostnames(&table, &reverse, "net", &[("dario".to_string(), v6(1))]).await;
+        // alice renames to laptop; bob leaves.
+        sync_network_hostnames(&table, &reverse, "net", &[("laptop".to_string(), v6(1))]).await;
         assert_eq!(
-            resolve_name("dario.net.ray", SUFFIX, &table).await,
+            resolve_name("laptop.net.ray", SUFFIX, &table).await,
             Some(v6(1))
         );
         // Old name and departed peer no longer resolve; reverse is rebuilt.
@@ -504,7 +504,7 @@ mod tests {
         assert_eq!(reverse.get(&IpAddr::V6(v6(2))).map(|e| e.0.clone()), None);
         assert_eq!(
             reverse.get(&IpAddr::V6(v6(1))).map(|e| e.0.clone()),
-            Some("dario".to_string())
+            Some("laptop".to_string())
         );
     }
 

@@ -747,7 +747,7 @@ mod tests {
             ConnectMsg::Request {
                 from_contact_id: test_id(1),
                 from_endpoint: test_id(2),
-                hostname: Some("dario".to_string()),
+                hostname: Some("laptop".to_string()),
             },
             ConnectMsg::Pending,
             ConnectMsg::Approved {

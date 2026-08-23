@@ -583,7 +583,7 @@ mod tests {
             &table,
             &reverse,
             "homelab",
-            "dario",
+            "laptop",
             "200::7".parse().unwrap(),
         )
         .await;
@@ -591,7 +591,7 @@ mod tests {
 
         // Build a full IPv6/UDP query packet to MAGIC_IP:53 (use build_udp_reply
         // in reverse: synthesize a query with src=app, dst=magic).
-        let dns_query = build_aaaa_query("dario.homelab.ray");
+        let dns_query = build_aaaa_query("laptop.homelab.ray");
         let app = crate::firewall::PacketInfo {
             src_ip: IpAddr::V6("200::5".parse().unwrap()),
             dst_ip: IpAddr::V6(crate::dns::MAGIC_DNS_V6),
@@ -655,13 +655,13 @@ mod tests {
             &table,
             &reverse,
             "homelab",
-            "dario",
+            "laptop",
             "200::7".parse().unwrap(),
         )
         .await;
         let r = Resolver::new(table, reverse);
         // No upstreams set; a .ray name must still resolve locally.
-        let query = build_aaaa_query("dario.homelab.ray");
+        let query = build_aaaa_query("laptop.homelab.ray");
         let resp = r.resolve(&query).await.expect("local answer");
         assert!(response_has_aaaa(&resp, "200::7".parse().unwrap()));
     }

@@ -57,7 +57,7 @@ step "3. srv-a requests a direct connection to srv-b"
 sleep 8
 CONNECT_OUT=""
 for _ in $(seq 1 6); do
-  CONNECT_OUT="$(on "$A" "ray connect $B_CID --hostname dario" 2>&1 | strip)"
+  CONNECT_OUT="$(on "$A" "ray connect $B_CID --hostname laptop" 2>&1 | strip)"
   echo "$CONNECT_OUT" | grep -qiE 'waiting for approval|connected' && break
   sleep 8
 done

@@ -51,7 +51,7 @@ pub type FastDashMap<K, V> = dashmap::DashMap<K, V, ahash::RandomState>;
 /// (shared `Arc`s), so it is handed to every per-network task by value.
 #[derive(Clone)]
 pub struct PeerTable {
-    /// Mesh IPv6 → peer. The only key: a peer's `200::/7` address is
+    /// Mesh IPv6 to peer. The only key: a peer's `200::/7` address is
     /// [`membership::derive_ipv6`] of its `EndpointId`, so an id resolves to its
     /// key with a hash and no side table. That is why the per-connection data
     /// reader needs nothing handed to it at spawn time: it knows the QUIC remote

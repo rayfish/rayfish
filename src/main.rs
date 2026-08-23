@@ -202,7 +202,7 @@ pub(crate) enum Command {
     Daemon,
     /// Install the system service if needed and start it
     Up {
-        /// Set your default hostname for future networks (e.g. "dario"). Used
+        /// Set your default hostname for future networks (e.g. "laptop"). Used
         /// when create/join don't specify one; doesn't rename existing networks
         #[arg(long)]
         hostname: Option<String>,

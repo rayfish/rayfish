@@ -30,7 +30,7 @@ scenario is the only thing that exercises it:
 The overlay carries no IPv4, so a tunnel takes IPv6 **and only IPv6**: the v6
 default goes into table 29793, no v4 rule is installed at all, `curl -6` reports
 srv-a's address and `curl -4` still reports srv-b's own. That last one is a
-deliberate non-property, not an oversight, so it is checked rather than assumed —
+deliberate non-property, not an oversight, so it is checked rather than assumed:
 claiming the host's IPv4 would source transit from a range the daemon leaves
 unrouted and take IPv4 away from whatever else shares the box.
 

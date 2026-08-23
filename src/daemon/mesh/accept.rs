@@ -387,7 +387,7 @@ impl CoordinatorAcceptState {
     /// A known member re-announced over a (re)established connection: register its
     /// route + data reader, refresh its device cert, and apply any rename
     /// authoritatively (resolve collisions, update roster + DNS, republish the blob
-    /// and broadcast `MemberSync` on a real change). Returns the member's mesh v4.
+    /// and broadcast `MemberSync` on a real change). Returns the member's mesh IPv6.
     async fn handle_member_hello(
         &self,
         conn: &Connection,
@@ -655,13 +655,14 @@ impl CoordinatorAcceptState {
         let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
     }
 
-    /// Admit a non-member peer into the network: assign hostname/IP, add to the
-    /// member list, broadcast `MemberApproved`, reply `Welcome` on the joiner's
+    /// Admit a non-member peer into the network: settle its hostname, add it to
+    /// the member list, broadcast `MemberApproved`, reply `Welcome` on the joiner's
     /// stream, and start forwarding. Shared by the invite, open-mode, and
     /// live-approval admission paths.
-    /// Returns `Some(ip)` with the admitted peer's mesh v4, or `None` if the join
-    /// was denied (hostname or IP collision). Callers that burned a credential to
-    /// get here (an invite) restore it on `None` so the holder isn't locked out.
+    /// Returns `Some(ip)` with the admitted peer's mesh IPv6, or `None` if the join
+    /// was denied (a hostname collision, the only kind left). Callers that burned a
+    /// credential to get here (an invite) restore it on `None` so the holder isn't
+    /// locked out.
     #[allow(clippy::too_many_arguments)]
     async fn admit_peer(
         &self,
@@ -676,14 +677,16 @@ impl CoordinatorAcceptState {
         // peer can claim another's name to take its suggested firewall rules.
         authoritative: bool,
     ) -> Option<Ipv6Addr> {
-        let (peer_ip, final_hostname) =
-            match self.validate_admission(remote_id, hostname, authoritative) {
-                Ok(plan) => plan,
-                Err(reason) => {
-                    self.deny(conn, send, reason).await;
-                    return None;
-                }
-            };
+        let Admission {
+            peer_ip,
+            hostname: final_hostname,
+        } = match self.validate_admission(remote_id, hostname, authoritative) {
+            Ok(plan) => plan,
+            Err(reason) => {
+                self.deny(conn, send, reason).await;
+                return None;
+            }
+        };
 
         // A direct (`ray connect`) network is a symmetric 2-peer link, so the
         // pre-approved requester is made a co-coordinator: marked coordinator in
@@ -803,20 +806,18 @@ impl CoordinatorAcceptState {
         Some(peer_ip)
     }
 
-    /// Decide a joiner's authoritative IP + hostname from the current roster, or
-    /// return a denial reason. The IP is the lowest free collision index (not the
-    /// peer-suggested address) so two coordinators admitting at index 0 produce a
-    /// roster the reconverge tiebreak resolves deterministically. An invite-bound
-    /// (`authoritative`) hostname already held by a different identity is rejected
-    /// (no silent rename); a joiner-chosen name keeps collision resolution
-    /// (`name` → `name-1` → …). An IP collision with a different identity is also
-    /// rejected.
+    /// Decide a joiner's hostname against the current roster, or return a denial
+    /// reason. The address needs no deciding: it is derived from the identity, so
+    /// two coordinators admitting the same peer arrive at the same one and there is
+    /// nothing to collide. An invite-bound (`authoritative`) hostname already held
+    /// by a different identity is rejected (no silent rename); a joiner-chosen name
+    /// keeps collision resolution (`name`, then `name-1`, and so on).
     fn validate_admission(
         &self,
         remote_id: EndpointId,
         hostname: Option<String>,
         authoritative: bool,
-    ) -> std::result::Result<(Ipv6Addr, Option<String>), String> {
+    ) -> Result<Admission, String> {
         let peer_ip = crate::membership::derive_ipv6(&remote_id);
         let final_hostname = if let Some(desired) = hostname {
             let taken = {
@@ -842,8 +843,19 @@ impl CoordinatorAcceptState {
         };
         // No collision check: the address is blake3 of the identity, so two
         // different members cannot claim the same one.
-        Ok((peer_ip, final_hostname))
+        Ok(Admission {
+            peer_ip,
+            hostname: final_hostname,
+        })
     }
+}
+
+/// What a coordinator settled for a joiner it is about to seat.
+struct Admission {
+    /// Derived from the joiner's identity, not chosen here.
+    peer_ip: Ipv6Addr,
+    /// The name it ends up with, which is not always the one it asked for.
+    hostname: Option<String>,
 }
 
 pub(crate) struct MemberAcceptState {
@@ -873,7 +885,7 @@ impl MemberAcceptState {
     /// Dispatch one control frame arriving on a mesh connection this member
     /// participates in. Coordinator broadcasts (`MemberApproved`/`MemberSync`/
     /// `BlobUpdated`/`AdminGrant`) and other members' `MeshHello`s all arrive here.
-    /// Returns the peer's mesh v4 when the frame registered it (so the demux can
+    /// Returns the peer's mesh IPv6 when the frame registered it (so the demux can
     /// announce our handle table), else `None`.
     pub(crate) async fn handle_frame(
         &self,
@@ -1343,8 +1355,8 @@ impl AcceptHandler {
         }
     }
 
-    /// Process one network-scoped control frame, returning the peer's mesh v4 if it
-    /// is now a registered member on this network (else `None`).
+    /// Process one network-scoped control frame, returning the peer's mesh IPv6 if
+    /// it is now a registered member on this network (else `None`).
     pub(crate) async fn handle_frame(
         &self,
         conn: &Connection,
@@ -1657,7 +1669,7 @@ mod direct_grant_tests {
             converged_hash: None,
             network_secret_key: None,
             network_public_key: eid(200),
-            network_name: Some("dario-alex".to_string()),
+            network_name: Some("team-alex".to_string()),
             mode: GroupMode::Restricted,
             suggested_firewall: SuggestedFirewall::default(),
             reusable_keys: BTreeMap::new(),
@@ -1669,7 +1681,7 @@ mod direct_grant_tests {
     }
 
     fn direct_net(peer: Option<EndpointId>) -> config::NetworkConfig {
-        let mut net = config::empty_network_config("dario-alex");
+        let mut net = config::empty_network_config("team-alex");
         net.direct = true;
         net.direct_peer = peer;
         net

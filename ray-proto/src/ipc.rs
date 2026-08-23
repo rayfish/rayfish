@@ -1472,7 +1472,7 @@ mod tests {
     fn test_connect_roundtrip() {
         let req = IpcMessage::Connect {
             contact_id: "contactabc".to_string(),
-            hostname: Some("dario".to_string()),
+            hostname: Some("laptop".to_string()),
         };
         let bytes = rmp_serde::to_vec_named(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
@@ -1482,7 +1482,7 @@ mod tests {
                 hostname,
             } => {
                 assert_eq!(contact_id, "contactabc");
-                assert_eq!(hostname.as_deref(), Some("dario"));
+                assert_eq!(hostname.as_deref(), Some("laptop"));
             }
             _ => panic!("wrong variant"),
         }

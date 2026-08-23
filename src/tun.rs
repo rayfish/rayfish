@@ -348,7 +348,7 @@ pub async fn unroute_default_via_tun(tun_name: &str) {
 }
 
 /// Install host routes for our *own* dual-stack addresses via the loopback
-/// interface so traffic to ourselves (e.g. `ping dario.field.ray` resolving to
+/// interface so traffic to ourselves (e.g. `ping laptop.field.ray` resolving to
 /// our own IP) is short-circuited locally instead of being sent out the TUN,
 /// where the forwarding loop would drop it as "no peer for dst".
 ///

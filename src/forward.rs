@@ -766,7 +766,7 @@ pub fn spawn_peer_reader(
                 stats.record_drop(DropReason::Malformed);
                 continue;
             };
-            // Resolve the peer's mesh v4 + arrival network from the handle in one
+            // Resolve the peer's mesh IPv6 + arrival network from the handle in one
             // pass, which also enforces the in-band reachability wall: it returns
             // `None` unless the handle maps to a network *we* currently share with
             // this peer per our own roster. So the peer's handle table alone can't

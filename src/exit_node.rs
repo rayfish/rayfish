@@ -1257,13 +1257,13 @@ pub fn install_client_routing(tun_name: &str, carries: ExitFamilies) -> Result<(
     // where an SSH session to this host's public IP is routed into the tunnel and
     // cut.
     nft_load(&client_nft_script(tun_name))?;
-    // Kernel rules outlive the process, so install has to be as mode-symmetric as
-    // teardown already is. A daemon killed (or aborted by the panic hook) while a
-    // dual-stack tunnel was up, restarted in IPv6-only mode with the selection
-    // still in config, would otherwise install `-6` and leave the previous run's
-    // `-4` rules and default in place: IPv4 policy-routed into a tunnel this mode
-    // promises not to claim, sourced from the /32 it deliberately leaves
-    // unrouted, taking the co-resident VPN's IPv4 down with it.
+    // Kernel rules outlive the process, so install has to tear down the family it
+    // stopped claiming, the way teardown already does. A daemon killed (or aborted
+    // by the panic hook) while an older build's dual-stack tunnel was up, restarted
+    // with the selection still in config, would otherwise install `-6` and leave
+    // the previous run's `-4` rules and default in place: IPv4 policy-routed into a
+    // tunnel that no longer claims it, sourced from an address the overlay no
+    // longer assigns, taking the co-resident VPN's IPv4 down with it.
     for family in ["-4", "-6"] {
         if !tunnel_families(carries).contains(&family) {
             remove_client_rules(family, RuleSweep::All);
@@ -1666,7 +1666,7 @@ struct MirroredRoute {
 /// rescues routes in `main`, and a policy-routing VPN keeps its prefixes in a
 /// private table (Tailscale's `100.64.0.0/10` and `fd7a:115c:a1e0::/48` live in
 /// table 52). The result would be the co-resident VPN black-holed the moment we
-/// route anything, which is precisely what IPv6-only mode exists to avoid.
+/// route anything, which is precisely what leaving `100.64.0.0/10` alone buys.
 ///
 /// Mirroring is one-directional: we only ever write our own table, never a foreign
 /// rule or a foreign table, and the teardown flush drops the copies with the

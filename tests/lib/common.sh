@@ -45,9 +45,10 @@ on(){ local ip="$1"; shift
 strip(){ sed -r 's/\x1B\[[0-9;]*[mGKH]//g'; }
 
 # own_ip <status-text> : extract a node's own mesh IPv6 (the 200::/7 range).
-# The prefix is /7, so only the first seven bits are fixed and the leading hextet
-# runs from 200 to 2ff: matching a literal `200:` finds 1 address in 256, which is
-# how this read as "no mesh IPv6" against real output.
+# The address is `[0x02] ++ blake3(identity)[0..15]`, so only the first byte is
+# fixed and the leading hextet runs from 200 to 2ff: matching a literal `200:`
+# finds 1 address in 256, which is how this read as "no mesh IPv6" against real
+# output.
 # Loud when there is none: every caller uses the result as a ping/ssh target, and
 # an empty string there turns a real failure into a test that passes. See
 # `fail_out` for why the complaint goes to stderr.
@@ -57,7 +58,6 @@ own_ip(){
   echo "$ip"
 }
 
-# peer_host <status-text> : first peer row's `<host>.<net>.ray` hostname label.
 # peer_host <status-text> : the first peer row's hostname. Peer rows carry a
 # status dot (●/○) and a mesh IP; the hostname is the token right after the dot.
 # (The status peer row prints the bare hostname, not the `.ray` FQDN.)

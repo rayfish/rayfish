@@ -3,7 +3,7 @@
 Spins up **2 droplets in the same region** and measures, for both
 directions, the cost rayfish adds on top of the raw link:
 
-- **latency** — `ping` mean RTT, direct (public IP) vs rayfish (`200::/7` TUN)
+- **latency**: `ping` mean RTT, direct (public IP) vs rayfish (`200::/7` TUN)
 - **throughput** — `iperf3` TCP, direct vs rayfish, forward (`tx`) and reverse (`rx`)
 
 The two peers join an **open** network (`ray create --open` / `ray join <room>`),

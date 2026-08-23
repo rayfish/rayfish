@@ -651,9 +651,8 @@ fn device_row(
 ) -> Vec<layout::Cell> {
     // The address column is the peer's mesh IPv6, which is the only address it
     // can be reached on and the one people copy into `ssh` and `ping`. It is
-    // three times the width of the old dotted quad, which the IPv6-only mode
-    // this replaces had already accepted: wider rows are the price, a wrong
-    // address is not.
+    // three times the width of the dotted quad it replaces: wider rows are the
+    // price, a wrong address is not.
     let addr = peer.ipv6.to_string();
     let base = peer.hostname.clone().unwrap_or_else(|| addr.clone());
     let host = match alias {
@@ -969,7 +968,7 @@ mod grouping_tests {
         let me = iroh::SecretKey::generate().public();
         // Two of my devices (one online, one offline) plus a standalone member.
         let net = net(
-            "dario",
+            "laptop",
             vec![
                 peer("phone", Some(me), true, true, false),
                 peer("tablet", Some(me), true, false, false),
@@ -978,12 +977,12 @@ mod grouping_tests {
         );
         let out = render(&net);
         // Parent row labelled by my hostname with a rollup, and a tree branch.
-        assert!(out.contains("dario"), "{out}");
+        assert!(out.contains("laptop"), "{out}");
         assert!(out.contains("2 devices, 1 online"), "{out}");
         assert!(out.contains("└─"), "{out}");
         // Parent sits before its devices; connected device before the offline one.
         let at = |s: &str| out.find(s).unwrap();
-        assert!(at("dario") < at("phone"));
+        assert!(at("laptop") < at("phone"));
         assert!(at("phone") < at("tablet"));
         // Standalone member still renders flat.
         assert!(out.contains("server"));
@@ -996,7 +995,7 @@ mod grouping_tests {
     fn peer_rows_carry_the_reachable_address() {
         let mut p = peer("dev", None, false, true, false);
         p.ipv6 = "200::9".parse().unwrap();
-        let net = net("dario", vec![p]);
+        let net = net("laptop", vec![p]);
 
         let out = render(&net);
         assert!(out.contains("200::9"), "{out}");
@@ -1008,12 +1007,12 @@ mod grouping_tests {
         // Viewing a *foreign* user whose primary device is itself a visible member
         // (endpoint id == user identity) plus one paired secondary. The primary
         // must anchor the group on its own row, not appear once flat and once as a
-        // separate rollup header (the `dario ... / dario ...` duplication bug).
-        let dario = iroh::SecretKey::generate().public();
+        // separate rollup header (the `laptop ... / laptop ...` duplication bug).
+        let laptop = iroh::SecretKey::generate().public();
         let primary = ipc::PeerStatus {
-            endpoint_id: dario,
+            endpoint_id: laptop,
             ipv6: "200::3".parse().unwrap(),
-            hostname: Some("dario".to_string()),
+            hostname: Some("laptop".to_string()),
             user_identity: None,
             is_own_device: false,
             incompatible: false,
@@ -1022,17 +1021,17 @@ mod grouping_tests {
             exit_node: false,
             exit_in_use: false,
         };
-        let secondary = peer("sm-f966b", Some(dario), false, false, false);
+        let secondary = peer("sm-f966b", Some(laptop), false, false, false);
         let net = net("umbrel", vec![primary, secondary]);
         let out = render(&net);
 
-        // "dario" is named exactly once, and there is no synthetic rollup header.
-        assert_eq!(out.matches("dario").count(), 1, "{out}");
+        // "laptop" is named exactly once, and there is no synthetic rollup header.
+        assert_eq!(out.matches("laptop").count(), 1, "{out}");
         assert!(!out.contains("device"), "unexpected rollup header:\n{out}");
         // The secondary nests under the primary's row.
         assert!(out.contains("└─"), "{out}");
         let at = |s: &str| out.find(s).unwrap();
-        assert!(at("dario") < at("sm-f966b"), "{out}");
+        assert!(at("laptop") < at("sm-f966b"), "{out}");
     }
 
     #[test]
@@ -1046,7 +1045,7 @@ mod grouping_tests {
         in_use.exit_node = true;
         in_use.exit_in_use = true;
         let plain = peer("srv", None, false, true, false);
-        let out = render(&net("dario", vec![offering, in_use, plain]));
+        let out = render(&net("laptop", vec![offering, in_use, plain]));
         let row = |host: &str| {
             out.lines()
                 .find(|l| l.contains(host))
@@ -1065,7 +1064,7 @@ mod grouping_tests {
 
     #[test]
     fn flags_incompatible_offline_peer() {
-        let net = net("dario", vec![peer("oldbox", None, false, false, true)]);
+        let net = net("laptop", vec![peer("oldbox", None, false, false, true)]);
         let out = render(&net);
         assert!(out.contains("oldbox"));
         assert!(out.contains("incompatible"), "{out}");
@@ -1076,7 +1075,7 @@ mod grouping_tests {
     #[test]
     fn single_device_group_reads_singular() {
         let me = iroh::SecretKey::generate().public();
-        let net = net("dario", vec![peer("phone", Some(me), true, true, false)]);
+        let net = net("laptop", vec![peer("phone", Some(me), true, true, false)]);
         let out = render(&net);
         assert!(out.contains("1 device, 1 online"), "{out}");
     }

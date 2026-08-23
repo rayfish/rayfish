@@ -1423,7 +1423,7 @@ mod tests {
     fn test_direct_flag_default_false() {
         let toml_str = r#"
 [[networks]]
-name = "dario-alice"
+name = "team-alice"
 "#;
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.networks[0].direct);
@@ -1491,7 +1491,7 @@ name = "test"
         save_settings_in(
             dir,
             &AppConfig {
-                default_hostname: Some("dario".into()),
+                default_hostname: Some("laptop".into()),
                 ..Default::default()
             },
         )
@@ -1499,7 +1499,7 @@ name = "test"
 
         let loaded = load_in(dir).unwrap();
         assert_eq!(loaded.networks.len(), 2);
-        assert_eq!(loaded.default_hostname.as_deref(), Some("dario"));
+        assert_eq!(loaded.default_hostname.as_deref(), Some("laptop"));
 
         // Single-network load.
         assert!(load_network_in(dir, "homelab").unwrap().is_some());
@@ -1527,6 +1527,23 @@ name = "test"
         let loaded = load_in(dir).unwrap();
         assert_eq!(loaded.download_dir.as_deref(), Some("/srv/incoming"));
         assert_eq!(loaded.download_user, Some(1000));
+    }
+
+    /// The IPv6-only cutover deleted the `ipv6-only` setting, and the release
+    /// notes promise a `settings.toml` still carrying it upgrades rather than
+    /// failing to parse. Nothing in `Settings` names the key any more, so what
+    /// keeps that promise is the absence of `deny_unknown_fields`, which is
+    /// exactly the kind of thing a later tidy-up adds without noticing.
+    #[test]
+    fn a_stale_ipv6_only_key_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(SETTINGS_FILE),
+            "mdns_enabled = false\nipv6_only = true\n",
+        )
+        .unwrap();
+        let loaded = load_in(tmp.path()).expect("a settings.toml from an older build still loads");
+        assert!(!loaded.mdns_enabled, "the keys we do know are still read");
     }
 
     #[test]
@@ -1810,7 +1827,7 @@ name = "test"
 
         // Write a legacy single-file config (the pre-shard format).
         let legacy = AppConfig {
-            default_hostname: Some("dario".into()),
+            default_hostname: Some("laptop".into()),
             networks: vec![net("homelab"), net("genesis")],
             ..Default::default()
         };
@@ -1829,7 +1846,7 @@ name = "test"
         // Both networks + globals are now in the sharded layout.
         let loaded = load_in(dir).unwrap();
         assert_eq!(loaded.networks.len(), 2);
-        assert_eq!(loaded.default_hostname.as_deref(), Some("dario"));
+        assert_eq!(loaded.default_hostname.as_deref(), Some("laptop"));
 
         // Idempotent: a second migrate (no legacy file) is a no-op.
         migrate_legacy(dir).unwrap();
