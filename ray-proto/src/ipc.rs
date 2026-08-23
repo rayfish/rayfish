@@ -429,6 +429,12 @@ pub enum IpcMessage {
         /// active. Shown in the UI as "waiting for approval".
         #[serde(default)]
         pending_networks: Vec<String>,
+        /// Networks saved in the daemon's config that it has not registered —
+        /// a restore that has not landed. Reported here rather than read from
+        /// config by the CLI, which resolves the *caller's* config directory
+        /// and so sees an empty one wherever the daemon's is root-owned.
+        #[serde(default)]
+        inactive_networks: Vec<InactiveNetwork>,
         /// Nodes seen on the LAN over mDNS that we do not already share a
         /// network with, i.e. the ones still to link up with. Peers we do share
         /// a network with are omitted: they show in `networks` instead. Empty
@@ -751,6 +757,37 @@ pub struct PendingFileInfo {
     pub own_device: bool,
 }
 
+/// A mesh-protocol version mismatch on a network: what its signed record
+/// advertises against what this daemon speaks.
+///
+/// The network is registered from its verified roster blob (that ride is not
+/// version-gated), but the versioned mesh ALPN refuses every dial, so no peer on
+/// it is reachable until one side is upgraded. Carried per network so `ray
+/// status` can name both versions instead of just saying "incompatible".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshVersionMismatch {
+    /// Mesh protocol version the network's signed pkarr record advertises.
+    pub network: u32,
+    /// Mesh protocol version this daemon speaks.
+    pub ours: u32,
+}
+
+/// A network saved in the daemon's config that the daemon has not registered:
+/// its restore has not landed yet and keeps retrying.
+///
+/// Reported by the daemon rather than read from config by the CLI. The daemon is
+/// the only side that can read its own config directory (on macOS it is
+/// root-owned and the CLI runs as someone else) and the only side that knows why
+/// the restore is failing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InactiveNetwork {
+    pub name: String,
+    /// The last restore failure, as a one-line message. `None` before the first
+    /// attempt has failed.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkStatus {
     pub name: String,
@@ -786,6 +823,12 @@ pub struct NetworkStatus {
     /// peer's exit offer but never your own.
     #[serde(default)]
     pub exit_offering: bool,
+    /// Set when this network's signed record advertises a mesh protocol version
+    /// this daemon does not speak. The network is registered (its roster came
+    /// from the verified blob) but every dial on it fails the ALPN gate, so
+    /// `ray status` marks it incompatible instead of showing it as healthy.
+    #[serde(default)]
+    pub incompatible: Option<MeshVersionMismatch>,
 }
 
 #[derive(
@@ -1583,6 +1626,7 @@ mod tests {
                 ephemeral_ttl_secs: None,
                 my_exit_node: None,
                 exit_offering: false,
+                incompatible: None,
             }],
             packets_rx: 0,
             packets_tx: 0,
@@ -1591,6 +1635,7 @@ mod tests {
             pending_files: 0,
             pending_connects: 0,
             pending_networks: vec![],
+            inactive_networks: vec![],
             lan_peers: vec![LanPeerInfo {
                 endpoint_id: peer_id,
                 short_id: peer_id.fmt_short().to_string(),

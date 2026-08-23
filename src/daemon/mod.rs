@@ -74,8 +74,8 @@ use crate::firewall::{self, SharedFirewall};
 use crate::forward;
 use crate::identity;
 use crate::ipc::{
-    self, FirewallRuleView, IpcMessage, LanPeerInfo, NetworkRole, NetworkStatus, PeerState,
-    PeerStatus, ipc_err,
+    self, FirewallRuleView, InactiveNetwork, IpcMessage, LanPeerInfo, MeshVersionMismatch,
+    NetworkRole, NetworkStatus, PeerState, PeerStatus, ipc_err,
 };
 use crate::membership::{
     ApprovedEntry, ApprovedList, ExitFamilies, GroupMode, IdentityProvider, IrohIdentityProvider,
@@ -467,6 +467,13 @@ pub struct NetworkHandle {
     /// joins can't double-burn a single-use invite (TOCTOU on the toml file).
     /// Shared with this network's [`CoordinatorAcceptState`].
     invite_lock: Arc<AsyncMutex<()>>,
+    /// Set when this network's signed record advertises a mesh protocol version
+    /// this build does not speak. The handle exists because the roster blob is
+    /// not version-gated and registers fine; every dial on it is refused by the
+    /// versioned ALPN, so the flag is what stops `ray status` from showing the
+    /// network as healthy. Cleared by construction: the restore loop replaces
+    /// the whole handle once the coordinator republishes at a version we speak.
+    incompatible: Option<MeshVersionMismatch>,
 }
 
 /// Shared, always-on daemon state. Cloned (via `Arc`) into every IPC handler
@@ -2330,6 +2337,7 @@ mod accept_handler_tests {
                     cancel: CancellationToken::new(),
                     tasks: Vec::new(),
                     invite_lock: Arc::new(AsyncMutex::new(())),
+                    incompatible: None,
                 },
             );
             assert!(
@@ -2439,6 +2447,7 @@ mod accept_handler_tests {
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
                 invite_lock: Arc::new(AsyncMutex::new(())),
+                incompatible: None,
             },
         );
 
@@ -2612,6 +2621,7 @@ mod accept_handler_tests {
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
                 invite_lock: Arc::new(AsyncMutex::new(())),
+                incompatible: None,
             },
         );
         let connmgr = Arc::new(ConnectionManager::new());
@@ -2678,6 +2688,7 @@ mod accept_handler_tests {
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
                 invite_lock: Arc::new(AsyncMutex::new(())),
+                incompatible: None,
             },
         );
         // Offering an exit, and the data plane is up so sync is enabled.

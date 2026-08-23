@@ -143,8 +143,10 @@ pub(crate) fn pluralize(n: usize, noun: &str) -> String {
 
 pub(crate) async fn ipc_status() -> Result<()> {
     let Ok(mut stream) = ipc::connect().await else {
-        // Daemon not running, show saved config
-        let app_config = config::load()?;
+        // Daemon not running, so its config is all there is to show. Read-only:
+        // `config::load` would create the directory it resolves, and this process
+        // is not the daemon.
+        let app_config = config::load_for_read()?;
         println!();
         println!("  {}", style::red("✗ daemon not running"));
         if app_config.networks.is_empty() {
@@ -185,6 +187,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
             bytes_tx,
             pending_files,
             pending_connects,
+            inactive_networks,
             lan_peers,
             ..
         } => {
@@ -206,6 +209,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                     "contact_id": contact_id,
                     "daemon_version": daemon_version,
                     "networks": networks,
+                    "inactive_networks": inactive_networks,
                     "traffic": {
                         "packets_rx": packets_rx, "packets_tx": packets_tx,
                         "bytes_rx": bytes_rx, "bytes_tx": bytes_tx,
@@ -266,36 +270,13 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 }
             }
 
-            // Show inactive networks from config that the daemon didn't restore
-            let active_names: std::collections::HashSet<&str> =
-                networks.iter().map(|n| n.name.as_str()).collect();
-            if let Ok(app_config) = config::load() {
-                let inactive: Vec<_> = app_config
-                    .networks
-                    .iter()
-                    .filter(|n| !active_names.contains(n.name.as_str()))
-                    .collect();
-                for net in &inactive {
-                    println!();
-                    println!(
-                        "  {}  {}",
-                        style::faint(&net.name),
-                        style::marker("inactive")
-                    );
-                    // The marker alone reads like a setting rather than a fault.
-                    // This state is always a failed restore: the network is saved
-                    // but the daemon never registered it, so peers on it are
-                    // unreachable and their packets are dropped as an unknown
-                    // network. Say that, and say it is being worked on, so this
-                    // doesn't read as something the user has to go fix.
-                    println!(
-                        "    {}",
-                        style::faint(
-                            "saved but not connected: peers on it are unreachable. \
-                             The daemon keeps retrying; its log has the reason."
-                        )
-                    );
-                }
+            // Saved networks the daemon never registered. The list comes from the
+            // daemon: reading config here resolves the *calling user's* config
+            // directory, which is empty (and gets created) wherever the daemon's
+            // is root-owned, so every failed restore rendered as no mention at all.
+            for net in &inactive_networks {
+                println!();
+                print!("{}", inactive_network_block(net));
             }
 
             print_nearby(&lan_peers);
@@ -381,29 +362,67 @@ fn print_nearby(peers: &[ipc::LanPeerInfo]) {
 /// Render one network block: header (name · role · dns · ip · member count),
 /// the aligned peer table, and the shareable join code (suppressed for direct
 /// `ray connect` networks).
-fn print_network(net: &ipc::NetworkStatus) {
+/// The block for one saved network the daemon has not registered, ending in a
+/// newline.
+///
+/// The marker alone reads like a setting rather than a fault. This state is
+/// always a failed restore: the network is saved but the daemon never registered
+/// it, so peers on it are unreachable and their packets are dropped as an unknown
+/// network. Say that, say the daemon is working on it, and give the reason when
+/// the daemon has one, so this doesn't read as something the user has to go fix.
+fn inactive_network_block(net: &ipc::InactiveNetwork) -> String {
+    let mut out = format!(
+        "  {}  {}\n",
+        style::faint(&net.name),
+        style::marker("inactive")
+    );
+    out.push_str(&format!(
+        "    {}\n",
+        style::faint(
+            "saved but not connected: peers on it are unreachable. The daemon keeps retrying."
+        )
+    ));
+    if let Some(ref reason) = net.reason {
+        out.push_str(&format!(
+            "    {} {}\n",
+            style::label("reason"),
+            style::faint(reason)
+        ));
+    }
+    out
+}
+
+/// A network's header block: the name/role/address line, plus the line that says
+/// why nothing on it works when the network runs a mesh protocol version this
+/// build does not speak.
+///
+/// Built as a string rather than printed so the flags can be tested, the way the
+/// peer rows already are.
+fn network_header(net: &ipc::NetworkStatus) -> String {
+    use std::fmt::Write as _;
+
     let role = net.role.to_string();
-    // Just the hostname: the network name is already the block header, so the
-    // `.{network}.ray` suffix would only repeat it.
-    let dns_name = net.my_hostname.clone();
     // member count (self excluded) belongs on the network header row. Reachable =
     // active + idle (everything not confirmed offline); on-demand nodes hold no
     // connections when idle, so counting only live connections would read "0/N".
     let reachable = net.peers.iter().filter(|p| !p.state.is_offline()).count();
-    println!();
-    print!("  {}  {}", style::bold(&net.name), style::marker(&role));
-    if let Some(ref dns) = dns_name {
-        print!("   {}", style::value(dns));
+    let mut out = format!("  {}  {}", style::bold(&net.name), style::marker(&role));
+    // Just the hostname: the network name is already the block header, so the
+    // `.{network}.ray` suffix would only repeat it.
+    if let Some(ref dns) = net.my_hostname {
+        let _ = write!(out, "   {}", style::value(dns));
     }
     let my_addr = net.my_ipv6.to_string();
-    print!("   {}", style::faint(&my_addr));
-    print!(
+    let _ = write!(out, "   {}", style::faint(&my_addr));
+    let _ = write!(
+        out,
         "   {} {}",
         style::label("members"),
         style::value(&format!("{reachable}/{}", net.peers.len())),
     );
     if let Some(ttl) = net.ephemeral_ttl_secs {
-        print!(
+        let _ = write!(
+            out,
             "   {} {}",
             style::label("ephemeral"),
             style::value(&format_ttl(ttl)),
@@ -412,12 +431,34 @@ fn print_network(net: &ipc::NetworkStatus) {
     // Both exit-node roles are worth seeing at a glance: the peer carrying our
     // internet traffic, and whether we are carrying someone else's.
     if let Some(ref gw) = net.my_exit_node {
-        print!("   {} {}", style::label("exit via"), style::value(gw));
+        let _ = write!(out, "   {} {}", style::label("exit via"), style::value(gw));
     }
     if net.exit_offering {
-        print!("   {}", style::marker("exit node"));
+        let _ = write!(out, "   {}", style::marker("exit node"));
     }
+    // A version-incompatible network is registered but carries nothing: its
+    // roster came from the signed blob, and the versioned mesh ALPN refuses
+    // every dial on it. The marker mirrors the one on an incompatible peer row,
+    // and the line under it names both versions, since "incompatible" alone
+    // doesn't say which side is behind.
+    if let Some(ref m) = net.incompatible {
+        let _ = write!(out, "   {}", style::red("incompatible"));
+        let _ = write!(
+            out,
+            "\n    {}",
+            style::faint(&format!(
+                "runs mesh protocol v{}, this build speaks v{}: no peer on it is reachable. \
+                 Run `ray update` so both sides match.",
+                m.network, m.ours
+            )),
+        );
+    }
+    out
+}
+
+fn print_network(net: &ipc::NetworkStatus) {
     println!();
+    println!("{}", network_header(net));
 
     // Invert the local alias map (alias -> identity) for identity -> alias
     // lookups when rendering peers.
@@ -956,6 +997,7 @@ mod grouping_tests {
             ephemeral_ttl_secs: None,
             my_exit_node: None,
             exit_offering: false,
+            incompatible: None,
         }
     }
 
@@ -1070,6 +1112,61 @@ mod grouping_tests {
         assert!(out.contains("incompatible"), "{out}");
         assert!(out.contains("ray update"), "{out}");
         assert!(!out.contains("offline"), "{out}");
+    }
+
+    /// A network whose record advertises a mesh version this build doesn't speak
+    /// registers from its signed blob but carries nothing, so the header has to
+    /// say so. Rendering it as an ordinary network is how a mesh that moved on
+    /// without you looks exactly like one that works.
+    #[test]
+    fn flags_an_incompatible_network() {
+        let mut n = net("laptop", vec![peer("oldbox", None, false, false, true)]);
+        n.incompatible = Some(ipc::MeshVersionMismatch {
+            network: 2,
+            ours: 4,
+        });
+        let out = network_header(&n);
+        assert!(out.contains("incompatible"), "{out}");
+        // Both versions, so the reader can tell which side is behind.
+        assert!(out.contains("v2"), "{out}");
+        assert!(out.contains("v4"), "{out}");
+        assert!(out.contains("ray update"), "{out}");
+    }
+
+    /// The same header on a healthy network carries none of that.
+    #[test]
+    fn a_compatible_network_header_carries_no_version_flag() {
+        let out = network_header(&net("laptop", vec![peer("srv", None, false, true, false)]));
+        assert!(!out.contains("incompatible"), "{out}");
+        assert!(!out.contains("ray update"), "{out}");
+    }
+
+    /// A saved network the daemon never registered still has to appear. The
+    /// daemon reports it (the CLI cannot read the daemon's config: on macOS it
+    /// is root-owned and `ray status` runs as someone else), and the reason it
+    /// carries is what the reader would otherwise have to go find in the log.
+    #[test]
+    fn lists_a_saved_network_the_daemon_never_registered() {
+        let out = inactive_network_block(&ipc::InactiveNetwork {
+            name: "homelab".to_string(),
+            reason: Some("runs mesh protocol v2, this build speaks v4".to_string()),
+        });
+        assert!(out.contains("homelab"), "{out}");
+        assert!(out.contains("inactive"), "{out}");
+        assert!(out.contains("peers on it are unreachable"), "{out}");
+        assert!(out.contains("runs mesh protocol v2"), "{out}");
+    }
+
+    /// Before the first attempt fails there is no reason to give, and an empty
+    /// `reason` line would read as one.
+    #[test]
+    fn an_inactive_network_without_a_reason_prints_no_reason_line() {
+        let out = inactive_network_block(&ipc::InactiveNetwork {
+            name: "homelab".to_string(),
+            reason: None,
+        });
+        assert!(out.contains("homelab"), "{out}");
+        assert!(!out.contains("reason"), "{out}");
     }
 
     #[test]

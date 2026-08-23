@@ -19,9 +19,11 @@ impl Daemon {
     pub fn status(&self) -> IpcMessage {
         let hostname_snapshot = self.dns.hostname_table.try_read().ok();
         let my_id = self.transport.endpoint.id();
+        let saved = config::load().ok();
         // Direct-connection networks are flagged in config; collect their names
         // so each NetworkStatus can be tagged `[direct]` in the CLI.
-        let direct_names: HashSet<String> = config::load()
+        let direct_names: HashSet<String> = saved
+            .as_ref()
             .map(|c| {
                 c.networks
                     .iter()
@@ -38,12 +40,35 @@ impl Daemon {
             .collect();
         // Persisted pending-join markers, minus any network that has since
         // become active (admitted while we were retrying in the background).
-        let pending_networks: Vec<String> = config::load()
+        let pending_networks: Vec<String> = saved
+            .as_ref()
             .map(|c| {
                 c.pending_joins
-                    .into_iter()
+                    .iter()
                     .filter(|p| !self.registry.networks.contains_key(&p.network_key))
-                    .map(|p| p.name.unwrap_or(p.network_key))
+                    .map(|p| p.name.clone().unwrap_or_else(|| p.network_key.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Saved networks the daemon has not registered: a restore that has not
+        // landed. Reported from here rather than read from config by the CLI,
+        // which resolves the *calling user's* config directory and so finds an
+        // empty one wherever the daemon's is root-owned, turning every failed
+        // restore into a network that simply is not mentioned.
+        let inactive_networks: Vec<InactiveNetwork> = saved
+            .as_ref()
+            .map(|c| {
+                c.networks
+                    .iter()
+                    .filter(|n| !self.registry.networks.contains_key(&n.name))
+                    .map(|n| InactiveNetwork {
+                        name: n.name.clone(),
+                        reason: self
+                            .registry
+                            .restore_errors
+                            .get(&n.name)
+                            .map(|e| e.value().clone()),
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -63,6 +88,7 @@ impl Daemon {
             pending_files: self.files.pending_files.lock().unwrap().len(),
             pending_connects: self.connect.pending_connects.len(),
             pending_networks,
+            inactive_networks,
             // Only the neighbours you could still link up with: peers already on
             // one of our networks are visible in the network list, not here.
             lan_peers: self
@@ -129,6 +155,7 @@ impl Daemon {
                         ephemeral_ttl_secs,
                         my_exit_node: None,
                         exit_offering: false,
+                        incompatible: h.incompatible.clone(),
                     };
                 }
             };
@@ -233,6 +260,11 @@ impl Daemon {
             my_exit_node,
             // A non-empty allow-list is exactly what makes this node an exit node.
             exit_offering: net_cfg.as_ref().is_some_and(|n| !n.exit_allow.is_empty()),
+            // Registered from the signed blob alone because the network's record
+            // advertises a mesh version this build does not speak. Every dial on
+            // it fails the ALPN gate, so the network is present but carries no
+            // traffic, and status has to say so rather than render it healthy.
+            incompatible: h.incompatible.clone(),
         }
     }
 

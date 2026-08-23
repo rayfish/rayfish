@@ -124,6 +124,11 @@ pub(crate) struct NetworkRegistry {
     /// second one for the same network. Removed when the restore finishes,
     /// however it finishes.
     pub(crate) restoring: Arc<DashSet<String>>,
+    /// Why each saved-but-unregistered network's last restore attempt failed,
+    /// keyed by network name. `ray status` reports it beside the network so a
+    /// failed restore says what went wrong instead of sending the reader to the
+    /// daemon log. Cleared when the restore lands or gives up.
+    pub(crate) restore_errors: Arc<DashMap<String, String>>,
     /// Nudges [`Self::run_restore_supervisor`] to sweep now instead of at its
     /// next tick. Fired when a peer sends a control frame for a network we have
     /// saved but not live: their traffic is proof the network is reachable
@@ -222,6 +227,7 @@ impl NetworkRegistry {
             exit_reapply: Arc::new(Notify::new()),
             exit_sync_enabled: AtomicBool::new(false),
             restoring: Arc::new(DashSet::new()),
+            restore_errors: Arc::new(DashMap::new()),
             restore_nudge: Arc::new(Notify::new()),
             poll_nudge: Arc::new(Notify::new()),
         }
@@ -630,6 +636,9 @@ impl NetworkRegistry {
             cancel: cancel.clone(),
             tasks,
             invite_lock: invite_lock.clone(),
+            // A coordinator holds the network key and publishes the record, so
+            // the version it advertises is this build's by construction.
+            incompatible: None,
         };
         self.networks.insert(name.clone(), handle);
 

@@ -1031,6 +1031,7 @@ mod tests {
             ephemeral_ttl_secs: None,
             my_exit_node: None,
             exit_offering: false,
+            incompatible: None,
         }
     }
 

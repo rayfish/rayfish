@@ -677,6 +677,37 @@ fn config_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
     raw.filter(|d| !d.is_empty()).map(PathBuf::from)
 }
 
+/// The platform's config location, before the `RAYFISH_CONFIG_DIR` override and
+/// without creating anything.
+///
+/// This is always the *daemon's* directory, never the calling process's. macOS
+/// is where the difference bites: the daemon runs as root under launchd, so its
+/// config lives under `/var/root`, and resolving `dirs::config_dir()` in an
+/// unprivileged `ray` would name an empty directory in that user's home instead
+/// (and, through [`config_dir`], create it).
+fn platform_config_dir() -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    let dir = PathBuf::from("/etc/rayfish");
+    #[cfg(target_os = "freebsd")]
+    let dir = PathBuf::from("/usr/local/etc/rayfish");
+    // Android without the override falls back to a fixed app-private path so the
+    // library still compiles/runs standalone.
+    #[cfg(target_os = "android")]
+    let dir = PathBuf::from("/data/local/tmp/rayfish");
+    #[cfg(target_os = "macos")]
+    let dir = PathBuf::from("/var/root/Library/Application Support/rayfish");
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "macos"
+    )))]
+    let dir = dirs::config_dir()
+        .context("could not determine config directory")?
+        .join("rayfish");
+    Ok(dir)
+}
+
 /// Base directory for all rayfish config + state. Created if missing.
 ///
 /// `RAYFISH_CONFIG_DIR` overrides the platform default on every platform. The
@@ -686,29 +717,32 @@ fn config_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
 ///
 /// Platform defaults: Linux `/etc/rayfish` (system service location,
 /// root:rayfish), FreeBSD `/usr/local/etc/rayfish`, macOS the daemon's
-/// `~/Library/Application Support/rayfish` (root-only, and under launchd that
-/// home is `/var/root`, not the home of whoever ran `sudo`), Android the app's
-/// `Context.getFilesDir()` (passed by `ray-mobile`'s `Node::new` through this
-/// same var).
+/// `/var/root/Library/Application Support/rayfish` (root-only; under launchd
+/// root's home is `/var/root`, not the home of whoever ran `sudo`), Android the
+/// app's `Context.getFilesDir()` (passed by `ray-mobile`'s `Node::new` through
+/// this same var).
+///
+/// Use [`config_dir_for_read`] from anything that only reads: creating the tree
+/// is the daemon's job, and a reader that does it can end up reporting the
+/// directory it just made as the daemon's config.
 pub fn config_dir() -> Result<PathBuf> {
-    if let Some(dir) = config_dir_override(std::env::var_os("RAYFISH_CONFIG_DIR")) {
-        ensure_dir(&dir)?;
-        return Ok(dir);
-    }
-    #[cfg(target_os = "linux")]
-    let dir = PathBuf::from("/etc/rayfish");
-    #[cfg(target_os = "freebsd")]
-    let dir = PathBuf::from("/usr/local/etc/rayfish");
-    // Android without the override falls back to a fixed app-private path so the
-    // library still compiles/runs standalone.
-    #[cfg(target_os = "android")]
-    let dir = PathBuf::from("/data/local/tmp/rayfish");
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
-    let dir = dirs::config_dir()
-        .context("could not determine config directory")?
-        .join("rayfish");
+    let dir = match config_dir_override(std::env::var_os("RAYFISH_CONFIG_DIR")) {
+        Some(dir) => dir,
+        None => platform_config_dir()?,
+    };
     ensure_dir(&dir)?;
     Ok(dir)
+}
+
+/// [`config_dir`] for a reader: same directory, never created.
+///
+/// A missing directory is not an error here — it reads as an empty config, which
+/// is what a reader wants to say about a daemon that has saved nothing.
+pub fn config_dir_for_read() -> Result<PathBuf> {
+    match config_dir_override(std::env::var_os("RAYFISH_CONFIG_DIR")) {
+        Some(dir) => Ok(dir),
+        None => platform_config_dir(),
+    }
 }
 
 /// Reject a network name that can't be a safe single path component (defence in
@@ -867,6 +901,13 @@ pub fn load() -> Result<AppConfig> {
     let dir = config_dir()?;
     migrate_legacy(&dir)?;
     load_in(&dir)
+}
+
+/// [`load`] for a process that only reads the daemon's config (the CLI when the
+/// daemon is down). Creates nothing and runs no migration; a config tree that
+/// isn't there, or isn't readable by this user, reads as an empty config.
+pub fn load_for_read() -> Result<AppConfig> {
+    load_in(&config_dir_for_read()?)
 }
 
 fn load_in(dir: &Path) -> Result<AppConfig> {

@@ -9,6 +9,8 @@ use super::super::*;
 use std::net::IpAddr;
 use std::sync::RwLock;
 
+use super::create_join::mesh_version_is_speakable;
+
 /// How long `ray exit-node use` waits for the exit peer to answer through the
 /// finished tunnel before returning anyway. Long enough to cover a re-punch after
 /// the routing change (the netwatch-driven rebind lands a few seconds in), short
@@ -30,6 +32,12 @@ const RESTORE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Minimum spacing between two peer-triggered sweeps. See
 /// [`NetworkRegistry::run_restore_supervisor`].
 const NUDGE_DEBOUNCE: Duration = Duration::from_secs(5);
+
+/// Whether the member-restore loop runs another attempt or is done.
+enum RestoreNext {
+    Retry,
+    Stop,
+}
 
 /// The membership a coordinator restores at startup, sourced from the signed
 /// `GroupBlob` (authoritative) or the stale config roster as a fallback.
@@ -321,6 +329,9 @@ impl NetworkRegistry {
             cancel: cancel.clone(),
             tasks,
             invite_lock,
+            // A coordinator holds the network key and publishes the record, so
+            // the version it advertises is this build's by construction.
+            incompatible: None,
         };
         self.networks.insert(name.to_string(), handle);
         self.refresh_search_domains().await;
@@ -532,6 +543,28 @@ impl NetworkRegistry {
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
+            // A network already registered as version-incompatible was built from
+            // its signed blob alone: it is visible and marked in `ray status`, but
+            // no peer on it is reachable until its coordinator republishes at a
+            // version this build speaks. Re-running the join would only be refused
+            // as "already in network", so watch the record instead and rebuild
+            // only once it matches. Leaving the registration untouched meanwhile
+            // is the point: tearing it down each retry would put the network back
+            // to invisible between attempts.
+            let stuck = match self.incompatible_registration(&name) {
+                Some(mismatch) => {
+                    !self
+                        .mesh_version_recovered(&name, &net_pubkey, &mismatch)
+                        .await
+                }
+                None => false,
+            };
+            if stuck {
+                match self.after_attempt(&name, &mut delay, attempt).await {
+                    RestoreNext::Retry => continue,
+                    RestoreNext::Stop => return,
+                }
+            }
             match self
                 .join_network_inner(
                     &net_pubkey,
@@ -551,8 +584,27 @@ impl NetworkRegistry {
                     IpcMessage::Joined {
                         ref name, my_ipv6, ..
                     } => {
-                        tracing::info!(network = %name, ip = %my_ipv6, attempt, "restored member network");
-                        return;
+                        // Registered, but possibly only from the blob because the
+                        // record advertises a mesh version we don't speak. That is
+                        // not the end of the restore: stay in the loop so a
+                        // coordinator republish promotes it.
+                        match self.incompatible_registration(name) {
+                            Some(m) => {
+                                self.restore_errors.insert(
+                                    name.clone(),
+                                    format!(
+                                        "runs mesh protocol v{}, this build speaks v{}",
+                                        m.network, m.ours
+                                    ),
+                                );
+                                tracing::warn!(network = %name, ip = %my_ipv6, attempt, network_version = m.network, our_version = m.ours, "registered member network as version-incompatible; waiting for the coordinator to republish");
+                            }
+                            None => {
+                                self.restore_errors.remove(name);
+                                tracing::info!(network = %name, ip = %my_ipv6, attempt, "restored member network");
+                                return;
+                            }
+                        }
                     }
                     // Not reachable today (a reconnect handshake only ever returns
                     // `Admitted`), and that is exactly why it must not be a silent
@@ -570,6 +622,10 @@ impl NetworkRegistry {
                     tracing::warn!(network = %name, attempt, retry_in = ?delay, "restore queued for approval on a closed network, retrying");
                 }
                 Err(e) => {
+                    // Keep the reason where `ray status` can read it: a saved
+                    // network that never registers otherwise renders as a bare
+                    // "inactive" with the explanation only in the daemon log.
+                    self.restore_errors.insert(name.clone(), format!("{e:#}"));
                     // The first failure is worth flagging; the rest are just the
                     // shape of waiting for connectivity, so keep them at debug.
                     if attempt == 1 {
@@ -580,27 +636,91 @@ impl NetworkRegistry {
                 }
             }
 
-            tokio::select! {
-                _ = self.shutdown_token.cancelled() => return,
-                _ = tokio::time::sleep(delay) => {}
+            match self.after_attempt(&name, &mut delay, attempt).await {
+                RestoreNext::Retry => {}
+                RestoreNext::Stop => return,
             }
-
-            // Stop if the network registered by another path while we waited (an
-            // inbound handshake), or if it was left/nuked meanwhile. Say so: every
-            // exit from this loop has to be greppable, otherwise a network that is
-            // saved but not live has no explanation anywhere.
-            if self.networks.contains_key(&name) {
-                tracing::debug!(network = %name, attempt, "network registered by another path, ending restore");
-                return;
-            }
-            if let Ok(cfg) = config::load()
-                && !cfg.networks.iter().any(|n| n.name == name)
-            {
-                tracing::debug!(network = %name, "network no longer saved, giving up restore");
-                return;
-            }
-            delay = (delay * 2).min(RESTORE_RETRY_MAX);
         }
+    }
+
+    /// The version mismatch a registered network is flagged with. `None` covers
+    /// both "not registered" and "registered and healthy".
+    fn incompatible_registration(&self, name: &str) -> Option<MeshVersionMismatch> {
+        self.networks.get(name).and_then(|h| h.incompatible.clone())
+    }
+
+    /// Sleep out one restore backoff step, then say whether the loop goes on.
+    ///
+    /// Every exit from the restore loop has to be greppable, otherwise a network
+    /// that is saved but not live has no explanation anywhere. A registration
+    /// flagged version-incompatible is not an exit: it holds the network open
+    /// (and marked) in `ray status` while the loop waits for its coordinator to
+    /// republish at a version this build speaks.
+    async fn after_attempt(&self, name: &str, delay: &mut Duration, attempt: u32) -> RestoreNext {
+        tokio::select! {
+            _ = self.shutdown_token.cancelled() => return RestoreNext::Stop,
+            _ = tokio::time::sleep(*delay) => {}
+        }
+        *delay = (*delay * 2).min(RESTORE_RETRY_MAX);
+
+        if self.networks.contains_key(name) && self.incompatible_registration(name).is_none() {
+            tracing::debug!(network = %name, attempt, "network registered by another path, ending restore");
+            self.restore_errors.remove(name);
+            return RestoreNext::Stop;
+        }
+        if let Ok(cfg) = config::load()
+            && !cfg.networks.iter().any(|n| n.name == name)
+        {
+            tracing::debug!(network = %name, "network no longer saved, giving up restore");
+            self.restore_errors.remove(name);
+            return RestoreNext::Stop;
+        }
+        RestoreNext::Retry
+    }
+
+    /// The mesh protocol version a network's signed record advertises. `Ok(None)`
+    /// means the record predates the field; `Err` means it could not be read at
+    /// all, which says nothing about the version.
+    async fn record_mesh_version(&self, net_pubkey: &str) -> Result<Option<u32>> {
+        let net_pubkey: EndpointId = net_pubkey.parse().context("invalid network key")?;
+        let client = dht::create_pkarr_client(&self.transport.endpoint)?;
+        let record = dht::resolve_network_packet(&client, net_pubkey).await?;
+        Ok(dht::mesh_version_from_record(&record))
+    }
+
+    /// Re-read a version-incompatible network's record and, if the coordinator
+    /// has since republished at a version this build speaks, drop the blob-only
+    /// registration so the caller can run a real restore over it. Returns whether
+    /// it did.
+    ///
+    /// Tearing down is the only thing this touches, and only on a version that
+    /// now matches: a mismatch that still holds must leave the registration
+    /// exactly where it is, or each retry would take the network out of
+    /// `ray status` and put it back.
+    async fn mesh_version_recovered(
+        &self,
+        name: &str,
+        net_pubkey: &str,
+        mismatch: &MeshVersionMismatch,
+    ) -> bool {
+        let record_version = match self.record_mesh_version(net_pubkey).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(network = %name, error = %e, "could not re-read the network record; keeping the incompatible registration");
+                return false;
+            }
+        };
+        if !mesh_version_is_speakable(record_version, transport::MESH_PROTOCOL_VERSION) {
+            return false;
+        }
+        tracing::info!(
+            network = %name,
+            was = mismatch.network,
+            now = ?record_version,
+            "network republished at a mesh version this build speaks; rebuilding the registration"
+        );
+        self.teardown_network_runtime(name).await;
+        true
     }
 
     /// Start a member network's restore loop, unless one is already running for

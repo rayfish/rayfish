@@ -30,6 +30,63 @@ struct JoinContext<'a> {
     invite_lock: Arc<AsyncMutex<()>>,
     /// Pinned coordinator to dial first (the invite minter), if known.
     coordinator: Option<EndpointId>,
+    /// Set on a restore whose network record advertises a mesh protocol version
+    /// this build does not speak. Only [`VersionGate::Record`] can produce it,
+    /// so it is always `None` on a fresh join.
+    mismatch: Option<MeshVersionMismatch>,
+}
+
+/// What a mesh-protocol version mismatch means for the path that hit it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VersionGate {
+    /// A fresh `ray join`. Admission needs a mesh connection the versioned ALPN
+    /// refuses, so nothing can be registered and the precise error is the whole
+    /// answer.
+    Refuse,
+    /// A restore of a network this node is already a member of. Its roster blob
+    /// rides the (unversioned) blob ALPN and still decodes, so the network
+    /// registers from it and the mismatch is recorded for `ray status` instead
+    /// of taking the network out of existence.
+    Record,
+}
+
+/// A network's verified roster blob plus what its signed record said about the
+/// mesh protocol version.
+struct ResolvedNetwork {
+    blob: crate::membership::GroupBlob,
+    /// `Some` when the record advertises a version this build does not speak and
+    /// the caller asked to record that rather than refuse.
+    mismatch: Option<MeshVersionMismatch>,
+}
+
+/// Whether the mesh version a network's record advertises is one this build can
+/// speak.
+///
+/// An absent version means a record published before the field existed: not a
+/// refusal, just unknown, so the ALPN gate decides for those.
+pub(super) fn mesh_version_is_speakable(record_version: Option<u32>, ours: u32) -> bool {
+    record_version.is_none_or(|v| v == ours)
+}
+
+/// Compare the mesh version a network's signed record advertises against ours,
+/// and turn a mismatch into whatever `gate` says it means here.
+fn gate_mesh_version(
+    record_version: Option<u32>,
+    ours: u32,
+    gate: VersionGate,
+) -> Result<Option<MeshVersionMismatch>> {
+    let Some(network) = record_version else {
+        return Ok(None);
+    };
+    if mesh_version_is_speakable(Some(network), ours) {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        gate == VersionGate::Record,
+        "incompatible mesh protocol: this network runs v{network}, this build speaks v{ours} \
+         - run `ray update` so both sides match"
+    );
+    Ok(Some(MeshVersionMismatch { network, ours }))
 }
 
 /// A live mesh connection produced by the dial phase: the per-network state cell
@@ -227,7 +284,19 @@ impl NetworkRegistry {
             anyhow::bail!("already in network '{a}'");
         }
 
-        let data = self.resolve_and_fetch_blob(net_pubkey).await?;
+        // A fresh join has to be admitted by a coordinator over a mesh connection
+        // the versioned ALPN would refuse, so a version mismatch there is fatal
+        // and the precise message is the right answer. A restore is already a
+        // member: it registers from the verified blob and records the mismatch.
+        let gate = if initial {
+            VersionGate::Refuse
+        } else {
+            VersionGate::Record
+        };
+        let ResolvedNetwork {
+            blob: data,
+            mismatch,
+        } = self.resolve_and_fetch_blob(net_pubkey, gate).await?;
 
         // If our own primary has nullified this device in the signed blob
         // (`ray unpair`), tear ourselves out instead of trying (and failing) to
@@ -291,6 +360,7 @@ impl NetworkRegistry {
             auto_accept_files,
             invite_lock: invite_lock.clone(),
             coordinator,
+            mismatch,
         };
 
         // Establish the mesh link. A fresh join tries each coordinator in the
@@ -315,10 +385,15 @@ impl NetworkRegistry {
     /// a pre-dial courtesy: the versioned ALPN is the hard gate but fails
     /// opaquely, so comparing the network-key-signed record up front yields a
     /// precise, actionable error instead.
+    ///
+    /// `gate` says what a mismatch means here. On a fresh join it is fatal (see
+    /// [`VersionGate`]); on a restore the blob is still fetched and returned, so
+    /// the caller can register the network from it and mark it incompatible.
     async fn resolve_and_fetch_blob(
         &self,
         net_pubkey: EndpointId,
-    ) -> Result<crate::membership::GroupBlob> {
+        gate: VersionGate,
+    ) -> Result<ResolvedNetwork> {
         let pkarr_client = dht::create_pkarr_client(&self.transport.endpoint)?;
         let record = dht::resolve_network_packet(&pkarr_client, net_pubkey)
             .await
@@ -329,15 +404,11 @@ impl NetworkRegistry {
                 )
             })?;
 
-        // Absent version (older record) ⇒ skip and let the ALPN gate decide.
-        if let Some(net_ver) = dht::mesh_version_from_record(&record) {
-            let mine = transport::MESH_PROTOCOL_VERSION;
-            anyhow::ensure!(
-                net_ver == mine,
-                "incompatible mesh protocol: this network runs v{net_ver}, this build speaks v{mine} \
-                 - run `ray update` so both sides match"
-            );
-        }
+        let mismatch = gate_mesh_version(
+            dht::mesh_version_from_record(&record),
+            transport::MESH_PROTOCOL_VERSION,
+            gate,
+        )?;
 
         let (expected_hash, peer_ids) =
             dht::decode_network_record(&record).context("invalid network record")?;
@@ -348,7 +419,7 @@ impl NetworkRegistry {
 
         for peer_id in &peer_ids {
             match self.try_fetch_group_blob(*peer_id, blob_hash).await {
-                Ok(data) => return Ok(data),
+                Ok(blob) => return Ok(ResolvedNetwork { blob, mismatch }),
                 Err(e) => {
                     tracing::warn!(peer = %peer_id.fmt_short(), error = %e, "failed to fetch blob");
                 }
@@ -501,8 +572,30 @@ impl NetworkRegistry {
         // reconverge poll populates it.
         self.seed_route_map(ctx.display_name, &data.members);
 
-        tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
         let mut seed_from_blob = false;
+        // A version-incompatible network gets no handshake: the versioned mesh
+        // ALPN refuses the dial, so attempting one only spends the restore's
+        // budget on a connection that cannot exist. Register from the verified
+        // blob so the network is visible (and marked) instead of vanishing, and
+        // let the restore loop watch for a coordinator republish. The member
+        // dials below still run, and each one failing the ALPN gate is what
+        // flags the peer rows incompatible too.
+        if let Some(ref m) = ctx.mismatch {
+            tracing::warn!(
+                network = %ctx.display_name,
+                network_version = m.network,
+                our_version = m.ours,
+                "network runs an incompatible mesh protocol version; registering from the signed blob, no peer on it is reachable"
+            );
+            self.seed_absent_members(ctx.display_name, &data.members);
+            return Ok(Some(EstablishedMesh {
+                state: state_from_blob(),
+                cancel,
+                tasks,
+            }));
+        }
+
+        tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
         let state = match transport::connect_to_peer_with_alpn(
             &self.transport.endpoint,
             coordinator_id,
@@ -541,22 +634,8 @@ impl NetworkRegistry {
             }
         };
 
-        // Cold registration (no live connection yet): the daemon-wide supervisor
-        // is edge-triggered on disconnects, and this peer isn't in the table, so
-        // kick a reconnect directly for each member on this network. Only fires
-        // when we registered from the blob without a live handshake. NB: the
-        // NetworkHandle is inserted by `finalize_join` after this returns, so the
-        // dial's per-network target lookup must tolerate a brief absence — the
-        // supervisor re-checks `self.networks` at dial time, by when it's present.
         if seed_from_blob {
-            let me = self.transport.identity.local_identity();
-            let net = SmolStr::new(ctx.display_name);
-            for m in &data.members {
-                if m.identity == me {
-                    continue;
-                }
-                self.clone().spawn_reconnect(m.identity, vec![net.clone()]);
-            }
+            self.seed_absent_members(ctx.display_name, &data.members);
         }
 
         Ok(Some(EstablishedMesh {
@@ -564,6 +643,25 @@ impl NetworkRegistry {
             cancel,
             tasks,
         }))
+    }
+
+    /// Kick a reconnect for every roster member but ourselves on a cold
+    /// registration (one with no live handshake).
+    ///
+    /// The daemon-wide supervisor is edge-triggered on disconnects and these
+    /// peers aren't in the table, so nothing else would dial them. NB: the
+    /// `NetworkHandle` is inserted by `finalize_join` after this returns, so the
+    /// dial's per-network target lookup must tolerate a brief absence — the
+    /// supervisor re-checks `self.networks` at dial time, by when it's present.
+    fn seed_absent_members(self: &Arc<Self>, network: &str, members: &[crate::membership::Member]) {
+        let me = self.transport.identity.local_identity();
+        let net = SmolStr::new(network);
+        for m in members {
+            if m.identity == me {
+                continue;
+            }
+            self.clone().spawn_reconnect(m.identity, vec![net.clone()]);
+        }
     }
 
     /// Run the mesh handshake over an established connection (shared by both dial
@@ -623,6 +721,7 @@ impl NetworkRegistry {
             my_hostname,
             net_pubkey,
             invite_lock,
+            mismatch,
             ..
         } = ctx;
 
@@ -715,6 +814,7 @@ impl NetworkRegistry {
             cancel,
             tasks,
             invite_lock,
+            incompatible: mismatch,
         };
         self.networks.insert(display_name.to_string(), handle);
         self.refresh_search_domains().await;
@@ -938,5 +1038,83 @@ impl NetworkRegistry {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A restore of a network we already belong to must not be undone by the
+    /// version gate. The roster blob is not ALPN-gated, so the network still
+    /// registers from it; the mismatch is recorded and shown. Without this the
+    /// network vanished from `ray status` entirely, which reads as "gone", not
+    /// as "you and it are on different protocol versions".
+    #[test]
+    fn a_restore_records_a_version_mismatch_instead_of_failing() {
+        let mismatch = gate_mesh_version(Some(2), 4, VersionGate::Record)
+            .expect("a restore never fails on the version")
+            .expect("a differing version is a mismatch");
+        assert_eq!(
+            mismatch,
+            MeshVersionMismatch {
+                network: 2,
+                ours: 4
+            }
+        );
+    }
+
+    /// A fresh join has to be admitted by a coordinator over a mesh connection
+    /// the versioned ALPN refuses, so there is nothing to register and the
+    /// precise message is the whole answer.
+    #[test]
+    fn a_fresh_join_still_fails_on_a_version_mismatch() {
+        let err = gate_mesh_version(Some(2), 4, VersionGate::Refuse)
+            .expect_err("a fresh join cannot proceed on a mismatch");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("this network runs v2"), "{msg}");
+        assert!(msg.contains("this build speaks v4"), "{msg}");
+        assert!(msg.contains("ray update"), "{msg}");
+    }
+
+    #[test]
+    fn a_matching_version_is_not_a_mismatch_on_either_path() {
+        assert!(
+            gate_mesh_version(Some(4), 4, VersionGate::Record)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            gate_mesh_version(Some(4), 4, VersionGate::Refuse)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Records published before the version field carry no version at all.
+    /// Treating that as a mismatch would flag every older network incompatible
+    /// on a guess; the ALPN gate is what decides for those.
+    #[test]
+    fn an_absent_version_is_not_a_mismatch() {
+        assert!(mesh_version_is_speakable(None, 4));
+        assert!(
+            gate_mesh_version(None, 4, VersionGate::Refuse)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            gate_mesh_version(None, 4, VersionGate::Record)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The check the restore loop runs on every retry over a network it
+    /// registered as incompatible: a coordinator republish at our version is
+    /// what lets the blob-only registration be rebuilt as a normal one.
+    #[test]
+    fn a_republished_matching_version_is_speakable_again() {
+        assert!(!mesh_version_is_speakable(Some(2), 4));
+        assert!(mesh_version_is_speakable(Some(4), 4));
     }
 }

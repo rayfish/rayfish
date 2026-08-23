@@ -147,6 +147,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A network running a different mesh protocol version no longer disappears
+  from `ray status`.** Rejoining a saved network stopped at the version check, so
+  a network whose coordinator had moved to a newer (or older) protocol was never
+  registered and was listed nowhere at all: it read as gone, not as out of step.
+  Such a network now appears marked `incompatible`, saying which version it runs
+  and which your build speaks, with the same `ray update` nudge an incompatible
+  peer already gets. Its peers stay unreachable, since the version gate is what
+  it always was, and the daemon keeps watching: the network goes back to normal
+  on its own once its coordinator republishes at a version you speak. A
+  first-time `ray join` against such a network still fails with the version
+  message, because there is no way for its coordinator to admit you.
+
+- **`ray status` shows saved networks the daemon never brought up.** It looked
+  for them in the config directory of whoever ran it, which on macOS is not the
+  daemon's (the daemon runs as root, so its config lives under `/var/root`), and
+  found an empty one it had just created. Any network whose restore was failing
+  was therefore missing from the output entirely rather than listed as inactive.
+  The daemon now reports them itself, along with why the last restore attempt
+  failed, so the reason is on screen instead of only in the log.
+
 - **A kicked member now actually leaves the network.** `ray kick` removed the
   member from the roster and cut its connection, but never told it *which*
   network it had been removed from: a connection close code cannot name one. The
