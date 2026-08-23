@@ -15,6 +15,8 @@ use std::path::Path;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 // Only the macOS/Linux configurators build resolver/backup file paths; Android
 // does no OS-level DNS configuration.
 #[cfg(not(target_os = "android"))]
@@ -1474,7 +1476,7 @@ pub enum Recapture {
 /// minute converges just as surely, and the cost of being slow here is that
 /// `.ray` resolves through the stub a minute late.
 #[cfg(target_os = "linux")]
-const MERGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+const MERGE_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// How often the re-assert pass runs regardless of inotify.
 ///
@@ -1486,7 +1488,7 @@ const MERGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 /// the daemon keeps declining off-mesh names while pointing the stub at an
 /// address that stopped answering.
 #[cfg(target_os = "linux")]
-const REASSERT_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+const REASSERT_TICK: Duration = Duration::from_secs(30);
 
 /// One re-assert pass, reporting only the outcomes the loop acts on. Errors are
 /// logged and treated as "keep watching" (the next tick retries).
@@ -2168,8 +2170,20 @@ impl DnsConfigurator for DirectResolvConf {
                 self.captured_upstreams.store(Arc::new(after));
             }
             NmQuietOutcome::Abort => {
-                restore_file(path).await?;
+                // Deliberately not `?`. This arm is the one that hands the host
+                // back to NetworkManager, and every step of it has to run: a `?`
+                // here left NM quieted with the `dns=none` drop-in still
+                // installed and no resolver of ours in the file, so the host had
+                // neither, and skipped the counter so the latch could never trip.
+                // Nothing else removes that drop-in until a `ray down`.
+                let restored = restore_file(path).await;
                 nm_quiet_remove().await;
+                if let Err(e) = &restored {
+                    tracing::error!(
+                        error = %e,
+                        "could not put /etc/resolv.conf back after aborting the takeover"
+                    );
+                }
                 // Two verdicts before the latch, the same two strikes
                 // `run_resolv_reassert` gives the resolver it shares the file
                 // with, and for the same reason: one lost packet or one
@@ -2181,13 +2195,15 @@ impl DnsConfigurator for DirectResolvConf {
                 if aborts >= 2 {
                     NM_TAKEOVER_UNSAFE.store(true, AtomicOrdering::Relaxed);
                 }
-                anyhow::bail!(
-                    "every DNS server /etc/resolv.conf named stopped answering once \
+                let reason = "every DNS server /etc/resolv.conf named stopped answering once \
                      NetworkManager was told to stop managing DNS (`dns=none`), which is how \
                      its built-in resolver is run; taking the file over would leave this host \
                      unable to resolve anything. Set `dns_upstreams` in the config to name a \
-                     server directly."
-                );
+                     server directly.";
+                match restored {
+                    Ok(()) => anyhow::bail!("{reason}"),
+                    Err(e) => anyhow::bail!("{reason} (and restoring the file failed: {e})"),
+                }
             }
         }
         let new_content = render_direct_resolv_conf(&self.search.load(), &self.fallbacks());
