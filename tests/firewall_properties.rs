@@ -51,31 +51,65 @@ proptest! {
         assert_info_eq(&info, &spec.expected())?;
     }
 
-    /// The refusal the round-trip property above is filtered around. An IPv6
-    /// next header naming an extension header means byte 6 is not the
-    /// upper-layer protocol and offset 40 is not the ports, so the parser cannot
-    /// answer and must say so rather than report a protocol of 44 with no ports:
-    /// the conntrack key is built from exactly those fields.
+    /// An extension-header chain is transparent: the parser walks it and reports
+    /// the same protocol, ports and flags it would have without one.
+    ///
+    /// This is the property the conntrack key depends on. Reading byte 6 as the
+    /// protocol instead made every chained packet `(44, 0, 0)`, a single wildcard
+    /// entry that an outbound fragment opened and any inbound packet could then
+    /// walk through.
     #[test]
-    fn ipv6_extension_headers_are_refused(
+    fn an_extension_header_chain_is_transparent(
+        spec in packet_spec(),
+        links in common::ext_chain_strategy(),
+    ) {
+        let Some(pkt) = spec.encode_behind(&links) else {
+            return Ok(()); // IPv4 has no chain to walk
+        };
+        let info = parse_packet_info(&pkt).expect("a chain must be walked, not refused");
+        assert_info_eq(&info, &spec.expected())?;
+    }
+
+    /// A non-first fragment is the one case that stays refused: the L4 header is
+    /// in a different packet, so there are no ports to key on and guessing zero
+    /// is what rebuilt the wildcard entry. The first fragment of the same
+    /// datagram does carry them and must still parse.
+    #[test]
+    fn a_non_first_ipv6_fragment_is_refused(
+        spec in packet_spec(),
+        offset in 1u16..8192,
+    ) {
+        const FRAGMENT: u8 = 44;
+        let Some(first) = spec.encode_behind(&[FRAGMENT]) else {
+            return Ok(());
+        };
+        prop_assert!(
+            parse_packet_info(&first).is_some(),
+            "the first fragment carries the L4 header",
+        );
+
+        // The fragment offset is the top 13 bits of the 16 at 42.
+        let mut later = first;
+        later[42..44].copy_from_slice(&(offset << 3).to_be_bytes());
+        prop_assert!(
+            parse_packet_info(&later).is_none(),
+            "a fragment at offset {} has no ports to read",
+            offset,
+        );
+    }
+
+    /// The same protocol numbers are ordinary upper-layer protocols in IPv4,
+    /// which has no extension headers at all, so nothing there may be walked.
+    #[test]
+    fn ipv4_does_not_walk_ipv6_extension_headers(
         nh in prop::sample::select(&rayfish::firewall::IPV6_EXTENSION_HEADERS[..]),
         spec in packet_spec(),
     ) {
+        prop_assume!(!spec.v6);
         let mut pkt = spec.encode();
-        // Force the packet to v6 with an extension header in the next-header slot.
-        let mut v6 = vec![0u8; 60];
-        v6[0] = 0x60;
-        v6[4..6].copy_from_slice(&20u16.to_be_bytes());
-        v6[6] = nh;
-        v6[7] = 64;
-        v6[24] = 0x02;
-        prop_assert!(parse_packet_info(&v6).is_none(), "next header {} must not parse", nh);
-        // And the IPv4 packet with the same protocol number is unaffected: these
-        // values are only extension headers in IPv6.
-        if !spec.v6 {
-            pkt[9] = nh;
-            prop_assert!(parse_packet_info(&pkt).is_some());
-        }
+        pkt[9] = nh;
+        let info = parse_packet_info(&pkt).expect("an IPv4 packet has no chain to refuse");
+        prop_assert_eq!(info.protocol, nh);
     }
 
     /// The version nibble is the parser's dispatch key: anything other than 4

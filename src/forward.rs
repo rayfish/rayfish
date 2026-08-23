@@ -949,7 +949,10 @@ mod tests {
 
     #[test]
     fn test_parse_packet_ipv6() {
-        let mut packet = vec![0u8; 40];
+        // 44 bytes: enough for the fixed header plus the TCP ports. A packet that
+        // names TCP and carries no TCP header has no ports to key on and is
+        // refused (`firewall::parse_ipv6`).
+        let mut packet = vec![0u8; 44];
         packet[0] = 0x60; // IPv6
         packet[6] = 6; // TCP next header
         // dst at bytes 24-39
@@ -1049,7 +1052,9 @@ mod tests {
     fn inbound_ipv6_evaluated_by_firewall() {
         let fw = inbound_fw(Action::Deny, vec![]);
         let peer = iroh::SecretKey::generate().public();
-        let mut pkt = vec![0u8; 40];
+        // 44 bytes, so the TCP ports are present: without them the packet is
+        // unclassifiable and would be dropped as malformed before the firewall.
+        let mut pkt = vec![0u8; 44];
         pkt[0] = 0x60; // IPv6
         pkt[6] = 6; // TCP
         // src is the sender's own mesh address, or the anti-spoof check drops it

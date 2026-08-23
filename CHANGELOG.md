@@ -121,25 +121,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   updating. A reply the CLI does not recognise, which is what a `ray` binary
   and a daemon on different versions produce, exits non-zero for the same
   reason and now names the version skew as the likely cause.
-- **An exit node no longer gives its clients a route onto its own network.** A
-  gateway refused to forward traffic into private IPv4 ranges, loopback and
-  link-local, but an IPv6 LAN is normally a *global* prefix handed out by the
-  ISP, which none of those checks can recognise. A client of the exit node could
-  therefore reach every other machine on the gateway's LAN. The gateway now reads
-  the prefixes it is directly attached to and refuses transit into them, which is
-  what the IPv4 side already had for free.
-- **Security: a peer could get past the inbound firewall with a fragmented IPv6
-  packet.** The packet parser read the protocol and ports at fixed offsets, so
-  any packet carrying an IPv6 extension header (a fragment, hop-by-hop, routing
-  or destination-options header) was recorded as protocol 44 with no ports. That
-  is a single connection-tracking entry matching *every* such packet from that
-  peer, so one ordinary outbound fragment — any UDP send larger than the 1280-byte
-  tunnel MTU — opened a 30-second window in which that peer could reach any local
-  port, whatever the firewall said. Such packets are now refused outright. Traffic
-  that relied on IPv6 fragmentation over the mesh will stop rather than fall
-  through, which is the safe direction; lower your application's datagram size or
-  let TCP handle it. Both directions are counted as `malformed` drops in `ray
-  status`, so traffic that stops this way is visible rather than silent.
 - **Taking over `/etc/resolv.conf` no longer breaks DNS on a NetworkManager
   host that runs its own resolver.** With NetworkManager in `dns=dnsmasq` mode,
   the server rayfish found in `resolv.conf` is NetworkManager's own local
@@ -254,6 +235,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **A peer could get past the inbound firewall with a fragmented IPv6 packet.**
+  The packet parser read the protocol and ports at fixed offsets, so any packet
+  carrying an IPv6 extension header (a fragment, hop-by-hop, routing or
+  destination-options header) was recorded as protocol 44 with no ports. That is
+  a single connection-tracking entry matching *every* such packet from that peer,
+  so one ordinary outbound fragment (any UDP send larger than the 1280-byte
+  tunnel MTU) opened a 30-second window in which that peer could reach any local
+  port, whatever the firewall said. The parser now walks the header chain to the
+  real protocol, so a chained packet is classified on its own ports. The one case
+  it cannot answer is a fragment after the first, which carries no transport
+  header at all: those are refused, so a datagram large enough to be fragmented
+  does not cross the mesh. Lower your application's datagram size or let TCP
+  handle it. Refusals are counted as `malformed` drops in `ray status`, so
+  traffic that stops this way is visible rather than silent.
+- **An exit node no longer gives its clients a route onto its own network.** A
+  gateway refused to forward traffic into private IPv4 ranges, loopback and
+  link-local, but an IPv6 LAN is normally a *global* prefix handed out by the
+  ISP, which none of those checks can recognise. A client of the exit node could
+  therefore reach every other machine on the gateway's LAN. The gateway now reads
+  the prefixes it is directly attached to and refuses transit into them, which is
+  what the IPv4 side already had for free.
 - **Knowing a network's room id no longer lets a stranger talk to it.** A mesh
   control message is addressed to a network by its public key, and that key is
   a discovery key by design: it is in every invite code and it is the address
