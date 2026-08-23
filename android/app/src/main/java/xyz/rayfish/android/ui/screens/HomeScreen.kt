@@ -25,6 +25,8 @@ import uniffi.ray_mobile.Status
 import xyz.rayfish.android.DownloadsOutcome
 import xyz.rayfish.android.FileAutoAccept
 import xyz.rayfish.android.NodeHolder
+import xyz.rayfish.android.OfferNotifier
+import xyz.rayfish.android.formatSize
 import xyz.rayfish.android.TransferKey
 import xyz.rayfish.android.TransferNotifier
 import xyz.rayfish.android.TunnelControl
@@ -120,6 +122,10 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
             // This is uncommon (standby is the default); the common case keeps the
             // control plane running in the background.
             runCatching { TransferNotifier.poll(context) }
+            // Posted even with the app open: the user may be on another tab, and
+            // an offer notification the foreground poll skipped would only appear
+            // once the background poller next ran, or never with the VPN fully off.
+            runCatching { OfferNotifier.poll(context) }
             val autoAccepting = NodeHolder.isAutoAcceptOwnDevices(context)
             files = runCatching { node.listFileOffers() }.getOrDefault(emptyList())
                 // Hide own-device offers while auto-accept is downloading or still
@@ -158,6 +164,10 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
     val doneFiles = remember { mutableStateMapOf<ULong, FileOffer>() }
     fun acceptFile(f: FileOffer) {
         accepting[f.id] = f
+        // Saving from the row settles the same offer the notification is
+        // advertising: take it down now rather than leaving a Save button on
+        // screen for a file that is already downloading.
+        OfferNotifier.markActedOn(context, f.id)
         val key = TransferKey(f.from, f.filename, f.size)
         // Mark pending before the blocking accept starts: the core reports the
         // transfer DONE from inside acceptFileOffer, before moveToDownloads below
@@ -225,7 +235,10 @@ fun HomeScreen(status: Status?, starting: Boolean, onToast: (String) -> Unit) {
                             title = f.filename,
                             subtitle = "file · ${formatSize(f.size)} · from ${f.from}",
                             acceptLabel = "Save", onAccept = { acceptFile(f) },
-                            onReject = { act { NodeHolder.get(context).rejectFileOffer(f.id) } },
+                            onReject = {
+                                OfferNotifier.markActedOn(context, f.id)
+                                act { NodeHolder.get(context).rejectFileOffer(f.id) }
+                            },
                         )
                     }
                     queued.forEach { q ->
@@ -302,16 +315,6 @@ private fun FileTransferRow(filename: String, done: Boolean) {
                 trackColor = Rf.CardBorder,
             )
         }
-    }
-}
-
-private fun formatSize(bytes: ULong): String {
-    val b = bytes.toDouble()
-    return when {
-        b >= 1_000_000_000 -> "%.1f GB".format(b / 1_000_000_000)
-        b >= 1_000_000 -> "%.1f MB".format(b / 1_000_000)
-        b >= 1_000 -> "%.1f KB".format(b / 1_000)
-        else -> "$bytes B"
     }
 }
 

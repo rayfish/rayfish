@@ -680,9 +680,11 @@ class RayfishVpnService : VpnService() {
 
     /**
      * Auto-accept own-device file offers, so a file shared to this device from one
-     * of the user's own devices lands in Downloads without the app being open, and
+     * of the user's own devices lands in Downloads without the app being open,
      * drive [TransferNotifier] so a transfer that completes while the app is closed
-     * still gets its progress/result notification. Runs in standby too: that is what
+     * still gets its progress/result notification, and drive [OfferNotifier] so a
+     * file sent by anyone else is announced instead of waiting silently for the
+     * next time the app happens to be opened. Runs in standby too: that is what
      * makes files keep working with the VPN off. Auto-accept is gated by the user's
      * opt-out toggle inside FileAutoAccept.run. Idempotent.
      */
@@ -693,6 +695,7 @@ class RayfishVpnService : VpnService() {
                 {
                     runCatching { FileAutoAccept.run(applicationContext) }
                     runCatching { TransferNotifier.poll(applicationContext) }
+                    runCatching { OfferNotifier.poll(applicationContext) }
                 },
                 4, 4, TimeUnit.SECONDS,
             )

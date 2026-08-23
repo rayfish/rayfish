@@ -39,6 +39,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   found no working resolver of its own: those entries are reachable only through
   the tunnel, so counting them would have taken the file and left the machine
   unable to resolve anything.
+- **Android notifies you when someone sends you a file.** An incoming file from
+  another peer used to arrive in silence: notifications only covered transfers
+  that were already under way, and a file waiting on your decision has no
+  transfer behind it yet, so the only place it appeared was the app's own list.
+  Sent while the app was closed, it sat there unannounced until you next opened
+  it. There is now a notification naming the file, who sent it and how big it
+  is, with Save and Reject on it so you can take the file without opening the
+  app at all. Files from your own paired devices are unaffected: those are still
+  saved automatically and reported as they download.
 
 ### Changed
 

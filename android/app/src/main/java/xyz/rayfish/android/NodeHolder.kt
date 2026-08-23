@@ -323,9 +323,10 @@ object NodeHolder {
      * [ensureStarted] rebuilds a fresh daemon. Safe to call when never started.
      *
      * The reset calls below deliberately run after the monitor is released:
-     * [TransferNotifier.reset] and [FileAutoAccept.reset] take their own locks,
-     * and neither is ever called from inside this object's monitor, so there is
-     * no path back into this monitor from theirs to deadlock against.
+     * [TransferNotifier.reset], [OfferNotifier.reset] and [FileAutoAccept.reset]
+     * take their own locks, and none of them is ever called from inside this
+     * object's monitor, so there is no path back into this monitor from theirs
+     * to deadlock against.
      */
     fun stopNode(context: Context) {
         synchronized(this) {
@@ -338,6 +339,7 @@ object NodeHolder {
         // transfer or offer landing on a reused id is never muted (or, for a
         // given-up offer, wrongly left un-hidden) by a stale entry.
         TransferNotifier.reset(context)
+        OfferNotifier.reset(context)
         FileAutoAccept.reset()
     }
 
