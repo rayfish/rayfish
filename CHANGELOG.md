@@ -147,6 +147,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Android: "Send diagnostics" now actually sends the diagnostics.** The button
+  reported success and delivered an empty report: the log snapshot, the node
+  health block, and the install and transport tags were all attached to the
+  event in a way the Sentry SDK dropped on the way out, so every report for the
+  past month arrived as a bare "rayfish diagnostics" line with nothing in it.
+  There was no way to tell from the app, since the report itself went through.
+  The same loss applied to the automatic report a node sends when it fails to
+  start, which is the one report nobody is around to notice is empty. Both now
+  carry their logs. A report that Sentry refuses also says "Diagnostics
+  unavailable" instead of claiming it was sent.
+
 - **A network running a different mesh protocol version no longer disappears
   from `ray status`.** Rejoining a saved network stopped at the version check, so
   a network whose coordinator had moved to a newer (or older) protocol was never
@@ -305,6 +316,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   between attempts rather than being re-dialed on every change.
 
 ### Security
+
+- **Android: a device identifier no longer leaks onto unrelated crash reports.**
+  The install id and network transport meant for diagnostics reports were being
+  written somewhere longer-lived than the report itself, and turned up on an
+  unrelated crash captured seconds later. They are now attached to the one event
+  they belong to and to nothing else.
 
 - **A peer could get past the inbound firewall with a fragmented IPv6 packet.**
   The packet parser read the protocol and ports at fixed offsets, so any packet
