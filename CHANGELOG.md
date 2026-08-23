@@ -48,6 +48,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is, with Save and Reject on it so you can take the file without opening the
   app at all. Files from your own paired devices are unaffected: those are still
   saved automatically and reported as they download.
+- **`ray logs`: read the daemon's log without hunting for the files.** The logs
+  are root-owned under `/var/log/rayfish` (`/Library/Logs/rayfish` on macOS),
+  so until now looking at them meant `sudo cat` and knowing which file, or
+  `ray report`, which bundles a week of them into a tarball meant for sharing.
+  `ray logs` prints today's, from the daemon over IPC, so it needs no root:
+
+  ```bash
+  ray logs                 # everything since the last daily rotation
+  ray logs --since 2h30m   # only the last two and a half hours
+  ray logs -f              # keep streaming new lines, like tail -f
+  ray logs --since 5m -f   # the last five minutes, then keep streaming
+  ```
+
+  Output goes through `$PAGER` (`less`) on a terminal and straight through
+  when piped or following, so `ray logs | grep peer` and `ray logs -f` both
+  behave the way you would expect.
 
 ### Changed
 
@@ -110,6 +126,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   existing scripts are unaffected; they no longer appear in `ray --help` or in
   tab completion. `ray open` (the `rayfish://` link handler, which nobody types)
   is hidden for the same reason.
+- **Android 8.0 (API 26) is now the minimum.** Every notification the app posts
+  goes through a notification channel, which is an 8.0 API, so on 7.x the calls
+  threw and were swallowed: transfers and incoming files were announced by
+  nothing at all, on a build that otherwise looked like it worked. Rather than
+  keep a tier where the app is quietly half-functional, 7.x is dropped. Android
+  8.0 and later are unaffected.
+- **The address on the mobile app's rows is readable again.** A node's only
+  address is now a full mesh IPv6, which did not fit on one line beside its
+  label, so it was ellipsised in the middle: unreadable, and impossible to check
+  against `ray status`. Those rows wrap to a second line instead.
 - **The mobile app stops waking the radio every minute.** Every node used to
   re-resolve each network's signed record once a minute, whether or not
   anything had changed, which on a phone is a wakeup per network per minute for
@@ -268,10 +294,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so one ordinary outbound fragment (any UDP send larger than the 1280-byte
   tunnel MTU) opened a 30-second window in which that peer could reach any local
   port, whatever the firewall said. The parser now walks the header chain to the
-  real protocol, so a chained packet is classified on its own ports. The one case
-  it cannot answer is a fragment after the first, which carries no transport
-  header at all: those are refused, so a datagram large enough to be fragmented
-  does not cross the mesh. Lower your application's datagram size or let TCP
+  real protocol, so a chained packet is classified on its own ports. Fragments
+  are refused outright, first one included: a fragment after the first carries no
+  transport header to classify, and forwarding the first one alone would only put
+  a datagram on the wire that the peer can never reassemble. So a datagram large
+  enough to be fragmented does not cross the mesh. Lower your application's
+  datagram size or let TCP
   handle it. Refusals are counted as `malformed` drops in `ray status`, so
   traffic that stops this way is visible rather than silent.
 - **An exit node no longer gives its clients a route onto its own network.** A
@@ -333,25 +361,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still made a coordinator re-sign and republish its membership record and
   notify every member, each of whom answered with a lookup of their own. It is
   now ignored.
-
-### Added
-
-- **`ray logs`: read the daemon's log without hunting for the files.** The logs
-  are root-owned under `/var/log/rayfish` (`/Library/Logs/rayfish` on macOS),
-  so until now looking at them meant `sudo cat` and knowing which file, or
-  `ray report`, which bundles a week of them into a tarball meant for sharing.
-  `ray logs` prints today's, from the daemon over IPC, so it needs no root:
-
-  ```bash
-  ray logs                 # everything since the last daily rotation
-  ray logs --since 2h30m   # only the last two and a half hours
-  ray logs -f              # keep streaming new lines, like tail -f
-  ray logs --since 5m -f   # the last five minutes, then keep streaming
-  ```
-
-  Output goes through `$PAGER` (`less`) on a terminal and straight through
-  when piped or following, so `ray logs | grep peer` and `ray logs -f` both
-  behave the way you would expect.
 
 ## [0.3.0] - 2026-08-15
 
