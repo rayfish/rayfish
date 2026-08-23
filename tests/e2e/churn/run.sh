@@ -36,7 +36,7 @@ SERVERS="$DIR/.servers"
 # shellcheck source=../../lib/common.sh
 source "$ROOT/tests/lib/common.sh"
 
-[[ -f "$SERVERS" ]] || { echo "No $SERVERS — run $DIR/provision.sh first"; exit 1; }
+[[ -f "$SERVERS" ]] || { echo "No $SERVERS, run $DIR/provision.sh first"; exit 1; }
 
 A="$(server_ip "$SERVERS" srv-a || true)"
 B="$(server_ip "$SERVERS" srv-b || true)"
@@ -63,9 +63,14 @@ daemon_stop(){ on "$1" 'systemctl stop rayfish' >/dev/null 2>&1 || true; }
 # no-op. Mirrors tests/e2e/restore-offline.
 daemon_start(){
   on "$1" 'systemctl start rayfish' >/dev/null 2>&1 || true
-  sleep 5
+  # Wait for IPC *before* `ray up`, not after. A 1-vCPU droplet can take well
+  # over a fixed sleep to bring up the TUN, bind the endpoint and dial its saved
+  # networks; `ray up` then cannot reach the socket, `|| true` swallows it, and
+  # the node comes back in standby. The control plane still converges, so
+  # `wait_back` passes and only the data-plane assertions of that round fail.
+  retry_until 60 "on '$1' 'ray status' >/dev/null 2>&1" || return 1
   on "$1" 'ray up' >/dev/null 2>&1 || true
-  retry_until 60 "on '$1' 'ray status' >/dev/null 2>&1"
+  retry_until 30 "on '$1' 'ray status' >/dev/null 2>&1"
 }
 
 # wait_gone <observer-ip> <peer-host> <secs> : block until <observer> reports the
@@ -90,6 +95,16 @@ reset_state "$A" "$B" "$C" "$D"
 deploy_all "$ROOT" "$A" "$B" "$C" "$D"
 for h in "$A" "$B" "$C" "$D"; do on "$h" 'ray up' >/dev/null 2>&1 || true; done
 wait_daemons "$A" "$B" "$C" "$D"
+
+# The health sweep at the end reads the journal, and a `.servers` fleet is reused
+# across runs by design, so without a floor one panic would fail every later run
+# on that fleet forever. Read the host's own clock, not ours: `--since` is
+# interpreted there.
+declare -A SINCE
+for h in "$A" "$B" "$C" "$D"; do
+  SINCE[$h]="$(on "$h" "date -u '+%Y-%m-%d %H:%M:%S'" | tr -d '[:space:]\r')"
+  [[ -n "${SINCE[$h]}" ]] || { echo "could not read the clock on $h"; exit 1; }
+done
 
 # ---------------------------------------------------------------------------
 step "1. closed network, four nodes, full mesh"
@@ -422,18 +437,26 @@ for pair in "A:srv-a" "B:srv-b" "C:srv-c" "D:srv-d"; do
   else
     fail "$name daemon is not responding after the churn"
   fi
+  # Both counts are bounded by this run's start (see SINCE) and both distinguish
+  # "read zero" from "read nothing": an ssh that fails leaves the capture empty,
+  # and `${x:-0}` would turn that into a PASS on a journal nobody looked at.
+  since="${SINCE[$ip]}"
   # The daemon's own hook logs `panic: <msg>`; a panic before it is installed, or
   # on a thread that bypasses it, still logs the default `panicked at`.
-  panics="$(on "$ip" "journalctl -u rayfish --no-pager 2>/dev/null | grep -cE 'panicked at|panic: '" | tr -d '[:space:]')"
-  if [[ "${panics:-0}" == "0" ]]; then
+  panics="$(on "$ip" "journalctl -u rayfish --utc --since '$since' --no-pager 2>/dev/null | grep -cE 'panicked at|panic: '" | tr -d '[:space:]')"
+  if [[ ! "$panics" =~ ^[0-9]+$ ]]; then
+    fail "$name: could not read the journal, so the panic check proves nothing"
+  elif [[ "$panics" == "0" ]]; then
     pass "$name logged no panic"
   else
-    fail "$name logged $panics panic line(s) (journalctl -u rayfish | grep -E 'panicked at|panic: ')"
+    fail "$name logged $panics panic line(s) (journalctl -u rayfish --since '$since' | grep -E 'panicked at|panic: ')"
   fi
   # A crash-restart is systemd's own line, and it survives the manual stops this
   # test performs. Anything here is a daemon that died rather than one we stopped.
-  crashes="$(on "$ip" "journalctl -u rayfish --no-pager 2>/dev/null | grep -c 'Scheduled restart job'" | tr -d '[:space:]')"
-  if [[ "${crashes:-0}" == "0" ]]; then
+  crashes="$(on "$ip" "journalctl -u rayfish --utc --since '$since' --no-pager 2>/dev/null | grep -c 'Scheduled restart job'" | tr -d '[:space:]')"
+  if [[ ! "$crashes" =~ ^[0-9]+$ ]]; then
+    fail "$name: could not read the journal, so the crash check proves nothing"
+  elif [[ "$crashes" == "0" ]]; then
     pass "$name never crash-restarted"
   else
     fail "$name crash-restarted $crashes time(s) during the run"

@@ -312,7 +312,11 @@ else
 
   # The loop-prevention assertion. If SO_MARK / the fwmark rule were missing, iroh's
   # own UDP would have looped into the tunnel and the mesh would be dead here.
-  if on "$B" "ping -c 3 -W 2 $A_VPN" 2>/dev/null | grep -q "0% packet loss"; then
+  #
+  # Read through `ping_loss` rather than grepping for "0% packet loss": that
+  # substring is also inside "100% packet loss", so the one assertion this whole
+  # fork chain exists for used to report PASS on a mesh that was completely dead.
+  if [[ "$(ping_loss "$B" "$A_VPN")" == "0" ]]; then
     pass "mesh still works under the full tunnel (srv-b pinged srv-a's mesh IP)"
   else
     fail "mesh broke under the full tunnel: loop prevention failed (SO_MARK/ip rule)"

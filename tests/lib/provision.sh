@@ -57,14 +57,20 @@ do_provision(){
     exit 1
   fi
 
-  local tmp; tmp="$(mktemp)"
-  # Every droplet already created is billed, and $tmp is the only record of it
-  # until the `mv` below. So the trap keeps the partial fleet rather than
-  # discarding it: `teardown` needs the ids, and "No .servers, nothing to tear
-  # down" on a fleet that is running costs real money. See tests/lib/teardown.sh.
-  trap 'if [[ -s "$tmp" ]]; then mv "$tmp" "$SERVERS"; \
+  # Deliberately not `local`. The trap below reads it, and bash pops the
+  # function's locals *before* running an EXIT trap when `set -e` kills the
+  # shell rather than an explicit `exit`. Under `set -u` the trap body then dies
+  # on `PROVISION_TMP: unbound variable` and keeps nothing, which is exactly the
+  # case it exists for: a `doctl create` that fails partway (quota, a 5xx, a
+  # --wait timeout) leaves the earlier droplets running and billed.
+  PROVISION_TMP="$(mktemp)"
+  # Every droplet already created is billed, and $PROVISION_TMP is the only
+  # record of it until the `mv` below. So the trap keeps the partial fleet rather
+  # than discarding it: `teardown` needs the ids, and "No .servers, nothing to
+  # tear down" on a running fleet costs real money. See tests/lib/teardown.sh.
+  trap 'if [[ -s "$PROVISION_TMP" ]]; then mv "$PROVISION_TMP" "$SERVERS"; \
           echo "   kept the partial fleet in $SERVERS; run teardown to remove it" >&2; \
-        else rm -f "$tmp"; fi' EXIT
+        else rm -f "$PROVISION_TMP"; fi' EXIT
 
   local i name label json id ip ip6 no_v6=0
   for i in "${!NAMES[@]}"; do
@@ -91,16 +97,16 @@ do_provision(){
     # before bailing or teardown has no id to destroy. `-` keeps the column
     # count; teardown only needs the id.
     [[ -n "$ip" ]] || {
-      echo "$id - $label $REGION" >> "$tmp"
+      echo "$id - $label $REGION" >> "$PROVISION_TMP"
       echo "   no public IPv4 for $name" >&2
       exit 1
     }
     echo "   id=$id  ip=$ip  ipv6=${ip6:-<none>}"
     [[ -n "$ip6" ]] || no_v6=1
-    echo "$id $ip $label $REGION" >> "$tmp"
+    echo "$id $ip $label $REGION" >> "$PROVISION_TMP"
   done
 
-  mv "$tmp" "$SERVERS"
+  mv "$PROVISION_TMP" "$SERVERS"
   trap - EXIT
   echo
   if [[ "$no_v6" == 1 ]]; then
