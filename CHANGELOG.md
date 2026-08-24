@@ -75,6 +75,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A join with no `--hostname` takes this machine's name.** `ray create` and
+  `ray join` used to fall back to a random noun, so `ray status` on a fleet read
+  as a list of animals nobody could match to a box. They now use the machine's
+  own hostname, folded into a mesh name (`Alice's MacBook.local` becomes
+  `alice-s-macbook`). A random name is still used when the machine has nothing
+  usable to offer (`localhost`, which is what Android reports) and when the name
+  is already on the network you are joining, since `laptop-1` would read as the
+  name of the `laptop` that is already there. `ray up --hostname <name>` still
+  wins over both, and naming one explicitly is unaffected.
+
 - **Rayfish is IPv6-only. Mesh IPv4 is gone.** Every peer had two mesh addresses:
   an IPv4 in `100.64.0.0/10` and an IPv6 in `200::/7`. Only the IPv6 remains.
   It is blake3 of the peer's identity, so it is collision-free, never rotates,

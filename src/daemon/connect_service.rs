@@ -168,10 +168,13 @@ impl ConnectService {
 
         // Decide our own hostname once so the network name (`<me>-<peer>`) and our
         // member hostname on it agree, instead of generating two different names.
-        let my_host = config::load()
-            .ok()
-            .and_then(|c| c.default_hostname)
-            .unwrap_or_else(crate::hostname::generate_hostname);
+        // The peer's name is the whole roster of a 2-peer network, so it is
+        // also the only thing our default can collide with, and it will when
+        // both ends are called `laptop`.
+        let my_host = crate::hostname::default_hostname(
+            config::load().ok().and_then(|c| c.default_hostname),
+            req.hostname.as_deref().as_slice(),
+        );
         let name = self
             .registry
             .direct_network_name(&my_host, req.hostname.as_deref());

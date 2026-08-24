@@ -101,7 +101,7 @@ pub(crate) enum Command {
         /// Network name used in DNS (e.g. "gaming" → alice.gaming.ray). Random if not set
         #[arg(long)]
         name: Option<String>,
-        /// Your hostname within the network (e.g. "alice" → alice.gaming.ray). Random if not set
+        /// Your hostname within the network (e.g. "alice" → alice.gaming.ray). Defaults to this machine's hostname
         #[arg(long)]
         hostname: Option<String>,
         /// Route traffic through Tor (requires running Tor daemon with ControlPort 9051)
@@ -115,7 +115,7 @@ pub(crate) enum Command {
         /// Optional local alias for the network
         #[arg(long)]
         name: Option<String>,
-        /// Your hostname within the network (e.g. "bob" → bob.gaming.ray). Random if not set
+        /// Your hostname within the network (e.g. "bob" → bob.gaming.ray). Defaults to this machine's hostname
         #[arg(long)]
         hostname: Option<String>,
         /// Route traffic through Tor (requires running Tor daemon with ControlPort 9051)
