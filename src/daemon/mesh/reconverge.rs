@@ -219,15 +219,19 @@ pub(crate) async fn fetch_verified_blob(
 ///
 /// Sent to every connected coordinator rather than one, because "which
 /// coordinator is reachable" is not something a member that cannot even read the
-/// roster is well placed to answer. The wall on the receiving side only answers
-/// a peer already on the verified roster.
+/// roster is well placed to answer. This is the already-a-member case, so it
+/// presents no invite: the receiver recognises us from its own roster.
 pub(crate) async fn request_read_key(
     peers: &PeerTable,
     net_pubkey: EndpointId,
     network_name: &str,
 ) {
+    let msg = ControlMsg::ReadKeyRequest {
+        invite_secret: None,
+        device_cert: None,
+    };
     for (_id, ip, conn) in peers.peers_for_network_with_conn(network_name) {
-        if let Err(e) = open_and_send(&conn, Some(net_pubkey), &ControlMsg::ReadKeyRequest).await {
+        if let Err(e) = open_and_send(&conn, Some(net_pubkey), &msg).await {
             tracing::debug!(peer_ip = %ip, error = %e, "read key request failed");
         }
     }

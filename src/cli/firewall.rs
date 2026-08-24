@@ -1018,7 +1018,6 @@ mod tests {
 
     fn net(my_hostname: Option<&str>, peers: Vec<ipc::PeerStatus>) -> ipc::NetworkStatus {
         ipc::NetworkStatus {
-            share_code: None,
             name: "n".to_string(),
             role: ipc::NetworkRole::Member,
             my_ipv6: "200::1".parse().unwrap(),

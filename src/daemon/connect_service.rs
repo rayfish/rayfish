@@ -200,11 +200,12 @@ impl ConnectService {
             .await
         {
             Ok(IpcMessage::Created {
-                name,
-                network_key,
-                read_key,
-                ..
+                name, network_key, ..
             }) => {
+                // The direct network was just minted, so its read key is in the
+                // registry; `Approved` carries it over the mesh, the way every
+                // other joiner gets one.
+                let read_key = self.registry.network_read_key(&name).map(|k| k.to_bytes());
                 self.pending_connects.remove(&peer);
                 self.approved_connects.insert(
                     peer,

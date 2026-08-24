@@ -285,9 +285,9 @@ fn persist_join_config(
     // network key so we survive a restart as a key-holder (a plain member persists
     // `None`).
     direct_key: Option<&SecretKey>,
-    // From the share code on a fresh join, or from config on a reconnect. Falls
-    // back to whatever is already persisted, so a reconnect (which is handed no
-    // code) never erases it.
+    // Granted by a coordinator on a fresh join, or read from config on a
+    // reconnect. Falls back to whatever is already persisted, so a reconnect
+    // (which asks for nothing) never erases it.
     read_key: Option<&ReadKey>,
 ) -> Result<()> {
     let persisted_hostname = members
@@ -317,8 +317,8 @@ fn persist_join_config(
     let (exit_allow, exit_node_use, prev_read_key) = prev
         .map(|n| (n.exit_allow, n.exit_node_use, n.read_key))
         .unwrap_or((vec![], None, None));
-    // A reconnect/restore arrives with no share code, so the persisted key is the
-    // only copy; a fresh join brings one and it wins. Getting this backwards is
+    // A reconnect/restore asks for no key, so the persisted one is the only copy;
+    // a fresh join was just granted one and it wins. Getting this backwards is
     // how the network would become unreadable on the second daemon start.
     let read_key = read_key.cloned().or(prev_read_key);
     // The toggle command (`ray files auto-accept`) is authoritative, so preserve
@@ -748,8 +748,8 @@ mod persist_config_tests {
         }
     }
 
-    /// A reconnect is handed no share code, so the persisted read key is the
-    /// only copy in existence. If `persist_join_config` dropped it the way it
+    /// A reconnect asks for no key, so the persisted one is the only copy in
+    /// existence. If `persist_join_config` dropped it the way it
     /// once dropped the exit policy, the network would seal itself shut on the
     /// second daemon start: the blob would still fetch and would no longer open.
     #[test]
@@ -802,10 +802,11 @@ mod persist_config_tests {
         }
     }
 
-    /// The other direction: a fresh join brings a key in its code, and that one
-    /// wins over whatever a stale config still holds.
+    /// The other direction: a fresh join was just granted a key by a
+    /// coordinator, and that one wins over whatever a stale config still holds
+    /// (a rejoin after the network rotated, say).
     #[test]
-    fn a_fresh_join_adopts_the_key_from_its_code() {
+    fn a_fresh_join_adopts_the_key_it_was_granted() {
         let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("RAYFISH_CONFIG_DIR");

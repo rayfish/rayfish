@@ -353,18 +353,36 @@ pub enum ControlMsg {
         /// The 32-byte roster read key.
         read_key: [u8; 32],
     },
-    /// Member to coordinator: I cannot open this network's group blob, please
-    /// send me the read key.
+    /// Peer to coordinator: I cannot open this network's group blob, please send
+    /// me the read key.
     ///
-    /// The half of the migration that matters. The push above is best-effort and
-    /// cannot reach a member that was offline while the coordinator upgraded;
-    /// this is how that member catches up, on its own schedule, whenever it next
-    /// finds a `k,` in the record that it cannot satisfy. Payload-free: the
-    /// asking device is the connection's authenticated remote and the network is
-    /// the frame tag. Answered only for a peer on the verified roster, which the
-    /// `knows_sender` wall already enforces for every variant not on its short
-    /// exemption list.
-    ReadKeyRequest,
+    /// Two callers, and they are why this is the only carrier of a read key that
+    /// a peer can initiate. A **member** asks when it finds a `k,` in the record
+    /// it cannot satisfy: the push in [`ControlMsg::ReadKeyGrant`] is
+    /// best-effort and cannot reach a member that was offline while its
+    /// coordinator upgraded, so this is how that member catches up on its own
+    /// schedule. A **joiner** asks before it is admitted, because it has to open
+    /// the roster to know which peers coordinate the network and whether its
+    /// chosen hostname is free, and no code it was handed carries the key.
+    ///
+    /// So this is one of the few frames a stranger may send, and the coordinator
+    /// answers it against the same admission policy that decides whether the
+    /// sender may join at all: on the roster, pre-approved, holding a redeemable
+    /// invite, one of our own paired devices, or an open network. `invite_secret`
+    /// is checked, never burned; redemption still happens once, at admission.
+    /// Anything else is answered with silence, so a refused or unused invite
+    /// reads nothing.
+    ReadKeyRequest {
+        /// The invite the asker intends to redeem, if it holds one. Same secret
+        /// it will present in its `JoinRequest`.
+        #[serde(default)]
+        invite_secret: Option<Vec<u8>>,
+        /// The asker's device certificate, so one of our own paired devices is
+        /// recognised here as it is at admission. Verified where it is read,
+        /// like every other cert on the wire.
+        #[serde(default)]
+        device_cert: Option<DeviceCert>,
+    },
 }
 
 /// One `network pubkey → u16 handle` binding in a [`ControlMsg::NetworkHandles`]

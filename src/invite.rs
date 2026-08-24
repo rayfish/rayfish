@@ -11,6 +11,11 @@
 //! the coordinator directly, and presents the secret; the coordinator hashes the
 //! secret, looks it up in the ledger, and burns it. Codes minted before the
 //! checksum existed still decode.
+//!
+//! No code carries the roster read key. The coordinator hands that out over the
+//! mesh, judging the invite with [`InviteStore::is_redeemable`] one message
+//! before [`InviteStore::redeem`] burns it, so possession of a code is never by
+//! itself a roster read.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,7 +23,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use iroh::EndpointId;
 
-use crate::groupkey::ReadKey;
 use serde::{Deserialize, Serialize};
 
 /// Length of the random invite secret, in bytes (128 bits).
@@ -124,79 +128,41 @@ fn invite_checksum(payload: &[u8]) -> [u8; CHECKSUM_LEN] {
     out
 }
 
-/// Version byte on a share code carrying a roster read key.
-///
-/// The pre-read-key formats had no version byte and were told apart by decoded
-/// length alone. That worked while there were two of them; adding a third (and
-/// wanting room for a fourth) makes the length a bad discriminator, so the new
-/// shapes lead with an explicit one. The legacy lengths keep decoding, so codes
-/// minted by an older build still work.
-const CODE_V1_INVITE: u8 = 0x01;
-const CODE_V1_ROOM: u8 = 0x02;
-
-/// `[0x01] || network(32) || coordinator(32) || read(32) || secret(16) || ck(4)`
-const INVITE_V1_PAYLOAD_LEN: usize = 1 + 32 + 32 + 32 + SECRET_LEN;
-/// `[0x02] || network(32) || read(32) || ck(4)`
-const ROOM_V1_PAYLOAD_LEN: usize = 1 + 32 + 32;
-
 /// What a share code carries. One type for every shape a user can paste into
-/// `ray join`: a bare room id, a legacy invite, or either of the versioned forms.
+/// `ray join`: a bare room id, or either invite length.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareCode {
     /// The network public key (room id).
     pub network: EndpointId,
     /// Coordinator to dial first. Only an invite names one.
     pub coordinator: Option<EndpointId>,
-    /// The roster read key. Absent on a bare room id and on the legacy invite
-    /// forms, which is exactly the set of codes for networks whose blob is not
-    /// sealed.
-    pub read_key: Option<ReadKey>,
     /// Single-use or reusable invite secret to redeem at admission.
     pub invite_secret: Option<Vec<u8>>,
 }
 
-/// Encode a room code: the network id plus its read key, and nothing else.
-///
-/// This is what `ray create` prints and `ray status` shows: the thing you hand
-/// someone so they can find *and read* the network. It is not a credential, and
-/// on a closed network it still does not admit anybody.
-pub fn encode_room_code(network_pubkey: &EndpointId, read_key: &ReadKey) -> String {
-    let mut bytes = Vec::with_capacity(ROOM_V1_PAYLOAD_LEN + CHECKSUM_LEN);
-    bytes.push(CODE_V1_ROOM);
-    bytes.extend_from_slice(network_pubkey.as_bytes());
-    bytes.extend_from_slice(read_key.as_bytes());
-    bytes.extend_from_slice(&invite_checksum(&bytes));
-    bs58::encode(&bytes).into_string()
-}
-
-/// Encode an invite code.
-///
-/// With a read key: `bs58([0x01] || network(32) || coordinator(32) ||
-/// read(32) || secret(16) || checksum(4))`. Without one (a network that predates
-/// read keys): the original `bs58(network(32) || coordinator(32) || secret(16)
-/// || checksum(4))`, so nothing changes for a network that is not sealed.
+/// Encode an invite code: `bs58(network(32) || coordinator(32) || secret(16) ||
+/// checksum(4))`.
 ///
 /// base58 carries no error detection of its own, so the trailing checksum is
 /// what makes a mangled code fail cleanly: without it, dropping a character
 /// divides the encoded number by 58 and can still land on a payload of the
 /// right length, which then decodes into a well-formed invite pointing
 /// nowhere.
+///
+/// **No code carries the roster read key.** A code says which network and whom
+/// to ask, and nothing more; the key is fetched over the mesh at join time
+/// (`ControlMsg::ReadKeyRequest`) under the same admission policy that decides
+/// whether the holder may join at all. So a code that leaks, is refused, or is
+/// never redeemed reads nothing, which a key riding in the bytes could not
+/// promise.
 pub fn encode_invite_code(
     network_pubkey: &EndpointId,
     coordinator: &EndpointId,
     secret: &[u8],
-    read_key: Option<&ReadKey>,
 ) -> String {
-    let mut bytes = Vec::with_capacity(INVITE_V1_PAYLOAD_LEN + CHECKSUM_LEN);
-    if let Some(rk) = read_key {
-        bytes.push(CODE_V1_INVITE);
-        bytes.extend_from_slice(network_pubkey.as_bytes());
-        bytes.extend_from_slice(coordinator.as_bytes());
-        bytes.extend_from_slice(rk.as_bytes());
-    } else {
-        bytes.extend_from_slice(network_pubkey.as_bytes());
-        bytes.extend_from_slice(coordinator.as_bytes());
-    }
+    let mut bytes = Vec::with_capacity(PAYLOAD_LEN + CHECKSUM_LEN);
+    bytes.extend_from_slice(network_pubkey.as_bytes());
+    bytes.extend_from_slice(coordinator.as_bytes());
     bytes.extend_from_slice(secret);
     bytes.extend_from_slice(&invite_checksum(&bytes));
     bs58::encode(&bytes).into_string()
@@ -206,8 +172,8 @@ pub fn encode_invite_code(
 ///
 /// The single entry point for `ray join`'s argument, the mobile `submit_code`,
 /// and the deep-link handler, so the three cannot disagree about what a code
-/// means. Tries, in order: the versioned share codes, the two legacy invite
-/// lengths, then a bare `EndpointId` (hex or base32).
+/// means. Tries the two invite lengths, then a bare `EndpointId` (hex or
+/// base32).
 pub fn decode_share_code(code: &str) -> Result<ShareCode> {
     let code = code.trim();
     if let Ok(bytes) = bs58::decode(code).into_vec()
@@ -215,16 +181,12 @@ pub fn decode_share_code(code: &str) -> Result<ShareCode> {
     {
         return Ok(parsed);
     }
-    // Not a share code, so the last possibility is a bare room id. A network
-    // whose blob is sealed cannot be joined from one, but that is diagnosed
-    // later, against the signed record, where the message can say so.
     let network = code
         .parse::<EndpointId>()
-        .map_err(|_| anyhow::anyhow!("not a valid room id, invite code, or share code"))?;
+        .map_err(|_| anyhow::anyhow!("not a valid room id or invite code"))?;
     Ok(ShareCode {
         network,
         coordinator: None,
-        read_key: None,
         invite_secret: None,
     })
 }
@@ -243,27 +205,10 @@ fn decode_share_bytes(bytes: &[u8]) -> Result<Option<ShareCode>> {
         Ok(payload)
     };
 
-    match (bytes.len(), bytes.first()) {
-        (len, Some(&CODE_V1_ROOM)) if len == ROOM_V1_PAYLOAD_LEN + CHECKSUM_LEN => {
-            let payload = checked(ROOM_V1_PAYLOAD_LEN)?;
-            Ok(Some(ShareCode {
-                network: endpoint_at(payload, 1, "network")?,
-                coordinator: None,
-                read_key: Some(read_key_at(payload, 33)),
-                invite_secret: None,
-            }))
-        }
-        (len, Some(&CODE_V1_INVITE)) if len == INVITE_V1_PAYLOAD_LEN + CHECKSUM_LEN => {
-            let payload = checked(INVITE_V1_PAYLOAD_LEN)?;
-            Ok(Some(ShareCode {
-                network: endpoint_at(payload, 1, "network")?,
-                coordinator: Some(endpoint_at(payload, 33, "coordinator")?),
-                read_key: Some(read_key_at(payload, 65)),
-                invite_secret: Some(payload[97..].to_vec()),
-            }))
-        }
-        // The two pre-read-key invite forms: unchecksummed, then checksummed.
-        (len, _) if len == PAYLOAD_LEN || len == PAYLOAD_LEN + CHECKSUM_LEN => {
+    match bytes.len() {
+        // The two invite forms: unchecksummed (minted by an older build), then
+        // checksummed.
+        len if len == PAYLOAD_LEN || len == PAYLOAD_LEN + CHECKSUM_LEN => {
             let payload = if len == PAYLOAD_LEN {
                 bytes
             } else {
@@ -272,7 +217,6 @@ fn decode_share_bytes(bytes: &[u8]) -> Result<Option<ShareCode>> {
             Ok(Some(ShareCode {
                 network: endpoint_at(payload, 0, "network")?,
                 coordinator: Some(endpoint_at(payload, 32, "coordinator")?),
-                read_key: None,
                 invite_secret: Some(payload[64..].to_vec()),
             }))
         }
@@ -285,12 +229,6 @@ fn endpoint_at(payload: &[u8], offset: usize, what: &str) -> Result<EndpointId> 
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid {what} key in code"))?;
     EndpointId::from_bytes(&raw).map_err(|e| anyhow::anyhow!("invalid {what} key in code: {e}"))
-}
-
-fn read_key_at(payload: &[u8], offset: usize) -> ReadKey {
-    let mut raw = [0u8; 32];
-    raw.copy_from_slice(&payload[offset..offset + 32]);
-    ReadKey::from_bytes(raw)
 }
 
 impl InviteStore {
@@ -362,6 +300,23 @@ impl InviteStore {
     /// Verify a presented secret and burn it (single-use). Errors if the secret is
     /// unknown, already used, revoked, or expired. Returns the invite's intended
     /// hostname (trusted networks) so the coordinator can assign it.
+    /// Would [`redeem`](Self::redeem) accept this secret right now, without
+    /// burning it?
+    ///
+    /// The roster read key is handed out before admission (a joiner must open
+    /// the blob to know whom to dial and what its own hostname may be), so the
+    /// coordinator has to judge an invite one message earlier than it burns it.
+    /// Same predicate as `redeem`, minus the mutation: a secret checked here and
+    /// then presented for real is burned exactly once, at admission.
+    pub fn is_redeemable(&self, secret: &[u8]) -> bool {
+        let hash = hash_secret(secret);
+        self.invites.iter().any(|i| {
+            i.secret_hash == hash
+                && matches!(i.status, InviteStatus::Pending)
+                && now_secs() < i.expires
+        })
+    }
+
     pub fn redeem(&mut self, secret: &[u8], by: EndpointId) -> Result<Option<String>> {
         let hash = hash_secret(secret);
         let now = now_secs();
@@ -510,62 +465,41 @@ mod tests {
         (InviteStore::with_path(path), dir)
     }
 
-    fn test_read_key(seed: u8) -> ReadKey {
-        let mut b = [0u8; 32];
-        b[0] = seed;
-        ReadKey::from_bytes(b)
-    }
-
     #[test]
     fn code_roundtrip() {
         let net = test_id(1);
         let coord = test_id(2);
         let secret = generate_secret();
-        let rk = test_read_key(3);
-        let code = encode_invite_code(&net, &coord, &secret, Some(&rk));
+        let code = encode_invite_code(&net, &coord, &secret);
         let got = decode_share_code(&code).unwrap();
         assert_eq!(got.network, net);
         assert_eq!(got.coordinator, Some(coord));
         assert_eq!(got.invite_secret, Some(secret.to_vec()));
-        assert_eq!(got.read_key, Some(rk));
     }
 
-    /// A network with no read key still mints the original code shape, so a
-    /// coordinator that has not migrated hands out what it always did.
+    /// An invite code is two keys, a secret and a checksum, and there is no room
+    /// in it for anything else. The roster read key is fetched over the mesh at
+    /// join time instead, so a code that leaks or is never redeemed reads
+    /// nothing; this pins the size that says so.
     #[test]
-    fn code_without_a_read_key_keeps_the_legacy_shape() {
-        let (net, coord, secret) = (test_id(1), test_id(2), generate_secret());
-        let code = encode_invite_code(&net, &coord, &secret, None);
+    fn a_code_carries_no_read_key() {
+        let code = encode_invite_code(&test_id(1), &test_id(2), &generate_secret());
         assert_eq!(
             bs58::decode(&code).into_vec().unwrap().len(),
             PAYLOAD_LEN + CHECKSUM_LEN
         );
-        let got = decode_share_code(&code).unwrap();
-        assert_eq!(got.network, net);
-        assert_eq!(got.read_key, None);
     }
 
-    #[test]
-    fn room_code_roundtrip() {
-        let net = test_id(1);
-        let rk = test_read_key(7);
-        let got = decode_share_code(&encode_room_code(&net, &rk)).unwrap();
-        assert_eq!(got.network, net);
-        assert_eq!(got.read_key, Some(rk));
-        assert_eq!(got.coordinator, None);
-        assert_eq!(got.invite_secret, None);
-    }
-
-    /// A bare room id is a share code with nothing in it but the network, which
-    /// is what keeps a pre-read-key network joinable from the string its owner
-    /// already published.
+    /// A bare room id is a share code with nothing in it but the network: it
+    /// names the network and buys no capability at all, neither admission nor a
+    /// roster read.
     #[test]
     fn bare_room_id_decodes() {
         let net = test_id(1);
         let got = decode_share_code(&net.to_string()).unwrap();
         assert_eq!(got.network, net);
-        assert_eq!(got.read_key, None);
         assert_eq!(got.coordinator, None);
+        assert_eq!(got.invite_secret, None);
     }
 
     /// The nasty case for "try base58, else parse as a room id": a room id is 64
@@ -591,7 +525,7 @@ mod tests {
 
         let got = decode_share_code(&id.to_string()).unwrap();
         assert_eq!(got.network, id);
-        assert_eq!(got.read_key, None);
+        assert_eq!(got.coordinator, None);
     }
 
     #[test]
@@ -617,7 +551,6 @@ mod tests {
         assert_eq!(got.network, net);
         assert_eq!(got.coordinator, Some(coord));
         assert_eq!(got.invite_secret, Some(secret.to_vec()));
-        assert_eq!(got.read_key, None);
     }
 
     #[test]
@@ -643,7 +576,7 @@ mod tests {
     /// [`decode_share_code`]).
     #[test]
     fn decode_rejects_truncated_code() {
-        let code = encode_invite_code(&test_id(1), &test_id(2), &generate_secret(), None);
+        let code = encode_invite_code(&test_id(1), &test_id(2), &generate_secret());
         for cut in 1..=4 {
             let truncated = &code[..code.len() - cut];
             assert!(
@@ -657,15 +590,34 @@ mod tests {
     /// share code that decoded as one would be routed to the pairing path.
     #[test]
     fn share_codes_do_not_collide_with_pairing_tickets() {
-        let rk = test_read_key(5);
-        for code in [
-            encode_room_code(&test_id(1), &rk),
-            encode_invite_code(&test_id(1), &test_id(2), &generate_secret(), Some(&rk)),
-            encode_invite_code(&test_id(1), &test_id(2), &generate_secret(), None),
-        ] {
-            let len = bs58::decode(&code).into_vec().unwrap().len();
-            assert_ne!(len, 64, "{code} is pairing-ticket length");
-        }
+        let code = encode_invite_code(&test_id(1), &test_id(2), &generate_secret());
+        let len = bs58::decode(&code).into_vec().unwrap().len();
+        assert_ne!(len, 64, "{code} is pairing-ticket length");
+    }
+
+    /// An invite is judged one message before it is burned (the read key is
+    /// handed out pre-admission), so the non-consuming check must agree with
+    /// `redeem` on every status and leave the ledger untouched.
+    #[test]
+    fn is_redeemable_agrees_with_redeem_without_burning() {
+        let (mut store, _dir) = temp_store();
+        let (secret, _id) = store
+            .mint(Duration::from_secs(3600), None)
+            .expect("mint an invite");
+
+        assert!(store.is_redeemable(&secret));
+        // Asking twice does not spend it.
+        assert!(store.is_redeemable(&secret));
+
+        store.redeem(&secret, test_id(9)).expect("redeem once");
+        assert!(
+            !store.is_redeemable(&secret),
+            "a burned invite is not redeemable"
+        );
+        assert!(
+            !store.is_redeemable(&generate_secret()),
+            "an unknown secret is not redeemable"
+        );
     }
 
     #[test]

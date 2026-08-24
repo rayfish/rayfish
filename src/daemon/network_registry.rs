@@ -681,7 +681,6 @@ impl NetworkRegistry {
             name,
             network_key: net_public_key,
             my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
-            read_key: Some(read_key.to_bytes()),
         })
     }
 
