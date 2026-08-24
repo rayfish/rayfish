@@ -286,6 +286,7 @@ pub(crate) enum Command {
         #[arg(add = complete::networks())]
         network: String,
         /// Short id of the pending peer (from `ray requests`)
+        #[arg(add = complete::join_requests())]
         id: String,
     },
     /// The old spelling of `ray requests <network> deny <id>`.
@@ -295,6 +296,7 @@ pub(crate) enum Command {
         #[arg(add = complete::networks())]
         network: String,
         /// Short id of the pending peer (from `ray requests`)
+        #[arg(add = complete::join_requests())]
         id: String,
     },
     /// Request a direct link, or review incoming ones
@@ -601,6 +603,7 @@ pub(crate) enum InviteAction {
     #[command(visible_alias = "rm")]
     Revoke {
         /// Invite id (from `ray invite <network> list`)
+        #[arg(add = complete::invite_ids())]
         id: String,
     },
 }
@@ -689,11 +692,13 @@ pub(crate) enum RequestsAction {
     #[command(visible_alias = "ok")]
     Accept {
         /// Short id of the pending peer (from `ray requests <network>`)
+        #[arg(add = complete::join_requests())]
         id: String,
     },
     /// Reject a peer waiting for approval
     Deny {
         /// Short id of the pending peer (from `ray requests <network>`)
+        #[arg(add = complete::join_requests())]
         id: String,
     },
 }
@@ -710,6 +715,7 @@ pub(crate) enum ConnectAction {
     #[command(visible_aliases = ["ok", "accept"])]
     Approve {
         /// Short id of the requester (from `ray connect`)
+        #[arg(add = complete::connect_requests())]
         id: String,
     },
 }
@@ -819,6 +825,7 @@ pub(crate) enum FirewallAction {
     #[command(visible_aliases = ["rm", "del"])]
     Remove {
         /// Rule index (from 'firewall show')
+        #[arg(add = complete::firewall_rules())]
         index: usize,
     },
     /// Show current firewall rules
@@ -1039,6 +1046,7 @@ pub(crate) enum FilesAction {
     /// Accept a pending file transfer
     Accept {
         /// Transfer ID (from 'rayfish files')
+        #[arg(add = complete::incoming_files())]
         id: u64,
         /// Output directory (default: ~/Downloads)
         #[arg(long, short, value_hint = clap::ValueHint::DirPath)]
@@ -1047,6 +1055,7 @@ pub(crate) enum FilesAction {
     /// Cancel a queued send that hasn't reached its peer yet
     Cancel {
         /// Queued-send ID (from 'ray files')
+        #[arg(add = complete::queued_sends())]
         id: u64,
     },
     /// Auto-accept offers from your own devices (on|off)

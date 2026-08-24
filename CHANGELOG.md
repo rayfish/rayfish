@@ -64,6 +64,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Output goes through `$PAGER` (`less`) on a terminal and straight through
   when piped or following, so `ray logs | grep peer` and `ray logs -f` both
   behave the way you would expect.
+- **Tab completion covers the ids you copy out of a listing.** `ray requests
+  <net> accept`, `ray requests <net> deny`, `ray connect approve`, `ray invite
+  <net> revoke`, `ray files accept`, `ray files cancel` and `ray firewall
+  remove` now complete their argument from what is actually waiting, each
+  candidate carrying who or what it refers to, so an id printed one line up no
+  longer has to be retyped. `ray requests <net>` joins the other listings in
+  being readable by any local user, so the tab answers without sudo; admitting
+  still needs root or the operator.
 
 ### Changed
 

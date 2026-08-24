@@ -839,6 +839,9 @@ impl Daemon {
                 | IpcMessage::ExitNodeStatus { .. }
                 | IpcMessage::ListFiles
                 | IpcMessage::Connections
+                // The queue `ray requests <net> accept` reads its id out of,
+                // and the same shape as `Connections` right above it.
+                | IpcMessage::Requests { .. }
                 | IpcMessage::ContactId
                 | IpcMessage::Ping { .. }
                 | IpcMessage::Netcheck
