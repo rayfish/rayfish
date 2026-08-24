@@ -4,7 +4,14 @@
 //! record lives at it, the record names the group blob's hash, and the blob
 //! store serves any hash to any dialer. So holding the room id used to buy a
 //! full roster read. The read key closes that: the blob's bytes are sealed
-//! under it, and it travels only in the code a member is handed.
+//! under it.
+//!
+//! **The key is in no code.** It is asked for over the mesh
+//! (`ControlMsg::ReadKeyRequest`) and granted against the same policy that
+//! decides admission, so a code that is copied, refused, or never redeemed
+//! opens nothing. A key riding in the bytes of a code could not say that: it
+//! would be a read capability from the moment it was written down, outliving
+//! the `ray requests deny` that refused its holder.
 //!
 //! Two properties the rest of the daemon depends on, both load-bearing:
 //!
@@ -34,8 +41,8 @@ const MAGIC: &[u8; 4] = b"rgb1";
 const NONCE_LEN: usize = 24;
 
 /// Domain separators for the two subkeys. Both are derived from the read key
-/// rather than using it directly, so the value that travels in a join code is
-/// never itself a cipher key.
+/// rather than using it directly, so the value that travels on the wire and
+/// sits in config is never itself a cipher key.
 const CIPHER_CONTEXT: &str = "rayfish group blob v1";
 const NONCE_CONTEXT: &str = "rayfish group blob nonce v1";
 
@@ -45,9 +52,9 @@ const NONCE_CONTEXT: &str = "rayfish group blob nonce v1";
 /// coordinators, this one decrypts and is held by every member. Splitting them
 /// is what lets a read be granted without granting a write.
 ///
-/// `Debug` prints nothing. This value rides join codes and control frames, and
-/// a stray `{:?}` on a `NetworkConfig` or a `ControlMsg` would otherwise put a
-/// roster read capability in the log file.
+/// `Debug` prints nothing. This value rides control frames and sits in
+/// `NetworkConfig`, and a stray `{:?}` on either would otherwise put a roster
+/// read capability in the log file.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadKey([u8; 32]);
 

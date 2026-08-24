@@ -848,7 +848,6 @@ impl NetworkRegistry {
             name,
             network_key: net_public_key,
             my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
-            read_key: Some(read_key.to_bytes()),
         })
     }
 
@@ -1381,7 +1380,6 @@ mod tests {
             &network_key,
             &coordinator,
             &crate::invite::generate_secret(),
-            None,
         );
 
         assert_eq!(

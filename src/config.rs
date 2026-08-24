@@ -472,8 +472,6 @@ pub struct PendingJoinEntry {
     /// The local display name to use once admitted, if the user gave one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default, with = "option_read_key_hex")]
-    pub read_key: Option<ReadKey>,
 }
 
 /// A controller this machine has explicitly authorized to issue management
@@ -2862,7 +2860,6 @@ name = "test"
             PendingJoinEntry {
                 network_key: "abc123".to_string(),
                 name: Some("homelab".to_string()),
-                read_key: None,
             },
         )
         .unwrap();
@@ -2877,7 +2874,6 @@ name = "test"
             PendingJoinEntry {
                 network_key: "abc123".to_string(),
                 name: None,
-                read_key: None,
             },
         )
         .unwrap();

@@ -597,9 +597,9 @@ impl Node {
     pub fn join(&self, code: String) -> Result<NetworkInfo, RayError> {
         let state = self.state()?;
 
-        // One decoder for every shape a user can paste (bare room id, either
-        // legacy invite, or a versioned share/invite code), shared with the CLI
-        // so the two cannot disagree about what a code means.
+        // One decoder for every shape a user can paste (bare room id or either
+        // invite length), shared with the CLI so the two cannot disagree about
+        // what a code means.
         let parsed =
             invite::decode_share_code(&code).map_err(|e| RayError::JoinFailed(format!("{e:#}")))?;
 
@@ -610,7 +610,9 @@ impl Node {
             hostname: None,
             invite: parsed.invite_secret,
             coordinator: parsed.coordinator,
-            read_key: parsed.read_key,
+            // Fetched from a coordinator over the mesh during the join; no code
+            // carries it.
+            read_key: None,
             auto_accept_firewall: false,
             // Own-device offers, identity-checked.
             auto_accept_files: true,
@@ -1659,7 +1661,6 @@ mod network_state_tests {
             my_ipv6: Ipv6Addr::LOCALHOST,
             my_hostname: Some("phone".to_string()),
             network_key: None,
-            share_code: None,
             member_count: peers.len(),
             peers,
             pending_suggestions: 0,

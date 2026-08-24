@@ -13,7 +13,7 @@ use rayfish::control::{
 };
 use rayfish::firewall::{PortRange, Protocol, parse_port_list, parse_port_range, parse_spec_token};
 use rayfish::groupkey::ReadKey;
-use rayfish::invite::{decode_share_code, encode_invite_code, encode_room_code};
+use rayfish::invite::{decode_share_code, encode_invite_code};
 use rayfish::membership::decode_group_blob;
 
 use iroh::EndpointId;
@@ -30,12 +30,6 @@ fn read_key_from_seed(seed: u32) -> ReadKey {
     ReadKey::from_bytes(bytes)
 }
 
-/// Both invite shapes, so every property below runs against the versioned form
-/// (a sealed network) and the legacy one (a network with no read key).
-fn maybe_read_key(seed: u32, present: bool) -> Option<ReadKey> {
-    present.then(|| read_key_from_seed(seed))
-}
-
 // ---------------------------------------------------------------------------
 // Invite codes and pairing tickets
 // ---------------------------------------------------------------------------
@@ -49,48 +43,29 @@ proptest! {
     fn invite_code_round_trips(
         net_seed in any::<u32>(),
         coord_seed in any::<u32>(),
-        rk_seed in any::<u32>(),
-        sealed in any::<bool>(),
         secret in prop::collection::vec(any::<u8>(), 16..=16),
     ) {
         let net = id_from_seed(net_seed);
         let coord = id_from_seed(coord_seed);
-        let read_key = maybe_read_key(rk_seed, sealed);
 
-        let code = encode_invite_code(&net, &coord, &secret, read_key.as_ref());
+        let code = encode_invite_code(&net, &coord, &secret);
         let got = decode_share_code(&code).expect("a freshly encoded invite must decode");
 
         prop_assert_eq!(got.network, net);
         prop_assert_eq!(got.coordinator, Some(coord));
         prop_assert_eq!(got.invite_secret, Some(secret));
-        prop_assert_eq!(got.read_key, read_key);
     }
 
-    /// A room code is the other half of the share surface: no coordinator and no
-    /// invite secret, just the network and the key needed to read its roster.
-    #[test]
-    fn room_code_round_trips(net_seed in any::<u32>(), rk_seed in any::<u32>()) {
-        let net = id_from_seed(net_seed);
-        let read_key = read_key_from_seed(rk_seed);
-
-        let got = decode_share_code(&encode_room_code(&net, &read_key))
-            .expect("a freshly encoded room code must decode");
-
-        prop_assert_eq!(got.network, net);
-        prop_assert_eq!(got.read_key, Some(read_key));
-        prop_assert_eq!(got.coordinator, None);
-        prop_assert_eq!(got.invite_secret, None);
-    }
-
-    /// A bare room id still parses, which is what keeps a network created before
-    /// read keys existed joinable by the string its owner already shared.
+    /// A bare room id parses to a network and nothing else: it is not a
+    /// credential and, since no code carries the roster read key, not a read
+    /// capability either.
     #[test]
     fn bare_room_id_still_parses(net_seed in any::<u32>()) {
         let net = id_from_seed(net_seed);
         let got = decode_share_code(&net.to_string()).expect("a bare room id must parse");
         prop_assert_eq!(got.network, net);
-        prop_assert_eq!(got.read_key, None);
         prop_assert_eq!(got.coordinator, None);
+        prop_assert_eq!(got.invite_secret, None);
     }
 
     /// No share code may be mistaken for a pairing ticket. `submit_code` on
@@ -100,19 +75,10 @@ proptest! {
     fn share_codes_are_not_pairing_tickets(
         net_seed in any::<u32>(),
         coord_seed in any::<u32>(),
-        rk_seed in any::<u32>(),
-        sealed in any::<bool>(),
         secret in prop::collection::vec(any::<u8>(), 16..=16),
     ) {
-        let net = id_from_seed(net_seed);
-        let coord = id_from_seed(coord_seed);
-        let rk = read_key_from_seed(rk_seed);
-        for code in [
-            encode_invite_code(&net, &coord, &secret, maybe_read_key(rk_seed, sealed).as_ref()),
-            encode_room_code(&net, &rk),
-        ] {
-            prop_assert!(decode_pairing_ticket(&code).is_err(), "{code} decoded as a pairing ticket");
-        }
+        let code = encode_invite_code(&id_from_seed(net_seed), &id_from_seed(coord_seed), &secret);
+        prop_assert!(decode_pairing_ticket(&code).is_err(), "{code} decoded as a pairing ticket");
     }
 
     /// Invite codes get pasted out of chat clients that mangle text. Decoding
@@ -140,21 +106,18 @@ proptest! {
     fn truncated_invite_code_rejected(
         net_seed in any::<u32>(),
         coord_seed in any::<u32>(),
-        rk_seed in any::<u32>(),
-        sealed in any::<bool>(),
         secret in prop::collection::vec(any::<u8>(), 16..=16),
         cut in 1usize..40,
     ) {
         let net = id_from_seed(net_seed);
         let coord = id_from_seed(coord_seed);
-        let read_key = maybe_read_key(rk_seed, sealed);
-        let code = encode_invite_code(&net, &coord, &secret, read_key.as_ref());
+        let code = encode_invite_code(&net, &coord, &secret);
         let truncated = &code[..code.len().saturating_sub(cut)];
 
         if let Ok(got) = decode_share_code(truncated) {
             prop_assert!(
-                (got.network, got.coordinator, got.invite_secret, got.read_key)
-                    != (net, Some(coord), Some(secret.clone()), read_key.clone()),
+                (got.network, got.coordinator, got.invite_secret)
+                    != (net, Some(coord), Some(secret.clone())),
                 "a truncated code decoded back to the original invite",
             );
         }
@@ -166,16 +129,13 @@ proptest! {
     fn corrupted_invite_code_rejected(
         net_seed in any::<u32>(),
         coord_seed in any::<u32>(),
-        rk_seed in any::<u32>(),
-        sealed in any::<bool>(),
         secret in prop::collection::vec(any::<u8>(), 16..=16),
         pos in any::<prop::sample::Index>(),
         replacement in "[1-9A-HJ-NP-Za-km-z]",
     ) {
         let net = id_from_seed(net_seed);
         let coord = id_from_seed(coord_seed);
-        let read_key = maybe_read_key(rk_seed, sealed);
-        let code = encode_invite_code(&net, &coord, &secret, read_key.as_ref());
+        let code = encode_invite_code(&net, &coord, &secret);
 
         let i = pos.index(code.len());
         let mut corrupted: Vec<char> = code.chars().collect();
@@ -186,11 +146,55 @@ proptest! {
         match decode_share_code(&corrupted) {
             Err(_) => {}
             Ok(got) => prop_assert!(
-                (got.network, got.coordinator, got.invite_secret, got.read_key)
-                    != (net, Some(coord), Some(secret.clone()), read_key.clone()),
+                (got.network, got.coordinator, got.invite_secret)
+                    != (net, Some(coord), Some(secret.clone())),
                 "a corrupted code decoded back to the original invite",
             ),
         }
+    }
+
+    /// Sealing the roster round-trips under the right key, and the network id
+    /// is bound into it: the same bytes opened against a different network fail
+    /// rather than yielding a roster. That binding is the AEAD's associated
+    /// data, and it is what stops a blob being replayed into another network.
+    #[test]
+    fn sealed_group_blob_round_trips(
+        net_seed in any::<u32>(),
+        other_seed in any::<u32>(),
+        rk_seed in any::<u32>(),
+        plaintext in prop::collection::vec(any::<u8>(), 0..512),
+    ) {
+        let net = id_from_seed(net_seed);
+        let key = read_key_from_seed(rk_seed);
+
+        let sealed = rayfish::groupkey::seal(&key, &net, &plaintext).expect("seal");
+        prop_assert!(rayfish::groupkey::is_sealed(&sealed));
+        prop_assert_eq!(
+            rayfish::groupkey::open(Some(&key), &net, &sealed).expect("open"),
+            plaintext,
+        );
+
+        let other = id_from_seed(other_seed);
+        prop_assume!(other != net);
+        prop_assert!(rayfish::groupkey::open(Some(&key), &other, &sealed).is_err());
+    }
+
+    /// Sealing is deterministic: the same roster under the same key produces the
+    /// same bytes, hence the same blob hash. The lazy publisher republishes on a
+    /// hash change, so a random nonce here would mean republishing forever and
+    /// two co-coordinators reading each other as reverting the roster.
+    #[test]
+    fn sealing_the_same_roster_is_byte_identical(
+        net_seed in any::<u32>(),
+        rk_seed in any::<u32>(),
+        plaintext in prop::collection::vec(any::<u8>(), 0..512),
+    ) {
+        let net = id_from_seed(net_seed);
+        let key = read_key_from_seed(rk_seed);
+        prop_assert_eq!(
+            rayfish::groupkey::seal(&key, &net, &plaintext).expect("seal"),
+            rayfish::groupkey::seal(&key, &net, &plaintext).expect("seal"),
+        );
     }
 
     /// A pairing ticket carries the primary device's endpoint and the shared

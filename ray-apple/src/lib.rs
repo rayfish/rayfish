@@ -501,7 +501,7 @@ impl Node {
             hostname,
             invite: parsed.invite_secret,
             coordinator: parsed.coordinator,
-            read_key: parsed.read_key,
+            read_key: None,
             auto_accept_firewall: false,
             auto_accept_files: true,
         })) {

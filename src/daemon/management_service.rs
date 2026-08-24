@@ -1078,7 +1078,7 @@ impl ManagementService {
                         hostname: Some(hostname.into()),
                         invite: Some(secret),
                         coordinator: Some(coordinator),
-                        read_key: share.read_key,
+                        read_key: None,
                         auto_accept_firewall,
                         auto_accept_files,
                     })

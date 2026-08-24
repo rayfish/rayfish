@@ -959,6 +959,97 @@ mod persist_config_tests {
     }
 
     #[test]
+    fn reconnect_preserves_the_roster_read_key() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("RAYFISH_CONFIG_DIR");
+        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", tmp.path()) };
+
+        let net_pubkey = id(1);
+        let me = id(2);
+        let read_key = ReadKey::from_bytes([9u8; 32]);
+        config::save_network(&NetworkConfig {
+            name: "homelab".to_string(),
+            network_public_key: Some(net_pubkey),
+            read_key: Some(read_key.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        persist_join_config(
+            "homelab",
+            &[member(2, false)],
+            &[],
+            me,
+            net_pubkey,
+            &Some("umbrel".to_string()),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config::load_network("homelab").unwrap().unwrap().read_key,
+            Some(read_key)
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RAYFISH_CONFIG_DIR", v),
+                None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_fresh_join_adopts_the_key_it_was_granted() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("RAYFISH_CONFIG_DIR");
+        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", tmp.path()) };
+
+        let net_pubkey = id(1);
+        let me = id(2);
+        let stale = ReadKey::from_bytes([1u8; 32]);
+        let fresh = ReadKey::from_bytes([2u8; 32]);
+        config::save_network(&NetworkConfig {
+            name: "homelab".to_string(),
+            network_public_key: Some(net_pubkey),
+            read_key: Some(stale),
+            ..Default::default()
+        })
+        .unwrap();
+
+        persist_join_config(
+            "homelab",
+            &[member(2, false)],
+            &[],
+            me,
+            net_pubkey,
+            &None,
+            false,
+            false,
+            true,
+            Some(&fresh),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config::load_network("homelab").unwrap().unwrap().read_key,
+            Some(fresh)
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RAYFISH_CONFIG_DIR", v),
+                None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+            }
+        }
+    }
+
+    #[test]
     fn reconnect_does_not_recreate_a_deleted_network_config() {
         let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();

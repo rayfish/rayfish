@@ -444,7 +444,6 @@ impl NetworkRegistry {
             name: name.to_string(),
             network_key: net_public_key,
             my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
-            read_key: None,
         })
     }
 
@@ -1044,7 +1043,9 @@ impl NetworkRegistry {
             let spec = JoinSpec {
                 network_key: pending.network_key.clone(),
                 name: pending.name.clone(),
-                read_key: pending.read_key.clone(),
+                // No read key to carry: a join still awaiting approval was never
+                // given one, and the retry asks for it again once approval makes
+                // it entitled to the roster.
                 ..JoinSpec::default()
             };
             tokio::spawn(async move {

@@ -378,7 +378,6 @@ impl Daemon {
                 transport: _,
                 invite,
                 coordinator,
-                read_key,
                 auto_accept_firewall,
                 auto_accept_files,
             } => {
@@ -388,7 +387,7 @@ impl Daemon {
                     hostname,
                     invite,
                     coordinator,
-                    read_key: read_key.map(ReadKey::from_bytes),
+                    read_key: None,
                     auto_accept_firewall,
                     auto_accept_files,
                 })

@@ -2,8 +2,6 @@
 
 use std::io::IsTerminal;
 
-use rayfish::groupkey::ReadKey;
-
 use crate::*;
 use ipc::NetworkKey;
 
@@ -35,15 +33,8 @@ pub(crate) async fn ipc_create(
             name,
             network_key,
             my_ipv6,
-            read_key,
         } => {
-            // What we tell people to share. On a network with a read key that is
-            // the compound code, because the bare room id no longer opens the
-            // roster; without one (an older network) it is still the room id.
-            let share = match read_key {
-                Some(rk) => invite::encode_room_code(&network_key, &ReadKey::from_bytes(rk)),
-                None => network_key.to_string(),
-            };
+            let share = network_key.to_string();
             let key_str = network_key.to_string();
             let short = if key_str.len() > 12 {
                 format!("{}…{}", &key_str[..4], &key_str[key_str.len() - 4..])
@@ -90,15 +81,14 @@ pub(crate) async fn ipc_join(
     } else {
         None
     };
-    // `ray join <arg>` takes a bare room id, a share code, or an invite code.
-    // The compound forms are split here and never travel inward whole: the
-    // daemon parses `network_key` as an `EndpointId`, slices it for a fallback
-    // display name, and compares it by string equality for pending-join dedupe.
+    // `ray join <arg>` takes a bare room id or an invite code. An invite is
+    // split here and never travels inward whole: the daemon parses
+    // `network_key` as an `EndpointId`, slices it for a fallback display name,
+    // and compares it by string equality for pending-join dedupe.
     let code = invite::decode_share_code(network_key)?;
     let network_key = code.network.to_string();
     let invite = code.invite_secret;
     let coordinator = code.coordinator;
-    let read_key = code.read_key.map(|k| k.to_bytes());
     let mut stream = ipc::connect().await?;
     ipc::send(
         &mut stream,
@@ -109,7 +99,6 @@ pub(crate) async fn ipc_join(
             transport,
             invite,
             coordinator,
-            read_key,
             auto_accept_firewall,
             auto_accept_files,
         },
