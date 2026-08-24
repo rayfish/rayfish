@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use iroh::{EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 
+use crate::groupkey::ReadKey;
 use crate::membership::GroupMode;
 
 /// Per-network transport preference. Defined in `ray-proto` (shared with GUI
@@ -57,6 +58,42 @@ mod option_secret_key_hex {
                     .try_into()
                     .map_err(|_| Error::custom("secret key must be 32 bytes"))?;
                 Ok(Some(SecretKey::from(bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+/// Same hex-string treatment as [`option_secret_key_hex`], for the per-network
+/// roster read key. Kept separate because a `ReadKey` is symmetric and carries
+/// no public half, so it shares no type with the signing key.
+mod option_read_key_hex {
+    use crate::groupkey::ReadKey;
+    use serde::de::Error;
+    use serde::{self, Deserializer, Serializer};
+
+    pub fn serialize<S>(key: &Option<ReadKey>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match key {
+            Some(k) => serializer.serialize_str(&hex::encode(k.to_bytes())),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<ReadKey>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+        match opt {
+            Some(s) => {
+                let bytes: [u8; 32] = hex::decode(&s)
+                    .map_err(Error::custom)?
+                    .try_into()
+                    .map_err(|_| Error::custom("read key must be 32 bytes"))?;
+                Ok(Some(ReadKey::from_bytes(bytes)))
             }
             None => Ok(None),
         }
@@ -113,6 +150,14 @@ pub struct NetworkConfig {
     pub network_secret_key: Option<SecretKey>,
     #[serde(default)]
     pub network_public_key: Option<EndpointId>,
+    /// The per-network roster read key, held by every member (unlike
+    /// `network_secret_key`, which only coordinators hold). It has to live here
+    /// rather than only in the join code: a cold restore fetches and decodes the
+    /// group blob before any mesh connection exists, so there is nothing else to
+    /// ask. `None` for a network created before read keys existed, whose blob is
+    /// still plaintext.
+    #[serde(default, with = "option_read_key_hex")]
+    pub read_key: Option<ReadKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<TransportMode>,
     /// This node auto-installs coordinator-suggested firewall rules without a
@@ -346,6 +391,7 @@ pub(crate) fn empty_network_config(name: &str) -> NetworkConfig {
         approved: vec![],
         network_secret_key: None,
         network_public_key: None,
+        read_key: None,
         transport: None,
         auto_accept_firewall: false,
         auto_accept_files: true,
@@ -1170,6 +1216,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    read_key: None,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1191,6 +1238,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    read_key: None,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1233,6 +1281,7 @@ mod tests {
             approved: vec![],
             network_secret_key: None,
             network_public_key: None,
+            read_key: None,
             my_hostname: None,
             pending_hostname: None,
             transport: None,
@@ -1263,6 +1312,7 @@ mod tests {
                 approved: vec![],
                 network_secret_key: None,
                 network_public_key: None,
+                read_key: None,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -1286,6 +1336,7 @@ mod tests {
             approved: vec![],
             network_secret_key: None,
             network_public_key: None,
+            read_key: None,
             my_hostname: None,
             pending_hostname: None,
             transport: None,
@@ -1316,6 +1367,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    read_key: None,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1337,6 +1389,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    read_key: None,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1384,6 +1437,7 @@ mod tests {
                 }],
                 network_secret_key: None,
                 network_public_key: None,
+                read_key: None,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -1418,6 +1472,7 @@ mod tests {
                 approved: vec![],
                 network_secret_key: Some(secret.clone()),
                 network_public_key: Some(public),
+                read_key: None,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -1508,6 +1563,7 @@ name = "test"
             approved: vec![],
             network_secret_key: Some(SecretKey::generate()),
             network_public_key: None,
+            read_key: None,
             transport: None,
             auto_accept_firewall: false,
             auto_accept_files: false,

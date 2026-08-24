@@ -493,7 +493,7 @@ fn print_network(net: &ipc::NetworkStatus) {
 
     // join code. Direct (`ray connect`) networks have no shareable room id, so
     // the join code is suppressed for them.
-    if let Some(ref key) = net.network_key
+    if let Some(key) = net.network_key.as_ref()
         && !net.role.is_direct()
     {
         println!("    {} {}", style::label("join"), style::rose(key));

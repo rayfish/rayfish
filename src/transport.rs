@@ -32,7 +32,7 @@ pub const FILES_ALPN: &[u8] = b"rayfish/files/2";
 /// addressed to this node's contact key. The trailing `/1` is its protocol
 /// version, **bump it on any breaking change to the `ConnectMsg` handshake**;
 /// peers on different versions can't negotiate a connection (transport-enforced).
-pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/2";
+pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/3";
 
 /// Fixed UDP port the endpoint binds so users can port-forward a stable, known
 /// port for guaranteed direct reachability (Tailscale-style). Unlike an ephemeral
@@ -78,7 +78,7 @@ pub const RAYFISH_LISTEN_PORT: u16 = 41383;
 /// Compact gave that up. Bump for anything that changes a struct's shape, and
 /// for anything an old peer would *misinterpret* (removed or repurposed fields
 /// and variants, changed semantics of existing ones).
-pub const MESH_PROTOCOL_VERSION: u32 = 4;
+pub const MESH_PROTOCOL_VERSION: u32 = 5;
 
 /// Capability bits a peer advertises in its `MeshHello.features`. These are
 /// negotiated *inside* the single mesh ALPN, so adding one needs no version bump:

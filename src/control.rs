@@ -69,14 +69,23 @@ impl DeviceCert {
 
 /// One of the primary's networks, shared during pairing so the new device can
 /// auto-join it. `network_key` is the network public key (bare room id) as a
-/// hex string; no secret is shared because the device cert is the credential.
+/// hex string; the device cert, not a secret, is what admits the new device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairNetwork {
     pub name: String,
     pub network_key: String,
+    /// The network's roster read key, when it has one.
+    ///
+    /// Admission and readability are separate questions and this is the second
+    /// one: the cert gets the device admitted, but the group blob is fetched and
+    /// opened before admission is even attempted, so a paired device with no key
+    /// would auto-join a network whose roster it cannot read. Carried over the
+    /// pairing link, which is already authenticated and already carries the cert.
+    #[serde(default)]
+    pub read_key: Option<[u8; 32]>,
 }
 
-/// Messages for the device pairing protocol (ALPN `rayfish/pair/2`).
+/// Messages for the device pairing protocol (ALPN `rayfish/pair/3`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PairMsg {
     Request {
@@ -91,7 +100,7 @@ pub enum PairMsg {
 }
 
 /// Messages for the `ray connect` friend-request handshake (ALPN
-/// `rayfish/connect/2`). The initiator (A) dials the recipient's (B) contact
+/// `rayfish/connect/3`). The initiator (A) dials the recipient's (B) contact
 /// key, sends `Request`, and polls until `Approved`. Approval is recipient-only:
 /// only B acts, A just waits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +121,10 @@ pub enum ConnectMsg {
     Approved {
         room_id: EndpointId,
         coordinator: EndpointId,
+        /// The minted network's roster read key. B creates the network, so A can
+        /// only ever learn it here.
+        #[serde(default)]
+        read_key: Option<[u8; 32]>,
     },
     /// B → A: request rejected.
     Denied { reason: String },
@@ -323,6 +336,52 @@ pub enum ControlMsg {
     /// `MeshConnection::nack_unknown`), so two mismatched builds cannot ping-pong.
     NotSupported {
         msg_kind: String,
+    },
+    /// Coordinator to member: this network's roster read key.
+    ///
+    /// Exists for migration. A network created before read keys publishes a
+    /// plaintext blob; when its coordinator upgrades it mints a key and starts
+    /// sealing, and its members have no way to be handed one (they hold no share
+    /// code, and a reconnect is given no `Welcome`). So the coordinator pushes it.
+    ///
+    /// Authenticated against the *record*, not the sender: the receiver accepts
+    /// it only if `blake3(read_key)` matches the `k,` value in the network-key-
+    /// signed pkarr record. Same trick as `admin_grant_key_valid`, which is what
+    /// lets a symmetric key with no public half be verified at all.
+    ReadKeyGrant {
+        network_pubkey: EndpointId,
+        /// The 32-byte roster read key.
+        read_key: [u8; 32],
+    },
+    /// Peer to coordinator: I cannot open this network's group blob, please send
+    /// me the read key.
+    ///
+    /// Two callers, and they are why this is the only carrier of a read key that
+    /// a peer can initiate. A **member** asks when it finds a `k,` in the record
+    /// it cannot satisfy: the push in [`ControlMsg::ReadKeyGrant`] is
+    /// best-effort and cannot reach a member that was offline while its
+    /// coordinator upgraded, so this is how that member catches up on its own
+    /// schedule. A **joiner** asks before it is admitted, because it has to open
+    /// the roster to know which peers coordinate the network and whether its
+    /// chosen hostname is free, and no code it was handed carries the key.
+    ///
+    /// So this is one of the few frames a stranger may send, and the coordinator
+    /// answers it against the same admission policy that decides whether the
+    /// sender may join at all: on the roster, pre-approved, holding a redeemable
+    /// invite, one of our own paired devices, or an open network. `invite_secret`
+    /// is checked, never burned; redemption still happens once, at admission.
+    /// Anything else is answered with silence, so a refused or unused invite
+    /// reads nothing.
+    ReadKeyRequest {
+        /// The invite the asker intends to redeem, if it holds one. Same secret
+        /// it will present in its `JoinRequest`.
+        #[serde(default)]
+        invite_secret: Option<Vec<u8>>,
+        /// The asker's device certificate, so one of our own paired devices is
+        /// recognised here as it is at admission. Verified where it is read,
+        /// like every other cert on the wire.
+        #[serde(default)]
+        device_cert: Option<DeviceCert>,
     },
 }
 
@@ -753,6 +812,7 @@ mod tests {
             ConnectMsg::Approved {
                 room_id: test_id(3),
                 coordinator: test_id(4),
+                read_key: None,
             },
             ConnectMsg::Denied {
                 reason: "no".to_string(),

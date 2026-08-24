@@ -72,6 +72,7 @@ use crate::dns;
 use crate::dns::config as dns_config;
 use crate::firewall::{self, SharedFirewall};
 use crate::forward;
+use crate::groupkey::ReadKey;
 use crate::identity;
 use crate::ipc::{
     self, FirewallRuleView, InactiveNetwork, IpcMessage, LanPeerInfo, MeshVersionMismatch,
@@ -106,6 +107,8 @@ pub(crate) use mesh::*;
 pub use mesh::run_daemon;
 // `build_headless` is the embedder (mobile) construction entry point.
 pub use mesh::build_headless;
+// The join input bundle, part of the same embedding API.
+pub use mesh::JoinSpec;
 
 /// Legacy name for [`Daemon`], kept so embedders (`ray-mobile`) that were
 /// written against `DaemonState` compile unchanged after the daemon refactor.
@@ -151,7 +154,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// ALPN for the device-pairing protocol. The trailing `/1` is its protocol
 /// version - **bump it on any breaking change to the `PairMsg` handshake**;
 /// peers on different versions can't negotiate a connection (transport-enforced).
-const PAIR_ALPN: &[u8] = b"rayfish/pair/2";
+const PAIR_ALPN: &[u8] = b"rayfish/pair/3";
 
 /// Node-wide shared handles, cloned into every per-network accept handler and
 /// background task. Every field is a cheap `Clone` (an `Arc`-backed handle, a
@@ -332,6 +335,10 @@ pub(crate) struct NetworkState {
     /// what we would publish.
     converged_hash: Option<blake3::Hash>,
     network_secret_key: Option<SecretKey>,
+    /// The roster read key this network's blob is sealed under. Held by every
+    /// member, not just key-holders: it grants a read, never a write. `None` on
+    /// a network created before read keys existed, whose blob stays plaintext.
+    read_key: Option<ReadKey>,
     network_public_key: EndpointId,
     network_name: Option<String>,
     /// Access mode (open auto-admits; restricted gates unknown joiners). Only the
@@ -412,7 +419,7 @@ impl NetworkState {
     }
 
     fn refresh_snapshot(&mut self) {
-        let bytes = canonical_group_bytes(
+        let plaintext = canonical_group_bytes(
             &self.members,
             &self.approved,
             &self.suggested_firewall,
@@ -420,6 +427,23 @@ impl NetworkState {
             &self.reusable_keys,
             &self.nullifiers,
         );
+        // Seal before hashing: the hash we publish is also the blob store's
+        // content address, so it has to cover the bytes a peer actually fetches
+        // (see `crate::groupkey`). Sealing is deterministic, so an unchanged
+        // roster still produces an unchanged hash and the publisher stays quiet.
+        let bytes = match &self.read_key {
+            Some(key) => match crate::groupkey::seal(key, &self.network_public_key, &plaintext) {
+                Ok(sealed) => sealed,
+                Err(e) => {
+                    // Effectively unreachable (the AEAD fails only on absurd
+                    // lengths), but the alternative is publishing a roster in
+                    // the clear, so keep the previous snapshot instead.
+                    tracing::error!(error = %e, "could not seal group blob; keeping the previous snapshot");
+                    return;
+                }
+            },
+            None => plaintext,
+        };
         let hash = blake3::hash(&bytes);
         self.snapshot = Some(GroupSnapshot {
             hash,
@@ -1090,15 +1114,19 @@ impl Daemon {
                 auto_accept_firewall,
                 auto_accept_files,
             } => {
-                self.join_network(
-                    &network_key,
-                    name.as_deref(),
+                self.join_network(JoinSpec {
+                    network_key,
+                    name,
                     hostname,
                     invite,
                     coordinator,
+                    // No code carries the read key: a fresh join asks a
+                    // coordinator for it over the mesh. Only a restore arrives
+                    // holding one, out of `NetworkConfig`.
+                    read_key: None,
                     auto_accept_firewall,
                     auto_accept_files,
-                )
+                })
                 .await
             }
             IpcMessage::Leave { name } => self.leave_network(&name).await,
@@ -1886,6 +1914,34 @@ async fn broadcast_control_msg(
     }
 }
 
+/// Send one peer this network's roster read key.
+///
+/// Used both by the coordinator's answer to a [`ControlMsg::ReadKeyRequest`] and
+/// by the push that follows minting a key for a network that predates them.
+/// Best-effort: a peer we cannot reach asks for itself later.
+pub(crate) async fn send_read_key_grant(
+    peers: &PeerTable,
+    net_pubkey: EndpointId,
+    network_name: &str,
+    peer_id: EndpointId,
+    read_key: &ReadKey,
+) {
+    let Some((_, ip, conn)) = peers
+        .peers_for_network_with_conn(network_name)
+        .into_iter()
+        .find(|(id, _, _)| *id == peer_id)
+    else {
+        return;
+    };
+    let msg = ControlMsg::ReadKeyGrant {
+        network_pubkey: net_pubkey,
+        read_key: read_key.to_bytes(),
+    };
+    if let Err(e) = open_and_send(&conn, Some(net_pubkey), &msg).await {
+        tracing::warn!(peer_ip = %ip, error = %e, "failed to send read key grant");
+    }
+}
+
 #[cfg(test)]
 mod report_tests {
     use super::{collect_recent_logs, write_bundle};
@@ -2001,6 +2057,7 @@ mod accept_handler_tests {
             snapshot: None,
             converged_hash: None,
             network_secret_key: None,
+            read_key: None,
             network_public_key: net_pub,
             network_name: Some("test-net".to_string()),
             mode: GroupMode::Restricted,

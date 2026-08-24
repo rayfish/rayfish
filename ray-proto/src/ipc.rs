@@ -1369,6 +1369,7 @@ mod tests {
                 name,
                 network_key,
                 my_ipv6,
+                ..
             } => {
                 assert_eq!(name, "test");
                 assert_eq!(network_key, key);

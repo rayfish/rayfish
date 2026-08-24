@@ -9,6 +9,16 @@
 
 use super::*;
 
+/// An approved incoming `ray connect`: the 2-peer network we minted for the
+/// requester, and what it needs to join and read it. A struct rather than a
+/// tuple because all three are opaque 32-byte values and two of them are keys.
+#[derive(Debug, Clone)]
+pub(crate) struct ApprovedConnect {
+    pub(crate) room_id: EndpointId,
+    pub(crate) coordinator: EndpointId,
+    pub(crate) read_key: Option<[u8; 32]>,
+}
+
 /// Cap on the queue of unapproved incoming `ray connect` requests.
 ///
 /// The dial that fills it is unauthenticated (a stranger needs only our contact
@@ -64,7 +74,7 @@ pub(crate) struct ConnectService {
     /// Approved connect requests: requester endpoint id → (room id, coordinator).
     /// The `CONNECT_ALPN` handler replies `Approved` from here when the requester
     /// re-dials after `ray connect approve`.
-    pub(crate) approved_connects: Arc<DashMap<EndpointId, (EndpointId, EndpointId)>>,
+    pub(crate) approved_connects: Arc<DashMap<EndpointId, ApprovedConnect>>,
     /// Peer endpoints we have sent an outgoing `ray connect` request to. Used by
     /// the concurrency tie-break: if both peers requested *and* approved each
     /// other, only the higher endpoint id mints, avoiding a duplicate network.
@@ -192,9 +202,19 @@ impl ConnectService {
             Ok(IpcMessage::Created {
                 name, network_key, ..
             }) => {
+                // The direct network was just minted, so its read key is in the
+                // registry; `Approved` carries it over the mesh, the way every
+                // other joiner gets one.
+                let read_key = self.registry.network_read_key(&name).map(|k| k.to_bytes());
                 self.pending_connects.remove(&peer);
-                self.approved_connects
-                    .insert(peer, (network_key, self.transport.endpoint.id()));
+                self.approved_connects.insert(
+                    peer,
+                    ApprovedConnect {
+                        room_id: network_key,
+                        coordinator: self.transport.endpoint.id(),
+                        read_key,
+                    },
+                );
                 IpcMessage::Ok {
                     message: format!("approved — direct connection '{name}' created"),
                 }
@@ -230,9 +250,16 @@ impl ConnectService {
             Ok(control::ConnectMsg::Approved {
                 room_id,
                 coordinator,
+                read_key,
             }) => {
                 self.outgoing_connects.remove(&peer);
-                self.join_direct(room_id, coordinator, hostname).await
+                self.join_direct(
+                    room_id,
+                    coordinator,
+                    hostname,
+                    read_key.map(ReadKey::from_bytes),
+                )
+                .await
             }
             Ok(control::ConnectMsg::Pending) => {
                 self.spawn_connect_retry(peer, hostname);
@@ -285,18 +312,17 @@ impl ConnectService {
         room_id: EndpointId,
         coordinator: EndpointId,
         hostname: Option<String>,
+        read_key: Option<ReadKey>,
     ) -> IpcMessage {
         let resp = self
             .registry
-            .join_network(
-                &room_id.to_string(),
-                None,
+            .join_network(JoinSpec {
+                network_key: room_id.to_string(),
                 hostname,
-                None,
-                Some(coordinator),
-                false,
-                false,
-            )
+                coordinator: Some(coordinator),
+                read_key,
+                ..JoinSpec::default()
+            })
             .await;
         if let IpcMessage::Joined { name, .. } = &resp
             && let Ok(Some(mut n)) = config::load_network(name)
@@ -326,8 +352,17 @@ impl ConnectService {
                     Ok(control::ConnectMsg::Approved {
                         room_id,
                         coordinator,
+                        read_key,
                     }) => {
-                        match me.join_direct(room_id, coordinator, hostname.clone()).await {
+                        match me
+                            .join_direct(
+                                room_id,
+                                coordinator,
+                                hostname.clone(),
+                                read_key.map(ReadKey::from_bytes),
+                            )
+                            .await
+                        {
                             IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => {
                                 tracing::info!(peer = %peer.fmt_short(), "direct connect join ok");
                             }
@@ -453,11 +488,12 @@ impl ConnectService {
                     }
                     // Already approved? Reply with the minted room id so
                     // a re-dialing requester joins it (idempotent).
-                    let already = approved.get(&from_endpoint).map(|r| *r.value());
-                    let reply = if let Some((room_id, coordinator)) = already {
+                    let already = approved.get(&from_endpoint).map(|r| r.value().clone());
+                    let reply = if let Some(a) = already {
                         control::ConnectMsg::Approved {
-                            room_id,
-                            coordinator,
+                            room_id: a.room_id,
+                            coordinator: a.coordinator,
+                            read_key: a.read_key,
                         }
                     } else {
                         evict_oldest_connect(&pending, from_endpoint, MAX_PENDING_CONNECTS);

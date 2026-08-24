@@ -69,7 +69,7 @@ use android_tun::{AndroidTunReader, AndroidTunWriter};
 use rayfish::config;
 use rayfish::control;
 use rayfish::daemon::transfers;
-use rayfish::daemon::{DaemonState, build_headless};
+use rayfish::daemon::{DaemonState, JoinSpec, build_headless};
 use rayfish::deeplink::{self, RayfishLink};
 use rayfish::firewall::{Action, Direction, Protocol};
 use rayfish::hostname;
@@ -468,23 +468,26 @@ impl Node {
     pub fn join(&self, code: String) -> Result<NetworkInfo, RayError> {
         let state = self.state()?;
 
-        // `code` is either a self-contained invite (network key + coordinator +
-        // secret) or a bare room id (the network pubkey). Mirrors the CLI's
-        // `ipc_join` fallback: on decode failure, treat the input as a room id.
-        let (network_key, invite, coordinator) = match invite::decode_invite_code(&code) {
-            Ok((net_pubkey, coord, secret)) => (net_pubkey.to_string(), Some(secret), Some(coord)),
-            Err(_) => (code.clone(), None, None),
-        };
+        // One decoder for every shape a user can paste (bare room id or either
+        // invite length), shared with the CLI so the two cannot disagree about
+        // what a code means.
+        let parsed =
+            invite::decode_share_code(&code).map_err(|e| RayError::JoinFailed(format!("{e:#}")))?;
 
-        let result = self.runtime.block_on(state.join_network(
-            &network_key,
-            None,
-            None,
-            invite,
-            coordinator,
-            false, // auto_accept_firewall
-            true,  // auto_accept_files (own-device offers, identity-checked)
-        ));
+        let network_key = parsed.network.to_string();
+        let result = self.runtime.block_on(state.join_network(JoinSpec {
+            network_key: network_key.clone(),
+            name: None,
+            hostname: None,
+            invite: parsed.invite_secret,
+            coordinator: parsed.coordinator,
+            // Fetched from a coordinator over the mesh during the join; no code
+            // carries it.
+            read_key: None,
+            auto_accept_firewall: false,
+            // Own-device offers, identity-checked.
+            auto_accept_files: true,
+        }));
 
         match result {
             IpcMessage::Joined { name, my_ipv6 } => Ok(NetworkInfo {

@@ -32,6 +32,7 @@ pub(crate) async fn ipc_create(
             network_key,
             my_ipv6,
         } => {
+            let share = network_key.to_string();
             let key_str = network_key.to_string();
             let short = if key_str.len() > 12 {
                 format!("{}…{}", &key_str[..4], &key_str[key_str.len() - 4..])
@@ -52,7 +53,7 @@ pub(crate) async fn ipc_create(
                 style::faint("·"),
                 style::rose(&short),
             );
-            let join = format!("ray join {network_key}");
+            let join = format!("ray join {share}");
             print_next(&[
                 (&join, "share this to invite peers"),
                 ("ray up", "activate the VPN"),
@@ -78,13 +79,14 @@ pub(crate) async fn ipc_join(
     } else {
         None
     };
-    // `ray join <arg>` accepts either a bare room id (the network public key) or
-    // a self-contained invite code. An invite decodes to the network key plus the
-    // coordinator to dial and a one-time secret to present.
-    let (network_key, invite, coordinator) = match invite::decode_invite_code(network_key) {
-        Ok((net_pubkey, coord, secret)) => (net_pubkey.to_string(), Some(secret), Some(coord)),
-        Err(_) => (network_key.to_string(), None, None),
-    };
+    // `ray join <arg>` takes a bare room id or an invite code. An invite is
+    // split here and never travels inward whole: the daemon parses
+    // `network_key` as an `EndpointId`, slices it for a fallback display name,
+    // and compares it by string equality for pending-join dedupe.
+    let code = invite::decode_share_code(network_key)?;
+    let network_key = code.network.to_string();
+    let invite = code.invite_secret;
+    let coordinator = code.coordinator;
     let mut stream = ipc::connect().await?;
     ipc::send(
         &mut stream,

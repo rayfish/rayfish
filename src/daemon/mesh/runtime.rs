@@ -61,6 +61,7 @@ impl NetworkRegistry {
         net_public_key: EndpointId,
         net_config: Option<&config::NetworkConfig>,
         persisted_hostname: &Option<String>,
+        read_key: Option<&ReadKey>,
     ) -> RestoredRoster {
         let mut member_list = MemberList::new();
         let mut approved_list = ApprovedList::new();
@@ -70,7 +71,10 @@ impl NetworkRegistry {
         // Reusable join keys are authoritative in the signed blob too.
         let mut reusable_keys = BTreeMap::new();
         let mut nullifiers = BTreeSet::new();
-        match self.restore_roster_from_blob(net_public_key).await {
+        match self
+            .restore_roster_from_blob(net_public_key, read_key)
+            .await
+        {
             Ok(data) => {
                 suggested_firewall = data.suggested_firewall.clone();
                 reusable_keys = data.reusable_keys.clone();
@@ -161,6 +165,8 @@ impl NetworkRegistry {
             .context("no network secret key in config — cannot restore as coordinator")?;
         let net_public_key = net_secret_key.public();
         let persisted_hostname = net_config.and_then(|nc| nc.my_hostname.clone());
+        // Read before the roster fetch, which needs it to open a sealed blob.
+        let persisted_read_key = net_config.and_then(|nc| nc.read_key.clone());
 
         // Restore membership from the authoritative published GroupBlob. The blob
         // (members + approved) is signed by the per-network key and published
@@ -179,8 +185,27 @@ impl NetworkRegistry {
             reusable_keys,
             nullifiers,
         } = self
-            .restore_member_roster(name, net_public_key, net_config, &persisted_hostname)
+            .restore_member_roster(
+                name,
+                net_public_key,
+                net_config,
+                &persisted_hostname,
+                persisted_read_key.as_ref(),
+            )
             .await;
+
+        // Migration: a network created before read keys existed has none, so the
+        // coordinator mints one on its first start and starts sealing. The
+        // `seal_and_publish` below puts the commitment in the record, and members
+        // pick the key up over the mesh (`ReadKeyGrant`, or their own
+        // `ReadKeyRequest` if they were offline for the push).
+        let read_key = persisted_read_key.unwrap_or_else(|| {
+            tracing::info!(
+                network = %name,
+                "network has no roster read key; minting one and sealing the group blob from now on"
+            );
+            ReadKey::generate()
+        });
 
         let mut net_state = NetworkState {
             members: member_list,
@@ -188,6 +213,7 @@ impl NetworkRegistry {
             snapshot: None,
             converged_hash: None,
             network_secret_key: Some(net_secret_key.clone()),
+            read_key: Some(read_key.clone()),
             network_public_key: net_public_key,
             network_name: Some(name.to_string()),
             mode,
@@ -217,6 +243,7 @@ impl NetworkRegistry {
             approved: approved_entries,
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: Some(net_public_key),
+            read_key: Some(read_key),
             transport: None,
             // Preserve the persisted consent flag + admin roster across a
             // restart; only the roster (members/approved) is authoritative
@@ -417,7 +444,9 @@ impl NetworkRegistry {
                 &BTreeMap::new(),
                 &BTreeSet::new(),
             );
-            if let Err(e) = dht::publish_network(&client, &key, &empty_hash, &[]).await {
+            // No commitment: the tombstone names an empty roster nobody stored,
+            // so there is nothing to seal and nothing to open.
+            if let Err(e) = dht::publish_network(&client, &key, &empty_hash, &[], None).await {
                 tracing::warn!(error = %e, "failed to publish empty network record on nuke");
             }
         }
@@ -531,14 +560,8 @@ impl NetworkRegistry {
     /// showed it inactive, and only a manual `ray restart` brought it back. So
     /// retry with backoff until the join lands, the network is gone from the
     /// config (leave/nuke), or the daemon shuts down.
-    async fn restore_member_network(
-        self: Arc<Self>,
-        name: String,
-        net_pubkey: String,
-        persisted_hostname: Option<String>,
-        auto_accept_firewall: bool,
-        auto_accept_files: bool,
-    ) {
+    async fn restore_member_network(self: Arc<Self>, name: String, spec: JoinSpec) {
+        let net_pubkey = spec.network_key.clone();
         let mut delay = RESTORE_RETRY_MIN;
         let mut attempt: u32 = 0;
         loop {
@@ -565,19 +588,7 @@ impl NetworkRegistry {
                     RestoreNext::Stop => return,
                 }
             }
-            match self
-                .join_network_inner(
-                    &net_pubkey,
-                    Some(&name),
-                    persisted_hostname.clone(),
-                    None,
-                    None,
-                    auto_accept_firewall,
-                    auto_accept_files,
-                    false,
-                )
-                .await
-            {
+            match self.join_network_inner(&spec, false).await {
                 // The reply is boxed (`TryJoin::Joined`), so the two Joined cases
                 // are told apart inside the arm rather than by pattern.
                 Ok(TryJoin::Joined(resp)) => match *resp {
@@ -737,19 +748,20 @@ impl NetworkRegistry {
         let me = Arc::clone(self);
         let name = net.name.clone();
         let guard = net.name.clone();
-        let persisted_hostname = net.my_hostname.clone();
-        let auto_accept_firewall = net.auto_accept_firewall;
-        let auto_accept_files = net.auto_accept_files;
+        let spec = JoinSpec {
+            network_key: net_pubkey,
+            name: Some(net.name.clone()),
+            hostname: net.my_hostname.clone(),
+            invite: None,
+            coordinator: None,
+            // A restore has nobody to ask (no mesh link yet), so config holds
+            // the only copy.
+            read_key: net.read_key.clone(),
+            auto_accept_firewall: net.auto_accept_firewall,
+            auto_accept_files: net.auto_accept_files,
+        };
         tokio::spawn(async move {
-            Arc::clone(&me)
-                .restore_member_network(
-                    name,
-                    net_pubkey,
-                    persisted_hostname,
-                    auto_accept_firewall,
-                    auto_accept_files,
-                )
-                .await;
+            Arc::clone(&me).restore_member_network(name, spec).await;
             me.restoring.remove(&guard);
         });
     }
@@ -902,12 +914,16 @@ impl NetworkRegistry {
                 continue;
             }
             let me = Arc::clone(self);
-            let key = pending.network_key.clone();
-            let name = pending.name.clone();
+            let spec = JoinSpec {
+                network_key: pending.network_key.clone(),
+                name: pending.name.clone(),
+                // No read key to carry: a join still awaiting approval was never
+                // given one, and the retry asks for it again once approval makes
+                // it entitled to the roster.
+                ..JoinSpec::default()
+            };
             tokio::spawn(async move {
-                let _ = me
-                    .join_network(&key, name.as_deref(), None, None, None, false, false)
-                    .await;
+                let _ = me.join_network(spec).await;
             });
         }
 
