@@ -392,8 +392,6 @@ impl NetworkRegistry {
             name: name.to_string(),
             network_key: net_public_key,
             my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
-            // A restore is not a share point; only `ray create` renders a code.
-            read_key: None,
         })
     }
 
@@ -756,7 +754,8 @@ impl NetworkRegistry {
             hostname: net.my_hostname.clone(),
             invite: None,
             coordinator: None,
-            // A restore is handed no share code, so config holds the only copy.
+            // A restore has nobody to ask (no mesh link yet), so config holds
+            // the only copy.
             read_key: net.read_key.clone(),
             auto_accept_firewall: net.auto_accept_firewall,
             auto_accept_files: net.auto_accept_files,
@@ -918,10 +917,9 @@ impl NetworkRegistry {
             let spec = JoinSpec {
                 network_key: pending.network_key.clone(),
                 name: pending.name.clone(),
-                // Carried through the persisted entry: a pending join that
-                // outlives a restart still has to be able to read the roster it
-                // is waiting to be admitted to.
-                read_key: pending.read_key.clone(),
+                // No read key to carry: a join still awaiting approval was never
+                // given one, and the retry asks for it again once approval makes
+                // it entitled to the roster.
                 ..JoinSpec::default()
             };
             tokio::spawn(async move {

@@ -43,6 +43,74 @@ fn owner_admits(device_cert: Option<&control::DeviceCert>, own_identity: Endpoin
     device_cert.map(|c| c.user_identity) == Some(own_identity)
 }
 
+/// Who is asking to read a network's roster, as
+/// [`state_permits_roster_read`] needs them. `device_cert` is already verified
+/// by the caller; `user_id` is the asker's resolved user identity, which may be
+/// the device key itself when nothing is paired.
+pub(crate) struct RosterReadRequest<'a> {
+    pub(crate) peer_id: EndpointId,
+    pub(crate) user_id: EndpointId,
+    pub(crate) invite_secret: Option<&'a [u8]>,
+    pub(crate) device_cert: Option<&'a control::DeviceCert>,
+}
+
+/// What the in-memory network state alone can decide about a roster read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RosterRead {
+    Allow,
+    Deny,
+    /// State says no, but the asker presented a secret that could still be a
+    /// single-use invite, which lives in the coordinator's on-disk ledger.
+    AskTheInviteLedger,
+}
+
+/// May this peer hold the key that opens this roster?
+///
+/// The same question admission answers, asked one message earlier because a
+/// joiner must read the roster before it can dial. Every `Allow` here has an
+/// admission branch behind it, with one deliberate omission: a *queued* request
+/// is not an allow. That is what makes a code, or a room id, worth nothing on
+/// its own — a join that is later denied never held a roster read.
+pub(crate) fn state_permits_roster_read(
+    s: &NetworkState,
+    req: &RosterReadRequest<'_>,
+    own_identity: EndpointId,
+) -> RosterRead {
+    // A device its primary unpaired is refused everywhere else; refuse it the
+    // roster too, before any of the allows below can rescue it.
+    if let Some(cert) = req.device_cert
+        && s.nullifiers.contains(&cert.device_key)
+    {
+        return RosterRead::Deny;
+    }
+    // Already in, or already approved by the operator: the roster is theirs.
+    if [req.peer_id, req.user_id]
+        .iter()
+        .any(|id| s.members.is_member(id) || s.approved.is_approved(id))
+    {
+        return RosterRead::Allow;
+    }
+    // A reusable key rides the signed blob, so it is checked in-state.
+    if let Some(secret) = req.invite_secret
+        && crate::membership::validate_reusable_key(&s.reusable_keys, secret, now_secs()).is_some()
+    {
+        return RosterRead::Allow;
+    }
+    // An open network admits anybody who asks, so withholding its roster from
+    // them would protect nothing.
+    if matches!(s.mode, GroupMode::Open) {
+        return RosterRead::Allow;
+    }
+    // One of our own paired devices, same as at admission.
+    if owner_admits(req.device_cert, own_identity) {
+        return RosterRead::Allow;
+    }
+    match req.invite_secret {
+        Some(_) => RosterRead::AskTheInviteLedger,
+        None => RosterRead::Deny,
+    }
+}
+
 /// Whether a signed record authored at `record_ts` may replace what we hold,
 /// given the timestamp of the last record applied (`floor`).
 ///
@@ -86,9 +154,17 @@ pub(crate) fn record_is_newer(record_ts: u64, floor: Option<u64>) -> bool {
 /// on, which is the same reason the settings enums are matched exhaustively.
 pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
     match msg {
+        // `ReadKeyRequest` joins the exemption list for the same reason as the
+        // three beside it: it is how a peer legitimately not on the roster yet
+        // reaches us. A joiner must open the group blob before it can dial (the
+        // roster is what names the coordinators), and no code carries the key,
+        // so gating this on the roster would make a sealed network unjoinable.
+        // The handler applies the admission policy in full; the wall would only
+        // decide it earlier and wrongly.
         ControlMsg::JoinRequest { .. }
         | ControlMsg::MeshHello { .. }
-        | ControlMsg::SignedRecord { .. } => true,
+        | ControlMsg::SignedRecord { .. }
+        | ControlMsg::ReadKeyRequest { .. } => true,
 
         // Coordinator authority. Each is checked again in its own arm.
         //
@@ -112,12 +188,7 @@ pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
         ControlMsg::MemberSync | ControlMsg::BlobUpdated => false,
 
         // A member's statements about itself, and its departure.
-        //
-        // `ReadKeyRequest` asks for a roster read capability, so the roster is
-        // exactly the right gate: only a peer already on it may ask.
-        ControlMsg::ExitNodeOffer { .. }
-        | ControlMsg::LeaveNetwork
-        | ControlMsg::ReadKeyRequest => false,
+        ControlMsg::ExitNodeOffer { .. } | ControlMsg::LeaveNetwork => false,
 
         // Connection-level: the demux handles these before it ever resolves a
         // per-network handler, so they never reach this decision. Listed rather
@@ -283,35 +354,115 @@ impl CoordinatorAcceptState {
                     .await;
                 None
             }
-            // A member cannot open our sealed blob and is asking for the key.
-            // The `knows_sender` wall already established it is on this network's
-            // verified roster, which is the whole authorization: a roster member
-            // is exactly who may read the roster.
-            ControlMsg::ReadKeyRequest => {
-                self.answer_read_key_request(peer_id).await;
+            // Someone cannot open our sealed blob and is asking for the key.
+            // `ReadKeyRequest` is exempt from the `knows_sender` wall (a joiner
+            // needs the roster before it can dial), so authorization is entirely
+            // this handler's job.
+            ControlMsg::ReadKeyRequest {
+                invite_secret,
+                device_cert,
+            } => {
+                self.answer_read_key_request(send, peer_id, invite_secret, device_cert)
+                    .await;
                 None
             }
             _ => None,
         }
     }
 
-    /// Send this network's read key to a member that asked for it.
+    /// Send this network's read key to a peer that asked for it, if it is
+    /// entitled to read the roster.
     ///
-    /// The member-driven half of the migration: the coordinator's push at
-    /// mint time cannot reach a node that was offline, so the node asks when it
-    /// next sees a `k,` it cannot satisfy.
-    async fn answer_read_key_request(&self, peer_id: EndpointId) {
+    /// This is the only place a read key is handed out on demand, so it carries
+    /// the whole policy. It answers the same question admission does — may this
+    /// peer be in this network — one message earlier, because a joiner has to
+    /// open the roster before it can dial anybody. Deliberately *not* the same
+    /// as "may it join eventually": a queued request is refused, so a peer whose
+    /// join is later denied never held a roster read.
+    ///
+    /// Silence on refusal. There is nothing useful to tell an unauthorized
+    /// asker, and a distinguishable refusal would turn this into an oracle for
+    /// whether a given invite secret is live.
+    async fn answer_read_key_request(
+        &self,
+        send: iroh::endpoint::SendStream,
+        peer_id: EndpointId,
+        invite_secret: Option<Vec<u8>>,
+        device_cert: Option<control::DeviceCert>,
+    ) {
         let Some(read_key) = self.state.read().ok().and_then(|s| s.read_key.clone()) else {
             return;
         };
-        send_read_key_grant(
-            &self.ctx.peers,
-            self.net_pubkey(),
-            &self.network_name,
+        if !self
+            .may_read_roster(peer_id, invite_secret.as_deref(), device_cert.as_ref())
+            .await
+        {
+            tracing::debug!(
+                peer = %peer_id.fmt_short(),
+                network = %self.network_name,
+                "refusing a roster read key: not entitled to read this roster",
+            );
+            return;
+        }
+        // Answer on the stream the request arrived on, not through the peer
+        // table: a joiner is not in it yet for this network, which is the whole
+        // reason it is asking.
+        let mut send = send;
+        let msg = ControlMsg::ReadKeyGrant {
+            network_pubkey: self.net_pubkey(),
+            read_key: read_key.to_bytes(),
+        };
+        if let Err(e) = control::send_msg(&mut send, Some(self.net_pubkey()), &msg).await {
+            tracing::debug!(peer = %peer_id.fmt_short(), error = %e, "failed to answer a read key request");
+        }
+    }
+
+    /// May this peer hold the key that opens our roster?
+    ///
+    /// Mirrors [`Self::handle_join_request`]'s branches, minus the one that
+    /// queues: a pending join is *not* a roster read, so a request awaiting
+    /// `ray requests accept` (and one that is eventually denied) gets nothing.
+    /// The invite is checked and not burned, so the joiner can still spend it
+    /// once, at admission.
+    async fn may_read_roster(
+        &self,
+        peer_id: EndpointId,
+        invite_secret: Option<&[u8]>,
+        device_cert: Option<&control::DeviceCert>,
+    ) -> bool {
+        let req = RosterReadRequest {
             peer_id,
-            &read_key,
-        )
-        .await;
+            user_id: self.ctx.device_user_map.resolve(&peer_id),
+            invite_secret,
+            // Verify the cert wherever it is read. Unlike the admission path
+            // this records nothing in `device_user_map`: the peer is not in the
+            // network yet, and the `JoinRequest` that follows is what binds it.
+            device_cert: device_cert.filter(|c| c.verify() && c.device_key == peer_id),
+        };
+        match self.state.read() {
+            Ok(s) => {
+                match state_permits_roster_read(&s, &req, self.ctx.identity.local_identity()) {
+                    RosterRead::Allow => return true,
+                    RosterRead::Deny => return false,
+                    // Everything in state said no, and only the coordinator's
+                    // single-use invite ledger is left to ask.
+                    RosterRead::AskTheInviteLedger => {}
+                }
+            }
+            Err(_) => return false,
+        }
+
+        // That ledger is a file, not state. Read under the same lock redemption
+        // takes, so it cannot report live an invite another joiner is burning
+        // right now.
+        match invite_secret {
+            Some(secret) => {
+                let _guard = self.invite_lock.lock().await;
+                crate::invite::InviteStore::load(&self.network_name)
+                    .is_ok_and(|store| store.is_redeemable(secret))
+            }
+            None => false,
+        }
     }
 
     /// A fresh joiner's `JoinRequest` (or an older client's bare `MeshHello`): gate
@@ -1709,7 +1860,7 @@ mod stranger_policy_tests {
         SecretKey::from(b).public()
     }
 
-    /// The three ways a peer our roster does not list may legitimately speak.
+    /// The four ways a peer our roster does not list may legitimately speak.
     #[test]
     fn only_the_pre_membership_messages_pass() {
         for msg in [
@@ -1724,6 +1875,12 @@ mod stranger_policy_tests {
                 device_cert: None,
             },
             ControlMsg::SignedRecord { packet: vec![] },
+            // A joiner must read the roster before it can dial, and the roster
+            // is sealed, so this one has to come before membership too.
+            ControlMsg::ReadKeyRequest {
+                invite_secret: None,
+                device_cert: None,
+            },
         ] {
             assert!(stranger_may_send(&msg), "{msg:?} must reach a coordinator");
         }
@@ -1766,6 +1923,184 @@ mod stranger_policy_tests {
         ] {
             assert!(!stranger_may_send(&msg), "{msg:?} must need membership");
         }
+    }
+}
+
+#[cfg(test)]
+mod roster_read_tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn eid(seed: u8) -> EndpointId {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        SecretKey::from(b).public()
+    }
+
+    fn state(mode: GroupMode, members: &[EndpointId]) -> NetworkState {
+        let mut list = MemberList::new();
+        for id in members {
+            list.add(Member {
+                identity: *id,
+                is_coordinator: false,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+                last_seen: None,
+                exit_node: false,
+                exit_families: ExitFamilies::Unknown,
+            });
+        }
+        NetworkState {
+            members: list,
+            approved: ApprovedList::new(),
+            snapshot: None,
+            converged_hash: None,
+            network_secret_key: None,
+            read_key: None,
+            network_public_key: eid(200),
+            network_name: Some("team-alex".to_string()),
+            mode,
+            suggested_firewall: SuggestedFirewall::default(),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+            pending_suggestions: Vec::new(),
+            pending: HashMap::new(),
+            last_record_timestamp: None,
+        }
+    }
+
+    fn asker(peer: EndpointId) -> RosterReadRequest<'static> {
+        RosterReadRequest {
+            peer_id: peer,
+            user_id: peer,
+            invite_secret: None,
+            device_cert: None,
+        }
+    }
+
+    /// The property the whole design rests on: knowing a network's id is not a
+    /// roster read. A stranger with no invite gets nothing from a closed
+    /// network, which is what makes it safe for no share code to carry the key.
+    #[test]
+    fn a_stranger_may_not_read_a_closed_roster() {
+        let s = state(GroupMode::Restricted, &[eid(1)]);
+        assert_eq!(
+            state_permits_roster_read(&s, &asker(eid(9)), eid(1)),
+            RosterRead::Deny,
+        );
+    }
+
+    /// A queued request is not an allow. This is the case a key riding in the
+    /// share code could not express: the holder can ask to join, and until an
+    /// operator says yes, the roster stays shut. A join later denied therefore
+    /// never read it.
+    #[test]
+    fn a_pending_request_does_not_open_the_roster() {
+        let mut s = state(GroupMode::Restricted, &[eid(1)]);
+        s.pending.insert(
+            eid(9),
+            PendingJoin {
+                hostname: Some("laptop".into()),
+                device_cert: None,
+                requested_at: Instant::now(),
+            },
+        );
+        assert_eq!(
+            state_permits_roster_read(&s, &asker(eid(9)), eid(1)),
+            RosterRead::Deny,
+        );
+    }
+
+    /// Approval is what flips it, so the joiner's next attempt (the one that
+    /// actually admits it) can read the roster it is about to join.
+    #[test]
+    fn approval_opens_the_roster() {
+        let mut s = state(GroupMode::Restricted, &[eid(1)]);
+        s.approved.approve(ApprovedEntry {
+            identity: eid(9),
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        });
+        assert_eq!(
+            state_permits_roster_read(&s, &asker(eid(9)), eid(1)),
+            RosterRead::Allow,
+        );
+    }
+
+    /// A member reading its own roster is the migration path: a node that was
+    /// offline when its coordinator minted a key asks for it later.
+    #[test]
+    fn a_member_may_read_its_own_roster() {
+        let s = state(GroupMode::Restricted, &[eid(1), eid(9)]);
+        assert_eq!(
+            state_permits_roster_read(&s, &asker(eid(9)), eid(1)),
+            RosterRead::Allow,
+        );
+    }
+
+    /// An open network admits anybody who asks, so refusing them the roster
+    /// would protect nothing and only break the join.
+    #[test]
+    fn an_open_network_hands_its_roster_to_anyone() {
+        let s = state(GroupMode::Open, &[eid(1)]);
+        assert_eq!(
+            state_permits_roster_read(&s, &asker(eid(9)), eid(1)),
+            RosterRead::Allow,
+        );
+    }
+
+    /// A secret nothing in state recognises might still be a single-use invite,
+    /// which lives in the coordinator's ledger. The caller has to go look.
+    #[test]
+    fn an_unrecognised_secret_defers_to_the_ledger() {
+        let s = state(GroupMode::Restricted, &[eid(1)]);
+        let secret = [7u8; 16];
+        let mut req = asker(eid(9));
+        req.invite_secret = Some(&secret);
+        assert_eq!(
+            state_permits_roster_read(&s, &req, eid(1)),
+            RosterRead::AskTheInviteLedger,
+        );
+    }
+
+    /// A nullified device is refused before any allow can rescue it. Ordering is
+    /// the point: this device is a *member*, so the membership branch would say
+    /// yes if the nullifier check ran after it.
+    #[test]
+    fn a_nullified_device_is_refused_even_as_a_member() {
+        let owner = SecretKey::from([7u8; 32]);
+        let device = eid(9);
+        let cert = control::DeviceCert::create(&owner, &device, 0);
+
+        let mut s = state(GroupMode::Open, &[device]);
+        s.nullifiers.insert(device);
+
+        let mut req = asker(device);
+        req.device_cert = Some(&cert);
+        assert_eq!(
+            state_permits_roster_read(&s, &req, owner.public()),
+            RosterRead::Deny,
+        );
+    }
+
+    /// One of our own paired devices joining a closed network is recognised
+    /// here, exactly as `owner_admits` recognises it at admission. Without this
+    /// the pre-admission fetch would refuse a device the join then admits.
+    #[test]
+    fn our_own_paired_device_may_read_the_roster() {
+        let owner = SecretKey::from([7u8; 32]);
+        let device = eid(9);
+        let cert = control::DeviceCert::create(&owner, &device, 0);
+
+        let s = state(GroupMode::Restricted, &[eid(1)]);
+        let mut req = asker(device);
+        req.device_cert = Some(&cert);
+        assert_eq!(
+            state_permits_roster_read(&s, &req, owner.public()),
+            RosterRead::Allow,
+        );
     }
 }
 

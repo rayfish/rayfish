@@ -449,12 +449,6 @@ pub struct PendingJoinEntry {
     /// The local display name to use once admitted, if the user gave one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// The read key from the share code this join came from. Persisted with the
-    /// pending entry because the retry outlives the process that was handed the
-    /// code, and without it a resumed retry could not open the roster it is
-    /// queued for.
-    #[serde(default, with = "option_read_key_hex")]
-    pub read_key: Option<ReadKey>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1977,7 +1971,6 @@ name = "test"
             PendingJoinEntry {
                 network_key: "abc123".to_string(),
                 name: Some("homelab".to_string()),
-                read_key: None,
             },
         )
         .unwrap();
@@ -1992,7 +1985,6 @@ name = "test"
             PendingJoinEntry {
                 network_key: "abc123".to_string(),
                 name: None,
-                read_key: None,
             },
         )
         .unwrap();

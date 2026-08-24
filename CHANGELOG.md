@@ -360,17 +360,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   key metadata. That held even for a closed network that would never have
   admitted the reader, which is what made a leaked invite a disclosure of the
   roster rather than just a spent credential. The member list is now encrypted
-  under a per-network read key that travels in the code you share, so the room id
-  still finds the network and no longer opens it.
+  under a per-network read key, so the room id still finds the network and no
+  longer opens it.
 
-  Because that key has to be in the code, **`ray create` and `ray invite` now
-  print a longer one**, and `ray status` shows it in place of the bare room id.
-  Codes you have already shared keep working: a network created before this
-  version has no read key and its list stays readable until its coordinator
-  restarts on this version, which is when the key is created. Members pick the
-  key up automatically the next time they reconnect, or ask for it themselves if
-  they were offline when it was created. Anyone removed from a network keeps the
-  key they already had, so rotating it on `ray kick` is still to come.
+  **The key is not in the codes you share.** Codes are unchanged in shape and
+  length, and a code by itself reads nothing. A joiner asks a coordinator for the
+  key while joining, and gets it only if it is already a member, has been
+  approved, holds an invite that is still good, or is knocking on an open
+  network. So an invite you hand out and then refuse with `ray requests deny`,
+  or one nobody ever uses, never opens the member list.
+
+  A network created before this version has no read key, and its list stays
+  readable until its coordinator restarts on this version, which is when the key
+  is created. Members pick it up automatically the next time they reconnect, or
+  ask for it themselves if they were offline when it was created. Anyone removed
+  from a network keeps the key they already had, so rotating it on `ray kick` is
+  still to come.
 
 - **Android: a device identifier no longer leaks onto unrelated crash reports.**
   The install id and network transport meant for diagnostics reports were being

@@ -3,7 +3,7 @@
 // client built on top.
 use rayfish::term::{layout, picker, progress, style};
 use rayfish::{
-    DNS_DOMAIN, apply, config, daemon, firewall, groupkey, hostname, identity, invite, ipc, logdir,
+    DNS_DOMAIN, apply, config, daemon, firewall, hostname, identity, invite, ipc, logdir,
     membership, onepassword, shutdown, stats,
 };
 

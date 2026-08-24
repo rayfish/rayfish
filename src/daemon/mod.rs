@@ -1111,7 +1111,6 @@ impl Daemon {
                 transport: _,
                 invite,
                 coordinator,
-                read_key,
                 auto_accept_firewall,
                 auto_accept_files,
             } => {
@@ -1121,7 +1120,10 @@ impl Daemon {
                     hostname,
                     invite,
                     coordinator,
-                    read_key: read_key.map(ReadKey::from_bytes),
+                    // No code carries the read key: a fresh join asks a
+                    // coordinator for it over the mesh. Only a restore arrives
+                    // holding one, out of `NetworkConfig`.
+                    read_key: None,
                     auto_accept_firewall,
                     auto_accept_files,
                 })
