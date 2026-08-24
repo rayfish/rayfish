@@ -43,6 +43,9 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
         // caller must also seed/remove the `allow in tcp:22` passthrough and
         // start/stop the live listener (see `Daemon::ssh_config_set`).
         GlobalKey::Ssh => cfg.ssh_enabled = parse_bool(value, false)?,
+        // Like `ssh`, only half the work: the live bridge has to start or stop
+        // with it (see `Daemon::v4_bridge_config_set`).
+        GlobalKey::V4Bridge => cfg.v4_bridge = parse_bool(value, true)?,
         // Validated here, not in the CLI arm, so every caller is bound by it: a
         // relative download dir would resolve against the daemon's cwd, not the
         // user's.
@@ -128,6 +131,7 @@ pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
         GlobalKey::OnDemand => on_off(cfg.on_demand),
         GlobalKey::Ssh => on_off(cfg.ssh_enabled),
+        GlobalKey::V4Bridge => on_off(cfg.v4_bridge),
         // Empty renders as unset, matching the `net.ephemeral-ttl` convention.
         GlobalKey::DownloadDir => cfg.download_dir.clone().unwrap_or_default(),
         GlobalKey::DownloadUser => cfg.download_user.map(|u| u.to_string()).unwrap_or_default(),
@@ -332,6 +336,19 @@ mod tests {
         // Unset goes back to off, the secure default.
         apply_global(&mut cfg, GlobalKey::Ssh, "", false).unwrap();
         assert!(!cfg.ssh_enabled);
+    }
+
+    #[test]
+    fn the_v4_bridge_toggles_and_unsets_back_on() {
+        let mut cfg = AppConfig::default();
+        assert!(cfg.v4_bridge, "on by default");
+        apply_global(&mut cfg, GlobalKey::V4Bridge, "off", false).unwrap();
+        assert!(!cfg.v4_bridge);
+        assert_eq!(render_global(&cfg, GlobalKey::V4Bridge), "off");
+        // Unset is the default, which here is on: the firewall is what decides
+        // whether a bridged port answers, and it denies inbound by default.
+        apply_global(&mut cfg, GlobalKey::V4Bridge, "", false).unwrap();
+        assert!(cfg.v4_bridge);
     }
 
     #[test]

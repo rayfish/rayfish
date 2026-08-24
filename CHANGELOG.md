@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Services that listen on IPv4 only are reachable over the mesh.** The mesh is
+  IPv6-only, so a peer reaches a service at `[<mesh ip>]:<port>` and a program
+  listening on `0.0.0.0` never saw the connection: the port was open in `ray
+  firewall`, the name resolved, and the connection was refused with nothing
+  saying why. The daemon now answers on the mesh address for those ports itself
+  and hands the connection to the local service over IPv4, so
+  `curl http://box.ray:4000` works against a server that only speaks IPv4.
+  Nothing new is exposed by it: only a service already listening on every
+  interface (`0.0.0.0`) is bridged, one bound to `127.0.0.1` is left alone, and
+  the firewall decides who reaches it exactly as before. The service sees the
+  connection coming from `127.0.0.1` rather than from the peer, so keep
+  per-peer rules in `ray firewall` rather than in the application. Turn it off
+  with `ray config set v4-bridge off`.
 - **Exit nodes tunnel IPv6.** `ray exit-node use` routes your IPv6 internet
   traffic through the gateway and leaves your IPv4 traffic leaving directly,
   which both `ray exit-node use` and `ray exit-node status` say out loud rather

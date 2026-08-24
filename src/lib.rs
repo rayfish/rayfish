@@ -96,3 +96,7 @@ pub mod tun;
 // only ever runs from the desktop daemon/CLI; it is not part of the Android lib.
 #[cfg(feature = "desktop")]
 pub mod update;
+// Bridging the host's IPv4-only listeners onto the mesh address needs to
+// enumerate those listeners, which is per-OS and has no answer on Android.
+#[cfg(feature = "desktop")]
+pub mod v4bridge;
