@@ -1069,6 +1069,11 @@ impl FileService {
                                             n.network_public_key.map(|k| control::PairNetwork {
                                                 name: n.name,
                                                 network_key: k.to_string(),
+                                                // The new device fetches and opens
+                                                // the blob before it is admitted,
+                                                // so the key has to travel with
+                                                // the network it names.
+                                                read_key: n.read_key.map(|rk| rk.to_bytes()),
                                             })
                                         })
                                         .collect(),

@@ -19,21 +19,29 @@ pub(crate) fn spawn_network_publisher(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let hash = {
+            // Only ever publish the snapshot's hash. It is the hash of the bytes
+            // that were `add_slice`d into the blob store, so it is the only one a
+            // fetcher can resolve; recomputing it from live state would name
+            // bytes nobody stored, and since sealing happens in
+            // `refresh_snapshot` it would also name the wrong flavour of them.
+            let (hash, commitment) = {
                 let s = state.read().unwrap();
-                s.snapshot
-                    .as_ref()
-                    .map(|snap| snap.hash)
-                    .unwrap_or_else(|| {
-                        group_blob_hash(
-                            &s.members,
-                            &s.approved,
-                            &s.suggested_firewall,
-                            s.network_name.as_deref(),
-                            &s.reusable_keys,
-                            &s.nullifiers,
-                        )
-                    })
+                (
+                    s.snapshot.as_ref().map(|snap| snap.hash),
+                    s.read_key.as_ref().map(|k| k.commitment()),
+                )
+            };
+            let Some(hash) = hash else {
+                tracing::debug!(
+                    network = %network_name,
+                    "no group snapshot yet; nothing to publish"
+                );
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = notify.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_secs(300)) => {},
+                }
+                continue;
             };
             let mut seed_peers: Vec<EndpointId> = peers
                 .peers_for_network(&network_name)
@@ -44,7 +52,15 @@ pub(crate) fn spawn_network_publisher(
             seed_peers.sort_by_key(|id| id.to_string());
             seed_peers.dedup();
 
-            match dht::publish_network(&client, &net_secret_key, &hash, &seed_peers).await {
+            match dht::publish_network(
+                &client,
+                &net_secret_key,
+                &hash,
+                &seed_peers,
+                commitment.as_ref(),
+            )
+            .await
+            {
                 Ok(()) => tracing::info!(peers = seed_peers.len(), "published network record"),
                 Err(e) => tracing::warn!(error = %e, "failed to publish network record"),
             }
@@ -108,23 +124,17 @@ pub(crate) fn spawn_lazy_publisher(
     tokio::spawn(async move {
         let mut last_hash: Option<blake3::Hash> = None;
         loop {
-            let hash = {
+            // Snapshot hash only, for the same reason as the eager publisher above.
+            let (hash, commitment) = {
                 let s = state.read().unwrap();
-                s.snapshot
-                    .as_ref()
-                    .map(|snap| snap.hash)
-                    .unwrap_or_else(|| {
-                        group_blob_hash(
-                            &s.members,
-                            &s.approved,
-                            &s.suggested_firewall,
-                            s.network_name.as_deref(),
-                            &s.reusable_keys,
-                            &s.nullifiers,
-                        )
-                    })
+                (
+                    s.snapshot.as_ref().map(|snap| snap.hash),
+                    s.read_key.as_ref().map(|k| k.commitment()),
+                )
             };
-            if last_hash != Some(hash) {
+            if let Some(hash) = hash
+                && last_hash != Some(hash)
+            {
                 let mut seed_peers: Vec<EndpointId> = peers
                     .peers_for_network(&network_name)
                     .into_iter()
@@ -133,7 +143,15 @@ pub(crate) fn spawn_lazy_publisher(
                 seed_peers.push(endpoint_id);
                 seed_peers.sort_by_key(|id| id.to_string());
                 seed_peers.dedup();
-                match dht::publish_network(&client, &net_secret_key, &hash, &seed_peers).await {
+                match dht::publish_network(
+                    &client,
+                    &net_secret_key,
+                    &hash,
+                    &seed_peers,
+                    commitment.as_ref(),
+                )
+                .await
+                {
                     Ok(()) => {
                         tracing::info!(
                             network = %network_name,

@@ -69,14 +69,23 @@ impl DeviceCert {
 
 /// One of the primary's networks, shared during pairing so the new device can
 /// auto-join it. `network_key` is the network public key (bare room id) as a
-/// hex string; no secret is shared because the device cert is the credential.
+/// hex string; the device cert, not a secret, is what admits the new device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairNetwork {
     pub name: String,
     pub network_key: String,
+    /// The network's roster read key, when it has one.
+    ///
+    /// Admission and readability are separate questions and this is the second
+    /// one: the cert gets the device admitted, but the group blob is fetched and
+    /// opened before admission is even attempted, so a paired device with no key
+    /// would auto-join a network whose roster it cannot read. Carried over the
+    /// pairing link, which is already authenticated and already carries the cert.
+    #[serde(default)]
+    pub read_key: Option<[u8; 32]>,
 }
 
-/// Messages for the device pairing protocol (ALPN `rayfish/pair/2`).
+/// Messages for the device pairing protocol (ALPN `rayfish/pair/3`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PairMsg {
     Request {
@@ -91,7 +100,7 @@ pub enum PairMsg {
 }
 
 /// Messages for the `ray connect` friend-request handshake (ALPN
-/// `rayfish/connect/2`). The initiator (A) dials the recipient's (B) contact
+/// `rayfish/connect/3`). The initiator (A) dials the recipient's (B) contact
 /// key, sends `Request`, and polls until `Approved`. Approval is recipient-only:
 /// only B acts, A just waits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +121,10 @@ pub enum ConnectMsg {
     Approved {
         room_id: EndpointId,
         coordinator: EndpointId,
+        /// The minted network's roster read key. B creates the network, so A can
+        /// only ever learn it here.
+        #[serde(default)]
+        read_key: Option<[u8; 32]>,
     },
     /// B → A: request rejected.
     Denied { reason: String },
@@ -324,6 +337,34 @@ pub enum ControlMsg {
     NotSupported {
         msg_kind: String,
     },
+    /// Coordinator to member: this network's roster read key.
+    ///
+    /// Exists for migration. A network created before read keys publishes a
+    /// plaintext blob; when its coordinator upgrades it mints a key and starts
+    /// sealing, and its members have no way to be handed one (they hold no share
+    /// code, and a reconnect is given no `Welcome`). So the coordinator pushes it.
+    ///
+    /// Authenticated against the *record*, not the sender: the receiver accepts
+    /// it only if `blake3(read_key)` matches the `k,` value in the network-key-
+    /// signed pkarr record. Same trick as `admin_grant_key_valid`, which is what
+    /// lets a symmetric key with no public half be verified at all.
+    ReadKeyGrant {
+        network_pubkey: EndpointId,
+        /// The 32-byte roster read key.
+        read_key: [u8; 32],
+    },
+    /// Member to coordinator: I cannot open this network's group blob, please
+    /// send me the read key.
+    ///
+    /// The half of the migration that matters. The push above is best-effort and
+    /// cannot reach a member that was offline while the coordinator upgraded;
+    /// this is how that member catches up, on its own schedule, whenever it next
+    /// finds a `k,` in the record that it cannot satisfy. Payload-free: the
+    /// asking device is the connection's authenticated remote and the network is
+    /// the frame tag. Answered only for a peer on the verified roster, which the
+    /// `knows_sender` wall already enforces for every variant not on its short
+    /// exemption list.
+    ReadKeyRequest,
 }
 
 /// One `network pubkey → u16 handle` binding in a [`ControlMsg::NetworkHandles`]
@@ -753,6 +794,7 @@ mod tests {
             ConnectMsg::Approved {
                 room_id: test_id(3),
                 coordinator: test_id(4),
+                read_key: None,
             },
             ConnectMsg::Denied {
                 reason: "no".to_string(),

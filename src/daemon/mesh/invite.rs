@@ -56,12 +56,17 @@ impl NetworkRegistry {
                 Err(e) => Err(e),
             }
         };
+        // The invite has to carry the read key: a joiner opens the group blob
+        // before it dials anyone, so an invite without it admits a peer that
+        // cannot read what it just joined.
+        let read_key = self.network_read_key(network);
         match minted {
             Ok((secret, id)) => {
                 let code = crate::invite::encode_invite_code(
                     &net_pubkey,
                     &self.transport.endpoint.id(),
                     &secret,
+                    read_key.as_ref(),
                 );
                 // Gossip the new invite (hash only, never the secret) to other
                 // coordinators so any of them can later redeem it. The wire field
@@ -151,8 +156,12 @@ impl NetworkRegistry {
             s.reusable_keys.insert(hash, key);
         }
         update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
-        let code =
-            crate::invite::encode_invite_code(&net_pubkey, &self.transport.endpoint.id(), &secret);
+        let code = crate::invite::encode_invite_code(
+            &net_pubkey,
+            &self.transport.endpoint.id(),
+            &secret,
+            self.network_read_key(network).as_ref(),
+        );
         IpcMessage::InviteCreated {
             code,
             id,

@@ -68,6 +68,7 @@ pub mod dns;
 pub mod exit_node;
 pub mod firewall;
 pub mod forward;
+pub mod groupkey;
 pub mod hostfw;
 pub mod hostname;
 pub mod identity;

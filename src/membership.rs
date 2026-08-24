@@ -13,6 +13,7 @@ use ray_proto::SuggestedFirewall;
 use serde::{Deserialize, Serialize};
 
 use crate::control::DeviceCert;
+use crate::groupkey::ReadKey;
 
 /// Current Unix time in whole seconds (0 if the clock predates the epoch).
 /// Shared clock source for `Member::last_seen` stamping and the ephemeral pruner.
@@ -577,12 +578,35 @@ pub fn decode_group_blob(bytes: &[u8]) -> Result<GroupBlob> {
     Ok(blob)
 }
 
-pub fn verify_group_blob(bytes: &[u8], expected_hash: &blake3::Hash) -> Result<GroupBlob> {
+/// Decode blob bytes as fetched from the blob store, unsealing them first when
+/// they are sealed (see [`crate::groupkey`]). Plaintext bytes decode as before,
+/// so a network created before read keys existed still works.
+pub fn open_group_blob(
+    bytes: &[u8],
+    read_key: Option<&ReadKey>,
+    network: &EndpointId,
+) -> Result<GroupBlob> {
+    let plaintext = crate::groupkey::open(read_key, network, bytes)?;
+    decode_group_blob(&plaintext)
+}
+
+/// Verify fetched bytes against the hash the signed record commits to, then
+/// decode them.
+///
+/// The hash covers the bytes *as stored*, sealed ones included: the record's
+/// hash is also the iroh-blobs content address, so it could not mean anything
+/// else (see [`crate::groupkey`]).
+pub fn verify_group_blob(
+    bytes: &[u8],
+    expected_hash: &blake3::Hash,
+    read_key: Option<&ReadKey>,
+    network: &EndpointId,
+) -> Result<GroupBlob> {
     let actual = blake3::hash(bytes);
     if actual != *expected_hash {
         bail!("group blob hash mismatch: expected {expected_hash}, got {actual}");
     }
-    decode_group_blob(bytes)
+    open_group_blob(bytes, read_key, network)
 }
 
 /// Decides whether to reconverge the local group state, and to which hash.
@@ -607,6 +631,84 @@ pub fn trusted_reconverge_hash(
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    /// The blob path end to end with a read key: seal, hash the *sealed* bytes
+    /// (which is what the record commits to and what iroh-blobs content-
+    /// addresses), then verify and open them back to the same roster.
+    #[test]
+    fn a_sealed_blob_verifies_and_opens() {
+        let net = test_id(1);
+        let key = crate::groupkey::ReadKey::from_bytes([4u8; 32]);
+        let mut members = MemberList::new();
+        members.add(Member {
+            identity: test_id(2),
+            is_coordinator: true,
+            hostname: Some("box".to_string()),
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        });
+
+        let plaintext = canonical_group_bytes(
+            &members,
+            &ApprovedList::new(),
+            &SuggestedFirewall::default(),
+            Some("homelab"),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        let sealed = crate::groupkey::seal(&key, &net, &plaintext).unwrap();
+        assert!(crate::groupkey::is_sealed(&sealed));
+        assert!(
+            !sealed.windows(3).any(|w| w == b"box"),
+            "the hostname must not be readable in the sealed bytes"
+        );
+
+        let hash = blake3::hash(&sealed);
+        let data = verify_group_blob(&sealed, &hash, Some(&key), &net).unwrap();
+        assert_eq!(data.members.len(), 1);
+        assert_eq!(data.members[0].hostname.as_deref(), Some("box"));
+        assert_eq!(data.name.as_deref(), Some("homelab"));
+    }
+
+    /// Someone holding only the room id gets bytes and no roster. This is the
+    /// property the whole change exists for.
+    #[test]
+    fn a_sealed_blob_does_not_open_without_the_key() {
+        let net = test_id(1);
+        let key = crate::groupkey::ReadKey::from_bytes([4u8; 32]);
+        let plaintext = canonical_group_bytes(
+            &MemberList::new(),
+            &ApprovedList::new(),
+            &SuggestedFirewall::default(),
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        let sealed = crate::groupkey::seal(&key, &net, &plaintext).unwrap();
+        let hash = blake3::hash(&sealed);
+        assert!(verify_group_blob(&sealed, &hash, None, &net).is_err());
+    }
+
+    /// A network that predates read keys publishes plaintext, and its members
+    /// hold no key. Both halves of that have to keep working.
+    #[test]
+    fn a_plaintext_blob_still_verifies_with_no_key() {
+        let net = test_id(1);
+        let bytes = canonical_group_bytes(
+            &MemberList::new(),
+            &ApprovedList::new(),
+            &SuggestedFirewall::default(),
+            Some("legacy"),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        let hash = blake3::hash(&bytes);
+        let data = verify_group_blob(&bytes, &hash, None, &net).unwrap();
+        assert_eq!(data.name.as_deref(), Some("legacy"));
+    }
 
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
@@ -1001,7 +1103,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeSet::new(),
         );
-        let data = verify_group_blob(&bytes, &hash).unwrap();
+        let data = verify_group_blob(&bytes, &hash, None, &test_id(0)).unwrap();
         assert_eq!(data.members.len(), 2);
     }
 
@@ -1039,7 +1141,7 @@ mod tests {
             &BTreeSet::new(),
         );
         let bad_hash = blake3::hash(b"wrong data");
-        let result = verify_group_blob(&bytes, &bad_hash);
+        let result = verify_group_blob(&bytes, &bad_hash, None, &test_id(0));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("hash mismatch"));
     }
@@ -1076,7 +1178,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeSet::new(),
         );
-        let data = verify_group_blob(&bytes, &hash).unwrap();
+        let data = verify_group_blob(&bytes, &hash, None, &test_id(0)).unwrap();
         assert_eq!(data.members[0].last_seen, Some(12345));
     }
 
@@ -1116,7 +1218,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeSet::new(),
         );
-        let data = verify_group_blob(&bytes, &hash).unwrap();
+        let data = verify_group_blob(&bytes, &hash, None, &test_id(0)).unwrap();
         assert_eq!(data.members[0].last_seen, None);
     }
 

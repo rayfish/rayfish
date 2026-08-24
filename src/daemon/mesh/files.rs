@@ -144,20 +144,18 @@ impl Daemon {
                     }
                     let me = Arc::clone(self);
                     let net_name = net.name.clone();
-                    let net_key = net.network_key.clone();
+                    let spec = JoinSpec {
+                        network_key: net.network_key.clone(),
+                        name: Some(net.name.clone()),
+                        coordinator: Some(endpoint_id),
+                        // Handed over the pairing link: the blob is opened before
+                        // the cert ever gets us admitted, so without this the
+                        // auto-join would fail on an encrypted network.
+                        read_key: net.read_key.map(ReadKey::from_bytes),
+                        ..JoinSpec::default()
+                    };
                     tokio::spawn(async move {
-                        match me
-                            .join_network(
-                                &net_key,
-                                Some(&net_name),
-                                None,
-                                None,
-                                Some(endpoint_id),
-                                false,
-                                false,
-                            )
-                            .await
-                        {
+                        match me.join_network(spec).await {
                             IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => {
                                 tracing::info!(network = %net_name, "pairing auto-join ok");
                             }
