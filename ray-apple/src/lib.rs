@@ -13,7 +13,7 @@ use rayfish::config;
 use rayfish::config::settings::GlobalKey;
 #[cfg(target_os = "macos")]
 use rayfish::daemon::start_embedded_ipc;
-use rayfish::daemon::{DaemonState, build_headless};
+use rayfish::daemon::{DaemonState, JoinSpec, build_headless};
 use rayfish::invite;
 use rayfish::ipc::{IpcMessage, TransferFileState};
 use rayfish::membership;
@@ -493,21 +493,18 @@ impl Node {
 
     pub fn join_network(&self, code: String, hostname: Option<String>) -> Result<(), AppleError> {
         let state = self.state()?;
-        let (network_key, invite, coordinator) = match invite::decode_invite_code(&code) {
-            Ok((network_key, coordinator, secret)) => {
-                (network_key.to_string(), Some(secret), Some(coordinator))
-            }
-            Err(_) => (code, None, None),
-        };
-        match self.runtime.block_on(state.join_network(
-            &network_key,
-            None,
+        let parsed =
+            invite::decode_share_code(&code).map_err(|e| AppleError::Network(format!("{e:#}")))?;
+        match self.runtime.block_on(state.join_network(JoinSpec {
+            network_key: parsed.network.to_string(),
+            name: None,
             hostname,
-            invite,
-            coordinator,
-            false,
-            true,
-        )) {
+            invite: parsed.invite_secret,
+            coordinator: parsed.coordinator,
+            read_key: parsed.read_key,
+            auto_accept_firewall: false,
+            auto_accept_files: true,
+        })) {
             IpcMessage::Joined { .. } | IpcMessage::Ok { .. } => Ok(()),
             IpcMessage::Error { message } => Err(AppleError::Network(message)),
             _ => Err(AppleError::Network(

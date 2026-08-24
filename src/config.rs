@@ -18,6 +18,7 @@ use iroh::{EndpointId, SecretKey};
 use ray_proto::ipc::{MachineHostname, UnixTimestampSecs};
 use serde::{Deserialize, Serialize};
 
+use crate::groupkey::ReadKey;
 use crate::management::EnrollmentReceipt;
 use crate::membership::GroupMode;
 
@@ -64,6 +65,39 @@ mod option_secret_key_hex {
                     .try_into()
                     .map_err(|_| Error::custom("secret key must be 32 bytes"))?;
                 Ok(Some(SecretKey::from(bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+mod option_read_key_hex {
+    use crate::groupkey::ReadKey;
+    use serde::de::Error;
+    use serde::{self, Deserializer, Serializer};
+
+    pub fn serialize<S>(key: &Option<ReadKey>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match key {
+            Some(k) => serializer.serialize_str(&hex::encode(k.to_bytes())),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<ReadKey>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+        match opt {
+            Some(s) => {
+                let bytes: [u8; 32] = hex::decode(&s)
+                    .map_err(Error::custom)?
+                    .try_into()
+                    .map_err(|_| Error::custom("read key must be 32 bytes"))?;
+                Ok(Some(ReadKey::from_bytes(bytes)))
             }
             None => Ok(None),
         }
@@ -125,6 +159,8 @@ pub struct NetworkConfig {
     pub network_secret_key: Option<SecretKey>,
     #[serde(default)]
     pub network_public_key: Option<EndpointId>,
+    #[serde(default, with = "option_read_key_hex")]
+    pub read_key: Option<ReadKey>,
     /// Hash of the last complete GroupBlob this node verified or authored.
     /// Coordinator restore uses it only when the signed pkarr record is
     /// unreachable, so an expired record can be republished without rebuilding
@@ -376,6 +412,7 @@ pub(crate) fn empty_network_config(name: &str) -> NetworkConfig {
         approved: vec![],
         network_secret_key: None,
         network_public_key: None,
+        read_key: None,
         last_group_hash: None,
         last_group_hash_published: true,
         transport: None,
@@ -435,6 +472,8 @@ pub struct PendingJoinEntry {
     /// The local display name to use once admitted, if the user gave one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, with = "option_read_key_hex")]
+    pub read_key: Option<ReadKey>,
 }
 
 /// A controller this machine has explicitly authorized to issue management
@@ -1761,6 +1800,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    read_key: None,
                     last_group_hash: None,
                     last_group_hash_published: true,
                     my_hostname: None,
@@ -1784,6 +1824,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    read_key: None,
                     last_group_hash: None,
                     last_group_hash_published: true,
                     my_hostname: None,
@@ -1828,6 +1869,7 @@ mod tests {
             approved: vec![],
             network_secret_key: None,
             network_public_key: None,
+            read_key: None,
             last_group_hash: None,
             last_group_hash_published: true,
             my_hostname: None,
@@ -1860,6 +1902,7 @@ mod tests {
                 approved: vec![],
                 network_secret_key: None,
                 network_public_key: None,
+                read_key: None,
                 last_group_hash: None,
                 last_group_hash_published: true,
                 my_hostname: None,
@@ -1885,6 +1928,7 @@ mod tests {
             approved: vec![],
             network_secret_key: None,
             network_public_key: None,
+            read_key: None,
             last_group_hash: None,
             last_group_hash_published: true,
             my_hostname: None,
@@ -1917,6 +1961,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    read_key: None,
                     last_group_hash: None,
                     last_group_hash_published: true,
                     my_hostname: None,
@@ -1940,6 +1985,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    read_key: None,
                     last_group_hash: None,
                     last_group_hash_published: true,
                     my_hostname: None,
@@ -1989,6 +2035,7 @@ mod tests {
                 }],
                 network_secret_key: None,
                 network_public_key: None,
+                read_key: None,
                 last_group_hash: None,
                 last_group_hash_published: true,
                 my_hostname: None,
@@ -2025,6 +2072,7 @@ mod tests {
                 approved: vec![],
                 network_secret_key: Some(secret.clone()),
                 network_public_key: Some(public),
+                read_key: None,
                 last_group_hash: None,
                 last_group_hash_published: true,
                 my_hostname: None,
@@ -2133,6 +2181,7 @@ name = "test"
             approved: vec![],
             network_secret_key: Some(SecretKey::generate()),
             network_public_key: None,
+            read_key: None,
             last_group_hash: None,
             last_group_hash_published: true,
             transport: None,
@@ -2813,6 +2862,7 @@ name = "test"
             PendingJoinEntry {
                 network_key: "abc123".to_string(),
                 name: Some("homelab".to_string()),
+                read_key: None,
             },
         )
         .unwrap();
@@ -2827,6 +2877,7 @@ name = "test"
             PendingJoinEntry {
                 network_key: "abc123".to_string(),
                 name: None,
+                read_key: None,
             },
         )
         .unwrap();

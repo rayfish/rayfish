@@ -18,6 +18,18 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// unbounded NAT-punch / relay storm.
 const WARM_DIAL_CONCURRENCY: usize = 12;
 
+#[derive(Debug, Clone, Default)]
+pub struct JoinSpec {
+    pub network_key: String,
+    pub name: Option<String>,
+    pub hostname: Option<String>,
+    pub invite: Option<Vec<u8>>,
+    pub coordinator: Option<EndpointId>,
+    pub read_key: Option<ReadKey>,
+    pub auto_accept_firewall: bool,
+    pub auto_accept_files: bool,
+}
+
 /// Borrowed bundle of the per-join inputs threaded through the dial + finalize
 /// phases of `join_network_inner`, so each phase takes one argument instead of a
 /// dozen. The references point at locals that live for the whole join.
@@ -38,6 +50,7 @@ struct JoinContext<'a> {
     invite_lock: Arc<AsyncMutex<()>>,
     /// Pinned coordinator to dial first (the invite minter), if known.
     coordinator: Option<EndpointId>,
+    read_key: Option<ReadKey>,
     /// Set on a restore whose network record advertises a mesh protocol version
     /// this build does not speak. Only [`VersionGate::Record`] can produce it,
     /// so it is always `None` on a fresh join.
@@ -279,73 +292,48 @@ impl Daemon {
     /// Part of the embedding API (used by `ray-mobile` and future embedders):
     /// join an existing network by key (optionally with an invite/coordinator).
     /// Thin delegate to the network registry, which owns the join path.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn join_network(
-        self: &Arc<Self>,
-        network_key: &str,
-        name: Option<&str>,
-        hostname: Option<String>,
-        invite: Option<Vec<u8>>,
-        coordinator: Option<EndpointId>,
-        auto_accept_firewall: bool,
-        auto_accept_files: bool,
-    ) -> IpcMessage {
-        self.registry
-            .join_network(
-                network_key,
-                name,
-                hostname,
-                invite,
-                coordinator,
-                auto_accept_firewall,
-                auto_accept_files,
-            )
-            .await
+    pub async fn join_network(self: &Arc<Self>, spec: JoinSpec) -> IpcMessage {
+        self.registry.join_network(spec).await
     }
 }
 
 impl NetworkRegistry {
     /// Join an existing network by key (optionally with an invite/coordinator).
-    #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, hostname), fields(net = name.unwrap_or(network_key)))]
-    pub async fn join_network(
-        self: &Arc<Self>,
-        network_key: &str,
-        name: Option<&str>,
-        hostname: Option<String>,
-        invite: Option<Vec<u8>>,
-        coordinator: Option<EndpointId>,
-        auto_accept_firewall: bool,
-        auto_accept_files: bool,
-    ) -> IpcMessage {
+    #[tracing::instrument(skip(self, spec), fields(net = spec.name.as_deref().unwrap_or(&spec.network_key)))]
+    pub async fn join_network(self: &Arc<Self>, spec: JoinSpec) -> IpcMessage {
+        let network_key = spec.network_key.clone();
+        let name = spec.name.clone();
         match self
             .join_network_inner(
-                network_key,
-                name,
-                hostname.clone(),
-                invite.clone(),
-                coordinator,
-                auto_accept_firewall,
-                auto_accept_files,
+                &network_key,
+                name.as_deref(),
+                spec.hostname.clone(),
+                spec.invite.clone(),
+                spec.coordinator,
+                spec.read_key.clone(),
+                spec.auto_accept_firewall,
+                spec.auto_accept_files,
                 true,
             )
             .await
         {
             Ok(TryJoin::Joined(resp)) => {
-                let _ = config::remove_pending_join(network_key);
+                let _ = config::remove_pending_join(&network_key);
                 *resp
             }
             Ok(TryJoin::Pending) => {
                 // Persist so the retry resumes after a restart.
                 let _ = config::add_pending_join(config::PendingJoinEntry {
                     network_key: network_key.to_string(),
-                    name: name.map(|s| s.to_string()),
+                    name: name.clone(),
+                    read_key: spec.read_key.clone(),
                 });
                 // Closed network: queued for live approval. Retry in the
                 // background on a backoff until `ray accept` admits us.
                 let me = Arc::clone(self);
-                let nk = network_key.to_string();
-                let nm = name.map(|s| s.to_string());
+                let nk = network_key;
+                let nm = name;
+                let retry_spec = spec;
                 tokio::spawn(async move {
                     let mut backoff = BACKOFF_INITIAL;
                     loop {
@@ -358,11 +346,12 @@ impl NetworkRegistry {
                             .join_network_inner(
                                 &nk,
                                 nm.as_deref(),
-                                hostname.clone(),
-                                invite.clone(),
-                                coordinator,
-                                auto_accept_firewall,
-                                auto_accept_files,
+                                retry_spec.hostname.clone(),
+                                retry_spec.invite.clone(),
+                                retry_spec.coordinator,
+                                retry_spec.read_key.clone(),
+                                retry_spec.auto_accept_firewall,
+                                retry_spec.auto_accept_files,
                                 true,
                             )
                             .await
@@ -396,6 +385,7 @@ impl NetworkRegistry {
         hostname: Option<String>,
         invite: Option<Vec<u8>>,
         coordinator: Option<EndpointId>,
+        read_key: Option<ReadKey>,
         // Auto-install coordinator-suggested firewall rules on this network
         // (`--auto-accept-firewall`); persisted so it survives restarts.
         auto_accept_firewall: bool,
@@ -428,7 +418,9 @@ impl NetworkRegistry {
             blob: data,
             hash: group_hash,
             mismatch,
-        } = self.resolve_and_fetch_blob(net_pubkey, gate).await?;
+        } = self
+            .resolve_and_fetch_blob(net_pubkey, gate, read_key.as_ref())
+            .await?;
 
         // If our own primary has nullified this device in the signed blob
         // (`ray unpair`), tear ourselves out instead of trying (and failing) to
@@ -505,6 +497,7 @@ impl NetworkRegistry {
             auto_accept_files,
             invite_lock: Arc::clone(&invite_lock),
             coordinator,
+            read_key,
             mismatch,
         };
 
@@ -538,6 +531,7 @@ impl NetworkRegistry {
         &self,
         net_pubkey: EndpointId,
         gate: VersionGate,
+        read_key: Option<&ReadKey>,
     ) -> Result<ResolvedNetwork> {
         let pkarr_client =
             dht::create_pkarr_client(&self.transport.endpoint, &self.transport.pkarr_relay_url)?;
@@ -556,16 +550,24 @@ impl NetworkRegistry {
             gate,
         )?;
 
-        let (expected_hash, peer_ids) =
-            dht::decode_network_record(&record).context("invalid network record")?;
-        if peer_ids.is_empty() {
+        let decoded = dht::decode_network_record(&record).context("invalid network record")?;
+        if decoded.seed_peers.is_empty() {
             anyhow::bail!("no peers found in network record");
         }
+        if decoded.read_key_commitment.is_some() && read_key.is_none() {
+            anyhow::bail!(
+                "this network's roster is encrypted and no read key was supplied; use the full share code or invite code rather than the bare room id"
+            );
+        }
+        let expected_hash = decoded.blob_hash;
         let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
 
         let mut last_err = None;
-        for peer_id in &peer_ids {
-            match self.try_fetch_group_blob(*peer_id, blob_hash).await {
+        for peer_id in &decoded.seed_peers {
+            match self
+                .try_fetch_group_blob(*peer_id, blob_hash, net_pubkey, read_key)
+                .await
+            {
                 Ok(blob) => {
                     return Ok(ResolvedNetwork {
                         blob,
@@ -711,6 +713,7 @@ impl NetworkRegistry {
             converged_hash: None,
             unconfirmed_durable_hash: None,
             network_secret_key: None,
+            read_key: ctx.read_key.clone(),
             network_public_key: ctx.net_pubkey,
             network_name: Some(ctx.display_name.to_string()),
             group_name: data.name.clone(),
@@ -882,7 +885,8 @@ impl NetworkRegistry {
         let Ok(bytes) = self.transport.blob_store.blobs().get_bytes(blob_hash).await else {
             return Ok(false);
         };
-        let Ok(data) = verify_group_blob(&bytes, &group_hash) else {
+        let Ok(data) = verify_group_blob(&bytes, &group_hash, saved.read_key.as_ref(), &net_pubkey)
+        else {
             tracing::warn!(network = %name, %group_hash, "discarding invalid cached group blob during warm resume");
             return Ok(false);
         };
@@ -931,6 +935,7 @@ impl NetworkRegistry {
             auto_accept_files,
             invite_lock,
             coordinator: None,
+            read_key: saved.read_key.clone(),
             mismatch: None,
         };
 
@@ -1001,6 +1006,7 @@ impl NetworkRegistry {
                 device_cert: self.current_device_cert(),
                 invite_secret,
                 group_blob: data.clone(),
+                read_key: ctx.read_key.clone(),
                 auto_accept_firewall: ctx.auto_accept_firewall,
                 auto_accept_files: ctx.auto_accept_files,
                 initial,
@@ -1221,6 +1227,7 @@ impl NetworkRegistry {
     pub(crate) async fn restore_roster_from_blob(
         &self,
         net_pubkey: EndpointId,
+        read_key: Option<&ReadKey>,
         cached_hash: Option<blake3::Hash>,
         cached_is_published: bool,
         persisted_peers: &[EndpointId],
@@ -1247,8 +1254,9 @@ impl NetworkRegistry {
         let resolution_error = resolved
             .is_none()
             .then(|| "signed network record was unavailable".to_string());
+        let published = resolved.map(|record| (record.blob_hash, record.seed_peers));
         let target =
-            select_restore_target(resolved, cached_hash, cached_is_published, persisted_peers)
+            select_restore_target(published, cached_hash, cached_is_published, persisted_peers)
                 .with_context(|| {
                     resolution_error
                         .clone()
@@ -1280,7 +1288,7 @@ impl NetworkRegistry {
         // Local blob store first: snapshots are permanently retained when they
         // are authored or fetched, so the normal restart has no network trip.
         if let Ok(bytes) = self.transport.blob_store.blobs().get_bytes(blob_hash).await
-            && let Ok(data) = verify_group_blob(&bytes, &expected_hash)
+            && let Ok(data) = verify_group_blob(&bytes, &expected_hash, read_key, &net_pubkey)
         {
             retain_group_blob(&self.transport.blob_store, &bytes).await?;
             return Ok(RestoredGroupBlob {
@@ -1317,7 +1325,7 @@ impl NetworkRegistry {
                 continue;
             }
             if let Ok(bytes) = self.transport.blob_store.blobs().get_bytes(blob_hash).await
-                && let Ok(data) = verify_group_blob(&bytes, &expected_hash)
+                && let Ok(data) = verify_group_blob(&bytes, &expected_hash, read_key, &net_pubkey)
             {
                 retain_group_blob(&self.transport.blob_store, &bytes).await?;
                 return Ok(RestoredGroupBlob {
@@ -1334,6 +1342,8 @@ impl NetworkRegistry {
         &self,
         peer_id: EndpointId,
         blob_hash: iroh_blobs::Hash,
+        net_pubkey: EndpointId,
+        read_key: Option<&ReadKey>,
     ) -> Result<crate::membership::GroupBlob> {
         let conn = transport::connect_to_peer_with_alpn(
             &self.transport.endpoint,
@@ -1354,7 +1364,7 @@ impl NetworkRegistry {
             .get_bytes(blob_hash)
             .await
             .map_err(|e| anyhow::anyhow!("blob read failed: {e}"))?;
-        let blob = crate::membership::decode_group_blob(&bytes)?;
+        let blob = crate::membership::open_group_blob(&bytes, read_key, &net_pubkey)?;
         retain_group_blob(&self.transport.blob_store, &bytes).await?;
         Ok(blob)
     }
@@ -1675,6 +1685,7 @@ mod tests {
             auto_accept_files: false,
             invite_lock: Arc::new(AsyncMutex::new(())),
             coordinator: None,
+            read_key: None,
             mismatch: None,
         };
         let outcome = timeout(

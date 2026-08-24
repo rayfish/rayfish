@@ -76,6 +76,7 @@ use crate::dns;
 use crate::dns::config as dns_config;
 use crate::firewall::{self, SharedFirewall};
 use crate::forward;
+use crate::groupkey::ReadKey;
 use crate::identity;
 use crate::ipc::{
     self, FirewallRuleView, InactiveNetwork, IpcMessage, LanPeerInfo, MeshVersionMismatch,
@@ -218,6 +219,7 @@ use report::*;
 // moved into `mesh/{join,background}.rs`; re-export them at the daemon level so
 // `mod.rs` and the other `mesh/` submodules (via `use super::super::*`) call them
 // by bare name, as before the split.
+pub use mesh::JoinSpec;
 pub(crate) use mesh::*;
 // `run_daemon` (the `ray daemon` entry point) stays public for the binary.
 pub use mesh::run_daemon;
@@ -478,6 +480,7 @@ pub(crate) struct NetworkState {
     /// and clears an older ambiguity.
     unconfirmed_durable_hash: Option<PendingSnapshotDurability>,
     network_secret_key: Option<SecretKey>,
+    read_key: Option<ReadKey>,
     network_public_key: EndpointId,
     /// Local config/runtime alias used to index this network on this device.
     network_name: Option<String>,
@@ -647,7 +650,7 @@ impl NetworkState {
         self.pending.retain(|identity, _| {
             !self.members.is_member(identity) && !self.approved.is_approved(identity)
         });
-        let bytes = canonical_group_bytes(
+        let plaintext = canonical_group_bytes(
             &self.members,
             &self.approved,
             &self.suggested_firewall,
@@ -655,6 +658,16 @@ impl NetworkState {
             &self.reusable_keys,
             &self.nullifiers,
         );
+        let bytes = match &self.read_key {
+            Some(key) => match crate::groupkey::seal(key, &self.network_public_key, &plaintext) {
+                Ok(sealed) => sealed,
+                Err(e) => {
+                    tracing::error!(error = %e, "could not seal group blob; keeping the previous snapshot");
+                    return;
+                }
+            },
+            None => plaintext,
+        };
         let hash = blake3::hash(&bytes);
         self.snapshot = Some(GroupSnapshot {
             hash,
@@ -1816,6 +1829,7 @@ mod accept_handler_tests {
             converged_hash: None,
             unconfirmed_durable_hash: None,
             network_secret_key: None,
+            read_key: None,
             network_public_key: net_pub,
             network_name: Some("test-net".to_string()),
             group_name: Some("test-net".to_string()),

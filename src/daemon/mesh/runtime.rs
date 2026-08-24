@@ -91,6 +91,7 @@ pub(crate) struct SavedMemberNetwork {
     pub(crate) auto_accept_files: bool,
     pub(crate) cached_hash: Option<blake3::Hash>,
     pub(crate) cached_is_published: bool,
+    pub(crate) read_key: Option<ReadKey>,
 }
 
 /// Whether the member-restore loop runs another attempt or is done.
@@ -155,24 +156,30 @@ fn materialize_coordinator_roster(
     }
 }
 
-fn apply_coordinator_restore_to_config(
-    config: &mut config::NetworkConfig,
+struct CoordinatorRestoreConfig<'a> {
     mode: GroupMode,
-    members: &MemberList,
-    approved: &ApprovedList,
-    net_secret_key: &SecretKey,
+    members: &'a MemberList,
+    approved: &'a ApprovedList,
+    network_secret_key: &'a SecretKey,
+    read_key: &'a ReadKey,
     last_group_hash: Option<blake3::Hash>,
     last_group_hash_published: bool,
+}
+
+fn apply_coordinator_restore_to_config(
+    config: &mut config::NetworkConfig,
+    restored: CoordinatorRestoreConfig<'_>,
 ) {
-    config.group_mode = mode;
+    config.group_mode = restored.mode;
     config.pending_hostname = None;
-    config.members = to_member_entries(members.all());
-    config.approved = to_approved_entries(approved.all());
-    config.network_secret_key = Some(net_secret_key.clone());
-    config.network_public_key = Some(net_secret_key.public());
-    if let Some(hash) = last_group_hash {
+    config.members = to_member_entries(restored.members.all());
+    config.approved = to_approved_entries(restored.approved.all());
+    config.network_secret_key = Some(restored.network_secret_key.clone());
+    config.network_public_key = Some(restored.network_secret_key.public());
+    config.read_key = Some(restored.read_key.clone());
+    if let Some(hash) = restored.last_group_hash {
         config.last_group_hash = Some(hash);
-        config.last_group_hash_published = last_group_hash_published;
+        config.last_group_hash_published = restored.last_group_hash_published;
     }
 }
 
@@ -186,11 +193,13 @@ impl NetworkRegistry {
         name: &str,
         net_public_key: EndpointId,
         net_config: &config::NetworkConfig,
+        read_key: Option<&ReadKey>,
     ) -> Result<RestoredRoster> {
         let persisted_peers: Vec<_> = net_config.members.iter().map(|m| m.identity).collect();
         let data = self
             .restore_roster_from_blob(
                 net_public_key,
+                read_key,
                 net_config.last_group_hash,
                 net_config.last_group_hash_published,
                 &persisted_peers,
@@ -232,6 +241,7 @@ impl NetworkRegistry {
             .context("no network secret key in config — cannot restore as coordinator")?;
         let net_public_key = net_secret_key.public();
         let persisted_hostname = net_config.my_hostname.clone();
+        let persisted_read_key = net_config.read_key.clone();
 
         // Restore membership from the authoritative published GroupBlob. The blob
         // (members + approved) is signed by the per-network key and published
@@ -254,8 +264,21 @@ impl NetworkRegistry {
             source_hash,
             source_published,
         } = self
-            .restore_member_roster(name, net_public_key, &net_config)
+            .restore_member_roster(
+                name,
+                net_public_key,
+                &net_config,
+                persisted_read_key.as_ref(),
+            )
             .await?;
+
+        let read_key = persisted_read_key.unwrap_or_else(|| {
+            tracing::info!(
+                network = %name,
+                "network has no roster read key; minting one and sealing the group blob"
+            );
+            ReadKey::generate()
+        });
 
         let mut net_state = NetworkState {
             members: member_list,
@@ -265,6 +288,7 @@ impl NetworkRegistry {
             converged_hash: None,
             unconfirmed_durable_hash: None,
             network_secret_key: Some(net_secret_key.clone()),
+            read_key: Some(read_key.clone()),
             network_public_key: net_public_key,
             network_name: Some(name.to_string()),
             group_name,
@@ -288,12 +312,15 @@ impl NetworkRegistry {
         let updated = config::update_network(name, |latest| {
             apply_coordinator_restore_to_config(
                 latest,
-                mode,
-                &net_state.members,
-                &net_state.approved,
-                &net_secret_key,
-                Some(last_group_hash),
-                restored_hash_was_published,
+                CoordinatorRestoreConfig {
+                    mode,
+                    members: &net_state.members,
+                    approved: &net_state.approved,
+                    network_secret_key: &net_secret_key,
+                    read_key: &read_key,
+                    last_group_hash: Some(last_group_hash),
+                    last_group_hash_published: restored_hash_was_published,
+                },
             );
             Ok(())
         })?;
@@ -417,6 +444,7 @@ impl NetworkRegistry {
             name: name.to_string(),
             network_key: net_public_key,
             my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
+            read_key: None,
         })
     }
 
@@ -470,7 +498,7 @@ impl NetworkRegistry {
                 &BTreeMap::new(),
                 &BTreeSet::new(),
             );
-            if let Err(e) = dht::publish_network(&client, &key, &empty_hash, &[]).await {
+            if let Err(e) = dht::publish_network(&client, &key, &empty_hash, &[], None).await {
                 tracing::warn!(error = %e, "failed to publish empty network record on nuke");
             }
         }
@@ -682,6 +710,7 @@ impl NetworkRegistry {
                     persisted_hostname.clone(),
                     None,
                     None,
+                    saved.read_key.clone(),
                     auto_accept_firewall,
                     auto_accept_files,
                     false,
@@ -856,6 +885,7 @@ impl NetworkRegistry {
             auto_accept_files: net.auto_accept_files,
             cached_hash: net.last_group_hash,
             cached_is_published: net.last_group_hash_published,
+            read_key: net.read_key.clone(),
         };
         tokio::spawn(async move {
             Arc::clone(&me).restore_member_network(saved).await;
@@ -1011,12 +1041,14 @@ impl NetworkRegistry {
                 continue;
             }
             let me = Arc::clone(self);
-            let key = pending.network_key.clone();
-            let name = pending.name.clone();
+            let spec = JoinSpec {
+                network_key: pending.network_key.clone(),
+                name: pending.name.clone(),
+                read_key: pending.read_key.clone(),
+                ..JoinSpec::default()
+            };
             tokio::spawn(async move {
-                let _ = me
-                    .join_network(&key, name.as_deref(), None, None, None, false, false)
-                    .await;
+                let _ = me.join_network(spec).await;
             });
         }
 
@@ -1978,6 +2010,7 @@ mod coordinator_restore_tests {
     fn restore_changes_only_blob_derived_config_fields() {
         let me = id(1);
         let key = SecretKey::generate();
+        let read_key = ReadKey::generate();
         let hash = blake3::hash(b"complete snapshot");
         let mut members = MemberList::new();
         members.add(member(me, true));
@@ -1993,12 +2026,15 @@ mod coordinator_restore_tests {
 
         apply_coordinator_restore_to_config(
             &mut config,
-            GroupMode::Restricted,
-            &members,
-            &ApprovedList::new(),
-            &key,
-            Some(hash),
-            true,
+            CoordinatorRestoreConfig {
+                mode: GroupMode::Restricted,
+                members: &members,
+                approved: &ApprovedList::new(),
+                network_secret_key: &key,
+                read_key: &read_key,
+                last_group_hash: Some(hash),
+                last_group_hash_published: true,
+            },
         );
 
         assert_eq!(config.name, "local-name");
@@ -2013,12 +2049,15 @@ mod coordinator_restore_tests {
 
         apply_coordinator_restore_to_config(
             &mut config,
-            GroupMode::Restricted,
-            &members,
-            &ApprovedList::new(),
-            &key,
-            None,
-            false,
+            CoordinatorRestoreConfig {
+                mode: GroupMode::Restricted,
+                members: &members,
+                approved: &ApprovedList::new(),
+                network_secret_key: &key,
+                read_key: &read_key,
+                last_group_hash: None,
+                last_group_hash_published: false,
+            },
         );
         assert_eq!(
             config.last_group_hash,

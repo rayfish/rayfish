@@ -378,18 +378,20 @@ impl Daemon {
                 transport: _,
                 invite,
                 coordinator,
+                read_key,
                 auto_accept_firewall,
                 auto_accept_files,
             } => {
-                self.join_network(
-                    &network_key,
-                    name.as_deref(),
+                self.join_network(JoinSpec {
+                    network_key,
+                    name,
                     hostname,
                     invite,
                     coordinator,
+                    read_key: read_key.map(ReadKey::from_bytes),
                     auto_accept_firewall,
                     auto_accept_files,
-                )
+                })
                 .await
             }
             IpcMessage::Leave { name } => self.leave_network(&name).await,

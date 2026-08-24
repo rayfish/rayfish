@@ -29,9 +29,9 @@ const MAX_WARM_ENDPOINT_HINTS: usize = 64;
 
 fn network_key_from_selector(selector: &str) -> Option<EndpointId> {
     selector.parse().ok().or_else(|| {
-        crate::invite::decode_invite_code(selector)
+        crate::invite::decode_share_code(selector)
             .ok()
-            .map(|(network_key, _, _)| network_key)
+            .map(|code| code.network)
     })
 }
 
@@ -637,6 +637,13 @@ impl NetworkRegistry {
             .find_map(|handle| (handle.network_key == network_key).then(|| handle.key().clone()))
     }
 
+    pub(crate) fn network_read_key(&self, network: &str) -> Option<ReadKey> {
+        let handle = self.networks.get(network)?;
+        let key = handle.state.read().ok()?.read_key.clone();
+        drop(handle);
+        key
+    }
+
     /// The name of any network whose roster already holds `peer`, if any. Used
     /// by `ray mdns scan` to mark which LAN neighbours are already reachable;
     /// unlike `existing_direct_network_with` this looks at every network, not
@@ -741,8 +748,15 @@ impl NetworkRegistry {
         // this is the one peer the co-coordinator key grant is pinned to.
         let pre_approved_peer = pre_approve.as_ref().map(|(id, _)| *id);
 
-        let mut net_state =
-            self.build_initial_roster(&name, &my_hostname, mode, &net_secret_key, pre_approve)?;
+        let read_key = ReadKey::generate();
+        let mut net_state = self.build_initial_roster(
+            &name,
+            &my_hostname,
+            mode,
+            &net_secret_key,
+            read_key.clone(),
+            pre_approve,
+        )?;
 
         let last_group_hash = self.seal_group_snapshot(&mut net_state).await?;
 
@@ -757,6 +771,7 @@ impl NetworkRegistry {
             approved: approved_entries,
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: Some(net_public_key),
+            read_key: Some(read_key.clone()),
             last_group_hash: Some(last_group_hash),
             last_group_hash_published: false,
             transport: None,
@@ -833,6 +848,7 @@ impl NetworkRegistry {
             name,
             network_key: net_public_key,
             my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
+            read_key: Some(read_key.to_bytes()),
         })
     }
 
@@ -845,6 +861,7 @@ impl NetworkRegistry {
         my_hostname: &str,
         mode: GroupMode,
         net_secret_key: &SecretKey,
+        read_key: ReadKey,
         pre_approve: Option<(EndpointId, Option<String>)>,
     ) -> Result<NetworkState> {
         let mut member_list = MemberList::new();
@@ -879,6 +896,7 @@ impl NetworkRegistry {
             converged_hash: None,
             unconfirmed_durable_hash: None,
             network_secret_key: Some(net_secret_key.clone()),
+            read_key: Some(read_key),
             network_public_key: net_secret_key.public(),
             network_name: Some(name.to_string()),
             group_name: Some(name.to_string()),
@@ -933,11 +951,13 @@ impl NetworkRegistry {
         else {
             return None;
         };
+        let commitment = self.network_read_key(network).map(|key| key.commitment());
         match dht::publish_network(
             &pkarr_client,
             net_secret_key,
             &blob_hash,
             &[self.transport.endpoint.id()],
+            commitment.as_ref(),
         )
         .await
         {
@@ -1032,10 +1052,11 @@ impl NetworkRegistry {
         if !snapshot_is_publishable(&self.transport.blob_store, &state, network, hash).await {
             return None;
         }
-        let (key, members, approved) = {
+        let (key, commitment, members, approved) = {
             let state = state.read().unwrap();
             (
                 state.network_secret_key.clone()?,
+                state.read_key.as_ref().map(ReadKey::commitment),
                 state.roster(),
                 state.approved_snapshot(),
             )
@@ -1049,7 +1070,8 @@ impl NetworkRegistry {
         seed_peers.push(self.transport.endpoint.id());
         seed_peers.sort_by_key(|id| id.to_string());
         seed_peers.dedup();
-        let packet = dht::encode_network_record(&key, &hash, &seed_peers).ok()?;
+        let packet =
+            dht::encode_network_record(&key, &hash, &seed_peers, commitment.as_ref()).ok()?;
         Some(CurrentSignedNetworkState {
             hash,
             packet: packet.as_bytes().to_vec(),
@@ -1359,6 +1381,7 @@ mod tests {
             &network_key,
             &coordinator,
             &crate::invite::generate_secret(),
+            None,
         );
 
         assert_eq!(
