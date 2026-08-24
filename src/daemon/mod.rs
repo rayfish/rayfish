@@ -315,6 +315,9 @@ pub(crate) struct NetworkState {
     members: MemberList,
     approved: ApprovedList,
     snapshot: Option<GroupSnapshot>,
+    /// Serializes durable snapshot-pointer updates with DHT publication for this
+    /// network. Clone the Arc under the state read lock, then await it separately.
+    snapshot_commit: Arc<AsyncMutex<()>>,
     /// The hash of the signed record this state is converged on, which is not
     /// always the hash of [`Self::snapshot`].
     ///
@@ -1017,17 +1020,12 @@ impl Daemon {
         key: NetworkKey,
         value: &str,
     ) -> IpcMessage {
-        let mut net = match config::load_network(network) {
-            Ok(Some(n)) => n,
-            Ok(None) => return ipc_err(format!("network '{network}' not found")),
-            Err(e) => return ipc_err(format!("failed to load network: {e}")),
-        };
-        if let Err(e) = settings::apply_network(&mut net, key, value) {
-            return ipc_err(e.to_string());
-        }
-        if let Err(e) = config::save_network(&net) {
-            return ipc_err(format!("failed to save config: {e}"));
-        }
+        let net =
+            match config::update_network(network, |net| settings::apply_network(net, key, value)) {
+                Ok(Some(net)) => net,
+                Ok(None) => return ipc_err(format!("network '{network}' not found")),
+                Err(e) => return ipc_err(format!("failed to save config: {e}")),
+            };
         // Run the live re-materialization the key implies, then confirm.
         match key {
             NetworkKey::AutoAcceptFirewall => self.registry.reapply_suggested_firewall(network),
@@ -1322,15 +1320,15 @@ impl Daemon {
         // pending intent so it keeps being delivered to a coordinator across
         // reconnects/restarts until the signed blob confirms it; a coordinator
         // publishes authoritatively, so it clears any pending intent.
-        if let Ok(Some(mut net)) = config::load_network(network) {
+        let _ = config::update_network(network, |net| {
             net.my_hostname = Some(new_hostname.clone());
             net.pending_hostname = if is_coord {
                 None
             } else {
                 Some(new_hostname.clone())
             };
-            let _ = config::save_network(&net);
-        }
+            Ok(())
+        });
 
         // Fast-path the rename to connected peers via `MeshHello`, regardless of
         // role. A peer *coordinator* only learns a self-rename this way: it acts
@@ -1996,6 +1994,7 @@ mod accept_handler_tests {
             members: MemberList::new(),
             approved: ApprovedList::new(),
             snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
             converged_hash: None,
             network_secret_key: None,
             network_public_key: net_pub,

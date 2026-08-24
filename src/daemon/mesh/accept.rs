@@ -703,13 +703,17 @@ impl CoordinatorAcceptState {
                 .flatten()
                 .is_some_and(|n| grants_direct_key(&n, remote_id, &self.state));
 
+        let snapshot_commit = self.state.read().unwrap().snapshot_commit.clone();
+        let commit_guard = snapshot_commit.lock().await;
         let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
-        let snap_bytes = {
+        let (removed_approved, removed_pending) = {
             let mut s = self.state.write().unwrap();
-            if was_approved {
-                s.approved.remove(&remote_id);
-            }
-            s.pending.remove(&remote_id);
+            let removed_approved = if was_approved {
+                s.approved.remove(&remote_id)
+            } else {
+                None
+            };
+            let removed_pending = s.pending.remove(&remote_id);
             s.members.add(Member {
                 identity: remote_id,
                 is_coordinator: grant_direct,
@@ -720,12 +724,30 @@ impl CoordinatorAcceptState {
                 exit_node: false,
                 exit_families: ExitFamilies::Unknown,
             });
-            s.refresh_snapshot();
-            s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
+            (removed_approved, removed_pending)
         };
-        if let Some(bytes) = snap_bytes {
-            let _ = self.ctx.blob_store.blobs().add_slice(&bytes).await;
+        if !commit_current_snapshot(&self.state, &self.ctx.blob_store, &self.dht_notify).await {
+            {
+                let mut s = self.state.write().unwrap();
+                s.members.remove(&remote_id);
+                if let Some(approved) = removed_approved {
+                    s.approved.approve(approved);
+                }
+                if let Some(pending) = removed_pending {
+                    s.pending.insert(remote_id, pending);
+                }
+                s.refresh_snapshot();
+            }
+            drop(commit_guard);
+            self.deny(
+                conn,
+                send,
+                "failed to durably store the updated network roster".to_string(),
+            )
+            .await;
+            return None;
         }
+        drop(commit_guard);
 
         if let Some(ref h) = final_hostname {
             dns::update_hostname(
@@ -775,10 +797,6 @@ impl CoordinatorAcceptState {
         )
         .await;
 
-        if let Some(notify) = &self.dht_notify {
-            notify.notify_one();
-        }
-
         // Register the peer's route + start its single data reader (the accept-side
         // demux already owns this connection's control loop).
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
@@ -796,12 +814,13 @@ impl CoordinatorAcceptState {
         // The key rode the Welcome above (see `direct_key`). Record the grant
         // locally (mirrors `admin_add`) so our own `ray admin list` shows the peer
         // as a co-coordinator too.
-        if grant_direct
-            && let Ok(Some(mut net)) = config::load_network(&self.network_name)
-            && !net.admins.contains(&remote_id)
-        {
-            net.admins.push(remote_id);
-            let _ = config::save_network(&net);
+        if grant_direct {
+            let _ = config::update_network(&self.network_name, |net| {
+                if !net.admins.contains(&remote_id) {
+                    net.admins.push(remote_id);
+                }
+                Ok(())
+            });
         }
         Some(peer_ip)
     }
@@ -1245,9 +1264,19 @@ impl MemberAcceptState {
             return;
         }
         let key = SecretKey::from(secret_key);
-        if let Ok(Some(mut net)) = config::load_network(&self.network_name) {
+        match config::update_network(&self.network_name, |net| {
             net.network_secret_key = Some(key.clone());
-            let _ = config::save_network(&net);
+            Ok(())
+        }) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::warn!(network = %self.network_name, "admin grant arrived after network config was deleted");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(network = %self.network_name, error = %e, "failed to persist admin grant");
+                return;
+            }
         }
         {
             let mut s = self.state.write().unwrap();
@@ -1255,13 +1284,13 @@ impl MemberAcceptState {
             if let Some(m) = s.members.get_mut(&self.my_identity) {
                 m.is_coordinator = true;
             }
-            s.refresh_snapshot();
         }
         if let Ok(client) = dht::create_pkarr_client(&self.endpoint) {
             spawn_lazy_publisher(
                 client,
                 key,
                 self.state.clone(),
+                self.ctx.blob_store.clone(),
                 self.endpoint.id(),
                 self.ctx.peers.clone(),
                 self.network_name.clone(),
@@ -1666,6 +1695,7 @@ mod direct_grant_tests {
             members: list,
             approved: ApprovedList::new(),
             snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
             converged_hash: None,
             network_secret_key: None,
             network_public_key: eid(200),

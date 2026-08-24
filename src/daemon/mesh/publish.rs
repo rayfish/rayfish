@@ -6,11 +6,33 @@
 
 use super::super::*;
 
+/// Renew records with enough margin for scheduler/network delay that a healthy
+/// coordinator never lets its five-minute pkarr lease expire.
+const RECORD_REPUBLISH_INTERVAL: Duration = Duration::from_secs((dht::RECORD_TTL / 2) as u64);
+
+async fn snapshot_is_publishable(blob_store: &FsStore, network: &str, hash: blake3::Hash) -> bool {
+    let hash_is_persisted = config::load_network(network)
+        .ok()
+        .flatten()
+        .is_some_and(|net| net.last_group_hash == Some(hash));
+    if !hash_is_persisted {
+        tracing::warn!(network, %hash, "not publishing a group snapshot without a recovery pointer");
+        return false;
+    }
+    let blob_hash = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
+    if blob_store.blobs().get_bytes(blob_hash).await.is_err() {
+        tracing::warn!(network, %hash, "not publishing a group snapshot absent from local storage");
+        return false;
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_network_publisher(
     client: PkarrRelayClient,
     net_secret_key: SecretKey,
     state: SharedNetworkState,
+    blob_store: FsStore,
     endpoint_id: EndpointId,
     peers: PeerTable,
     network_name: String,
@@ -19,39 +41,36 @@ pub(crate) fn spawn_network_publisher(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let hash = {
-                let s = state.read().unwrap();
-                s.snapshot
-                    .as_ref()
-                    .map(|snap| snap.hash)
-                    .unwrap_or_else(|| {
-                        group_blob_hash(
-                            &s.members,
-                            &s.approved,
-                            &s.suggested_firewall,
-                            s.network_name.as_deref(),
-                            &s.reusable_keys,
-                            &s.nullifiers,
-                        )
-                    })
-            };
-            let mut seed_peers: Vec<EndpointId> = peers
-                .peers_for_network(&network_name)
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect();
-            seed_peers.push(endpoint_id);
-            seed_peers.sort_by_key(|id| id.to_string());
-            seed_peers.dedup();
+            {
+                let commit = state.read().unwrap().snapshot_commit.clone();
+                let _commit = commit.lock().await;
+                if let Some(hash) = config::load_network(&network_name)
+                    .ok()
+                    .flatten()
+                    .and_then(|net| net.last_group_hash)
+                    && snapshot_is_publishable(&blob_store, &network_name, hash).await
+                {
+                    let mut seed_peers: Vec<EndpointId> = peers
+                        .peers_for_network(&network_name)
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect();
+                    seed_peers.push(endpoint_id);
+                    seed_peers.sort_by_key(|id| id.to_string());
+                    seed_peers.dedup();
 
-            match dht::publish_network(&client, &net_secret_key, &hash, &seed_peers).await {
-                Ok(()) => tracing::info!(peers = seed_peers.len(), "published network record"),
-                Err(e) => tracing::warn!(error = %e, "failed to publish network record"),
+                    match dht::publish_network(&client, &net_secret_key, &hash, &seed_peers).await {
+                        Ok(()) => {
+                            tracing::info!(peers = seed_peers.len(), "published network record")
+                        }
+                        Err(e) => tracing::warn!(error = %e, "failed to publish network record"),
+                    }
+                }
             }
             tokio::select! {
                 _ = token.cancelled() => break,
                 _ = notify.notified() => {},
-                _ = tokio::time::sleep(Duration::from_secs(300)) => {},
+                _ = tokio::time::sleep(RECORD_REPUBLISH_INTERVAL) => {},
             }
         }
     })
@@ -81,7 +100,7 @@ pub(crate) fn spawn_contact_publisher(
             }
             tokio::select! {
                 _ = token.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(150)) => {},
+                _ = tokio::time::sleep(RECORD_REPUBLISH_INTERVAL) => {},
             }
         }
     })
@@ -99,6 +118,7 @@ pub(crate) fn spawn_lazy_publisher(
     client: PkarrRelayClient,
     net_secret_key: SecretKey,
     state: SharedNetworkState,
+    blob_store: FsStore,
     endpoint_id: EndpointId,
     peers: PeerTable,
     network_name: String,
@@ -106,42 +126,41 @@ pub(crate) fn spawn_lazy_publisher(
 ) -> JoinHandle<()> {
     const LAZY_PUBLISH_INTERVAL: Duration = Duration::from_secs(10);
     tokio::spawn(async move {
-        let mut last_hash: Option<blake3::Hash> = None;
+        let mut last_publish: Option<(blake3::Hash, Instant)> = None;
         loop {
-            let hash = {
-                let s = state.read().unwrap();
-                s.snapshot
-                    .as_ref()
-                    .map(|snap| snap.hash)
-                    .unwrap_or_else(|| {
-                        group_blob_hash(
-                            &s.members,
-                            &s.approved,
-                            &s.suggested_firewall,
-                            s.network_name.as_deref(),
-                            &s.reusable_keys,
-                            &s.nullifiers,
-                        )
-                    })
-            };
-            if last_hash != Some(hash) {
-                let mut seed_peers: Vec<EndpointId> = peers
-                    .peers_for_network(&network_name)
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect();
-                seed_peers.push(endpoint_id);
-                seed_peers.sort_by_key(|id| id.to_string());
-                seed_peers.dedup();
-                match dht::publish_network(&client, &net_secret_key, &hash, &seed_peers).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            network = %network_name,
-                            "lazy publisher: published network record"
-                        );
-                        last_hash = Some(hash);
+            let hash = config::load_network(&network_name)
+                .ok()
+                .flatten()
+                .and_then(|net| net.last_group_hash);
+            let publish_due = hash.is_some_and(|hash| {
+                last_publish.is_none_or(|(last_hash, published_at)| {
+                    last_hash != hash || published_at.elapsed() >= RECORD_REPUBLISH_INTERVAL
+                })
+            });
+            if let Some(hash) = hash
+                && publish_due
+            {
+                let commit = state.read().unwrap().snapshot_commit.clone();
+                let _commit = commit.lock().await;
+                if snapshot_is_publishable(&blob_store, &network_name, hash).await {
+                    let mut seed_peers: Vec<EndpointId> = peers
+                        .peers_for_network(&network_name)
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect();
+                    seed_peers.push(endpoint_id);
+                    seed_peers.sort_by_key(|id| id.to_string());
+                    seed_peers.dedup();
+                    match dht::publish_network(&client, &net_secret_key, &hash, &seed_peers).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                network = %network_name,
+                                "lazy publisher: published network record"
+                            );
+                            last_publish = Some((hash, Instant::now()));
+                        }
+                        Err(e) => tracing::warn!(error = %e, "lazy publisher: publish failed"),
                     }
-                    Err(e) => tracing::warn!(error = %e, "lazy publisher: publish failed"),
                 }
             }
             tokio::select! {
@@ -152,22 +171,140 @@ pub(crate) fn spawn_lazy_publisher(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotPersist {
+    Persisted,
+    Superseded,
+    Failed,
+}
+
+fn persist_current_snapshot_hash(
+    state: &SharedNetworkState,
+    network: &str,
+    hash: blake3::Hash,
+) -> SnapshotPersist {
+    let mut current = false;
+    match config::update_network(network, |net| {
+        current = state
+            .read()
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.hash == hash);
+        if current {
+            net.last_group_hash = Some(hash);
+        }
+        Ok(())
+    }) {
+        Ok(Some(_)) if current => SnapshotPersist::Persisted,
+        Ok(Some(_)) => SnapshotPersist::Superseded,
+        Ok(None) => {
+            tracing::warn!(
+                network,
+                "failed to persist group snapshot hash: network was deleted"
+            );
+            SnapshotPersist::Failed
+        }
+        Err(e) => {
+            tracing::warn!(network, error = %e, "failed to persist complete group snapshot hash");
+            SnapshotPersist::Failed
+        }
+    }
+}
+
+pub(crate) fn persist_group_hash_locked(
+    state: &SharedNetworkState,
+    network: &str,
+    hash: blake3::Hash,
+) -> bool {
+    let mut current = false;
+    match config::update_network(network, |net| {
+        current = state.read().unwrap().converged_hash == Some(hash);
+        if current {
+            net.last_group_hash = Some(hash);
+        }
+        Ok(())
+    }) {
+        Ok(Some(_)) => current,
+        Ok(None) => {
+            tracing::warn!(
+                network,
+                "failed to persist group snapshot hash: network was deleted"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(network, error = %e, "failed to persist complete group snapshot hash");
+            false
+        }
+    }
+}
+
+/// Commit the latest snapshot while the caller holds this state's
+/// `snapshot_commit` guard.
+pub(crate) async fn commit_current_snapshot(
+    state: &SharedNetworkState,
+    blob_store: &FsStore,
+    dht_notify: &Option<Arc<tokio::sync::Notify>>,
+) -> bool {
+    let ready_to_publish = loop {
+        let snapshot = {
+            let mut s = state.write().unwrap();
+            s.refresh_snapshot();
+            if s.network_secret_key.is_some() {
+                s.converged_hash = None;
+            }
+            s.snapshot.as_ref().map(|snap| {
+                (
+                    s.network_name.clone(),
+                    snap.hash,
+                    snap.msgpack_bytes.clone(),
+                )
+            })
+        };
+        let Some((network, hash, bytes)) = snapshot else {
+            break false;
+        };
+        if let Err(e) = blob_store.blobs().add_slice(&bytes).await {
+            tracing::warn!(error = %e, "failed to store complete group snapshot");
+            break false;
+        }
+        let outcome = match network.as_deref() {
+            Some(network) => persist_current_snapshot_hash(state, network, hash),
+            None => {
+                if state
+                    .read()
+                    .unwrap()
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.hash == hash)
+                {
+                    SnapshotPersist::Persisted
+                } else {
+                    SnapshotPersist::Superseded
+                }
+            }
+        };
+        match outcome {
+            SnapshotPersist::Persisted => break true,
+            SnapshotPersist::Superseded => continue,
+            SnapshotPersist::Failed => break false,
+        }
+    };
+    if ready_to_publish && let Some(notify) = dht_notify {
+        notify.notify_one();
+    }
+    ready_to_publish
+}
+
 pub(crate) async fn update_snapshot_and_publish(
     state: &SharedNetworkState,
     blob_store: &FsStore,
     dht_notify: &Option<Arc<tokio::sync::Notify>>,
-) {
-    let snap_bytes = {
-        let mut s = state.write().unwrap();
-        s.refresh_snapshot();
-        s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
-    };
-    if let Some(bytes) = snap_bytes {
-        let _ = blob_store.blobs().add_slice(&bytes).await;
-    }
-    if let Some(notify) = dht_notify {
-        notify.notify_one();
-    }
+) -> bool {
+    let commit = state.read().unwrap().snapshot_commit.clone();
+    let _commit = commit.lock().await;
+    commit_current_snapshot(state, blob_store, dht_notify).await
 }
 
 impl Daemon {
@@ -197,5 +334,103 @@ impl Daemon {
     /// stops resolving once its pkarr record expires (~5 min).
     pub(crate) async fn rotate_contact(&self) -> IpcMessage {
         self.connect.rotate_contact().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CONFIG_ENV_LOCK;
+
+    fn state_with_snapshot(hash: blake3::Hash) -> SharedNetworkState {
+        Arc::new(RwLock::new(NetworkState {
+            members: MemberList::new(),
+            approved: ApprovedList::new(),
+            snapshot: Some(GroupSnapshot {
+                hash,
+                msgpack_bytes: Vec::new(),
+            }),
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
+            converged_hash: None,
+            network_secret_key: None,
+            network_public_key: SecretKey::generate().public(),
+            network_name: Some("test".to_string()),
+            mode: GroupMode::Restricted,
+            suggested_firewall: SuggestedFirewall::default(),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+            last_record_timestamp: None,
+            pending_suggestions: Vec::new(),
+            pending: HashMap::new(),
+        }))
+    }
+
+    #[test]
+    fn superseded_snapshot_cannot_replace_the_newer_recovery_pointer() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config_dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("RAYFISH_CONFIG_DIR");
+        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", config_dir.path()) };
+
+        let old = blake3::hash(b"old snapshot");
+        let current = blake3::hash(b"current snapshot");
+        let state = state_with_snapshot(current);
+        let mut net = config::empty_network_config("test");
+        net.last_group_hash = Some(current);
+        config::save_network(&net).unwrap();
+
+        assert_eq!(
+            persist_current_snapshot_hash(&state, "test", old),
+            SnapshotPersist::Superseded
+        );
+        assert_eq!(
+            config::load_network("test")
+                .unwrap()
+                .unwrap()
+                .last_group_hash,
+            Some(current)
+        );
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("RAYFISH_CONFIG_DIR", value),
+                None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // serializes this process-global env override
+    async fn publication_requires_both_the_recovery_pointer_and_blob() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("RAYFISH_CONFIG_DIR");
+        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", config_dir.path()) };
+
+        let store = FsStore::load(blobs_dir.path()).await.unwrap();
+        let bytes = b"complete signed group";
+        let hash = blake3::hash(bytes);
+        let mut net = config::empty_network_config("test");
+        net.last_group_hash = Some(hash);
+        config::save_network(&net).unwrap();
+
+        assert!(!snapshot_is_publishable(&store, "test", hash).await);
+        store.blobs().add_slice(bytes).await.unwrap();
+        assert!(snapshot_is_publishable(&store, "test", hash).await);
+
+        config::update_network("test", |net| {
+            net.last_group_hash = Some(blake3::hash(b"newer complete group"));
+            Ok(())
+        })
+        .unwrap();
+        assert!(!snapshot_is_publishable(&store, "test", hash).await);
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("RAYFISH_CONFIG_DIR", value),
+                None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+            }
+        }
     }
 }

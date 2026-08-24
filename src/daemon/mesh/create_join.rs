@@ -20,6 +20,8 @@ struct JoinContext<'a> {
     my_hostname: &'a str,
     alpn: &'a [u8],
     net_pubkey: EndpointId,
+    /// Exact GroupBlob hash committed by the signed record used for this join.
+    group_hash: blake3::Hash,
     /// Single-use invite secret to redeem at admission, if any. Cloned per dial
     /// attempt (a fresh join may try several coordinators).
     invite: Option<Vec<u8>>,
@@ -54,9 +56,58 @@ enum VersionGate {
 /// mesh protocol version.
 struct ResolvedNetwork {
     blob: crate::membership::GroupBlob,
+    /// Exact content hash committed by the verified network record.
+    hash: blake3::Hash,
     /// `Some` when the record advertises a version this build does not speak and
     /// the caller asked to record that rather than refuse.
     mismatch: Option<MeshVersionMismatch>,
+}
+
+/// Where coordinator restore learned the complete blob hash it is allowed to
+/// apply. A live signed record always wins; the cached hash exists only to let a
+/// sole coordinator republish after that record expires while it is offline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreHashSource {
+    Published,
+    Cached,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RestoreTarget {
+    hash: blake3::Hash,
+    peers: Vec<EndpointId>,
+    source: RestoreHashSource,
+}
+
+/// Select the exact content-addressed blob a coordinator may restore. Persisted
+/// members are transport hints only: they can supply bytes for `hash`, but can
+/// neither choose the hash nor become roster data themselves.
+fn select_restore_target(
+    published: Option<(blake3::Hash, Vec<EndpointId>)>,
+    cached: Option<blake3::Hash>,
+    persisted_peers: &[EndpointId],
+) -> Option<RestoreTarget> {
+    let (hash, mut peers, source) = match published {
+        Some((hash, peers)) => (hash, peers, RestoreHashSource::Published),
+        None => (cached?, Vec::new(), RestoreHashSource::Cached),
+    };
+    peers.extend_from_slice(persisted_peers);
+    peers.sort_by_key(|id| *id.as_bytes());
+    peers.dedup();
+    Some(RestoreTarget {
+        hash,
+        peers,
+        source,
+    })
+}
+
+fn apply_join_record_pointer(
+    net: &mut config::NetworkConfig,
+    net_pubkey: EndpointId,
+    group_hash: blake3::Hash,
+) {
+    net.network_public_key = Some(net_pubkey);
+    net.last_group_hash = Some(group_hash);
 }
 
 /// Whether the mesh version a network's record advertises is one this build can
@@ -295,6 +346,7 @@ impl NetworkRegistry {
         };
         let ResolvedNetwork {
             blob: data,
+            hash: group_hash,
             mismatch,
         } = self.resolve_and_fetch_blob(net_pubkey, gate).await?;
 
@@ -355,6 +407,7 @@ impl NetworkRegistry {
             my_hostname: &my_hostname,
             alpn: &alpn,
             net_pubkey,
+            group_hash,
             invite,
             auto_accept_firewall,
             auto_accept_files,
@@ -419,7 +472,13 @@ impl NetworkRegistry {
 
         for peer_id in &peer_ids {
             match self.try_fetch_group_blob(*peer_id, blob_hash).await {
-                Ok(blob) => return Ok(ResolvedNetwork { blob, mismatch }),
+                Ok(blob) => {
+                    return Ok(ResolvedNetwork {
+                        blob,
+                        hash: expected_hash,
+                        mismatch,
+                    });
+                }
                 Err(e) => {
                     tracing::warn!(peer = %peer_id.fmt_short(), error = %e, "failed to fetch blob");
                 }
@@ -548,6 +607,7 @@ impl NetworkRegistry {
                 members: MemberList::from_members(data.members.clone()),
                 approved: ApprovedList::from_entries(data.approved.clone()),
                 snapshot: None,
+                snapshot_commit: Arc::new(AsyncMutex::new(())),
                 converged_hash: None,
                 network_secret_key: None,
                 network_public_key: ctx.net_pubkey,
@@ -720,6 +780,7 @@ impl NetworkRegistry {
             display_name,
             my_hostname,
             net_pubkey,
+            group_hash,
             invite_lock,
             mismatch,
             ..
@@ -776,21 +837,29 @@ impl NetworkRegistry {
             s.network_public_key = net_pubkey;
             s.refresh_snapshot();
         }
-        let snap_bytes = state
+        let snapshot = state
             .read()
             .unwrap()
             .snapshot
             .as_ref()
-            .map(|s| s.msgpack_bytes.clone());
-        if let Some(bytes) = snap_bytes {
-            let _ = self.transport.blob_store.blobs().add_slice(&bytes).await;
+            .map(|s| (s.hash, s.msgpack_bytes.clone()));
+        if let Some((_hash, bytes)) = snapshot
+            && let Err(e) = self.transport.blob_store.blobs().add_slice(&bytes).await
+        {
+            tracing::warn!(error = %e, "failed to store local group snapshot");
         }
 
-        // Save config with network public key (use display_name for config)
-        if let Ok(Some(mut net)) = config::load_network(display_name) {
-            net.network_public_key = Some(net_pubkey);
-            let _ = config::save_network(&net);
-        }
+        // Persist the network key and the exact hash committed by the signed
+        // record in one transaction. The local state above may be a deliberate
+        // partial projection during admission.
+        let updated = config::update_network(display_name, |net| {
+            apply_join_record_pointer(net, net_pubkey, group_hash);
+            Ok(())
+        })?;
+        anyhow::ensure!(
+            updated.is_some(),
+            "network config was deleted while joining"
+        );
 
         // Membership poller
         if let Ok(poller_client) = dht::create_pkarr_client(&self.transport.endpoint) {
@@ -849,34 +918,66 @@ impl NetworkRegistry {
         })))
     }
 
-    /// Fetch the authoritative GroupBlob for a network we coordinate, used to
-    /// restore the roster across a daemon restart. Resolves the pkarr record to
-    /// get the blob hash, reads the bytes back from the local blob store (where
-    /// we stored them before publishing, no network round-trip), and verifies +
-    /// decodes. Falls back to fetching from a seed peer if the local store
-    /// doesn't have them (e.g. blobs dir was wiped). Returns an error if the
-    /// authoritative record or blob is unavailable, so the caller retries
-    /// without publishing stale local state.
+    /// Fetch the complete GroupBlob used to restore a coordinated network. A
+    /// currently signed pkarr record chooses the hash whenever it is reachable.
+    /// If that record has expired, the last complete hash persisted alongside
+    /// the network config lets a sole coordinator read the same content-addressed
+    /// bytes back and republish the record. Persisted member identities are only
+    /// fetch hints for that exact hash; their lossy config roster is never applied.
     pub(crate) async fn restore_roster_from_blob(
         &self,
         net_pubkey: EndpointId,
+        cached_hash: Option<blake3::Hash>,
+        persisted_peers: &[EndpointId],
     ) -> Result<crate::membership::GroupBlob> {
-        let pkarr_client = dht::create_pkarr_client(&self.transport.endpoint)?;
-        let (expected_hash, seed_peers) = dht::resolve_network(&pkarr_client, net_pubkey)
-            .await
-            .context("resolve pkarr record for roster restore")?;
+        let resolved = match dht::create_pkarr_client(&self.transport.endpoint) {
+            Ok(client) => match dht::resolve_network_packet(&client, net_pubkey).await {
+                Ok(packet) => Some(
+                    dht::decode_network_record(&packet)
+                        .context("decode signed pkarr record for roster restore")?,
+                ),
+                Err(e) => {
+                    tracing::debug!(error = %e, "network record unavailable during roster restore");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::debug!(error = %e, "pkarr client unavailable during roster restore");
+                None
+            }
+        };
+        let resolution_error = resolved
+            .is_none()
+            .then(|| "signed network record was unavailable".to_string());
+        let target =
+            select_restore_target(resolved, cached_hash, persisted_peers).with_context(|| {
+                resolution_error
+                    .clone()
+                    .unwrap_or_else(|| "no roster hash available".into())
+            })?;
+        if target.source == RestoreHashSource::Cached {
+            tracing::warn!(
+                network = %net_pubkey.fmt_short(),
+                error = resolution_error.as_deref().unwrap_or("record unavailable"),
+                hash = %target.hash,
+                "network record unavailable; restoring its last complete local snapshot"
+            );
+        }
+
+        let expected_hash = target.hash;
         let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
 
-        // Local blob store first: the coordinator stored these bytes before
-        // publishing, so they're on disk.
+        // Local blob store first: snapshots are permanently retained when they
+        // are authored or fetched, so the normal restart has no network trip.
         if let Ok(bytes) = self.transport.blob_store.blobs().get_bytes(blob_hash).await
             && let Ok(data) = verify_group_blob(&bytes, &expected_hash)
         {
             return Ok(data);
         }
 
-        // Fall back to fetching from a seed peer.
-        for peer_id in &seed_peers {
+        // A current record's seeds and the saved roster are only transport hints:
+        // every peer must provide bytes matching the selected hash.
+        for peer_id in &target.peers {
             if *peer_id == self.transport.endpoint.id() {
                 continue;
             }
@@ -906,7 +1007,7 @@ impl NetworkRegistry {
                 return Ok(data);
             }
         }
-        anyhow::bail!("group blob not found locally or at any seed peer");
+        anyhow::bail!("group blob {expected_hash} not found locally or at any known peer");
     }
 
     pub(crate) async fn try_fetch_group_blob(
@@ -1116,5 +1217,73 @@ mod tests {
     fn a_republished_matching_version_is_speakable_again() {
         assert!(!mesh_version_is_speakable(Some(2), 4));
         assert!(mesh_version_is_speakable(Some(4), 4));
+    }
+
+    fn id(seed: u8) -> EndpointId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        SecretKey::from(bytes).public()
+    }
+
+    #[test]
+    fn join_caches_the_signed_record_hash_not_a_local_projection() {
+        let net_pubkey = id(1);
+        let signed_hash = blake3::hash(b"signed complete roster");
+        let local_partial_hash = blake3::hash(b"local partial roster");
+        let mut net = config::empty_network_config("joined");
+        net.last_group_hash = Some(local_partial_hash);
+
+        apply_join_record_pointer(&mut net, net_pubkey, signed_hash);
+
+        assert_eq!(net.network_public_key, Some(net_pubkey));
+        assert_eq!(net.last_group_hash, Some(signed_hash));
+        assert_ne!(net.last_group_hash, Some(local_partial_hash));
+    }
+
+    #[test]
+    fn a_published_restore_hash_wins_over_the_cached_hash() {
+        let published = blake3::hash(b"published");
+        let cached = blake3::hash(b"cached");
+        let record_seed = id(1);
+        let saved_member = id(2);
+
+        let target = select_restore_target(
+            Some((published, vec![record_seed])),
+            Some(cached),
+            &[saved_member],
+        )
+        .expect("published record is a restore target");
+
+        assert_eq!(target.hash, published);
+        assert_eq!(target.source, RestoreHashSource::Published);
+        let mut expected = vec![record_seed, saved_member];
+        expected.sort_by_key(|id| *id.as_bytes());
+        assert_eq!(target.peers, expected);
+    }
+
+    #[test]
+    fn an_unreachable_record_uses_the_last_complete_snapshot_hash() {
+        let cached = blake3::hash(b"cached");
+        let saved_member = id(2);
+
+        let target = select_restore_target(None, Some(cached), &[saved_member])
+            .expect("cached complete snapshot is a restore target");
+
+        assert_eq!(target.hash, cached);
+        assert_eq!(target.source, RestoreHashSource::Cached);
+        assert_eq!(target.peers, vec![saved_member]);
+    }
+
+    #[test]
+    fn restore_has_no_target_without_a_record_or_cached_snapshot() {
+        assert!(select_restore_target(None, None, &[id(2)]).is_none());
+    }
+
+    #[test]
+    fn restore_fetch_hints_are_deduplicated() {
+        let hash = blake3::hash(b"published");
+        let peer = id(1);
+        let target = select_restore_target(Some((hash, vec![peer])), None, &[peer]).unwrap();
+        assert_eq!(target.peers, vec![peer]);
     }
 }

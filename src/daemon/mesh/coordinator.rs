@@ -788,6 +788,7 @@ mod sender_authority_tests {
             members: list,
             approved: ApprovedList::new(),
             snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
             converged_hash: None,
             network_secret_key: None,
             network_public_key: eid(200),

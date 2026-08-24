@@ -3,6 +3,7 @@ use std::fs::Permissions;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 // Only the test-only `CONFIG_ENV_LOCK` holds one.
 #[cfg(test)]
 use std::sync::Mutex;
@@ -113,6 +114,12 @@ pub struct NetworkConfig {
     pub network_secret_key: Option<SecretKey>,
     #[serde(default)]
     pub network_public_key: Option<EndpointId>,
+    /// Hash of the last complete GroupBlob this node verified or authored.
+    /// Coordinator restore uses it only when the signed pkarr record is
+    /// unreachable, so an expired record can be republished without rebuilding
+    /// the roster from the deliberately lossy `members` config projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_group_hash: Option<blake3::Hash>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<TransportMode>,
     /// This node auto-installs coordinator-suggested firewall rules without a
@@ -346,6 +353,7 @@ pub(crate) fn empty_network_config(name: &str) -> NetworkConfig {
         approved: vec![],
         network_secret_key: None,
         network_public_key: None,
+        last_group_hash: None,
         transport: None,
         auto_accept_firewall: false,
         auto_accept_files: true,
@@ -579,6 +587,12 @@ pub fn rotate_contact_secret(config: &mut AppConfig) -> SecretKey {
 const LEGACY_FILE: &str = "networks.toml";
 const SETTINGS_FILE: &str = "settings.toml";
 const NETWORKS_SUBDIR: &str = "networks";
+
+/// Process-wide transaction boundary for network shards. Public per-network
+/// reads take a shared guard; save, update, migration, and delete take an
+/// exclusive guard so a stale whole-file write cannot overwrite another task's
+/// fields or resurrect a deleted network.
+static NETWORK_CONFIG_LOCK: RwLock<()> = RwLock::new(());
 
 /// Globals persisted to `settings.toml` (everything in [`AppConfig`] except the
 /// per-network entries, which live in their own files).
@@ -884,7 +898,7 @@ fn migrate_legacy(dir: &Path) -> Result<()> {
 
     save_settings_in(dir, &old)?;
     for net in &old.networks {
-        save_network_in(dir, net)?;
+        save_network_unlocked(dir, net)?;
     }
 
     let bak = dir.join("networks.toml.bak");
@@ -899,7 +913,15 @@ fn migrate_legacy(dir: &Path) -> Result<()> {
 /// on first call after an upgrade.
 pub fn load() -> Result<AppConfig> {
     let dir = config_dir()?;
-    migrate_legacy(&dir)?;
+    {
+        let _guard = NETWORK_CONFIG_LOCK
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        migrate_legacy(&dir)?;
+    }
+    let _guard = NETWORK_CONFIG_LOCK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     load_in(&dir)
 }
 
@@ -907,6 +929,9 @@ pub fn load() -> Result<AppConfig> {
 /// daemon is down). Creates nothing and runs no migration; a config tree that
 /// isn't there, or isn't readable by this user, reads as an empty config.
 pub fn load_for_read() -> Result<AppConfig> {
+    let _guard = NETWORK_CONFIG_LOCK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     load_in(&config_dir_for_read()?)
 }
 
@@ -1039,13 +1064,18 @@ fn remove_pending_join_in(dir: &Path, network_key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Persist a single network to `networks/<name>.toml`. Touches only that file,
-/// so concurrent saves of distinct networks can never clobber one another.
+/// Persist a single network to `networks/<name>.toml`. Direct full-record
+/// writes share the same transaction boundary as updates and deletes.
 pub fn save_network(net: &NetworkConfig) -> Result<()> {
-    save_network_in(&config_dir()?, net)
+    let dir = config_dir()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    save_network_unlocked(&dir, net)
 }
 
-fn save_network_in(dir: &Path, net: &NetworkConfig) -> Result<()> {
+/// Caller holds [`NETWORK_CONFIG_LOCK`] when this runs in production.
+fn save_network_unlocked(dir: &Path, net: &NetworkConfig) -> Result<()> {
     validate_net_name(&net.name)?;
     let ndir = dir.join(NETWORKS_SUBDIR);
     let path = ndir.join(format!("{}.toml", net.name));
@@ -1056,10 +1086,15 @@ fn save_network_in(dir: &Path, net: &NetworkConfig) -> Result<()> {
 
 /// Load a single network's config, if present.
 pub fn load_network(name: &str) -> Result<Option<NetworkConfig>> {
-    load_network_in(&config_dir()?, name)
+    let dir = config_dir()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    load_network_unlocked(&dir, name)
 }
 
-fn load_network_in(dir: &Path, name: &str) -> Result<Option<NetworkConfig>> {
+/// Caller holds [`NETWORK_CONFIG_LOCK`] when this runs in production.
+fn load_network_unlocked(dir: &Path, name: &str) -> Result<Option<NetworkConfig>> {
     validate_net_name(name)?;
     let path = dir.join(NETWORKS_SUBDIR).join(format!("{name}.toml"));
     if !path.exists() {
@@ -1072,12 +1107,100 @@ fn load_network_in(dir: &Path, name: &str) -> Result<Option<NetworkConfig>> {
     ))
 }
 
-/// Delete a single network's config file. Returns true if it existed.
-pub fn delete_network(name: &str) -> Result<bool> {
-    delete_network_in(&config_dir()?, name)
+/// Atomically load, synchronously mutate, and save an existing network's latest
+/// config. The callback must not call another network-config API; the lock is
+/// deliberately never held across an await. Returns `None` when the network was
+/// deleted or never existed.
+pub fn update_network(
+    name: &str,
+    update: impl FnOnce(&mut NetworkConfig) -> Result<()>,
+) -> Result<Option<NetworkConfig>> {
+    update_network_in(&config_dir()?, name, update)
 }
 
-fn delete_network_in(dir: &Path, name: &str) -> Result<bool> {
+fn update_network_in(
+    dir: &Path,
+    name: &str,
+    update: impl FnOnce(&mut NetworkConfig) -> Result<()>,
+) -> Result<Option<NetworkConfig>> {
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut net) = load_network_unlocked(dir, name)? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        net.name == name,
+        "network config {name:?} contains mismatched name {:?}",
+        net.name
+    );
+    let before = toml::to_string(&net).context("serializing network config")?;
+    update(&mut net)?;
+    anyhow::ensure!(
+        net.name == name,
+        "network update cannot rename {name:?} to {:?}",
+        net.name
+    );
+    let after = toml::to_string(&net).context("serializing network config")?;
+    if after != before {
+        save_network_unlocked(dir, &net)?;
+    }
+    Ok(Some(net))
+}
+
+/// Atomically update the latest network config, inserting `initial` only when
+/// the network is absent. This is the fresh-join counterpart to
+/// [`update_network`]; existing node-local fields remain available to `update`.
+pub fn update_network_or_insert(
+    name: &str,
+    initial: NetworkConfig,
+    update: impl FnOnce(&mut NetworkConfig) -> Result<()>,
+) -> Result<NetworkConfig> {
+    update_network_or_insert_in(&config_dir()?, name, initial, update)
+}
+
+fn update_network_or_insert_in(
+    dir: &Path,
+    name: &str,
+    initial: NetworkConfig,
+    update: impl FnOnce(&mut NetworkConfig) -> Result<()>,
+) -> Result<NetworkConfig> {
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let existing = load_network_unlocked(dir, name)?;
+    let inserting = existing.is_none();
+    let mut net = existing.unwrap_or(initial);
+    anyhow::ensure!(
+        net.name == name,
+        "network config {name:?} contains mismatched name {:?}",
+        net.name
+    );
+    let before = toml::to_string(&net).context("serializing network config")?;
+    update(&mut net)?;
+    anyhow::ensure!(
+        net.name == name,
+        "network update cannot rename {name:?} to {:?}",
+        net.name
+    );
+    let after = toml::to_string(&net).context("serializing network config")?;
+    if inserting || after != before {
+        save_network_unlocked(dir, &net)?;
+    }
+    Ok(net)
+}
+
+/// Delete a single network's config file. Returns true if it existed.
+pub fn delete_network(name: &str) -> Result<bool> {
+    let dir = config_dir()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    delete_network_unlocked(&dir, name)
+}
+
+/// Caller holds [`NETWORK_CONFIG_LOCK`] when this runs in production.
+fn delete_network_unlocked(dir: &Path, name: &str) -> Result<bool> {
     validate_net_name(name)?;
     let path = dir.join(NETWORKS_SUBDIR).join(format!("{name}.toml"));
     match std::fs::remove_file(&path) {
@@ -1170,6 +1293,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    last_group_hash: None,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1191,6 +1315,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    last_group_hash: None,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1233,6 +1358,7 @@ mod tests {
             approved: vec![],
             network_secret_key: None,
             network_public_key: None,
+            last_group_hash: None,
             my_hostname: None,
             pending_hostname: None,
             transport: None,
@@ -1263,6 +1389,7 @@ mod tests {
                 approved: vec![],
                 network_secret_key: None,
                 network_public_key: None,
+                last_group_hash: None,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -1286,6 +1413,7 @@ mod tests {
             approved: vec![],
             network_secret_key: None,
             network_public_key: None,
+            last_group_hash: None,
             my_hostname: None,
             pending_hostname: None,
             transport: None,
@@ -1316,6 +1444,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    last_group_hash: None,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1337,6 +1466,7 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    last_group_hash: None,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1384,6 +1514,7 @@ mod tests {
                 }],
                 network_secret_key: None,
                 network_public_key: None,
+                last_group_hash: None,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -1418,6 +1549,7 @@ mod tests {
                 approved: vec![],
                 network_secret_key: Some(secret.clone()),
                 network_public_key: Some(public),
+                last_group_hash: None,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -1498,6 +1630,19 @@ name = "test"
         assert_eq!(minimal.ephemeral_ttl_secs, None);
     }
 
+    #[test]
+    fn last_group_hash_roundtrips_and_defaults_none() {
+        let hash = blake3::hash(b"complete signed roster");
+        let mut n = net("cached");
+        n.last_group_hash = Some(hash);
+        let text = toml::to_string(&n).unwrap();
+        let back: NetworkConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.last_group_hash, Some(hash));
+
+        let minimal: NetworkConfig = toml::from_str("name = \"x\"").unwrap();
+        assert_eq!(minimal.last_group_hash, None);
+    }
+
     fn net(name: &str) -> NetworkConfig {
         NetworkConfig {
             name: name.to_string(),
@@ -1508,6 +1653,7 @@ name = "test"
             approved: vec![],
             network_secret_key: Some(SecretKey::generate()),
             network_public_key: None,
+            last_group_hash: None,
             transport: None,
             auto_accept_firewall: false,
             auto_accept_files: false,
@@ -1527,8 +1673,8 @@ name = "test"
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
 
-        save_network_in(dir, &net("homelab")).unwrap();
-        save_network_in(dir, &net("genesis")).unwrap();
+        save_network_unlocked(dir, &net("homelab")).unwrap();
+        save_network_unlocked(dir, &net("genesis")).unwrap();
         save_settings_in(
             dir,
             &AppConfig {
@@ -1543,12 +1689,12 @@ name = "test"
         assert_eq!(loaded.default_hostname.as_deref(), Some("laptop"));
 
         // Single-network load.
-        assert!(load_network_in(dir, "homelab").unwrap().is_some());
-        assert!(load_network_in(dir, "absent").unwrap().is_none());
+        assert!(load_network_unlocked(dir, "homelab").unwrap().is_some());
+        assert!(load_network_unlocked(dir, "absent").unwrap().is_none());
 
         // Deleting one leaves the other untouched.
-        assert!(delete_network_in(dir, "homelab").unwrap());
-        assert!(!delete_network_in(dir, "homelab").unwrap());
+        assert!(delete_network_unlocked(dir, "homelab").unwrap());
+        assert!(!delete_network_unlocked(dir, "homelab").unwrap());
         let after = load_in(dir).unwrap();
         assert_eq!(after.networks.len(), 1);
         assert_eq!(after.networks[0].name, "genesis");
@@ -1605,8 +1751,8 @@ name = "test"
         let mut n = net("homelab");
         n.aliases.insert("alice".into(), "id-alice".into());
         n.aliases.insert("bob".into(), "id-bob".into());
-        save_network_in(dir, &n).unwrap();
-        let loaded = load_network_in(dir, "homelab").unwrap().unwrap();
+        save_network_unlocked(dir, &n).unwrap();
+        let loaded = load_network_unlocked(dir, "homelab").unwrap().unwrap();
         assert_eq!(
             loaded.aliases.get("alice").map(String::as_str),
             Some("id-alice")
@@ -1848,7 +1994,7 @@ name = "test"
             for i in 0..N {
                 let dir = dir.clone();
                 s.spawn(move || {
-                    save_network_in(&dir, &net(&format!("net-{i}"))).unwrap();
+                    save_network_unlocked(&dir, &net(&format!("net-{i}"))).unwrap();
                 });
             }
         });
@@ -1858,6 +2004,92 @@ name = "test"
             loaded.networks.len(),
             N,
             "all concurrent saves must survive"
+        );
+    }
+
+    #[test]
+    fn concurrent_same_network_updates_preserve_unrelated_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        save_network_unlocked(&dir, &net("homelab")).unwrap();
+        let barrier = std::sync::Barrier::new(3);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                update_network_in(&dir, "homelab", |net| {
+                    net.aliases.insert("alice".into(), "id-alice".into());
+                    Ok(())
+                })
+                .unwrap();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                update_network_in(&dir, "homelab", |net| {
+                    net.last_group_hash = Some(blake3::hash(b"latest group"));
+                    Ok(())
+                })
+                .unwrap();
+            });
+            barrier.wait();
+        });
+
+        let loaded = load_network_unlocked(&dir, "homelab").unwrap().unwrap();
+        assert_eq!(
+            loaded.aliases.get("alice").map(String::as_str),
+            Some("id-alice")
+        );
+        assert_eq!(loaded.last_group_hash, Some(blake3::hash(b"latest group")));
+    }
+
+    #[test]
+    fn update_or_insert_uses_initial_only_when_network_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut initial = net("homelab");
+        initial.aliases.insert("local".into(), "first".into());
+
+        update_network_or_insert_in(dir, "homelab", initial, |net| {
+            net.last_group_hash = Some(blake3::hash(b"first group"));
+            Ok(())
+        })
+        .unwrap();
+
+        let mut stale_initial = net("homelab");
+        stale_initial.aliases.insert("local".into(), "stale".into());
+        update_network_or_insert_in(dir, "homelab", stale_initial, |net| {
+            net.my_hostname = Some("latest".into());
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded = load_network_unlocked(dir, "homelab").unwrap().unwrap();
+        assert_eq!(
+            loaded.aliases.get("local").map(String::as_str),
+            Some("first")
+        );
+        assert_eq!(loaded.last_group_hash, Some(blake3::hash(b"first group")));
+        assert_eq!(loaded.my_hostname.as_deref(), Some("latest"));
+    }
+
+    #[test]
+    fn failed_network_update_does_not_persist_partial_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        save_network_unlocked(dir, &net("homelab")).unwrap();
+
+        let result = update_network_in(dir, "homelab", |net| {
+            net.aliases.insert("alice".into(), "id-alice".into());
+            anyhow::bail!("reject update")
+        });
+
+        assert!(result.is_err());
+        assert!(
+            load_network_unlocked(dir, "homelab")
+                .unwrap()
+                .unwrap()
+                .aliases
+                .is_empty()
         );
     }
 
@@ -1898,8 +2130,8 @@ name = "test"
     fn rejects_unsafe_network_names() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        assert!(save_network_in(dir, &net("../escape")).is_err());
-        assert!(load_network_in(dir, "a/b").is_err());
+        assert!(save_network_unlocked(dir, &net("../escape")).is_err());
+        assert!(load_network_unlocked(dir, "a/b").is_err());
     }
 
     #[test]

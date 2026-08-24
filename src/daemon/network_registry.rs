@@ -574,16 +574,7 @@ impl NetworkRegistry {
         let mut net_state =
             self.build_initial_roster(&name, &my_hostname, mode, &net_secret_key, pre_approve)?;
 
-        dns::update_hostname(
-            &self.dns.hostname_table,
-            &self.dns.reverse_table,
-            &name,
-            &my_hostname,
-            derive_ipv6(&self.transport.identity.local_identity()),
-        )
-        .await;
-
-        self.seal_and_publish(&mut net_state, &net_secret_key).await;
+        let last_group_hash = self.seal_group_snapshot(&mut net_state).await?;
 
         let member_entries = to_member_entries(net_state.members.all());
         let approved_entries = to_approved_entries(net_state.approved.all());
@@ -596,6 +587,7 @@ impl NetworkRegistry {
             approved: approved_entries,
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: Some(net_public_key),
+            last_group_hash: Some(last_group_hash),
             transport: None,
             auto_accept_firewall: false,
             // Own-device file offers are auto-accepted by default (identity-checked).
@@ -612,6 +604,16 @@ impl NetworkRegistry {
             exit_allow: vec![],
             exit_node_use: None,
         })?;
+        dns::update_hostname(
+            &self.dns.hostname_table,
+            &self.dns.reverse_table,
+            &name,
+            &my_hostname,
+            derive_ipv6(&self.transport.identity.local_identity()),
+        )
+        .await;
+        self.publish_group_hash(&net_secret_key, last_group_hash)
+            .await;
 
         let cancel = self.shutdown_token.child_token();
         let state = Arc::new(std::sync::RwLock::new(net_state));
@@ -700,6 +702,7 @@ impl NetworkRegistry {
             members: member_list,
             approved,
             snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
             converged_hash: None,
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: net_secret_key.public(),
@@ -716,14 +719,14 @@ impl NetworkRegistry {
         })
     }
 
-    /// Seed a coordinated network's nullifiers from our durable `revoked_devices`,
-    /// refresh its blob snapshot, store the bytes, and publish the signed pkarr
-    /// record. The coordinator-setup counterpart to [`Self::store_and_publish_group`].
-    pub(crate) async fn seal_and_publish(
+    /// Seed a coordinated network's nullifiers from our durable
+    /// `revoked_devices`, refresh its blob snapshot, and durably store the bytes.
+    /// The caller persists the returned hash before publishing it, so a crash can
+    /// never leave the DHT newer than the recovery pointer on disk.
+    pub(crate) async fn seal_group_snapshot(
         &self,
         net_state: &mut NetworkState,
-        net_secret_key: &SecretKey,
-    ) {
+    ) -> Result<blake3::Hash> {
         {
             let cfg = config::load().unwrap_or_default();
             net_state
@@ -731,30 +734,36 @@ impl NetworkRegistry {
                 .extend(config::revoked_device_ids(&cfg));
         }
         net_state.refresh_snapshot();
-        if let Some(snap) = &net_state.snapshot {
-            let _ = self
-                .transport
-                .blob_store
-                .blobs()
-                .add_slice(&snap.msgpack_bytes)
-                .await;
-        }
-        if let Ok(pkarr_client) = dht::create_pkarr_client(&self.transport.endpoint) {
-            let blob_hash = net_state
-                .snapshot
-                .as_ref()
-                .map(|s| s.hash)
-                .expect("snapshot set");
-            if let Err(e) = dht::publish_network(
-                &pkarr_client,
-                net_secret_key,
-                &blob_hash,
-                &[self.transport.endpoint.id()],
-            )
+        let snap = net_state
+            .snapshot
+            .as_ref()
+            .context("group snapshot missing")?;
+        self.transport
+            .blob_store
+            .blobs()
+            .add_slice(&snap.msgpack_bytes)
             .await
-            {
-                tracing::warn!(error = %e, "failed to publish network record");
-            }
+            .context("store complete group snapshot")?;
+        Ok(snap.hash)
+    }
+
+    pub(crate) async fn publish_group_hash(
+        &self,
+        net_secret_key: &SecretKey,
+        blob_hash: blake3::Hash,
+    ) {
+        let Ok(pkarr_client) = dht::create_pkarr_client(&self.transport.endpoint) else {
+            return;
+        };
+        if let Err(e) = dht::publish_network(
+            &pkarr_client,
+            net_secret_key,
+            &blob_hash,
+            &[self.transport.endpoint.id()],
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "failed to publish network record");
         }
     }
 
@@ -779,6 +788,7 @@ impl NetworkRegistry {
                 pkarr_client,
                 net_secret_key.clone(),
                 state.clone(),
+                self.transport.blob_store.clone(),
                 self.transport.endpoint.id(),
                 self.peers.clone(),
                 name.to_string(),
@@ -798,40 +808,17 @@ impl NetworkRegistry {
         tasks
     }
 
-    /// Store a network's current blob snapshot in the blob store and publish the
-    /// signed pkarr record (hash + seed peers). No-op if the network is gone or
-    /// has no snapshot / secret key (only a coordinator holds the key).
+    /// Store a network's current blob snapshot, persist its recovery pointer,
+    /// and wake its single publisher. Publication stays serialized in that task,
+    /// so an older async write can never complete after a newer one.
     pub(crate) async fn store_and_publish_group(&self, network: &str) {
-        let (hash, net_key, snap_bytes) = {
+        let (state, notify) = {
             let Some(handle) = self.networks.get(network) else {
                 return;
             };
-            let s = handle.state.read().unwrap();
-            (
-                s.snapshot.as_ref().map(|x| x.hash),
-                s.network_secret_key.clone(),
-                s.snapshot.as_ref().map(|x| x.msgpack_bytes.clone()),
-            )
+            (handle.state.clone(), handle.dht_notify.clone())
         };
-        if let Some(bytes) = snap_bytes {
-            let _ = self.transport.blob_store.blobs().add_slice(&bytes).await;
-        }
-        if let (Some(hash), Some(key)) = (hash, net_key)
-            && let Ok(client) = dht::create_pkarr_client(&self.transport.endpoint)
-        {
-            let mut seed_peers: Vec<EndpointId> = self
-                .peers
-                .peers_for_network(network)
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect();
-            seed_peers.push(self.transport.endpoint.id());
-            seed_peers.sort_by_key(|id| id.to_string());
-            seed_peers.dedup();
-            if let Err(e) = dht::publish_network(&client, &key, &hash, &seed_peers).await {
-                tracing::warn!(error = %e, "failed to publish network record after accept");
-            }
-        }
+        update_snapshot_and_publish(&state, &self.transport.blob_store, &notify).await;
     }
 
     /// This coordinator's current network record, serialized as a signed pkarr
@@ -841,13 +828,13 @@ impl NetworkRegistry {
     /// snapshot yet. Mirrors the record built by [`Self::store_and_publish_group`];
     /// the receiver verifies it against the network key before trusting it.
     pub(crate) fn current_signed_record(&self, network: &str) -> Option<Vec<u8>> {
-        let (hash, key) = {
+        let hash = config::load_network(network)
+            .ok()
+            .flatten()?
+            .last_group_hash?;
+        let key = {
             let handle = self.networks.get(network)?;
-            let s = handle.state.read().unwrap();
-            (
-                s.snapshot.as_ref().map(|x| x.hash)?,
-                s.network_secret_key.clone()?,
-            )
+            handle.state.read().unwrap().network_secret_key.clone()?
         };
         let mut seed_peers: Vec<EndpointId> = self
             .peers

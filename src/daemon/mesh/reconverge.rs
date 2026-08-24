@@ -201,6 +201,20 @@ pub(crate) async fn fetch_verified_blob(
     None
 }
 
+/// Compute a generation directly from the blob-bearing fields. `snapshot` is a
+/// publication cache and may lag mutations that have not reached
+/// `refresh_snapshot` yet, so it cannot safely guard an in-flight reconverge.
+fn current_group_hash(state: &NetworkState) -> blake3::Hash {
+    group_blob_hash(
+        &state.members,
+        &state.approved,
+        &state.suggested_firewall,
+        state.network_name.as_deref(),
+        &state.reusable_keys,
+        &state.nullifiers,
+    )
+}
+
 /// Reconverge the live network state from the signed pkarr record and apply it
 /// (roster + DNS + suggested firewall). Invoked when a peer sends a `MemberSync`
 /// or `BlobUpdated` *hint*: the hint is only a trigger; the roster/firewall come
@@ -228,7 +242,10 @@ pub(crate) async fn reconverge_and_apply(
         registry,
         ..
     } = ctx;
-    let floor = state.read().unwrap().last_record_timestamp;
+    let (floor, generation) = {
+        let s = state.read().unwrap();
+        (s.last_record_timestamp, current_group_hash(&s))
+    };
     let Some((signed, seeds, record_ts)) = resolve_signed(endpoint, net_pubkey).await else {
         tracing::debug!(network = %network_name, "reconverge: signed record unavailable");
         return;
@@ -289,7 +306,6 @@ pub(crate) async fn reconverge_and_apply(
         tracing::warn!(network = %network_name, "reconverge: could not fetch verified blob");
         return;
     };
-    state.write().unwrap().last_record_timestamp = Some(record_ts);
     // Self-unpair: if our own device cert is nullified in this (verified, signed)
     // blob and the blob is coordinated by our *own* primary, the primary has
     // revoked this device. Tear ourselves out (delete the cert + leave every
@@ -298,20 +314,30 @@ pub(crate) async fn reconverge_and_apply(
     // poller already fetches, so it needs no live mesh link. The
     // own-primary-coordinator gate stops a foreign network's coordinator from
     // forcing a global deauth by listing our key.
-    if let Some(cert) = device_cert
-        && self_is_nullified(cert, &data.members, &data.nullifiers)
-    {
-        tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-        let registry = registry.clone();
-        tokio::spawn(async move {
-            let _ = registry.unpair_self().await;
-        });
-        return;
-    }
+    let self_nullified = device_cert
+        .as_ref()
+        .is_some_and(|cert| self_is_nullified(cert, &data.members, &data.nullifiers));
+    let commit = state.read().unwrap().snapshot_commit.clone();
+    let commit_guard = commit.lock().await;
     // No tiebreak: an address is blake3 of the identity, so two coordinators
     // admitting concurrently cannot produce a roster with duplicate addresses.
+    // Revalidate and replace under one write guard so a mutation cannot land in
+    // the gap and then be overwritten by this fetched state.
     let roster = {
         let mut s = state.write().unwrap();
+        if current_group_hash(&s) != generation {
+            tracing::debug!(network = %network_name, "reconverge: local roster changed while fetching; discarding stale result");
+            return;
+        }
+        if self_nullified {
+            drop(s);
+            tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let _ = registry.unpair_self().await;
+            });
+            return;
+        }
         s.members = MemberList::from_members(data.members.clone());
         s.approved = ApprovedList::from_entries(data.approved.clone());
         s.suggested_firewall = data.suggested_firewall.clone();
@@ -320,8 +346,11 @@ pub(crate) async fn reconverge_and_apply(
         // What the network agreed on, which is not our re-encoding of it unless
         // the publisher writes the same bytes we would. See `converged_hash`.
         s.converged_hash = Some(signed);
+        s.last_record_timestamp = Some(record_ts);
         s.roster()
     };
+    persist_group_hash_locked(state, network_name, signed);
+    drop(commit_guard);
     apply_roster_to_dns(
         &roster,
         network_name,
@@ -517,7 +546,7 @@ pub(crate) async fn apply_roster_to_dns(
         .find(|m| m.identity == my_identity)
         .and_then(|m| m.hostname.clone());
 
-    if let Ok(Some(mut net)) = config::load_network(network_name) {
+    let _ = config::update_network(network_name, |net| {
         match net.pending_hostname.clone() {
             // A locally-requested rename is in flight. Until the blob confirms
             // it, keep showing/persisting the requested name and don't let a
@@ -538,13 +567,11 @@ pub(crate) async fn apply_roster_to_dns(
                 }
                 if net.my_hostname.as_deref() != Some(pending.as_str()) {
                     net.my_hostname = Some(pending);
-                    let _ = config::save_network(&net);
                 }
             }
             // Either the rename landed, or there was none: follow the blob and
             // clear any (now-confirmed) pending intent.
             pending => {
-                let mut dirty = false;
                 if let Some(p) = &pending {
                     tracing::info!(
                         network = %network_name,
@@ -553,20 +580,16 @@ pub(crate) async fn apply_roster_to_dns(
                         "rename confirmed by signed blob; clearing pending intent"
                     );
                     net.pending_hostname = None;
-                    dirty = true;
                 }
                 if let Some(mine) = blob_self.clone()
                     && net.my_hostname.as_deref() != Some(mine.as_str())
                 {
                     net.my_hostname = Some(mine);
-                    dirty = true;
-                }
-                if dirty {
-                    let _ = config::save_network(&net);
                 }
             }
         }
-    }
+        Ok(())
+    });
 
     dns::sync_network_hostnames(hostname_table, reverse_table, network_name, &entries).await;
 }
@@ -669,6 +692,8 @@ pub(crate) enum ReconvergeOutcome {
     Applied,
     /// The blob could not be fetched from any peer or seed; nothing changed.
     Unfetched,
+    /// State changed while the blob was in flight, so its result was discarded.
+    Superseded,
     /// This node is no longer part of the network (kicked, or its own primary
     /// nullified this device). The caller should stop polling this network.
     Departed,
@@ -694,6 +719,7 @@ pub(crate) async fn fetch_and_apply_blob(
     remote_hash: blake3::Hash,
     seed_peers: &[EndpointId],
 ) -> ReconvergeOutcome {
+    let generation = current_group_hash(&state.read().unwrap());
     // Fetch the verified blob from any connected peer *or* the record's seed
     // peers. Including the seeds is essential: a node that has been isolated
     // (e.g. an unpaired device the coordinator already severed) has no connected
@@ -717,45 +743,42 @@ pub(crate) async fn fetch_and_apply_blob(
     // nullifiers (`ray unpair`). Tear ourselves out even though we never
     // received `ControlMsg::Unpaired` (we were offline/severed). Rides the
     // signed blob, so it needs no live mesh link. See `self_is_nullified`.
-    if let Some(cert) = crate::identity::load_device_cert().ok().flatten()
-        && self_is_nullified(&cert, &data.members, &data.nullifiers)
-    {
-        tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
-        let registry = registry.clone();
-        tokio::spawn(async move {
-            let _ = registry.unpair_self().await;
-        });
-        return ReconvergeOutcome::Departed;
-    }
+    let self_nullified = crate::identity::load_device_cert()
+        .ok()
+        .flatten()
+        .is_some_and(|cert| self_is_nullified(&cert, &data.members, &data.nullifiers));
 
-    // Reconcile: find removed peers
-    let old_members: Vec<EndpointId> = {
-        let s = state.read().unwrap();
-        s.members.all().iter().map(|m| m.identity).collect()
-    };
     let new_member_ids: std::collections::HashSet<EndpointId> =
         data.members.iter().map(|m| m.identity).collect();
-
-    for old_id in &old_members {
-        if !new_member_ids.contains(old_id) {
-            let s = state.read().unwrap();
-            if s.members.get(old_id).is_some() {
-                peers.remove(&derive_ipv6(old_id));
-                tracing::info!(peer = %old_id.fmt_short(), "removed kicked peer");
-            }
-        }
-    }
-
     let my_id = endpoint.id();
-    if !new_member_ids.contains(&my_id) && !data.approved.iter().any(|a| a.identity == my_id) {
-        tracing::warn!("we have been removed from the network");
-        return ReconvergeOutcome::Departed;
-    }
+    let self_removed =
+        !new_member_ids.contains(&my_id) && !data.approved.iter().any(|a| a.identity == my_id);
 
-    // Update state and re-materialize suggested firewall rules from the freshly
-    // verified blob. Suggestions ride in the blob, so they are refreshed here.
-    {
+    let commit = state.read().unwrap().snapshot_commit.clone();
+    let commit_guard = commit.lock().await;
+    // Revalidate and replace under one write guard so a mutation cannot land in
+    // the gap and then be overwritten by this fetched state.
+    let old_members: Vec<EndpointId> = {
         let mut s = state.write().unwrap();
+        if current_group_hash(&s) != generation {
+            tracing::debug!(network = %network_name, "reconverge: local roster changed while fetching; discarding stale result");
+            return ReconvergeOutcome::Superseded;
+        }
+        if self_nullified {
+            drop(s);
+            tracing::warn!(network = %network_name, "this device is nullified by its primary in the signed blob; unpairing self");
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let _ = registry.unpair_self().await;
+            });
+            return ReconvergeOutcome::Departed;
+        }
+        if self_removed {
+            drop(s);
+            tracing::warn!("we have been removed from the network");
+            return ReconvergeOutcome::Departed;
+        }
+        let old_members = s.members.all().iter().map(|m| m.identity).collect();
         s.members = MemberList::from_members(data.members.clone());
         s.approved = ApprovedList::from_entries(data.approved.clone());
         s.suggested_firewall = data.suggested_firewall.clone();
@@ -764,7 +787,21 @@ pub(crate) async fn fetch_and_apply_blob(
         // The hash the network agreed on, not our re-encoding of it. See
         // `converged_hash`.
         s.converged_hash = Some(remote_hash);
+        old_members
+    };
+
+    // Reconcile: find removed peers after the state replacement. `old_members`
+    // was captured under the same guard, so each absent id was present in the
+    // generation we just replaced.
+    for old_id in &old_members {
+        if !new_member_ids.contains(old_id) {
+            peers.remove(&derive_ipv6(old_id));
+            tracing::info!(peer = %old_id.fmt_short(), "removed kicked peer");
+        }
     }
+
+    persist_group_hash_locked(state, network_name, remote_hash);
+    drop(commit_guard);
     apply_suggested_firewall(fw, endpoint.id(), network_name, state);
 
     // Exit-node reconciliation. The fresh roster may have wiped our advertised
