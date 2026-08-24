@@ -869,7 +869,7 @@ mod tests {
     /// above it printed carries a completer.
     ///
     /// These are the ids nobody should be retyping (`ray requests <net> accept
-    /// d75a26f3f6`), and an argument that is a bare `String` in the clap model
+    /// a1b2c3d4e5`), and an argument that is a bare `String` in the clap model
     /// looks no different from one that is free-form, so the gap is invisible
     /// until someone presses tab. Named per page rather than derived, because
     /// what makes an argument completable is where its value came from, which
