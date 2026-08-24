@@ -147,6 +147,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Android: `.ray` names now open in Chrome on an IPv4-only network.** The
+  browser showed `DNS_PROBE_FINISHED_NXDOMAIN` for a name that every other app
+  on the phone resolved fine. Chrome only asks for an IPv6 address once it has
+  checked that IPv6 works, by connecting to a fixed global address, and on a
+  Wi-Fi with no IPv6 that check failed. It then asked for an IPv4 address alone,
+  which the mesh does not have and never will, so nothing on the mesh was
+  reachable by name from the browser. The tunnel now carries a route for that
+  check, and only on networks with no IPv6 of their own. Real IPv6 traffic is
+  untouched.
 - **Android: "Send diagnostics" now actually sends the diagnostics.** The button
   reported success and delivered an empty report: the log snapshot, the node
   health block, and the install and transport tags were all attached to the
