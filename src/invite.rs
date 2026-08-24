@@ -17,6 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use iroh::EndpointId;
+
+use crate::groupkey::ReadKey;
 use serde::{Deserialize, Serialize};
 
 /// Length of the random invite secret, in bytes (128 bits).
@@ -122,8 +124,57 @@ fn invite_checksum(payload: &[u8]) -> [u8; CHECKSUM_LEN] {
     out
 }
 
-/// Encode an invite code:
-/// `bs58(network_pubkey(32) || coordinator(32) || secret(16) || checksum(4))`.
+/// Version byte on a share code carrying a roster read key.
+///
+/// The pre-read-key formats had no version byte and were told apart by decoded
+/// length alone. That worked while there were two of them; adding a third (and
+/// wanting room for a fourth) makes the length a bad discriminator, so the new
+/// shapes lead with an explicit one. The legacy lengths keep decoding, so codes
+/// minted by an older build still work.
+const CODE_V1_INVITE: u8 = 0x01;
+const CODE_V1_ROOM: u8 = 0x02;
+
+/// `[0x01] || network(32) || coordinator(32) || read(32) || secret(16) || ck(4)`
+const INVITE_V1_PAYLOAD_LEN: usize = 1 + 32 + 32 + 32 + SECRET_LEN;
+/// `[0x02] || network(32) || read(32) || ck(4)`
+const ROOM_V1_PAYLOAD_LEN: usize = 1 + 32 + 32;
+
+/// What a share code carries. One type for every shape a user can paste into
+/// `ray join`: a bare room id, a legacy invite, or either of the versioned forms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareCode {
+    /// The network public key (room id).
+    pub network: EndpointId,
+    /// Coordinator to dial first. Only an invite names one.
+    pub coordinator: Option<EndpointId>,
+    /// The roster read key. Absent on a bare room id and on the legacy invite
+    /// forms, which is exactly the set of codes for networks whose blob is not
+    /// sealed.
+    pub read_key: Option<ReadKey>,
+    /// Single-use or reusable invite secret to redeem at admission.
+    pub invite_secret: Option<Vec<u8>>,
+}
+
+/// Encode a room code: the network id plus its read key, and nothing else.
+///
+/// This is what `ray create` prints and `ray status` shows: the thing you hand
+/// someone so they can find *and read* the network. It is not a credential, and
+/// on a closed network it still does not admit anybody.
+pub fn encode_room_code(network_pubkey: &EndpointId, read_key: &ReadKey) -> String {
+    let mut bytes = Vec::with_capacity(ROOM_V1_PAYLOAD_LEN + CHECKSUM_LEN);
+    bytes.push(CODE_V1_ROOM);
+    bytes.extend_from_slice(network_pubkey.as_bytes());
+    bytes.extend_from_slice(read_key.as_bytes());
+    bytes.extend_from_slice(&invite_checksum(&bytes));
+    bs58::encode(&bytes).into_string()
+}
+
+/// Encode an invite code.
+///
+/// With a read key: `bs58([0x01] || network(32) || coordinator(32) ||
+/// read(32) || secret(16) || checksum(4))`. Without one (a network that predates
+/// read keys): the original `bs58(network(32) || coordinator(32) || secret(16)
+/// || checksum(4))`, so nothing changes for a network that is not sealed.
 ///
 /// base58 carries no error detection of its own, so the trailing checksum is
 /// what makes a mangled code fail cleanly: without it, dropping a character
@@ -134,49 +185,112 @@ pub fn encode_invite_code(
     network_pubkey: &EndpointId,
     coordinator: &EndpointId,
     secret: &[u8],
+    read_key: Option<&ReadKey>,
 ) -> String {
-    let mut bytes = Vec::with_capacity(PAYLOAD_LEN + CHECKSUM_LEN);
-    bytes.extend_from_slice(network_pubkey.as_bytes());
-    bytes.extend_from_slice(coordinator.as_bytes());
+    let mut bytes = Vec::with_capacity(INVITE_V1_PAYLOAD_LEN + CHECKSUM_LEN);
+    if let Some(rk) = read_key {
+        bytes.push(CODE_V1_INVITE);
+        bytes.extend_from_slice(network_pubkey.as_bytes());
+        bytes.extend_from_slice(coordinator.as_bytes());
+        bytes.extend_from_slice(rk.as_bytes());
+    } else {
+        bytes.extend_from_slice(network_pubkey.as_bytes());
+        bytes.extend_from_slice(coordinator.as_bytes());
+    }
     bytes.extend_from_slice(secret);
     bytes.extend_from_slice(&invite_checksum(&bytes));
     bs58::encode(&bytes).into_string()
 }
 
-/// Decode an invite code into `(network_pubkey, coordinator, secret)`.
+/// Decode anything a user can paste as a network identifier.
 ///
-/// Accepts both the checksummed form and the older unchecksummed one, so codes
-/// minted before the checksum existed (and codes minted by a peer still on an
-/// older build) keep working. A code carrying a checksum must have a correct
-/// one.
-pub fn decode_invite_code(code: &str) -> Result<(EndpointId, EndpointId, Vec<u8>)> {
-    let bytes = bs58::decode(code.trim())
-        .into_vec()
-        .map_err(|e| anyhow::anyhow!("invalid invite code: {e}"))?;
+/// The single entry point for `ray join`'s argument, the mobile `submit_code`,
+/// and the deep-link handler, so the three cannot disagree about what a code
+/// means. Tries, in order: the versioned share codes, the two legacy invite
+/// lengths, then a bare `EndpointId` (hex or base32).
+pub fn decode_share_code(code: &str) -> Result<ShareCode> {
+    let code = code.trim();
+    if let Ok(bytes) = bs58::decode(code).into_vec()
+        && let Some(parsed) = decode_share_bytes(&bytes)?
+    {
+        return Ok(parsed);
+    }
+    // Not a share code, so the last possibility is a bare room id. A network
+    // whose blob is sealed cannot be joined from one, but that is diagnosed
+    // later, against the signed record, where the message can say so.
+    let network = code
+        .parse::<EndpointId>()
+        .map_err(|_| anyhow::anyhow!("not a valid room id, invite code, or share code"))?;
+    Ok(ShareCode {
+        network,
+        coordinator: None,
+        read_key: None,
+        invite_secret: None,
+    })
+}
 
-    let payload = match bytes.len() {
-        PAYLOAD_LEN => &bytes[..],
-        len if len == PAYLOAD_LEN + CHECKSUM_LEN => {
-            let (payload, checksum) = bytes.split_at(PAYLOAD_LEN);
-            if checksum != invite_checksum(payload) {
-                bail!("invalid invite code: checksum mismatch (was it copied in full?)");
-            }
-            payload
+/// The base58 half of [`decode_share_code`]. `Ok(None)` means "these bytes are
+/// not any share-code shape", which is not an error: the caller falls through to
+/// parsing the string as a bare room id. `Err` is reserved for bytes that *are*
+/// a share code and are damaged, so a mistyped code says so rather than being
+/// reported as an unparseable room id.
+fn decode_share_bytes(bytes: &[u8]) -> Result<Option<ShareCode>> {
+    let checked = |payload_len: usize| -> Result<&[u8]> {
+        let (payload, checksum) = bytes.split_at(payload_len);
+        if checksum != invite_checksum(payload) {
+            bail!("invalid code: checksum mismatch (was it copied in full?)");
         }
-        len => bail!(
-            "invalid invite code: expected {} bytes, got {len}",
-            PAYLOAD_LEN + CHECKSUM_LEN,
-        ),
+        Ok(payload)
     };
 
-    let net: [u8; 32] = payload[0..32].try_into().unwrap();
-    let coord: [u8; 32] = payload[32..64].try_into().unwrap();
-    let secret = payload[64..].to_vec();
-    let network_pubkey = EndpointId::from_bytes(&net)
-        .map_err(|e| anyhow::anyhow!("invalid network key in invite: {e}"))?;
-    let coordinator = EndpointId::from_bytes(&coord)
-        .map_err(|e| anyhow::anyhow!("invalid coordinator key in invite: {e}"))?;
-    Ok((network_pubkey, coordinator, secret))
+    match (bytes.len(), bytes.first()) {
+        (len, Some(&CODE_V1_ROOM)) if len == ROOM_V1_PAYLOAD_LEN + CHECKSUM_LEN => {
+            let payload = checked(ROOM_V1_PAYLOAD_LEN)?;
+            Ok(Some(ShareCode {
+                network: endpoint_at(payload, 1, "network")?,
+                coordinator: None,
+                read_key: Some(read_key_at(payload, 33)),
+                invite_secret: None,
+            }))
+        }
+        (len, Some(&CODE_V1_INVITE)) if len == INVITE_V1_PAYLOAD_LEN + CHECKSUM_LEN => {
+            let payload = checked(INVITE_V1_PAYLOAD_LEN)?;
+            Ok(Some(ShareCode {
+                network: endpoint_at(payload, 1, "network")?,
+                coordinator: Some(endpoint_at(payload, 33, "coordinator")?),
+                read_key: Some(read_key_at(payload, 65)),
+                invite_secret: Some(payload[97..].to_vec()),
+            }))
+        }
+        // The two pre-read-key invite forms: unchecksummed, then checksummed.
+        (len, _) if len == PAYLOAD_LEN || len == PAYLOAD_LEN + CHECKSUM_LEN => {
+            let payload = if len == PAYLOAD_LEN {
+                bytes
+            } else {
+                checked(PAYLOAD_LEN)?
+            };
+            Ok(Some(ShareCode {
+                network: endpoint_at(payload, 0, "network")?,
+                coordinator: Some(endpoint_at(payload, 32, "coordinator")?),
+                read_key: None,
+                invite_secret: Some(payload[64..].to_vec()),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn endpoint_at(payload: &[u8], offset: usize, what: &str) -> Result<EndpointId> {
+    let raw: [u8; 32] = payload[offset..offset + 32]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid {what} key in code"))?;
+    EndpointId::from_bytes(&raw).map_err(|e| anyhow::anyhow!("invalid {what} key in code: {e}"))
+}
+
+fn read_key_at(payload: &[u8], offset: usize) -> ReadKey {
+    let mut raw = [0u8; 32];
+    raw.copy_from_slice(&payload[offset..offset + 32]);
+    ReadKey::from_bytes(raw)
 }
 
 impl InviteStore {
@@ -396,23 +510,96 @@ mod tests {
         (InviteStore::with_path(path), dir)
     }
 
+    fn test_read_key(seed: u8) -> ReadKey {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        ReadKey::from_bytes(b)
+    }
+
     #[test]
     fn code_roundtrip() {
         let net = test_id(1);
         let coord = test_id(2);
         let secret = generate_secret();
-        let code = encode_invite_code(&net, &coord, &secret);
-        let (dn, dc, ds) = decode_invite_code(&code).unwrap();
-        assert_eq!(dn, net);
-        assert_eq!(dc, coord);
-        assert_eq!(ds, secret.to_vec());
+        let rk = test_read_key(3);
+        let code = encode_invite_code(&net, &coord, &secret, Some(&rk));
+        let got = decode_share_code(&code).unwrap();
+        assert_eq!(got.network, net);
+        assert_eq!(got.coordinator, Some(coord));
+        assert_eq!(got.invite_secret, Some(secret.to_vec()));
+        assert_eq!(got.read_key, Some(rk));
+    }
+
+    /// A network with no read key still mints the original code shape, so a
+    /// coordinator that has not migrated hands out what it always did.
+    #[test]
+    fn code_without_a_read_key_keeps_the_legacy_shape() {
+        let (net, coord, secret) = (test_id(1), test_id(2), generate_secret());
+        let code = encode_invite_code(&net, &coord, &secret, None);
+        assert_eq!(
+            bs58::decode(&code).into_vec().unwrap().len(),
+            PAYLOAD_LEN + CHECKSUM_LEN
+        );
+        let got = decode_share_code(&code).unwrap();
+        assert_eq!(got.network, net);
+        assert_eq!(got.read_key, None);
+    }
+
+    #[test]
+    fn room_code_roundtrip() {
+        let net = test_id(1);
+        let rk = test_read_key(7);
+        let got = decode_share_code(&encode_room_code(&net, &rk)).unwrap();
+        assert_eq!(got.network, net);
+        assert_eq!(got.read_key, Some(rk));
+        assert_eq!(got.coordinator, None);
+        assert_eq!(got.invite_secret, None);
+    }
+
+    /// A bare room id is a share code with nothing in it but the network, which
+    /// is what keeps a pre-read-key network joinable from the string its owner
+    /// already published.
+    #[test]
+    fn bare_room_id_decodes() {
+        let net = test_id(1);
+        let got = decode_share_code(&net.to_string()).unwrap();
+        assert_eq!(got.network, net);
+        assert_eq!(got.read_key, None);
+        assert_eq!(got.coordinator, None);
+    }
+
+    /// The nasty case for "try base58, else parse as a room id": a room id is 64
+    /// hex characters, and hex that happens to contain none of base58's excluded
+    /// characters (`0`, `O`, `I`, `l`) *is* a valid base58 string. It decodes to
+    /// ~47 bytes, which matches no share-code shape, so the fallback still has to
+    /// be reached. Search for such a key rather than hoping a fixed one has the
+    /// property.
+    #[test]
+    fn a_room_id_that_is_also_valid_base58_still_parses() {
+        let excluded = ['0', 'O', 'I', 'l'];
+        let id = (0u32..20_000)
+            .map(|seed| {
+                let mut b = [0u8; 32];
+                b[..4].copy_from_slice(&seed.to_le_bytes());
+                iroh::SecretKey::from(b).public()
+            })
+            .find(|id| {
+                let hex = id.to_string();
+                !hex.chars().any(|c| excluded.contains(&c)) && bs58::decode(&hex).into_vec().is_ok()
+            })
+            .expect("a 64-char hex id avoiding 0/O/I/l exists well inside this sample");
+
+        let got = decode_share_code(&id.to_string()).unwrap();
+        assert_eq!(got.network, id);
+        assert_eq!(got.read_key, None);
     }
 
     #[test]
     fn decode_rejects_bad_length() {
-        // A 32-byte bs58 string (a bare room id) is not a valid invite.
-        let code = bs58::encode(test_id(1).as_bytes()).into_string();
-        assert!(decode_invite_code(&code).is_err());
+        // Random bytes of no recognised shape are neither a share code nor a
+        // room id.
+        let code = bs58::encode([7u8; 40]).into_string();
+        assert!(decode_share_code(&code).is_err());
     }
 
     /// Codes minted before the checksum was added (and by peers still on an
@@ -426,10 +613,11 @@ mod tests {
         bytes.extend_from_slice(&secret);
         let legacy = bs58::encode(&bytes).into_string();
 
-        let (dn, dc, ds) = decode_invite_code(&legacy).unwrap();
-        assert_eq!(dn, net);
-        assert_eq!(dc, coord);
-        assert_eq!(ds, secret.to_vec());
+        let got = decode_share_code(&legacy).unwrap();
+        assert_eq!(got.network, net);
+        assert_eq!(got.coordinator, Some(coord));
+        assert_eq!(got.invite_secret, Some(secret.to_vec()));
+        assert_eq!(got.read_key, None);
     }
 
     #[test]
@@ -441,7 +629,7 @@ mod tests {
         bytes.extend_from_slice(&secret);
         bytes.extend_from_slice(&[0xff; 4]); // not the real checksum
 
-        let err = decode_invite_code(&bs58::encode(&bytes).into_string()).unwrap_err();
+        let err = decode_share_code(&bs58::encode(&bytes).into_string()).unwrap_err();
         assert!(err.to_string().contains("checksum"), "got: {err}");
     }
 
@@ -452,16 +640,31 @@ mod tests {
     /// four dropped characters shrink the payload by at most three bytes, so
     /// the result can't reach the four-bytes-shorter legacy shape, which is
     /// the one case the decoder still accepts unchecked (see
-    /// [`decode_invite_code`]).
+    /// [`decode_share_code`]).
     #[test]
     fn decode_rejects_truncated_code() {
-        let code = encode_invite_code(&test_id(1), &test_id(2), &generate_secret());
+        let code = encode_invite_code(&test_id(1), &test_id(2), &generate_secret(), None);
         for cut in 1..=4 {
             let truncated = &code[..code.len() - cut];
             assert!(
-                decode_invite_code(truncated).is_err(),
+                decode_share_code(truncated).is_err(),
                 "truncation by {cut} was accepted",
             );
+        }
+    }
+
+    /// The pairing ticket decoder runs first in mobile's `submit_code`, so a
+    /// share code that decoded as one would be routed to the pairing path.
+    #[test]
+    fn share_codes_do_not_collide_with_pairing_tickets() {
+        let rk = test_read_key(5);
+        for code in [
+            encode_room_code(&test_id(1), &rk),
+            encode_invite_code(&test_id(1), &test_id(2), &generate_secret(), Some(&rk)),
+            encode_invite_code(&test_id(1), &test_id(2), &generate_secret(), None),
+        ] {
+            let len = bs58::decode(&code).into_vec().unwrap().len();
+            assert_ne!(len, 64, "{code} is pairing-ticket length");
         }
     }
 

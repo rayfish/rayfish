@@ -91,7 +91,14 @@ pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
         | ControlMsg::SignedRecord { .. } => true,
 
         // Coordinator authority. Each is checked again in its own arm.
-        ControlMsg::MemberApproved { .. }
+        //
+        // `ReadKeyGrant` verifies against the signed record rather than the
+        // sender, so a stranger's copy would be rejected on its own merits; it
+        // sits behind the wall anyway, because a peer we would accept a key from
+        // is by definition one we already share a network with, and there is no
+        // reason to spend a record resolve on anyone else.
+        ControlMsg::ReadKeyGrant { .. }
+        | ControlMsg::MemberApproved { .. }
         | ControlMsg::AdminGrant { .. }
         | ControlMsg::InviteShare { .. }
         | ControlMsg::InviteUsed { .. }
@@ -105,7 +112,12 @@ pub(crate) fn stranger_may_send(msg: &ControlMsg) -> bool {
         ControlMsg::MemberSync | ControlMsg::BlobUpdated => false,
 
         // A member's statements about itself, and its departure.
-        ControlMsg::ExitNodeOffer { .. } | ControlMsg::LeaveNetwork => false,
+        //
+        // `ReadKeyRequest` asks for a roster read capability, so the roster is
+        // exactly the right gate: only a peer already on it may ask.
+        ControlMsg::ExitNodeOffer { .. }
+        | ControlMsg::LeaveNetwork
+        | ControlMsg::ReadKeyRequest => false,
 
         // Connection-level: the demux handles these before it ever resolves a
         // per-network handler, so they never reach this decision. Listed rather
@@ -271,8 +283,35 @@ impl CoordinatorAcceptState {
                     .await;
                 None
             }
+            // A member cannot open our sealed blob and is asking for the key.
+            // The `knows_sender` wall already established it is on this network's
+            // verified roster, which is the whole authorization: a roster member
+            // is exactly who may read the roster.
+            ControlMsg::ReadKeyRequest => {
+                self.answer_read_key_request(peer_id).await;
+                None
+            }
             _ => None,
         }
+    }
+
+    /// Send this network's read key to a member that asked for it.
+    ///
+    /// The member-driven half of the migration: the coordinator's push at
+    /// mint time cannot reach a node that was offline, so the node asks when it
+    /// next sees a `k,` it cannot satisfy.
+    async fn answer_read_key_request(&self, peer_id: EndpointId) {
+        let Some(read_key) = self.state.read().ok().and_then(|s| s.read_key.clone()) else {
+            return;
+        };
+        send_read_key_grant(
+            &self.ctx.peers,
+            self.net_pubkey(),
+            &self.network_name,
+            peer_id,
+            &read_key,
+        )
+        .await;
     }
 
     /// A fresh joiner's `JoinRequest` (or an older client's bare `MeshHello`): gate
@@ -951,6 +990,14 @@ impl MemberAcceptState {
                     .await;
                 None
             }
+            ControlMsg::ReadKeyGrant {
+                network_pubkey,
+                read_key,
+            } => {
+                self.handle_read_key_grant(peer_id, network_pubkey, read_key)
+                    .await;
+                None
+            }
             ControlMsg::InviteShare {
                 id,
                 secret_hash,
@@ -1020,7 +1067,7 @@ impl MemberAcceptState {
             }
         };
         let (remote_hash, seed_peers) = match dht::decode_network_record(&packet) {
-            Ok(r) => r,
+            Ok(r) => (r.blob_hash, r.seed_peers),
             Err(e) => {
                 tracing::warn!(error = %e, "undecodable signed record handed over the mesh");
                 return;
@@ -1143,6 +1190,24 @@ impl MemberAcceptState {
             }
             self.ctx
                 .register_peer_conn(conn, peer_identity, &self.network_name);
+            // Opportunistic half of the read-key migration: a member reconnecting
+            // to a network that started sealing while it was away has no way to
+            // have been handed the key, and this is the first moment we can reach
+            // it. Cheap (32 bytes on a reconnect) and idempotent (the receiver
+            // drops a key it already holds), so it is not worth working out first
+            // whether this particular member needs it. A member we never see
+            // reconnect asks for itself instead (`ControlMsg::ReadKeyRequest`),
+            // which is what actually guarantees convergence.
+            if let Some(read_key) = self.state.read().ok().and_then(|s| s.read_key.clone()) {
+                send_read_key_grant(
+                    &self.ctx.peers,
+                    self.net_pubkey,
+                    &self.network_name,
+                    peer_identity,
+                    &read_key,
+                )
+                .await;
+            }
             return Some(member_ip);
         }
         None
@@ -1228,6 +1293,73 @@ impl MemberAcceptState {
     /// A coordinator granted us the per-network key: verify it targets this
     /// network and is self-authenticating, persist it, take publish capability,
     /// and signal the daemon loop to swap in the coordinator accept handler.
+    /// Adopt a roster read key handed to us by a coordinator.
+    ///
+    /// Verified against the network-key-signed record, never against the sender:
+    /// a symmetric key has no public half to check, so the signed `k,`
+    /// commitment is what stands in for `admin_grant_key_valid`. That also means
+    /// a key we already hold and that already matches is a no-op rather than an
+    /// error, which matters because the push is best-effort and may arrive twice.
+    async fn handle_read_key_grant(
+        &self,
+        peer_id: EndpointId,
+        network_pubkey: EndpointId,
+        read_key: [u8; 32],
+    ) {
+        if network_pubkey != self.net_pubkey {
+            tracing::warn!(peer = %peer_id.fmt_short(), "read key grant for a different network; ignoring");
+            return;
+        }
+        let offered = ReadKey::from_bytes(read_key);
+        if self
+            .state
+            .read()
+            .is_ok_and(|s| s.read_key == Some(offered.clone()))
+        {
+            return;
+        }
+        let Some(commitment) = self.record_read_key_commitment().await else {
+            tracing::warn!(
+                network = %self.network_name,
+                "read key offered but the signed record names none; ignoring"
+            );
+            return;
+        };
+        if offered.commitment() != commitment {
+            tracing::warn!(
+                peer = %peer_id.fmt_short(),
+                network = %self.network_name,
+                "read key does not match the commitment in the signed record; ignoring"
+            );
+            return;
+        }
+        if let Ok(Some(mut net)) = config::load_network(&self.network_name) {
+            net.read_key = Some(offered.clone());
+            let _ = config::save_network(&net);
+        }
+        if let Ok(mut s) = self.state.write() {
+            s.read_key = Some(offered);
+        }
+        tracing::info!(
+            network = %self.network_name,
+            "adopted this network's roster read key"
+        );
+        // We could not read the blob until now, so converge on it immediately
+        // rather than waiting out a poll interval.
+        self.reconverge_notify.notify_one();
+    }
+
+    /// The `k,` commitment in this network's current signed record, if any.
+    async fn record_read_key_commitment(&self) -> Option<blake3::Hash> {
+        let client = dht::create_pkarr_client(&self.endpoint).ok()?;
+        let packet = dht::resolve_network_packet(&client, self.net_pubkey)
+            .await
+            .ok()?;
+        dht::decode_network_record(&packet)
+            .ok()?
+            .read_key_commitment
+    }
+
     async fn handle_admin_grant(
         &self,
         peer_id: EndpointId,
@@ -1668,6 +1800,7 @@ mod direct_grant_tests {
             snapshot: None,
             converged_hash: None,
             network_secret_key: None,
+            read_key: None,
             network_public_key: eid(200),
             network_name: Some("team-alex".to_string()),
             mode: GroupMode::Restricted,

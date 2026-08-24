@@ -39,6 +39,12 @@ pub enum IpcMessage {
         /// Coordinator endpoint id to dial directly when joining via an invite.
         #[serde(default)]
         coordinator: Option<EndpointId>,
+        /// The network's roster read key, split out of the share code by the CLI.
+        /// Raw bytes rather than a typed key because `ray-proto` is shared with
+        /// GUI frontends and holds no crypto types. Travels the same local Unix
+        /// socket as `invite`, and is exactly as sensitive.
+        #[serde(default)]
+        read_key: Option<[u8; 32]>,
         /// Auto-install coordinator-suggested firewall rules on this network
         /// without a manual review queue (`--auto-accept-firewall`).
         #[serde(default, alias = "allow_trusted")]
@@ -386,6 +392,11 @@ pub enum IpcMessage {
         name: String,
         network_key: EndpointId,
         my_ipv6: Ipv6Addr,
+        /// The new network's roster read key, so the CLI can render the share
+        /// code that carries it. Without this the daemon would be the only
+        /// holder and nobody could be invited to read the roster.
+        #[serde(default)]
+        read_key: Option<[u8; 32]>,
     },
     Joined {
         name: String,
@@ -795,6 +806,11 @@ pub struct NetworkStatus {
     pub my_ipv6: Ipv6Addr,
     pub my_hostname: Option<String>,
     pub network_key: Option<String>,
+    /// The code to hand someone so they can join *and read* this network: the
+    /// room id plus the roster read key. `None` on a network with no read key,
+    /// where `network_key` is still the whole story.
+    #[serde(default)]
+    pub share_code: Option<String>,
     pub member_count: usize,
     pub peers: Vec<PeerStatus>,
     /// Suggested firewall rules queued for review on this node for this network
@@ -1360,6 +1376,7 @@ mod tests {
         let resp = IpcMessage::Created {
             name: "test".to_string(),
             network_key: key,
+            read_key: None,
             my_ipv6: Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 5),
         };
         let bytes = rmp_serde::to_vec_named(&resp).unwrap();
@@ -1369,6 +1386,7 @@ mod tests {
                 name,
                 network_key,
                 my_ipv6,
+                ..
             } => {
                 assert_eq!(name, "test");
                 assert_eq!(network_key, key);
@@ -1488,6 +1506,7 @@ mod tests {
         let coord = iroh::SecretKey::generate().public();
         let req = IpcMessage::Join {
             network_key: "abc".to_string(),
+            read_key: None,
             name: None,
             hostname: None,
             transport: None,
@@ -1607,6 +1626,7 @@ mod tests {
                 my_ipv6: Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 5),
                 my_hostname: Some("alice".to_string()),
                 network_key: Some("abc123".to_string()),
+                share_code: None,
                 member_count: 2,
                 peers: vec![PeerStatus {
                     endpoint_id: peer_id,

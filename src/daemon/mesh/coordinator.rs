@@ -146,6 +146,8 @@ impl NetworkRegistry {
                 signed,
                 network,
                 &seeds,
+                net_pubkey,
+                self.network_read_key(network).as_ref(),
             )
             .await
             .is_some_and(|data| {
@@ -790,6 +792,7 @@ mod sender_authority_tests {
             snapshot: None,
             converged_hash: None,
             network_secret_key: None,
+            read_key: None,
             network_public_key: eid(200),
             network_name: Some("test-net".to_string()),
             mode: GroupMode::Restricted,

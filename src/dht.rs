@@ -81,12 +81,21 @@ pub fn encode_network_record(
     key: &SecretKey,
     blob_hash: &blake3::Hash,
     seed_peers: &[EndpointId],
+    read_key_commitment: Option<&blake3::Hash>,
 ) -> Result<SignedPacket> {
     let mut values = vec![
         RECORD_VERSION.to_string(),
         format!("h,{blob_hash}"),
         format!("m,{}", crate::transport::MESH_PROTOCOL_VERSION),
     ];
+    // `k,<blake3(read_key)>`: present iff the group blob is sealed. Two jobs, and
+    // both need it to be in the *signed* record rather than in the blob it
+    // describes. It tells a fetcher the bytes will need opening, before it has
+    // them; and because the network key signed it, a node handed a read key can
+    // check the key against it without trusting whoever handed it over.
+    if let Some(commitment) = read_key_commitment {
+        values.push(format!("k,{commitment}"));
+    }
     for peer in seed_peers {
         values.push(format!("p,{peer}"));
     }
@@ -121,7 +130,18 @@ pub fn verify_network_record(bytes: &[u8], network_pubkey: EndpointId) -> Result
     Ok(packet)
 }
 
-pub fn decode_network_record(packet: &SignedPacket) -> Result<(blake3::Hash, Vec<EndpointId>)> {
+/// What a signed network record says: the blob hash, the seed peers to fetch it
+/// from, and the read-key commitment when the blob is sealed.
+#[derive(Debug, Clone)]
+pub struct NetworkRecord {
+    pub blob_hash: blake3::Hash,
+    pub seed_peers: Vec<EndpointId>,
+    /// `blake3(read_key)`, present iff the blob is sealed. `None` means the
+    /// network predates read keys and publishes plaintext.
+    pub read_key_commitment: Option<blake3::Hash>,
+}
+
+pub fn decode_network_record(packet: &SignedPacket) -> Result<NetworkRecord> {
     let records = packet.txt_records(RECORD_NAME);
     ensure!(!records.is_empty(), "no network records found");
     ensure!(
@@ -132,6 +152,7 @@ pub fn decode_network_record(packet: &SignedPacket) -> Result<(blake3::Hash, Vec
 
     let mut blob_hash = None;
     let mut peers = Vec::new();
+    let mut read_key_commitment = None;
 
     for record in &records[1..] {
         if let Some(hash_str) = record.strip_prefix("h,") {
@@ -146,10 +167,19 @@ pub fn decode_network_record(packet: &SignedPacket) -> Result<(blake3::Hash, Vec
                     .parse::<EndpointId>()
                     .context("invalid peer endpoint ID")?,
             );
+        } else if let Some(k) = record.strip_prefix("k,") {
+            read_key_commitment = Some(
+                k.parse::<blake3::Hash>()
+                    .context("invalid read key commitment")?,
+            );
         }
     }
 
-    Ok((blob_hash.context("missing blob hash (h,)")?, peers))
+    Ok(NetworkRecord {
+        blob_hash: blob_hash.context("missing blob hash (h,)")?,
+        seed_peers: peers,
+        read_key_commitment,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -196,8 +226,9 @@ pub async fn publish_network(
     key: &SecretKey,
     blob_hash: &blake3::Hash,
     seed_peers: &[EndpointId],
+    read_key_commitment: Option<&blake3::Hash>,
 ) -> Result<()> {
-    let packet = encode_network_record(key, blob_hash, seed_peers)?;
+    let packet = encode_network_record(key, blob_hash, seed_peers, read_key_commitment)?;
     client
         .publish(&packet)
         .await
@@ -230,7 +261,7 @@ pub async fn resolve_network_packet(
 pub async fn resolve_network(
     client: &PkarrRelayClient,
     network_pubkey: EndpointId,
-) -> Result<(blake3::Hash, Vec<EndpointId>)> {
+) -> Result<NetworkRecord> {
     let packet = resolve_network_packet(client, network_pubkey).await?;
     decode_network_record(&packet)
 }
@@ -285,34 +316,35 @@ mod tests {
             SecretKey::generate().public(),
             SecretKey::generate().public(),
         ];
-        let packet = encode_network_record(&key, &hash, &peers).unwrap();
-        let (decoded_hash, decoded_peers) = decode_network_record(&packet).unwrap();
-        assert_eq!(decoded_hash, hash);
-        assert_eq!(decoded_peers, peers);
+        let packet = encode_network_record(&key, &hash, &peers, None).unwrap();
+        let decoded = decode_network_record(&packet).unwrap();
+        assert_eq!(decoded.blob_hash, hash);
+        assert_eq!(decoded.seed_peers, peers);
+        assert_eq!(decoded.read_key_commitment, None);
     }
 
     #[test]
     fn network_record_empty_peers() {
         let key = SecretKey::generate();
         let hash = blake3::hash(b"test");
-        let packet = encode_network_record(&key, &hash, &[]).unwrap();
-        let (decoded_hash, decoded_peers) = decode_network_record(&packet).unwrap();
-        assert_eq!(decoded_hash, hash);
-        assert!(decoded_peers.is_empty());
+        let packet = encode_network_record(&key, &hash, &[], None).unwrap();
+        let decoded = decode_network_record(&packet).unwrap();
+        assert_eq!(decoded.blob_hash, hash);
+        assert!(decoded.seed_peers.is_empty());
     }
 
     #[test]
     fn network_record_carries_mesh_version() {
         let key = SecretKey::generate();
         let hash = blake3::hash(b"test");
-        let packet = encode_network_record(&key, &hash, &[]).unwrap();
+        let packet = encode_network_record(&key, &hash, &[], None).unwrap();
         // A fresh record advertises this build's mesh protocol version, and the
         // standard hash/peers decode is unaffected by the added field.
         assert_eq!(
             mesh_version_from_record(&packet),
             Some(crate::transport::MESH_PROTOCOL_VERSION)
         );
-        assert_eq!(decode_network_record(&packet).unwrap().0, hash);
+        assert_eq!(decode_network_record(&packet).unwrap().blob_hash, hash);
     }
 
     #[test]
@@ -330,22 +362,22 @@ mod tests {
         let key = SecretKey::generate();
         let hash = blake3::hash(b"test");
         let peer = SecretKey::generate().public();
-        let bytes = encode_network_record(&key, &hash, &[peer])
+        let bytes = encode_network_record(&key, &hash, &[peer], None)
             .unwrap()
             .as_bytes()
             .to_vec();
         // Correct key: verifies and decodes to the same hash + seeds.
         let packet = verify_network_record(&bytes, key.public()).unwrap();
-        let (got_hash, got_peers) = decode_network_record(&packet).unwrap();
-        assert_eq!(got_hash, hash);
-        assert_eq!(got_peers, vec![peer]);
+        let decoded = decode_network_record(&packet).unwrap();
+        assert_eq!(decoded.blob_hash, hash);
+        assert_eq!(decoded.seed_peers, vec![peer]);
     }
 
     #[test]
     fn verify_network_record_rejects_wrong_key() {
         let key = SecretKey::generate();
         let hash = blake3::hash(b"test");
-        let bytes = encode_network_record(&key, &hash, &[])
+        let bytes = encode_network_record(&key, &hash, &[], None)
             .unwrap()
             .as_bytes()
             .to_vec();
@@ -365,7 +397,7 @@ mod tests {
     fn record_version_check() {
         let key = SecretKey::generate();
         let hash = blake3::hash(b"test");
-        let packet = encode_network_record(&key, &hash, &[]).unwrap();
+        let packet = encode_network_record(&key, &hash, &[], None).unwrap();
         let records = packet.txt_records("_rayfish");
         assert_eq!(records[0], "v1");
     }

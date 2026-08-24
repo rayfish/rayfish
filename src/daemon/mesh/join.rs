@@ -61,6 +61,10 @@ pub(crate) struct JoinParams {
     /// From the fetched blob: reusable join keys, so this node can validate
     /// redemptions if it later holds the network key (HA admission).
     pub(crate) reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
+    /// The roster read key this network's blob is sealed under. Persisted with
+    /// the network so a cold restore, which has no code and no `Welcome` to be
+    /// handed one by, can still open the blob.
+    pub(crate) read_key: Option<ReadKey>,
     /// Consent: auto-install suggested rules without a manual review queue.
     pub(crate) auto_accept_firewall: bool,
     /// Seed for per-network auto-accept of file offers from own devices
@@ -110,6 +114,7 @@ pub(crate) async fn join_mesh_shared(
         invite_secret,
         suggested_firewall,
         reusable_keys,
+        read_key,
         auto_accept_firewall,
         auto_accept_files,
         initial,
@@ -128,6 +133,7 @@ pub(crate) async fn join_mesh_shared(
         invite_secret,
         &my_hostname,
         &device_cert,
+        read_key.as_ref(),
     )
     .await?
     {
@@ -155,6 +161,7 @@ pub(crate) async fn join_mesh_shared(
         auto_accept_firewall,
         auto_accept_files,
         direct_key.as_ref(),
+        read_key.as_ref(),
     )?;
 
     let remote_id = initial_conn.remote_id();
@@ -168,6 +175,7 @@ pub(crate) async fn join_mesh_shared(
         reusable_keys,
         &blob_store,
         direct_key.as_ref(),
+        read_key.clone(),
         record_ts,
     )
     .await;
@@ -277,6 +285,10 @@ fn persist_join_config(
     // network key so we survive a restart as a key-holder (a plain member persists
     // `None`).
     direct_key: Option<&SecretKey>,
+    // From the share code on a fresh join, or from config on a reconnect. Falls
+    // back to whatever is already persisted, so a reconnect (which is handed no
+    // code) never erases it.
+    read_key: Option<&ReadKey>,
 ) -> Result<()> {
     let persisted_hostname = members
         .iter()
@@ -302,9 +314,13 @@ fn persist_join_config(
             )
         })
         .unwrap_or((false, None, None, vec![], BTreeMap::new(), false));
-    let (exit_allow, exit_node_use) = prev
-        .map(|n| (n.exit_allow, n.exit_node_use))
-        .unwrap_or((vec![], None));
+    let (exit_allow, exit_node_use, prev_read_key) = prev
+        .map(|n| (n.exit_allow, n.exit_node_use, n.read_key))
+        .unwrap_or((vec![], None, None));
+    // A reconnect/restore arrives with no share code, so the persisted key is the
+    // only copy; a fresh join brings one and it wins. Getting this backwards is
+    // how the network would become unreadable on the second daemon start.
+    let read_key = read_key.cloned().or(prev_read_key);
     // The toggle command (`ray files auto-accept`) is authoritative, so preserve
     // a previously-persisted value; the join-time `--auto-accept-files` seed only
     // needs to take effect on the first join (no prior config).
@@ -318,6 +334,7 @@ fn persist_join_config(
         approved: to_approved_entries(approved.iter()),
         network_secret_key: direct_key.cloned(),
         network_public_key: Some(net_pubkey),
+        read_key,
         transport: None,
         auto_accept_firewall,
         auto_accept_files,
@@ -348,6 +365,7 @@ async fn build_member_state(
     // state with the network key so `finalize_join` registers us as a coordinator
     // (starts a publisher, admits future peers). `None` for a plain member.
     direct_key: Option<&SecretKey>,
+    read_key: Option<ReadKey>,
     // Replay floor seeded from the record this roster came out of, if any.
     record_ts: Option<u64>,
 ) -> SharedNetworkState {
@@ -357,6 +375,7 @@ async fn build_member_state(
         snapshot: None,
         converged_hash: None,
         network_secret_key: direct_key.cloned(),
+        read_key,
         network_public_key: net_pubkey,
         network_name: Some(network_name.to_string()),
         mode: GroupMode::Restricted,
@@ -443,6 +462,7 @@ async fn perform_join_handshake(
     invite_secret: Option<Vec<u8>>,
     my_hostname: &Option<String>,
     device_cert: &Option<control::DeviceCert>,
+    read_key: Option<&ReadKey>,
 ) -> Result<HandshakeOutcome> {
     if initial {
         let (mut send, mut recv) = initial_conn
@@ -522,7 +542,17 @@ async fn perform_join_handshake(
         // carries no record, hence no floor.
         let (members, approved, record_ts) = match resolve_signed(ep, net_pubkey).await {
             Some((signed, seeds, ts)) => {
-                match fetch_verified_blob(ep, blob_store, peers, signed, network_name, &seeds).await
+                match fetch_verified_blob(
+                    ep,
+                    blob_store,
+                    peers,
+                    signed,
+                    network_name,
+                    &seeds,
+                    net_pubkey,
+                    read_key,
+                )
+                .await
                 {
                     Some(data) => (data.members, data.approved, Some(ts)),
                     None => (persisted_roster(network_name), vec![], None),
@@ -667,6 +697,7 @@ mod persist_config_tests {
             approved: vec![],
             network_secret_key: None,
             network_public_key: Some(net_pubkey),
+            read_key: None,
             transport: None,
             auto_accept_firewall: false,
             auto_accept_files: false,
@@ -693,6 +724,7 @@ mod persist_config_tests {
             false,
             false,
             None,
+            None,
         )
         .unwrap();
 
@@ -706,6 +738,109 @@ mod persist_config_tests {
             after.exit_node_use,
             Some(exit_peer),
             "selected exit peer must survive a reconnect"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RAYFISH_CONFIG_DIR", v),
+                None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+            }
+        }
+    }
+
+    /// A reconnect is handed no share code, so the persisted read key is the
+    /// only copy in existence. If `persist_join_config` dropped it the way it
+    /// once dropped the exit policy, the network would seal itself shut on the
+    /// second daemon start: the blob would still fetch and would no longer open.
+    #[test]
+    fn reconnect_preserves_the_roster_read_key() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("RAYFISH_CONFIG_DIR");
+        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", tmp.path()) };
+
+        let net_pubkey = id(1);
+        let me = id(2);
+        let read_key = ReadKey::from_bytes([9u8; 32]);
+
+        config::save_network(&NetworkConfig {
+            name: "homelab".to_string(),
+            group_mode: GroupMode::Restricted,
+            my_hostname: Some("umbrel".to_string()),
+            network_public_key: Some(net_pubkey),
+            read_key: Some(read_key.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Reconnect: no code, so `read_key` arrives as `None`.
+        persist_join_config(
+            "homelab",
+            &[member(2, false)],
+            &[],
+            me,
+            net_pubkey,
+            &Some("umbrel".to_string()),
+            false,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config::load_network("homelab").unwrap().unwrap().read_key,
+            Some(read_key),
+            "the read key must survive a reconnect that carries no code"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RAYFISH_CONFIG_DIR", v),
+                None => std::env::remove_var("RAYFISH_CONFIG_DIR"),
+            }
+        }
+    }
+
+    /// The other direction: a fresh join brings a key in its code, and that one
+    /// wins over whatever a stale config still holds.
+    #[test]
+    fn a_fresh_join_adopts_the_key_from_its_code() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("RAYFISH_CONFIG_DIR");
+        unsafe { std::env::set_var("RAYFISH_CONFIG_DIR", tmp.path()) };
+
+        let net_pubkey = id(1);
+        let me = id(2);
+        let stale = ReadKey::from_bytes([1u8; 32]);
+        let fresh = ReadKey::from_bytes([2u8; 32]);
+
+        config::save_network(&NetworkConfig {
+            name: "homelab".to_string(),
+            network_public_key: Some(net_pubkey),
+            read_key: Some(stale),
+            ..Default::default()
+        })
+        .unwrap();
+
+        persist_join_config(
+            "homelab",
+            &[member(2, false)],
+            &[],
+            me,
+            net_pubkey,
+            &None,
+            false,
+            false,
+            None,
+            Some(&fresh),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config::load_network("homelab").unwrap().unwrap().read_key,
+            Some(fresh)
         );
 
         unsafe {

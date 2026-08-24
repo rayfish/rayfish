@@ -492,8 +492,10 @@ fn print_network(net: &ipc::NetworkStatus) {
     }
 
     // join code. Direct (`ray connect`) networks have no shareable room id, so
-    // the join code is suppressed for them.
-    if let Some(ref key) = net.network_key
+    // the join code is suppressed for them. Prefer the share code: on a network
+    // with a read key the bare room id no longer opens the roster, so printing
+    // it here would hand out something that does not work.
+    if let Some(key) = net.share_code.as_ref().or(net.network_key.as_ref())
         && !net.role.is_direct()
     {
         println!("    {} {}", style::label("join"), style::rose(key));
@@ -984,6 +986,7 @@ mod grouping_tests {
 
     fn net(my_hostname: &str, peers: Vec<ipc::PeerStatus>) -> ipc::NetworkStatus {
         ipc::NetworkStatus {
+            share_code: None,
             name: "n".to_string(),
             role: ipc::NetworkRole::Coordinator,
             my_ipv6: "200::1".parse().unwrap(),

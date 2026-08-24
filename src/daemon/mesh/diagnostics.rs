@@ -137,6 +137,7 @@ impl Daemon {
             })
         };
 
+        let share_code = h.state.read().ok().and_then(|s| s.read_key.clone());
         let (members, member_count, pending_suggestions, pending_requests) = {
             let s = match h.state.read() {
                 Ok(s) => s,
@@ -147,6 +148,9 @@ impl Daemon {
                         my_ipv6: derive_ipv6(&my_id),
                         my_hostname: None,
                         network_key: Some(h.network_key.to_string()),
+                        // The state lock is poisoned, so the read key is out of
+                        // reach; the room id alone is the honest answer here.
+                        share_code: None,
                         member_count: 0,
                         peers: vec![],
                         pending_suggestions: 0,
@@ -251,6 +255,9 @@ impl Daemon {
             my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
             my_hostname: lookup_hostname(self.transport.identity.local_identity()),
             network_key: Some(h.network_key.to_string()),
+            share_code: share_code
+                .as_ref()
+                .map(|rk| crate::invite::encode_room_code(&h.network_key, rk)),
             member_count,
             peers,
             pending_suggestions,
