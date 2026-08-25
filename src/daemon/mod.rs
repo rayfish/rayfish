@@ -2018,9 +2018,21 @@ fn create_bundle_file(path: &Path, owner: Option<&ReportRequester>) -> std::io::
     crate::windows_security::create_report_file(path, Some(sid)).map_err(to_io)
 }
 
+/// Flatten back to an `io::Error` **keeping the kind**. `create_report_bundle`
+/// retries on `AlreadyExists` to survive a name collision, and it can only see
+/// one if the kind survives the trip through `anyhow`; `io::Error::other` would
+/// make every collision look like a hard failure and end the loop on its first
+/// iteration.
 #[cfg(windows)]
 fn to_io(error: anyhow::Error) -> std::io::Error {
-    std::io::Error::other(format!("{error:#}"))
+    let kind = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::kind);
+    match kind {
+        Some(kind) => std::io::Error::new(kind, format!("{error:#}")),
+        None => std::io::Error::other(format!("{error:#}")),
+    }
 }
 
 /// Open the finished bundle to whoever asked for it.
@@ -2076,27 +2088,59 @@ fn hand_bundle_to_requester(_file: &File, _owner: Option<&ReportRequester>) -> s
 /// `/tmp` is world-writable and this runs as root, so the unlink is deliberately
 /// narrow: `symlink_metadata` does not follow a planted link, and only a regular
 /// file owned by the same uid whose name matches the bundle pattern is removed.
+/// A short, stable tag naming the principal a bundle belongs to, so the sweep
+/// can pick out this caller's own without reading an owner back off the disk.
+#[cfg(unix)]
+fn requester_tag(owner: Option<&ReportRequester>) -> String {
+    let uid = match owner {
+        Some(ReportRequester::Unix { uid, .. }) => *uid,
+        None => unsafe { libc::geteuid() },
+    };
+    format!("u{uid}")
+}
+
+/// The Windows counterpart. A hash of the SID rather than the SID itself: the
+/// daemon's temp directory is `C:\Windows\Temp`, which any local account may
+/// list, and who has run `ray report` is not their business. Truncating to 8
+/// bytes is fine for telling a handful of local principals apart; a collision
+/// costs one lost bundle, not access to one.
+#[cfg(windows)]
+fn requester_tag(owner: Option<&ReportRequester>) -> String {
+    use sha2::{Digest, Sha256};
+
+    let sid = match owner {
+        Some(ReportRequester::Windows { sid }) => sid.as_str(),
+        None => "",
+    };
+    format!("s{}", hex::encode(&Sha256::digest(sid.as_bytes())[..8]))
+}
+
 /// A reader holding one open keeps it until they close it.
 fn sweep_prior_bundles(dir: &Path, owner: Option<&ReportRequester>) {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
 
-    // Only this caller's own bundles. On Unix that is a uid comparison, and the
-    // daemon's own euid when the caller is unidentified.
+    // Only this caller's own bundles, matched by the tag their names carry.
+    // The pipe DACL limits `Report` to LocalSystem, Administrators and the
+    // operator, but that is still more than one principal, and
+    // `create_report_file` grants read to exactly one of them per bundle. An
+    // administrator running `ray report` must not unlink the bundle the daemon
+    // just handed the operator and that they have not opened yet.
+    let prefix = format!("rayfish-report-{}-", requester_tag(owner));
+    // On Unix the name is a hint and the uid below is the decision, since `/tmp`
+    // lets any account create a file with any name in it.
     #[cfg(unix)]
     let uid = match owner {
         Some(ReportRequester::Unix { uid, .. }) => *uid,
         None => unsafe { libc::geteuid() },
     };
-    #[cfg(windows)]
-    let _ = owner;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.starts_with("rayfish-report-") || !name.ends_with(".tgz") {
+        if !name.starts_with(&prefix) || !name.ends_with(".tgz") {
             continue;
         }
         let path = entry.path();
@@ -2106,12 +2150,10 @@ fn sweep_prior_bundles(dir: &Path, owner: Option<&ReportRequester>) {
         if !md.is_file() {
             continue;
         }
-        // `std::fs::Metadata` carries no owner on Windows, and reading one back
-        // would mean a `GetSecurityInfo` round trip per entry. It is not needed:
-        // every bundle in this directory was written by this daemon for a caller
-        // the pipe DACL already limits to Administrators and the operator, so
-        // there is no other account's file here to protect. A bundle someone
-        // still has open refuses to be deleted, and the next sweep gets it.
+        // `std::fs::Metadata` carries no owner on Windows, so there is no second
+        // check to make there: the tag in the name is the whole scoping, which
+        // is why it has to be in the name. A bundle someone still has open
+        // refuses to be deleted, and the next sweep gets it.
         #[cfg(unix)]
         if md.uid() != uid {
             continue;
@@ -2128,13 +2170,16 @@ fn create_report_bundle(
 ) -> std::io::Result<PathBuf> {
     // Reclaim the caller's previous bundles first; the new one replaces them.
     sweep_prior_bundles(dir, owner);
+    // The tag is what makes the sweep above find this caller's bundles and only
+    // this caller's, so it has to go in every name the sweep is meant to match.
+    let tag = requester_tag(owner);
     for _ in 0..16 {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let nonce: u64 = rand::random();
-        let path = dir.join(format!("rayfish-report-{timestamp}-{nonce:016x}.tgz"));
+        let path = dir.join(format!("rayfish-report-{tag}-{timestamp}-{nonce:016x}.tgz"));
         match write_bundle(&path, files, owner) {
             Ok(()) => return Ok(path),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -2300,7 +2345,24 @@ async fn broadcast_control_msg(
 
 #[cfg(test)]
 mod report_tests {
-    use super::{ReportRequester, collect_recent_logs, sweep_prior_bundles};
+    use super::{ReportRequester, collect_recent_logs, requester_tag, sweep_prior_bundles};
+
+    /// Some principal that is not this process, for asserting the sweep leaves
+    /// other people's bundles alone.
+    #[cfg(unix)]
+    fn other_requester() -> ReportRequester {
+        ReportRequester::Unix {
+            uid: unsafe { libc::geteuid() } ^ 1,
+            gid: unsafe { libc::getegid() },
+        }
+    }
+
+    #[cfg(windows)]
+    fn other_requester() -> ReportRequester {
+        ReportRequester::Windows {
+            sid: "S-1-5-21-0-0-0-4242".to_owned(),
+        }
+    }
 
     /// The identity a bundle is written for, so the sweep that reclaims it is
     /// scoped to a caller this process can actually stand in for.
@@ -2331,14 +2393,26 @@ mod report_tests {
     #[test]
     fn the_sweep_reclaims_the_requesters_earlier_bundles() {
         let dir = tempfile::tempdir().unwrap();
-        let stale = dir.path().join("rayfish-report-1-aaaaaaaaaaaaaaaa.tgz");
+        let bundle = |who: &ReportRequester, nonce: &str| {
+            dir.path().join(format!(
+                "rayfish-report-{}-1-{nonce}.tgz",
+                requester_tag(Some(who))
+            ))
+        };
+        let stale = bundle(&current_requester(), "aaaaaaaaaaaaaaaa");
+        // Another principal the pipe DACL also admits. On Windows the tag is the
+        // only thing keeping this file: both bundles are the test process's own,
+        // so no ownership check can tell them apart there.
+        let theirs = bundle(&other_requester(), "bbbbbbbbbbbbbbbb");
         let unrelated = dir.path().join("someone-elses.tgz");
         std::fs::write(&stale, b"old bundle").unwrap();
+        std::fs::write(&theirs, b"not the caller's").unwrap();
         std::fs::write(&unrelated, b"not ours").unwrap();
 
         sweep_prior_bundles(dir.path(), Some(&current_requester()));
 
         assert!(!stale.exists(), "the caller's previous bundle was kept");
+        assert!(theirs.exists(), "another principal's bundle was deleted");
         assert!(unrelated.exists(), "an unrelated file was deleted");
     }
 
@@ -2478,10 +2552,18 @@ mod report_permission_tests {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
-        let stale = dir.path().join("rayfish-report-1-aaaaaaaaaaaaaaaa.tgz");
+        // Both names carry the caller's own tag, so the sweep treats them as
+        // candidates and the symlink below is actually tested rather than
+        // filtered out by the name before it gets there.
+        let tag = super::requester_tag(Some(&current_requester()));
+        let stale = dir
+            .path()
+            .join(format!("rayfish-report-{tag}-1-aaaaaaaaaaaaaaaa.tgz"));
         let unrelated = dir.path().join("someone-elses.tgz");
         let victim = dir.path().join("victim");
-        let planted = dir.path().join("rayfish-report-2-bbbbbbbbbbbbbbbb.tgz");
+        let planted = dir
+            .path()
+            .join(format!("rayfish-report-{tag}-2-bbbbbbbbbbbbbbbb.tgz"));
         std::fs::write(&stale, b"old bundle").unwrap();
         std::fs::write(&unrelated, b"not ours").unwrap();
         std::fs::write(&victim, b"do not delete").unwrap();
