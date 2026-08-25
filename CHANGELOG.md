@@ -181,6 +181,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Tab completion works on Debian and Ubuntu.** The zsh stub was installed to
+  `/usr/share/zsh/site-functions`, which Arch and Fedora search but Debian and
+  Ubuntu do not: those build zsh with its site directory under `/usr/local` and
+  give packages `/usr/share/zsh/vendor-completions`. The file was written, the
+  install reported success, and pressing tab did nothing, with nothing anywhere
+  saying why. The install now reads the real `fpath` off the zsh on the box
+  instead of assuming one path fits every distribution, and a stub an earlier
+  version left somewhere zsh ignores is cleared out by the next `sudo ray up`
+  or `ray update`. Installing for one user (`ray completions zsh --install`)
+  writes to a directory no zsh searches by default, so it now checks and says
+  so, with the two lines to add to `~/.zshrc`, rather than leaving it to be
+  discovered by pressing tab.
 - **Two settings changed at the same moment no longer undo each other.** Every
   writer of `settings.toml` read the whole file, changed its one field and wrote
   the whole file back, so a setting saved while another was in flight was
