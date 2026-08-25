@@ -88,6 +88,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   longer has to be retyped. `ray requests <net>` joins the other listings in
   being readable by any local user, so the tab answers without sudo; admitting
   still needs root or the operator.
+- **Windows x64 support.** Rayfish installs from an MSI as a LocalSystem
+  service and runs the same commands as on Linux and macOS. IPC is a named pipe
+  authorized by Windows SID, the tunnel is Wintun (pinned and signature-checked
+  at build time), and routes, DNS and search domains are set up on the Rayfish
+  adapter only, leaving the rest of the machine's configuration alone. `ray
+  update` upgrades in place through the MSI. Three gaps in this first port:
+  `ray firewall ssh` is not available on Windows, tab completion installs for
+  the current user rather than machine-wide because no shell there has a
+  directory every user's shell already searches, and the MSI is not yet
+  code-signed, so the first install goes through a SmartScreen warning.
 
 ### Changed
 
@@ -618,15 +628,6 @@ this build cannot be redeemed by a peer still on 0.2.x.
   recognised, the error now tells you to run `sudo ray daemon` directly instead
   of leaving you to guess. Under SysV init nothing supervises the daemon, so
   `ray up` says so: a crash stays down until the next `ray start`.
-
-- **Windows x64 support.** Rayfish installs from an MSI as a LocalSystem
-  service and runs the same commands as on Linux and macOS. IPC is a named pipe
-  authorized by Windows SID, the tunnel is Wintun (pinned and signature-checked
-  at build time), and routes, DNS and search domains are set up on the Rayfish
-  adapter only, leaving the rest of the machine's configuration alone. `ray
-  update` upgrades in place through the MSI. Two gaps in this first port: `ray
-  firewall ssh` is not available on Windows, and the MSI is not yet
-  code-signed, so the first install goes through a SmartScreen warning.
 
 - **Android: toggle the tunnel from quick settings.** Rayfish now offers a
   quick settings tile, so the tunnel goes on and off from the shade without
