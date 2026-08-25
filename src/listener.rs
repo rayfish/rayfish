@@ -24,8 +24,14 @@ pub(crate) fn bind_listener(ip: IpAddr, port: u16) -> Result<TcpListener> {
     };
     let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     sock.set_reuse_address(true)?;
-    // No SO_REUSEPORT on Windows, and SO_REUSEADDR there already means what
-    // this pair means on Unix: a second bind on the same address succeeds.
+    // Unix only, and deliberately not "because Windows has no SO_REUSEPORT".
+    // Windows spells SO_REUSEADDR differently enough to matter: it lets *any*
+    // process, including one running as another unprivileged user, bind the
+    // same address and take delivery. The Unix pair is a coexistence primitive;
+    // the Windows option is a hijack primitive, which is why SO_EXCLUSIVEADDRUSE
+    // exists. Nothing binds through here on Windows today (`v4bridge` has no
+    // port enumeration there), so the first caller that does needs to set
+    // SO_EXCLUSIVEADDRUSE by hand: socket2 0.6 does not expose it.
     #[cfg(unix)]
     sock.set_reuse_port(true)?;
     sock.set_nonblocking(true)?;

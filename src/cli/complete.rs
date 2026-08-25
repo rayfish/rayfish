@@ -901,7 +901,7 @@ fn uninstall_system_under(root: &Path) {
 /// a read-only `/usr` or a distro with no `bash-completion` must not turn a
 /// working service install into a failure.
 pub(crate) fn install_with_service() {
-    if !is_root() {
+    if !HAS_SYSTEM_DIRS || !is_root() {
         return;
     }
     let written = install_system();
