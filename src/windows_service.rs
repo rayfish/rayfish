@@ -212,16 +212,22 @@ fn run_service() -> windows_service::Result<()> {
         _ => ServiceControlHandlerResult::NotImplemented,
     };
     let handle = service_control_handler::register(SERVICE_NAME, handler)?;
+    status(&handle, ServiceState::Running)?;
     // [`failure_actions`] is the only description of the restart policy, and
     // this is the only place that runs on every way the service can be
     // installed. The MSI's `ServiceInstall` never calls `install`, so applying
     // it there as well would either leave an MSI-installed service with no
     // policy or give the two installation paths different ones. Best-effort: a
     // service that cannot configure its own restarts should still start.
+    //
+    // After the Running report rather than before it: this makes three blocking
+    // SCM calls about our own service, and the MSI starts us with `Wait="yes"`,
+    // so the SCM sits inside `StartService` on this service while we call back
+    // into it. The policy is only read on the next failure, so nothing wants it
+    // any sooner, and this way none of it is charged against the start timeout.
     if let Err(error) = apply_own_failure_actions() {
         tracing::warn!(%error, "could not configure the service restart policy");
     }
-    status(&handle, ServiceState::Running)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -270,13 +276,17 @@ fn start_transition(state: ServiceState) -> StartTransition {
 /// MSI installs the service itself and never runs `ray install`.
 fn apply_own_failure_actions() -> Result<()> {
     let scm = manager(ServiceManagerAccess::CONNECT)?;
-    // `update_failure_actions` needs CHANGE_CONFIG, and the SCM requires
-    // QUERY_CONFIG alongside it for the failure-action calls specifically.
-    // Nothing here starts or stops anything, so it asks for no more than that.
+    // START looks wrong here and is not: `ChangeServiceConfig2` requires it
+    // whenever the actions being set include SC_ACTION_RESTART, because that is
+    // the SCM asking whether this handle could start the service it is about to
+    // promise to restart. [`failure_actions`] is three Restart entries, so the
+    // rule applies. Without it the call fails ACCESS_DENIED and the policy is
+    // silently never applied. QUERY_CONFIG is not needed: both calls below go
+    // to `ChangeServiceConfig2` and neither reads the config back.
     let service = scm
         .open_service(
             SERVICE_NAME,
-            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG,
+            ServiceAccess::START | ServiceAccess::CHANGE_CONFIG,
         )
         .context("open the rayfish service to configure its restart policy")?;
     configure_failure_actions(&service)
