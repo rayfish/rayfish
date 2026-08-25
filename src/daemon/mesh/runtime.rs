@@ -965,6 +965,30 @@ impl Daemon {
         crate::forward::set_ssh_nat_active(true);
     }
 
+    /// Start the IPv4 listener bridge, if not already running. Idempotent.
+    /// Bound to the data plane for the same reason as the SSH listeners: it
+    /// binds this node's mesh address, which goes down with the TUN.
+    #[cfg(feature = "desktop")]
+    pub(crate) fn start_v4_bridge(self: &Arc<Self>) {
+        let mut guard = self.v4_bridge_token.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let token = CancellationToken::new();
+        *guard = Some(token.clone());
+        drop(guard);
+        let my_v6 = derive_ipv6(&self.transport.identity.local_identity());
+        crate::v4bridge::V4Bridge::new(my_v6).spawn(token);
+    }
+
+    /// Stop the IPv4 listener bridge if running. Idempotent.
+    #[cfg(feature = "desktop")]
+    pub(crate) fn stop_v4_bridge(&self) {
+        if let Some(t) = self.v4_bridge_token.lock().unwrap().take() {
+            t.cancel();
+        }
+    }
+
     /// Stop the SSH listeners if running. Idempotent.
     #[cfg(feature = "desktop")]
     pub(crate) fn stop_ssh(&self) {
@@ -1087,6 +1111,15 @@ impl Daemon {
                 tracing::warn!("{w}");
                 warnings.push(w);
             }
+        }
+
+        // Bridge the host's IPv4-only listeners onto the mesh address. Same
+        // lifetime as the SSH server and for the same reason: it binds that
+        // address. What it exposes is what `0.0.0.0` already exposes, and the
+        // firewall still decides who reaches it (see `crate::v4bridge`).
+        #[cfg(feature = "desktop")]
+        if config::load().map(|c| c.v4_bridge).unwrap_or(true) {
+            self.start_v4_bridge();
         }
 
         // From here until `deactivate()`, the roster's exit-offer flag is kept in
@@ -1546,9 +1579,12 @@ impl Daemon {
             };
         }
 
-        // The SSH listeners bind the mesh IPs, which go down with the data plane.
+        // The SSH listeners and the IPv4 bridge bind the mesh IPs, which go down
+        // with the data plane.
         #[cfg(feature = "desktop")]
         self.stop_ssh();
+        #[cfg(feature = "desktop")]
+        self.stop_v4_bridge();
 
         // Clone the TUN name out of the lock before awaiting (see `activate`);
         // the DnsService reverts system DNS and clears the TUN search domains.

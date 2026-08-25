@@ -20,6 +20,7 @@ DigitalOcean droplets (the default) and local Docker containers
 | [`apply/`](apply) | 3 | Declarative `ray apply` deploy end to end: create-if-absent + membership-gap diff, `--invite-missing`, `ray identityof`, alias/group expansion (`--dry-run`), real suggestion publish + data-plane enforcement, and `--prune`. |
 | [`dns/`](dns) | 2 | Magic DNS resolution over a real TUN: `<host>.<net>.ray` resolves via the system resolver, drives reachability, no host `:53` bind, non-`.ray` passthrough, and `ray down` revert. |
 | [`ssh/`](ssh) | 2 | Mesh SSH (`ray firewall ssh`): the allow/deny matrix over the TUN, so an SSH grant is a firewall rule and not a separate door. |
+| [`v4bridge/`](v4bridge) | 2 | A service listening on `0.0.0.0` answers over the IPv6-only mesh: the payload path by IP and by `.ray` name, the firewall still upstream of the bridge, loopback-only services declined, no bind/unbind flap across rescans, the setting + data-plane lifetime, and a new listener picked up from a kernel event rather than a timer (droplets only, see the scenario README). |
 | [`reliability/`](reliability) | 4 | Full-mesh packet-loss test: every pair probed both ways with `ping -c 1000 -i 0.01`, ICMP flood, and iperf3 UDP, over the rayfish tunnel vs the direct public-IP baseline. Fails when rayfish adds loss over the raw link. |
 | [`restore-offline/`](restore-offline) | 3 | A member whose daemon restarts while its coordinator is offline keeps the network and re-meshes with the *other* member, rather than dropping the network until the coordinator returns. |
 | [`unpair/`](unpair) | 3 | `ray unpair` revokes a device cert: the nullifier rides the signed blob, a third peer drops the unpaired device, and the device cannot re-join. |
@@ -109,6 +110,9 @@ against a direct-public-IP baseline that on one host is the same bridge.
   complementary, not equal.
 - `dns/run.sh`'s "no host `:53` bind" check has no positive control in a container
   with no `:53` listener at all, so it passes for free.
+- tracefs is not mounted in a privileged container, so `v4bridge/run.sh` step 12
+  exercises the timer fallback and never the kernel listen events the daemon
+  actually uses on Linux (`src/listen_events.rs`). It says so when it runs.
 - mDNS is off on the nodes (one bridge means every node hears every other one, which
   no real fleet does). `E2E_DOCKER_MDNS=1` turns it back on.
 

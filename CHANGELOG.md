@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Services that listen on IPv4 only are reachable over the mesh.** The mesh is
+  IPv6-only, so a peer reaches a service at `[<mesh ip>]:<port>` and a program
+  listening on `0.0.0.0` never saw the connection: the port was open in `ray
+  firewall`, the name resolved, and the connection was refused with nothing
+  saying why. The daemon now answers on the mesh address for those ports itself
+  and hands the connection to the local service over IPv4, so
+  `curl http://box.ray:4000` works against a server that only speaks IPv4. On
+  Linux a port becomes reachable the moment the service starts listening,
+  because the kernel says so; on other systems it is picked up within a few
+  seconds.
+  Nothing new is exposed by it: only a service already listening on every
+  interface (`0.0.0.0`) is bridged, one bound to `127.0.0.1` is left alone, and
+  the firewall decides who reaches it exactly as before. The service sees the
+  connection coming from `127.0.0.1` rather than from the peer, so keep
+  per-peer rules in `ray firewall` rather than in the application. Turn it off
+  with `ray config set v4-bridge off`.
 - **Exit nodes tunnel IPv6.** `ray exit-node use` routes your IPv6 internet
   traffic through the gateway and leaves your IPv4 traffic leaving directly,
   which both `ray exit-node use` and `ray exit-node status` say out loud rather
@@ -64,8 +80,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Output goes through `$PAGER` (`less`) on a terminal and straight through
   when piped or following, so `ray logs | grep peer` and `ray logs -f` both
   behave the way you would expect.
+- **Tab completion covers the ids you copy out of a listing.** `ray requests
+  <net> accept`, `ray requests <net> deny`, `ray connect approve`, `ray invite
+  <net> revoke`, `ray files accept`, `ray files cancel` and `ray firewall
+  remove` now complete their argument from what is actually waiting, each
+  candidate carrying who or what it refers to, so an id printed one line up no
+  longer has to be retyped. `ray requests <net>` joins the other listings in
+  being readable by any local user, so the tab answers without sudo; admitting
+  still needs root or the operator.
 
 ### Changed
+
+- **A join with no `--hostname` takes this machine's name.** `ray create` and
+  `ray join` used to fall back to a random noun, so `ray status` on a fleet read
+  as a list of animals nobody could match to a box. They now use the machine's
+  own hostname, folded into a mesh name (`Alice's MacBook.local` becomes
+  `alice-s-macbook`). A random name is still used when the machine has nothing
+  usable to offer (`localhost`, which is what Android reports) and when the name
+  is already on the network you are joining, since `laptop-1` would read as the
+  name of the `laptop` that is already there. `ray up --hostname <name>` still
+  wins over both, and naming one explicitly is unaffected.
 
 - **Rayfish is IPv6-only. Mesh IPv4 is gone.** Every peer had two mesh addresses:
   an IPv4 in `100.64.0.0/10` and an IPv6 in `200::/7`. Only the IPv6 remains.
@@ -147,6 +181,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Android: `.ray` names now open in Chrome on an IPv4-only network.** The
+  browser showed `DNS_PROBE_FINISHED_NXDOMAIN` for a name that every other app
+  on the phone resolved fine. Chrome only asks for an IPv6 address once it has
+  checked that IPv6 works, by connecting to a fixed global address, and on a
+  Wi-Fi with no IPv6 that check failed. It then asked for an IPv4 address alone,
+  which the mesh does not have and never will, so nothing on the mesh was
+  reachable by name from the browser. The tunnel now carries a route for that
+  check, and only on networks with no IPv6 of their own. Real IPv6 traffic is
+  untouched.
 - **Android: "Send diagnostics" now actually sends the diagnostics.** The button
   reported success and delivered an empty report: the log snapshot, the node
   health block, and the install and transport tags were all attached to the

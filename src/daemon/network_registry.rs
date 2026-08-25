@@ -570,10 +570,11 @@ impl NetworkRegistry {
                 );
                 h
             }
-            None => config::load()
-                .ok()
-                .and_then(|c| c.default_hostname)
-                .unwrap_or_else(crate::hostname::generate_hostname),
+            // Founding the network, so there is no roster to clash with yet.
+            None => crate::hostname::default_hostname(
+                config::load().ok().and_then(|c| c.default_hostname),
+                &[],
+            ),
         };
 
         // Captured before `pre_approve` is consumed below: on a direct network

@@ -20,6 +20,7 @@ import android.os.ParcelFileDescriptor
 // when the user has crash reporting opted out (Sentry stays uninitialized).
 import io.sentry.android.core.SentryLogcatAdapter as Log
 import java.net.Inet4Address
+import java.net.Inet6Address
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -402,6 +403,33 @@ class RayfishVpnService : VpnService() {
                 .addAddress(meshV6, 128)
                 .addRoute("200::", 7)
 
+            // **Load-bearing on an IPv4-only network.** Chromium and bionic both
+            // gate AAAA lookups on an IPv6 reachability probe: a UDP connect() to
+            // a fixed global address, which needs a route but sends no packet.
+            // With only 200::/7 routed and no IPv6 underneath, that probe fails,
+            // Chrome drops AAAA from the query set entirely
+            // (host_resolver_manager.cc, `effective_types.Remove(DnsQueryType::AAAA)`)
+            // and asks for A alone. The overlay is IPv6-only, so every .ray name
+            // then resolves to nothing and the browser shows NXDOMAIN while the
+            // very same name resolves fine for any app that asks for AAAA.
+            // Routing the probe targets makes the probe succeed. Real IPv6
+            // destinations are deliberately left unrouted, so they keep failing
+            // instantly with ENETUNREACH from the kernel rather than blackholing
+            // in the tunnel, which is what keeps happy-eyeballs fallback prompt.
+            // Skipped when the underlay has real IPv6: the probe succeeds on its
+            // own there, and we must not sit on Google Public DNS's address for a
+            // host that can genuinely reach it.
+            if (!underlayHasGlobalIpv6()) {
+                for (probe in IPV6_PROBE_ADDRS) {
+                    try {
+                        builder.addRoute(probe, 128)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "could not add IPv6 probe route $probe", t)
+                    }
+                }
+                Log.i(TAG, "no IPv6 on the underlay; routed AAAA probe targets $IPV6_PROBE_ADDRS")
+            }
+
             // **Load-bearing.** VpnService blocks a whole address family outright
             // when the Builder names no address, route or DNS server of it, and
             // this tunnel names none for IPv4: the mesh has no IPv4 address, the
@@ -723,6 +751,42 @@ class RayfishVpnService : VpnService() {
         return servers
     }
 
+    // Whether the underlying (non-VPN) network can actually carry global IPv6:
+    // a global unicast address to source from *and* a default route to send on.
+    // Both are required, which is exactly what a connect() to a global address
+    // needs, and neither alone implies the other (an address with no default
+    // route is a LAN-only prefix; a default route with no global address cannot
+    // be sourced). Same enumerate-and-skip-VPN shape as [systemDnsServers]: our
+    // own tunnel always has a 200::/7 address and would otherwise read as IPv6.
+    private fun underlayHasGlobalIpv6(): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return false
+        for (network in cm.allNetworks) {
+            val caps = cm.getNetworkCapabilities(network) ?: continue
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+            val props = cm.getLinkProperties(network) ?: continue
+            val hasGlobalAddr = props.linkAddresses.any { la ->
+                val a = la.address
+                a is Inet6Address &&
+                    !a.isLinkLocalAddress && !a.isLoopbackAddress &&
+                    !a.isAnyLocalAddress && !a.isMulticastAddress &&
+                    !a.isSiteLocalAddress &&
+                    // Unique local (fc00::/7). Java has no predicate for it and
+                    // isSiteLocalAddress only covers the deprecated fec0::/10, so
+                    // a ULA would otherwise read as global. NAT66 is rare enough
+                    // that a ULA is no evidence of IPv6 internet, and guessing
+                    // "no IPv6" merely adds the probe routes, which is the
+                    // recoverable side of this call.
+                    (a.address[0].toInt() and 0xFE) != 0xFC
+            }
+            if (!hasGlobalAddr) continue
+            if (props.routes.any { it.isDefaultRoute && it.destination.address is Inet6Address }) {
+                return true
+            }
+        }
+        return false
+    }
+
     /**
      * Bring the tunnel down. In standby the control plane survives (Node.down):
      * files keep flowing and the device stays online in the mesh. Otherwise this is
@@ -996,6 +1060,16 @@ class RayfishVpnService : VpnService() {
             "com.google.android.apps.messaging",      // RCS / Jibe messaging
             "com.gopro.smarty",                       // GoPro
             "com.sonos.acr", "com.sonos.acr2",        // Sonos
+        )
+
+        // Fixed addresses the two IPv6 reachability probes on this platform aim
+        // at. Neither is ever a real destination for us: 2000:: is the reserved
+        // subnet-router anycast of 2000::/3, and while 2001:4860:4860::8888 is a
+        // live Google Public DNS resolver, we only claim it on a host with no
+        // IPv6 at all, which by definition cannot reach it. See the call site.
+        private val IPV6_PROBE_ADDRS = listOf(
+            "2001:4860:4860::8888", // Chromium, net/dns/host_resolver_manager.cc
+            "2000::",               // bionic / DnsResolver, have_ipv6()
         )
     }
 }

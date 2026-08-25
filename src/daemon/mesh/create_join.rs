@@ -461,10 +461,22 @@ impl NetworkRegistry {
                 );
                 h
             }
-            None => config::load()
-                .ok()
-                .and_then(|c| c.default_hostname)
-                .unwrap_or_else(crate::hostname::generate_hostname),
+            // No name given: this machine's own, unless the roster we just
+            // fetched already has it. The blob is in hand before we dial, so
+            // that clash is visible here and needs nothing from the wire.
+            None => {
+                let me = self.transport.identity.local_identity();
+                let taken: Vec<&str> = data
+                    .members
+                    .iter()
+                    .filter(|m| m.identity != me)
+                    .filter_map(|m| m.hostname.as_deref())
+                    .collect();
+                crate::hostname::default_hostname(
+                    config::load().ok().and_then(|c| c.default_hostname),
+                    &taken,
+                )
+            }
         };
 
         // One invite-ledger lock for this network, shared between the join's

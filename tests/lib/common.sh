@@ -243,11 +243,12 @@ tcp_probe(){
 # HTTP server on the host, and its teardown.
 #
 # Binds `::`, not `0.0.0.0`. The overlay is IPv6-only, so a socket on the IPv4
-# wildcard has no presence on the TUN at all and every probe against it reads
-# CLOSED whatever the firewall says: the deny assertions would pass for the wrong
-# reason and the allow assertions could never pass. `::` accepts both families
-# on Linux (net.ipv6.bindv6only defaults to 0), which is the same fix a user hits
-# when a service of theirs stops answering over the mesh.
+# wildcard has no presence on the TUN of its own: what reaches one now is the
+# daemon's IPv4 listener bridge (`src/v4bridge.rs`), and a firewall assertion
+# resting on that would be testing the bridge instead. `::` accepts both families
+# on Linux (net.ipv6.bindv6only defaults to 0) and needs nothing in front of it,
+# so these probes stay about the packet path. The bridge has its own scenario
+# (tests/e2e/v4bridge), which is where a `0.0.0.0` listener belongs.
 start_tcp_listener(){
   on "$1" "setsid python3 -m http.server $2 --bind :: >/tmp/lst_$2.log 2>&1 </dev/null & sleep 1" \
     >/dev/null 2>&1 || true

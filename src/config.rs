@@ -456,6 +456,13 @@ pub struct AppConfig {
     /// authorized in a network's [`NetworkConfig::ssh_allow`] list. Off by default.
     #[serde(default)]
     pub ssh_enabled: bool,
+    /// Global toggle for bridging this host's IPv4-only listeners onto the mesh
+    /// address (`ray config set v4-bridge off`). On by default: the mesh
+    /// firewall still denies inbound by default, so the only ports it changes
+    /// are ones a rule already opened and which silently did not answer. See
+    /// `crate::v4bridge`.
+    #[serde(default = "default_true")]
+    pub v4_bridge: bool,
     /// On-demand connection mode (battery-minimizing, Tailscale-style). When on,
     /// the node does not eagerly dial peers at startup: it restores memberships and
     /// the roster locally, dials a peer lazily on the first outgoing packet that
@@ -522,6 +529,7 @@ impl Default for AppConfig {
             discovery_dns: ServerOverride::default(),
             dns_upstreams: ServerOverride::default(),
             ssh_enabled: false,
+            v4_bridge: true,
             on_demand: true,
             idle_timeout_secs: None,
             auto_update: false,
@@ -664,6 +672,8 @@ struct Settings {
     dns_upstreams: ServerOverride,
     #[serde(default)]
     ssh_enabled: bool,
+    #[serde(default = "default_true")]
+    v4_bridge: bool,
     #[serde(default = "default_true")]
     on_demand: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1053,6 +1063,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         discovery_dns: settings.discovery_dns,
         dns_upstreams: settings.dns_upstreams,
         ssh_enabled: settings.ssh_enabled,
+        v4_bridge: settings.v4_bridge,
         on_demand: settings.on_demand,
         idle_timeout_secs: settings.idle_timeout_secs,
         auto_update: settings.auto_update,
@@ -1082,6 +1093,7 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         discovery_dns: config.discovery_dns.clone(),
         dns_upstreams: config.dns_upstreams.clone(),
         ssh_enabled: config.ssh_enabled,
+        v4_bridge: config.v4_bridge,
         on_demand: config.on_demand,
         idle_timeout_secs: config.idle_timeout_secs,
         auto_update: config.auto_update,

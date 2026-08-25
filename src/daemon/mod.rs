@@ -606,6 +606,12 @@ pub struct Daemon {
     /// Android build at all.
     #[cfg(feature = "desktop")]
     ssh_token: Mutex<Option<CancellationToken>>,
+    /// Cancellation token for the IPv4 listener bridge (`None` when off / on
+    /// standby). Same shape and same reason as `ssh_token`: it binds the mesh
+    /// address, so it lives and dies with the data plane. See
+    /// [`crate::v4bridge`].
+    #[cfg(feature = "desktop")]
+    v4_bridge_token: Mutex<Option<CancellationToken>>,
 }
 
 /// Map key-holding status to a [`NetworkRole`].
@@ -858,6 +864,9 @@ impl Daemon {
                 | IpcMessage::ExitNodeStatus { .. }
                 | IpcMessage::ListFiles
                 | IpcMessage::Connections
+                // The queue `ray requests <net> accept` reads its id out of,
+                // and the same shape as `Connections` right above it.
+                | IpcMessage::Requests { .. }
                 | IpcMessage::ContactId
                 | IpcMessage::Ping { .. }
                 | IpcMessage::Netcheck
@@ -972,6 +981,8 @@ impl Daemon {
             NodeKey::Firewall(k) => return self.registry.firewall_config_set(k, value),
             // Not a plain config write: see `Daemon::ssh_config_set`.
             NodeKey::Global(GlobalKey::Ssh) => return self.ssh_config_set(value),
+            // Likewise: the bridge's listeners follow the setting live.
+            NodeKey::Global(GlobalKey::V4Bridge) => return self.v4_bridge_config_set(value),
             // Spelled out rather than caught by `_`, so a new global key cannot
             // land here by default. Falling through silently is precisely the
             // `ssh` bug: a key whose write needs a live side effect, getting
@@ -1463,14 +1474,16 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
         GlobalKey::DownloadUser => format!("download-user set. {restart}"),
         // Spelled out rather than caught by `_`, so a new global key cannot
         // inherit this generic wording (and its "Restart the daemon" claim) by
-        // default. `Ssh` never reaches here (`config_apply` routes it to
-        // `ssh_config_set`); it is listed only to keep the match exhaustive.
+        // default. `Ssh` and `V4Bridge` never reach here (`config_apply` routes
+        // them to their own setters); they are listed only to keep the match
+        // exhaustive.
         k @ (GlobalKey::Relay
         | GlobalKey::DiscoveryDns
         | GlobalKey::DnsUpstreams
         | GlobalKey::AutoUpdate
         | GlobalKey::OnDemand
-        | GlobalKey::Ssh) => {
+        | GlobalKey::Ssh
+        | GlobalKey::V4Bridge) => {
             if reset {
                 format!("Reset {k} to default. {restart}")
             } else {

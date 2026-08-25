@@ -288,10 +288,13 @@ impl SshServer {
     }
 }
 
-/// Bind a TCP listener on a specific mesh IP's port 22 with SO_REUSEADDR (and
-/// SO_REUSEPORT on Unix) so it can coexist with a host sshd bound on the wildcard
-/// address. Returns a tokio listener ready to accept.
-fn bind_listener(ip: IpAddr, port: u16) -> Result<TcpListener> {
+/// Bind a TCP listener on one specific address with SO_REUSEADDR (and
+/// SO_REUSEPORT on Unix) so it can coexist with a host daemon bound on the
+/// wildcard address: the SSH server's port alongside a host sshd on
+/// `0.0.0.0:22`, and every port `v4bridge` claims on the mesh address alongside
+/// the `0.0.0.0` listener it bridges to. Returns a tokio listener ready to
+/// accept.
+pub(crate) fn bind_listener(ip: IpAddr, port: u16) -> Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if ip.is_ipv4() {
         Domain::IPV4

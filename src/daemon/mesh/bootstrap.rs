@@ -671,6 +671,8 @@ async fn build_daemon_inner(
         ssh_authz: crate::ssh::new_authz(),
         #[cfg(feature = "desktop")]
         ssh_token: Mutex::new(None),
+        #[cfg(feature = "desktop")]
+        v4_bridge_token: Mutex::new(None),
     });
 
     // File auto-accept is evaluated inline by `FileService::accept_file_offer`

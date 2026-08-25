@@ -40,6 +40,8 @@ use crate::*;
 
 use ipc::{IpcMessage, NetworkStatus, NodeKey, PeerState};
 
+use super::files::format_size;
+
 /// The environment variable the installed stub sets to ask for completions.
 const VAR: &str = "COMPLETE";
 
@@ -105,6 +107,164 @@ pub(crate) fn paired_devices() -> ArgValueCompleter {
                 .into_iter()
                 .map(|d| (d.hostname.unwrap_or(d.short_id), d.networks.join(", "))),
         )
+        .into_iter()
+        .filter(|c| starts_with(c, current))
+        .collect()
+    })
+}
+
+/// Peers waiting for admission, for `ray requests <net> accept|deny <id>`.
+///
+/// The id is a short id read off the listing directly above it on screen, which
+/// is exactly the kind of value nobody should be retyping by hand.
+pub(crate) fn join_requests() -> ArgValueCompleter {
+    ArgValueCompleter::new(|current: &OsStr| {
+        let Some(network) = scoped_network() else {
+            return Vec::new();
+        };
+        waiting_peers(current, IpcMessage::Requests { network })
+    })
+}
+
+/// Peers waiting for a direct link, for `ray connect approve <id>`.
+pub(crate) fn connect_requests() -> ArgValueCompleter {
+    ArgValueCompleter::new(|current: &OsStr| waiting_peers(current, IpcMessage::Connections))
+}
+
+/// The two queues share a reply type, and a joiner and a would-be contact read
+/// the same on screen: an id, who it is, and how long they have been waiting.
+fn waiting_peers(current: &OsStr, request: IpcMessage) -> Vec<CompletionCandidate> {
+    let requests = ask(request, |reply| match reply {
+        IpcMessage::PendingRequests { requests } => Some(requests),
+        _ => None,
+    })
+    .unwrap_or_default();
+    described(requests.into_iter().map(|req| {
+        let who = req.hostname.unwrap_or_else(|| "unnamed".to_string());
+        (
+            req.short_id,
+            format!("{who}, waiting {}s", req.waiting_secs),
+        )
+    }))
+    .into_iter()
+    .filter(|c| starts_with(c, current))
+    .collect()
+}
+
+/// Invites still worth revoking, for `ray invite <net> revoke <id>`.
+///
+/// Pending only: a redeemed, expired or already-revoked code is not something
+/// `revoke` has anything left to do with.
+///
+/// Unlike the queues above, `InviteList` is not an open read, so this answers
+/// for root and the operator and comes back empty for anyone else, which is the
+/// same set that can run the command it completes.
+pub(crate) fn invite_ids() -> ArgValueCompleter {
+    ArgValueCompleter::new(|current: &OsStr| {
+        let Some(network) = scoped_network() else {
+            return Vec::new();
+        };
+        let invites = ask(IpcMessage::InviteList { network }, |reply| match reply {
+            IpcMessage::InviteListResponse { invites } => Some(invites),
+            _ => None,
+        })
+        .unwrap_or_default();
+        described(
+            invites
+                .into_iter()
+                .filter(|invite| invite.status == "pending")
+                .map(|invite| {
+                    let kind = match invite.reusable {
+                        true => "reusable",
+                        false => "one-time",
+                    };
+                    let help = match invite.hostname {
+                        Some(host) => format!("{kind}, bound to {host}"),
+                        None => kind.to_string(),
+                    };
+                    (invite.id, help)
+                }),
+        )
+        .into_iter()
+        .filter(|c| starts_with(c, current))
+        .collect()
+    })
+}
+
+/// Incoming transfers awaiting a decision, for `ray files accept <id>`.
+pub(crate) fn incoming_files() -> ArgValueCompleter {
+    ArgValueCompleter::new(|current: &OsStr| {
+        let (files, _) = file_queues();
+        described(files.into_iter().map(|file| {
+            (
+                file.id.to_string(),
+                format!(
+                    "{} from {}, {}",
+                    file.filename,
+                    file.from,
+                    format_size(file.size)
+                ),
+            )
+        }))
+        .into_iter()
+        .filter(|c| starts_with(c, current))
+        .collect()
+    })
+}
+
+/// Sends still queued for an offline peer, for `ray files cancel <id>`.
+///
+/// The outbox, not the inbox: cancelling takes back something of ours that has
+/// not left yet, and offering an incoming id here would only ever fail.
+pub(crate) fn queued_sends() -> ArgValueCompleter {
+    ArgValueCompleter::new(|current: &OsStr| {
+        let (_, outbox) = file_queues();
+        described(outbox.into_iter().map(|file| {
+            (
+                file.id.to_string(),
+                format!(
+                    "{} to {}, {}",
+                    file.filename,
+                    file.peer,
+                    format_size(file.size)
+                ),
+            )
+        }))
+        .into_iter()
+        .filter(|c| starts_with(c, current))
+        .collect()
+    })
+}
+
+fn file_queues() -> (Vec<ipc::PendingFileInfo>, Vec<ipc::OutboxFileInfo>) {
+    ask(IpcMessage::ListFiles, |reply| match reply {
+        IpcMessage::FileList { files, outbox } => Some((files, outbox)),
+        _ => None,
+    })
+    .unwrap_or_default()
+}
+
+/// Rule positions, for `ray firewall remove <index>`.
+///
+/// An index means nothing without the rule it points at, and the list is
+/// renumbered by every removal, so each candidate carries the rule it would
+/// take out.
+pub(crate) fn firewall_rules() -> ArgValueCompleter {
+    ArgValueCompleter::new(|current: &OsStr| {
+        let rules = ask(IpcMessage::FirewallShow, |reply| match reply {
+            IpcMessage::FirewallState { rules, .. } => Some(rules),
+            _ => None,
+        })
+        .unwrap_or_default();
+        described(rules.into_iter().enumerate().map(|(index, rule)| {
+            (
+                index.to_string(),
+                format!(
+                    "{} {} {} {} {}",
+                    rule.direction, rule.action, rule.protocol, rule.port, rule.peer
+                ),
+            )
+        }))
         .into_iter()
         .filter(|c| starts_with(c, current))
         .collect()
@@ -278,6 +438,16 @@ fn scope(networks: &[NetworkStatus]) -> Option<&str> {
     named.next().is_none().then_some(first)
 }
 
+/// [`scope`] as an owned name, for the completers whose request carries one.
+///
+/// Two round trips rather than one, because the network has to be recognised
+/// before it can be asked about. Both are unix-socket reads against a live
+/// process, and each has [`BUDGET`] of its own.
+fn scoped_network() -> Option<String> {
+    let (networks, _) = status()?;
+    scope(&networks).map(str::to_string)
+}
+
 fn line_words() -> Vec<String> {
     std::env::args_os()
         .skip_while(|arg| arg != "--")
@@ -320,8 +490,11 @@ fn status() -> Option<(Vec<NetworkStatus>, Vec<String>)> {
 
 /// One request, one reply, within [`BUDGET`].
 ///
-/// Only the open reads belong here: `Daemon::check_authorized` lets `Status` and
-/// friends through for any local uid, so completion works without sudo.
+/// Reads only, and the open ones wherever there is a choice:
+/// `Daemon::check_authorized` lets `Status` and friends through for any local
+/// uid, so completion works without sudo. A read it gates (`InviteList`) is
+/// still worth asking, since the reply is an error rather than a hang and the
+/// users it answers for are the ones who can run the command anyway.
 fn ask<T>(request: IpcMessage, reply: impl FnOnce(IpcMessage) -> Option<T>) -> Option<T> {
     blocking(BUDGET, async {
         // No socket means no daemon. Connecting would not start one, but
@@ -690,6 +863,50 @@ mod tests {
         // Nothing to read at all.
         assert!(domain_of("no parenthesis here").is_empty());
         assert!(domain_of("a single word (on)").is_empty());
+    }
+
+    /// Every argument whose value is copied out of a listing the command just
+    /// above it printed carries a completer.
+    ///
+    /// These are the ids nobody should be retyping (`ray requests <net> accept
+    /// a1b2c3d4e5`), and an argument that is a bare `String` in the clap model
+    /// looks no different from one that is free-form, so the gap is invisible
+    /// until someone presses tab. Named per page rather than derived, because
+    /// what makes an argument completable is where its value came from, which
+    /// is not something the model records.
+    #[test]
+    fn every_id_read_off_a_listing_has_a_completer() {
+        let expected: [(&[&str], &str); 9] = [
+            (&["requests", "accept"], "id"),
+            (&["requests", "deny"], "id"),
+            (&["accept"], "id"),
+            (&["deny"], "id"),
+            (&["connect", "approve"], "id"),
+            (&["invite", "revoke"], "id"),
+            (&["files", "accept"], "id"),
+            (&["files", "cancel"], "id"),
+            (&["firewall", "remove"], "index"),
+        ];
+        for (path, name) in expected {
+            let mut command = Cli::command();
+            command.build();
+            let mut at = &command;
+            for step in path {
+                at = at
+                    .get_subcommands()
+                    .find(|sub| sub.get_name() == *step)
+                    .unwrap_or_else(|| panic!("no such command: ray {}", path.join(" ")));
+            }
+            let arg = at
+                .get_arguments()
+                .find(|arg| arg.get_id() == name)
+                .unwrap_or_else(|| panic!("ray {} has no <{name}>", path.join(" ")));
+            assert!(
+                arg.get::<ArgValueCompleter>().is_some(),
+                "ray {} <{name}> completes nothing",
+                path.join(" ")
+            );
+        }
     }
 
     #[test]

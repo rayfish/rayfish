@@ -502,6 +502,50 @@ impl Daemon {
         IpcMessage::Ok { message }
     }
 
+    /// Write the `v4-bridge` setting and make the running bridge follow it.
+    ///
+    /// A plain config write would leave the listeners up until the next restart,
+    /// which is the `ssh` bug in a second place, so this key gets its own setter
+    /// for the same reason that one does.
+    pub(crate) fn v4_bridge_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
+        let mut app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                return ipc_err(format!("failed to load config: {e}"));
+            }
+        };
+        if let Err(e) = settings::apply_global(&mut app_config, GlobalKey::V4Bridge, value, false) {
+            return ipc_err(e.to_string());
+        }
+        let enabled = app_config.v4_bridge;
+        if let Err(e) = config::save_settings(&app_config) {
+            return ipc_err(format!("failed to persist v4-bridge setting: {e}"));
+        }
+        // Reflect immediately if the data plane is up (else activate() starts it).
+        #[cfg(feature = "desktop")]
+        if self.active.load(Ordering::SeqCst) {
+            if enabled {
+                self.start_v4_bridge();
+            } else {
+                self.stop_v4_bridge();
+            }
+        }
+        IpcMessage::Ok {
+            message: format!(
+                "IPv4 listener bridge {}. {}",
+                if enabled { "on" } else { "off" },
+                if enabled {
+                    "A service listening on 0.0.0.0 now answers at this node's mesh \
+                     address, for the peers the firewall allows. Services bound to \
+                     127.0.0.1 are not bridged."
+                } else {
+                    "Services that listen on IPv4 only are no longer reachable over \
+                     the mesh."
+                }
+            ),
+        }
+    }
+
     /// Add or remove a peer from a network's SSH allow list. `peer` is `*` (any
     /// peer on the network) or a name/ip/short-id resolved to a user identity.
     /// On allow, `users` is the set of local accounts the peer may log in as
