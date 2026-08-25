@@ -293,12 +293,13 @@ impl NetworkRegistry {
 
         // Persist the nullifier seed so it survives a restart and is unioned into
         // every coordinated network's blob at seal time.
-        let mut cfg = config::load().unwrap_or_default();
         let hex = target.to_string();
-        if !cfg.revoked_devices.contains(&hex) {
-            cfg.revoked_devices.push(hex);
-        }
-        if let Err(e) = config::save_settings(&cfg) {
+        if let Err(e) = config::update_settings(|cfg| {
+            if !cfg.revoked_devices.contains(&hex) {
+                cfg.revoked_devices.push(hex);
+            }
+            Ok(())
+        }) {
             return Err(format!("failed to persist nullifier: {e}"));
         }
         self.device_user_map.remove(&target);

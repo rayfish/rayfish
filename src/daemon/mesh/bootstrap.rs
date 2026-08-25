@@ -214,10 +214,20 @@ async fn build_daemon_inner(
     dht::set_discovery_override(&app_config.discovery_dns);
     // Lazily generate + persist this node's contact key (`ray connect`). The
     // secret stays in config; only its public id is held in `Daemon`.
-    let contact_public = config::contact_secret(&mut app_config).public();
-    if let Err(e) = config::save_settings(&app_config) {
-        tracing::warn!(error = %e, "failed to persist contact key");
+    let mut contact_public = None;
+    match config::update_settings(|cfg| {
+        contact_public = Some(config::contact_secret(cfg).public());
+        Ok(())
+    }) {
+        Ok(cfg) => app_config = cfg,
+        Err(e) => tracing::warn!(error = %e, "failed to persist contact key"),
     }
+    // The callback did not run if the update failed before it. Fall back to an
+    // in-memory key so the node still starts.
+    let contact_public = match contact_public {
+        Some(id) => id,
+        None => config::contact_secret(&mut app_config).public(),
+    };
     let alpns = initial_alpns(&app_config);
     let use_tor = app_config
         .networks
@@ -965,7 +975,7 @@ async fn auto_update_once() -> Result<()> {
     // Restart-loop guard: refuse a repeat of the same target inside the backoff
     // window so a bad build that keeps mis-reporting its version can't tight-loop
     // download + restart.
-    let mut cfg = config::load()?;
+    let cfg = config::load()?;
     let now = unix_now();
     if !crate::update::should_attempt_target(
         &tag,
@@ -980,9 +990,12 @@ async fn auto_update_once() -> Result<()> {
 
     // Record the attempt *before* swapping so a crash mid-swap still counts
     // against the backoff; it survives the restart via settings.toml.
-    cfg.auto_update_last_target = Some(tag.clone());
-    cfg.auto_update_last_attempt = Some(now);
-    if let Err(e) = config::save_settings(&cfg) {
+    let attempted = tag.clone();
+    if let Err(e) = config::update_settings(|cfg| {
+        cfg.auto_update_last_target = Some(attempted);
+        cfg.auto_update_last_attempt = Some(now);
+        Ok(())
+    }) {
         tracing::warn!(error = %e, "auto-update: failed to persist attempt marker");
     }
 

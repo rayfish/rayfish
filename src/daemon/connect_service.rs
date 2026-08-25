@@ -396,16 +396,16 @@ impl ConnectService {
     /// Rotate this node's contact key and, if the data plane is active, republish
     /// the contact record immediately so the new id resolves.
     pub(crate) async fn rotate_contact(&self) -> IpcMessage {
-        let mut cfg = match config::load() {
-            Ok(c) => c,
-            Err(e) => {
-                return ipc_err(format!("failed to load config: {e}"));
-            }
-        };
-        let secret = config::rotate_contact_secret(&mut cfg);
-        if let Err(e) = config::save_settings(&cfg) {
+        let mut rotated = None;
+        if let Err(e) = config::update_settings(|cfg| {
+            rotated = Some(config::rotate_contact_secret(cfg));
+            Ok(())
+        }) {
             return ipc_err(format!("failed to save config: {e}"));
         }
+        let Some(secret) = rotated else {
+            return ipc_err("contact key rotation did not run".to_string());
+        };
         if self.active.load(Ordering::SeqCst)
             && let Ok(client) = dht::create_pkarr_client(&self.transport.endpoint)
         {

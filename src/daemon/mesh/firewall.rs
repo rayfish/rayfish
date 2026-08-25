@@ -439,21 +439,24 @@ impl Daemon {
     /// precisely so those side effects cannot be bypassed: `ssh_enabled` written
     /// on its own leaves the node advertising SSH with nothing listening.
     pub(crate) fn ssh_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => {
-                return ipc_err(format!("failed to load config: {e}"));
-            }
-        };
         // The registry parses and writes the field; everything below is the side
         // effects it deliberately does not do.
-        if let Err(e) = settings::apply_global(&mut app_config, GlobalKey::Ssh, value, false) {
-            return ipc_err(e.to_string());
+        let mut parse_err = None;
+        let saved = config::update_settings(|cfg| {
+            if let Err(e) = settings::apply_global(cfg, GlobalKey::Ssh, value, false) {
+                parse_err = Some(e.to_string());
+                anyhow::bail!("rejected");
+            }
+            Ok(())
+        });
+        if let Some(e) = parse_err {
+            return ipc_err(e);
         }
+        let app_config = match saved {
+            Ok(cfg) => cfg,
+            Err(e) => return ipc_err(format!("failed to persist ssh setting: {e}")),
+        };
         let enabled = app_config.ssh_enabled;
-        if let Err(e) = config::save_settings(&app_config) {
-            return ipc_err(format!("failed to persist ssh setting: {e}"));
-        }
         // Open/close port 22 at the packet layer; SSH-layer authz is the real gate.
         let fw = self.registry.firewall.set_ssh_passthrough(enabled);
         if let Err(e) = firewall::save_firewall(&fw) {
@@ -508,19 +511,21 @@ impl Daemon {
     /// which is the `ssh` bug in a second place, so this key gets its own setter
     /// for the same reason that one does.
     pub(crate) fn v4_bridge_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => {
-                return ipc_err(format!("failed to load config: {e}"));
+        let mut parse_err = None;
+        let saved = config::update_settings(|cfg| {
+            if let Err(e) = settings::apply_global(cfg, GlobalKey::V4Bridge, value, false) {
+                parse_err = Some(e.to_string());
+                anyhow::bail!("rejected");
             }
+            Ok(())
+        });
+        if let Some(e) = parse_err {
+            return ipc_err(e);
+        }
+        let enabled = match saved {
+            Ok(cfg) => cfg.v4_bridge,
+            Err(e) => return ipc_err(format!("failed to persist v4-bridge setting: {e}")),
         };
-        if let Err(e) = settings::apply_global(&mut app_config, GlobalKey::V4Bridge, value, false) {
-            return ipc_err(e.to_string());
-        }
-        let enabled = app_config.v4_bridge;
-        if let Err(e) = config::save_settings(&app_config) {
-            return ipc_err(format!("failed to persist v4-bridge setting: {e}"));
-        }
         // Reflect immediately if the data plane is up (else activate() starts it).
         #[cfg(feature = "desktop")]
         if self.active.load(Ordering::SeqCst) {

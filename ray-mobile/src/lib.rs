@@ -594,9 +594,11 @@ impl Node {
                 "invalid hostname '{name}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
             )));
         }
-        let mut cfg = config::load().map_err(RayError::network)?;
-        cfg.default_hostname = Some(name);
-        config::save_settings(&cfg).map_err(RayError::network)?;
+        config::update_settings(|cfg| {
+            cfg.default_hostname = Some(name);
+            Ok(())
+        })
+        .map_err(RayError::network)?;
         Ok(())
     }
 

@@ -911,14 +911,10 @@ impl Daemon {
     /// Persist the operator UID so that user can run mutating `ray` commands
     /// without root. Authorization (root-only) is enforced in `check_authorized`.
     pub(crate) fn set_operator(&self, uid: u32) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => {
-                return ipc_err(format!("failed to load config: {e}"));
-            }
-        };
-        app_config.operator_uid = Some(uid);
-        if let Err(e) = config::save_settings(&app_config) {
+        if let Err(e) = config::update_settings(|cfg| {
+            cfg.operator_uid = Some(uid);
+            Ok(())
+        }) {
             return ipc_err(format!("failed to save config: {e}"));
         }
         IpcMessage::Ok {
@@ -999,16 +995,21 @@ impl Daemon {
                 | GlobalKey::DownloadUser),
             ) => k,
         };
-        let mut app_config = match config::load() {
-            Ok(c) => c,
-            Err(e) => return ipc_err(format!("failed to load config: {e}")),
+        let mut set_err = None;
+        let saved = config::update_settings(|cfg| {
+            if let Err(e) = config::config_set(cfg, key, value, replace) {
+                set_err = Some(e.to_string());
+                anyhow::bail!("rejected");
+            }
+            Ok(())
+        });
+        if let Some(e) = set_err {
+            return ipc_err(e);
+        }
+        let app_config = match saved {
+            Ok(cfg) => cfg,
+            Err(e) => return ipc_err(format!("failed to save config: {e}")),
         };
-        if let Err(e) = config::config_set(&mut app_config, key, value, replace) {
-            return ipc_err(e.to_string());
-        }
-        if let Err(e) = config::save_settings(&app_config) {
-            return ipc_err(format!("failed to save config: {e}"));
-        }
         IpcMessage::Ok {
             message: global_set_message(&app_config, key, reset),
         }
@@ -1818,12 +1819,54 @@ fn write_bundle(
     result
 }
 
+/// Delete `uid`'s earlier bundles in `dir`.
+///
+/// The old fixed `rayfish-report-{ts}.tgz` was truncated and reused within the
+/// same second, which bounded a flood at one file. An unpredictable name closed
+/// the symlink hole but took that bound away, and `IpcMessage::Report` is in the
+/// open-reads arm of `check_authorized`: without this, any local account can
+/// loop `ray report` and have the root daemon leave a fresh gzip of up to seven
+/// days of debug logs in `/tmp` every time, forever.
+///
+/// `/tmp` is world-writable and this runs as root, so the unlink is deliberately
+/// narrow: `symlink_metadata` does not follow a planted link, and only a regular
+/// file owned by the same uid whose name matches the bundle pattern is removed.
+/// A reader holding one open keeps it until they close it.
+fn sweep_prior_bundles(dir: &Path, uid: u32) {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("rayfish-report-") || !name.ends_with(".tgz") {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(md) = std::fs::symlink_metadata(&path)
+            && md.is_file()
+            && md.uid() == uid
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// Create a report under `dir` with an unpredictable, exclusively-created name.
 fn create_report_bundle(
     dir: &Path,
     files: &[(String, Vec<u8>)],
     owner: Option<(u32, u32)>,
 ) -> std::io::Result<PathBuf> {
+    // Reclaim the caller's previous bundles first; the new one replaces them.
+    sweep_prior_bundles(
+        dir,
+        owner
+            .map(|(uid, _)| uid)
+            .unwrap_or(unsafe { libc::geteuid() }),
+    );
     for _ in 0..16 {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1996,7 +2039,7 @@ async fn broadcast_control_msg(
 
 #[cfg(test)]
 mod report_tests {
-    use super::{collect_recent_logs, write_bundle};
+    use super::{collect_recent_logs, create_report_bundle, write_bundle};
 
     #[test]
     fn test_write_bundle_is_valid_targz() {
@@ -2109,6 +2152,43 @@ mod report_tests {
             "a dangling destination symlink was followed"
         );
         assert!(!target.exists(), "the symlink target was created");
+    }
+
+    /// A random name per call closed the symlink hole but removed the only
+    /// bound on `/tmp`: nothing ever deleted a bundle again, and `Report` is an
+    /// open read, so an unprivileged caller could loop it to fill the disk.
+    #[test]
+    fn a_new_bundle_reclaims_the_requesters_earlier_ones() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("rayfish-report-1-aaaaaaaaaaaaaaaa.tgz");
+        let unrelated = dir.path().join("someone-elses.tgz");
+        let victim = dir.path().join("victim");
+        let planted = dir.path().join("rayfish-report-2-bbbbbbbbbbbbbbbb.tgz");
+        std::fs::write(&stale, b"old bundle").unwrap();
+        std::fs::write(&unrelated, b"not ours").unwrap();
+        std::fs::write(&victim, b"do not delete").unwrap();
+        // A symlink wearing the bundle name: /tmp is world-writable and this
+        // runs as root, so the sweep must not follow it.
+        symlink(&victim, &planted).unwrap();
+        let me = (unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+
+        let fresh = create_report_bundle(
+            dir.path(),
+            &[("status.txt".to_string(), b"report".to_vec())],
+            Some(me),
+        )
+        .unwrap();
+
+        assert!(!stale.exists(), "the caller's previous bundle was kept");
+        assert!(fresh.exists(), "the new bundle is missing");
+        assert!(unrelated.exists(), "an unrelated file was deleted");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"do not delete",
+            "the sweep followed a planted symlink"
+        );
     }
 
     #[test]

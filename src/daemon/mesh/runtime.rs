@@ -1016,16 +1016,11 @@ impl Daemon {
                     "invalid hostname '{h}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
                 ));
             }
-            match config::load() {
-                Ok(mut app_config) => {
-                    app_config.default_hostname = Some(h);
-                    if let Err(e) = config::save_settings(&app_config) {
-                        tracing::warn!(error = %e, "failed to persist default hostname");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to load config to set default hostname")
-                }
+            if let Err(e) = config::update_settings(|cfg| {
+                cfg.default_hostname = Some(h);
+                Ok(())
+            }) {
+                tracing::warn!(error = %e, "failed to persist default hostname");
             }
         }
 

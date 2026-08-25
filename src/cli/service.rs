@@ -244,11 +244,11 @@ pub(crate) fn require_root() -> Result<()> {
 pub(crate) async fn cmd_install(auto_update: bool) -> Result<()> {
     require_root()?;
     if auto_update {
-        let mut cfg = config::load()?;
-        if !cfg.auto_update {
+        // A no-op when it is already on: the update skips the write.
+        config::update_settings(|cfg| {
             cfg.auto_update = true;
-            config::save_settings(&cfg)?;
-        }
+            Ok(())
+        })?;
         println!("automatic stable updates enabled for this node");
     }
     install_and_start_service(None).await

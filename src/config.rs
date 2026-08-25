@@ -225,8 +225,9 @@ fn default_true() -> bool {
 
 /// In-memory aggregate of the on-disk config. Reads assemble this from
 /// `settings.toml` (globals) + one `networks/<name>.toml` per network; writes
-/// are targeted (`save_settings` / `save_network` / `delete_network`) so a write
-/// to one network can never clobber another. See the storage section below.
+/// are targeted (`update_settings` / `save_network` / `delete_network`) so a
+/// write to one network can never clobber another. See the storage section
+/// below.
 /// A global server override (relay / discovery-DNS / DNS-upstreams). `servers`
 /// holds preset keywords (`rayfish`, `n0`) or literal URLs/IPs as the user typed
 /// them; an empty list means unset (use the iroh n0 defaults). `replace` swaps
@@ -1106,12 +1107,49 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
     })
 }
 
-/// Persist the global settings (`settings.toml`) only. Does not touch networks.
-pub fn save_settings(config: &AppConfig) -> Result<()> {
-    save_settings_in(&config_dir()?, config)
+/// Atomically load, synchronously mutate, and save the globals. The read and the
+/// write happen under one exclusive guard, so two tasks changing different
+/// globals cannot lose each other's field the way a `load` + `save_settings`
+/// pair does. Returns the saved config.
+///
+/// Same contract as [`update_network`]: the callback must not call another
+/// config API, and the guard is deliberately never held across an await.
+pub fn update_settings(update: impl FnOnce(&mut AppConfig) -> Result<()>) -> Result<AppConfig> {
+    update_settings_in(&config_dir()?, update)
+}
+
+fn update_settings_in(
+    dir: &Path,
+    update: impl FnOnce(&mut AppConfig) -> Result<()>,
+) -> Result<AppConfig> {
+    ensure_not_in_network_update()?;
+    let _guard = NETWORK_CONFIG_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut config = load_in(dir)?;
+    let before = settings_toml(&config)?;
+    let update_scope = NetworkUpdateScope::enter()?;
+    let applied = update(&mut config);
+    drop(update_scope);
+    applied?;
+    // A callback that decided there was nothing to do must not cost a write:
+    // every save fsyncs the file and its directory entry.
+    if settings_toml(&config)? != before {
+        save_settings_in(dir, &config)?;
+    }
+    Ok(config)
 }
 
 fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
+    let path = dir.join(SETTINGS_FILE);
+    let contents = settings_toml(config)?;
+    // Secret-bearing: holds the contact key.
+    write_atomic(&path, &contents, true)
+}
+
+/// The `settings.toml` projection of `config`, serialized. Also the change
+/// detector for [`update_settings`]: identical text means nothing to write.
+fn settings_toml(config: &AppConfig) -> Result<String> {
     let settings = Settings {
         mdns_enabled: config.mdns_enabled,
         operator_uid: config.operator_uid,
@@ -1133,10 +1171,7 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         cert_generation: config.cert_generation,
         revoked_devices: config.revoked_devices.clone(),
     };
-    let path = dir.join(SETTINGS_FILE);
-    let contents = toml::to_string_pretty(&settings).context("serializing settings")?;
-    // Secret-bearing: holds the contact key.
-    write_atomic(&path, &contents, true)
+    toml::to_string_pretty(&settings).context("serializing settings")
 }
 
 /// Record a queued join so its background retry survives a daemon restart.
@@ -2144,6 +2179,62 @@ name = "test"
             N,
             "all concurrent saves must survive"
         );
+    }
+
+    /// The network shards got a transaction boundary but `settings.toml` did
+    /// not, so the ten `load()` -> mutate one global -> `save_settings()` sites
+    /// still raced: each wrote back the whole file, reverting whatever another
+    /// task had changed in between.
+    #[test]
+    fn concurrent_settings_updates_preserve_unrelated_globals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let barrier = std::sync::Barrier::new(3);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                update_settings_in(&dir, |cfg| {
+                    cfg.operator_uid = Some(1234);
+                    Ok(())
+                })
+                .unwrap();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                update_settings_in(&dir, |cfg| {
+                    cfg.default_hostname = Some("umbrel".into());
+                    Ok(())
+                })
+                .unwrap();
+            });
+            barrier.wait();
+        });
+
+        let loaded = load_in(&dir).unwrap();
+        assert_eq!(loaded.operator_uid, Some(1234));
+        assert_eq!(loaded.default_hostname.as_deref(), Some("umbrel"));
+    }
+
+    /// A failing callback must leave the file as it was, not write a
+    /// half-applied config.
+    #[test]
+    fn a_failed_settings_update_saves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        update_settings_in(&dir, |cfg| {
+            cfg.operator_uid = Some(7);
+            Ok(())
+        })
+        .unwrap();
+
+        let err = update_settings_in(&dir, |cfg| {
+            cfg.operator_uid = Some(9);
+            anyhow::bail!("callback failed")
+        });
+
+        assert!(err.is_err());
+        assert_eq!(load_in(&dir).unwrap().operator_uid, Some(7));
     }
 
     #[test]

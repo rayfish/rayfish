@@ -181,6 +181,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Two settings changed at the same moment no longer undo each other.** Every
+  writer of `settings.toml` read the whole file, changed its one field and wrote
+  the whole file back, so a setting saved while another was in flight was
+  reverted a moment later by a copy that predated it. Turning on SSH could put
+  back the operator uid you had just cleared, and neither command reported
+  anything wrong. Reads and writes of the globals now happen under the same
+  transaction the per-network files already used.
+- **`ray report` no longer fills `/tmp`.** Each report wrote a fresh archive
+  under a new name and nothing ever removed the old ones, so a machine that had
+  run it often was holding a gzip of a week of debug logs for every run. A new
+  report now reclaims that user's previous ones.
 - **A saved config survives a power loss.** Writing a config file reported
   success once the bytes reached the operating system, which is not the same as
   reaching the disk: a machine that lost power seconds later came back with the

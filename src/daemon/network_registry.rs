@@ -1093,13 +1093,16 @@ impl NetworkRegistry {
     /// logged, not surfaced.
     pub(crate) async fn reauth_device(self: &Arc<Self>, device: EndpointId) {
         // Drop from the durable nullifier seed so a later reseal won't re-add it.
-        let mut cfg = config::load().unwrap_or_default();
         let hex = device.to_string();
-        if let Some(pos) = cfg.revoked_devices.iter().position(|d| *d == hex) {
-            cfg.revoked_devices.remove(pos);
-            if let Err(e) = config::save_settings(&cfg) {
-                tracing::warn!(error = %e, "reauth: failed to clear device from nullifier seed");
+        // No-op when the device was not in the seed: `update_settings` skips the
+        // write when the callback changes nothing.
+        if let Err(e) = config::update_settings(|cfg| {
+            if let Some(pos) = cfg.revoked_devices.iter().position(|d| *d == hex) {
+                cfg.revoked_devices.remove(pos);
             }
+            Ok(())
+        }) {
+            tracing::warn!(error = %e, "reauth: failed to clear device from nullifier seed");
         }
         // Collect coordinated networks (clone the handles) before awaiting.
         let mut nets: Vec<(String, SharedNetworkState, Option<Arc<Notify>>)> = Vec::new();
