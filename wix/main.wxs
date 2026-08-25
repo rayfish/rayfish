@@ -4,8 +4,7 @@
 <?else ?>
   <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
 <?endif ?>
-<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
-     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <?ifndef ProductVersion ?>
     <?define ProductVersion = "0.0.0" ?>
   <?endif ?>
@@ -42,12 +41,11 @@
                         DisplayName="Rayfish Mesh VPN" Description="Rayfish mesh VPN daemon"
                         Start="auto" ErrorControl="normal" Account="LocalSystem"
                         Arguments="daemon" />
-        <util:ServiceConfig ServiceName="rayfish"
-                            FirstFailureActionType="restart"
-                            SecondFailureActionType="restart"
-                            ThirdFailureActionType="restart"
-                            ResetPeriodInDays="1"
-                            RestartServiceDelayInSeconds="5" />
+        <!-- No ServiceConfig here on purpose. The restart policy has one source,
+             `failure_actions()` in src/windows_service.rs, applied by the daemon
+             to its own service on every start. Declaring it here as well gave a
+             machine a different policy depending on whether the service came
+             from the MSI or from `ray install`. -->
         <!-- The first elevated `ray up` records the invoking operator SID before start. -->
         <ServiceControl Id="RayfishServiceControl" Name="rayfish"
                         Start="install" Stop="both" Remove="uninstall" Wait="yes" />

@@ -971,9 +971,21 @@ impl Daemon {
 
         // Granting operator access is reserved for root.
         if matches!(req, IpcMessage::SetOperator { .. }) {
+            #[cfg(unix)]
             return Some(ipc_err(
                 "permission denied: granting operator access requires root \
                           (re-run with sudo)"
+                    .to_string(),
+            ));
+            // There is no root here to be, and `ray set-operator` does not use
+            // this path on Windows: it writes the SID itself from an elevated
+            // process (see `cmd_set_operator`). A frame arriving here is either
+            // an older CLI or something hand-rolled, so say which command works
+            // rather than naming a privilege that does not exist.
+            #[cfg(windows)]
+            return Some(ipc_err(
+                "permission denied: set the operator from an Administrator \
+                 terminal with: ray set-operator <user>"
                     .to_string(),
             ));
         }
@@ -992,9 +1004,19 @@ impl Daemon {
             }
         }
 
-        Some(ipc_err(
+        // The one error a non-operator is most likely to see, so it has to name a
+        // command that exists on the platform reading it. Windows has no sudo,
+        // and its `set-operator` needs an elevated terminal rather than a prefix.
+        #[cfg(unix)]
+        return Some(ipc_err(
             "permission denied: this user is not authorized to control rayfish.\n\
                       Grant access with: sudo ray set-operator <user>"
+                .to_string(),
+        ));
+        #[cfg(windows)]
+        Some(ipc_err(
+            "permission denied: this user is not authorized to control rayfish.\n\
+             Grant access from an Administrator terminal with: ray set-operator <user>"
                 .to_string(),
         ))
     }

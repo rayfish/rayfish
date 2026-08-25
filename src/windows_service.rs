@@ -212,6 +212,15 @@ fn run_service() -> windows_service::Result<()> {
         _ => ServiceControlHandlerResult::NotImplemented,
     };
     let handle = service_control_handler::register(SERVICE_NAME, handler)?;
+    // [`failure_actions`] is the only description of the restart policy, and
+    // this is the only place that runs on every way the service can be
+    // installed. The MSI's `ServiceInstall` never calls `install`, so applying
+    // it there as well would either leave an MSI-installed service with no
+    // policy or give the two installation paths different ones. Best-effort: a
+    // service that cannot configure its own restarts should still start.
+    if let Err(error) = apply_own_failure_actions() {
+        tracing::warn!(%error, "could not configure the service restart policy");
+    }
     status(&handle, ServiceState::Running)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -254,6 +263,27 @@ fn start_transition(state: ServiceState) -> StartTransition {
     }
 }
 
+/// Apply [`failure_actions`] to the service this process is running as.
+///
+/// The daemon is LocalSystem, so it can open its own service for the change.
+/// Called from [`run_service`] rather than only from [`install`], because the
+/// MSI installs the service itself and never runs `ray install`.
+fn apply_own_failure_actions() -> Result<()> {
+    let scm = manager(ServiceManagerAccess::CONNECT)?;
+    let service = scm
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::START | ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG,
+        )
+        .context("open the rayfish service to configure its restart policy")?;
+    configure_failure_actions(&service)
+}
+
+/// Restart on failure, backing off 5s, 30s, 60s, with the count reset after a
+/// day of staying up. The documented panic hook `abort()`s on the assumption
+/// that the service manager restarts the process, which is true for systemd and
+/// launchd but is not the SCM default: without this a panic leaves the VPN down
+/// until someone runs `ray start` by hand.
 fn failure_actions() -> ServiceFailureActions {
     ServiceFailureActions {
         reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 60 * 60)),

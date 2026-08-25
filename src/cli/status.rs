@@ -905,13 +905,18 @@ pub(crate) async fn ipc_report() -> Result<()> {
 /// Best-effort: open `url` in the user's default browser. Returns false if no
 /// opener is available (e.g. headless), so the caller can print it instead.
 pub(crate) fn open_url(url: &str) -> bool {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
+    // Windows has no `xdg-open`, and this is the one that matters most there:
+    // the browser GUI is the only interface Windows gets. `url.dll` rather than
+    // `cmd /c start`, which needs an empty title argument before the URL and
+    // treats `&` in one as a command separator.
+    #[cfg(windows)]
+    let (opener, args): (&str, [&str; 2]) = ("rundll32.exe", ["url.dll,FileProtocolHandler", url]);
+    #[cfg(target_os = "macos")]
+    let (opener, args): (&str, [&str; 1]) = ("open", [url]);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let (opener, args): (&str, [&str; 1]) = ("xdg-open", [url]);
     std::process::Command::new(opener)
-        .arg(url)
+        .args(args)
         .status()
         .map(|s| s.success())
         .unwrap_or(false)

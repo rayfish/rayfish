@@ -135,13 +135,15 @@ pub(crate) async fn cmd_up(hostname: Option<String>) -> Result<()> {
 /// VPN), we surface the tail of its log so the user knows what went wrong
 /// instead of seeing a cheerful "started" followed by a dead `ray status`.
 pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Result<()> {
+    // The Windows counterpart of the `geteuid() != 0` precheck in `cmd_up`, kept
+    // here because every caller reaches the SCM through this function. Without
+    // it the failure surfaces as a raw access-denied from `OpenSCManager`, which
+    // does not tell anyone what to do about it.
     #[cfg(windows)]
     if !rayfish::windows_identity::is_current_process_elevated_admin() {
-        eprintln!(
-            "rayfish service is not running. Reopen this terminal as Administrator and rerun: ray up"
-        );
         anyhow::bail!(
-            "an elevated Administrator terminal is required to start the Windows service"
+            "rayfish service is not running, and installing it needs Administrator.\n\
+             Reopen this terminal as Administrator and rerun: ray up"
         );
     }
     #[cfg(windows)]

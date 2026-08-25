@@ -943,7 +943,7 @@ async fn serve_ipc(daemon: &Arc<Daemon>, token: CancellationToken) -> Result<()>
     let pipe_name = ipc::socket_path();
     let pipe_name = pipe_name.to_string_lossy().into_owned();
     let staging_dir = prepare_ipc_upload_dir()?;
-    sweep_ipc_upload_orphans(&staging_dir)?;
+    sweep_ipc_upload_orphans(&staging_dir);
     let mut server = create_named_pipe(&pipe_name, true)?;
     let mut standby = create_named_pipe(&pipe_name, false)?;
     tracing::info!(pipe = %pipe_name, "IPC named pipe listening");
@@ -1038,12 +1038,30 @@ fn is_internal_file_frame(message: &IpcMessage) -> bool {
     )
 }
 
+/// Reclaim `.part` files left by an upload the daemon died in the middle of.
+///
+/// Infallible on purpose. Every failure here is per-entry and survivable: a
+/// leftover whose handle is still held (an AV scanner mid-scan is the usual
+/// one), or a reparse point we refuse to follow. This runs on the startup path,
+/// so returning an error would take the daemon down before it ever listens, and
+/// the service's restart actions would turn that into a restart loop SCM gives
+/// up on after three attempts, leaving the VPN down with no obvious cause. An
+/// orphan surviving one boot costs nothing; the next sweep gets it.
 #[cfg(windows)]
-fn sweep_ipc_upload_orphans(dir: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("enumerate IPC upload staging directory {}", dir.display()))?
-    {
-        let entry = entry?;
+fn sweep_ipc_upload_orphans(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                %error,
+                "could not enumerate the IPC upload staging directory; skipping the orphan sweep"
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
             continue;
@@ -1051,19 +1069,24 @@ fn sweep_ipc_upload_orphans(dir: &Path) -> Result<()> {
         if !is_ipc_upload_temp_name(name) {
             continue;
         }
-        let metadata = std::fs::symlink_metadata(&path)
-            .with_context(|| format!("inspect IPC upload staging path {}", path.display()))?;
-        anyhow::ensure!(
-            metadata.file_attributes() & 0x400 == 0,
-            "refusing to sweep reparse-point IPC upload staging path {}",
-            path.display()
-        );
-        if metadata.is_file() {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("remove orphaned IPC upload {}", path.display()))?;
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        // FILE_ATTRIBUTE_REPARSE_POINT. Something planted a link where only our
+        // own staging files belong, so leave it alone and say so.
+        if metadata.file_attributes() & 0x400 != 0 {
+            tracing::warn!(
+                path = %path.display(),
+                "refusing to sweep a reparse point in the IPC upload staging directory"
+            );
+            continue;
+        }
+        if metadata.is_file()
+            && let Err(error) = std::fs::remove_file(&path)
+        {
+            tracing::warn!(path = %path.display(), %error, "could not remove an orphaned IPC upload");
         }
     }
-    Ok(())
 }
 
 #[cfg(all(test, windows))]
