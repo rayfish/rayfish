@@ -1733,8 +1733,14 @@ fn collect_recent_logs() -> Vec<(String, Vec<u8>)> {
 }
 
 /// Write `files` as a gzipped tar archive at a new, non-symlink `path`.
-/// Each entry is `(name, bytes)`. The file starts private and is only made
-/// readable after the complete archive is on disk.
+/// Each entry is `(name, bytes)`.
+///
+/// The bundle stays 0600 for its whole life when there is an `owner` to hand it
+/// to: it packs the root daemon's `rayfish=debug` logs, status dump, peer ids
+/// and mesh IPs, and `IpcMessage::Report` is an open read, so a world-readable
+/// copy sitting in `/tmp` is those logs handed to every other local user. It
+/// widens to 0644 only when the file is still root-owned and would otherwise be
+/// unreadable by the very caller that asked for it.
 fn write_bundle(
     path: &Path,
     files: &[(String, Vec<u8>)],
@@ -1760,12 +1766,30 @@ fn write_bundle(
         }
         builder.into_inner()?.finish()?;
         file.sync_all()?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
-        if let Some((uid, gid)) = owner {
-            let rc = unsafe { libc::fchown(file.as_raw_fd(), uid, gid) };
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error());
+        let given_to_requester = match owner {
+            Some((uid, gid)) => {
+                let rc = unsafe { libc::fchown(file.as_raw_fd(), uid, gid) };
+                if rc == 0 {
+                    true
+                } else {
+                    // Best-effort, as it was before the fd move: a daemon
+                    // without CAP_CHOWN, or a /tmp on a mount that refuses
+                    // ownership changes, would otherwise have its finished
+                    // archive deleted by the cleanup below and report
+                    // "Operation not permitted" with nothing to attach.
+                    tracing::warn!(
+                        error = %std::io::Error::last_os_error(),
+                        "could not hand the report bundle to the requester"
+                    );
+                    false
+                }
             }
+            None => false,
+        };
+        if !given_to_requester {
+            // Still root-owned, so the caller needs the wider mode to read it
+            // at all. This is the only path that exposes the bundle.
+            file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
         }
         Ok(())
     })();
@@ -1999,6 +2023,73 @@ mod report_tests {
 
         assert!(result.is_err(), "a report destination symlink was followed");
         assert_eq!(std::fs::read(&target).unwrap(), b"do not overwrite");
+    }
+
+    /// The bundle used to be widened to 0644 even on the path that chowns it to
+    /// the requester. `Report` is an open read and the archive packs the root
+    /// daemon's debug logs, so that left any other local user free to read them
+    /// out of `/tmp`.
+    #[test]
+    fn a_bundle_handed_to_its_requester_stays_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.tgz");
+        let files = vec![("status.txt".to_string(), b"peer ids and mesh ips".to_vec())];
+        // chowning a file to the uid/gid that already owns it is permitted for
+        // an unprivileged owner, so this takes the success branch off root too.
+        let me = (unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+
+        write_bundle(&path, &files, Some(me)).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "report bundle is readable by other local users"
+        );
+    }
+
+    /// The fallback: with nobody to give it to the bundle stays root-owned, so
+    /// it has to be readable or the caller cannot collect what it asked for.
+    #[test]
+    fn an_unowned_bundle_is_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.tgz");
+
+        write_bundle(&path, &[("status.txt".to_string(), b"x".to_vec())], None).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    /// The existing symlink test points at a file that exists, which `O_EXCL`
+    /// alone refuses. A dangling link is the case that would let a planted path
+    /// be created at the target, and it must be refused too. Neither test can
+    /// isolate `O_NOFOLLOW` while the open also carries `O_EXCL`, which fails on
+    /// any symlink: the flag is there for a future helper that opens this path
+    /// without it.
+    #[test]
+    fn test_write_bundle_refuses_a_dangling_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("not-there-yet");
+        let path = dir.path().join("bundle.tgz");
+        symlink(&target, &path).unwrap();
+
+        let result = write_bundle(
+            &path,
+            &[("status.txt".to_string(), b"sensitive report".to_vec())],
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "a dangling destination symlink was followed"
+        );
+        assert!(!target.exists(), "the symlink target was created");
     }
 
     #[test]
