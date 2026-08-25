@@ -651,8 +651,10 @@ pub(crate) fn parse_on_link_prefixes(out: &str) -> Vec<Ipv6Prefix> {
 /// suffixes stripped.
 // Same platforms as its only caller: Android has neither `ip` nor `ifconfig`,
 // and Windows reads its addresses through PowerShell, so nothing else produces
-// output for it to parse.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+// output for it to parse. `test` joins them because the parser is pure string
+// handling and its test is worth running everywhere, the same way
+// [`parse_on_link_prefixes`] is gated.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", test))]
 fn parse_host_addresses(out: &str) -> HashSet<IpAddr> {
     let mut addrs = HashSet::new();
     let mut tokens = out.split_whitespace().peekable();

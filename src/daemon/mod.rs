@@ -2300,7 +2300,65 @@ async fn broadcast_control_msg(
 
 #[cfg(test)]
 mod report_tests {
-    use super::{ReportRequester, collect_recent_logs, create_report_bundle, write_bundle};
+    use super::{ReportRequester, collect_recent_logs, sweep_prior_bundles};
+
+    /// The identity a bundle is written for, so the sweep that reclaims it is
+    /// scoped to a caller this process can actually stand in for.
+    #[cfg(unix)]
+    pub(super) fn current_requester() -> ReportRequester {
+        // chowning a file to the uid/gid that already owns it is permitted for
+        // an unprivileged owner, so this takes the success branch off root too.
+        ReportRequester::Unix {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn current_requester() -> ReportRequester {
+        ReportRequester::Windows {
+            sid: crate::windows_identity::current_user_sid()
+                .expect("a running process always has a user SID"),
+        }
+    }
+
+    /// The bound on `/tmp`: `Report` is an open read, so without the sweep any
+    /// local account could loop `ray report` and leave a fresh gzip of the
+    /// daemon's debug logs behind every time. Writing the bundles here rather
+    /// than going through `create_report_bundle` keeps the test on both
+    /// platforms: on Windows that path demands LocalSystem or an elevated
+    /// Administrator, which a test process is not.
+    #[test]
+    fn the_sweep_reclaims_the_requesters_earlier_bundles() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("rayfish-report-1-aaaaaaaaaaaaaaaa.tgz");
+        let unrelated = dir.path().join("someone-elses.tgz");
+        std::fs::write(&stale, b"old bundle").unwrap();
+        std::fs::write(&unrelated, b"not ours").unwrap();
+
+        sweep_prior_bundles(dir.path(), Some(&current_requester()));
+
+        assert!(!stale.exists(), "the caller's previous bundle was kept");
+        assert!(unrelated.exists(), "an unrelated file was deleted");
+    }
+
+    #[test]
+    fn test_collect_recent_logs_missing_dir_is_empty() {
+        // The log dir may not exist in CI / non-root test runs; must not panic.
+        let _ = collect_recent_logs();
+    }
+}
+
+/// The rest of the bundle's guarantees are POSIX ones: `O_NOFOLLOW` and
+/// `O_EXCL` on the create, `fchown` to hand it over, and mode bits to keep it
+/// private. Windows reaches the same end through an SDDL DACL on `CreateFileW`
+/// (`windows_security::create_report_file`), which only LocalSystem or an
+/// elevated Administrator may write, so there is nothing here for a test
+/// process on that platform to assert.
+#[cfg(all(test, unix))]
+mod report_permission_tests {
+    use super::report_tests::current_requester;
+    use super::{create_report_bundle, write_bundle};
 
     #[test]
     fn test_write_bundle_is_valid_targz() {
@@ -2359,14 +2417,8 @@ mod report_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bundle.tgz");
         let files = vec![("status.txt".to_string(), b"peer ids and mesh ips".to_vec())];
-        // chowning a file to the uid/gid that already owns it is permitted for
-        // an unprivileged owner, so this takes the success branch off root too.
-        let me = ReportRequester::Unix {
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
-        };
 
-        write_bundle(&path, &files, Some(&me)).unwrap();
+        write_bundle(&path, &files, Some(&current_requester())).unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
@@ -2436,15 +2488,11 @@ mod report_tests {
         // A symlink wearing the bundle name: /tmp is world-writable and this
         // runs as root, so the sweep must not follow it.
         symlink(&victim, &planted).unwrap();
-        let me = ReportRequester::Unix {
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
-        };
 
         let fresh = create_report_bundle(
             dir.path(),
             &[("status.txt".to_string(), b"report".to_vec())],
-            Some(&me),
+            Some(&current_requester()),
         )
         .unwrap();
 
@@ -2456,12 +2504,6 @@ mod report_tests {
             b"do not delete",
             "the sweep followed a planted symlink"
         );
-    }
-
-    #[test]
-    fn test_collect_recent_logs_missing_dir_is_empty() {
-        // The log dir may not exist in CI / non-root test runs; must not panic.
-        let _ = collect_recent_logs();
     }
 }
 
