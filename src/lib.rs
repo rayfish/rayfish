@@ -82,6 +82,9 @@ pub mod ipc;
 // for the same reason it is.
 #[cfg(feature = "desktop")]
 mod listen_events;
+// Shared by `ssh` and `v4bridge`, so it cannot live in `ssh`: that module is
+// Unix-only and `v4bridge` is not.
+mod listener;
 pub mod logdir;
 pub mod membership;
 pub mod network_name;

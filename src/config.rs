@@ -8,6 +8,7 @@ use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+#[cfg(not(windows))]
 use std::sync::atomic::{AtomicU64, Ordering};
 // Only the test-only `CONFIG_ENV_LOCK` holds one.
 #[cfg(test)]
@@ -1017,7 +1018,9 @@ fn validate_net_name(name: &str) -> Result<()> {
 }
 
 /// Serial number for temp file names, so two writers in this process never
-/// share one. See [`write_file`].
+/// share one. See [`write_file`], which uses an unguessable nonce on Windows
+/// instead and so needs no counter.
+#[cfg(not(windows))]
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Re-establish the durability barrier for a file already in place: fsync the

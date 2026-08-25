@@ -39,7 +39,9 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use iroh_metrics::service::MetricsServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -170,6 +172,34 @@ impl PeerIdentity {
     fn unix_cred(&self) -> Option<(u32, u32)> {
         None
     }
+
+    /// This caller in the form [`create_report_bundle`] opens the bundle to.
+    fn report_requester(&self) -> ReportRequester {
+        match self {
+            #[cfg(unix)]
+            Self::Unix { uid, gid } => ReportRequester::Unix {
+                uid: *uid,
+                gid: *gid,
+            },
+            #[cfg(windows)]
+            Self::Windows { sid, .. } => ReportRequester::Windows { sid: sid.clone() },
+        }
+    }
+}
+
+/// Who asked for a diagnostics bundle, in whatever form the platform can hand a
+/// file to.
+///
+/// The bundle packs the root daemon's `rayfish=debug` logs, peer ids and mesh
+/// addresses, and `IpcMessage::Report` sits in the open-reads tier, so it is
+/// created readable by nobody and then opened to exactly this caller: chowned on
+/// Unix, granted read by SID on Windows. Not a `(u32, u32)`, because the two
+/// platforms do not agree on what identifies a caller.
+pub(crate) enum ReportRequester {
+    #[cfg(unix)]
+    Unix { uid: u32, gid: u32 },
+    #[cfg(windows)]
+    Windows { sid: String },
 }
 
 // `Daemon`'s IPC operations are split by domain into the `mesh/` submodule;
@@ -1250,7 +1280,7 @@ impl Daemon {
             IpcMessage::Nuke { name, force } => self.registry.nuke_network(&name, force).await,
             IpcMessage::Kick { network, peer } => self.registry.kick_member(&network, &peer).await,
             IpcMessage::Status => self.status(),
-            IpcMessage::Report => self.build_report(peer_cred),
+            IpcMessage::Report => self.build_report(peer.as_ref()),
             IpcMessage::Up { hostname } => self.activate(hostname).await,
             IpcMessage::Down => self.deactivate().await,
             IpcMessage::Shutdown => {
@@ -1937,16 +1967,9 @@ fn collect_recent_logs() -> Vec<(String, Vec<u8>)> {
 fn write_bundle(
     path: &Path,
     files: &[(String, Vec<u8>)],
-    owner: Option<(u32, u32)>,
+    owner: Option<&ReportRequester>,
 ) -> std::io::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let mut file = create_bundle_file(path, owner)?;
     let result = (|| {
         let enc = flate2::write::GzEncoder::new(&mut file, flate2::Compression::default());
         let mut builder = tar::Builder::new(enc);
@@ -1959,37 +1982,86 @@ fn write_bundle(
         }
         builder.into_inner()?.finish()?;
         file.sync_all()?;
-        let given_to_requester = match owner {
-            Some((uid, gid)) => {
-                let rc = unsafe { libc::fchown(file.as_raw_fd(), uid, gid) };
-                if rc == 0 {
-                    true
-                } else {
-                    // Best-effort, as it was before the fd move: a daemon
-                    // without CAP_CHOWN, or a /tmp on a mount that refuses
-                    // ownership changes, would otherwise have its finished
-                    // archive deleted by the cleanup below and report
-                    // "Operation not permitted" with nothing to attach.
-                    tracing::warn!(
-                        error = %std::io::Error::last_os_error(),
-                        "could not hand the report bundle to the requester"
-                    );
-                    false
-                }
-            }
-            None => false,
-        };
-        if !given_to_requester {
-            // Still root-owned, so the caller needs the wider mode to read it
-            // at all. This is the only path that exposes the bundle.
-            file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
-        }
-        Ok(())
+        hand_bundle_to_requester(&file, owner)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(path);
     }
     result
+}
+
+/// The bundle's file, created exclusively and readable by nobody else yet.
+#[cfg(unix)]
+fn create_bundle_file(path: &Path, _owner: Option<&ReportRequester>) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// The Windows counterpart. `CREATE_NEW` is what `O_NOFOLLOW` is here: it fails
+/// on anything already at the path, a planted reparse point included. The DACL
+/// names the requester at creation rather than being widened afterwards, since
+/// Windows has no ownership handoff to widen *from*.
+#[cfg(windows)]
+fn create_bundle_file(path: &Path, owner: Option<&ReportRequester>) -> std::io::Result<File> {
+    let ReportRequester::Windows { sid } = match owner {
+        Some(owner) => owner,
+        // No identified caller, so nobody beyond SYSTEM and Administrators gets
+        // to read the daemon's logs.
+        None => return crate::windows_security::create_report_file(path, None).map_err(to_io),
+    };
+    crate::windows_security::create_report_file(path, Some(sid)).map_err(to_io)
+}
+
+#[cfg(windows)]
+fn to_io(error: anyhow::Error) -> std::io::Error {
+    std::io::Error::other(format!("{error:#}"))
+}
+
+/// Open the finished bundle to whoever asked for it.
+///
+/// Unix only: on Windows the DACL was set when the file was created, because
+/// there is no equivalent of "still root-owned, so widen the mode".
+#[cfg(unix)]
+fn hand_bundle_to_requester(file: &File, owner: Option<&ReportRequester>) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let given_to_requester = match owner {
+        Some(ReportRequester::Unix { uid, gid }) => {
+            let rc = unsafe { libc::fchown(file.as_raw_fd(), *uid, *gid) };
+            if rc == 0 {
+                true
+            } else {
+                // Best-effort, as it was before the fd move: a daemon
+                // without CAP_CHOWN, or a /tmp on a mount that refuses
+                // ownership changes, would otherwise have its finished
+                // archive deleted by the cleanup below and report
+                // "Operation not permitted" with nothing to attach.
+                tracing::warn!(
+                    error = %std::io::Error::last_os_error(),
+                    "could not hand the report bundle to the requester"
+                );
+                false
+            }
+        }
+        None => false,
+    };
+    if !given_to_requester {
+        // Still root-owned, so the caller needs the wider mode to read it
+        // at all. This is the only path that exposes the bundle.
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn hand_bundle_to_requester(_file: &File, _owner: Option<&ReportRequester>) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Delete `uid`'s earlier bundles in `dir`.
@@ -2005,9 +2077,19 @@ fn write_bundle(
 /// narrow: `symlink_metadata` does not follow a planted link, and only a regular
 /// file owned by the same uid whose name matches the bundle pattern is removed.
 /// A reader holding one open keeps it until they close it.
-fn sweep_prior_bundles(dir: &Path, uid: u32) {
+fn sweep_prior_bundles(dir: &Path, owner: Option<&ReportRequester>) {
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
 
+    // Only this caller's own bundles. On Unix that is a uid comparison, and the
+    // daemon's own euid when the caller is unidentified.
+    #[cfg(unix)]
+    let uid = match owner {
+        Some(ReportRequester::Unix { uid, .. }) => *uid,
+        None => unsafe { libc::geteuid() },
+    };
+    #[cfg(windows)]
+    let _ = owner;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -2018,12 +2100,23 @@ fn sweep_prior_bundles(dir: &Path, uid: u32) {
             continue;
         }
         let path = entry.path();
-        if let Ok(md) = std::fs::symlink_metadata(&path)
-            && md.is_file()
-            && md.uid() == uid
-        {
-            let _ = std::fs::remove_file(&path);
+        let Ok(md) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !md.is_file() {
+            continue;
         }
+        // `std::fs::Metadata` carries no owner on Windows, and reading one back
+        // would mean a `GetSecurityInfo` round trip per entry. It is not needed:
+        // every bundle in this directory was written by this daemon for a caller
+        // the pipe DACL already limits to Administrators and the operator, so
+        // there is no other account's file here to protect. A bundle someone
+        // still has open refuses to be deleted, and the next sweep gets it.
+        #[cfg(unix)]
+        if md.uid() != uid {
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -2031,15 +2124,10 @@ fn sweep_prior_bundles(dir: &Path, uid: u32) {
 fn create_report_bundle(
     dir: &Path,
     files: &[(String, Vec<u8>)],
-    owner: Option<(u32, u32)>,
+    owner: Option<&ReportRequester>,
 ) -> std::io::Result<PathBuf> {
     // Reclaim the caller's previous bundles first; the new one replaces them.
-    sweep_prior_bundles(
-        dir,
-        owner
-            .map(|(uid, _)| uid)
-            .unwrap_or(unsafe { libc::geteuid() }),
-    );
+    sweep_prior_bundles(dir, owner);
     for _ in 0..16 {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2212,7 +2300,7 @@ async fn broadcast_control_msg(
 
 #[cfg(test)]
 mod report_tests {
-    use super::{collect_recent_logs, create_report_bundle, write_bundle};
+    use super::{ReportRequester, collect_recent_logs, create_report_bundle, write_bundle};
 
     #[test]
     fn test_write_bundle_is_valid_targz() {
@@ -2273,9 +2361,12 @@ mod report_tests {
         let files = vec![("status.txt".to_string(), b"peer ids and mesh ips".to_vec())];
         // chowning a file to the uid/gid that already owns it is permitted for
         // an unprivileged owner, so this takes the success branch off root too.
-        let me = (unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+        let me = ReportRequester::Unix {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        };
 
-        write_bundle(&path, &files, Some(me)).unwrap();
+        write_bundle(&path, &files, Some(&me)).unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
@@ -2345,12 +2436,15 @@ mod report_tests {
         // A symlink wearing the bundle name: /tmp is world-writable and this
         // runs as root, so the sweep must not follow it.
         symlink(&victim, &planted).unwrap();
-        let me = (unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+        let me = ReportRequester::Unix {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        };
 
         let fresh = create_report_bundle(
             dir.path(),
             &[("status.txt".to_string(), b"report".to_vec())],
-            Some(me),
+            Some(&me),
         )
         .unwrap();
 

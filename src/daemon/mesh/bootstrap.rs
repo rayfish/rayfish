@@ -1156,7 +1156,18 @@ async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Res
         is_elevated_admin: identity.is_elevated_admin,
     });
     let mut framed = ipc::framed(stream);
-    let req = ipc::recv(&mut framed).await?;
+    // A request this build cannot decode gets the reason back, the same as on
+    // Unix. Dropping the connection instead leaves the client reporting a dead
+    // daemon, and `cmd_up` acts on that by trying to install the service.
+    let req = match ipc::recv(&mut framed).await {
+        Ok(req) => req,
+        Err(e) => {
+            let msg = truncate(&format!("{e:#}"));
+            tracing::debug!(error = %msg, "undecodable IPC request");
+            let _ = ipc::send(&mut framed, ipc_err(msg)).await;
+            return Ok(());
+        }
+    };
     if is_internal_file_frame(&req) {
         ipc::send(
             &mut framed,
@@ -1167,6 +1178,25 @@ async fn handle_ipc_client(stream: NamedPipeServer, daemon: &Arc<Daemon>) -> Res
         )
         .await?;
         return Ok(());
+    }
+    // `Logs` answers with a run of frames rather than one message, so it keeps
+    // the connection instead of going through `handle_request`. Same open-read
+    // authorization tier as `Status` and `Report`, and the same handler the Unix
+    // path uses.
+    if let IpcMessage::Logs { since, follow } = &req {
+        let (since, follow) = (*since, *follow);
+        if let Some(denied) = Daemon::check_authorized(&req, peer.as_ref()) {
+            let _ = ipc::send(&mut framed, denied).await;
+            return Ok(());
+        }
+        return super::diagnostics::stream_logs(
+            &crate::logdir::log_dir(),
+            &mut framed,
+            since,
+            follow,
+            &daemon.shutdown_token,
+        )
+        .await;
     }
     if matches!(req, ipc::IpcMessage::SendFileBegin { .. })
         && let Some(error) = Daemon::check_authorized(&req, peer.as_ref())

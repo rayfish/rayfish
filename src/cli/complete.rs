@@ -779,8 +779,20 @@ fn user_path(shell: Shell) -> Option<PathBuf> {
     })
 }
 
+/// Whether this process may write the system-wide completion directories.
+///
+/// Windows has no euid; an elevated Administrator is what corresponds to root
+/// for writing under `%ProgramData%`, and it is the same check `ray up` makes
+/// before touching the service.
 fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(windows)]
+    {
+        rayfish::windows_identity::is_current_process_elevated_admin()
+    }
 }
 
 /// Write one stub, or leave the file alone when it already says this.

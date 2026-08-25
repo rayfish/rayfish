@@ -91,6 +91,19 @@ impl SearchDomain {
     fn is_ours(&self) -> bool {
         self.0 == DNS_DOMAIN || self.0.ends_with(&format!(".{DNS_DOMAIN}"))
     }
+
+    /// The bare network name this was built from, for a `<network>.ray`.
+    ///
+    /// `None` for the `ray` root and for anything captured from the host, which
+    /// name no network of ours. Windows wants both forms and is handed only
+    /// this list, so the split happens here rather than by re-splitting strings
+    /// at the call site, which is the confusion the type exists to prevent.
+    #[cfg(any(windows, test))]
+    fn network_name(&self) -> Option<&str> {
+        self.0
+            .strip_suffix(&format!(".{DNS_DOMAIN}"))
+            .filter(|name| !name.is_empty() && !name.contains('.'))
+    }
 }
 
 impl std::fmt::Display for SearchDomain {
@@ -368,7 +381,7 @@ pub(crate) async fn set_manager_search_domains(
     }
     #[cfg(windows)]
     {
-        set_search_domains_windows(rayfish_domains, network_names, tun_name).await
+        set_search_domains_windows(rayfish_domains, tun_name).await
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -416,7 +429,7 @@ impl DnsConfigurator for WindowsDns {
         let result = powershell_status(&format!(
             "Set-DnsClientServerAddress -InterfaceAlias '{}' -ServerAddresses '{}'",
             ps_quote(&self.interface_alias),
-            RESOLVER_IP
+            resolver_addr()
         ))
         .await;
         if result.is_err() {
@@ -572,7 +585,7 @@ fn touched_rule_displays(
             && rules[0].namespace.len() == 1
             && rules[0].namespace[0] == namespace
             && rules[0].name_servers.len() == 1
-            && rules[0].name_servers[0] == RESOLVER_IP;
+            && rules[0].name_servers[0] == resolver_addr().to_string();
         if !exact {
             touched.insert(display);
         }
@@ -591,8 +604,11 @@ fn windows_dns_reconcile_script(
     let suffix_desired = ps_array(suffix_domains);
     let next_managed = ps_array(managed_suffixes);
     let transaction_id = ps_quote(transaction_id);
+    // The `.ray` nameserver every NRPT rule points at. Rendered once so the two
+    // places the script names it cannot drift apart.
+    let resolver = resolver_addr();
     format!(
-        "$statePath='HKLM:\\SOFTWARE\\Rayfish'; $desired={desired}; $suffixDesired={suffix_desired}; $nextManaged={next_managed}; $txnMarker='{transaction_id}'; $current=@((Get-DnsClientGlobalSetting).SuffixSearchList); $marker=$null; if (Test-Path $statePath) {{ $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }}; $previousManaged=if ($null -eq $marker) {{ @() }} else {{ @($marker.ManagedDnsSuffixes) }}; $foreign=@($current | Where-Object {{ $previousManaged -notcontains $_ }}); $next=@($foreign + $suffixDesired | Select-Object -Unique); $owned=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }}); foreach ($rule in $owned) {{ $domain=$rule.DisplayName.Substring(8); if ($desired -notcontains $domain) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }} }}; foreach ($domain in $desired) {{ $display='rayfish:'+$domain; $namespace='.'+$domain; $matches=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -eq $display }}); $valid=@($matches | Where-Object {{ @($_.Namespace).Count -eq 1 -and @($_.Namespace)[0] -eq $namespace -and @($_.NameServers).Count -eq 1 -and @($_.NameServers)[0] -eq '{RESOLVER_IP}' }}); if ($matches.Count -ne 1 -or $valid.Count -ne 1) {{ foreach ($rule in $matches) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }}; Add-DnsClientNrptRule -Namespace $namespace -NameServers '{RESOLVER_IP}' -DisplayName $display -Comment $txnMarker -ErrorAction Stop }} }}; New-Item -Path $statePath -Force -ErrorAction Stop | Out-Null; Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixTransaction -Value $txnMarker -ErrorAction Stop; Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixExpected -Value ([string[]]$next) -ErrorAction Stop; if ($nextManaged.Count -eq 0) {{ Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }} else {{ Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -Value ([string[]]$nextManaged) -ErrorAction Stop }}; Set-DnsClientGlobalSetting -SuffixSearchList $next -ErrorAction Stop; Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixTransaction -ErrorAction SilentlyContinue; Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixExpected -ErrorAction SilentlyContinue"
+        "$statePath='HKLM:\\SOFTWARE\\Rayfish'; $desired={desired}; $suffixDesired={suffix_desired}; $nextManaged={next_managed}; $txnMarker='{transaction_id}'; $current=@((Get-DnsClientGlobalSetting).SuffixSearchList); $marker=$null; if (Test-Path $statePath) {{ $marker=Get-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }}; $previousManaged=if ($null -eq $marker) {{ @() }} else {{ @($marker.ManagedDnsSuffixes) }}; $foreign=@($current | Where-Object {{ $previousManaged -notcontains $_ }}); $next=@($foreign + $suffixDesired | Select-Object -Unique); $owned=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -like 'rayfish:*' }}); foreach ($rule in $owned) {{ $domain=$rule.DisplayName.Substring(8); if ($desired -notcontains $domain) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }} }}; foreach ($domain in $desired) {{ $display='rayfish:'+$domain; $namespace='.'+$domain; $matches=@(Get-DnsClientNrptRule | Where-Object {{ $_.DisplayName -eq $display }}); $valid=@($matches | Where-Object {{ @($_.Namespace).Count -eq 1 -and @($_.Namespace)[0] -eq $namespace -and @($_.NameServers).Count -eq 1 -and @($_.NameServers)[0] -eq '{resolver}' }}); if ($matches.Count -ne 1 -or $valid.Count -ne 1) {{ foreach ($rule in $matches) {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop }}; Add-DnsClientNrptRule -Namespace $namespace -NameServers '{resolver}' -DisplayName $display -Comment $txnMarker -ErrorAction Stop }} }}; New-Item -Path $statePath -Force -ErrorAction Stop | Out-Null; Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixTransaction -Value $txnMarker -ErrorAction Stop; Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixExpected -Value ([string[]]$next) -ErrorAction Stop; if ($nextManaged.Count -eq 0) {{ Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -ErrorAction SilentlyContinue }} else {{ Set-ItemProperty -Path $statePath -Name ManagedDnsSuffixes -Value ([string[]]$nextManaged) -ErrorAction Stop }}; Set-DnsClientGlobalSetting -SuffixSearchList $next -ErrorAction Stop; Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixTransaction -ErrorAction SilentlyContinue; Remove-ItemProperty -Path $statePath -Name ManagedDnsSuffixExpected -ErrorAction SilentlyContinue"
     )
 }
 
@@ -716,24 +732,33 @@ async fn reset_wintun_dns(interface_alias: &str) -> Result<()> {
     powershell_status(&reset_wintun_dns_script(interface_alias)).await
 }
 
+/// Reconcile the machine's NRPT rules and DNS suffix search list.
+///
+/// The two lists are deliberately different. NRPT namespaces route a query to
+/// our resolver, and get the bare network names as well as the `.ray` domains,
+/// so `box.homelab` resolves and not only `box.homelab.ray`. The suffix search
+/// list is machine-wide and only gets the `.ray` domains: a bare `homelab` in
+/// there would be appended to every unqualified lookup on the host, and it is
+/// not a suffix anyone else's names live under.
 #[cfg(windows)]
-async fn set_search_domains_windows(
-    rayfish_domains: &[String],
-    network_names: &[String],
-    _tun_name: &str,
-) -> Result<()> {
+async fn set_search_domains_windows(domains: &[SearchDomain], _tun_name: &str) -> Result<()> {
+    let rayfish_domains: Vec<String> = domains.iter().map(|d| d.as_str().to_owned()).collect();
+    let network_names: Vec<String> = domains
+        .iter()
+        .filter_map(|d| d.network_name().map(str::to_owned))
+        .collect();
     let _transaction = WINDOWS_DNS_TRANSACTION.lock().await;
     let snapshot_text = powershell_text(windows_dns_snapshot_script()).await?;
     let snapshot: WindowsDnsSnapshot =
         serde_json::from_str(&snapshot_text).context("parse Windows DNS snapshot")?;
     let transaction_id = next_windows_dns_transaction_id();
-    let nrpt_domains = windows_nrpt_domains(rayfish_domains, network_names);
-    let managed_suffixes = next_managed_suffixes(&snapshot, rayfish_domains);
-    let expected_suffixes = expected_suffixes_after(&snapshot, rayfish_domains);
+    let nrpt_domains = windows_nrpt_domains(&rayfish_domains, &network_names);
+    let managed_suffixes = next_managed_suffixes(&snapshot, &rayfish_domains);
+    let expected_suffixes = expected_suffixes_after(&snapshot, &rayfish_domains);
     let touched_displays = touched_rule_displays(&snapshot, &nrpt_domains);
     let mutation = powershell_status(&windows_dns_reconcile_script(
         &nrpt_domains,
-        rayfish_domains,
+        &rayfish_domains,
         &managed_suffixes,
         &transaction_id,
     ))
@@ -2679,6 +2704,35 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     use super::{nsswitch_uses_resolve, resolv_conf_points_at_resolved};
+
+    /// Windows is handed only the search domains and has to recover the bare
+    /// network names from them, for the NRPT namespaces. The two lists must not
+    /// be interchangeable: a bare `homelab` in the machine-wide
+    /// `SuffixSearchList` would be appended to every unqualified lookup on the
+    /// host, and it survived `ray down` and uninstall once because it was never
+    /// recorded as one of ours.
+    #[test]
+    fn only_a_network_dot_ray_yields_a_network_name() {
+        fn names(domains: &[SearchDomain]) -> Vec<String> {
+            domains
+                .iter()
+                .filter_map(SearchDomain::network_name)
+                .map(str::to_owned)
+                .collect()
+        }
+
+        assert_eq!(
+            names(&search_domains_for(&networks(&["homelab"]))),
+            ["homelab"]
+        );
+        // The `ray` root is in every list and names no network.
+        assert!(names(&search_domains_for(&[])).is_empty());
+        // Nothing the host already had is ours to turn into a namespace, even
+        // when it happens to end in our domain.
+        assert!(names(&host(&["corp", "other.example.com"])).is_empty());
+        // A deeper name under `.ray` is not a network either.
+        assert!(names(&host(&["box.homelab.ray"])).is_empty());
+    }
 
     #[test]
     fn resolv_conf_is_ours_detects_marker() {

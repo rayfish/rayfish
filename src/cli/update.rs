@@ -6,6 +6,7 @@
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
 #[cfg(target_os = "macos")]
 use std::process::Stdio;
@@ -481,6 +482,12 @@ pub(crate) fn print_daemon_log_tail() {
     }
 }
 
+/// Run a command, reporting a non-zero exit rather than failing on it.
+///
+/// Every caller is a service-manager invocation (`systemctl`, `launchctl`,
+/// `journalctl`), so there is nothing for it to do on Windows, where the SCM is
+/// driven through `windows_service` rather than a process.
+#[cfg(unix)]
 pub(crate) fn run_cmd(program: &str, args: &[&str]) {
     match Command::new(program).args(args).status() {
         Ok(status) if status.success() => {}

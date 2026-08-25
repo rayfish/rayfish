@@ -204,6 +204,48 @@ pub(crate) fn create_protected_new_file(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Create a diagnostics bundle readable by SYSTEM, Administrators, and the SID
+/// that asked for it.
+///
+/// Windows' answer to the `fchown` the Unix path does: the caller cannot be
+/// made the owner, so it is named in the DACL at creation instead. `requester`
+/// is `None` when nothing identified the caller, which leaves the bundle to the
+/// two trusted principals. Read-only for the requester (`FR`), because the file
+/// is something to collect, not something to edit.
+///
+/// `CREATE_NEW` plus `FILE_FLAG_OPEN_REPARSE_POINT` is the same refusal to
+/// follow a planted link that `O_NOFOLLOW` gives the Unix path.
+pub(crate) fn create_report_file(path: &Path, requester: Option<&str>) -> Result<File> {
+    let owner = current_trusted_owner()
+        .context("writing a diagnostics bundle requires LocalSystem or elevated Administrator")?;
+    let owner = match owner {
+        TrustedOwner::LocalSystem => "SY",
+        TrustedOwner::Administrators => "BA",
+    };
+    let sddl = match requester {
+        Some(sid) => format!("O:{owner}D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;{sid})"),
+        None => format!("O:{owner}{PROTECTED_FILE_DACL}"),
+    };
+    let mut descriptor = OwnedSecurityDescriptor::from_sddl(&sddl)?;
+    let attrs = descriptor.attributes();
+    let handle = unsafe {
+        CreateFileW(
+            wide(path.as_os_str()).as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ,
+            &attrs,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("creating diagnostics bundle {}", path.display()));
+    }
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
 /// Reopens a protected file without following a reparse point and keeps a
 /// non-delete-sharing handle alive across the privileged consumer operation.
 pub(crate) fn open_protected_file_no_follow(path: &Path) -> Result<File> {
