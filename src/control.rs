@@ -183,6 +183,16 @@ pub enum ControlMsg {
         /// pubkey before adopting (see `admin_grant_key_valid`).
         #[serde(default)]
         direct_key: Option<[u8; 32]>,
+        /// Exact network-key-signed record for the admitted generation above.
+        /// Present with `direct_key`, so the new co-coordinator can bind durable
+        /// authority to the complete blob without racing a second DHT resolve.
+        #[serde(default)]
+        direct_record: Option<Vec<u8>>,
+        /// Whether publication of `direct_record` was confirmed before Welcome.
+        /// False is a locally pending authoritative generation that this new
+        /// key-holder must preserve and publish before accepting another record.
+        #[serde(default)]
+        direct_record_published: bool,
     },
     /// Notify connected members that the signed group blob changed. Payload-free:
     /// a *trigger only*. Receivers reconverge from the network-key-signed pkarr
@@ -816,6 +826,8 @@ mod tests {
                 device_cert: None,
             }],
             direct_key: Some([7u8; 32]),
+            direct_record: Some(vec![1, 2, 3]),
+            direct_record_published: true,
         };
         let bytes = encode_msg(None, &msg);
         let decoded = decode_msg(&bytes).unwrap();

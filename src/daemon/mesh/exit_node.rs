@@ -814,37 +814,36 @@ impl NetworkRegistry {
         set: impl Fn(&mut Member) -> bool,
     ) {
         let user_id = self.device_user_map.resolve(&sender);
-        let changed = match self.networks.get(network) {
-            Some(h) => {
-                let mut s = h.state.write().unwrap();
-                if s.network_secret_key.is_none() {
-                    tracing::debug!(network = %network, "{what} received but we hold no network key; ignoring");
-                    return;
-                }
-                // The roster keys a member by its own identity, which for a paired
-                // multi-device peer is the user identity rather than the device id
-                // the datagram arrived under. Try both.
-                let Some(id) = [sender, user_id]
-                    .into_iter()
-                    .find(|id| s.members.get(id).is_some())
-                else {
-                    tracing::warn!(
-                        network = %network,
-                        sender = %sender.fmt_short(),
-                        "{what} from a peer the roster does not list; ignoring"
-                    );
-                    return;
-                };
-                let changed = match s.members.get_mut(&id) {
-                    Some(member) => set(member),
-                    None => false,
-                };
-                if changed {
-                    s.refresh_snapshot();
-                }
-                changed
-            }
+        let (state, dht_notify) = match self.networks.get(network) {
+            Some(h) => (h.state.clone(), h.dht_notify.clone()),
             None => return,
+        };
+        let snapshot_commit = state.read().unwrap().snapshot_commit.clone();
+        let _commit_guard = snapshot_commit.lock().await;
+        let changed = {
+            let mut s = state.write().unwrap();
+            if s.network_secret_key.is_none() {
+                tracing::debug!(network = %network, "{what} received but we hold no network key; ignoring");
+                return;
+            }
+            // The roster keys a member by its own identity, which for a paired
+            // multi-device peer is the user identity rather than the device id
+            // the datagram arrived under. Try both.
+            let Some(id) = [sender, user_id]
+                .into_iter()
+                .find(|id| s.members.get(id).is_some())
+            else {
+                tracing::warn!(
+                    network = %network,
+                    sender = %sender.fmt_short(),
+                    "{what} from a peer the roster does not list; ignoring"
+                );
+                return;
+            };
+            match s.members.get_mut(&id) {
+                Some(member) => set(member),
+                None => false,
+            }
         };
         tracing::debug!(
             network = %network,
@@ -853,7 +852,7 @@ impl NetworkRegistry {
             "{what} recorded"
         );
         if changed {
-            self.store_and_publish_group(network).await;
+            commit_current_snapshot(&state, &self.transport.blob_store, &dht_notify).await;
         }
     }
 }

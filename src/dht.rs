@@ -13,7 +13,7 @@ use url::Url;
 
 const RECORD_NAME: &str = "_rayfish";
 const RECORD_VERSION: &str = "v1";
-const RECORD_TTL: u32 = 300;
+pub(crate) const RECORD_TTL: u32 = 300;
 const PKARR_RELAY_URL: &str = "https://dns.iroh.link/pkarr";
 
 /// Cap on a single record resolution. The relay is plain HTTPS and iroh's
@@ -21,6 +21,9 @@ const PKARR_RELAY_URL: &str = "https://dns.iroh.link/pkarr";
 /// stopped resolving the relay's own name) would otherwise leave `ray join`
 /// hanging with nothing on screen.
 const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Bound publication too: snapshot commits wait behind an in-flight publish so
+/// an older record cannot land after a newer recovery pointer.
+const PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Process-wide pkarr relay URL, set once at daemon startup from the
 /// `discovery-dns` config. The discovery server is a set-once constant for the
@@ -196,12 +199,16 @@ pub async fn publish_network(
     key: &SecretKey,
     blob_hash: &blake3::Hash,
     seed_peers: &[EndpointId],
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     let packet = encode_network_record(key, blob_hash, seed_peers)?;
-    client
-        .publish(&packet)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to publish network record: {e:#}"))
+    match tokio::time::timeout(PUBLISH_TIMEOUT, client.publish(&packet)).await {
+        Ok(Ok(())) => Ok(packet.as_bytes().to_vec()),
+        Ok(Err(e)) => Err(anyhow::anyhow!("failed to publish network record: {e:#}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "timed out publishing network record after {}s",
+            PUBLISH_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// Resolves the raw signed network record packet. Use this when you need fields
