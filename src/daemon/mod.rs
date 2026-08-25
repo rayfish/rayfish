@@ -311,10 +311,20 @@ struct GroupSnapshot {
 /// publisher, poller, and cleanup tasks for that network.
 pub(crate) type SharedNetworkState = Arc<RwLock<NetworkState>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingSnapshotDurability {
+    hash: blake3::Hash,
+    /// Whether the exact generation came from a verified published record.
+    published: bool,
+}
+
 pub(crate) struct NetworkState {
     members: MemberList,
     approved: ApprovedList,
     snapshot: Option<GroupSnapshot>,
+    /// Serializes durable snapshot-pointer updates with DHT publication for this
+    /// network. Clone the Arc under the state read lock, then await it separately.
+    snapshot_commit: Arc<AsyncMutex<()>>,
     /// The hash of the signed record this state is converged on, which is not
     /// always the hash of [`Self::snapshot`].
     ///
@@ -331,9 +341,18 @@ pub(crate) struct NetworkState {
     /// So convergence is tracked as what we last accepted, and the snapshot stays
     /// what we would publish.
     converged_hash: Option<blake3::Hash>,
+    /// The current generation's config rename may have landed but its durability
+    /// barrier failed. No generation can be published or welcomed until an exact
+    /// retry succeeds; durably persisting a newer current generation supersedes
+    /// and clears an older ambiguity.
+    unconfirmed_durable_hash: Option<PendingSnapshotDurability>,
     network_secret_key: Option<SecretKey>,
     network_public_key: EndpointId,
+    /// Local config/runtime alias used to index this network on this device.
     network_name: Option<String>,
+    /// Name carried by the signed GroupBlob. It must not be replaced by a local
+    /// join alias, because a later promotion may make this node a publisher.
+    group_name: Option<String>,
     /// Access mode (open auto-admits; restricted gates unknown joiners). Only the
     /// coordinator's accept path consults this; members default to `Restricted`.
     mode: GroupMode,
@@ -416,7 +435,7 @@ impl NetworkState {
             &self.members,
             &self.approved,
             &self.suggested_firewall,
-            self.network_name.as_deref(),
+            self.group_name.as_deref(),
             &self.reusable_keys,
             &self.nullifiers,
         );
@@ -1999,10 +2018,13 @@ mod accept_handler_tests {
             members: MemberList::new(),
             approved: ApprovedList::new(),
             snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
             converged_hash: None,
+            unconfirmed_durable_hash: None,
             network_secret_key: None,
             network_public_key: net_pub,
             network_name: Some("test-net".to_string()),
+            group_name: Some("test-net".to_string()),
             mode: GroupMode::Restricted,
             suggested_firewall: SuggestedFirewall::default(),
             reusable_keys: BTreeMap::new(),
@@ -2011,6 +2033,21 @@ mod accept_handler_tests {
             pending: HashMap::new(),
             last_record_timestamp: None,
         }))
+    }
+
+    #[test]
+    fn local_network_alias_never_rewrites_the_signed_group_name() {
+        let state = make_network_state();
+        let bytes = {
+            let mut state = state.write().unwrap();
+            state.network_name = Some("my-local-alias".to_string());
+            state.group_name = Some("signed-network-name".to_string());
+            state.refresh_snapshot();
+            state.snapshot.as_ref().unwrap().msgpack_bytes.clone()
+        };
+
+        let blob = crate::membership::decode_group_blob(&bytes).unwrap();
+        assert_eq!(blob.name.as_deref(), Some("signed-network-name"));
     }
 
     /// Convergence is tracked as the hash we accepted, not the hash of our own
@@ -2275,7 +2312,6 @@ mod accept_handler_tests {
             ),
             network_name: "test-net".to_string(),
             state: make_network_state(),
-            token: CancellationToken::new(),
             net_pubkey: SecretKey::from_bytes(&[1u8; 32]).public(),
             my_identity: my_id,
             endpoint,

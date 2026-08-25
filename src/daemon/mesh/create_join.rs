@@ -20,6 +20,8 @@ struct JoinContext<'a> {
     my_hostname: &'a str,
     alpn: &'a [u8],
     net_pubkey: EndpointId,
+    /// Exact GroupBlob hash committed by the signed record used for this join.
+    group_hash: blake3::Hash,
     /// Single-use invite secret to redeem at admission, if any. Cloned per dial
     /// attempt (a fresh join may try several coordinators).
     invite: Option<Vec<u8>>,
@@ -54,9 +56,114 @@ enum VersionGate {
 /// mesh protocol version.
 struct ResolvedNetwork {
     blob: crate::membership::GroupBlob,
+    /// Exact content hash committed by the verified network record.
+    hash: blake3::Hash,
     /// `Some` when the record advertises a version this build does not speak and
     /// the caller asked to record that rather than refuse.
     mismatch: Option<MeshVersionMismatch>,
+}
+
+/// Where coordinator restore learned the complete blob hash it is allowed to
+/// apply. A live signed record wins unless the local pointer is a durably stored
+/// authored generation whose publication had not yet been confirmed. The plain
+/// cached fallback exists to republish after an already-published record expires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreHashSource {
+    Published,
+    Cached,
+    LocalPending,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RestoreTarget {
+    hash: blake3::Hash,
+    peers: Vec<EndpointId>,
+    source: RestoreHashSource,
+}
+
+pub(crate) struct RestoredGroupBlob {
+    pub(crate) blob: crate::membership::GroupBlob,
+    pub(crate) hash: blake3::Hash,
+    pub(crate) published: bool,
+}
+
+/// Select the exact content-addressed blob a coordinator may restore. Persisted
+/// members are transport hints only: they can supply bytes for `hash`, but can
+/// neither choose the hash nor become roster data themselves.
+fn select_restore_target(
+    published: Option<(blake3::Hash, Vec<EndpointId>)>,
+    cached: Option<blake3::Hash>,
+    cached_is_published: bool,
+    persisted_peers: &[EndpointId],
+) -> Option<RestoreTarget> {
+    let pending = cached.filter(|_| !cached_is_published);
+    let (hash, mut peers, source) = if let Some(hash) = pending {
+        let peers = published.map(|(_, peers)| peers).unwrap_or_default();
+        (hash, peers, RestoreHashSource::LocalPending)
+    } else {
+        match published {
+            Some((hash, peers)) => (hash, peers, RestoreHashSource::Published),
+            None => (cached?, Vec::new(), RestoreHashSource::Cached),
+        }
+    };
+    peers.extend_from_slice(persisted_peers);
+    peers.sort_by_key(|id| *id.as_bytes());
+    peers.dedup();
+    Some(RestoreTarget {
+        hash,
+        peers,
+        source,
+    })
+}
+
+fn apply_join_record_pointer(
+    net: &mut config::NetworkConfig,
+    net_pubkey: EndpointId,
+    group_hash: blake3::Hash,
+) {
+    net.network_public_key = Some(net_pubkey);
+    net.last_group_hash = Some(group_hash);
+    net.last_group_hash_published = true;
+}
+
+/// Finish a join's durable authority transition. Plain members cache the signed
+/// record they initially fetched. A freshly promoted direct-network key-holder
+/// instead persists the key together with the exact admitted generation and
+/// marks that authored authority as pending until its own publisher confirms it.
+fn apply_finalized_join_config(
+    net: &mut config::NetworkConfig,
+    net_pubkey: EndpointId,
+    initial_group_hash: blake3::Hash,
+    held_key: Option<&SecretKey>,
+    converged_hash: Option<blake3::Hash>,
+    direct_exact_hash: Option<blake3::Hash>,
+    direct_hash_published: Option<bool>,
+) -> Result<()> {
+    if let Some(key) = held_key {
+        let current_hash = converged_hash
+            .context("co-coordinator join has no exact admitted group snapshot hash")?;
+        // Reconvergence may have advanced the complete signed state between the
+        // Welcome and finalization. Preserve provenance already persisted for
+        // that generation; otherwise the live generation must still be the exact
+        // record bound to the key grant.
+        let published = if net.last_group_hash == Some(current_hash) {
+            net.last_group_hash_published
+        } else {
+            anyhow::ensure!(
+                direct_exact_hash == Some(current_hash),
+                "co-coordinator join advanced beyond its exact admission record without durable provenance"
+            );
+            direct_hash_published
+                .context("co-coordinator join has no admission publication provenance")?
+        };
+        net.network_secret_key = Some(key.clone());
+        net.network_public_key = Some(net_pubkey);
+        net.last_group_hash = Some(current_hash);
+        net.last_group_hash_published = published;
+    } else {
+        apply_join_record_pointer(net, net_pubkey, initial_group_hash);
+    }
+    Ok(())
 }
 
 /// Whether the mesh version a network's record advertises is one this build can
@@ -89,11 +196,26 @@ fn gate_mesh_version(
     Ok(Some(MeshVersionMismatch { network, ours }))
 }
 
+fn reconnect_coordinator(
+    explicit: Option<EndpointId>,
+    members: &[crate::membership::Member],
+    my_identity: EndpointId,
+) -> Option<EndpointId> {
+    explicit.filter(|id| *id != my_identity).or_else(|| {
+        members
+            .iter()
+            .find(|member| member.is_coordinator && member.identity != my_identity)
+            .map(|member| member.identity)
+    })
+}
+
 /// A live mesh connection produced by the dial phase: the per-network state cell
 /// plus the cancellation token and background tasks that `finalize_join` folds
 /// into the `NetworkHandle`.
 struct EstablishedMesh {
     state: SharedNetworkState,
+    direct_exact_hash: Option<blake3::Hash>,
+    direct_hash_published: Option<bool>,
     cancel: CancellationToken,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -295,6 +417,7 @@ impl NetworkRegistry {
         };
         let ResolvedNetwork {
             blob: data,
+            hash: group_hash,
             mismatch,
         } = self.resolve_and_fetch_blob(net_pubkey, gate).await?;
 
@@ -355,6 +478,7 @@ impl NetworkRegistry {
             my_hostname: &my_hostname,
             alpn: &alpn,
             net_pubkey,
+            group_hash,
             invite,
             auto_accept_firewall,
             auto_accept_files,
@@ -419,7 +543,13 @@ impl NetworkRegistry {
 
         for peer_id in &peer_ids {
             match self.try_fetch_group_blob(*peer_id, blob_hash).await {
-                Ok(blob) => return Ok(ResolvedNetwork { blob, mismatch }),
+                Ok(blob) => {
+                    return Ok(ResolvedNetwork {
+                        blob,
+                        hash: expected_hash,
+                        mismatch,
+                    });
+                }
                 Err(e) => {
                     tracing::warn!(peer = %peer_id.fmt_short(), error = %e, "failed to fetch blob");
                 }
@@ -485,9 +615,15 @@ impl NetworkRegistry {
                 .run_join_handshake(ctx, data, conn, true, &cancel, ctx.invite.clone())
                 .await
             {
-                Ok(JoinResult::Joined(state)) => {
+                Ok(JoinResult::Joined {
+                    state,
+                    direct_exact_hash,
+                    direct_hash_published,
+                }) => {
                     return Ok(Some(EstablishedMesh {
                         state,
+                        direct_exact_hash,
+                        direct_hash_published,
                         cancel,
                         tasks,
                     }));
@@ -520,14 +656,8 @@ impl NetworkRegistry {
         ctx: &JoinContext<'_>,
         data: &crate::membership::GroupBlob,
     ) -> Result<Option<EstablishedMesh>> {
-        let coordinator_id = ctx
-            .coordinator
-            .or_else(|| {
-                data.members
-                    .iter()
-                    .find(|m| m.is_coordinator)
-                    .map(|m| m.identity)
-            })
+        let my_identity = self.transport.identity.local_identity();
+        let coordinator_id = reconnect_coordinator(ctx.coordinator, &data.members, my_identity)
             .context("no coordinator found in network record")?;
 
         // The reconnect loop is spawned unconditionally and up front. A member
@@ -548,10 +678,13 @@ impl NetworkRegistry {
                 members: MemberList::from_members(data.members.clone()),
                 approved: ApprovedList::from_entries(data.approved.clone()),
                 snapshot: None,
+                snapshot_commit: Arc::new(AsyncMutex::new(())),
                 converged_hash: None,
+                unconfirmed_durable_hash: None,
                 network_secret_key: None,
                 network_public_key: ctx.net_pubkey,
                 network_name: Some(ctx.display_name.to_string()),
+                group_name: data.name.clone(),
                 mode: GroupMode::Restricted,
                 suggested_firewall: data.suggested_firewall.clone(),
                 reusable_keys: data.reusable_keys.clone(),
@@ -590,6 +723,8 @@ impl NetworkRegistry {
             self.seed_absent_members(ctx.display_name, &data.members);
             return Ok(Some(EstablishedMesh {
                 state: state_from_blob(),
+                direct_exact_hash: None,
+                direct_hash_published: None,
                 cancel,
                 tasks,
             }));
@@ -607,7 +742,11 @@ impl NetworkRegistry {
                 .run_join_handshake(ctx, data, conn, false, &cancel, ctx.invite.clone())
                 .await
             {
-                Ok(JoinResult::Joined(state)) => state,
+                Ok(JoinResult::Joined {
+                    state,
+                    direct_exact_hash: _,
+                    direct_hash_published: _,
+                }) => state,
                 Ok(JoinResult::Pending) => {
                     // Closed network: queued for live approval. Stop the just-
                     // spawned reconnect loop (nothing connected yet); caller
@@ -640,6 +779,8 @@ impl NetworkRegistry {
 
         Ok(Some(EstablishedMesh {
             state,
+            direct_exact_hash: None,
+            direct_hash_published: None,
             cancel,
             tasks,
         }))
@@ -688,8 +829,7 @@ impl NetworkRegistry {
                 net_pubkey: ctx.net_pubkey,
                 device_cert: self.current_device_cert(),
                 invite_secret,
-                suggested_firewall: data.suggested_firewall.clone(),
-                reusable_keys: data.reusable_keys.clone(),
+                group_blob: data.clone(),
                 auto_accept_firewall: ctx.auto_accept_firewall,
                 auto_accept_files: ctx.auto_accept_files,
                 initial,
@@ -713,6 +853,8 @@ impl NetworkRegistry {
     ) -> Result<TryJoin> {
         let EstablishedMesh {
             state,
+            direct_exact_hash,
+            direct_hash_published,
             cancel,
             mut tasks,
         } = mesh;
@@ -720,82 +862,87 @@ impl NetworkRegistry {
             display_name,
             my_hostname,
             net_pubkey,
+            group_hash,
             invite_lock,
             mismatch,
             ..
         } = ctx;
 
-        // A node that already holds the network secret key (e.g. a
-        // co-coordinator joining after a config-only restore) should run as
-        // Coordinator so it can admit future peers immediately — even though
-        // it arrived here via join rather than restore. This overwrites the
-        // member handler `join_mesh_shared` registered on the live-join path.
-        let held_key = state.read().unwrap().network_secret_key.clone();
-        match role_for_key_holder(held_key.is_some()) {
-            NetworkRole::Coordinator => {
-                let net_public_key = state.read().unwrap().network_public_key;
-                self.register_coordinator_handler(
-                    &self.mesh_ctx(),
-                    display_name,
-                    state.clone(),
-                    invite_lock.clone(),
-                    None,
-                    net_public_key,
-                );
-            }
-            // `Direct` is a display-only role (set in `status`), never produced by
-            // `role_for_key_holder`; a non-key-holder runs as a plain member. The
-            // live-join path already registered the member handler in
-            // `join_mesh_shared`; register here only for the cold-restore path
-            // (state built from the blob, no live handshake). Reconverge for that
-            // path is covered by the group poller below.
-            NetworkRole::Member | NetworkRole::Direct => {
-                if !self.protocol_router().is_registered(&net_pubkey) {
-                    self.protocol_router().register(
-                        net_pubkey,
-                        AcceptHandler::Member(Arc::new(MemberAcceptState {
-                            ctx: self.mesh_ctx(),
-                            network_name: display_name.to_string(),
-                            state: state.clone(),
-                            token: cancel.clone(),
-                            net_pubkey,
-                            my_identity: self.transport.identity.local_identity(),
-                            endpoint: self.transport.endpoint.clone(),
-                            registry: self.clone(),
-                            invite_lock: invite_lock.clone(),
-                            reconverge_notify: Arc::new(tokio::sync::Notify::new()),
-                        })),
-                    );
-                }
-            }
-        }
+        // Serialize the authority transition with every snapshot mutation. This
+        // binds the durable key and provenance to one exact live generation.
+        let snapshot_commit = state.read().unwrap().snapshot_commit.clone();
+        let commit_guard = snapshot_commit.lock().await;
+        let (held_key, converged_hash) = {
+            let state = state.read().unwrap();
+            (state.network_secret_key.clone(), state.converged_hash)
+        };
 
-        // Set the network public key on the state
-        {
-            let mut s = state.write().unwrap();
-            s.network_public_key = net_pubkey;
-            s.refresh_snapshot();
-        }
-        let snap_bytes = state
+        // Set the network public key on the state. It is not part of GroupBlob,
+        // so refreshing here would only overwrite the exact signed convergence
+        // hash adopted by a direct-network co-coordinator.
+        state.write().unwrap().network_public_key = net_pubkey;
+        let snapshot = state
             .read()
             .unwrap()
             .snapshot
             .as_ref()
-            .map(|s| s.msgpack_bytes.clone());
-        if let Some(bytes) = snap_bytes {
-            let _ = self.transport.blob_store.blobs().add_slice(&bytes).await;
+            .map(|s| (s.hash, s.msgpack_bytes.clone()));
+        if let Some((_hash, bytes)) = snapshot
+            && let Err(e) = self.transport.blob_store.blobs().add_slice(&bytes).await
+        {
+            tracing::warn!(error = %e, "failed to store local group snapshot");
         }
 
-        // Save the network public key without replacing settings that may have
-        // changed while the join was in flight.
-        let updated = config::update_network(display_name, |net| {
-            net.network_public_key = Some(net_pubkey);
-            Ok(())
-        })?;
-        anyhow::ensure!(
-            updated.is_some(),
-            "network config was deleted while joining"
-        );
+        // Persist either the plain member's signed record pointer or the direct
+        // co-coordinator's key plus exact admitted hash in one transaction. The
+        // key is not exposed through a coordinator handler until this succeeds.
+        let persist_result = config::update_network(display_name, |net| {
+            apply_finalized_join_config(
+                net,
+                net_pubkey,
+                group_hash,
+                held_key.as_ref(),
+                converged_hash,
+                direct_exact_hash,
+                direct_hash_published,
+            )
+        })
+        .and_then(|updated| updated.context("network config was deleted while joining"));
+        let finalized_config = match persist_result {
+            Ok(config) => config,
+            Err(e) => {
+                drop(commit_guard);
+                cancel.cancel();
+                self.conn.unregister(&net_pubkey);
+                for (_ip, conn) in self.peers.remove_by_network(display_name) {
+                    conn.close(VarInt::from_u32(0), b"failed join");
+                }
+                self.route_map.remove_network(display_name);
+                return Err(e);
+            }
+        };
+        drop(commit_guard);
+
+        let role = role_for_key_holder(held_key.is_some());
+        let dht_notify = if let Some(key) = held_key.as_ref() {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let initially_published = (finalized_config.last_group_hash == converged_hash
+                && finalized_config.last_group_hash_published)
+                .then_some(converged_hash)
+                .flatten();
+            tasks.extend(self.spawn_coordinator_background_tasks(
+                &self.mesh_ctx(),
+                display_name,
+                key,
+                &state,
+                &notify,
+                &cancel,
+                initially_published,
+            ));
+            Some(notify)
+        } else {
+            None
+        };
 
         // Membership poller
         if let Ok(poller_client) = dht::create_pkarr_client(&self.transport.endpoint) {
@@ -813,15 +960,52 @@ impl NetworkRegistry {
         let handle = NetworkHandle {
             name: display_name.to_string(),
             network_key: net_pubkey,
-            role: NetworkRole::Member,
-            state,
-            dht_notify: None,
-            cancel,
+            role: role.clone(),
+            state: state.clone(),
+            dht_notify: dht_notify.clone(),
+            cancel: cancel.clone(),
             tasks,
-            invite_lock,
+            invite_lock: invite_lock.clone(),
             incompatible: mismatch,
         };
         self.networks.insert(display_name.to_string(), handle);
+
+        // Expose coordinator authority only after its key, exact complete hash,
+        // publisher, and Coordinator handle are all installed.
+        match role {
+            NetworkRole::Coordinator => self.register_coordinator_handler(
+                &self.mesh_ctx(),
+                display_name,
+                state.clone(),
+                invite_lock.clone(),
+                dht_notify,
+                net_pubkey,
+            ),
+            NetworkRole::Member | NetworkRole::Direct => {
+                if !self.protocol_router().is_registered(&net_pubkey) {
+                    self.protocol_router().register(
+                        net_pubkey,
+                        AcceptHandler::Member(Arc::new(MemberAcceptState {
+                            ctx: self.mesh_ctx(),
+                            network_name: display_name.to_string(),
+                            state: state.clone(),
+                            net_pubkey,
+                            my_identity: self.transport.identity.local_identity(),
+                            endpoint: self.transport.endpoint.clone(),
+                            registry: self.clone(),
+                            invite_lock: invite_lock.clone(),
+                            reconverge_notify: Arc::new(tokio::sync::Notify::new()),
+                        })),
+                    );
+                }
+            }
+        }
+        apply_suggested_firewall(
+            &self.firewall,
+            self.transport.identity.local_identity(),
+            display_name,
+            &state,
+        );
         self.refresh_search_domains().await;
 
         // Register hostnames in DNS table
@@ -854,34 +1038,85 @@ impl NetworkRegistry {
         })))
     }
 
-    /// Fetch the authoritative GroupBlob for a network we coordinate, used to
-    /// restore the roster across a daemon restart. Resolves the pkarr record to
-    /// get the blob hash, reads the bytes back from the local blob store (where
-    /// we stored them before publishing, no network round-trip), and verifies +
-    /// decodes. Falls back to fetching from a seed peer if the local store
-    /// doesn't have them (e.g. blobs dir was wiped). Returns an error if the DHT
-    /// is unreachable, so the caller can fall back to the (possibly stale)
-    /// config roster rather than booting empty.
+    /// Fetch the complete GroupBlob used to restore a coordinated network. A
+    /// pending locally-authored hash wins over an older reachable record; once
+    /// its publication is confirmed, the live signed record wins again. If no
+    /// record is reachable, the last complete hash persisted alongside the
+    /// network config lets a sole coordinator read the same content-addressed
+    /// bytes back and republish it. Persisted member identities are only fetch
+    /// hints for that exact hash; their lossy config roster is never applied.
     pub(crate) async fn restore_roster_from_blob(
         &self,
         net_pubkey: EndpointId,
-    ) -> Result<crate::membership::GroupBlob> {
-        let pkarr_client = dht::create_pkarr_client(&self.transport.endpoint)?;
-        let (expected_hash, seed_peers) = dht::resolve_network(&pkarr_client, net_pubkey)
-            .await
-            .context("resolve pkarr record for roster restore")?;
+        cached_hash: Option<blake3::Hash>,
+        cached_is_published: bool,
+        persisted_peers: &[EndpointId],
+    ) -> Result<RestoredGroupBlob> {
+        let resolved = match dht::create_pkarr_client(&self.transport.endpoint) {
+            Ok(client) => match dht::resolve_network_packet(&client, net_pubkey).await {
+                Ok(packet) => Some(
+                    dht::decode_network_record(&packet)
+                        .context("decode signed pkarr record for roster restore")?,
+                ),
+                Err(e) => {
+                    tracing::debug!(error = %e, "network record unavailable during roster restore");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::debug!(error = %e, "pkarr client unavailable during roster restore");
+                None
+            }
+        };
+        let resolution_error = resolved
+            .is_none()
+            .then(|| "signed network record was unavailable".to_string());
+        let target =
+            select_restore_target(resolved, cached_hash, cached_is_published, persisted_peers)
+                .with_context(|| {
+                    resolution_error
+                        .clone()
+                        .unwrap_or_else(|| "no roster hash available".into())
+                })?;
+        let target_was_published = target.source != RestoreHashSource::LocalPending;
+        match target.source {
+            RestoreHashSource::Cached => {
+                tracing::warn!(
+                    network = %net_pubkey.fmt_short(),
+                    error = resolution_error.as_deref().unwrap_or("record unavailable"),
+                    hash = %target.hash,
+                    "network record unavailable; restoring its last complete local snapshot"
+                );
+            }
+            RestoreHashSource::LocalPending => {
+                tracing::warn!(
+                    network = %net_pubkey.fmt_short(),
+                    hash = %target.hash,
+                    "restoring a durably authored local snapshot whose publication was not confirmed"
+                );
+            }
+            RestoreHashSource::Published => {}
+        }
+
+        let expected_hash = target.hash;
         let blob_hash = iroh_blobs::Hash::from_bytes(*expected_hash.as_bytes());
 
-        // Local blob store first: the coordinator stored these bytes before
-        // publishing, so they're on disk.
+        // Local blob store first: snapshots are permanently retained when they
+        // are authored or fetched, so the normal restart has no network trip.
         if let Ok(bytes) = self.transport.blob_store.blobs().get_bytes(blob_hash).await
             && let Ok(data) = verify_group_blob(&bytes, &expected_hash)
         {
-            return Ok(data);
+            retain_group_blob(&self.transport.blob_store, &bytes).await?;
+            return Ok(RestoredGroupBlob {
+                blob: data,
+                hash: expected_hash,
+                published: target_was_published,
+            });
         }
 
-        // Fall back to fetching from a seed peer.
-        for peer_id in &seed_peers {
+        // A current record's seeds and the saved roster are only transport hints:
+        // every peer must provide bytes matching the selected hash.
+        for peer_id in &target.peers {
             if *peer_id == self.transport.endpoint.id() {
                 continue;
             }
@@ -908,10 +1143,15 @@ impl NetworkRegistry {
             if let Ok(bytes) = self.transport.blob_store.blobs().get_bytes(blob_hash).await
                 && let Ok(data) = verify_group_blob(&bytes, &expected_hash)
             {
-                return Ok(data);
+                retain_group_blob(&self.transport.blob_store, &bytes).await?;
+                return Ok(RestoredGroupBlob {
+                    blob: data,
+                    hash: expected_hash,
+                    published: target_was_published,
+                });
             }
         }
-        anyhow::bail!("group blob not found locally or at any seed peer");
+        anyhow::bail!("group blob {expected_hash} not found locally or at any known peer");
     }
 
     pub(crate) async fn try_fetch_group_blob(
@@ -938,7 +1178,9 @@ impl NetworkRegistry {
             .get_bytes(blob_hash)
             .await
             .map_err(|e| anyhow::anyhow!("blob read failed: {e}"))?;
-        crate::membership::decode_group_blob(&bytes)
+        let blob = crate::membership::decode_group_blob(&bytes)?;
+        retain_group_blob(&self.transport.blob_store, &bytes).await?;
+        Ok(blob)
     }
 
     /// Dial every known member of a network: open a QUIC connection on the
@@ -1121,5 +1363,239 @@ mod tests {
     fn a_republished_matching_version_is_speakable_again() {
         assert!(!mesh_version_is_speakable(Some(2), 4));
         assert!(mesh_version_is_speakable(Some(4), 4));
+    }
+
+    fn id(seed: u8) -> EndpointId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        SecretKey::from(bytes).public()
+    }
+
+    #[test]
+    fn reconnect_never_selects_the_locally_listed_coordinator() {
+        let me = id(1);
+        let other = id(2);
+        let member = |identity| crate::membership::Member {
+            identity,
+            is_coordinator: true,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        };
+        let roster = vec![member(me), member(other)];
+
+        assert_eq!(reconnect_coordinator(None, &roster, me), Some(other));
+        assert_eq!(reconnect_coordinator(Some(me), &roster, me), Some(other));
+    }
+
+    #[test]
+    fn join_caches_the_signed_record_hash_not_a_local_projection() {
+        let net_pubkey = id(1);
+        let signed_hash = blake3::hash(b"signed complete roster");
+        let local_partial_hash = blake3::hash(b"local partial roster");
+        let mut net = config::empty_network_config("joined");
+        net.last_group_hash = Some(local_partial_hash);
+
+        apply_join_record_pointer(&mut net, net_pubkey, signed_hash);
+
+        assert_eq!(net.network_public_key, Some(net_pubkey));
+        assert_eq!(net.last_group_hash, Some(signed_hash));
+        assert!(net.last_group_hash_published);
+        assert_ne!(net.last_group_hash, Some(local_partial_hash));
+    }
+
+    #[test]
+    fn direct_join_commits_the_key_with_the_exact_admitted_generation() {
+        let key = SecretKey::generate();
+        let net_pubkey = key.public();
+        let pre_admission = blake3::hash(b"record used to find the coordinator");
+        let admitted = blake3::hash(b"record containing the admitted co-coordinator");
+        let mut net = config::empty_network_config("direct");
+
+        apply_finalized_join_config(
+            &mut net,
+            net_pubkey,
+            pre_admission,
+            Some(&key),
+            Some(admitted),
+            Some(admitted),
+            Some(true),
+        )
+        .unwrap();
+
+        assert_eq!(
+            net.network_secret_key.as_ref().map(SecretKey::to_bytes),
+            Some(key.to_bytes())
+        );
+        assert_eq!(net.network_public_key, Some(net_pubkey));
+        assert_eq!(net.last_group_hash, Some(admitted));
+        assert_ne!(net.last_group_hash, Some(pre_admission));
+        assert!(
+            net.last_group_hash_published,
+            "the original coordinator confirmed publication before Welcome"
+        );
+    }
+
+    #[test]
+    fn unconfirmed_direct_admission_remains_pending_until_a_key_holder_publishes_it() {
+        let key = SecretKey::generate();
+        let admitted = blake3::hash(b"durable but not confirmed published");
+        let mut net = config::empty_network_config("direct");
+
+        apply_finalized_join_config(
+            &mut net,
+            key.public(),
+            blake3::hash(b"pre-admission"),
+            Some(&key),
+            Some(admitted),
+            Some(admitted),
+            Some(false),
+        )
+        .unwrap();
+
+        assert_eq!(net.last_group_hash, Some(admitted));
+        assert!(!net.last_group_hash_published);
+    }
+
+    #[test]
+    fn direct_join_preserves_provenance_for_a_newer_durable_generation() {
+        let key = SecretKey::generate();
+        let admitted = blake3::hash(b"admission record");
+        let newer = blake3::hash(b"newer signed record applied during finalization");
+        let mut net = config::empty_network_config("direct");
+        net.last_group_hash = Some(newer);
+        net.last_group_hash_published = true;
+
+        apply_finalized_join_config(
+            &mut net,
+            key.public(),
+            blake3::hash(b"pre-admission"),
+            Some(&key),
+            Some(newer),
+            Some(admitted),
+            Some(false),
+        )
+        .unwrap();
+
+        assert_eq!(net.last_group_hash, Some(newer));
+        assert!(net.last_group_hash_published);
+        assert_eq!(
+            net.network_secret_key.as_ref().map(SecretKey::to_bytes),
+            Some(key.to_bytes())
+        );
+    }
+
+    #[test]
+    fn direct_join_rejects_an_unpersisted_generation_advance() {
+        let key = SecretKey::generate();
+        let admitted = blake3::hash(b"admission record");
+        let newer = blake3::hash(b"unpersisted newer record");
+        let mut net = config::empty_network_config("direct");
+
+        let err = apply_finalized_join_config(
+            &mut net,
+            key.public(),
+            blake3::hash(b"pre-admission"),
+            Some(&key),
+            Some(newer),
+            Some(admitted),
+            Some(false),
+        )
+        .expect_err("a different live generation needs its own durable provenance");
+
+        assert!(format!("{err:#}").contains("advanced beyond its exact admission record"));
+        assert!(net.network_secret_key.is_none());
+        assert!(net.last_group_hash.is_none());
+    }
+
+    #[test]
+    fn direct_join_refuses_to_persist_authority_without_an_exact_generation() {
+        let key = SecretKey::generate();
+        let mut net = config::empty_network_config("direct");
+
+        let err = apply_finalized_join_config(
+            &mut net,
+            key.public(),
+            blake3::hash(b"pre-admission"),
+            Some(&key),
+            None,
+            None,
+            Some(false),
+        )
+        .expect_err("authority without a complete recovery generation must fail");
+
+        assert!(format!("{err:#}").contains("no exact admitted group snapshot hash"));
+        assert!(net.network_secret_key.is_none());
+        assert!(net.last_group_hash.is_none());
+    }
+
+    #[test]
+    fn a_published_restore_hash_wins_over_the_cached_hash() {
+        let published = blake3::hash(b"published");
+        let cached = blake3::hash(b"cached");
+        let record_seed = id(1);
+        let saved_member = id(2);
+
+        let target = select_restore_target(
+            Some((published, vec![record_seed])),
+            Some(cached),
+            true,
+            &[saved_member],
+        )
+        .expect("published record is a restore target");
+
+        assert_eq!(target.hash, published);
+        assert_eq!(target.source, RestoreHashSource::Published);
+        let mut expected = vec![record_seed, saved_member];
+        expected.sort_by_key(|id| *id.as_bytes());
+        assert_eq!(target.peers, expected);
+    }
+
+    #[test]
+    fn an_unconfirmed_local_generation_wins_over_the_older_record() {
+        let published = blake3::hash(b"published");
+        let pending = blake3::hash(b"pending local generation");
+        let record_seed = id(1);
+
+        let target = select_restore_target(
+            Some((published, vec![record_seed])),
+            Some(pending),
+            false,
+            &[],
+        )
+        .expect("pending durable snapshot is a restore target");
+
+        assert_eq!(target.hash, pending);
+        assert_eq!(target.source, RestoreHashSource::LocalPending);
+        assert_eq!(target.peers, vec![record_seed]);
+    }
+
+    #[test]
+    fn an_unreachable_record_uses_the_last_complete_snapshot_hash() {
+        let cached = blake3::hash(b"cached");
+        let saved_member = id(2);
+
+        let target = select_restore_target(None, Some(cached), true, &[saved_member])
+            .expect("cached complete snapshot is a restore target");
+
+        assert_eq!(target.hash, cached);
+        assert_eq!(target.source, RestoreHashSource::Cached);
+        assert_eq!(target.peers, vec![saved_member]);
+    }
+
+    #[test]
+    fn restore_has_no_target_without_a_record_or_cached_snapshot() {
+        assert!(select_restore_target(None, None, true, &[id(2)]).is_none());
+    }
+
+    #[test]
+    fn restore_fetch_hints_are_deduplicated() {
+        let hash = blake3::hash(b"published");
+        let peer = id(1);
+        let target = select_restore_target(Some((hash, vec![peer])), None, true, &[peer]).unwrap();
+        assert_eq!(target.peers, vec![peer]);
     }
 }

@@ -9,7 +9,7 @@ use super::super::*;
 use std::net::IpAddr;
 use std::sync::RwLock;
 
-use super::create_join::mesh_version_is_speakable;
+use super::create_join::{RestoredGroupBlob, mesh_version_is_speakable};
 
 /// How long `ray exit-node use` waits for the exit peer to answer through the
 /// finished tunnel before returning anyway. Long enough to cover a re-punch after
@@ -39,104 +39,115 @@ enum RestoreNext {
     Stop,
 }
 
-/// The membership a coordinator restores at startup, sourced from the signed
-/// `GroupBlob` (authoritative) or the stale config roster as a fallback.
+/// The membership a coordinator restores at startup from the authoritative,
+/// network-key-signed `GroupBlob`.
 struct RestoredRoster {
     members: MemberList,
     approved: ApprovedList,
+    group_name: Option<String>,
     suggested_firewall: SuggestedFirewall,
     reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
     nullifiers: BTreeSet<EndpointId>,
+    source_hash: blake3::Hash,
+    source_published: bool,
+}
+
+/// Turn a complete content-addressed blob into coordinator state, reconciling the
+/// one authority the blob cannot revoke: possession of the network secret key.
+/// Existing signed metadata is preserved; only the local key-holder role and its
+/// online timestamp are local facts refreshed at boot.
+fn materialize_coordinator_roster(
+    restored: RestoredGroupBlob,
+    local_identity: EndpointId,
+    persisted_hostname: Option<String>,
+) -> RestoredRoster {
+    let RestoredGroupBlob {
+        blob: data,
+        hash: source_hash,
+        published: source_published,
+    } = restored;
+    let mut members = MemberList::from_members(data.members);
+    match members.get_mut(&local_identity) {
+        Some(local) => {
+            local.is_coordinator = true;
+            local.last_seen = None;
+        }
+        None => members.add(Member {
+            identity: local_identity,
+            is_coordinator: true,
+            hostname: persisted_hostname,
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        }),
+    }
+    RestoredRoster {
+        members,
+        approved: ApprovedList::from_entries(data.approved),
+        group_name: data.name,
+        suggested_firewall: data.suggested_firewall,
+        reusable_keys: data.reusable_keys,
+        nullifiers: data.nullifiers,
+        source_hash,
+        source_published,
+    }
+}
+
+fn apply_coordinator_restore_to_config(
+    config: &mut config::NetworkConfig,
+    mode: GroupMode,
+    members: &MemberList,
+    approved: &ApprovedList,
+    net_secret_key: &SecretKey,
+    last_group_hash: Option<blake3::Hash>,
+    last_group_hash_published: bool,
+) {
+    config.group_mode = mode;
+    config.pending_hostname = None;
+    config.members = to_member_entries(members.all());
+    config.approved = to_approved_entries(approved.all());
+    config.network_secret_key = Some(net_secret_key.clone());
+    config.network_public_key = Some(net_secret_key.public());
+    if let Some(hash) = last_group_hash {
+        config.last_group_hash = Some(hash);
+        config.last_group_hash_published = last_group_hash_published;
+    }
 }
 
 impl NetworkRegistry {
-    /// Rebuild a network's roster for a coordinator restart. Prefers the
-    /// published, network-key-signed `GroupBlob` (members + approved + suggested
-    /// firewall + reusable keys); if the DHT is unreachable, falls back to the
-    /// last-persisted config roster (which may be stale). Always ensures this
-    /// node is present as a coordinator member.
+    /// Rebuild a network's roster for a coordinator restart from the published,
+    /// network-key-signed `GroupBlob` (members + approved + suggested firewall +
+    /// reusable keys). A transient resolve/fetch failure is an error so the
+    /// restore supervisor retries without publishing stale local config.
     async fn restore_member_roster(
         &self,
         name: &str,
         net_public_key: EndpointId,
-        net_config: Option<&config::NetworkConfig>,
-        persisted_hostname: &Option<String>,
-    ) -> RestoredRoster {
-        let mut member_list = MemberList::new();
-        let mut approved_list = ApprovedList::new();
-        // `suggested_firewall` is authoritative in the signed blob; fall back to
-        // an empty set only if the blob can't be fetched.
-        let mut suggested_firewall = SuggestedFirewall::default();
-        // Reusable join keys are authoritative in the signed blob too.
-        let mut reusable_keys = BTreeMap::new();
-        let mut nullifiers = BTreeSet::new();
-        match self.restore_roster_from_blob(net_public_key).await {
-            Ok(data) => {
-                suggested_firewall = data.suggested_firewall.clone();
-                reusable_keys = data.reusable_keys.clone();
-                nullifiers = data.nullifiers.clone();
-                for m in &data.members {
-                    member_list.add(m.clone());
-                }
-                for a in &data.approved {
-                    approved_list.approve(a.clone());
-                }
-                tracing::info!(
-                    network = %name,
-                    members = member_list.all().len(),
-                    "restored roster from published group blob"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    network = %name,
-                    error = %e,
-                    "could not restore roster from DHT blob; falling back to config (may be stale)"
-                );
-                if let Some(nc) = net_config {
-                    for entry in &nc.members {
-                        member_list.add(Member {
-                            identity: entry.identity,
-                            is_coordinator: entry.is_coordinator,
-                            hostname: entry.hostname.clone(),
-                            user_identity: None,
-                            device_cert: None,
-                            last_seen: None,
-                            exit_node: false,
-                            exit_families: ExitFamilies::Unknown,
-                        });
-                    }
-                    for entry in &nc.approved {
-                        let ae = ApprovedEntry {
-                            identity: entry.identity,
-                            hostname: entry.hostname.clone(),
-                            user_identity: None,
-                            device_cert: None,
-                        };
-                        approved_list.approve(ae);
-                    }
-                }
-            }
-        }
-        if !member_list.is_member(&self.transport.identity.local_identity()) {
-            member_list.add(Member {
-                identity: self.transport.identity.local_identity(),
-                is_coordinator: true,
-                hostname: persisted_hostname.clone(),
-                user_identity: None,
-                device_cert: None,
-                last_seen: None,
-                exit_node: false,
-                exit_families: ExitFamilies::Unknown,
-            });
-        }
-        RestoredRoster {
-            members: member_list,
-            approved: approved_list,
-            suggested_firewall,
-            reusable_keys,
-            nullifiers,
-        }
+        net_config: &config::NetworkConfig,
+    ) -> Result<RestoredRoster> {
+        let persisted_peers: Vec<_> = net_config.members.iter().map(|m| m.identity).collect();
+        let data = self
+            .restore_roster_from_blob(
+                net_public_key,
+                net_config.last_group_hash,
+                net_config.last_group_hash_published,
+                &persisted_peers,
+            )
+            .await
+            .with_context(|| format!("restore complete roster for '{name}'"))?;
+        let restored = materialize_coordinator_roster(
+            data,
+            self.transport.identity.local_identity(),
+            net_config.my_hostname.clone(),
+        );
+        tracing::info!(
+            network = %name,
+            members = restored.members.all().len(),
+            "restored roster from complete group blob"
+        );
+        Ok(restored)
     }
 
     /// Restores a coordinator network from saved config (uses the existing name).
@@ -153,21 +164,22 @@ impl NetworkRegistry {
 
         let my_ip = self.transport.identity.local_ipv6();
 
-        // Load persisted network secret key from config
-        let app_config = config::load()?;
-        let net_config = app_config.networks.iter().find(|n| n.name == name);
+        // Load persisted network secret key from config.
+        let net_config = config::load_network(name)?.context("network is no longer saved")?;
         let net_secret_key = net_config
-            .and_then(|nc| nc.network_secret_key.clone())
+            .network_secret_key
+            .clone()
             .context("no network secret key in config — cannot restore as coordinator")?;
         let net_public_key = net_secret_key.public();
-        let persisted_hostname = net_config.and_then(|nc| nc.my_hostname.clone());
+        let persisted_hostname = net_config.my_hostname.clone();
 
         // Restore membership from the authoritative published GroupBlob. The blob
         // (members + approved) is signed by the per-network key and published
         // to DHT, so it is the source of truth and survives a daemon restart. The
         // local blob store still holds the bytes we published before going down, so
         // we read them back by the hash in the pkarr record (falling back to a seed
-        // peer, then to the stale config roster only if the DHT is unreachable).
+        // peer. If neither source has it, restoration fails and is retried without
+        // publishing anything.
         // Restoring from the blob is also what prevents a clobber: the rebuilt
         // snapshot hashes identical to the published record, so the periodic
         // re-publish becomes a no-op instead of overwriting the roster with a
@@ -175,21 +187,27 @@ impl NetworkRegistry {
         let RestoredRoster {
             members: member_list,
             approved: approved_list,
+            group_name,
             suggested_firewall,
             reusable_keys,
             nullifiers,
+            source_hash,
+            source_published,
         } = self
-            .restore_member_roster(name, net_public_key, net_config, &persisted_hostname)
-            .await;
+            .restore_member_roster(name, net_public_key, &net_config)
+            .await?;
 
         let mut net_state = NetworkState {
             members: member_list,
             approved: approved_list,
             snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
             converged_hash: None,
+            unconfirmed_durable_hash: None,
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: net_public_key,
             network_name: Some(name.to_string()),
+            group_name,
             mode,
             suggested_firewall,
             reusable_keys,
@@ -201,20 +219,28 @@ impl NetworkRegistry {
             last_record_timestamp: None,
         };
 
-        self.seal_and_publish(&mut net_state, &net_secret_key).await;
+        let last_group_hash = self.seal_group_snapshot(&mut net_state).await?;
+        let restored_hash_was_published = source_published && last_group_hash == source_hash;
 
-        // Replace only the roster-derived projection on the latest saved config.
-        // Node-local policy may have changed while restoration awaited.
+        // Replace only the blob-derived projection on the latest saved config.
+        // Everything else in this file is node-local policy and must survive
+        // both a coordinator restart and writes made while restoration awaited.
         let updated = config::update_network(name, |latest| {
-            latest.group_mode = mode;
-            latest.pending_hostname = None;
-            latest.members = to_member_entries(net_state.members.all());
-            latest.approved = to_approved_entries(net_state.approved.all());
-            latest.network_secret_key = Some(net_secret_key.clone());
-            latest.network_public_key = Some(net_public_key);
+            apply_coordinator_restore_to_config(
+                latest,
+                mode,
+                &net_state.members,
+                &net_state.approved,
+                &net_secret_key,
+                Some(last_group_hash),
+                restored_hash_was_published,
+            );
             Ok(())
         })?;
         anyhow::ensure!(updated.is_some(), "network is no longer saved");
+        let restored_record = self
+            .publish_group_hash(name, &net_secret_key, last_group_hash)
+            .await;
 
         let cancel = self.shutdown_token.child_token();
         let state = Arc::new(RwLock::new(net_state));
@@ -228,6 +254,7 @@ impl NetworkRegistry {
             &state,
             &dht_notify,
             &cancel,
+            restored_record.as_ref().map(|_| last_group_hash),
         );
 
         self.register_coordinator_handler(
@@ -277,20 +304,7 @@ impl NetworkRegistry {
         // any member that has since been idle-closed, before the first reconverge
         // (self excluded).
         self.seed_route_map(name, &members_to_dial);
-        // Eager-connect the roster at startup (all nodes): a failed dial marks a peer
-        // offline immediately, so status distinguishes offline from idle from boot.
-        // On-demand nodes then idle-close these links per connection and re-dial
-        // lazily; the route map above is what lets them come back.
-        self.dial_all_members(
-            &members_to_dial,
-            net_public_key,
-            name,
-            self.transport.identity.local_identity(),
-            persisted_hostname.clone(),
-        )
-        .await;
-
-        // Register the network from its restored local state *before* dialing
+        // Register the network from its restored local state before dialing
         // peers, so `ray status` / IPC sees it the instant the local restore
         // finishes. `dial_all_members` awaits a handshake per peer; when it gated
         // this insert, a freshly (re)started daemon answered `status` with "no
@@ -313,25 +327,28 @@ impl NetworkRegistry {
 
         // Full mesh: proactively dial every known member in the background so a
         // restarting coordinator/co-coordinator reconnects to peers that haven't
-        // (yet) dialed in, without blocking restore on peer connectivity. Without
-        // the dial, a co-coordinator that comes back up only learns about peers
-        // that connect *to it*, so two co-coordinators restarting together each
-        // show the other offline until one is disturbed. The accept handler is
-        // already registered so return traffic is handled, and the reconnect loop
-        // retries anything still unreachable.
-        {
-            let me = Arc::clone(self);
-            let network_name = name.to_string();
-            tokio::spawn(async move {
-                me.dial_all_members(
+        // (yet) dialed in, without blocking restore on peer connectivity. Track
+        // the task on the handle and stop it with the network token so leave/nuke
+        // cannot let a stale restore dial recreate routes after teardown.
+        let me = Arc::clone(self);
+        let network_name = name.to_string();
+        let dial_cancel = cancel.clone();
+        let dial_task = tokio::spawn(async move {
+            tokio::select! {
+                _ = dial_cancel.cancelled() => {}
+                _ = me.dial_all_members(
                     &members_to_dial,
                     net_public_key,
                     &network_name,
                     me.transport.identity.local_identity(),
                     persisted_hostname,
-                )
-                .await;
-            });
+                ) => {}
+            }
+        });
+        if let Some(mut handle) = self.networks.get_mut(name) {
+            handle.tasks.push(dial_task);
+        } else {
+            dial_task.abort();
         }
 
         tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network restored (coordinator)");
@@ -1649,4 +1666,160 @@ fn peer_underlay_ips(conn: &Connection) -> Vec<IpAddr> {
         }
     }
     ips
+}
+
+#[cfg(test)]
+mod coordinator_restore_tests {
+    use super::*;
+
+    fn id(seed: u8) -> EndpointId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        SecretKey::from(bytes).public()
+    }
+
+    fn member(identity: EndpointId, coordinator: bool) -> Member {
+        Member {
+            identity,
+            is_coordinator: coordinator,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            last_seen: Some(42),
+            exit_node: false,
+            exit_families: ExitFamilies::Unknown,
+        }
+    }
+
+    fn blob(members: Vec<Member>) -> crate::membership::GroupBlob {
+        crate::membership::GroupBlob {
+            members,
+            approved: Vec::new(),
+            suggested_firewall: SuggestedFirewall::default(),
+            name: Some("signed-name".to_string()),
+            reusable_keys: BTreeMap::new(),
+            nullifiers: BTreeSet::new(),
+        }
+    }
+
+    fn restored(blob: crate::membership::GroupBlob) -> RestoredGroupBlob {
+        RestoredGroupBlob {
+            blob,
+            hash: blake3::hash(b"source"),
+            published: true,
+        }
+    }
+
+    #[test]
+    fn restore_repairs_an_existing_key_holder() {
+        let me = id(1);
+        let mut existing = member(me, false);
+        existing.hostname = Some("signed-host".to_string());
+        existing.exit_node = true;
+        existing.exit_families = ExitFamilies::V6;
+
+        let restored = materialize_coordinator_roster(restored(blob(vec![existing])), me, None);
+        let mine = restored.members.get(&me).unwrap();
+
+        assert!(mine.is_coordinator);
+        assert_eq!(mine.hostname.as_deref(), Some("signed-host"));
+        assert!(mine.exit_node);
+        assert_eq!(mine.exit_families, ExitFamilies::V6);
+        assert_eq!(mine.last_seen, None);
+    }
+
+    #[test]
+    fn restore_inserts_an_absent_key_holder_without_dropping_the_roster() {
+        let me = id(1);
+        let peer = id(2);
+
+        let restored = materialize_coordinator_roster(
+            restored(blob(vec![member(peer, true)])),
+            me,
+            Some("local-host".to_string()),
+        );
+
+        assert_eq!(restored.members.all().len(), 2);
+        assert!(restored.members.get(&peer).is_some());
+        let mine = restored.members.get(&me).unwrap();
+        assert!(mine.is_coordinator);
+        assert_eq!(mine.hostname.as_deref(), Some("local-host"));
+    }
+
+    #[test]
+    fn restore_preserves_complete_blob_policy_state() {
+        let me = id(1);
+        let approved_id = id(2);
+        let nullified = id(3);
+        let (key_hash, key) = crate::membership::ReusableKey::from_secret(b"key", 10, 20);
+        let approved = ApprovedEntry {
+            identity: approved_id,
+            hostname: Some("waiting".to_string()),
+            user_identity: None,
+            device_cert: None,
+        };
+        let mut source = blob(vec![member(me, true)]);
+        source.approved.push(approved.clone());
+        source.reusable_keys.insert(key_hash.clone(), key.clone());
+        source.nullifiers.insert(nullified);
+
+        let restored = materialize_coordinator_roster(restored(source), me, None);
+
+        assert_eq!(restored.approved.all(), vec![&approved]);
+        assert_eq!(restored.reusable_keys.get(&key_hash), Some(&key));
+        assert_eq!(restored.nullifiers, BTreeSet::from([nullified]));
+    }
+
+    #[test]
+    fn restore_changes_only_blob_derived_config_fields() {
+        let me = id(1);
+        let key = SecretKey::generate();
+        let hash = blake3::hash(b"complete snapshot");
+        let mut members = MemberList::new();
+        members.add(member(me, true));
+        let mut config = config::NetworkConfig {
+            name: "local-name".to_string(),
+            pending_hostname: Some("queued-rename".to_string()),
+            transport: Some(config::TransportMode::Tor),
+            auto_accept_firewall: true,
+            ephemeral_ttl_secs: Some(7_200),
+            exit_allow: vec!["*".to_string()],
+            ..Default::default()
+        };
+
+        apply_coordinator_restore_to_config(
+            &mut config,
+            GroupMode::Restricted,
+            &members,
+            &ApprovedList::new(),
+            &key,
+            Some(hash),
+            true,
+        );
+
+        assert_eq!(config.name, "local-name");
+        assert_eq!(config.transport, Some(config::TransportMode::Tor));
+        assert!(config.auto_accept_firewall);
+        assert_eq!(config.ephemeral_ttl_secs, Some(7_200));
+        assert_eq!(config.exit_allow, vec!["*"]);
+        assert_eq!(config.pending_hostname, None);
+        assert_eq!(config.last_group_hash, Some(hash));
+        assert!(config.last_group_hash_published);
+        assert_eq!(config.network_public_key, Some(key.public()));
+
+        apply_coordinator_restore_to_config(
+            &mut config,
+            GroupMode::Restricted,
+            &members,
+            &ApprovedList::new(),
+            &key,
+            None,
+            false,
+        );
+        assert_eq!(
+            config.last_group_hash,
+            Some(hash),
+            "a failed replacement snapshot write must retain the recovery pointer"
+        );
+    }
 }

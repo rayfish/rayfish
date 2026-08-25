@@ -115,6 +115,19 @@ pub struct NetworkConfig {
     pub network_secret_key: Option<SecretKey>,
     #[serde(default)]
     pub network_public_key: Option<EndpointId>,
+    /// Hash of the last complete GroupBlob this node verified or authored.
+    /// Coordinator restore uses it only when the signed pkarr record is
+    /// unreachable, so an expired record can be republished without rebuilding
+    /// the roster from the deliberately lossy `members` config projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_group_hash: Option<blake3::Hash>,
+    /// Whether `last_group_hash` has been confirmed published. `false` marks a
+    /// locally authored generation durably stored before its pkarr write; restore
+    /// must prefer that hash over an older live record after a crash. Existing
+    /// configs default to `true` because their pointers predate this marker and
+    /// were written only by already-running publishers/reconvergence.
+    #[serde(default = "default_true")]
+    pub last_group_hash_published: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<TransportMode>,
     /// This node auto-installs coordinator-suggested firewall rules without a
@@ -348,6 +361,8 @@ pub(crate) fn empty_network_config(name: &str) -> NetworkConfig {
         approved: vec![],
         network_secret_key: None,
         network_public_key: None,
+        last_group_hash: None,
+        last_group_hash_published: true,
         transport: None,
         auto_accept_firewall: false,
         auto_accept_files: true,
@@ -804,6 +819,19 @@ fn validate_net_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn sync_file_and_parent(path: &Path) -> Result<()> {
+    let dir = path.parent().context("config path has no parent")?;
+    std::fs::File::open(path)
+        .with_context(|| format!("opening {} for sync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing {}", path.display()))?;
+    std::fs::File::open(dir)
+        .with_context(|| format!("opening config directory {} for sync", dir.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing config directory {}", dir.display()))?;
+    Ok(())
+}
+
 /// Atomically write `bytes` to `path`: write a sibling temp file, set its
 /// perms/owner, then rename over the target. The rename is atomic on POSIX, so
 /// a concurrent reader sees either the old file or the new one, never a torn
@@ -819,24 +847,34 @@ pub fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("config");
     let tmp = dir.join(format!(".{fname}.tmp.{}", std::process::id()));
-    {
+    let mode = if secret { 0o600 } else { 0o640 };
+    let prepared = (|| -> Result<()> {
         use std::io::Write;
         let mut f =
             std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         f.write_all(bytes)
             .with_context(|| format!("writing {}", tmp.display()))?;
-        f.sync_all().ok();
+        let _ = std::fs::set_permissions(&tmp, Permissions::from_mode(mode));
+        #[cfg(target_os = "linux")]
+        set_owner(&tmp, secret);
+        f.sync_all()
+            .with_context(|| format!("syncing {}", tmp.display()))?;
+        Ok(())
+    })();
+    if let Err(e) = prepared {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    let mode = if secret { 0o600 } else { 0o640 };
-    let _ = std::fs::set_permissions(&tmp, Permissions::from_mode(mode));
-    #[cfg(target_os = "linux")]
-    set_owner(&tmp, secret);
     let renamed = std::fs::rename(&tmp, path);
     if renamed.is_err() {
         // Clean up the temp file on a failed rename so we don't litter.
         let _ = std::fs::remove_file(&tmp);
     }
     renamed.with_context(|| format!("renaming into {}", path.display()))?;
+    std::fs::File::open(dir)
+        .with_context(|| format!("opening config directory {} for sync", dir.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing config directory {}", dir.display()))?;
     Ok(())
 }
 
@@ -1171,9 +1209,9 @@ fn update_network_in(
         net.name
     );
     let before = toml::to_string(&net).context("serializing network config")?;
-    let _update_scope = NetworkUpdateScope::enter()?;
+    let update_scope = NetworkUpdateScope::enter()?;
     update(&mut net)?;
-    drop(_update_scope);
+    drop(update_scope);
     anyhow::ensure!(
         net.name == name,
         "network update cannot rename {name:?} to {:?}",
@@ -1182,6 +1220,12 @@ fn update_network_in(
     let after = toml::to_string(&net).context("serializing network config")?;
     if after != before {
         save_network_unlocked(dir, &net)?;
+    } else {
+        // A prior atomic write may have installed this exact file and then
+        // reported an ambiguous parent-directory sync failure. A no-op retry is
+        // still a durability barrier, not merely a serialization optimization.
+        let path = dir.join(NETWORKS_SUBDIR).join(format!("{name}.toml"));
+        sync_file_and_parent(&path)?;
     }
     Ok(Some(net))
 }
@@ -1216,9 +1260,9 @@ fn update_network_or_insert_in(
         net.name
     );
     let before = toml::to_string(&net).context("serializing network config")?;
-    let _update_scope = NetworkUpdateScope::enter()?;
+    let update_scope = NetworkUpdateScope::enter()?;
     update(&mut net)?;
-    drop(_update_scope);
+    drop(update_scope);
     anyhow::ensure!(
         net.name == name,
         "network update cannot rename {name:?} to {:?}",
@@ -1335,6 +1379,8 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    last_group_hash: None,
+                    last_group_hash_published: true,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1356,6 +1402,8 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    last_group_hash: None,
+                    last_group_hash_published: true,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1398,6 +1446,8 @@ mod tests {
             approved: vec![],
             network_secret_key: None,
             network_public_key: None,
+            last_group_hash: None,
+            last_group_hash_published: true,
             my_hostname: None,
             pending_hostname: None,
             transport: None,
@@ -1428,6 +1478,8 @@ mod tests {
                 approved: vec![],
                 network_secret_key: None,
                 network_public_key: None,
+                last_group_hash: None,
+                last_group_hash_published: true,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -1451,6 +1503,8 @@ mod tests {
             approved: vec![],
             network_secret_key: None,
             network_public_key: None,
+            last_group_hash: None,
+            last_group_hash_published: true,
             my_hostname: None,
             pending_hostname: None,
             transport: None,
@@ -1481,6 +1535,8 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    last_group_hash: None,
+                    last_group_hash_published: true,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1502,6 +1558,8 @@ mod tests {
                     approved: vec![],
                     network_secret_key: None,
                     network_public_key: None,
+                    last_group_hash: None,
+                    last_group_hash_published: true,
                     my_hostname: None,
                     pending_hostname: None,
                     transport: None,
@@ -1549,6 +1607,8 @@ mod tests {
                 }],
                 network_secret_key: None,
                 network_public_key: None,
+                last_group_hash: None,
+                last_group_hash_published: true,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -1583,6 +1643,8 @@ mod tests {
                 approved: vec![],
                 network_secret_key: Some(secret.clone()),
                 network_public_key: Some(public),
+                last_group_hash: None,
+                last_group_hash_published: true,
                 my_hostname: None,
                 pending_hostname: None,
                 transport: None,
@@ -1663,6 +1725,22 @@ name = "test"
         assert_eq!(minimal.ephemeral_ttl_secs, None);
     }
 
+    #[test]
+    fn last_group_hash_roundtrips_and_defaults_none() {
+        let hash = blake3::hash(b"complete signed roster");
+        let mut n = net("cached");
+        n.last_group_hash = Some(hash);
+        n.last_group_hash_published = false;
+        let text = toml::to_string(&n).unwrap();
+        let back: NetworkConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.last_group_hash, Some(hash));
+        assert!(!back.last_group_hash_published);
+
+        let minimal: NetworkConfig = toml::from_str("name = \"x\"").unwrap();
+        assert_eq!(minimal.last_group_hash, None);
+        assert!(minimal.last_group_hash_published);
+    }
+
     fn net(name: &str) -> NetworkConfig {
         NetworkConfig {
             name: name.to_string(),
@@ -1673,6 +1751,8 @@ name = "test"
             approved: vec![],
             network_secret_key: Some(SecretKey::generate()),
             network_public_key: None,
+            last_group_hash: None,
+            last_group_hash_published: true,
             transport: None,
             auto_accept_firewall: false,
             auto_accept_files: false,
@@ -2045,7 +2125,7 @@ name = "test"
             scope.spawn(|| {
                 barrier.wait();
                 update_network_in(&dir, "homelab", |net| {
-                    net.auto_accept_files = false;
+                    net.last_group_hash = Some(blake3::hash(b"latest group"));
                     Ok(())
                 })
                 .unwrap();
@@ -2058,7 +2138,7 @@ name = "test"
             loaded.aliases.get("alice").map(String::as_str),
             Some("id-alice")
         );
-        assert!(!loaded.auto_accept_files);
+        assert_eq!(loaded.last_group_hash, Some(blake3::hash(b"latest group")));
     }
 
     #[test]
@@ -2069,7 +2149,7 @@ name = "test"
         initial.aliases.insert("local".into(), "first".into());
 
         update_network_or_insert_in(dir, "homelab", initial, |net| {
-            net.auto_accept_firewall = true;
+            net.last_group_hash = Some(blake3::hash(b"first group"));
             Ok(())
         })
         .unwrap();
@@ -2087,7 +2167,7 @@ name = "test"
             loaded.aliases.get("local").map(String::as_str),
             Some("first")
         );
-        assert!(loaded.auto_accept_firewall);
+        assert_eq!(loaded.last_group_hash, Some(blake3::hash(b"first group")));
         assert_eq!(loaded.my_hostname.as_deref(), Some("latest"));
     }
 

@@ -77,7 +77,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Two consequences worth knowing before you upgrade:
 
-  - **Every node must upgrade together.** The mesh protocol goes to 4 and peers
+  - **Every node must upgrade together.** The mesh protocol goes to 5 and peers
     on different versions cannot connect at all, so a node left behind stops
     seeing the network rather than degrading. `ray status` marks such a peer
     incompatible, and a join against a network on another version fails naming
@@ -255,6 +255,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   selection is not in effect and why (the routing rules would not install, the
   data plane is down, the peer is not in the roster yet, or the gateway cannot
   carry the family this node tunnels).
+- **A coordinator restart can no longer erase a healthy network roster.** If
+  the signed membership blob was temporarily unavailable at startup, a
+  coordinator fell back to its stale config copy and immediately published it
+  as authoritative; that copy could contain only the coordinator, making every
+  member disappear. Coordinator restore now republishes only a complete blob:
+  an authored snapshot whose publication was interrupted, the current signed
+  record, or its last cached content hash.
 - **`.ray` names now resolve alongside another VPN that manages
   `/etc/resolv.conf`.** On a host with no DNS manager (no systemd-resolved in
   the resolution path), Rayfish and a VPN like Tailscale both want that file.

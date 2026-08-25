@@ -174,7 +174,11 @@ impl NetworkRegistry {
             (h.state.clone(), h.network_key, h.dht_notify.clone())
         };
         let member_id = self.device_user_map.resolve(&ev.endpoint_id);
+        let snapshot_commit = state.read().unwrap().snapshot_commit.clone();
+        let commit_guard = snapshot_commit.lock().await;
         state.write().unwrap().members.remove(&member_id);
+        commit_current_snapshot(&state, &self.transport.blob_store, &dht_notify).await;
+        drop(commit_guard);
         dns::remove_hostname_by_ip(
             &self.dns.hostname_table,
             &self.dns.reverse_table,
@@ -182,7 +186,6 @@ impl NetworkRegistry {
             ev.ipv6,
         )
         .await;
-        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
         broadcast_member_sync(self, net_pubkey, network, None).await;
         tracing::info!(peer = %member_id.fmt_short(), network, "pruned member after leave");
     }
@@ -214,6 +217,8 @@ impl NetworkRegistry {
             (h.state.clone(), h.network_key, h.dht_notify.clone())
         };
         let member_id = self.device_user_map.resolve(&peer_id);
+        let snapshot_commit = state.read().unwrap().snapshot_commit.clone();
+        let commit_guard = snapshot_commit.lock().await;
         // Nothing to prune means nothing to announce. The tail of this function
         // is a signature, a DHT publish, and a `MemberSync` to every roster
         // member (each of which answers with a reconverge: a pkarr resolve plus a
@@ -225,6 +230,8 @@ impl NetworkRegistry {
             tracing::debug!(peer = %member_id.fmt_short(), network, "leave from a peer the roster does not list; ignoring");
             return;
         }
+        commit_current_snapshot(&state, &self.transport.blob_store, &dht_notify).await;
+        drop(commit_guard);
         if let Some(ip) = leaver_ip {
             dns::remove_hostname_by_ip(
                 &self.dns.hostname_table,
@@ -234,7 +241,6 @@ impl NetworkRegistry {
             )
             .await;
         }
-        update_snapshot_and_publish(&state, &self.transport.blob_store, &dht_notify).await;
         broadcast_member_sync(self, net_pubkey, network, None).await;
         tracing::info!(peer = %member_id.fmt_short(), network, "pruned member after in-band leave");
     }
@@ -788,10 +794,13 @@ mod sender_authority_tests {
             members: list,
             approved: ApprovedList::new(),
             snapshot: None,
+            snapshot_commit: Arc::new(AsyncMutex::new(())),
             converged_hash: None,
+            unconfirmed_durable_hash: None,
             network_secret_key: None,
             network_public_key: eid(200),
             network_name: Some("test-net".to_string()),
+            group_name: Some("test-net".to_string()),
             mode: GroupMode::Restricted,
             suggested_firewall: SuggestedFirewall::default(),
             reusable_keys: BTreeMap::new(),
