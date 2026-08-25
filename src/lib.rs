@@ -83,7 +83,9 @@ pub mod ipc;
 #[cfg(feature = "desktop")]
 mod listen_events;
 // Shared by `ssh` and `v4bridge`, so it cannot live in `ssh`: that module is
-// Unix-only and `v4bridge` is not.
+// Unix-only and `v4bridge` is not. Both are `desktop`-only, and a build without
+// that feature (Android) has no listener to bind.
+#[cfg(feature = "desktop")]
 mod listener;
 pub mod logdir;
 pub mod membership;
