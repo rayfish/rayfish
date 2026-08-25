@@ -365,9 +365,16 @@ mod tests {
             "a rejected value must not be stored"
         );
 
-        apply_global(&mut cfg, GlobalKey::DownloadDir, "/srv/inbox", false).unwrap();
-        assert_eq!(cfg.download_dir.as_deref(), Some("/srv/inbox"));
-        assert_eq!(render_global(&cfg, GlobalKey::DownloadDir), "/srv/inbox");
+        // `Path::is_absolute` is the host's own rule, and a POSIX path does not
+        // satisfy Windows': there it wants a drive letter or a UNC share.
+        #[cfg(windows)]
+        let absolute = r"C:\srv\inbox";
+        #[cfg(not(windows))]
+        let absolute = "/srv/inbox";
+
+        apply_global(&mut cfg, GlobalKey::DownloadDir, absolute, false).unwrap();
+        assert_eq!(cfg.download_dir.as_deref(), Some(absolute));
+        assert_eq!(render_global(&cfg, GlobalKey::DownloadDir), absolute);
 
         // Empty clears it (what `ray files download-dir --clear` sends).
         apply_global(&mut cfg, GlobalKey::DownloadDir, "", false).unwrap();

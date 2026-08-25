@@ -3236,9 +3236,9 @@ mod tests {
     fn zombie_windows_dns_reconcile_is_scoped_transactional_and_quotes_boundaries() {
         use super::{
             WindowsDnsSnapshot, WindowsNrptRuleSnapshot, expected_suffixes_after,
-            next_managed_suffixes, ps_quote, suffix_rollback_cas_matches, touched_rule_displays,
-            windows_dns_reconcile_script, windows_dns_rollback_script, windows_dns_snapshot_script,
-            windows_nrpt_domains,
+            next_managed_suffixes, ps_quote, resolver_addr, suffix_rollback_cas_matches,
+            touched_rule_displays, windows_dns_reconcile_script, windows_dns_rollback_script,
+            windows_dns_snapshot_script, windows_nrpt_domains,
         };
 
         assert_eq!(ps_quote(""), "");
@@ -3263,7 +3263,11 @@ mod tests {
         assert!(one.contains("@($_.Namespace).Count -eq 1"));
         assert!(one.contains("@($_.Namespace)[0] -eq $namespace"));
         assert!(one.contains("@($_.NameServers).Count -eq 1"));
-        assert!(one.contains("@($_.NameServers)[0] -eq '100.100.100.53'"));
+        // Both spellings of the nameserver, because the script's own comment
+        // promises they are rendered from one value and cannot drift apart.
+        let resolver = resolver_addr();
+        assert!(one.contains(&format!("@($_.NameServers)[0] -eq '{resolver}'")));
+        assert!(one.contains(&format!("-NameServers '{resolver}'")));
         assert!(one.contains("foreach ($rule in $matches)"));
         assert!(one.contains("-Comment $txnMarker"));
 
