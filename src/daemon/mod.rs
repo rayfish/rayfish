@@ -39,9 +39,9 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use iroh_metrics::service::MetricsServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1732,20 +1732,96 @@ fn collect_recent_logs() -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// Write `files` as a gzipped tar archive at `path`. Each entry is `(name, bytes)`.
-fn write_bundle(path: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
-    let file = File::create(path)?;
-    let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-    let mut builder = tar::Builder::new(enc);
-    for (name, data) in files {
-        let mut header = tar::Header::new_gnu();
-        header.set_size(data.len() as u64);
-        header.set_mode(0o644);
-        // `append_data` sets the path and recomputes the checksum.
-        builder.append_data(&mut header, name, data.as_slice())?;
+/// Write `files` as a gzipped tar archive at a new, non-symlink `path`.
+/// Each entry is `(name, bytes)`.
+///
+/// The bundle stays 0600 for its whole life when there is an `owner` to hand it
+/// to: it packs the root daemon's `rayfish=debug` logs, status dump, peer ids
+/// and mesh IPs, and `IpcMessage::Report` is an open read, so a world-readable
+/// copy sitting in `/tmp` is those logs handed to every other local user. It
+/// widens to 0644 only when the file is still root-owned and would otherwise be
+/// unreadable by the very caller that asked for it.
+fn write_bundle(
+    path: &Path,
+    files: &[(String, Vec<u8>)],
+    owner: Option<(u32, u32)>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let result = (|| {
+        let enc = flate2::write::GzEncoder::new(&mut file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        for (name, data) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            // `append_data` sets the path and recomputes the checksum.
+            builder.append_data(&mut header, name, data.as_slice())?;
+        }
+        builder.into_inner()?.finish()?;
+        file.sync_all()?;
+        let given_to_requester = match owner {
+            Some((uid, gid)) => {
+                let rc = unsafe { libc::fchown(file.as_raw_fd(), uid, gid) };
+                if rc == 0 {
+                    true
+                } else {
+                    // Best-effort, as it was before the fd move: a daemon
+                    // without CAP_CHOWN, or a /tmp on a mount that refuses
+                    // ownership changes, would otherwise have its finished
+                    // archive deleted by the cleanup below and report
+                    // "Operation not permitted" with nothing to attach.
+                    tracing::warn!(
+                        error = %std::io::Error::last_os_error(),
+                        "could not hand the report bundle to the requester"
+                    );
+                    false
+                }
+            }
+            None => false,
+        };
+        if !given_to_requester {
+            // Still root-owned, so the caller needs the wider mode to read it
+            // at all. This is the only path that exposes the bundle.
+            file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
     }
-    builder.into_inner()?.finish()?;
-    Ok(())
+    result
+}
+
+/// Create a report under `dir` with an unpredictable, exclusively-created name.
+fn create_report_bundle(
+    dir: &Path,
+    files: &[(String, Vec<u8>)],
+    owner: Option<(u32, u32)>,
+) -> std::io::Result<PathBuf> {
+    for _ in 0..16 {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let nonce: u64 = rand::random();
+        let path = dir.join(format!("rayfish-report-{timestamp}-{nonce:016x}.tgz"));
+        match write_bundle(&path, files, owner) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique report path",
+    ))
 }
 
 // Process bootstrap + IPC server live in `mesh/bootstrap.rs`; background tasks +
@@ -1905,9 +1981,8 @@ mod report_tests {
 
     #[test]
     fn test_write_bundle_is_valid_targz() {
-        let dir = std::env::temp_dir().join(format!("rayfish-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("bundle.tgz");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.tgz");
         let files = vec![
             ("sysinfo.txt".to_string(), b"rayfish 0.1.0\n".to_vec()),
             (
@@ -1915,7 +1990,7 @@ mod report_tests {
                 b"hello log\n".to_vec(),
             ),
         ];
-        write_bundle(&path, &files).unwrap();
+        write_bundle(&path, &files, None).unwrap();
 
         // Re-read it back through the gzip+tar decoders to prove it's well-formed.
         let f = std::fs::File::open(&path).unwrap();
@@ -1928,7 +2003,93 @@ mod report_tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["logs/rayfish.log.2026-06-23", "sysinfo.txt"]);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_bundle_refuses_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let path = dir.path().join("bundle.tgz");
+        std::fs::write(&target, b"do not overwrite").unwrap();
+        symlink(&target, &path).unwrap();
+
+        let result = write_bundle(
+            &path,
+            &[("status.txt".to_string(), b"sensitive report".to_vec())],
+            None,
+        );
+
+        assert!(result.is_err(), "a report destination symlink was followed");
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not overwrite");
+    }
+
+    /// The bundle used to be widened to 0644 even on the path that chowns it to
+    /// the requester. `Report` is an open read and the archive packs the root
+    /// daemon's debug logs, so that left any other local user free to read them
+    /// out of `/tmp`.
+    #[test]
+    fn a_bundle_handed_to_its_requester_stays_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.tgz");
+        let files = vec![("status.txt".to_string(), b"peer ids and mesh ips".to_vec())];
+        // chowning a file to the uid/gid that already owns it is permitted for
+        // an unprivileged owner, so this takes the success branch off root too.
+        let me = (unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+
+        write_bundle(&path, &files, Some(me)).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "report bundle is readable by other local users"
+        );
+    }
+
+    /// The fallback: with nobody to give it to the bundle stays root-owned, so
+    /// it has to be readable or the caller cannot collect what it asked for.
+    #[test]
+    fn an_unowned_bundle_is_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.tgz");
+
+        write_bundle(&path, &[("status.txt".to_string(), b"x".to_vec())], None).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    /// The existing symlink test points at a file that exists, which `O_EXCL`
+    /// alone refuses. A dangling link is the case that would let a planted path
+    /// be created at the target, and it must be refused too. Neither test can
+    /// isolate `O_NOFOLLOW` while the open also carries `O_EXCL`, which fails on
+    /// any symlink: the flag is there for a future helper that opens this path
+    /// without it.
+    #[test]
+    fn test_write_bundle_refuses_a_dangling_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("not-there-yet");
+        let path = dir.path().join("bundle.tgz");
+        symlink(&target, &path).unwrap();
+
+        let result = write_bundle(
+            &path,
+            &[("status.txt".to_string(), b"sensitive report".to_vec())],
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "a dangling destination symlink was followed"
+        );
+        assert!(!target.exists(), "the symlink target was created");
     }
 
     #[test]

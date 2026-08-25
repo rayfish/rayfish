@@ -383,6 +383,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **Unprivileged report requests can no longer overwrite root-owned files.**
+  Diagnostic bundles now use unpredictable, exclusively created paths and set
+  ownership through the open file descriptor, so a symlink planted in `/tmp`
+  cannot redirect the root daemon's report output.
+- **A diagnostic bundle is no longer readable by other users on the machine.**
+  `ray report` packs the daemon's debug logs, status dump, peer ids and mesh
+  IPs, and anyone with a local account can ask for one. The finished archive
+  was left world-readable in `/tmp`, so one user running `ray report` handed
+  all of that to every other user on the box. The bundle is now owned by
+  whoever asked for it and readable by them alone.
 - **Android: a device identifier no longer leaks onto unrelated crash reports.**
   The install id and network transport meant for diagnostics reports were being
   written somewhere longer-lived than the report itself, and turned up on an
