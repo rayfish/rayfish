@@ -34,20 +34,6 @@ pub fn load_or_create() -> Result<SecretKey> {
     }
 }
 
-fn collision_index_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join("collision_index"))
-}
-
-pub fn load_collision_index() -> Result<u32> {
-    let path = collision_index_path()?;
-    if path.exists() {
-        let s = std::fs::read_to_string(&path).context("read collision_index")?;
-        s.trim().parse::<u32>().context("parse collision_index")
-    } else {
-        Ok(0)
-    }
-}
-
 fn device_cert_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("device_cert"))
 }

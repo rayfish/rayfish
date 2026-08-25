@@ -19,9 +19,11 @@ impl Daemon {
     pub fn status(&self) -> IpcMessage {
         let hostname_snapshot = self.dns.hostname_table.try_read().ok();
         let my_id = self.transport.endpoint.id();
+        let saved = config::load().ok();
         // Direct-connection networks are flagged in config; collect their names
         // so each NetworkStatus can be tagged `[direct]` in the CLI.
-        let direct_names: HashSet<String> = config::load()
+        let direct_names: HashSet<String> = saved
+            .as_ref()
             .map(|c| {
                 c.networks
                     .iter()
@@ -38,12 +40,35 @@ impl Daemon {
             .collect();
         // Persisted pending-join markers, minus any network that has since
         // become active (admitted while we were retrying in the background).
-        let pending_networks: Vec<String> = config::load()
+        let pending_networks: Vec<String> = saved
+            .as_ref()
             .map(|c| {
                 c.pending_joins
-                    .into_iter()
+                    .iter()
                     .filter(|p| !self.registry.networks.contains_key(&p.network_key))
-                    .map(|p| p.name.unwrap_or(p.network_key))
+                    .map(|p| p.name.clone().unwrap_or_else(|| p.network_key.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Saved networks the daemon has not registered: a restore that has not
+        // landed. Reported from here rather than read from config by the CLI,
+        // which resolves the *calling user's* config directory and so finds an
+        // empty one wherever the daemon's is root-owned, turning every failed
+        // restore into a network that simply is not mentioned.
+        let inactive_networks: Vec<InactiveNetwork> = saved
+            .as_ref()
+            .map(|c| {
+                c.networks
+                    .iter()
+                    .filter(|n| !self.registry.networks.contains_key(&n.name))
+                    .map(|n| InactiveNetwork {
+                        name: n.name.clone(),
+                        reason: self
+                            .registry
+                            .restore_errors
+                            .get(&n.name)
+                            .map(|e| e.value().clone()),
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -52,7 +77,6 @@ impl Daemon {
             endpoint_id: self.transport.endpoint.id(),
             mdns_enabled: self.mdns_enabled,
             auto_update: self.auto_update,
-            ipv6_only: self.ipv6_only,
             active: self.active.load(Ordering::SeqCst),
             contact_id: Some(self.contact_public.to_string()),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -64,6 +88,7 @@ impl Daemon {
             pending_files: self.files.pending_files.lock().unwrap().len(),
             pending_connects: self.connect.pending_connects.len(),
             pending_networks,
+            inactive_networks,
             // Only the neighbours you could still link up with: peers already on
             // one of our networks are visible in the network list, not here.
             lan_peers: self
@@ -98,16 +123,15 @@ impl Daemon {
             .map(|n| n.aliases.clone())
             .unwrap_or_default();
         let ephemeral_ttl_secs = net_cfg.as_ref().and_then(|n| n.ephemeral_ttl_secs);
-        // Resolve a mesh IPv4 back to its `.ray` hostname via the DNS snapshot.
-        // A member running an IPv6-only data plane holds no IPv4 in the table, so
-        // fall back to matching on its derived IPv6.
-        let lookup_hostname = |ip: Ipv4Addr, id: EndpointId| {
+        // Resolve a mesh address back to its `.ray` hostname via the DNS snapshot,
+        // matching on the address derived from the member's identity.
+        let lookup_hostname = |id: EndpointId| {
             let v6 = derive_ipv6(&id);
             hostname_snapshot.and_then(|table| {
                 table.get(&h.name).and_then(|hosts| {
                     hosts
                         .iter()
-                        .find(|(_, v)| v.0 == Some(ip) || v.1 == v6)
+                        .find(|(_, v)| **v == v6)
                         .map(|(k, _)| k.clone())
                 })
             })
@@ -120,8 +144,7 @@ impl Daemon {
                     return NetworkStatus {
                         name: h.name.clone(),
                         role,
-                        my_ip: h.my_ip,
-                        my_ipv6: Some(derive_ipv6(&my_id)),
+                        my_ipv6: derive_ipv6(&my_id),
                         my_hostname: None,
                         network_key: Some(h.network_key.to_string()),
                         member_count: 0,
@@ -132,6 +155,7 @@ impl Daemon {
                         ephemeral_ttl_secs,
                         my_exit_node: None,
                         exit_offering: false,
+                        incompatible: h.incompatible.clone(),
                     };
                 }
             };
@@ -170,17 +194,13 @@ impl Daemon {
             .iter()
             .filter(|m| m.identity != my_id)
             .map(|m| {
-                let hostname = m
-                    .hostname
-                    .clone()
-                    .or_else(|| lookup_hostname(m.ip, m.identity));
+                let hostname = m.hostname.clone().or_else(|| lookup_hostname(m.identity));
                 let connection = connected.get(&m.identity).map(Self::gather_conn_info);
                 let user_id = self.registry.device_user_map.resolve(&m.identity);
                 let user_identity = (user_id != m.identity).then_some(user_id);
                 PeerStatus {
                     endpoint_id: m.identity,
-                    ip: m.ip,
-                    ipv6: Some(derive_ipv6(&m.identity)),
+                    ipv6: derive_ipv6(&m.identity),
                     hostname,
                     user_identity,
                     is_own_device: user_id == own_user,
@@ -221,16 +241,15 @@ impl Daemon {
                 Some(m) => m
                     .hostname
                     .clone()
-                    .or_else(|| lookup_hostname(m.ip, m.identity))
+                    .or_else(|| lookup_hostname(m.identity))
                     .unwrap_or_else(|| m.identity.fmt_short().to_string()),
                 None => stored,
             });
         NetworkStatus {
             name: h.name.clone(),
             role,
-            my_ip: h.my_ip,
-            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
-            my_hostname: lookup_hostname(h.my_ip, self.transport.identity.local_identity()),
+            my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
+            my_hostname: lookup_hostname(self.transport.identity.local_identity()),
             network_key: Some(h.network_key.to_string()),
             member_count,
             peers,
@@ -241,6 +260,11 @@ impl Daemon {
             my_exit_node,
             // A non-empty allow-list is exactly what makes this node an exit node.
             exit_offering: net_cfg.as_ref().is_some_and(|n| !n.exit_allow.is_empty()),
+            // Registered from the signed blob alone because the network's record
+            // advertises a mesh version this build does not speak. Every dial on
+            // it fails the ALPN gate, so the network is present but carries no
+            // traffic, and status has to say so rather than render it healthy.
+            incompatible: h.incompatible.clone(),
         }
     }
 
@@ -403,10 +427,10 @@ impl Daemon {
     // Diagnostics (ray ping / ray netcheck)
     // -----------------------------------------------------------------------
 
-    /// Resolve a `ray ping` peer argument (hostname / IPv4 / short id / `self`)
-    /// to its virtual IPv4 plus a display name. Mirrors `resolve_peer_name` but
-    /// returns the address (so `lookup_v4` can yield a live connection).
-    pub(crate) async fn resolve_peer_ip(&self, name: &str) -> Option<(Ipv4Addr, String)> {
+    /// Resolve a `ray ping` peer argument (hostname / mesh IPv6 / short id /
+    /// `self`) to its mesh IPv6 plus a display name. Mirrors `resolve_peer_name`
+    /// but returns the address (so `lookup_v6` can yield a live connection).
+    pub(crate) async fn resolve_peer_ip(&self, name: &str) -> Option<(Ipv6Addr, String)> {
         let id = self.resolve_peer_name(name).await?;
         for entry in self.registry.networks.iter() {
             let state = entry.value().state.read().unwrap();
@@ -415,7 +439,7 @@ impl Daemon {
                     .hostname
                     .clone()
                     .unwrap_or_else(|| id.fmt_short().to_string());
-                return Some((m.ip, display));
+                return Some((derive_ipv6(&m.identity), display));
             }
         }
         None
@@ -437,25 +461,26 @@ impl Daemon {
             return false;
         };
         // A live link already exists (the peer table only holds connected peers).
-        if self.registry.peers.v4_for_id(&id).is_some() {
+        if self.registry.peers.ipv6_for_id(&id).is_some() {
             return true;
         }
-        let Some(ip) = self.member_ipv4(&id) else {
+        let Some(ip) = self.member_ipv6(&id) else {
             return false;
         };
-        match self.registry.resolve_route(IpAddr::V4(ip)) {
+        match self.registry.resolve_route(IpAddr::V6(ip)) {
             Some(target) => self.registry.dial_target(&target).await,
             None => false,
         }
     }
 
-    /// The peer's mesh IPv4 as recorded in the roster, for peers with no live
-    /// connection (where `PeerTable::v4_for_id` has nothing).
-    fn member_ipv4(&self, id: &EndpointId) -> Option<Ipv4Addr> {
+    /// The peer's mesh IPv6, for peers with no live connection (where
+    /// `PeerTable::ipv6_for_id` has nothing). Derived from the identity, so the
+    /// roster only has to confirm the peer is a member somewhere.
+    fn member_ipv6(&self, id: &EndpointId) -> Option<Ipv6Addr> {
         for entry in self.registry.networks.iter() {
             let state = entry.value().state.read().unwrap();
-            if let Some(m) = state.members.all().iter().find(|m| &m.identity == id) {
-                return Some(m.ip);
+            if state.members.all().iter().any(|m| &m.identity == id) {
+                return Some(derive_ipv6(id));
             }
         }
         None
@@ -470,16 +495,16 @@ impl Daemon {
                 return ipc_err(format!("unknown peer '{peer}'"));
             }
         };
-        let route = match self.registry.peers.lookup_v4(&ip) {
+        let route = match self.registry.peers.lookup_v6(&ip) {
             Some(r) => r,
             None => {
                 // No live link (an on-demand idle peer holds none): dial it on
                 // demand so ping works like a reach probe, then re-look up.
                 // `dial_target` stamps reachability, so a failure here also flips
                 // the peer's status to offline.
-                match self.registry.resolve_route(IpAddr::V4(ip)) {
+                match self.registry.resolve_route(IpAddr::V6(ip)) {
                     Some(target) if self.registry.dial_target(&target).await => {
-                        match self.registry.peers.lookup_v4(&ip) {
+                        match self.registry.peers.lookup_v6(&ip) {
                             Some(r) => r,
                             None => {
                                 return ipc_err(format!("{display}: dialed but no route to {ip}"));

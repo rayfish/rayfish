@@ -79,11 +79,11 @@ setting_keys! {
         Mdns = "mdns", "LAN peer discovery over mDNS (on|off)";
         Relay = "relay", "iroh relay servers (preset or URL, comma-separated)";
         DiscoveryDns = "discovery-dns", "pkarr discovery server (preset or URL)";
-        DnsUpstreams = "dns-upstreams", "Magic DNS upstream forwarders (IPv4, comma-separated)";
+        DnsUpstreams = "dns-upstreams", "Magic DNS upstream forwarders (IP addresses, comma-separated)";
         AutoUpdate = "auto-update", "install new releases automatically (on|off)";
         OnDemand = "on-demand", "dial peers lazily on first packet (on|off)";
-        Ipv6Only = "ipv6-only", "run the data plane over mesh IPv6 alone (on|off|auto)";
         Ssh = "ssh", "embedded mesh SSH server (on|off)";
+        V4Bridge = "v4-bridge", "reach this host's IPv4-only listeners over the mesh (on|off)";
         DownloadDir = "download-dir", "directory accepted files land in (absolute path, empty to clear)";
         DownloadUser = "download-user", "uid that owns accepted files (numeric, empty to clear)";
     }

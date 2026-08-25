@@ -12,7 +12,7 @@
 //! signalling the daemon through a channel.
 
 use super::*;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -23,14 +23,13 @@ use tokio::sync::Notify;
 /// the peer is marked unreachable until a later packet retries the dial.
 const LAZY_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One network to (re)handshake when dialing a peer: its name, the per-network
-/// public key that signs the `MeshHello`, and our mesh IPv4 on it. A peer's single
-/// connection carries every shared network, so a dial takes a slice of these.
+/// One network to (re)handshake when dialing a peer: its name and the per-network
+/// public key that signs the `MeshHello`. A peer's single connection carries every
+/// shared network, so a dial takes a slice of these.
 #[derive(Clone)]
 pub(crate) struct DialTarget {
     pub network: String,
     pub network_key: EndpointId,
-    pub my_ip: Ipv4Addr,
 }
 
 pub(crate) struct NetworkRegistry {
@@ -102,7 +101,16 @@ pub(crate) struct NetworkRegistry {
     /// re-runs the exit reconcile instead of leaking traffic until the next
     /// `ray up`.
     pub(crate) exit_selection_pending: AtomicBool,
-    /// Nudged by reconverge when [`Self::exit_selection_pending`] is set; the
+    /// The last failure from installing the client full tunnel, or `None` when
+    /// the last attempt succeeded (or there was nothing to install).
+    ///
+    /// A failed install rolls its own rules back and leaves the *selection* in
+    /// place, which is right (the next re-apply retries it) but makes the
+    /// selection a poor answer to "is traffic being tunnelled". `ray exit-node
+    /// status` reads this so the answer comes from what the kernel accepted
+    /// rather than from what the config asked for.
+    pub(crate) exit_install_error: ArcSwapOption<String>,
+    /// Nudged by reconverge via [`NetworkRegistry::nudge_exit_reapply`]; the
     /// daemon listens and re-runs `apply_exit_node`. A channel rather than a
     /// direct call because the kernel plumbing lives on `Daemon`, above the
     /// registry in the service graph.
@@ -112,15 +120,15 @@ pub(crate) struct NetworkRegistry {
     /// fires while the data plane is down (boot, standby) from withdrawing an
     /// offer that `activate()` is about to re-advertise.
     pub(crate) exit_sync_enabled: AtomicBool,
-    /// Whether this node's data plane is IPv6-only (`AppConfig::ipv6_only`).
-    /// Fixed for the daemon's lifetime (the TUN's addressing is decided at
-    /// startup), and advertised on every network's signed roster so peers stop
-    /// resolving us to a mesh IPv4 that carries nothing. See `mesh/ipv6_only.rs`.
-    pub(crate) ipv6_only: bool,
     /// Networks whose restore is already running, so a sweep never starts a
     /// second one for the same network. Removed when the restore finishes,
     /// however it finishes.
     pub(crate) restoring: Arc<DashSet<String>>,
+    /// Why each saved-but-unregistered network's last restore attempt failed,
+    /// keyed by network name. `ray status` reports it beside the network so a
+    /// failed restore says what went wrong instead of sending the reader to the
+    /// daemon log. Cleared when the restore lands or gives up.
+    pub(crate) restore_errors: Arc<DashMap<String, String>>,
     /// Nudges [`Self::run_restore_supervisor`] to sweep now instead of at its
     /// next tick. Fired when a peer sends a control frame for a network we have
     /// saved but not live: their traffic is proof the network is reachable
@@ -192,7 +200,6 @@ impl NetworkRegistry {
         disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
         on_demand: bool,
         idle_timeout: Duration,
-        ipv6_only: bool,
     ) -> Self {
         Self {
             networks,
@@ -216,10 +223,11 @@ impl NetworkRegistry {
             exit_server: crate::exit_node::ExitServer::new(),
             exit_client: crate::exit_node::ExitClient::new(),
             exit_selection_pending: AtomicBool::new(false),
+            exit_install_error: ArcSwapOption::empty(),
             exit_reapply: Arc::new(Notify::new()),
             exit_sync_enabled: AtomicBool::new(false),
-            ipv6_only,
             restoring: Arc::new(DashSet::new()),
+            restore_errors: Arc::new(DashMap::new()),
             restore_nudge: Arc::new(Notify::new()),
             poll_nudge: Arc::new(Notify::new()),
         }
@@ -229,9 +237,11 @@ impl NetworkRegistry {
     /// loop can dial, if we know one. Just a route-map lookup; the loop owns the
     /// packet buffering and dedup.
     pub(crate) fn resolve_route(&self, dst: IpAddr) -> Option<peers::RouteTarget> {
+        // Only the IPv6 half of the overlay is routed, so an IPv4 destination
+        // never names a roster member to dial.
         match dst {
-            IpAddr::V4(v4) => self.route_map.resolve_v4(&v4),
             IpAddr::V6(v6) => self.route_map.resolve_v6(&v6),
+            IpAddr::V4(_) => None,
         }
     }
 
@@ -248,7 +258,6 @@ impl NetworkRegistry {
                 self.networks.get(net.as_str()).map(|h| DialTarget {
                     network: net.to_string(),
                     network_key: h.network_key,
-                    my_ip: h.my_ip,
                 })
             })
             .collect();
@@ -256,11 +265,8 @@ impl NetworkRegistry {
         // `dial_peer_once` stamps reachability (ok/fail) itself, so the timeout arm
         // is the only failure this path must record separately.
         let ok = !targets.is_empty()
-            && match tokio::time::timeout(
-                LAZY_DIAL_TIMEOUT,
-                self.dial_peer_once(id, target.ipv4, &targets),
-            )
-            .await
+            && match tokio::time::timeout(LAZY_DIAL_TIMEOUT, self.dial_peer_once(id, &targets))
+                .await
             {
                 Ok(established) => established,
                 Err(_elapsed) => {
@@ -282,7 +288,6 @@ impl NetworkRegistry {
             .filter(|m| m.identity != my_id)
             .map(|m| peers::RouteMember {
                 endpoint_id: m.identity,
-                ipv4: m.ip,
                 ipv6: derive_ipv6(&m.identity),
             })
             .collect();
@@ -546,7 +551,7 @@ impl NetworkRegistry {
             return Ok(ipc_err(format!("network '{name}' already active")));
         }
 
-        let my_ip = self.transport.identity.local_ip();
+        let my_ip = self.transport.identity.local_ipv6();
 
         let my_hostname = match hostname {
             Some(h) => {
@@ -556,31 +561,25 @@ impl NetworkRegistry {
                 );
                 h
             }
-            None => config::load()
-                .ok()
-                .and_then(|c| c.default_hostname)
-                .unwrap_or_else(crate::hostname::generate_hostname),
+            // Founding the network, so there is no roster to clash with yet.
+            None => crate::hostname::default_hostname(
+                config::load().ok().and_then(|c| c.default_hostname),
+                &[],
+            ),
         };
 
         // Captured before `pre_approve` is consumed below: on a direct network
         // this is the one peer the co-coordinator key grant is pinned to.
         let pre_approved_peer = pre_approve.as_ref().map(|(id, _)| *id);
 
-        let mut net_state = self.build_initial_roster(
-            &name,
-            my_ip,
-            &my_hostname,
-            mode,
-            &net_secret_key,
-            pre_approve,
-        )?;
+        let mut net_state =
+            self.build_initial_roster(&name, &my_hostname, mode, &net_secret_key, pre_approve)?;
 
         dns::update_hostname(
             &self.dns.hostname_table,
             &self.dns.reverse_table,
             &name,
             &my_hostname,
-            (!self.ipv6_only).then_some(my_ip),
             derive_ipv6(&self.transport.identity.local_identity()),
         )
         .await;
@@ -592,7 +591,6 @@ impl NetworkRegistry {
         config::save_network(&config::NetworkConfig {
             name: name.clone(),
             group_mode: mode,
-            my_ip: Some(my_ip),
             my_hostname: Some(my_hostname.clone()),
             pending_hostname: None,
             members: member_entries,
@@ -634,12 +632,14 @@ impl NetworkRegistry {
             name: name.clone(),
             network_key: net_public_key,
             role: NetworkRole::Coordinator,
-            my_ip,
             state: state.clone(),
             dht_notify: Some(dht_notify.clone()),
             cancel: cancel.clone(),
             tasks,
             invite_lock: invite_lock.clone(),
+            // A coordinator holds the network key and publishes the record, so
+            // the version it advertises is this build's by construction.
+            incompatible: None,
         };
         self.networks.insert(name.clone(), handle);
 
@@ -658,8 +658,7 @@ impl NetworkRegistry {
         Ok(IpcMessage::Created {
             name,
             network_key: net_public_key,
-            my_ip,
-            my_ipv6: Some(derive_ipv6(&self.transport.identity.local_identity())),
+            my_ipv6: derive_ipv6(&self.transport.identity.local_identity()),
         })
     }
 
@@ -669,52 +668,40 @@ impl NetworkRegistry {
     pub(crate) fn build_initial_roster(
         &self,
         name: &str,
-        my_ip: Ipv4Addr,
         my_hostname: &str,
         mode: GroupMode,
         net_secret_key: &SecretKey,
         pre_approve: Option<(EndpointId, Option<String>)>,
     ) -> Result<NetworkState> {
         let mut member_list = MemberList::new();
-        member_list
-            .add(Member {
-                identity: self.transport.identity.local_identity(),
-                ip: my_ip,
-                is_coordinator: true,
-                hostname: Some(my_hostname.to_string()),
-                user_identity: None,
-                device_cert: None,
-                collision_index: 0,
-                last_seen: None,
-                exit_node: false,
-                // Our own entry starts out truthful, so the first published blob
-                // already tells peers not to use our mesh IPv4.
-                ipv6_only: self.ipv6_only,
-            })
-            .expect("self-add cannot collide");
+        member_list.add(Member {
+            identity: self.transport.identity.local_identity(),
+            is_coordinator: true,
+            hostname: Some(my_hostname.to_string()),
+            user_identity: None,
+            device_cert: None,
+            last_seen: None,
+            exit_node: false,
+            // `Unknown` until the data plane probes the uplink: an offer we have
+            // not verified is not a claim to publish.
+            exit_families: ExitFamilies::Unknown,
+        });
 
         let mut approved = ApprovedList::new();
         if let Some((peer_id, peer_hostname)) = pre_approve {
-            let peer_ip = self.transport.identity.derive_ip(&peer_id);
-            approved
-                .approve(
-                    ApprovedEntry {
-                        identity: peer_id,
-                        ip: peer_ip,
-                        hostname: peer_hostname,
-                        user_identity: None,
-                        device_cert: None,
-                        collision_index: 0,
-                    },
-                    &member_list,
-                )
-                .map_err(|e| anyhow::anyhow!("failed to pre-approve peer: {e:?}"))?;
+            approved.approve(ApprovedEntry {
+                identity: peer_id,
+                hostname: peer_hostname,
+                user_identity: None,
+                device_cert: None,
+            });
         }
 
         Ok(NetworkState {
             members: member_list,
             approved,
             snapshot: None,
+            converged_hash: None,
             network_secret_key: Some(net_secret_key.clone()),
             network_public_key: net_secret_key.public(),
             network_name: Some(name.to_string()),
@@ -876,7 +863,7 @@ impl NetworkRegistry {
         Some(packet.as_bytes().to_vec())
     }
 
-    /// Resolve a peer name (hostname, `host.net.ray`, or mesh IPv4) to its
+    /// Resolve a peer name (hostname, `host.net.ray`, or mesh address) to its
     /// endpoint id: Magic DNS + connected-peer route first, then the member
     /// roster (offline peers / self), then a short-id / endpoint-id prefix scan.
     pub(crate) async fn resolve_peer_name(&self, name: &str) -> Option<EndpointId> {
@@ -886,14 +873,8 @@ impl NetworkRegistry {
         } else {
             format!("{name}{suffix}")
         };
-        // The IPv4 half is absent for a peer running an IPv6-only data plane; its
-        // IPv6 is always there, so match on that when there is no address to key
-        // on. (Both halves derive from the same identity, so either resolves it.)
-        if let Some((v4, v6)) = self.dns.resolve(&qualified, &suffix).await {
-            if let Some(route) = v4
-                .and_then(|ip| self.peers.lookup_v4(&ip))
-                .or_else(|| self.peers.lookup_v6(&v6))
-            {
+        if let Some(v6) = self.dns.resolve(&qualified, &suffix).await {
+            if let Some(route) = self.peers.lookup_v6(&v6) {
                 return Some(route.endpoint_id);
             }
             for entry in self.networks.iter() {
@@ -902,7 +883,7 @@ impl NetworkRegistry {
                     .members
                     .all()
                     .iter()
-                    .find(|m| Some(m.ip) == v4 || derive_ipv6(&m.identity) == v6)
+                    .find(|m| derive_ipv6(&m.identity) == v6)
                 {
                     return Some(m.identity);
                 }
@@ -912,17 +893,12 @@ impl NetworkRegistry {
     }
 
     /// Resolve a firewall `--peer` argument to a peer's **device** endpoint id,
-    /// accepting more forms than [`Self::resolve_peer_name`]: hostname, mesh IPv4
-    /// (incl. offline members from the roster), mesh IPv6 (connected peers only),
+    /// accepting more forms than [`Self::resolve_peer_name`]: hostname, mesh address
+    /// (incl. offline members, since it derives from the roster's identities),
     /// short / full endpoint id, or a paired user identity.
     pub(crate) async fn resolve_peer_flexible(&self, name: &str) -> Option<EndpointId> {
         if let Some(id) = self.resolve_peer_name(name).await {
             return Some(id);
-        }
-        if let Ok(v4) = name.parse::<Ipv4Addr>()
-            && let Some(route) = self.peers.lookup_v4(&v4)
-        {
-            return Some(route.endpoint_id);
         }
         if let Ok(v6) = name.parse::<std::net::Ipv6Addr>()
             && let Some(route) = self.peers.lookup_v6(&v6)

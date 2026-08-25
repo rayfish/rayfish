@@ -132,6 +132,42 @@ impl PacketSpec {
         pkt
     }
 
+    /// [`Self::encode`] with `links` extension headers inserted between the fixed
+    /// IPv6 header and the L4 one, outermost first. `None` for an IPv4 spec,
+    /// which has no such chain.
+    ///
+    /// Every kind is rendered as exactly 8 octets, which each of the three length
+    /// conventions agrees on at its smallest: a TLV `hdr_ext_len` of 0 is
+    /// `(0 + 1) * 8`, an Authentication Header payload length of 0 is
+    /// `(0 + 2) * 4`, and a Fragment header is 8 by definition. A fragment
+    /// rendered this way has offset 0, i.e. the *first* fragment, which is the
+    /// one that does carry the L4 header.
+    ///
+    /// The lengths are written literally rather than computed from the parser's
+    /// own constants, so a change to the parser's arithmetic fails here instead
+    /// of being mirrored into the fixture.
+    pub fn encode_behind(&self, links: &[u8]) -> Option<Vec<u8>> {
+        if !self.v6 {
+            return None;
+        }
+        const LINK_LEN: usize = 8;
+        let base = self.encode();
+        let mut pkt = vec![0u8; 40 + links.len() * LINK_LEN + L4_LEN];
+        pkt[..40].copy_from_slice(&base[..40]);
+        // Byte 6 names the first link instead of the protocol.
+        pkt[6] = links.first().copied().unwrap_or(self.protocol);
+        let payload = links.len() * LINK_LEN + L4_LEN;
+        pkt[4..6].copy_from_slice(&(payload as u16).to_be_bytes());
+        for (i, _) in links.iter().enumerate() {
+            let off = 40 + i * LINK_LEN;
+            pkt[off] = links.get(i + 1).copied().unwrap_or(self.protocol);
+            // `hdr_ext_len` on a TLV or AH header, reserved on a Fragment one.
+            pkt[off + 1] = 0;
+        }
+        pkt[40 + links.len() * LINK_LEN..].copy_from_slice(&base[40..]);
+        Some(pkt)
+    }
+
     /// The `PacketInfo` a correct parser must produce for `encode()`. Fields
     /// the parser only fills in for the relevant protocol are zero elsewhere.
     pub fn expected(&self) -> PacketInfo {
@@ -190,6 +226,14 @@ pub fn icmp_type_strategy() -> impl Strategy<Value = u8> {
     ]
 }
 
+/// A well-formed packet the parser is expected to accept.
+///
+/// IPv6 specs naming an extension header are filtered out rather than generated,
+/// because [`PacketSpec::encode`] writes the protocol at byte 6 and the L4 header
+/// at 40 with nothing in between: a chain link there names a chain that is not
+/// present, which is a truncated packet rather than a well-formed one. Chains
+/// that *are* present are built by [`PacketSpec::encode_behind`], and the
+/// property that a link is transparent lives beside it.
 pub fn packet_spec() -> impl Strategy<Value = PacketSpec> {
     (
         any::<bool>(),
@@ -239,6 +283,28 @@ pub fn packet_spec() -> impl Strategy<Value = PacketSpec> {
                 }
             },
         )
+        .prop_filter(
+            "a chain link at byte 6 names a chain that is not there",
+            |spec| !(spec.v6 && rayfish::firewall::IPV6_EXTENSION_HEADERS.contains(&spec.protocol)),
+        )
+}
+
+/// The fragment header, which the parser refuses rather than walks.
+pub const IPV6_FRAGMENT: u8 = 44;
+
+/// One to three extension-header kinds, for [`PacketSpec::encode_behind`].
+///
+/// Fragment-free: a chain carrying one is refused whatever else is in it, so it
+/// has no transparency to assert. `a_fragmented_packet_is_refused` covers that
+/// half, generating the fragment's position within the chain rather than
+/// leaving it to chance here.
+pub fn ext_chain_strategy() -> impl Strategy<Value = Vec<u8>> {
+    let walkable: Vec<u8> = rayfish::firewall::IPV6_EXTENSION_HEADERS
+        .iter()
+        .copied()
+        .filter(|h| *h != IPV6_FRAGMENT)
+        .collect();
+    prop::collection::vec(prop::sample::select(walkable), 1..=3)
 }
 
 // ---------------------------------------------------------------------------

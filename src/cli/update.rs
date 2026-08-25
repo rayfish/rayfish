@@ -354,7 +354,7 @@ async fn download_verify_and_install(
     // stale cached unit, leaving the daemon on the old binary. `wait_for_daemon`
     // then confirms the new daemon actually comes up.
     if service_installed {
-        install_and_start_service(None, None).await
+        install_and_start_service(None).await
     } else {
         println!("run `sudo ray up` to start the service with the new binary");
         Ok(())

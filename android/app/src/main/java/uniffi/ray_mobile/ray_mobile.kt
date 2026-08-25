@@ -1012,7 +1012,7 @@ fun uniffi_ray_mobile_fn_method_node_set_dns_upstreams(`ptr`: Pointer,`servers`:
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_set_hostname(`ptr`: Pointer,`network`: RustBuffer.ByValue,`hostname`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-fun uniffi_ray_mobile_fn_method_node_start(`ptr`: Pointer,`ipv6Only`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+fun uniffi_ray_mobile_fn_method_node_start(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_ray_mobile_fn_method_node_start_pairing(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1226,7 +1226,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_log_snapshot() != 20955.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_network_changed() != 41989.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_network_changed() != 59345.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_pair() != 22172.toShort()) {
@@ -1250,7 +1250,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_set_hostname() != 56819.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_start() != 31235.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_start() != 4927.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_start_pairing() != 51955.toShort()) {
@@ -1815,7 +1815,7 @@ public interface NodeInterface {
     /**
      * Send a file to a peer. `path` is a readable file path (the core reads its
      * bytes and adds them to the blob store); `peer` is any identifier the core
-     * resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+     * resolves: a hostname, mesh address, short id, or full endpoint id.
      * Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
      * (or auto-accepts if it is one of the sender's own paired devices). Needs
      * only the control plane ([`Node::start`]), not the tunnel, but the peer must
@@ -1879,24 +1879,9 @@ public interface NodeInterface {
      * Build the headless daemon (identity, endpoint, blob store, resolver) and
      * bring the saved networks' control plane up. Idempotent: a second call is a
      * no-op success. Must run before `join`/`create`/`pair`/`up`.
-     *
-     * `ipv6_only` runs the data plane over mesh IPv6 alone, for a network where
-     * something else already owns `100.64.0.0/10` (a carrier handing the phone a
-     * CGNAT address, say). It is start-time: the caller decides it here because
-     * the tunnel's addressing is fixed when the interface is built, so changing
-     * it means stopping the node and starting a new one. The app's own settings
-     * store is the authority, not the core's `settings.toml`, which on Android
-     * lives in an app-private directory the user cannot reach.
-     *
-     * [`Ipv6OnlyMode::Auto`] hands the decision to the core, which looks at the
-     * device's own addresses; the result is reported back through
-     * [`Status::ipv6_only`], which says `Auto` when the core turned the mode on
-     * by itself.
-     * [`Ipv6OnlyMode::Off`] on a device that already has a `100.64.x.x` address
-     * is an error rather than an override: it is an explicit instruction not to
-     * run in the only mode that would work there.
+
      */
-    fun `start`(`ipv6Only`: Ipv6OnlyMode)
+    fun `start`()
     
     /**
      * Begin pairing: returns a ticket to show (as QR) to a device that will
@@ -2452,7 +2437,7 @@ open class Node: Disposable, AutoCloseable, NodeInterface
     /**
      * Send a file to a peer. `path` is a readable file path (the core reads its
      * bytes and adds them to the blob store); `peer` is any identifier the core
-     * resolves — a hostname, mesh IPv4/IPv6, short id, or full endpoint id.
+     * resolves: a hostname, mesh address, short id, or full endpoint id.
      * Offers the file over `FILES_ALPN`; the recipient pulls the bytes on accept
      * (or auto-accepts if it is one of the sender's own paired devices). Needs
      * only the control plane ([`Node::start`]), not the tunnel, but the peer must
@@ -2595,29 +2580,14 @@ open class Node: Disposable, AutoCloseable, NodeInterface
      * Build the headless daemon (identity, endpoint, blob store, resolver) and
      * bring the saved networks' control plane up. Idempotent: a second call is a
      * no-op success. Must run before `join`/`create`/`pair`/`up`.
-     *
-     * `ipv6_only` runs the data plane over mesh IPv6 alone, for a network where
-     * something else already owns `100.64.0.0/10` (a carrier handing the phone a
-     * CGNAT address, say). It is start-time: the caller decides it here because
-     * the tunnel's addressing is fixed when the interface is built, so changing
-     * it means stopping the node and starting a new one. The app's own settings
-     * store is the authority, not the core's `settings.toml`, which on Android
-     * lives in an app-private directory the user cannot reach.
-     *
-     * [`Ipv6OnlyMode::Auto`] hands the decision to the core, which looks at the
-     * device's own addresses; the result is reported back through
-     * [`Status::ipv6_only`], which says `Auto` when the core turned the mode on
-     * by itself.
-     * [`Ipv6OnlyMode::Off`] on a device that already has a `100.64.x.x` address
-     * is an error rather than an override: it is an explicit instruction not to
-     * run in the only mode that would work there.
+
      */
-    @Throws(RayException::class)override fun `start`(`ipv6Only`: Ipv6OnlyMode)
+    @Throws(RayException::class)override fun `start`()
         = 
     callWithPointer {
     uniffiRustCallWithError(RayException) { _status ->
     UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_start(
-        it, FfiConverterTypeIpv6OnlyMode.lower(`ipv6Only`),_status)
+        it, _status)
 }
     }
     
@@ -2953,7 +2923,7 @@ data class HealthSnapshot (
     var `networks`: List<NetworkHealth>, 
     var `meshUp`: kotlin.Boolean, 
     var `nodeId`: kotlin.String, 
-    var `meshIpv4`: kotlin.String, 
+    var `meshIpv6`: kotlin.String, 
     var `warnCount`: kotlin.ULong, 
     var `errorCount`: kotlin.ULong, 
     var `recentErrors`: List<kotlin.String>
@@ -2988,7 +2958,7 @@ public object FfiConverterTypeHealthSnapshot: FfiConverterRustBuffer<HealthSnaps
             FfiConverterSequenceTypeNetworkHealth.allocationSize(value.`networks`) +
             FfiConverterBoolean.allocationSize(value.`meshUp`) +
             FfiConverterString.allocationSize(value.`nodeId`) +
-            FfiConverterString.allocationSize(value.`meshIpv4`) +
+            FfiConverterString.allocationSize(value.`meshIpv6`) +
             FfiConverterULong.allocationSize(value.`warnCount`) +
             FfiConverterULong.allocationSize(value.`errorCount`) +
             FfiConverterSequenceString.allocationSize(value.`recentErrors`)
@@ -3001,7 +2971,7 @@ public object FfiConverterTypeHealthSnapshot: FfiConverterRustBuffer<HealthSnaps
             FfiConverterSequenceTypeNetworkHealth.write(value.`networks`, buf)
             FfiConverterBoolean.write(value.`meshUp`, buf)
             FfiConverterString.write(value.`nodeId`, buf)
-            FfiConverterString.write(value.`meshIpv4`, buf)
+            FfiConverterString.write(value.`meshIpv6`, buf)
             FfiConverterULong.write(value.`warnCount`, buf)
             FfiConverterULong.write(value.`errorCount`, buf)
             FfiConverterSequenceString.write(value.`recentErrors`, buf)
@@ -3015,7 +2985,6 @@ public object FfiConverterTypeHealthSnapshot: FfiConverterRustBuffer<HealthSnaps
  */
 data class NetworkDetail (
     var `name`: kotlin.String, 
-    var `ipv4`: kotlin.String, 
     var `ipv6`: kotlin.String, 
     var `hostname`: kotlin.String, 
     var `isCoordinator`: kotlin.Boolean, 
@@ -3034,7 +3003,6 @@ public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetai
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
-            FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceTypePeerInfo.read(buf),
         )
@@ -3042,7 +3010,6 @@ public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetai
 
     override fun allocationSize(value: NetworkDetail) = (
             FfiConverterString.allocationSize(value.`name`) +
-            FfiConverterString.allocationSize(value.`ipv4`) +
             FfiConverterString.allocationSize(value.`ipv6`) +
             FfiConverterString.allocationSize(value.`hostname`) +
             FfiConverterBoolean.allocationSize(value.`isCoordinator`) +
@@ -3051,7 +3018,6 @@ public object FfiConverterTypeNetworkDetail: FfiConverterRustBuffer<NetworkDetai
 
     override fun write(value: NetworkDetail, buf: ByteBuffer) {
             FfiConverterString.write(value.`name`, buf)
-            FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`ipv6`, buf)
             FfiConverterString.write(value.`hostname`, buf)
             FfiConverterBoolean.write(value.`isCoordinator`, buf)
@@ -3102,7 +3068,6 @@ public object FfiConverterTypeNetworkHealth: FfiConverterRustBuffer<NetworkHealt
 data class NetworkInfo (
     var `name`: kotlin.String, 
     var `nodeId`: kotlin.String, 
-    var `ipv4`: kotlin.String, 
     var `ipv6`: kotlin.String, 
     /**
      * True when the join was queued for coordinator approval (no IP yet).
@@ -3122,7 +3087,6 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
-            FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
         )
     }
@@ -3130,7 +3094,6 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
     override fun allocationSize(value: NetworkInfo) = (
             FfiConverterString.allocationSize(value.`name`) +
             FfiConverterString.allocationSize(value.`nodeId`) +
-            FfiConverterString.allocationSize(value.`ipv4`) +
             FfiConverterString.allocationSize(value.`ipv6`) +
             FfiConverterBoolean.allocationSize(value.`pending`)
     )
@@ -3138,7 +3101,6 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
     override fun write(value: NetworkInfo, buf: ByteBuffer) {
             FfiConverterString.write(value.`name`, buf)
             FfiConverterString.write(value.`nodeId`, buf)
-            FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`ipv6`, buf)
             FfiConverterBoolean.write(value.`pending`, buf)
     }
@@ -3150,7 +3112,11 @@ public object FfiConverterTypeNetworkInfo: FfiConverterRustBuffer<NetworkInfo> {
  * One peer in a network snapshot.
  */
 data class PeerInfo (
-    var `ipv4`: kotlin.String, 
+    /**
+     * The peer's mesh IPv6, derived from its identity. The only address it has:
+     * the overlay carries no IPv4.
+     */
+    var `ipv6`: kotlin.String, 
     var `nodeId`: kotlin.String, 
     var `hostname`: kotlin.String, 
     var `state`: PeerConnState
@@ -3173,14 +3139,14 @@ public object FfiConverterTypePeerInfo: FfiConverterRustBuffer<PeerInfo> {
     }
 
     override fun allocationSize(value: PeerInfo) = (
-            FfiConverterString.allocationSize(value.`ipv4`) +
+            FfiConverterString.allocationSize(value.`ipv6`) +
             FfiConverterString.allocationSize(value.`nodeId`) +
             FfiConverterString.allocationSize(value.`hostname`) +
             FfiConverterTypePeerConnState.allocationSize(value.`state`)
     )
 
     override fun write(value: PeerInfo, buf: ByteBuffer) {
-            FfiConverterString.write(value.`ipv4`, buf)
+            FfiConverterString.write(value.`ipv6`, buf)
             FfiConverterString.write(value.`nodeId`, buf)
             FfiConverterString.write(value.`hostname`, buf)
             FfiConverterTypePeerConnState.write(value.`state`, buf)
@@ -3283,16 +3249,7 @@ public object FfiConverterTypeQueuedSend: FfiConverterRustBuffer<QueuedSend> {
 data class Status (
     var `running`: kotlin.Boolean, 
     var `nodeId`: kotlin.String, 
-    var `ipv4`: kotlin.String, 
     var `ipv6`: kotlin.String, 
-    /**
-     * The running node's data-plane mode. `On` and `Auto` both mean IPv6-only;
-     * `Auto` says it was decided for the user (something else on this device
-     * already holds `100.64.0.0/10`) rather than chosen in the app, so the
-     * screen can report what `Auto` resolved to instead of leaving it a
-     * mystery.
-     */
-    var `ipv6Only`: Ipv6OnlyMode, 
     var `peers`: List<PeerInfo>, 
     var `networks`: List<NetworkDetail>, 
     var `pendingNetworks`: List<kotlin.String>
@@ -3310,8 +3267,6 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
             FfiConverterBoolean.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
-            FfiConverterString.read(buf),
-            FfiConverterTypeIpv6OnlyMode.read(buf),
             FfiConverterSequenceTypePeerInfo.read(buf),
             FfiConverterSequenceTypeNetworkDetail.read(buf),
             FfiConverterSequenceString.read(buf),
@@ -3321,9 +3276,7 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
     override fun allocationSize(value: Status) = (
             FfiConverterBoolean.allocationSize(value.`running`) +
             FfiConverterString.allocationSize(value.`nodeId`) +
-            FfiConverterString.allocationSize(value.`ipv4`) +
             FfiConverterString.allocationSize(value.`ipv6`) +
-            FfiConverterTypeIpv6OnlyMode.allocationSize(value.`ipv6Only`) +
             FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`) +
             FfiConverterSequenceTypeNetworkDetail.allocationSize(value.`networks`) +
             FfiConverterSequenceString.allocationSize(value.`pendingNetworks`)
@@ -3332,9 +3285,7 @@ public object FfiConverterTypeStatus: FfiConverterRustBuffer<Status> {
     override fun write(value: Status, buf: ByteBuffer) {
             FfiConverterBoolean.write(value.`running`, buf)
             FfiConverterString.write(value.`nodeId`, buf)
-            FfiConverterString.write(value.`ipv4`, buf)
             FfiConverterString.write(value.`ipv6`, buf)
-            FfiConverterTypeIpv6OnlyMode.write(value.`ipv6Only`, buf)
             FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
             FfiConverterSequenceTypeNetworkDetail.write(value.`networks`, buf)
             FfiConverterSequenceString.write(value.`pendingNetworks`, buf)
@@ -3395,53 +3346,6 @@ public object FfiConverterTypeTransfer: FfiConverterRustBuffer<Transfer> {
             FfiConverterTypeTransferState.write(value.`state`, buf)
     }
 }
-
-
-
-/**
- * The app's IPv6-only setting, mirroring the desktop `ipv6-only` config key.
- *
- * Tri-state for the same reason: `Off` has to be sayable, or a phone could not
- * opt out of being moved onto the mode by the scan.
- */
-
-enum class Ipv6OnlyMode {
-    
-    /**
-     * Decide at start: IPv6-only when something else on the device already
-     * holds a `100.64.x.x` address (a carrier, typically), dual-stack when not.
-     */
-    AUTO,
-    /**
-     * Always IPv6-only.
-     */
-    ON,
-    /**
-     * Never. Fails to start rather than run beside such an address.
-     */
-    OFF;
-    companion object
-}
-
-
-/**
- * @suppress
- */
-public object FfiConverterTypeIpv6OnlyMode: FfiConverterRustBuffer<Ipv6OnlyMode> {
-    override fun read(buf: ByteBuffer) = try {
-        Ipv6OnlyMode.values()[buf.getInt() - 1]
-    } catch (e: IndexOutOfBoundsException) {
-        throw RuntimeException("invalid enum value, something is very wrong!!", e)
-    }
-
-    override fun allocationSize(value: Ipv6OnlyMode) = 4UL
-
-    override fun write(value: Ipv6OnlyMode, buf: ByteBuffer) {
-        buf.putInt(value.ordinal + 1)
-    }
-}
-
-
 
 
 

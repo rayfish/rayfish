@@ -73,7 +73,13 @@ android {
 
     defaultConfig {
         applicationId = "xyz.rayfish.android"
-        minSdk = 24
+        // 26 (Android 8.0), not lower. Every notification this app posts goes
+        // through `Notification.Builder(Context, channelId)` and a
+        // NotificationChannel, both of which are API 26: on 24/25 the builder
+        // threw NoSuchMethodError at runtime, which the surrounding runCatching
+        // swallowed, so incoming files were announced by nothing at all. The
+        // pre-O branches that were meant to cover it could not.
+        minSdk = 26
         targetSdk = 35
         versionCode = rayVersionCode
         versionName = rayVersion

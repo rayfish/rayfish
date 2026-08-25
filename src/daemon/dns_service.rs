@@ -326,6 +326,15 @@ impl DnsService {
         }
     }
 
+    /// The active OS-DNS backend's name, or `None` before `configure` / after
+    /// `revert`. Used to say whether a change that only affects the daemon's own
+    /// forwarder can actually reach an application's queries: on a split-DNS
+    /// backend only `.ray` is routed to us, so everything else bypasses it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn backend_name(&self) -> Option<&'static str> {
+        self.configurator.lock().unwrap().as_ref().map(|c| c.name())
+    }
+
     /// Revert the OS-DNS changes made by [`configure`](Self::configure): stop the
     /// re-assert watcher, restore the captured configurator, and clear the TUN's
     /// search domains. Idempotent (no-op if never configured).

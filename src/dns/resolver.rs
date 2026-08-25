@@ -2,25 +2,53 @@
 //! Answers names held in the hostname tables and forwards everything else to
 //! the captured system upstreams.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use smol_str::SmolStr;
 
-use crate::dns::{HostnameTable, MAGIC_DNS_V4, ReverseLookupTable};
+use crate::dns::{HostnameTable, MAGIC_DNS_V4, MAGIC_DNS_V6, ReverseLookupTable};
+
+/// Whether `ip` is this resolver's own address, so forwarding to it is a loop
+/// with no second party: the query comes straight back in through
+/// `handle_tun_query`. Dropped from the upstream set outright, since neither is
+/// a place another resolver lives.
+///
+/// The two magic addresses and nothing else. **Not** the whole `200::/7`: the
+/// intercept is `dst_ip == MAGIC_DNS_V6` alone (`forward::is_magic_dns`), so a
+/// query aimed at any other overlay address is routed out to the peer that owns
+/// it, which is a real second party. A resolver a user runs on a mesh peer is a
+/// legitimate upstream, and under a full tunnel it is the *best* one, being
+/// reachable only through the tunnel by construction. `MAGIC_DNS_V4` is here
+/// only because an older build may have left it in a file we then captured.
+fn is_own_resolver(ip: IpAddr) -> bool {
+    ip == IpAddr::V6(MAGIC_DNS_V6) || ip == IpAddr::V4(MAGIC_DNS_V4)
+}
+
+/// Whether forwarding to `ip` could loop back into this resolver *via somebody
+/// else*: a co-resident VPN's resolver lives in the CGNAT range, and if it
+/// forwards back to us (as Tailscale does, since it only filters out its own
+/// service IPs) the two resolvers point at each other.
+///
+/// Rate-limited rather than dropped, unlike [`is_own_resolver`]: it is a real
+/// resolver that really answers, and on a host where the capture found nothing
+/// else, dropping it leaves the forwarder with nothing to ask at all.
+fn is_loopable_upstream(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(v4))
+}
 
 pub struct Resolver {
     table: HostnameTable,
     reverse: ReverseLookupTable,
     upstreams: Arc<ArcSwap<Vec<SocketAddr>>>,
-    /// Whether this node's data plane is IPv6-only. When set, the roster
-    /// responder withholds A records (see [`crate::dns::handle_query`]): mesh
-    /// IPv4 is not routed here, so handing an app one is a black hole.
-    ipv6_only: AtomicBool,
+    /// Upstreams to use instead of `upstreams` while a full tunnel is up, so
+    /// lookups leave by the exit node rather than around it. See
+    /// [`set_tunnel_upstreams`](Resolver::set_tunnel_upstreams).
+    tunnel_upstreams: Arc<ArcSwapOption<Vec<SocketAddr>>>,
     /// Per-name forwarding counters for [`LOOP_WINDOW`], kept only for names
     /// sent to another mesh's resolver. See [`Resolver::loop_guard_allows`].
     overlay_forwards: DashMap<SmolStr, (Instant, u32)>,
@@ -60,10 +88,50 @@ impl Resolver {
             table,
             reverse,
             upstreams: Arc::new(ArcSwap::from_pointee(Vec::new())),
-            ipv6_only: AtomicBool::new(false),
+            tunnel_upstreams: Arc::new(ArcSwapOption::empty()),
             overlay_forwards: DashMap::new(),
             defer_off_mesh: AtomicBool::new(false),
         }
+    }
+
+    /// Override the upstream set for as long as a full tunnel is up, or with
+    /// `None` go back to the captured one.
+    ///
+    /// A layer rather than a write to `upstreams`, so teardown restores what the
+    /// system capture found without having to re-detect the OS DNS backend.
+    ///
+    /// It exists for the IPv6-only client tunnel. The daemon forwards non-`.ray`
+    /// queries itself, and every upstream the desktop capture can produce is IPv4
+    /// (`DnsConfigurator::captured_upstreams`), while that tunnel carries IPv6
+    /// alone: left as they are, the exit node would see the traffic and none of
+    /// the lookups that steered it. Pointing the forwarder at an IPv6 resolver
+    /// puts the queries back inside the tunnel.
+    ///
+    /// Filters the magic IPs for the same reason [`Self::set_upstream_addrs`]
+    /// does: `dns_upstreams` now accepts any `IpAddr`, so `ray config set
+    /// dns-upstreams 200::53` would otherwise hand the forwarder its own address
+    /// and every miss would recurse through `handle_tun_query`. Only those two,
+    /// though: see [`is_own_resolver`] for why a *peer's* mesh address has to
+    /// survive this, being the one upstream a tunnel is guaranteed to reach.
+    ///
+    /// It governs only what *we* forward, so it does nothing on a host that
+    /// declines off-mesh names ([`Self::set_defer_off_mesh`]): there the stub
+    /// asks the next `nameserver` itself and never reaches the forwarder. That
+    /// combination is not hypothetical, it is the same host this mode exists
+    /// for, so `apply_exit_dns` warns about it rather than leaving the override
+    /// looking effective.
+    pub fn set_tunnel_upstreams(&self, addrs: Option<Vec<SocketAddr>>) {
+        // An override that filters down to nothing becomes no override: `forward`
+        // reads an empty list as "no upstream configured" and refuses, where
+        // falling back to the captured ones at least resolves something.
+        let addrs = addrs
+            .map(|v| {
+                v.into_iter()
+                    .filter(|a| !is_own_resolver(a.ip()))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v: &Vec<SocketAddr>| !v.is_empty());
+        self.tunnel_upstreams.store(addrs.map(Arc::new));
     }
 
     /// Whether to decline names outside `.ray` instead of forwarding them.
@@ -79,11 +147,10 @@ impl Resolver {
         self.defer_off_mesh.store(on, Ordering::Relaxed);
     }
 
-    /// Record whether mesh IPv4 is usable on this node. Called once at daemon
-    /// start; a setter rather than a `new` parameter so the mode stays out of
-    /// every construction site.
-    pub fn set_ipv6_only(&self, on: bool) {
-        self.ipv6_only.store(on, Ordering::Relaxed);
+    /// Whether off-mesh names are being declined, for the callers that need to
+    /// know the forwarder is out of the path.
+    pub fn defers_off_mesh(&self) -> bool {
+        self.defer_off_mesh.load(Ordering::Relaxed)
     }
 
     /// Replace the upstream set (bare IPv4 on port 53), dropping the magic IP to
@@ -99,15 +166,21 @@ impl Resolver {
     pub fn set_upstream_addrs(&self, addrs: impl IntoIterator<Item = SocketAddr>) {
         let v: Vec<SocketAddr> = addrs
             .into_iter()
-            .filter(|a| {
-                a.ip() != IpAddr::V4(MAGIC_DNS_V4) && a.ip() != IpAddr::V6(crate::dns::MAGIC_DNS_V6)
-            })
+            .filter(|a| !is_own_resolver(a.ip()))
             .collect();
         self.upstreams.store(Arc::new(v));
     }
 
     pub fn upstreams(&self) -> Vec<SocketAddr> {
         self.upstreams.load().as_ref().clone()
+    }
+
+    /// The tunnel override in force, if any. `None` means queries go to the
+    /// captured upstreams.
+    pub fn tunnel_upstreams(&self) -> Option<Vec<SocketAddr>> {
+        self.tunnel_upstreams
+            .load_full()
+            .map(|v| v.as_ref().clone())
     }
 
     /// Answer from the roster, and fall back to the system resolver for
@@ -118,10 +191,7 @@ impl Resolver {
     /// goes upstream to the real internet instead of failing. It does not apply
     /// inside `.ray`, where [`crate::dns::handle_query`] answers a miss itself.
     pub async fn resolve(&self, query: &[u8]) -> Option<Vec<u8>> {
-        let ipv6_only = self.ipv6_only.load(Ordering::Relaxed);
-        if let Some(local) =
-            crate::dns::handle_query(query, &self.table, &self.reverse, ipv6_only).await
-        {
+        if let Some(local) = crate::dns::handle_query(query, &self.table, &self.reverse).await {
             return Some(local);
         }
         // Sharing resolv.conf means the stub has another nameserver listed
@@ -183,7 +253,11 @@ impl Resolver {
     }
 
     async fn forward(&self, query: &[u8]) -> Option<Vec<u8>> {
-        let upstreams = self.upstreams.load();
+        let tunnel = self.tunnel_upstreams.load_full();
+        let upstreams = match &tunnel {
+            Some(over) => Arc::clone(over),
+            None => self.upstreams.load_full(),
+        };
         if upstreams.is_empty() {
             tracing::warn!("no DNS upstream configured; cannot forward off-mesh queries");
             return None;
@@ -192,14 +266,14 @@ impl Resolver {
         // upstream could loop. A host with ordinary resolvers pays nothing.
         let name = upstreams
             .iter()
-            .any(|a| crate::membership::is_overlay_ip(a.ip()))
+            .any(|a| is_loopable_upstream(a.ip()))
             .then(|| query_name(query))
             .flatten();
         for up in upstreams.iter() {
-            // Skip an overlay resolver that this name has already been bounced
-            // off, and fall through to the next upstream (a real server, if the
+            // Skip another mesh's resolver once this name has been bounced off
+            // it, and fall through to the next upstream (a real server, if the
             // capture found one) rather than feeding the loop another hop.
-            if crate::membership::is_overlay_ip(up.ip()) && !self.loop_guard_allows(name.as_ref()) {
+            if is_loopable_upstream(up.ip()) && !self.loop_guard_allows(name.as_ref()) {
                 continue;
             }
             match forward_once(query, *up, FORWARD_TIMEOUT).await {
@@ -214,9 +288,9 @@ impl Resolver {
     /// Count one forward of this query's name to another mesh's resolver, and
     /// say whether it is still under [`LOOP_LIMIT`] for the current window.
     ///
-    /// Only asked about overlay upstreams, so the map hit stays off the path a
-    /// host with ordinary resolvers takes. A query we could not parse a name
-    /// out of is allowed: it is not the shape a loop has, and guessing would
+    /// Only asked about another mesh's resolver, so the map hit stays off the
+    /// path a host with ordinary resolvers takes. A query we could not parse a
+    /// name out of is allowed: it is not the shape a loop has, and guessing would
     /// drop real traffic.
     fn loop_guard_allows(&self, name: Option<&SmolStr>) -> bool {
         let Some(name) = name else {
@@ -276,7 +350,13 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 async fn forward_once(query: &[u8], up: SocketAddr, wait: Duration) -> std::io::Result<Vec<u8>> {
-    let sock = tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await?;
+    // Bind the upstream's own family: a `0.0.0.0` socket cannot reach an IPv6
+    // resolver, which is the only kind a full tunnel can forward to.
+    let bind: SocketAddr = match up {
+        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let sock = tokio::net::UdpSocket::bind(bind).await?;
     sock.connect(up).await?;
     sock.send(query).await?;
     let mut buf = vec![0u8; 4096];
@@ -458,6 +538,8 @@ mod tests {
         assert!(!r.loop_guard_allows(query_name(&build_a_query("MIXED.EXAMPLE.COM")).as_ref()));
     }
 
+    /// An A record in a response. Still meaningful for *upstream* answers: the
+    /// mesh has no IPv4, but the public names we forward do.
     fn response_has_a(bytes: &[u8], ip: Ipv4Addr) -> bool {
         let pkt = Packet::parse(bytes).expect("parse response");
         pkt.answers.iter().any(|rr| {
@@ -469,28 +551,50 @@ mod tests {
         })
     }
 
+    fn build_aaaa_query(name: &str) -> Vec<u8> {
+        let mut pkt = Packet::new_query(1);
+        pkt.set_flags(PacketFlag::RECURSION_DESIRED);
+        pkt.questions.push(Question::new(
+            Name::new_unchecked(name),
+            QTYPE::TYPE(simple_dns::TYPE::AAAA),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        pkt.build_bytes_vec().expect("build query")
+    }
+
+    fn response_has_aaaa(bytes: &[u8], ip: std::net::Ipv6Addr) -> bool {
+        let pkt = Packet::parse(bytes).expect("parse response");
+        pkt.answers.iter().any(|rr| {
+            if let simple_dns::rdata::RData::AAAA(a) = &rr.rdata {
+                std::net::Ipv6Addr::from(a.address) == ip
+            } else {
+                false
+            }
+        })
+    }
+
     #[tokio::test]
     async fn handle_tun_query_injects_reply_for_ray_name() {
-        use std::net::{IpAddr, Ipv4Addr};
+        use std::net::IpAddr;
         let table = crate::dns::new_hostname_table();
         let reverse = crate::dns::new_reverse_table();
         crate::dns::update_hostname(
             &table,
             &reverse,
             "homelab",
-            "dario",
-            Some(Ipv4Addr::new(100, 64, 0, 7)),
+            "laptop",
             "200::7".parse().unwrap(),
         )
         .await;
         let r = Resolver::new(table, reverse);
 
-        // Build a full IPv4/UDP query packet to MAGIC_IP:53 (use build_udp_reply
+        // Build a full IPv6/UDP query packet to MAGIC_IP:53 (use build_udp_reply
         // in reverse: synthesize a query with src=app, dst=magic).
-        let dns_query = build_a_query("dario.homelab.ray");
+        let dns_query = build_aaaa_query("laptop.homelab.ray");
         let app = crate::firewall::PacketInfo {
-            src_ip: IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5)),
-            dst_ip: IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            src_ip: IpAddr::V6("200::5".parse().unwrap()),
+            dst_ip: IpAddr::V6(crate::dns::MAGIC_DNS_V6),
             protocol: 17,
             src_port: 50000,
             dst_port: 53,
@@ -517,9 +621,9 @@ mod tests {
 
         let reply = rx.try_recv().expect("a reply was injected");
         let rinfo = crate::firewall::parse_packet_info(&reply).unwrap();
-        assert_eq!(rinfo.src_ip, IpAddr::V4(crate::dns::MAGIC_DNS_V4));
+        assert_eq!(rinfo.src_ip, IpAddr::V6(crate::dns::MAGIC_DNS_V6));
         assert_eq!(rinfo.dst_port, 50000);
-        assert!(response_has_a(&reply[28..], Ipv4Addr::new(100, 64, 0, 7)));
+        assert!(response_has_aaaa(&reply[48..], "200::7".parse().unwrap()));
     }
 
     #[tokio::test]
@@ -531,7 +635,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let info = crate::firewall::PacketInfo {
             src_ip: "100.64.0.5".parse().unwrap(),
-            dst_ip: std::net::IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            dst_ip: std::net::IpAddr::V6(crate::dns::MAGIC_DNS_V6),
             protocol: 6,
             src_port: 50000,
             dst_port: 53,
@@ -551,16 +655,15 @@ mod tests {
             &table,
             &reverse,
             "homelab",
-            "dario",
-            Some(Ipv4Addr::new(100, 64, 0, 7)),
+            "laptop",
             "200::7".parse().unwrap(),
         )
         .await;
         let r = Resolver::new(table, reverse);
         // No upstreams set; a .ray name must still resolve locally.
-        let query = build_a_query("dario.homelab.ray");
+        let query = build_aaaa_query("laptop.homelab.ray");
         let resp = r.resolve(&query).await.expect("local answer");
-        assert!(response_has_a(&resp, Ipv4Addr::new(100, 64, 0, 7)));
+        assert!(response_has_aaaa(&resp, "200::7".parse().unwrap()));
     }
 
     /// A network named `dev` must not swallow `zed.dev`. The roster holds a
@@ -568,18 +671,10 @@ mod tests {
     /// internet, while `box.dev` still resolves to its mesh IP.
     #[tokio::test]
     async fn unknown_bare_network_name_falls_back_upstream() {
-        let peer_ip = Ipv4Addr::new(100, 64, 0, 7);
         let table = crate::dns::new_hostname_table();
         let reverse = crate::dns::new_reverse_table();
-        crate::dns::update_hostname(
-            &table,
-            &reverse,
-            "dev",
-            "box",
-            Some(peer_ip),
-            "200::7".parse().unwrap(),
-        )
-        .await;
+        crate::dns::update_hostname(&table, &reverse, "dev", "box", "200::7".parse().unwrap())
+            .await;
 
         let upstream_answer = Ipv4Addr::new(93, 184, 216, 34);
         let up = fake_upstream(upstream_answer).await;
@@ -596,10 +691,15 @@ mod tests {
         );
 
         // The peer that does exist keeps resolving to the mesh, suffix or not.
+        // AAAA, because the overlay has no IPv4 to put in an A record.
+        let peer_ip: std::net::Ipv6Addr = "200::7".parse().unwrap();
         for name in ["box.dev", "box.dev.ray", "box.ray"] {
-            let resp = r.resolve(&build_a_query(name)).await.expect("local answer");
+            let resp = r
+                .resolve(&build_aaaa_query(name))
+                .await
+                .expect("local answer");
             assert!(
-                response_has_a(&resp, peer_ip),
+                response_has_aaaa(&resp, peer_ip),
                 "{name} must resolve locally"
             );
         }
@@ -678,8 +778,8 @@ mod tests {
 
         let dns_query = build_a_query("example.com");
         let app = crate::firewall::PacketInfo {
-            src_ip: IpAddr::V4(Ipv4Addr::new(100, 69, 9, 225)),
-            dst_ip: IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            src_ip: IpAddr::V6("200::9".parse().unwrap()),
+            dst_ip: IpAddr::V6(crate::dns::MAGIC_DNS_V6),
             protocol: 17,
             src_port: 50000,
             dst_port: 53,
@@ -705,9 +805,9 @@ mod tests {
 
         let reply = rx.try_recv().expect("forwarded answer injected into TUN");
         let rinfo = crate::firewall::parse_packet_info(&reply).unwrap();
-        assert_eq!(rinfo.src_ip, IpAddr::V4(crate::dns::MAGIC_DNS_V4));
+        assert_eq!(rinfo.src_ip, IpAddr::V6(crate::dns::MAGIC_DNS_V6));
         assert_eq!(rinfo.dst_port, 50000);
-        assert!(response_has_a(&reply[28..], upstream_answer));
+        assert!(response_has_a(&reply[48..], upstream_answer));
     }
 
     /// A dead address: bind a socket to claim a port, then drop it, so nothing
@@ -756,8 +856,8 @@ mod tests {
 
         let dns_query = build_a_query("example.com");
         let app = crate::firewall::PacketInfo {
-            src_ip: IpAddr::V4(Ipv4Addr::new(100, 69, 9, 225)),
-            dst_ip: IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            src_ip: IpAddr::V6("200::9".parse().unwrap()),
+            dst_ip: IpAddr::V6(crate::dns::MAGIC_DNS_V6),
             protocol: 17,
             src_port: 50000,
             dst_port: 53,
@@ -784,7 +884,7 @@ mod tests {
         let reply = rx
             .try_recv()
             .expect("SERVFAIL injected, not a dropped query");
-        let pkt = Packet::parse(&reply[28..]).expect("parse SERVFAIL");
+        let pkt = Packet::parse(&reply[48..]).expect("parse SERVFAIL");
         assert_eq!(pkt.rcode(), simple_dns::RCODE::ServerFailure);
         // The id and question have to survive or the client can't match the
         // response to its outstanding query and will ignore it.
@@ -827,5 +927,106 @@ mod tests {
             r.upstreams(),
             vec!["127.0.0.1:5353".parse::<SocketAddr>().unwrap()]
         );
+    }
+
+    /// The tunnel override wins while it is set, and `None` puts the captured
+    /// upstreams back without re-detecting the OS DNS backend.
+    #[tokio::test]
+    async fn tunnel_override_wins_and_clears() {
+        let r = Resolver::new(
+            crate::dns::new_hostname_table(),
+            crate::dns::new_reverse_table(),
+        );
+        let captured = "192.168.1.1:53".parse::<SocketAddr>().unwrap();
+        let v6 = "[2606:4700:4700::1111]:53".parse::<SocketAddr>().unwrap();
+        r.set_upstream_addrs([captured]);
+        assert_eq!(r.tunnel_upstreams(), None);
+
+        r.set_tunnel_upstreams(Some(vec![v6]));
+        assert_eq!(r.tunnel_upstreams(), Some(vec![v6]));
+        // Layered, not written through: teardown has to find these unchanged.
+        assert_eq!(r.upstreams(), vec![captured]);
+
+        r.set_tunnel_upstreams(None);
+        assert_eq!(r.tunnel_upstreams(), None);
+        assert_eq!(r.upstreams(), vec![captured]);
+    }
+
+    /// The override takes the same magic-IP filter as the capture path, because
+    /// `dns_upstreams` now accepts any `IpAddr` and `200::53` is a loop back into
+    /// our own responder. Filtering to empty means no override at all, not an
+    /// override with nowhere to send.
+    #[tokio::test]
+    async fn tunnel_override_drops_the_magic_ips() {
+        let r = Resolver::new(
+            crate::dns::new_hostname_table(),
+            crate::dns::new_reverse_table(),
+        );
+        let v6 = "[2606:4700:4700::1111]:53".parse::<SocketAddr>().unwrap();
+        r.set_tunnel_upstreams(Some(vec![
+            SocketAddr::from((crate::dns::MAGIC_DNS_V6, 53)),
+            v6,
+        ]));
+        assert_eq!(r.tunnel_upstreams(), Some(vec![v6]));
+
+        r.set_tunnel_upstreams(Some(vec![
+            SocketAddr::from((crate::dns::MAGIC_DNS_V6, 53)),
+            SocketAddr::from((crate::dns::MAGIC_DNS_V4, 53)),
+        ]));
+        assert_eq!(r.tunnel_upstreams(), None);
+
+        // Another mesh's resolver is not one of ours and is not dropped here
+        // either, for the same reason the capture path keeps it. It reaches the
+        // loop guard in `forward` instead.
+        let foreign = SocketAddr::from((Ipv4Addr::new(100, 100, 100, 100), 53));
+        r.set_tunnel_upstreams(Some(vec![foreign]));
+        assert_eq!(r.tunnel_upstreams(), Some(vec![foreign]));
+    }
+
+    /// A resolver running on a mesh peer is an upstream, not a loop. `200::53`
+    /// is the only overlay address that comes back to us; every other one is
+    /// routed to the peer that owns it, so filtering the whole `200::/7` would
+    /// throw away the one upstream a full tunnel is guaranteed to reach and
+    /// leave the override empty, which is no override at all.
+    #[tokio::test]
+    async fn a_resolver_on_a_mesh_peer_is_a_usable_upstream() {
+        let r = Resolver::new(
+            crate::dns::new_hostname_table(),
+            crate::dns::new_reverse_table(),
+        );
+        let peer = SocketAddr::from((Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 9), 53));
+        let magic = SocketAddr::from((crate::dns::MAGIC_DNS_V6, 53));
+
+        // The capture/override path a `dns_upstreams` setting takes.
+        r.set_upstream_addrs([magic, peer]);
+        assert_eq!(r.upstreams(), vec![peer]);
+
+        // And the tunnel override, where dropping it is worst: an empty result
+        // becomes `None`, and the forwarder falls back to the captured IPv4
+        // servers, which leave around the exit.
+        r.set_tunnel_upstreams(Some(vec![peer]));
+        assert_eq!(r.tunnel_upstreams(), Some(vec![peer]));
+
+        // It is nobody's loop either: only `200::53` is intercepted.
+        assert!(!is_own_resolver(peer.ip()));
+        assert!(is_own_resolver(magic.ip()));
+    }
+
+    /// Another mesh's resolver is kept, not filtered. It is a real server that
+    /// really answers, and on a host where it is the only nameserver the capture
+    /// found, dropping it would leave off-mesh names with nowhere to go. The
+    /// loop it can form is bounded by `loop_guard_allows` instead, and that
+    /// guard is dead code the moment such an upstream cannot reach the list.
+    #[tokio::test]
+    async fn a_foreign_mesh_resolver_survives_the_filter() {
+        let r = Resolver::new(
+            crate::dns::new_hostname_table(),
+            crate::dns::new_reverse_table(),
+        );
+        let foreign = Ipv4Addr::new(100, 100, 100, 100);
+        r.set_upstreams(vec![crate::dns::MAGIC_DNS_V4, foreign]);
+        assert_eq!(r.upstreams(), vec![SocketAddr::from((foreign, 53))]);
+        assert!(is_loopable_upstream(IpAddr::V4(foreign)));
+        assert!(!is_own_resolver(IpAddr::V4(foreign)));
     }
 }

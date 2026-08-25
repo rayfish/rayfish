@@ -8,7 +8,7 @@
 //! pair matches its scope's key enum exhaustively, so a new key cannot be
 //! added without teaching every handler that serves it.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -39,19 +39,13 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
         GlobalKey::Mdns => cfg.mdns_enabled = parse_bool(value, true)?,
         GlobalKey::AutoUpdate => cfg.auto_update = parse_bool(value, false)?,
         GlobalKey::OnDemand => cfg.on_demand = parse_bool(value, true)?,
-        // The one tri-state: `auto` (and `unset`, which sends an empty value)
-        // both parse to `Auto`, which is not written to the file at all, so the
-        // decision stays with the startup scan.
-        GlobalKey::Ipv6Only => {
-            cfg.ipv6_only = value
-                .parse()
-                .map_err(|e| anyhow::anyhow!("'{value}' is not a valid ipv6-only value: {e}"))?
-        }
-
         // Writing `ssh_enabled` is only half of `ray firewall ssh on|off`: the
         // caller must also seed/remove the `allow in tcp:22` passthrough and
         // start/stop the live listener (see `Daemon::ssh_config_set`).
         GlobalKey::Ssh => cfg.ssh_enabled = parse_bool(value, false)?,
+        // Like `ssh`, only half the work: the live bridge has to start or stop
+        // with it (see `Daemon::v4_bridge_config_set`).
+        GlobalKey::V4Bridge => cfg.v4_bridge = parse_bool(value, true)?,
         // Validated here, not in the CLI arm, so every caller is bound by it: a
         // relative download dir would resolve against the daemon's cwd, not the
         // user's.
@@ -91,9 +85,14 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
             if entries.is_empty() {
                 cfg.dns_upstreams = ServerOverride::default();
             } else {
+                // Either family. IPv4 entries are merged with the system-captured
+                // upstreams (`config::resolve_upstreams`); IPv6 ones are what an
+                // exit-node full tunnel forwards to, since that tunnel carries no
+                // IPv4 for a v4 resolver to be reached over
+                // (`exit_node::tunnel_upstreams`).
                 for e in &entries {
-                    e.parse::<Ipv4Addr>()
-                        .with_context(|| format!("invalid IPv4 address: {e}"))?;
+                    e.parse::<IpAddr>()
+                        .with_context(|| format!("invalid IP address: {e}"))?;
                 }
                 cfg.dns_upstreams = ServerOverride {
                     servers: entries,
@@ -131,8 +130,8 @@ pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
         GlobalKey::Mdns => on_off(cfg.mdns_enabled),
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
         GlobalKey::OnDemand => on_off(cfg.on_demand),
-        GlobalKey::Ipv6Only => cfg.ipv6_only.to_string(),
         GlobalKey::Ssh => on_off(cfg.ssh_enabled),
+        GlobalKey::V4Bridge => on_off(cfg.v4_bridge),
         // Empty renders as unset, matching the `net.ephemeral-ttl` convention.
         GlobalKey::DownloadDir => cfg.download_dir.clone().unwrap_or_default(),
         GlobalKey::DownloadUser => cfg.download_user.map(|u| u.to_string()).unwrap_or_default(),
@@ -237,31 +236,6 @@ fn parse_action(value: &str, default: Action) -> Result<Action> {
 mod tests {
     use super::super::empty_network_config as empty_network;
     use super::*;
-    use crate::config::Ipv6Only;
-
-    /// The one tri-state key: `on`/`off` are stored choices, `auto` (and
-    /// `unset`, which sends an empty value) stores nothing, so the daemon
-    /// decides at startup from what else is on the host.
-    #[test]
-    fn ipv6_only_is_on_off_or_auto() {
-        let mut cfg = AppConfig::default();
-        assert_eq!(cfg.ipv6_only, Ipv6Only::Auto, "auto is the default");
-        assert_eq!(render_global(&cfg, GlobalKey::Ipv6Only), "auto");
-
-        for (input, want, rendered) in [
-            ("on", Ipv6Only::On, "on"),
-            ("off", Ipv6Only::Off, "off"),
-            ("auto", Ipv6Only::Auto, "auto"),
-            ("on", Ipv6Only::On, "on"),
-            ("", Ipv6Only::Auto, "auto"),
-        ] {
-            apply_global(&mut cfg, GlobalKey::Ipv6Only, input, false).unwrap();
-            assert_eq!(cfg.ipv6_only, want, "set ipv6-only {input:?}");
-            assert_eq!(render_global(&cfg, GlobalKey::Ipv6Only), rendered);
-        }
-
-        assert!(apply_global(&mut cfg, GlobalKey::Ipv6Only, "maybe", false).is_err());
-    }
 
     #[test]
     fn network_auto_accept_toggles_round_trip() {
@@ -362,6 +336,19 @@ mod tests {
         // Unset goes back to off, the secure default.
         apply_global(&mut cfg, GlobalKey::Ssh, "", false).unwrap();
         assert!(!cfg.ssh_enabled);
+    }
+
+    #[test]
+    fn the_v4_bridge_toggles_and_unsets_back_on() {
+        let mut cfg = AppConfig::default();
+        assert!(cfg.v4_bridge, "on by default");
+        apply_global(&mut cfg, GlobalKey::V4Bridge, "off", false).unwrap();
+        assert!(!cfg.v4_bridge);
+        assert_eq!(render_global(&cfg, GlobalKey::V4Bridge), "off");
+        // Unset is the default, which here is on: the firewall is what decides
+        // whether a bridged port answers, and it denies inbound by default.
+        apply_global(&mut cfg, GlobalKey::V4Bridge, "", false).unwrap();
+        assert!(cfg.v4_bridge);
     }
 
     #[test]

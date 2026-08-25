@@ -10,18 +10,13 @@ impl NetworkRegistry {
     /// canonicalized CLI-side (the string `ray identityof` prints); this just
     /// persists the mapping. Overwrites any existing alias of the same name.
     pub(crate) fn set_alias(&self, network: &str, identity: &str, alias: &str) -> IpcMessage {
-        let mut net = match config::load_network(network) {
-            Ok(Some(n)) => n,
-            Ok(None) => {
-                return ipc_err(format!("network '{network}' not found"));
-            }
-            Err(e) => {
-                return ipc_err(format!("failed to load network config: {e}"));
-            }
-        };
-        net.aliases.insert(alias.to_string(), identity.to_string());
-        if let Err(e) = config::save_network(&net) {
-            return ipc_err(format!("failed to save config: {e}"));
+        match config::update_network(network, |net| {
+            net.aliases.insert(alias.to_string(), identity.to_string());
+            Ok(())
+        }) {
+            Ok(Some(_)) => {}
+            Ok(None) => return ipc_err(format!("network '{network}' not found")),
+            Err(e) => return ipc_err(format!("failed to save config: {e}")),
         }
         IpcMessage::Ok {
             message: format!("alias '{alias}' -> {identity} on '{network}'"),
@@ -31,20 +26,15 @@ impl NetworkRegistry {
     /// Remove a local alias by name. Reports an error if no such alias exists so
     /// a typo is visible rather than silently succeeding.
     pub(crate) fn remove_alias(&self, network: &str, alias: &str) -> IpcMessage {
-        let mut net = match config::load_network(network) {
-            Ok(Some(n)) => n,
-            Ok(None) => {
-                return ipc_err(format!("network '{network}' not found"));
-            }
-            Err(e) => {
-                return ipc_err(format!("failed to load network config: {e}"));
-            }
-        };
-        if net.aliases.remove(alias).is_none() {
-            return ipc_err(format!("no alias '{alias}' on '{network}'"));
-        }
-        if let Err(e) = config::save_network(&net) {
-            return ipc_err(format!("failed to save config: {e}"));
+        let mut removed = false;
+        match config::update_network(network, |net| {
+            removed = net.aliases.remove(alias).is_some();
+            Ok(())
+        }) {
+            Ok(Some(_)) if removed => {}
+            Ok(Some(_)) => return ipc_err(format!("no alias '{alias}' on '{network}'")),
+            Ok(None) => return ipc_err(format!("network '{network}' not found")),
+            Err(e) => return ipc_err(format!("failed to save config: {e}")),
         }
         IpcMessage::Ok {
             message: format!("removed alias '{alias}' from '{network}'"),

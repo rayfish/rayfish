@@ -119,7 +119,9 @@ pub(crate) async fn resolve_signed(
     net_pubkey: EndpointId,
 ) -> Option<(blake3::Hash, Vec<EndpointId>, u64)> {
     let client = dht::create_pkarr_client(endpoint).ok()?;
-    let packet = dht::resolve_network_packet(&client, net_pubkey).await.ok()?;
+    let packet = dht::resolve_network_packet(&client, net_pubkey)
+        .await
+        .ok()?;
     let ts = packet.timestamp().as_micros();
     let (hash, seeds) = dht::decode_network_record(&packet).ok()?;
     Some((hash, seeds, ts))
@@ -129,6 +131,17 @@ pub(crate) async fn resolve_signed(
 /// its bytes against `signed`. Returns the verified blob, or `None` if no source
 /// could serve a blob matching the signed hash. The blob is content-addressed by
 /// `signed`, so a peer can only ever serve the authentic blob, never a forgery.
+///
+/// The two ways this returns `None` are told apart in the log, and the second one
+/// stops the loop early. Bytes that do not hash to `signed` are that peer's
+/// problem, so the next source is worth trying. Bytes that hash correctly and
+/// then fail to decode are *everyone's*: the blob is content-addressed, so every
+/// source serves those same bytes, and what we are looking at is a publisher on a
+/// build whose `GroupBlob` is not the shape ours is (the roster rides the shared
+/// `iroh_blobs` ALPN, which gates nothing). That reads as an unreachable
+/// coordinator when it is a version split, and it repeats every group poll, so
+/// the decode error itself goes in the log rather than being swallowed with the
+/// dial failures.
 pub(crate) async fn fetch_verified_blob(
     endpoint: &Endpoint,
     blob_store: &FsStore,
@@ -147,17 +160,42 @@ pub(crate) async fn fetch_verified_blob(
     peer_ids.sort_by_key(|id| id.to_string());
     peer_ids.dedup();
     for pid in &peer_ids {
-        if let Ok(conn) =
+        let Ok(conn) =
             transport::connect_to_peer_with_alpn(endpoint, *pid, iroh_blobs::protocol::ALPN).await
-            && blob_store
-                .remote()
-                .fetch(conn, HashAndFormat::raw(blob_hash))
-                .await
-                .is_ok()
-            && let Ok(bytes) = blob_store.blobs().get_bytes(blob_hash).await
-            && let Ok(data) = crate::membership::verify_group_blob(&bytes, &signed)
+        else {
+            continue;
+        };
+        if blob_store
+            .remote()
+            .fetch(conn, HashAndFormat::raw(blob_hash))
+            .await
+            .is_err()
         {
-            return Some(data);
+            continue;
+        }
+        let Ok(bytes) = blob_store.blobs().get_bytes(blob_hash).await else {
+            continue;
+        };
+        if blake3::hash(&bytes) != signed {
+            tracing::warn!(
+                network = %network_name,
+                peer = %pid.fmt_short(),
+                "reconverge: a peer served bytes that do not match the signed hash"
+            );
+            continue;
+        }
+        match crate::membership::decode_group_blob(&bytes) {
+            Ok(data) => return Some(data),
+            Err(e) => {
+                tracing::warn!(
+                    network = %network_name,
+                    peer = %pid.fmt_short(),
+                    error = %e,
+                    "reconverge: the signed group blob does not decode against this build; \
+                     the network's coordinator is on an incompatible version"
+                );
+                return None;
+            }
         }
     }
     None
@@ -176,7 +214,6 @@ pub(crate) async fn reconverge_and_apply(
     state: &SharedNetworkState,
     my_identity: EndpointId,
     alpn: &[u8],
-    my_ip: Ipv4Addr,
     device_cert: &Option<control::DeviceCert>,
 ) {
     let MeshCtx {
@@ -191,18 +228,12 @@ pub(crate) async fn reconverge_and_apply(
         registry,
         ..
     } = ctx;
-    let (current, floor) = {
-        let s = state.read().unwrap();
-        (
-            s.snapshot.as_ref().map(|s| s.hash),
-            s.last_record_timestamp,
-        )
-    };
+    let floor = state.read().unwrap().last_record_timestamp;
     let Some((signed, seeds, record_ts)) = resolve_signed(endpoint, net_pubkey).await else {
         tracing::debug!(network = %network_name, "reconverge: signed record unavailable");
         return;
     };
-    if crate::membership::trusted_reconverge_hash(current, signed).is_none() {
+    if !state.read().unwrap().needs_reconverge(signed) {
         // Already converged on the signed hash. Even so, check whether we have
         // been nullified in the blob we already hold (e.g. we applied it while
         // still offline-blocked from ever receiving `ControlMsg::Unpaired`): if so,
@@ -228,7 +259,6 @@ pub(crate) async fn reconverge_and_apply(
             alpn,
             network_name,
             my_identity,
-            my_ip,
             device_cert,
         )
         .await;
@@ -238,7 +268,6 @@ pub(crate) async fn reconverge_and_apply(
         // so the apply path below would never run and the offer would stay
         // invisible forever. Quiet no-op when the flag already matches.
         registry.sync_exit_offers().await;
-        registry.sync_ipv6_only().await;
         return;
     }
     // The record names a different blob than we hold. Take it only if it was
@@ -279,21 +308,18 @@ pub(crate) async fn reconverge_and_apply(
         });
         return;
     }
-    // Two coordinators can independently admit a fresh joiner at the same
-    // collision index, producing a roster with duplicate IPs. Resolve it
-    // deterministically (lowest identity keeps the slot, others re-roll) before
-    // it reaches the PeerTable/DNS so every node converges on the same map.
-    let tiebroken = crate::membership::resolve_ip_tiebreak(data.members.clone());
-    if let Err(e) = crate::membership::validate_no_duplicate_ips(&tiebroken) {
-        tracing::warn!(network = %network_name, error = %e, "roster still has duplicate IPs after tiebreak; applying tiebroken version");
-    }
+    // No tiebreak: an address is blake3 of the identity, so two coordinators
+    // admitting concurrently cannot produce a roster with duplicate addresses.
     let roster = {
         let mut s = state.write().unwrap();
-        s.members = MemberList::from_members(tiebroken);
+        s.members = MemberList::from_members(data.members.clone());
         s.approved = ApprovedList::from_entries(data.approved.clone());
         s.suggested_firewall = data.suggested_firewall.clone();
         s.nullifiers = data.nullifiers.clone();
         s.refresh_snapshot();
+        // What the network agreed on, which is not our re-encoding of it unless
+        // the publisher writes the same bytes we would. See `converged_hash`.
+        s.converged_hash = Some(signed);
         s.roster()
     };
     apply_roster_to_dns(
@@ -331,7 +357,6 @@ pub(crate) async fn reconverge_and_apply(
         alpn,
         network_name,
         my_identity,
-        my_ip,
         device_cert,
     )
     .await;
@@ -342,13 +367,7 @@ pub(crate) async fn reconverge_and_apply(
     // the activation-time one, which can fire before any network is connected
     // and go to zero peers. Quiet no-op when the flag already matches.
     registry.sync_exit_offers().await;
-    registry.sync_ipv6_only().await;
-    if registry
-        .exit_selection_pending
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        registry.exit_reapply.notify_one();
-    }
+    registry.nudge_exit_reapply();
     tracing::info!(network = %network_name, "reconverged from signed record");
 }
 
@@ -384,7 +403,7 @@ pub(crate) fn prune_departed_peers(
 ) {
     // Device keys nullified on this network (`ray unpair`), read once.
     let nullifiers = state.read().unwrap().nullifiers.clone();
-    for (peer_id, ip, _conn) in peers.peers_for_network_with_conn(network_name) {
+    for (peer_id, _ip, _conn) in peers.peers_for_network_with_conn(network_name) {
         // Membership is by roster identity, which for a paired peer is its user
         // identity, not the transport id the PeerTable is keyed on. Check both.
         let user_id = device_user_map.resolve(&peer_id);
@@ -406,9 +425,7 @@ pub(crate) fn prune_departed_peers(
         // was the peer's last network with us; otherwise just drop this network's
         // route and leave the peer reachable on the others (`remove_peer_from_network`
         // returns the connection iff its network set emptied).
-        if let Some(conn) =
-            peers.remove_peer_from_network(&ip, &derive_ipv6(&peer_id), network_name)
-        {
+        if let Some(conn) = peers.remove_peer_from_network(&derive_ipv6(&peer_id), network_name) {
             conn.close(
                 VarInt::from_u32(forward::KICK_CODE),
                 b"removed from network",
@@ -445,11 +462,10 @@ pub(crate) async fn attach_rejoined_peers(
         // The roster keys a paired peer by its user identity, while the peer table
         // is keyed on the transport (device) id, so resolve through the same map
         // the prune pass uses before looking the connection up.
-        let Some((ip, ipv6, conn)) = peers.connected_device_for(&m.identity, device_user_map)
-        else {
+        let Some((ip, conn)) = peers.connected_device_for(&m.identity, device_user_map) else {
             continue;
         };
-        if peers.attach_network(&ip, &ipv6, network_name).is_none() {
+        if peers.attach_network(&ip, network_name).is_none() {
             continue;
         }
         tracing::info!(
@@ -479,25 +495,19 @@ pub(crate) async fn apply_roster_to_dns(
         .filter(|m| m.identity != my_identity)
         .map(|m| peers::RouteMember {
             endpoint_id: m.identity,
-            ipv4: m.ip,
             ipv6: derive_ipv6(&m.identity),
         })
         .collect();
     route_map.sync_network(network_name, &routes);
-    // The roster is the source of truth for DNS, including which members have a
-    // usable mesh IPv4: a member running an IPv6-only data plane gets `None`, so
-    // the responder withholds its A record instead of pointing apps at an
-    // address another VPN owns on that host.
-    let mut entries: Vec<(String, Option<Ipv4Addr>, Ipv6Addr)> = members
+    // The roster is the source of truth for DNS. Every member has exactly one
+    // address and it is derived, not stored, so the entry is a bare `Ipv6Addr`:
+    // there is no A record to hold back and nothing that can be missing.
+    let mut entries: Vec<(String, Ipv6Addr)> = members
         .iter()
         .filter_map(|m| {
-            m.hostname.as_ref().map(|h| {
-                (
-                    h.clone(),
-                    (!m.ipv6_only).then_some(m.ip),
-                    derive_ipv6(&m.identity),
-                )
-            })
+            m.hostname
+                .as_ref()
+                .map(|h| (h.clone(), derive_ipv6(&m.identity)))
         })
         .collect();
 
@@ -507,7 +517,7 @@ pub(crate) async fn apply_roster_to_dns(
         .find(|m| m.identity == my_identity)
         .and_then(|m| m.hostname.clone());
 
-    if let Ok(Some(mut net)) = config::load_network(network_name) {
+    let _ = config::update_network(network_name, |net| {
         match net.pending_hostname.clone() {
             // A locally-requested rename is in flight. Until the blob confirms
             // it, keep showing/persisting the requested name and don't let a
@@ -523,18 +533,16 @@ pub(crate) async fn apply_roster_to_dns(
                     // Override our own DNS entry so `.ray` resolution and
                     // `ray status` reflect the pending name immediately.
                     let v6 = derive_ipv6(&my_identity);
-                    entries.retain(|(_, v4, _)| *v4 != Some(me.ip));
-                    entries.push((pending.clone(), (!me.ipv6_only).then_some(me.ip), v6));
+                    entries.retain(|(_, addr)| *addr != derive_ipv6(&me.identity));
+                    entries.push((pending.clone(), v6));
                 }
                 if net.my_hostname.as_deref() != Some(pending.as_str()) {
                     net.my_hostname = Some(pending);
-                    let _ = config::save_network(&net);
                 }
             }
             // Either the rename landed, or there was none: follow the blob and
             // clear any (now-confirmed) pending intent.
             pending => {
-                let mut dirty = false;
                 if let Some(p) = &pending {
                     tracing::info!(
                         network = %network_name,
@@ -543,21 +551,16 @@ pub(crate) async fn apply_roster_to_dns(
                         "rename confirmed by signed blob; clearing pending intent"
                     );
                     net.pending_hostname = None;
-                    dirty = true;
                 }
                 if let Some(mine) = blob_self.clone()
                     && net.my_hostname.as_deref() != Some(mine.as_str())
                 {
                     net.my_hostname = Some(mine);
-                    dirty = true;
-                }
-                if dirty {
-                    let _ = config::save_network(&net);
                 }
             }
         }
-    }
-
+        Ok(())
+    });
     dns::sync_network_hostnames(hostname_table, reverse_table, network_name, &entries).await;
 }
 
@@ -604,12 +607,6 @@ pub(crate) fn spawn_group_poller(
             // blob, so no reconverge trigger would ever heal it. Quiet local
             // no-op when the flag already matches.
             registry.sync_exit_offers().await;
-            registry.sync_ipv6_only().await;
-
-            let current_hash = {
-                let s = state.read().unwrap();
-                s.snapshot.as_ref().map(|snap| snap.hash)
-            };
 
             let (remote_hash, seed_peers) = match dht::resolve_network(&client, net_pubkey).await {
                 Ok(r) => r,
@@ -619,9 +616,21 @@ pub(crate) fn spawn_group_poller(
                 }
             };
 
-            if current_hash == Some(remote_hash) {
-                continue;
-            }
+            // Through the same method as the trigger-driven path, so the two
+            // cannot answer "have we converged on this record" differently. They
+            // did: this one open-coded the comparison against the snapshot hash,
+            // our own re-encoding, and was missed when the other moved off it.
+            // This is the hotter of the two and has no timestamp floor to damp it,
+            // so a member whose bytes differ from the publisher's refetched the
+            // whole roster, re-materialized the suggested firewall and nudged the
+            // exit reconcile once a minute, forever.
+            let current_hash = {
+                let s = state.read().unwrap();
+                if !s.needs_reconverge(remote_hash) {
+                    continue;
+                }
+                s.converged_hash
+            };
 
             tracing::info!(old = ?current_hash, new = %remote_hash, "group blob changed");
 
@@ -723,8 +732,8 @@ pub(crate) async fn fetch_and_apply_blob(
     for old_id in &old_members {
         if !new_member_ids.contains(old_id) {
             let s = state.read().unwrap();
-            if let Some(member) = s.members.get(old_id) {
-                peers.remove(&member.ip, &derive_ipv6(old_id));
+            if s.members.get(old_id).is_some() {
+                peers.remove(&derive_ipv6(old_id));
                 tracing::info!(peer = %old_id.fmt_short(), "removed kicked peer");
             }
         }
@@ -745,23 +754,21 @@ pub(crate) async fn fetch_and_apply_blob(
         s.suggested_firewall = data.suggested_firewall.clone();
         s.nullifiers = data.nullifiers.clone();
         s.refresh_snapshot();
+        // The hash the network agreed on, not our re-encoding of it. See
+        // `converged_hash`.
+        s.converged_hash = Some(remote_hash);
     }
     apply_suggested_firewall(fw, endpoint.id(), network_name, state);
 
     // Exit-node reconciliation. The fresh roster may have wiped our advertised
     // offer (a coordinator rebuild) or missed one made while every coordinator was
-    // offline: re-sync the flag with what we actually offer. And it may contain
-    // the exit peer a pending client selection has been waiting on since boot:
+    // offline: re-sync the flag with what we actually offer. And it may carry the
+    // exit peer a pending client selection has been waiting on since boot, or a
+    // changed capability claim from the gateway a live tunnel already points at:
     // nudge the daemon to re-run the exit reconcile rather than leaking traffic
-    // until the next `ray up`. Both are cheap no-ops otherwise.
+    // until the next `ray up`. All cheap no-ops otherwise.
     registry.sync_exit_offers().await;
-    registry.sync_ipv6_only().await;
-    if registry
-        .exit_selection_pending
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        registry.exit_reapply.notify_one();
-    }
+    registry.nudge_exit_reapply();
     ReconvergeOutcome::Applied
 }
 
@@ -782,15 +789,13 @@ mod self_nullified_tests {
     fn member(identity: EndpointId, is_coordinator: bool) -> Member {
         Member {
             identity,
-            ip: std::net::Ipv4Addr::new(100, 64, 0, 2),
             is_coordinator,
             hostname: None,
             user_identity: None,
             device_cert: None,
-            collision_index: 0,
             last_seen: None,
             exit_node: false,
-            ipv6_only: false,
+            exit_families: ExitFamilies::Unknown,
         }
     }
 

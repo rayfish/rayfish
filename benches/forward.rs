@@ -1,7 +1,7 @@
 //! Microbenchmarks for the per-packet data path.
 //!
 //! These isolate the CPU/allocation work rayfish does **per forwarded packet**,
-//! away from the network. The Scaleway harness (`tests/bench/`) measures
+//! away from the network. The cloud harness (`tests/bench/`) measures
 //! end-to-end throughput, but on a shared-vCPU box single-stream TCP is
 //! loss/congestion-bound, which hides per-packet CPU savings. These benches are
 //! the complementary instrument: they hold everything else constant and time

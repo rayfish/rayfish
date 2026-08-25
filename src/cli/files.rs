@@ -68,30 +68,30 @@ async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     };
     match resp {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        // Returned, not exited: [`ipc_send_files`] calls this once per file and
+        // is written to keep going, so ending the process here would drop every
+        // file after the first rejected one. The caller prints this with the
+        // file's name and still exits non-zero at the end.
+        ipc::IpcMessage::Error { message } => anyhow::bail!(message),
+        // Returned, not exited, for the same reason as the arm above.
+        other => anyhow::bail!(unexpected_detail(&other)),
     }
     Ok(())
 }
 
-/// Read one global settings key from the daemon. Returns the rendered value, or
-/// `None` once the daemon's error has been printed, so the caller can just
-/// return.
-async fn config_row(key: NodeKey) -> Result<Option<String>> {
+/// Read one global settings key from the daemon. A daemon-side error ends the
+/// command, so there is no "no value" case left for the caller to handle: an
+/// absent row renders as the empty string, which is how every settings key
+/// spells unset.
+async fn config_row(key: NodeKey) -> Result<String> {
     let mut stream = ipc::connect().await?;
     ipc::send(&mut stream, ipc::IpcMessage::ConfigGet { key: Some(key) }).await?;
     match ipc::recv(&mut stream).await? {
-        ipc::IpcMessage::ConfigValues { rows } => Ok(Some(
-            rows.into_iter().next().map(|(_, v)| v).unwrap_or_default(),
-        )),
-        ipc::IpcMessage::Error { message } => {
-            print_error("error", &message, None);
-            Ok(None)
+        ipc::IpcMessage::ConfigValues { rows } => {
+            Ok(rows.into_iter().next().map(|(_, v)| v).unwrap_or_default())
         }
-        other => {
-            eprintln!("Unexpected response: {other:?}");
-            Ok(None)
-        }
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
 }
 
@@ -121,12 +121,11 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 })
                 .await;
             }
-            if let Some(dir) = config_row(NodeKey::Global(GlobalKey::DownloadDir)).await? {
-                println!(
-                    "download-dir = {}",
-                    if dir.is_empty() { "<unset>" } else { &dir }
-                );
-            }
+            let dir = config_row(NodeKey::Global(GlobalKey::DownloadDir)).await?;
+            println!(
+                "download-dir = {}",
+                if dir.is_empty() { "<unset>" } else { &dir }
+            );
             return Ok(());
         }
         Some(FilesAction::DownloadUser { user, clear }) => {
@@ -148,12 +147,11 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 })
                 .await;
             }
-            if let Some(uid) = config_row(NodeKey::Global(GlobalKey::DownloadUser)).await? {
-                if uid.is_empty() {
-                    println!("download-user = <unset>");
-                } else {
-                    println!("download-user = uid {uid}");
-                }
+            let uid = config_row(NodeKey::Global(GlobalKey::DownloadUser)).await?;
+            if uid.is_empty() {
+                println!("download-user = <unset>");
+            } else {
+                println!("download-user = uid {uid}");
             }
             return Ok(());
         }
@@ -249,8 +247,8 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                         println!();
                     }
                 }
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-                other => eprintln!("Unexpected response: {:?}", other),
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
+                other => fail_unexpected(&other),
             }
         }
         Some(FilesAction::Accept { id, output }) => {
@@ -269,8 +267,8 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 ipc::IpcMessage::Ok { message } => {
                     println!("  {} {}", style::check(), style::value(&message));
                 }
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-                other => eprintln!("Unexpected response: {:?}", other),
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
+                other => fail_unexpected(&other),
             }
         }
         Some(FilesAction::Cancel { id }) => {
@@ -279,13 +277,11 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 ipc::IpcMessage::Ok { message } => {
                     println!("  {} {}", style::check(), style::value(&message));
                 }
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-                other => eprintln!("Unexpected response: {:?}", other),
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
+                other => fail_unexpected(&other),
             }
         }
         Some(FilesAction::AutoAccept { network, state }) => {
-            // This arm prints a daemon error without failing, so a typo caught
-            // only server-side would exit 0 instead of 1.
             parse_on_off(&state)?;
             ipc::send(
                 &mut stream,
@@ -301,8 +297,8 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                 ipc::IpcMessage::Ok { message } => {
                     println!("  {} {}", style::check(), style::value(&message));
                 }
-                ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-                other => eprintln!("Unexpected response: {:?}", other),
+                ipc::IpcMessage::Error { message } => fail_with("error", &message),
+                other => fail_unexpected(&other),
             }
         }
         // Config-only subcommands are handled above and return early.

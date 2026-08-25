@@ -52,8 +52,8 @@ pub(crate) async fn ipc_pair_start() -> Result<()> {
             // We could poll for completion, but the daemon logs when it happens.
             // For now, just tell the user it's ready.
         }
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -80,8 +80,8 @@ pub(crate) async fn ipc_pair_accept(ticket: &str) -> Result<()> {
             println!();
             println!("This device will present its certificate when joining networks.");
         }
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -130,8 +130,8 @@ pub(crate) async fn ipc_pair_list() -> Result<()> {
                 );
             }
         }
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -147,8 +147,8 @@ pub(crate) async fn ipc_unpair(device: &str) -> Result<()> {
     .await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }

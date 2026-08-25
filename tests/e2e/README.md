@@ -6,8 +6,8 @@ shared SSH/deploy/reset/assert plumbing lives in [`../lib/`](../lib) and is sour
 every scenario.
 
 A host is anything that answers `ssh root@<ip>`, so there are two backends: real
-Scaleway instances (the default) and local Docker containers (`E2E_BACKEND=docker`).
-See [Backends](#backends).
+DigitalOcean droplets (the default) and local Docker containers
+(`E2E_BACKEND=docker`). See [Backends](#backends).
 
 ## Scenarios
 
@@ -19,7 +19,13 @@ See [Backends](#backends).
 | [`closed-net/`](closed-net) | 3 | Closed-net admission + lifecycle commands: live approval (`requests`/`accept`/`deny`), co-coordinator (`admin add`) gatekeeper resilience with a reusable key, `ray hostname` + magic-DNS, `ray leave`/`nuke`, and a `ray apply` smoke. |
 | [`apply/`](apply) | 3 | Declarative `ray apply` deploy end to end: create-if-absent + membership-gap diff, `--invite-missing`, `ray identityof`, alias/group expansion (`--dry-run`), real suggestion publish + data-plane enforcement, and `--prune`. |
 | [`dns/`](dns) | 2 | Magic DNS resolution over a real TUN: `<host>.<net>.ray` resolves via the system resolver, drives reachability, no host `:53` bind, non-`.ray` passthrough, and `ray down` revert. |
+| [`ssh/`](ssh) | 2 | Mesh SSH (`ray firewall ssh`): the allow/deny matrix over the TUN, so an SSH grant is a firewall rule and not a separate door. |
+| [`v4bridge/`](v4bridge) | 2 | A service listening on `0.0.0.0` answers over the IPv6-only mesh: the payload path by IP and by `.ray` name, the firewall still upstream of the bridge, loopback-only services declined, no bind/unbind flap across rescans, the setting + data-plane lifetime, and a new listener picked up from a kernel event rather than a timer (droplets only, see the scenario README). |
 | [`reliability/`](reliability) | 4 | Full-mesh packet-loss test: every pair probed both ways with `ping -c 1000 -i 0.01`, ICMP flood, and iperf3 UDP, over the rayfish tunnel vs the direct public-IP baseline. Fails when rayfish adds loss over the raw link. |
+| [`restore-offline/`](restore-offline) | 3 | A member whose daemon restarts while its coordinator is offline keeps the network and re-meshes with the *other* member, rather than dropping the network until the coordinator returns. |
+| [`unpair/`](unpair) | 3 | `ray unpair` revokes a device cert: the nullifier rides the signed blob, a third peer drops the unpaired device, and the device cannot re-join. |
+| [`churn/`](churn) | 4 | Lifecycle events under churn: repeated hard flap, simultaneous flap, `ray down`/`up` cycles, and a `kick`/`nuke` delivered while a member is offline (which must still converge from the signed blob). Ends with a no-panic/no-crash-restart sweep. |
+| [`exit-node/`](exit-node) | 3 | The internet-gateway path: `allow`/`use` forwarding + NAT, full-tunnel egress, `SO_MARK` loop prevention, the IPv6-only tunnel gate, and the deny path. |
 
 Everything runs through one dispatcher, [`../e2e.sh`](../e2e.sh):
 
@@ -30,7 +36,8 @@ tests/e2e.sh <scenario> teardown    # destroy the instances (manual)
 ```
 
 where `<scenario>` is `device-cert`, `connect`, `firewall`, `closed-net`,
-`apply`, `dns`, `reliability`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
+`apply`, `dns`, `ssh`, `reliability`, `restore-offline`, `unpair`, `churn`,
+`exit-node`, `all`, or `bench` (run `tests/e2e.sh` with no scenario for usage). The per-scenario run steps live in `<dir>/run.sh`
 (still runnable directly once `.servers` exists); the fleet definitions and the
 provision/teardown/assert bodies are shared in [`../lib/`](../lib).
 
@@ -47,14 +54,27 @@ under [`../bench/`](../bench) (same shared `tests/lib/`).
 
 ## Backends
 
-`E2E_BACKEND` selects one; the `.servers` zone column records which backend wrote a
-fleet, and each backend refuses to touch the other's.
+`E2E_BACKEND` selects one; the `.servers` region column records which backend wrote
+a fleet, and each backend refuses to touch the other's.
 
-### `scaleway` (default)
+### `digitalocean` (default)
 
-Real instances, one fleet per scenario. Also needs `scw` authenticated
-(`scw account project list` should work) and your public key registered in the
-Scaleway account.
+Real droplets, one fleet per scenario. Needs `doctl` authenticated (`doctl auth
+init`, then `doctl account get` should work) and at least one SSH key on the
+account.
+
+Droplets are created with `--enable-ipv6`, which matters more than it looks:
+the overlay is IPv6-only and `exit-node/run.sh` **skips** its egress assertions
+on a host with no v6 internet, so a fleet without IPv6 makes that suite pass
+without testing the tunnel. IPv6 is settable only at create time, so a fleet
+provisioned without it is easier to destroy and recreate than to fix. Provision
+warns when a droplet comes up without a v6 address.
+
+Unlike some providers, DigitalOcean injects **no** SSH key unless `--ssh-keys`
+names one, so the provisioner passes every key on the account by default
+(`DO_SSH_KEYS` overrides with a comma-separated list of ids or fingerprints).
+That matches what the harness needs: `just scp` runs bare `rsync`/`ssh` with no
+`-i`, so the hosts have to accept ssh's default identity.
 
 ### `docker`
 
@@ -73,7 +93,7 @@ after deploying, so a redeployed-but-not-reactivated daemon comes back in standb
 every data-plane check fails; containers are cheap enough to just rebuild.
 `E2E_DOCKER_REUSE=1` keeps a live fleet if you want to poke at it.
 
-**Scaleway-only scenarios.** `exit-node`, `reliability` and `bench` exit early under
+**Cloud-only scenarios.** `exit-node`, `reliability` and `bench` exit early under
 this backend. All the containers share the host's public IP, and `exit-node` asserts
 the opposite by design ("srv-a and srv-b already share a public IP: the egress
 assertion would be meaningless"); `reliability` and `bench` measure the rayfish path
@@ -82,11 +102,17 @@ against a direct-public-IP baseline that on one host is the same bridge.
 **What a green docker run does not cover:**
 
 - No NAT between peers, so no hole punching and no relay fallback anywhere.
-- The nodes take the direct `/etc/resolv.conf` DNS path; Scaleway's `ubuntu_jammy`
-  runs systemd-resolved and takes the D-Bus path. The conditional takeover block in
-  `dns/run.sh` is skipped on Scaleway and exercised here — complementary, not equal.
+- The bridge is a `fd00:e2e::/64` ULA with no v6 egress, so anything that probes
+  the IPv6 internet has nothing to reach.
+- The nodes take the direct `/etc/resolv.conf` DNS path; DigitalOcean's
+  `ubuntu-22-04-x64` runs systemd-resolved and takes the D-Bus path. The conditional
+  takeover block in `dns/run.sh` is skipped on droplets and exercised here:
+  complementary, not equal.
 - `dns/run.sh`'s "no host `:53` bind" check has no positive control in a container
   with no `:53` listener at all, so it passes for free.
+- tracefs is not mounted in a privileged container, so `v4bridge/run.sh` step 12
+  exercises the timer fallback and never the kernel listen events the daemon
+  actually uses on Linux (`src/listen_events.rs`). It says so when it runs.
 - mDNS is off on the nodes (one bridge means every node hears every other one, which
   no real fleet does). `E2E_DOCKER_MDNS=1` turns it back on.
 
@@ -94,10 +120,11 @@ against a direct-public-IP baseline that on one host is the same bridge.
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `E2E_BACKEND` | `scaleway` | `scaleway` or `docker` |
-| `ZONE` | `fr-par-1` | Scaleway zone (provision) |
-| `TYPE` | `DEV1-S` | instance type (provision) |
-| `IMAGE` | `ubuntu_jammy` | instance image label (provision) |
+| `E2E_BACKEND` | `digitalocean` | `digitalocean` or `docker` |
+| `REGION` | `fra1` | droplet region (provision) |
+| `SIZE` | `s-1vcpu-1gb` | droplet size slug (provision) |
+| `IMAGE` | `ubuntu-22-04-x64` | droplet image slug (provision) |
+| `DO_SSH_KEYS` | every key on the account | comma-separated key ids/fingerprints (provision) |
 | `SSH_KEY` | `~/.ssh/id_ed25519` | private key for `root@<ip>` |
 | `KEEP_STATE` | `0` | `1` skips the per-run rayfish state wipe |
 | `E2E_DOCKER_REUSE` | `0` | `1` keeps a live container fleet instead of recreating it |

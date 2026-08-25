@@ -103,24 +103,25 @@ impl ConnectService {
     /// to look up. Otherwise the argument is a contact id and resolves through
     /// pkarr as before. Contact ids and transport endpoint ids are distinct
     /// keys, so the two cases cannot collide.
-    async fn resolve_connect_target(&self, arg: &str) -> Result<EndpointId, IpcMessage> {
+    ///
+    /// The error is the message, not a whole `IpcMessage`: every failure here is
+    /// an `ipc_err`, and the one caller is what turns it into a reply.
+    async fn resolve_connect_target(&self, arg: &str) -> Result<EndpointId, String> {
         let me = self.transport.endpoint.id();
         if let Some(peer) = self.transport.lan_peers.resolve(arg, me) {
             return Ok(peer);
         }
         let contact_pubkey = arg
             .parse::<EndpointId>()
-            .map_err(|e| ipc_err(format!("invalid contact id: {e}")))?;
+            .map_err(|e| format!("invalid contact id: {e}"))?;
         if contact_pubkey == self.transport.contact_public {
-            return Err(ipc_err("cannot connect to your own contact id".to_string()));
+            return Err("cannot connect to your own contact id".to_string());
         }
         let pkarr = dht::create_pkarr_client(&self.transport.endpoint)
-            .map_err(|e| ipc_err(format!("failed to create pkarr client: {e}")))?;
+            .map_err(|e| format!("failed to create pkarr client: {e}"))?;
         dht::resolve_contact(&pkarr, contact_pubkey)
             .await
-            .map_err(|_| {
-                ipc_err("contact offline or unknown (could not resolve contact id)".to_string())
-            })
+            .map_err(|_| "contact offline or unknown (could not resolve contact id)".to_string())
     }
 
     /// Approve a pending `ray connect` request by contact-id prefix: mint a
@@ -167,10 +168,13 @@ impl ConnectService {
 
         // Decide our own hostname once so the network name (`<me>-<peer>`) and our
         // member hostname on it agree, instead of generating two different names.
-        let my_host = config::load()
-            .ok()
-            .and_then(|c| c.default_hostname)
-            .unwrap_or_else(crate::hostname::generate_hostname);
+        // The peer's name is the whole roster of a 2-peer network, so it is
+        // also the only thing our default can collide with, and it will when
+        // both ends are called `laptop`.
+        let my_host = crate::hostname::default_hostname(
+            config::load().ok().and_then(|c| c.default_hostname),
+            req.hostname.as_deref().as_slice(),
+        );
         let name = self
             .registry
             .direct_network_name(&my_host, req.hostname.as_deref());
@@ -214,7 +218,7 @@ impl ConnectService {
     ) -> IpcMessage {
         let peer = match self.resolve_connect_target(contact_id).await {
             Ok(peer) => peer,
-            Err(e) => return e,
+            Err(message) => return ipc_err(message),
         };
         if let Some(name) = self.registry.existing_direct_network_with(&peer) {
             return IpcMessage::Ok {
@@ -294,11 +298,11 @@ impl ConnectService {
                 false,
             )
             .await;
-        if let IpcMessage::Joined { name, .. } = &resp
-            && let Ok(Some(mut n)) = config::load_network(name)
-        {
-            n.direct = true;
-            let _ = config::save_network(&n);
+        if let IpcMessage::Joined { name, .. } = &resp {
+            let _ = config::update_network(name, |net| {
+                net.direct = true;
+                Ok(())
+            });
         }
         resp
     }
@@ -521,7 +525,10 @@ mod pending_connect_cap_tests {
         let base = Instant::now();
         let pending = DashMap::new();
         for s in 0..4u8 {
-            pending.insert(eid(s), queued_at(eid(s), base + Duration::from_millis(s as u64)));
+            pending.insert(
+                eid(s),
+                queued_at(eid(s), base + Duration::from_millis(s as u64)),
+            );
         }
         assert_eq!(evict_oldest_connect(&pending, eid(99), 4), Some(eid(0)));
         assert_eq!(pending.len(), 3);
@@ -535,7 +542,10 @@ mod pending_connect_cap_tests {
         let base = Instant::now();
         let pending = DashMap::new();
         for s in 0..4u8 {
-            pending.insert(eid(s), queued_at(eid(s), base + Duration::from_millis(s as u64)));
+            pending.insert(
+                eid(s),
+                queued_at(eid(s), base + Duration::from_millis(s as u64)),
+            );
         }
         assert_eq!(evict_oldest_connect(&pending, eid(1), 4), None);
         assert_eq!(pending.len(), 4);

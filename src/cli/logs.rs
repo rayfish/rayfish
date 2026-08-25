@@ -36,12 +36,13 @@ pub(crate) async fn ipc_logs(since: Option<String>, follow: bool) -> Result<()> 
             Ok(ipc::IpcMessage::Ok { .. }) => break,
             Ok(ipc::IpcMessage::Error { message }) => {
                 sink.finish();
-                print_error("error", &message, None);
-                std::process::exit(1);
+                fail_with("error", &message);
             }
+            // `finish` first, as the error arm does: it waits on the pager, and
+            // exiting out from under it leaves the terminal to the pager's mercy.
             Ok(other) => {
-                eprintln!("Unexpected response: {other:?}");
-                break;
+                sink.finish();
+                fail_unexpected(&other);
             }
             // The daemon went away mid-stream (a restart, a shutdown). What
             // arrived is still worth showing, so this is an end, not a failure.

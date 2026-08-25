@@ -8,6 +8,7 @@ import io.sentry.Attachment
 import io.sentry.Sentry
 import io.sentry.SentryLevel
 import io.sentry.android.core.SentryAndroid
+import io.sentry.protocol.SentryId
 
 /**
  * Sentry crash reporting, gated by the user's opt-out toggle in the You screen.
@@ -84,16 +85,20 @@ object Telemetry {
             if (last != 0L && now - last < FAILURE_REPORT_INTERVAL_MS) return
             lastFailureReportMs = now
         }
-        Sentry.withScope { scope ->
+        // The scope goes to the capture, not through `Sentry.withScope`. See
+        // sendDiagnostics for why: under `withScope` none of this reached the
+        // event, and some of it leaked onto later ones.
+        Sentry.captureException(t) { scope ->
             scope.setTag("install_id", NodeHolder.installId(context))
             scope.setTag("transport", transportType(context))
             // The core's own log ring is the only place the reason lives: the
             // Kotlin exception says "start failed", the Rust log says what failed.
             runCatching {
                 val logs = NodeHolder.get(context).logSnapshot()
-                scope.addAttachment(Attachment(logs.toByteArray(), "rayfish-logs.txt", "text/plain"))
+                if (logs.isNotEmpty()) {
+                    scope.addAttachment(Attachment(logs.toByteArray(), "rayfish-logs.txt", "text/plain"))
+                }
             }
-            Sentry.captureException(t)
         }
     }
 
@@ -108,6 +113,7 @@ object Telemetry {
         if (!Sentry.isEnabled()) return null
         val node = NodeHolder.get(context)
         val logs = runCatching { node.logSnapshot() }.getOrDefault("")
+        val health = runCatching { node.healthSnapshot() }.getOrNull()
         // Every report deliberately lands in one Sentry group. An earlier version
         // set a per-send fingerprint (a millisecond stamp) to split each click
         // into its own issue; it never actually split anything (488 reports in a
@@ -116,29 +122,43 @@ object Telemetry {
         // real crashes in the same queue. The tags below are what make a
         // particular report findable (`issue:<id> install_id:<uuid>`), and the
         // caller gets the event id back to quote.
-        var id: String? = null
-        Sentry.withScope { scope ->
+        //
+        // The scope is passed to the capture, never set up around it. Under
+        // `Sentry.withScope` (SDK 8.47.0) not one of these writes reached the
+        // event: 12 of 12 reports over a month carried no `install_id`, no
+        // `transport`, no `rayfish` context and no attachment, which is every
+        // field that makes a report worth having. They did not vanish either.
+        // They landed somewhere longer-lived and surfaced on an unrelated ANR
+        // captured 16 seconds after one of these calls, so the old shape both
+        // lost the data here and leaked a device id onto an event that had no
+        // business carrying one. This overload applies the callback to the
+        // event being sent and to nothing else.
+        val id = Sentry.captureMessage("rayfish diagnostics", SentryLevel.INFO) { scope ->
             scope.setTag("install_id", NodeHolder.installId(context))
             scope.setTag("transport", transportType(context))
-            scope.addAttachment(Attachment(logs.toByteArray(), "rayfish-logs.txt", "text/plain"))
-            runCatching {
-                val h = node.healthSnapshot()
+            // An empty ring is a plausible drop on ingest, and an attachment that
+            // may or may not exist is worse to read than one that never does.
+            if (logs.isNotEmpty()) {
+                scope.addAttachment(Attachment(logs.toByteArray(), "rayfish-logs.txt", "text/plain"))
+            }
+            if (health != null) {
                 scope.setContexts("rayfish", mapOf(
-                    "running" to h.running,
-                    "networks" to h.networkCount.toLong(),
-                    "peers_online" to h.peersOnline.toLong(),
-                    "node_id" to h.nodeId,
-                    "mesh_ipv4" to h.meshIpv4,
-                    "warn_count" to h.warnCount.toLong(),
-                    "error_count" to h.errorCount.toLong(),
+                    "running" to health.running,
+                    "networks" to health.networkCount.toLong(),
+                    "peers_online" to health.peersOnline.toLong(),
+                    "node_id" to health.nodeId,
+                    "warn_count" to health.warnCount.toLong(),
+                    "error_count" to health.errorCount.toLong(),
                 ))
             }
-            id = Sentry.captureMessage("rayfish diagnostics", SentryLevel.INFO).toString()
         }
         // captureMessage only enqueues; block briefly so a user-initiated report
         // is actually delivered before we tell them it was sent. Called off the
         // main thread (Dispatchers.IO in YouScreen).
         Sentry.flush(5000)
-        return id
+        // A refused capture answers EMPTY_ID instead of throwing, and the caller
+        // turns null into "Diagnostics unavailable". Stringifying before the
+        // check made every refusal read back as a successful send.
+        return if (id == SentryId.EMPTY_ID) null else id.toString()
     }
 }

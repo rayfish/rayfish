@@ -4,9 +4,83 @@ use rand::RngExt;
 
 use crate::network_name::NOUNS_B;
 
+/// Placeholder names an OS hands out when it has nothing better, which several
+/// machines on one mesh will share. Taking one would put the collision resolver
+/// to work naming a fleet `localhost-1`, `localhost-2`, so they are refused and
+/// a random name is used instead.
+const PLACEHOLDERS: [&str; 3] = ["localhost", "unknown", "android"];
+
 pub fn generate_hostname() -> String {
     let mut rng = rand::rng();
     NOUNS_B[rng.random_range(0..NOUNS_B.len())].to_string()
+}
+
+/// The hostname to take on a network when the user named none.
+///
+/// `configured` is the node's `default_hostname` (`ray up --hostname`), an
+/// explicit choice, so it is taken as-is and any clash is left to the
+/// coordinator's `-1` suffix. Without one, the name this machine already
+/// answers to is the useful default: a `ray status` full of random nouns is a
+/// list nobody can match back to a box. A random name is the last resort, for
+/// the machine that has no usable name of its own and for the one whose name is
+/// already on the roster: `laptop-1` would read as the name of the `laptop`
+/// that is already there.
+///
+/// `taken` is the hostnames already on the network, excluding our own.
+pub fn default_hostname(configured: Option<String>, taken: &[&str]) -> String {
+    if let Some(name) = configured {
+        return name;
+    }
+    match system_hostname() {
+        Some(name) if !taken.contains(&name.as_str()) => name,
+        _ => generate_hostname(),
+    }
+}
+
+/// This machine's own name, in a form Magic DNS can carry, or `None` when the
+/// OS has nothing worth using.
+pub fn system_hostname() -> Option<String> {
+    mesh_form(&raw_system_hostname()?)
+}
+
+/// Read the OS hostname. `None` when the call fails or the name is not UTF-8;
+/// Android answers `localhost` here, which [`mesh_form`] then refuses.
+fn raw_system_hostname() -> Option<String> {
+    // HOST_NAME_MAX is 64 on Linux and 255 on macOS, so this cannot truncate.
+    let mut buf = [0u8; 512];
+    // SAFETY: `buf` is a live, writable array and its true length is what is
+    // passed, which is the whole contract of `gethostname`.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8(buf[..end].to_vec()).ok()
+}
+
+/// Fold an OS hostname into a mesh one, or `None` if nothing usable is left.
+///
+/// An OS hostname is allowed to be things a mesh hostname is not: uppercase, a
+/// full FQDN, or (on macOS) a sentence with spaces and an apostrophe in it. So
+/// only the first label is kept, it is lowercased, and every other character
+/// becomes a hyphen: `Alice's MacBook.local` -> `alice-s-macbook`.
+fn mesh_form(raw: &str) -> Option<String> {
+    let label = raw.split('.').next().unwrap_or(raw).to_ascii_lowercase();
+    let mut name = String::with_capacity(label.len());
+    for c in label.chars() {
+        match c.is_ascii_lowercase() || c.is_ascii_digit() {
+            true => name.push(c),
+            // Runs collapse, or `My  Box` would come out as `my--box`.
+            false if !name.ends_with('-') => name.push('-'),
+            false => {}
+        }
+    }
+    let name = name.trim_matches('-');
+    let name: String = name.chars().take(63).collect();
+    let name = name.trim_end_matches('-').to_string();
+    match is_valid_hostname(&name) && !PLACEHOLDERS.contains(&name.as_str()) {
+        true => Some(name),
+        false => None,
+    }
 }
 
 pub fn is_valid_hostname(name: &str) -> bool {
@@ -68,6 +142,56 @@ mod tests {
             let h = generate_hostname();
             assert!(is_valid_hostname(&h), "invalid: {h}");
         }
+    }
+
+    #[test]
+    fn an_os_hostname_is_folded_into_a_mesh_one() {
+        assert_eq!(mesh_form("build-box"), Some("build-box".to_string()));
+        // Only the first label, and lowercased.
+        assert_eq!(mesh_form("Build.example.com"), Some("build".to_string()));
+        // macOS lets a hostname be a sentence.
+        assert_eq!(
+            mesh_form("Alice's MacBook Pro.local"),
+            Some("alice-s-macbook-pro".to_string())
+        );
+        // Runs of junk collapse to one hyphen, and the edges are trimmed.
+        assert_eq!(mesh_form("__my  box__"), Some("my-box".to_string()));
+        // 63 characters is the limit, and cutting at it must not leave a
+        // trailing hyphen behind.
+        let long = format!("{}-{}", "a".repeat(62), "b".repeat(20));
+        assert_eq!(mesh_form(&long), Some("a".repeat(62)));
+    }
+
+    #[test]
+    fn a_hostname_no_machine_owns_is_refused() {
+        // Placeholders half the fleet would share.
+        assert_eq!(mesh_form("localhost"), None);
+        assert_eq!(mesh_form("localhost.localdomain"), None);
+        assert_eq!(mesh_form("Unknown"), None);
+        // Nothing usable left after folding.
+        assert_eq!(mesh_form(""), None);
+        assert_eq!(mesh_form("???"), None);
+        assert_eq!(mesh_form(".config"), None);
+    }
+
+    #[test]
+    fn the_default_hostname_prefers_the_configured_name_then_this_machines() {
+        // An explicit `ray up --hostname` wins outright, collision or not: the
+        // coordinator's `-1` suffix is what handles that case.
+        assert_eq!(
+            default_hostname(Some("laptop".into()), &["laptop"]),
+            "laptop"
+        );
+
+        // Without one, this machine's own name, unless the roster already has
+        // it, in which case a name that is at least nobody else's.
+        let Some(mine) = system_hostname() else {
+            return;
+        };
+        assert_eq!(default_hostname(None, &["someone-else"]), mine);
+        let taken = default_hostname(None, &[mine.as_str()]);
+        assert_ne!(taken, mine);
+        assert!(is_valid_hostname(&taken), "invalid: {taken}");
     }
 
     #[test]

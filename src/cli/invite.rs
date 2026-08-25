@@ -82,8 +82,8 @@ pub(crate) async fn ipc_invite(network: &str, action: Option<InviteAction>) -> R
         ),
         ipc::IpcMessage::InviteListResponse { invites } => print_invite_list(&invites),
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -226,8 +226,8 @@ pub(crate) async fn ipc_requests(network: &str) -> Result<()> {
                 );
             }
         }
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -244,8 +244,8 @@ pub(crate) async fn ipc_accept_request(network: &str, id: &str) -> Result<()> {
     .await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }
@@ -262,8 +262,8 @@ pub(crate) async fn ipc_deny_request(network: &str, id: &str) -> Result<()> {
     .await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
-        ipc::IpcMessage::Error { message } => print_error("error", &message, None),
-        other => eprintln!("Unexpected response: {:?}", other),
+        ipc::IpcMessage::Error { message } => fail_with("error", &message),
+        other => fail_unexpected(&other),
     }
     Ok(())
 }

@@ -41,15 +41,10 @@ pub enum DropReason {
     /// rather than blackholing. Seen mostly under an exit-node full tunnel
     /// carrying bulk traffic over a relayed peer.
     PacketTooBig,
-    /// Inbound mesh IPv4 datagram dropped because this node runs an IPv6-only
-    /// data plane (`ray config set ipv6-only on`). Its mesh IPv4 is not routed,
-    /// so accepting the packet would give the sender a one-way path: the reply
-    /// would leave through whichever interface owns `100.64.0.0/10` here.
-    Ipv4Disabled,
 }
 
 impl DropReason {
-    const ALL: [DropReason; 9] = [
+    const ALL: [DropReason; 8] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
@@ -58,7 +53,6 @@ impl DropReason {
         DropReason::Spoof,
         DropReason::ExitDenied,
         DropReason::PacketTooBig,
-        DropReason::Ipv4Disabled,
     ];
 }
 
@@ -339,5 +333,37 @@ mod tests {
             .find(|(r, _)| r == "NoPeer")
             .map(|(_, c)| *c);
         assert_eq!(no_peer, Some(1));
+    }
+
+    /// `ALL` is hand-maintained and is the only thing `total_drops` and the
+    /// snapshot iterate, so a variant left out of it is invisible in both and
+    /// still compiles.
+    ///
+    /// This does not catch that, and cannot: iterating `ALL` never sees a
+    /// variant missing from `ALL`, and the `assert_eq!` adds nothing that the
+    /// fixed length on `ALL` does not already enforce. What it is, is a
+    /// tripwire. The match is exhaustive, so adding a variant is a compile error
+    /// *in this file*, three lines from the `ALL` it has to be added to. The
+    /// omission gets caught because the author is standing next to it, not
+    /// because a test found it.
+    ///
+    /// A real assertion needs the list generated from the enum rather than typed
+    /// out twice, which means a derive (`strum::EnumIter`) this crate does not
+    /// depend on. Worth it if `DropReason` keeps growing; not yet.
+    #[test]
+    fn adding_a_drop_reason_lands_next_to_all() {
+        let counted = DropReason::ALL.iter().fold(0usize, |n, r| {
+            n + match r {
+                DropReason::Firewall
+                | DropReason::SendFailure
+                | DropReason::NoPeer
+                | DropReason::Malformed
+                | DropReason::Backpressure
+                | DropReason::Spoof
+                | DropReason::ExitDenied
+                | DropReason::PacketTooBig => 1,
+            }
+        });
+        assert_eq!(counted, DropReason::ALL.len());
     }
 }

@@ -71,8 +71,8 @@ fun NetworkDetailScreen(
             }
             val addr = "${detail.hostname.ifEmpty { "-" }}.${detail.name}.ray"
             KeyValueRow("Your address", addr, onClick = { copyToClipboard(context, "address", addr); onToast("Copied $addr") })
-            val ip4 = detail.ipv4.takeIf { it.isNotEmpty() }
-            KeyValueRow("IPv4", ip4 ?: "-", onClick = ip4?.let { v -> { copyToClipboard(context, "IPv4", v); onToast("Copied $v") } })
+            val ip6 = detail.ipv6.takeIf { it.isNotEmpty() }
+            KeyValueRow("IPv6", ip6 ?: "-", onClick = ip6?.let { v -> { copyToClipboard(context, "IPv6", v); onToast("Copied $v") } })
             KeyValueRow("Role", if (detail.isCoordinator) "coordinator" else "member")
         }
         SectionCard {
@@ -80,11 +80,11 @@ fun NetworkDetailScreen(
             if (detail.peers.isEmpty()) Text("No peers yet", fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Faint)
             detail.peers.forEach { p ->
                 Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp))
-                    .clickable { copyToClipboard(context, p.hostname.ifEmpty { "peer" }, p.ipv4); onToast("Copied ${p.ipv4}") }
+                    .clickable { copyToClipboard(context, p.hostname.ifEmpty { "peer" }, p.ipv6); onToast("Copied ${p.ipv6}") }
                     .padding(top = 9.dp), verticalAlignment = Alignment.CenterVertically) {
                     Box(Modifier.size(6.dp).clip(RoundedCornerShape(3.dp)).background(if (p.isActive) Rf.Emerald else Rf.Faint))
                     Spacer(Modifier.width(8.dp))
-                    Text(p.ipv4, fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Body)
+                    Text(p.ipv6, fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Body)
                     Spacer(Modifier.weight(1f))
                     Text("${p.hostname.ifEmpty { "?" }} · ${p.nodeId.take(4)}", fontFamily = PlexMono, fontSize = 9.sp, color = Rf.Faint)
                 }

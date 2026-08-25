@@ -39,7 +39,7 @@ Each machine runs a small daemon (comparable to Tailscale's `tailscaled`) that c
 
 1. **Create.** One peer starts a network and becomes its coordinator. The network's public key is its **room id**: it lets others discover the network but, on a closed network, is not enough to get in.
 2. **Join.** On a closed network a peer gets in with a one-time invite code (`ray invite`) or by requesting approval (`ray requests`). The coordinator is the gatekeeper.
-3. **Mesh.** Every peer derives its own stable virtual IPv4 (`100.64.0.0/10`) and IPv6 (`200::/7`) from its identity, then connects directly to every other peer.
+3. **Mesh.** Every peer derives its own stable virtual IPv6 (`200::/7`) from its identity, then connects directly to every other peer.
 4. **Use it.** Any TCP/UDP app works, addressed by IP or by `name.network.ray`.
 
 ## Features
@@ -122,8 +122,7 @@ ray config set auto-update on    # or toggle it any time (takes effect on `sudo 
 ```bash
 ray create --hostname alice          # closed by default; add --open for a public network
 # ✓ network created  gentle-amber-fox
-#   IPv4  100.64.23.142
-#   IPv6  200:ab3f:d92c:1e4a::1
+#   address  200:ab3f:d92c:1e4a:8f02:71bd:c534:9e16
 ```
 
 ### 3. Invite someone
@@ -142,8 +141,7 @@ Hand the code to a friend. On a closed network they can also run `ray join <room
 ```bash
 ray join <invite-code> --name gaming --hostname bob
 # ✓ joined gaming
-#   IPv4  100.64.7.201
-#   IPv6  200:7c10:5e8b:33a1::1
+#   address  200:7c10:5e8b:33a1:2d94:6ae0:1f77:b3c8
 ```
 
 ### 5. Reach each other
@@ -152,7 +150,7 @@ ray join <invite-code> --name gaming --hostname bob
 ray status               # networks, peers, and traffic
 ping alice.gaming.ray    # by name
 ping bob.ray             # flat lookup
-ping 100.64.23.142       # or just the IP
+ping 200:ab3f:d92c:1e4a:8f02:71bd:c534:9e16    # or just the address
 ray ping alice           # mesh probe: RTT, loss, and direct-vs-relay path
 ray netcheck             # your own bound port, relay, and reachability
 ```
@@ -171,9 +169,9 @@ row telling you the exact command to deal with it:
 ```text
   rayfish  ● up      mDNS on      endpoint k7f2…9abc
 
-  gentle-amber-fox  coordinator   alice   100.64.23.142   members 2/3
-    ● bob      100.64.7.201   direct   12ms   ↑ 1.2 MB   ↓ 3.4 MB
-    ○ carol    100.64.9.14
+  gentle-amber-fox  coordinator   alice   200:ab3f:d92c:1e4a:8f02:71bd:c534:9e16   members 2/3
+    ● bob      200:7c10:5e8b:33a1:2d94:6ae0:1f77:b3c8   direct   12ms   ↑ 1.2 MB   ↓ 3.4 MB
+    ○ carol    200:5d31:9f04:c7e2:44ab:8102:e6d9:37f5
     join  <room-id>
 
   pending
@@ -218,11 +216,11 @@ $ ray leave <TAB>
 gaming  homelab
 
 $ ray ping <TAB>
-alice   100.64.3.1, active
-nas     100.64.9.4, idle
+alice   200:ab3f:d92c:1e4a:8f02:71bd:c534:9e16, active
+nas     200:5d31:9f04:c7e2:44ab:8102:e6d9:37f5, idle
 
 $ ray exit-node use homelab <TAB>
-gateway 100.64.2.7, active
+gateway 200:1e77:b0c3:95da:6f28:31ac:d740:5b92, active
 ```
 
 A tab never starts the daemon and never blocks: with the service stopped it
@@ -493,41 +491,59 @@ ray config unset relay                        # back to defaults
 ```
 
 Keys: `relay`, `discovery-dns`, `dns-upstreams`. Values are a comma list of
-presets (`rayfish`, `n0`), URLs, or IPv4 addresses. By default custom servers are
-added alongside the defaults; `--replace` swaps them out (a bad custom server
-with no fallback can isolate the node). Settings are saved to `settings.toml` and
-take effect on `sudo ray restart`.
+presets (`rayfish`, `n0`), URLs, or IP addresses (`dns-upstreams` takes IPv6 ones
+too, which is what an exit-node tunnel forwards through). By default custom
+servers are added alongside the defaults; `--replace` swaps them out (a bad
+custom server with no fallback can isolate the node). Settings are saved to
+`settings.toml` and take effect on `sudo ray restart`.
 
 ## Running alongside another VPN
 
-Tailscale (and anything else built on CGNAT space) routes all of
-`100.64.0.0/10`, the same range rayfish derives its IPv4 from, so on a host
-running both, one of the two loses its IPv4 half. The IPv6 ranges don't overlap,
-so rayfish steps aside and uses only its own.
+Nothing to configure. Rayfish's overlay is IPv6-only, in `200::/7`, and it never
+claims `100.64.0.0/10` at all. Tailscale (and anything else built on CGNAT
+space) can have that range to itself, and the two coexist without either of
+them stepping aside.
 
-This needs no setup: the daemon looks for another VPN on that range at startup
-and switches itself, logging why and showing `ipv6-only on (auto)` in
-`ray status`. Nothing is written to your config, so the mode ends when the other
-VPN does. To decide it yourself:
+Peers, mesh SSH, file transfer, and `.ray` names all work over IPv6. `.ray`
+answers AAAA only: an A query for a mesh name is NODATA, because there is no
+IPv4 address to give. Magic DNS is at `200::53`.
 
-```bash
-ray config set ipv6-only on    # always, even with no other VPN present
-ray config set ipv6-only off   # never; refuse to start on such a host instead
-ray config set ipv6-only auto  # the default: let the daemon decide at startup
-sudo ray restart               # the mode is fixed when the tunnel is built
-```
+`ray exit-node use` tunnels IPv6 and leaves your IPv4 internet traffic leaving
+directly, which `ray exit-node use` and `ray exit-node status` both say out
+loud. Two things follow:
 
-Peers, mesh SSH, file transfer, and `.ray` names all keep working over IPv6;
-`.ray` answers AAAA only, and peers are told not to use your mesh IPv4 either.
-Magic DNS moves to `200::53` in this mode, because the usual `100.100.100.53`
-sits in the range the other VPN is filtering (Tailscale drops anything sourced
-from `100.64.0.0/10` that doesn't arrive on `tailscale0`, which includes our own
-DNS replies).
+- The gateway needs an IPv6 uplink of its own. Ones that report having it are
+  marked `(IPv6)` in `ray exit-node status`, and picking one that reports the
+  opposite is refused rather than left to time out. A gateway that reports
+  nothing either way is still selectable: that is what a network whose
+  coordinator predates this feature looks like, and refusing there would rule
+  out every gateway on it. `ray exit-node use` says so when it happens.
+- The daemon's own DNS forwarder is pointed at an IPv6 resolver while the tunnel
+  is up, so the lookups it makes go through the exit rather than around it. Name
+  one yourself with `ray config set dns-upstreams` (IPv6 addresses are accepted);
+  otherwise Cloudflare and Google's IPv6 resolvers are used.
 
-The one thing that doesn't work is `ray exit-node use`: the full tunnel is IPv4
-policy routing, so it's refused in this mode. Serving as an exit node for others
-is unaffected. NetworkManager's DNS backend is skipped too (it can only carry an
-IPv4 nameserver); the next backend down takes over.
+  This only covers applications' lookups on a host where rayfish is the whole
+  of DNS. On systemd-resolved or resolvconf, rayfish registers `~ray` as its
+  only routing domain, so everything else goes to the host's other DNS servers,
+  over IPv4, which the tunnel does not carry: those lookups still leave
+  directly. Sharing `/etc/resolv.conf` with another VPN (below) has the same
+  effect, since rayfish declines names outside `.ray` there and the system
+  resolver asks that VPN's server itself. The daemon logs a warning when either
+  applies. macOS has no such gap, since it switches to a catch-all match domain
+  while the tunnel is up. Giving Linux the same switch is not done yet.
+
+The other VPN's own routes are copied into the tunnel's routing table before the
+default goes in, and a rule sends its destinations there, so it keeps working:
+without that our catch-all rule sits above its rules (Tailscale's are at
+priority 5210-5270) and its prefixes live in a table of its own, not `main`, so
+it would be black-holed the moment the tunnel came up. The rule matters as much
+as the copy, and covers a case the copy alone does not: an SSH session that came
+*in* over that VPN has replies sourced from its address, and those take a
+higher-priority rule that looks up `main`, where the prefix isn't.
+
+NetworkManager's DNS backend is not used at all: it can only carry an IPv4
+nameserver, and rayfish's resolver is IPv6. The next backend down takes over.
 
 If both VPNs manage `/etc/resolv.conf` directly (no systemd-resolved), rayfish
 shares the file rather than fighting over it or giving it up. It writes its own
@@ -535,16 +551,13 @@ resolver in first, keeps the other VPN's behind it, and keeps both sets of
 search domains. It answers `.ray` and declines everything else, so your system
 resolver moves straight on to the other VPN's server, whose own DNS setup then
 applies as usual. Both meshes resolve, in either start order, and it holds
-whichever way the two write the file. Rayfish rewrites at most once a minute, so the two daemons can't spin
-against each other, and once the other VPN is gone it goes back to managing the
-file alone.
+whichever way the two write the file. Rayfish rewrites at most once a minute, so
+the two daemons can't spin against each other, and once the other VPN is gone it
+goes back to managing the file alone.
 
 Shutting rayfish down removes only its own lines and leaves the other VPN's
 DNS as it found it. `dig @200::53 <host>.ray` answers throughout, since Magic
-DNS is reached through the tunnel and not through `resolv.conf`. (Use
-`@200::53`, not the v4 `100.100.100.53`: a host sharing the CGNAT range with
-another VPN is in IPv6-only mode, where the v4 magic address is exactly what
-the mode gives up.)
+DNS is reached through the tunnel and not through `resolv.conf`.
 
 With `resolvconf` in the path both VPNs do get to register, but the system
 tries the resolvers in order and stops at the first that answers, so whichever
@@ -552,9 +565,8 @@ sorts second never sees its own names. rayfish says which resolver is ahead of
 it in the log if that happens; fix it by giving rayfish's stanza priority in
 resolvconf's interface order.
 
-On Android the same mode is a switch under **You > IPv6-only mode**. Two VPNs
-can't run at once there, so the reason to reach for it is a carrier that gives
-the phone a `100.64.x.x` address of its own. Flipping it reconnects.
+On Android the same holds, and there is nothing to switch: a carrier handing the
+phone a `100.64.x.x` address of its own is simply not a conflict any more.
 
 ## Troubleshooting
 

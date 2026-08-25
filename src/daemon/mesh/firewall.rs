@@ -492,7 +492,6 @@ impl Daemon {
             && let Some(warning) = crate::hostfw::check_inbound_tcp(
                 self.tun_name.load().as_str(),
                 crate::forward::SSH_LISTEN_PORT,
-                self.ipv6_only.enabled(),
             )
             .warning(crate::forward::SSH_LISTEN_PORT)
         {
@@ -501,6 +500,50 @@ impl Daemon {
             message.push_str(&warning);
         }
         IpcMessage::Ok { message }
+    }
+
+    /// Write the `v4-bridge` setting and make the running bridge follow it.
+    ///
+    /// A plain config write would leave the listeners up until the next restart,
+    /// which is the `ssh` bug in a second place, so this key gets its own setter
+    /// for the same reason that one does.
+    pub(crate) fn v4_bridge_config_set(self: &Arc<Self>, value: &str) -> IpcMessage {
+        let mut app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                return ipc_err(format!("failed to load config: {e}"));
+            }
+        };
+        if let Err(e) = settings::apply_global(&mut app_config, GlobalKey::V4Bridge, value, false) {
+            return ipc_err(e.to_string());
+        }
+        let enabled = app_config.v4_bridge;
+        if let Err(e) = config::save_settings(&app_config) {
+            return ipc_err(format!("failed to persist v4-bridge setting: {e}"));
+        }
+        // Reflect immediately if the data plane is up (else activate() starts it).
+        #[cfg(feature = "desktop")]
+        if self.active.load(Ordering::SeqCst) {
+            if enabled {
+                self.start_v4_bridge();
+            } else {
+                self.stop_v4_bridge();
+            }
+        }
+        IpcMessage::Ok {
+            message: format!(
+                "IPv4 listener bridge {}. {}",
+                if enabled { "on" } else { "off" },
+                if enabled {
+                    "A service listening on 0.0.0.0 now answers at this node's mesh \
+                     address, for the peers the firewall allows. Services bound to \
+                     127.0.0.1 are not bridged."
+                } else {
+                    "Services that listen on IPv4 only are no longer reachable over \
+                     the mesh."
+                }
+            ),
+        }
     }
 
     /// Add or remove a peer from a network's SSH allow list. `peer` is `*` (any
@@ -515,15 +558,12 @@ impl Daemon {
         users: Vec<String>,
         allow: bool,
     ) -> IpcMessage {
-        let mut app_config = match config::load() {
-            Ok(c) => c,
+        let ssh_enabled = match config::load() {
+            Ok(c) => c.ssh_enabled,
             Err(e) => {
                 return ipc_err(format!("failed to load config: {e}"));
             }
         };
-        if !app_config.networks.iter().any(|n| n.name == network) {
-            return ipc_err(format!("no such network: {network}"));
-        }
         // Resolve the peer to a stored allow-entry: `*` stays literal, otherwise
         // resolve to the peer's **user identity** hex. `resolve_peer_name` may
         // return a transport endpoint id (for a connected peer) which differs
@@ -540,29 +580,27 @@ impl Daemon {
                 }
             }
         };
-        let net = app_config
-            .networks
-            .iter_mut()
-            .find(|n| n.name == network)
-            .expect("network presence checked above");
-        if allow {
-            // Normalize: a `*` collapses the list to just `*` (any incl. root);
-            // otherwise dedupe. Empty = the non-root default.
-            let users = normalize_ssh_users(users);
-            match net.ssh_allow.iter_mut().find(|r| r.peer == entry) {
-                Some(r) => r.users = users,
-                None => net.ssh_allow.push(config::SshRule {
-                    peer: entry.clone(),
-                    users,
-                }),
+        let net = match config::update_network(network, |net| {
+            if allow {
+                // Normalize: a `*` collapses the list to just `*` (any incl. root);
+                // otherwise dedupe. Empty = the non-root default.
+                let users = normalize_ssh_users(users);
+                match net.ssh_allow.iter_mut().find(|r| r.peer == entry) {
+                    Some(r) => r.users = users,
+                    None => net.ssh_allow.push(config::SshRule {
+                        peer: entry.clone(),
+                        users,
+                    }),
+                }
+            } else {
+                net.ssh_allow.retain(|r| r.peer != entry);
             }
-        } else {
-            net.ssh_allow.retain(|r| r.peer != entry);
-        }
-        let net = net.clone();
-        if let Err(e) = config::save_network(&net) {
-            return ipc_err(format!("failed to persist network config: {e}"));
-        }
+            Ok(())
+        }) {
+            Ok(Some(net)) => net,
+            Ok(None) => return ipc_err(format!("no such network: {network}")),
+            Err(e) => return ipc_err(format!("failed to persist network config: {e}")),
+        };
         // Push the change to any live listener.
         #[cfg(feature = "desktop")]
         self.rebuild_ssh_authz();
@@ -580,7 +618,7 @@ impl Daemon {
         // Mirror of the `ssh on` nudge: a rule with the server off looks like it
         // took effect, but `:22` still falls through to the host sshd (which
         // asks for a password), so the failure doesn't point back here.
-        if allow && !app_config.ssh_enabled {
+        if allow && !ssh_enabled {
             detail.push_str(
                 "\n\nmesh SSH is off, so this rule is not in effect yet. \
                  Start the server with `ray firewall ssh on`.",
